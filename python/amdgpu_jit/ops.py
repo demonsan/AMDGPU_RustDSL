@@ -1,4 +1,4 @@
-"""High-level ops: the MXFP8 blockscale GEMM and the MXFP8 FMHA forward (head dim 128), with the shipped path selection.
+"""High-level ops: the MXFP8 blockscale GEMM, the MXFP8 FMHA forward (head dim 128) and the bf16 paged-KV decode, with the shipped dispatch.
 
 Both ops take device tensors (torch tensors, ``__dlpack__`` objects, ``DeviceBuffer`` or ``RawPtr``), validate shapes / element sizes /
 alignment, specialize the kernel for the call's shape by default (``specialize=False``: the generic kernel), check the launch against the
@@ -153,3 +153,84 @@ def decode16_plan(b, hk, ctx, page=16):
                          capture_output=True, text=True, check=True).stdout
     j = json.loads(out)
     return j["kernel"], j["form"], int(j["splits"])
+
+
+# ----------------------------------------------------------------------------------------------------------------------------- paged decode
+def _plan_cached(b, hk, ctx, page):
+    key = (int(b), int(hk), int(ctx), int(page))
+    hit = _plans.get(key)
+    if hit is None:
+        hit = _plans[key] = decode16_plan(*key)
+    return hit
+
+
+_plans = {}
+
+
+def _ws_zeroed(key, nbytes):
+    """Persistent workspace that is zero when first allocated (the last-arriver counters: the kernel resets them after each use)."""
+    buf = _workspace.get(key)
+    if buf is None or buf[1] < nbytes:
+        if buf is not None:
+            _hip.free(buf[0])
+        ptr = _hip.malloc(nbytes)
+        _hip.memset(ptr, 0, nbytes)
+        buf = _workspace[key] = (ptr, nbytes)
+    return buf[0]
+
+
+def paged_decode_bf16(q, k_cache, v_cache, block_table, context_lens, out, *, scale=None, max_context=None, stream=None, check=True):
+    """Paged-KV decode attention (one new token per sequence), bf16, head dim 128, GQA group G = H / HK <= 16:
+    ``out[b, h] = softmax(scale q[b, h] . K[b, :len_b, h / G]) V[b, :len_b, h / G]``.
+
+    q             [B, H, 128]               bf16
+    k_cache       [num_pages, P, HK, 128]   bf16 (NHD pages, P = page size, a power of two >= 16)
+    v_cache       [num_pages, P, HK, 128]   bf16
+    block_table   [B, max_pages]            int32 (page of each P-token block of a sequence)
+    context_lens  [B]                       int32 (tokens per sequence, <= max_pages P)
+    out           [B, H, 128]               bf16
+    scale defaults to 1 / sqrt(128); ``max_context`` (the longest sequence, default max_pages P) only steers the dispatch. The kernel and
+    its split count come from the single dispatch rule (``decode16_plan``): the fused form for B HK >= 256, else the last-arriver form
+    (``_c``; partials and the ticket counters live in a persistent workspace). Returns (kernel_name, splits).
+    """
+    rq, rk, rv, rbt, rcl, ro = (as_ref(x) for x in (q, k_cache, v_cache, block_table, context_lens, out))
+    B, H, Dq = rq.shape
+    NP, P, HK, Dk = rk.shape
+    if Dq != D or Dk != D:
+        raise ValueError(f"paged_decode_bf16: head dim must be {D} (q {Dq}, cache {Dk})")
+    if H % HK or H // HK > 16:
+        raise ValueError(f"paged_decode_bf16: H ({H}) must be a multiple of HK ({HK}) with G = H / HK <= 16")
+    if P < 16 or P & (P - 1):
+        raise ValueError(f"paged_decode_bf16: page size {P} must be a power of two >= 16")
+    MP = rbt.shape[1]
+    expect(rq, "q", (B, H, D), 2)
+    expect(rk, "k_cache", (NP, P, HK, D), 2)
+    expect(rv, "v_cache", (NP, P, HK, D), 2)
+    expect(rbt, "block_table", (B, MP), 4, align=4)
+    expect(rcl, "context_lens", (B,), 4, align=4)
+    expect(ro, "out", (B, H, D), 2)
+    ctx = int(max_context) if max_context else MP * P
+    name, form, S = _plan_cached(B, HK, ctx, P)
+    kern = get_kernel(name)
+    st = current_stream([rq, rk, rv, rbt, rcl, ro], stream)
+    sc = float(scale) if scale is not None else 1.0 / math.sqrt(D)
+    vals = {"ptr_q": rq.ptr, "ptr_k": rk.ptr, "ptr_v": rv.ptr, "ptr_bt": rbt.ptr, "ptr_cl": rcl.ptr, "scale": sc, "H": H, "HK": HK,
+            "max_pages": MP, "num_pages": NP, "S": S}
+    sizes = {"ptr_q": rq.cap, "ptr_k": rk.cap, "ptr_v": rv.cap, "ptr_bt": rbt.cap, "ptr_cl": rcl.cap}
+    lse_bytes = B * H * S * 16
+    vals["ptr_plse"] = _ws("pa_lse", lse_bytes)
+    sizes["ptr_plse"] = lse_bytes
+    if form == "fused":
+        vals["ptr_po"] = ro.ptr
+        sizes["ptr_po"] = ro.cap
+    else:
+        po_bytes = B * H * S * 4 * 4 * D
+        cnt_bytes = B * HK * 4
+        vals["ptr_po"] = _ws("pa_partials", po_bytes)
+        sizes["ptr_po"] = po_bytes
+        vals["ptr_counter"] = _ws_zeroed("pa_counters", cnt_bytes)
+        sizes["ptr_counter"] = cnt_bytes
+        vals["ptr_out"] = ro.ptr
+        sizes["ptr_out"] = ro.cap
+    kern.launch(_present(kern, vals), (HK, B, S), {"G": H // HK, "B": B}, sizes, st, check)
+    return name, S
