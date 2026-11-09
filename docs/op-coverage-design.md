@@ -975,6 +975,23 @@ blockscale 128×128（`fp8bs`）的规则：
 - causal 时 dkdv 只裁掉了前部的 q tile。
 - 方向：合并为一个 kernel，dQ 用原子累加（需要后端提供 `buffer_atomic_add_f32`）；加入延迟 rescale 一类的 VALU 优化。
 
+**更新（2026-11-09）：causal 的启动顺序改为"最重的 tile 先启动"，dq / dkdv 的 causal 版本网格改为 `(H, B, tiles)`**。
+- 发现：causal dkdv 在所有尺寸上都比 non-causal 慢（B4 H8 2048²：245 vs 227 µs），虽然工作量只有约 53 %。ATT（一个 SIMD、扫多个 CU）显示每个 pair 的耗时在孤立（128 个 CTA）和满载（512 个 CTA）下相同（7.1 – 7.5 µs / pair，各类停顿占比也相同），所以差距不在单 CTA 速度，而在调度顺序：workgroup 按线性 id 顺序发射，并按 id 轮流分给 8 个 XCD（每个 32 个 CU），tile 下标放在 x（最快变化）时，每个 XCD 的队列里长短 tile 交错，长 tile 开始得晚，决定了尾部。一个小的发射模型（线性 id 顺序、轮流分给 8 个 XCD、每 CU 一个 CTA）复现了实测：B4 H8 2048² 模型 237 µs / 实测 244 µs；最长优先模型 126 µs（理想值）。
+- 做法：causal 的 dq / dkdv 以 `(H, B, tiles)` 启动，tile 下标放最慢变化，最重的 tile 在前（dkdv 是 key tile 0，dq 是最高的 query tile）；non-causal 不变。上一版的 XCD 蛇形重排（`snake8`）只拉平了各 XCD 的总量，没有改队列内的顺序，收益很小，已去掉。
+- 数据（同次运行，causal，dkdv µs，前：x 方向最快；后：最长优先）：B4 H8 2048² 244 → 128 – 144；B1 H32 2048² 246 → 126 – 143；256 个 CTA 125 → 111；128 个 CTA 120 → 92 – 105（含 kernel-opt 之后的 dkdv 改进）。`_causal_pair`（一个 CTA 处理 key tile x 和 nkt − 1 − x）在所有测过的形状上都输给最长优先（B1 H8 2048² 115 vs 92，B1 H32 2048² 132 vs 125，B2 H8 1024² 68.5 vs 50.8，B1 H16 4096² 233 vs 223 µs），已归档为 tag `archive/bwd-dkdv-pair` 并移除（kernel、registry、`dispatch::bwd_dkdv_pair`）。
+- 与 aiter 同次运行（B H HK SQ SK，ours 总计 vs 厂商 odo + dqdkdv + dq_convert）：
+
+| 形状 | ours | aiter | 比 |
+|---|--:|--:|--:|
+| B1 H8 2048²，非 causal | 171.0 µs（dq 69.8 + dkdv 93.5） | 141.4 µs | 0.83 |
+| B1 H8 HK2 2048²，causal | 166.0 µs（66.5 + 92.3） | 163.4 µs | 0.98 |
+| B1 H8 2048²，causal | 165.7 µs | 163.7 µs | 0.99 |
+| B4 H8 2048²，causal | 226.0 µs（89.0 + 128.0） | 196.7 µs | 0.87 |
+| B1 H32 2048²，causal | 223.4 µs（88.5 + 126.0） | 194.8 µs | 0.87 |
+| B2 H8 1024²，causal | 93.8 µs（36.5 + 51.0） | 107.6 µs | **1.15** |
+
+正确性：ours 全部 `bad=0`，`gpu_verify --strict` 0 错误；厂商在 SQ ≠ SK 且不是 128 的整数倍的形状（B2 H8 HK2 1000 × 1500，causal）上自己有 dk / dv 错误（`dk=196 dv=177` bad），ours 没有。
+
 ### 7.8 批次 5b（implicit-GEMM 卷积）状态：2d / 3d bf16 覆盖完成
 
 **实现**：`conv{2,3}d_bf16_[t<T>]r<R>s<S>_st<st>_p<pad>_d<dil>[_c128]`，见 [`gemm/mod.rs`](../crates/amdgpu-kernels/src/gemm/mod.rs) 的 `ConvCfg`。它复用 v4 bf16 GEMM 结构。
