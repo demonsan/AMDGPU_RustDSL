@@ -129,7 +129,10 @@ fn assemble(asm: &str, tag: &str) -> Option<Result<(), String>> {
     if !std::process::Command::new(&clang).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         return None;
     }
-    let dir = std::env::temp_dir().join(format!("amdc-dc-{}-{tag}", std::process::id()));
+    // unique per call: the tests of this binary run in parallel threads and both sweeps assemble the same kernel names
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("amdc-dc-{}-{:?}-{n}-{tag}", std::process::id(), std::thread::current().id()).replace(['(', ')'], ""));
     std::fs::create_dir_all(&dir).ok()?;
     let s = dir.join("k.s");
     std::fs::write(&s, asm).ok()?;
