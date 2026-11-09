@@ -430,8 +430,13 @@ impl<'a> An<'a> {
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.sig(v, 0).hash(&mut h);
-        (false, h.finish() & !(1u64 << 63))
+        let s = self.sig(v, 0);
+        s.hash(&mut h);
+        let k = (false, h.finish() & !(1u64 << 63));
+        if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+            self.sig_memo.borrow_mut().insert(u32::MAX - (k.1 % 1_000_000) as u32, s.chars().take(300).collect());
+        }
+        k
     }
 
     /// Structural signature of a value: its defining op with every value operand replaced by that operand's signature.
@@ -604,6 +609,17 @@ impl<'a> An<'a> {
                 None => "<no linear form>".into(),
             };
             eprintln!("gw: arg 0x{:x}: {} stores: {:?}; first: {}", ss[0].0, ss.len(), r, show(&ss[0].1));
+            let mut keys: std::collections::BTreeSet<(bool, u64)> = Default::default();
+            for s in ss {
+                if let Some((a, _)) = &s.1 {
+                    keys.extend(a.keys().cloned());
+                }
+            }
+            for k in keys.iter().take(12) {
+                let n = ss.iter().filter(|s| s.1.as_ref().map_or(false, |(a, _)| a.contains_key(k))).count();
+                let sg = if k.0 { format!("var{}", k.1) } else { self.sig_memo.borrow().get(&(u32::MAX - (k.1 % 1_000_000) as u32)).cloned().unwrap_or_default() };
+                eprintln!("gw:   atom {:x} in {n}/{} stores: {}", k.1, ss.len(), sg);
+            }
         }
         r.is_ok()
     }
