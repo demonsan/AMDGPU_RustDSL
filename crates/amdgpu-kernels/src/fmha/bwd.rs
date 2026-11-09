@@ -108,7 +108,7 @@ pub fn fmha_bwd_dot(name: &str) -> Function {
 
 /// dQ per 128-query tile (see the module doc). Grid (ceil(SQ / 128), H, B), 4 waves x 32 queries.
 pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
-    let mut b = FnBuilder::new(name, 256);
+    b.compile_profile(CompileProfile::Vs128);
     b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(160).ceil_div(128));
@@ -306,13 +306,16 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
         }
     }
     b.end_if();
-    b.finish()
+    let mut f = b.finish();
+    // (as dkdv: Vs128 + the scheduler tokens; dq 224 -> 222 us)
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
 }
 
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
-    let mut b = FnBuilder::new(name, 256);
+    b.compile_profile(CompileProfile::Vs128);
     b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(176).ceil_div(128));
@@ -550,5 +553,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         }
     }
     b.end_if();
-    b.finish()
+    let mut f = b.finish();
+    // the Vs128 profile + ldsink / wsink / ldahead32 tokens: dkdv 585 -> 407 us at B1 H16 4096² (same run; Gemm profile + tokens alone 1065 vs 1072,
+    // Vs128 alone slower)
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
 }
