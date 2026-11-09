@@ -1092,15 +1092,14 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             let (wa, wb) = (win(a), win(b));
             if wa.0 < wb.1 && wb.0 < wa.1 {
                 let what = |x: &Info| if x.ev.produce { "write" } else { "read" };
-                diags.push((
-                    "GV-TILE-ALIAS-RACE",
-                    Severity::Error,
-                    a.ev.stmt.max(b.ev.stmt),
-                    format!(
+                let (newn, oldn) = if f.contract.tile_reuses.iter().any(|(p, _)| *p == name(a.ev.tile)) { (name(a.ev.tile), name(b.ev.tile)) } else { (name(b.ev.tile), name(a.ev.tile)) };
+                let msg = format!(
                         "stmt {} / stmt {}: the {} of `{}` (role {}, phases {}..{}) and the {} of `{}` (role {}, phases {}..{}) may touch the same LDS bytes in [{}, {}): `{}` reuses the storage of `{}` (tile_over / overlays) but no barrier separates them and the write is not provably inside the writer's own slice - the reused range may still be live for another wave (complete the last reads with wait_lds(0) and put a barrier before reusing it, or write only the own wave's slice)",
-                        a.ev.stmt, b.ev.stmt, what(a), name(a.ev.tile), a.role, wa.0, wa.1, what(b), name(b.ev.tile), b.role, wb.0, wb.1, ra.0.max(rb.0), ra.1.min(rb.1), name(a.ev.tile), name(b.ev.tile)
-                    ),
-                ));
+                        a.ev.stmt, b.ev.stmt, what(a), name(a.ev.tile), a.role, wa.0, wa.1, what(b), name(b.ev.tile), b.role, wb.0, wb.1, ra.0.max(rb.0), ra.1.min(rb.1), newn, oldn
+                    );
+                if !diags.iter().any(|d| d.3 == msg) {
+                    diags.push(("GV-TILE-ALIAS-RACE", Severity::Error, a.ev.stmt.max(b.ev.stmt), msg));
+                }
             }
         }
     }
