@@ -379,9 +379,8 @@ impl<'a> An<'a> {
                     return atom(self.atom_key(*v), *o);
                 }
                 if !matches!(def, Some(Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ | Op::WorkitemId)) {
-                    let it = self.int_of(o);
-                    if it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0] {
-                        return Some((BTreeMap::new(), it.lo[0].clone()));
+                    if let Some(p) = self.point_of(o) {
+                        return Some((BTreeMap::new(), p));
                     }
                 }
                 match def {
@@ -524,8 +523,9 @@ impl<'a> An<'a> {
 
     /// The exact (point) value of a uniform operand, if its interval is one polynomial.
     fn point_of(&self, o: &Opnd) -> Option<Poly> {
+        // a lower bound that is also an upper bound (an interval keeps several candidate bounds)
         let it = self.int_of(o);
-        (it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0]).then(|| it.lo[0].clone())
+        it.lo.iter().find(|l| it.hi.contains(l)).cloned()
     }
 
     /// `cond == live` as `x < y`.
