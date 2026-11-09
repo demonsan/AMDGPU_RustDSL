@@ -249,8 +249,9 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
         }
         // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot)
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        let mut ds: Vec<ValueId> = Vec::with_capacity(32);
+        // per 32-key half sb: its 16 dS values, packed to bf16 and consumed by its two dQ steps before the next half (fewer live registers)
         for sb in 0..2usize {
+            let mut ds: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
                 let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                 let s = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
@@ -264,12 +265,10 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 let x = b.sub_f32(dp, dot);
                 ds.push(b.mul_f32(p, x));
             }
-        }
-        // dQ^T += K^T dS^T: 4 steps of 16 keys x 4 blocks of 32 d
-        kslot.read(&mut b, |b| {
-            for t in 0..4usize {
-                let (sb, tt) = (t / 2, t % 2);
-                let i0 = 16 * sb + 8 * tt;
+            // dQ^T += K^T dS^T: 2 steps of 16 keys x 4 blocks of 32 d
+            kslot.read(&mut b, |b| {
+            for tt in 0..2usize {
+                let i0 = 8 * tt;
                 let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(ds[i0 + 2 * j], ds[i0 + 2 * j + 1])).collect();
                 let pf = b.pack4(w[0], w[1], w[2], w[3]);
                 for e in 0..4usize {
@@ -279,7 +278,8 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                     b.var_mfma(dqv[e], kind, kf, pf, false);
                 }
             }
-        });
+            });
+        }
     }
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
