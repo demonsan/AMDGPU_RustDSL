@@ -373,6 +373,7 @@ impl FromIr for TileDecl {
             slots: FromIr::from_ir(v.field("slots")?)?,
             private: FromIr::from_ir(v.field("private")?)?,
             global: FromIr::from_ir(v.field("global")?)?,
+            owned: FromIr::from_ir(v.field("owned")?)?,
         })
     }
 }
@@ -384,6 +385,7 @@ impl IrIds for TileDecl {
         IrIds::ids(&mut self.slots, fv, fr);
         IrIds::ids(&mut self.private, fv, fr);
         IrIds::ids(&mut self.global, fv, fr);
+        IrIds::ids(&mut self.owned, fv, fr);
     }
 }
 

@@ -60,6 +60,8 @@ pub struct Report {
     pub proven: BTreeMap<&'static str, usize>,
     /// (marker statement, reused private region): every access of a tile_over marker avoids the region or stays in the writer's own slice
     pub own_reuse: BTreeMap<(usize, String), bool>,
+    /// marker statement of an `lds_owned` tile -> every access of the scope is proven to be in the issuing thread's own words
+    pub owned: BTreeMap<usize, bool>,
     /// Accesses that are bounds-checked but NOT race-checked, by kind (docs/trust-inventory.md): `lds-untracked` (an LDS access outside every
     /// tile marker), `global-write-untracked` (a global / buffer store outside a `buf_region` marker: cross-workgroup disjointness is trusted)
     pub unchecked: BTreeMap<&'static str, usize>,
@@ -360,6 +362,43 @@ impl<'a> An<'a> {
             if let Some(last) = self.rep.findings.last_mut() {
                 last.msg.push_str(&format!("{why} | address = {sh}"));
             }
+        }
+    }
+
+    /// Under a marker of an `lds_owned` tile: is this access (the current address operand) in the issuing thread's own words? The address must be
+    /// `base + col_stride tid + k row_stride + r` with 0 <= r <= col_stride - size, every other term a multiple of row_stride, and the columns of
+    /// all threads inside one row (row_stride >= threads col_stride).
+    fn note_owned(&mut self, size: i128) {
+        let Some((ti, _, _)) = self.tag.clone() else { return };
+        let t = &self.f.contract.tiles[ti];
+        let Some((col, row)) = t.owned else { return };
+        let (col, row, base) = (col as i128, row as i128, t.base as i128);
+        let ok = (|| {
+            let (o, off) = self.cur_addr?;
+            let (atoms, c) = self.lin(&o)?;
+            let c = c + off;
+            if row < self.f.workgroup_size as i128 * col {
+                return None;
+            }
+            let mut tid_seen = false;
+            for ((is_var, id), k) in &atoms {
+                let is_tid = !is_var && matches!(self.defs.get(id), Some(Op::WorkitemId));
+                if is_tid {
+                    if *k != col || tid_seen {
+                        return None;
+                    }
+                    tid_seen = true;
+                } else if k % row != 0 {
+                    return None;
+                }
+            }
+            let r = (c - base).rem_euclid(row);
+            (tid_seen && r + size <= col).then_some(())
+        })()
+        .is_some();
+        if self.rep.quiet == 0 {
+            let e = self.rep.owned.entry(self.tag_stmt).or_insert(true);
+            *e &= ok;
         }
     }
 
@@ -1308,6 +1347,7 @@ impl<'a> An<'a> {
         if self.tag.is_none() {
             self.rep.unchecked_access("lds-untracked");
         }
+        self.note_owned(size);
         self.tile_cover(what, addr, size);
         self.cur_addr = None;
         let limit = Itv::konst(self.f.lds_bytes as i128);
