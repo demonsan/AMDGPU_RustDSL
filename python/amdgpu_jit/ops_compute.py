@@ -172,7 +172,7 @@ def prefill_bf16(q, k, v, out, *, causal=False, lse=None, scale=None, cus=256, s
     g[2] = B * S
     launch(name, vals, grid=tuple(g), syms=syms, stream=stream, check=check)
     if S > 1:
-        launch("attn_combine_bf16_hd128_q", ptrs=[out, vals["ptr_po"], vals["ptr_plse"], lse], scalars=[H, SQ, S, int(want_lse)], grid=(SQ, H, B), stream=stream, check=check)
+        launch("attn_combine_bf16_hd128_q16", ptrs=[out, vals["ptr_po"], vals["ptr_plse"], lse], scalars=[H, SQ, S, int(want_lse)], grid=((SQ + 15) // 16, H, B), stream=stream, check=check)
     return name, S
 
 

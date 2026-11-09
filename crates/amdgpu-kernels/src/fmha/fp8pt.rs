@@ -171,6 +171,10 @@ impl skeleton_vs128::Vs128Slots for PtSlots {
     type Cx = PtCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> PtCx {
         b.compile_profile(CompileProfile::Vs128);
+        // the softmax phase in its woven (declaration) order: the list scheduler put the first S read (the m-scale `v_pk_mul`, which waits for
+        // the QK MFMA chain to drain, ~930 cycles) ahead of the next tile's DMA issues (sched's ATT read, 2026-11-09); authored: same run
+        // B2 H32 8192^2 1198 -> 1083 us (0.93 -> 1.03x aiter), causal 677 -> 639, B4 H16 2048^2 97 -> 90 / causal 65 -> 62, split forms +2-6 %
+        b.declare_region("v_phase", true, "");
         let io = declare_io_pt(b, self.causal, false);
         let mode = Some(PtMode { causal: self.causal });
         // non-causal: the XCD block order of `_vs128`; causal (paired): the plain order
@@ -251,6 +255,10 @@ impl skeleton_kvsplit::KvsplitSlots for PtKvSlots {
     type Cx = PtCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> PtCx {
         b.compile_profile(CompileProfile::Vs128);
+        // the softmax phase in its woven (declaration) order: the list scheduler put the first S read (the m-scale `v_pk_mul`, which waits for
+        // the QK MFMA chain to drain, ~930 cycles) ahead of the next tile's DMA issues (sched's ATT read, 2026-11-09); authored: same run
+        // B2 H32 8192^2 1198 -> 1083 us (0.93 -> 1.03x aiter), causal 677 -> 639, B4 H16 2048^2 97 -> 90 / causal 65 -> 62, split forms +2-6 %
+        b.declare_region("v_phase", true, "");
         let io = declare_io_pt(b, false, true);
         let (x, y) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY));
         let blk = block3_at(&io, b, 8, x, y, Some(PtMode { causal: self.causal }));

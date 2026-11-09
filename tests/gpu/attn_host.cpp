@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     // fmha_fwd_v3_args: field i at 16 i
     // our ABI extension: sliding window (WL / WR env, >= 0) at 656 / 672
     const int WL = envi("WL", -1), WR = envi("WR", -1);
-    // KS=lg (ours *_v3_ks): 2^lg key parts per q tile, partials + attn_combine_bf16_hd128_q (COMBINE_CO)
+    // KS=lg (ours *_v3_ks): 2^lg key parts per q tile, partials + attn_combine_bf16_hd128_q16 (COMBINE_CO; COMBINE_KN overrides the name)
     const int KS = envi("KS", -1);
     std::vector<uint8_t> a(KS >= 0 ? 704 : WL >= 0 ? 688 : 656, 0);
     auto P = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
         HC(hipMalloc(&dpo, (size_t)B * H * SQ * S * D * 4)); HC(hipMalloc(&dpl, (size_t)B * H * SQ * S * 4));
         uint32_t lg = KS, sc = S;
         memcpy(&a[656], &lg, 4); memcpy(&a[660], &sc, 4); memcpy(&a[672], &dpo, 8); memcpy(&a[688], &dpl, 8);
-        hipModule_t cm; HC(hipModuleLoad(&cm, getenv("COMBINE_CO"))); HC(hipModuleGetFunction(&fcomb, cm, "attn_combine_bf16_hd128_q"));
+        hipModule_t cm; HC(hipModuleLoad(&cm, getenv("COMBINE_CO"))); HC(hipModuleGetFunction(&fcomb, cm, getenv("COMBINE_KN") ? getenv("COMBINE_KN") : "attn_combine_bf16_hd128_q16"));
         float* lsep = want_lse ? dlse : nullptr;
         memcpy(&ca[0], &dout, 8); memcpy(&ca[8], &dpo, 8); memcpy(&ca[16], &dpl, 8); memcpy(&ca[24], &lsep, 8);
         uint32_t hh = H, sqq = SQ, lo = want_lse;
@@ -108,7 +108,10 @@ int main(int argc, char** argv) {
     void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
         HC(hipModuleLaunchKernel(fn, gx, gy, gz * S, block, 1, 1, 0, nullptr, nullptr, cfg));
-        if (fcomb) HC(hipModuleLaunchKernel(fcomb, SQ, H, B, 128, 1, 1, 0, nullptr, nullptr, ccfg));
+        // NO_COMBINE=1: time the key-split kernel alone (the check then fails: diagnostics only)
+        // the q16 combine: 16 rows per workgroup, grid (ceil(SQ / 16), H, B), 256 threads (a one-row combine name: grid (SQ, H, B), 128 threads)
+        const bool q16 = !getenv("COMBINE_KN") || std::string(getenv("COMBINE_KN")).find("q16") != std::string::npos;
+        if (fcomb && !envi("NO_COMBINE", 0)) HC(hipModuleLaunchKernel(fcomb, q16 ? (SQ + 15) / 16 : SQ, H, B, q16 ? 256 : 128, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
     HC(hipDeviceSynchronize());

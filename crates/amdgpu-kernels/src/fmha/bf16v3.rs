@@ -301,7 +301,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 }
 
 /// `split` (`..._ks`, for small grids): the key range of every q tile is cut into S = 2^lg_s parts (grid z = B S; our ABI extension: lg_s
-/// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
+/// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q16` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
     fmha_fwd_bf16_v3_d(name, causal, split, 128)
 }
@@ -653,11 +653,13 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     f
 }
 
-/// Merges the S = 2^lg_s key parts of `fmha_fwd_hd128_bf16_v3_ks`: O[b, q, h, :] (bf16, BSHD) = sum_s w_s po_s / sum_s w_s with w_s =
-/// exp(lse_s - M); optional LSE [B, H, SQ] = M + ln(sum w). Grid (SQ, H, B), 128 threads (one per d). ABI: 0 ptr_o, 8 ptr_po, 16 ptr_plse,
-/// 24 ptr_lse, 32 H, 36 SQ, 40 S, 44 lse_on.
-pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
-    let mut b = FnBuilder::new(name, 128);
+/// Merges the S = 2^lg_s key parts of `fmha_fwd_*_bf16_v3[_causal]_ks`: O[b, q, h, :] (bf16, BSHD) = sum_s w_s po_s / sum_s w_s with
+/// w_s = exp(lse_s - M); optional LSE [B, H, SQ] = M + ln(sum w). ABI: 0 ptr_o, 8 ptr_po, 16 ptr_plse, 24 ptr_lse, 32 H, 36 SQ, 40 S, 44 lse_on.
+/// 256 threads = 16 query rows of one (batch, head) x 16 threads, 8 dims per thread (two 16-byte loads per part), one online pass over the
+/// parts (running max / rescale); grid (ceil(SQ / 16), H, B). Replaces the one-row-per-workgroup `attn_combine_bf16_hd128_q` (one dword per
+/// thread per part, two passes, latency bound): hd192 B1 H8 2048^2 S4 54.4 -> 41.3 us, 4096^2 S2 122.5 -> 111.8, B4 H16 1024^2 S2 112 -> 86.
+pub fn attn_combine_bf16_hd128_q16(name: &str) -> Function {
+    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     for (n, o) in [("ptr_o", 0u32), ("ptr_po", 8), ("ptr_plse", 16), ("ptr_lse", 24)] {
         b.arg(n, DType::Ptr, o, 8);
@@ -671,7 +673,7 @@ pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     b.sym_range("SPL", 1, 16);
     b.ka_is(40, Ext::sym("SPL"));
     b.sym_range("B", 1, 1 << 12);
-    b.grid_is(0, sq.clone());
+    b.grid_is(0, sq.clone().ceil_div(16));
     b.grid_is(1, hh.clone());
     b.grid_is(2, Ext::sym("B"));
     let rows = Ext::sym("B") * hh * sq;
@@ -682,77 +684,82 @@ pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
     let ki = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargI32 { offset: o });
     let (p_o, p_po, p_pl, p_l) = (kp(&mut b, 0), kp(&mut b, 8), kp(&mut b, 16), kp(&mut b, 24));
-    let (hq, s_q, lg, lse_on) = (ki(&mut b, 32), ki(&mut b, 36), ki(&mut b, 40), ki(&mut b, 44));
-    let (q, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let (hq, s_q, ns, lse_on) = (ki(&mut b, 32), ki(&mut b, 36), ki(&mut b, 40), ki(&mut b, 44));
+    let (qb, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let tid = b.let_(Op::WorkitemId);
-    let row = { let v = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(q)); b.read_first_lane(v) };
-    let ns = lg;
-    let nrow = { let v = b.bind_i32((ev(row) + 1) * ev(ns)); b.read_first_lane(v) };
+    // the thread's query row (clamped for the loads; the stores are guarded) and dims 8 (tid % 16) ..
+    let q = b.bind_i32((ev(qb) << 4) + ev(tid).lshr(4));
+    let live = b.bind_cond(ev(q).lt(ev(s_q)));
+    let qc = b.bind_i32(ev(q).min(ev(s_q) - 1));
+    let d0 = b.bind_i32((ev(tid) & 15) << 3);
+    let row = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(qc));
+    let nrow = { let v = b.bind_i32((((ev(bat) * ev(hq) + ev(h)) + 1) * ev(s_q)) * ev(ns)); b.read_first_lane(v) };
     let r_pl = { let n = b.bind_i32(ev(nrow) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_pl, n) };
     let r_po = { let n = b.bind_i32(ev(nrow) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    let base = { let v = b.bind_i32(ev(row) * ev(ns)); b.read_first_lane(v) };
-    let lso = { let v = b.bind_i32(ev(base) << 2); b.read_first_lane(v) };
+    let base = b.bind_i32(ev(row) * ev(ns));
     let c0 = b.c_i32(0);
-    let neg_inf = b.c_f32(f32::NEG_INFINITY);
+    let neg_big = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
-    // M
-    let v1 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(neg_inf))]);
-    let s1 = amdgpu_dsl::varx(v1[0]);
-    let off = b.bind_i32(s1.clone() << 2);
-    let x = b.buffer_load_f32(r_pl, off, lso, 0);
-    let mx = b.max_f32(Opnd::Var(v1[1]), x);
-    b.set_var(v1[1], mx);
-    let n1 = b.bind_i32(s1 + 1);
-    b.set_var(v1[0], n1);
-    let d1 = b.bind_cond(ev(n1).ge(ev(ns)));
-    b.break_if(d1);
-    b.end_loop();
-    let mbits = b.bitcast_i32(Opnd::Var(v1[1]));
-    let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
-    let mm = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(fin), a: Opnd::Var(v1[1]), b: Opnd::Val(zf) });
-    // sums
-    let v2 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(zf)), (DType::F32, Opnd::Val(zf))]);
-    let s2 = amdgpu_dsl::varx(v2[0]);
-    let off = b.bind_i32(s2.clone() << 2);
-    let x = b.buffer_load_f32(r_pl, off, lso, 0);
-    let dx = b.sub_f32(x, mm);
     let l2e = b.c_f32(std::f32::consts::LOG2_E);
-    let t = b.mul_f32(dx, l2e);
-    let w = b.exp2_f32(t);
-    let po = b.bind_i32(((ev(base) + s2.clone()) * D + ev(tid)) << 2);
-    let o = b.buffer_load_f32(r_po, po, c0, 0);
-    let acc = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(o), Opnd::Var(v2[1])));
-    b.set_var(v2[1], acc);
-    let sw = b.add_f32(Opnd::Var(v2[2]), w);
-    b.set_var(v2[2], sw);
-    let n2 = b.bind_i32(s2 + 1);
-    b.set_var(v2[0], n2);
-    let d2 = b.bind_cond(ev(n2).ge(ev(ns)));
-    b.break_if(d2);
+    let mut inits = vec![(DType::I32, Opnd::Val(c0)), (DType::F32, Opnd::Val(neg_big)), (DType::F32, Opnd::Val(zf))];
+    inits.extend((0..8).map(|_| (DType::F32, Opnd::Val(zf))));
+    let v = b.begin_loop(&inits);
+    let s = amdgpu_dsl::varx(v[0]);
+    let lo = b.bind_i32((ev(base) + s.clone()) << 2);
+    let l = b.buffer_load_f32(r_pl, lo, c0, 0);
+    let po = b.bind_i32((((ev(base) + s.clone()) * D) + ev(d0)) << 2);
+    let o0 = b.buffer_load_b128(r_po, po, c0, 0);
+    let o1 = b.buffer_load_b128(r_po, po, c0, 16);
+    let m_new = b.max_f32(Opnd::Var(v[1]), l);
+    let d_old = b.sub_f32(Opnd::Var(v[1]), m_new);
+    let d_new = b.sub_f32(l, m_new);
+    let t_old = b.mul_f32(d_old, l2e);
+    let t_new = b.mul_f32(d_new, l2e);
+    let a = b.exp2_f32(t_old);
+    let w = b.exp2_f32(t_new);
+    let den_a = b.mul_f32(Opnd::Var(v[2]), a);
+    let den = b.add_f32(den_a, w);
+    for k in 0..8usize {
+        let f = if k < 4 { o0 } else { o1 };
+        let x = b.frag4_lane(f, (k % 4) as u8);
+        let x = b.bitcast_f32(x);
+        let acc_a = b.mul_f32(Opnd::Var(v[3 + k]), a);
+        let acc = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(x), Opnd::Val(acc_a)));
+        b.set_var(v[3 + k], acc);
+    }
+    b.set_var(v[1], m_new);
+    b.set_var(v[2], den);
+    let n1 = b.bind_i32(s + 1);
+    b.set_var(v[0], n1);
+    let done = b.bind_cond(ev(n1).ge(ev(ns)));
+    b.break_if(done);
     b.end_loop();
     let tiny = b.c_f32(1e-30);
-    let den = b.max_f32(Opnd::Var(v2[2]), tiny);
+    let den = b.max_f32(Opnd::Var(v[2]), tiny);
     let inv = b.rcp_f32(den);
-    let y = b.mul_f32(Opnd::Var(v2[1]), inv);
-    let yb = b.cvt_pk_bf16_f32(y, y);
+    let ys: Vec<ValueId> = (0..8).map(|k| b.mul_f32(Opnd::Var(v[3 + k]), inv)).collect();
+    let w: Vec<ValueId> = (0..4).map(|k| b.cvt_pk_bf16_f32(ys[2 * k], ys[2 * k + 1])).collect();
+    let f4 = b.frag4(w[0], w[1], w[2], w[3]);
     let nob = { let v = b.bind_i32(((ev(bat) + 1) * ev(s_q) * ev(hq)) * ROW); b.read_first_lane(v) };
     let r_o = b.buffer_desc_dyn(p_o, nob);
-    let o_vo = b.bind_i32(((ev(bat) * ev(s_q) + ev(q)) * ev(hq) + ev(h)) * ROW + (ev(tid) << 1));
-    b.buffer_store_n(r_o, Some(Opnd::Val(o_vo)), c0, 0, yb, amdgpu_dsl::MemTy::U16, false);
-    // a uniform branch on lse_on; the store from thread 0 only (per-lane select of the offset)
-    let lc = b.bind_cond(ev(tid).eq(0));
+    let big = b.c_i32(0x7fff_fff0);
+    let o_vo = b.bind_i32(((ev(bat) * ev(s_q) + ev(qc)) * ev(hq) + ev(h)) * ROW + (ev(d0) << 1));
+    let o_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(o_vo), b: Opnd::Val(big) });
+    b.buffer_store_b128(r_o, o_vo, c0, 0, f4);
     let on = b.bind_cond(ev(lse_on).ne(0));
     b.begin_if(Opnd::Val(on));
     {
+        // natural-log LSE of the row from its first thread
         let lg2 = b.log2_f32(den);
         let ln2 = b.c_f32(std::f32::consts::LN_2);
         let lnl = b.mul_f32(lg2, ln2);
-        let lse = b.add_f32(mm, lnl);
-        let nl = { let v = b.bind_i32((ev(row) + 1) << 2); b.read_first_lane(v) };
+        let lse = b.add_f32(Opnd::Var(v[1]), lnl);
+        let nl = { let v = b.bind_i32(((ev(bat) * ev(hq) + ev(h)) + 1) * ev(s_q) << 2); b.read_first_lane(v) };
         let r_l = b.buffer_desc_dyn(p_l, nl);
-        let big = b.c_i32(0x7fff_fff0);
+        let first = b.bind_cond(ev(d0).eq(0));
         let lvo = b.bind_i32(ev(row) << 2);
-        let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lc), a: Opnd::Val(lvo), b: Opnd::Val(big) });
+        let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(first), a: Opnd::Val(lvo), b: Opnd::Val(big) });
+        let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(lvo), b: Opnd::Val(big) });
         b.buffer_store_f32(r_l, lvo, c0, 0, lse);
     }
     b.end_if();

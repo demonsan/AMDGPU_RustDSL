@@ -924,7 +924,7 @@
 - **验证**：两个 kernel strict 均 0 错误。causal 起初报 42 个 `GV-PROTO-UNROLL-LIMIT`：两 pass × 版本 × 尾 tile × epilogue 的 `row0 < S` 分支超过协议模拟器的 64 条路径。epilogue 改为只用该条件保护全局 store（wave 私有的 LDS 转置无条件执行，`store_out3_lds_x(.., stores_only)`），路径数降到 20 以内，证书 12 / 31 / 0。出厂 kernel md5 不变（vs128 cd403880、t128 84269a3b、kvsplit 240ecbae、combine8h 24a95a51、gemm_mxfp8_bs_v4 e4369386）。
 - **对照工具**：[`fp8pt_host.cpp`](../tests/gpu/fp8pt_host.cpp)，同进程、同数据、交替计时；数据为 N(0,1) 按 (b, KV head) 量化（descale = amax/448）。判定沿用项目的厂商对齐准则（bad ≤ 厂商且 mean_err ≤ 1.10× 厂商）。
 - **厂商 descale 的观察**：厂商 `.co` 只有在标量 descale（步长 0）时与 CPU 参考一致；按 head 变化的 [B, HK] descale 下，它的 mean_err 是 1.8–3.2e-2（我们 1.3–2.2e-3），把 Hs 改成元素步长结果完全不变，说明它不读 Hs 步长 `[待核：厂商是否只取第一个 descale]`。因此性能与精度对比都用 `SCALAR_DS=1`。
-- **结果**（2026-11-09，GPU 5，同次运行，全部厂商对齐 PASS，ours/厂商 mean_err 0.97–1.04×）：
+- **结果**（2026-11-09，GPU 5，同次运行，全部厂商对齐 PASS，ours/厂商 mean_err 0.97–1.04×；authored 之前的数据，现值见下方汇总表）：
 
   | 形状 | 非 causal ours / 厂商（TF/s） | 比 | causal ours / 厂商（TF/s） | 比 |
   |---|--:|--:|--:|--:|
@@ -933,7 +933,8 @@
   | B2 H32 HK8 4096² | 1853 / 1915 | 0.97 | 1520 / 1636 | 0.93 |
   | B1 H8 4096²（64 CTA） | 1004 / 1138 | 0.88 | 382 / 499 | 0.77 |
 
-  - 厂商这个 kernel 用标准 exp 路径（每元素 `v_pk_fma` + `v_exp_f32` + `v_cvt_pk_fp8_f32`，VALU 行和）和不带 scale 的 MFMA；我们沿用 MXFP8 的位技巧配方，VALU 少得多，但仍慢 3–12%。差距的归因（ATT）还没做。
+  - 厂商这个 kernel 用标准 exp 路径（每元素 `v_pk_fma` + `v_exp_f32` + `v_cvt_pk_fp8_f32`，VALU 行和）和不带 scale 的 MFMA；我们沿用 MXFP8 的位技巧配方，VALU 少得多，但起初仍慢 3–12%。
+  - **ATT 归因与修正**（sched，2026-11-09，[`att_fp8pt.sh`](../tools/att_fp8pt.sh)，以 MXFP8 `_vs128` 同形状为基线）：list 调度器把第一条读 S 的指令（m 缩放的 `v_pk_mul_f32`，要等 QK 的 MFMA 链排空，约 930 cycle/次）排到了下一 tile 的 DMA 发射之前，于是 DMA 延迟暴露（`waitcnt vm` 517 对基线 331 cycle/次），对组的 ping-pong 在 barrier 上等（428 对 132 cycle/次）。把 softmax 区域声明为 authored（`declare_region("v_phase", true, "")`，按编织顺序发射）后，同次 A/B：B2 H32 8192² 1198 → 1083 µs，causal 677 → 639，B4 H16 2048² 97 → 90 / causal 65 → 62，split 形式 +2–6%。sched 的另一建议（把 m 并进 exp 的 fma）不适用：P 来自没有 scale 操作数的 pknorm 位技巧转换。
   - 小形状（B2 H8 300×200 等，几十 µs 以内）约 0.62×，属启动与短序列 LUT 副本的开销。
 - **小网格：KV split（`fmha_fwd_hd128_fp8pt_v3[_causal]_kvsplit`）**：`skeleton_kvsplit` 上的同一个 body（MUBUF staging、优先级 ping-pong、单次 bias MFMA），每个 q tile 的 key 范围切成 S 份（grid z = B·S），fp16 部分结果加 LSE，由出厂的 `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` 合并。
   - ABI 扩展放在 656 字节之后（0x290 Ohat、0x298 LSE、0x2A0 splits、0x2A4 rows_total），因为 0x270 / 0x280 已被 V descale 的步长占用。
@@ -956,24 +957,29 @@
 | MXFP8 `_vs128`（真实数据，强制 vs128） | B2 H32 8192² | 912 µs | 902 µs（fwd_hd128_mxfp8） | 0.99 |
 | MXFP8 | B1 H8 8192² | 120 µs | 115 µs | 0.96 |
 | MXFP8 | B4 H8 2048² | 39.4 µs | 40.0 µs | 1.02 |
-| fp8 per-tensor | B2 H32 8192² | 1205 µs | 1107 µs（fwd_hd128_fp8） | 0.92 |
-| fp8 per-tensor causal | B2 H32 8192² | 672 µs | 615 µs | 0.91 |
-| fp8 per-tensor（分发：`_kvsplit` S2） | B1 H8 4096² | 51.7 µs | 61.5 µs | 1.19 |
-| fp8 per-tensor causal（`_causal_kvsplit` S2） | B1 H8 4096² | 51.3 µs | 67.8 µs | 1.32 |
-| fp8 per-tensor（`_kvsplit` S4） | B1 H8 2048² | 24.0 µs | 32.6 µs | 1.36 |
+| fp8 per-tensor（authored v_phase） | B2 H32 8192² | 1083 µs | 1112 µs（fwd_hd128_fp8） | 1.03 |
+| fp8 per-tensor causal | B2 H32 8192² | 639 µs | 617 µs | 0.97 |
+| fp8 per-tensor | B4 H16 2048² | — | — | 0.98 |
+| fp8 per-tensor causal | B4 H16 2048² | — | — | 0.94 |
+| fp8 per-tensor（GQA4） | B2 H32 HK8 4096² | — | — | 1.01 |
+| fp8 per-tensor causal（GQA4） | B2 H32 HK8 4096² | — | — | 0.98 |
+| fp8 per-tensor（分发：`_kvsplit` S2） | B1 H8 4096² | — | — | 1.26 |
+| fp8 per-tensor causal（`_causal_kvsplit` S2） | B1 H8 4096² | — | — | 1.41 |
+| fp8 per-tensor（`_kvsplit` S4） | B1 H8 2048² | — | — | 1.38 |
+| fp8 per-tensor causal（`_causal_kvsplit` S4） | B1 H8 2048² | — | — | 1.64 |
 | bf16 v3 hd128 | B2 H32 8192² | 2037 µs | 1950 µs（fwd_hd128_bf16） | 0.96 |
 | bf16 v3 hd128 | B4 H16 2048² | 172 µs | 154 µs | 0.89 |
-| bf16 v3 hd128 | B1 H8 4096² | 114 µs | 100 µs | 0.88 |
+| bf16 v3 hd128（分发：`_ks` S2 + q16 combine） | B1 H8 4096² | 91.6 µs | 97.9 µs | 1.07 |
 | bf16 v3 hd128 causal | B2 H32 8192² | 1137 µs | 1023 µs | 0.90 |
 | bf16 v3 hd128 causal | B4 H16 2048² | 111 µs | 88.8 µs | 0.80 |
 | bf16 v3 hd128 causal | B1 H8 4096² | 120 µs | 90.5 µs | 0.75 |
 | bf16 hd192/hd128（MLA prefill） | B1 H16 4096² | 187 µs | 178 µs（fwd_hd192_hd128_bf16，128 行） | 0.95 |
 | bf16 hd192/hd128 | B4 H16 2048² | 206 µs | 189 µs | 0.91 |
-| bf16 hd192/hd128 | B1 H8 4096²（128 CTA） | 135 µs | 88.3 µs | 0.66 |
+| bf16 hd192/hd128（`_ks` S2 + q16 combine） | B1 H8 4096²（128 CTA） | 112 µs | 90.3 µs | 0.81 |
 | bf16 hd192/hd128 causal（配对） | B4 H16 2048² | 128 µs | 126 µs | 0.98 |
 | bf16 hd192/hd128 causal（配对） | B1 H128 1024² | 82.8 µs | 79.5 µs | 0.96 |
 | bf16 hd192/hd128 causal（`_np`） | B1 H16 4096² | 147 µs | 113 µs | 0.77 |
-| bf16 hd192/hd128 causal（`_ks` S2） | B1 H8 4096² | 103 µs | 84.6 µs | 0.82 |
+| bf16 hd192/hd128 causal（`_ks` S2 + q16 combine） | B1 H8 4096² | 89.1 µs | 84.4 µs | 0.95 |
 | bf16 反向 | B4 H16 2048² | 670 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.74 |
 | bf16 反向 | B1 H16 4096² | 637 µs | 465 µs | 0.73 |
 | bf16 反向 GQA4 | B4 H16 HK4 2048² | 671 µs | 490 µs | 0.73 |
@@ -987,7 +993,10 @@
 - decode 两族的 host 需要分发计划（`decode16_plan`、`mla_config`），没有放进同次脚本；数字取自上文 2026-11-08/09 的记录。
 - MXFP8 一行是强制 `_vs128` 的单 kernel 比较；出厂分发（短序列 KV-split / `_t128`）的 25 形状矩阵为 0.93–1.06×，见 [`current-status.md`](current-status.md)。
 - 同一脚本里 bf16 反向非 causal 为 0.73–0.74×（交接记录的 0.83× 是不同形状与批次）；causal 4096² 0.86×。
-- 剩余短板：hd192 的小网格（非 causal B1 H8 4096² 0.66，causal 0.77–0.82）、bf16 hd128 causal 小网格（分发目标 `_causal_ks` 待后端 SGPR 修复后重测；表中 0.75 为配对的普通形式）、反向 0.72–0.86。
+- fp8 per-tensor 的行在 authored 之后重测（只记录了比值）；其余 prefill 行为同日的同次运行。
+- 剩余短板：hd192 小网格（非 causal B1 H8 4096² 0.81、causal `_np` 0.77）、bf16 hd128 causal 小网格（分发目标 `_causal_ks` 待后端 SGPR 修复合入后重测；表中 0.75 为配对的普通形式）、反向 0.72–0.86。
+- **key-split 合并 kernel `attn_combine_bf16_hd128_q16`**（取代 `attn_combine_bf16_hd128_q`）：每个 workgroup 16 行、每线程 8 维（每份两次 16 字节读），一遍在线合并；旧版每行一个 workgroup、每线程每份一个 dword、两遍，受延迟限制（hd192 `_ks` B1 H8 4096² S2 的合并约 22 µs）。同次 A/B（µs，旧 / 新）：hd192 B1 H8 2048² S4 54.4 / 41.3，4096² S2 122.5 / 111.8，B4 H16 1024² S2 112 / 86，B1 H16 4096² S2 243 / 224。Python `prefill_bf16` 与 `attn_host` 默认改用它。
+- **hd192 非 causal 小网格**：`hd192_prefill_kernel` 对 U ≤ CU/4 用 `_ks` S4，对 U < CU 且 key tile ≥ 32 用 S2（B1 H8 2048² 66.6 → 41.3 µs，厂商 32.5；4096² 134 → 112，厂商 88）；U = 128、16 个 key tile（B1 H16 2048²）切分不划算，不切。剩余差距是结构性的：我们 256 行 / 8 wave 的 tile 在小网格下每 CU 一个 workgroup，厂商用 128 行 / 4 wave。
 
 **性能待办**：
 - prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
