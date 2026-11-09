@@ -49,6 +49,13 @@ pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_all(name, page, kt, 0, false, true)
 }
 
+/// `_c` (last-arriver combine, any S): the split form, then each CTA releases its partials (per-wave drain + L2 write-back), thread 0 takes a
+/// ticket on counter[b HK + hk] (kernarg 208, u32 [B][HK], zero before the first launch; the last CTA resets it), and the last of the S CTAs
+/// of a (b, hk) acquires and merges the 4 S partials of its G heads into the bf16 output (kernarg 224, [B][H][D]) - no combine launch.
+pub fn pa_decode16_lastc(name: &str, page: i32) -> Function {
+    pa_decode16_gen(name, page, 32, 0, false, false, true)
+}
+
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -67,6 +74,11 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 }
 
 fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
+    pa_decode16_gen(name, page, kt, kvm, mtp, fused, false)
+}
+
+fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool, lastc: bool) -> Function {
+    assert!(!lastc || (kvm == 0 && !mtp && !fused), "decode16 last-arriver combine: bf16, qlen 1, split form");
     assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
@@ -136,7 +148,13 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     } else {
         b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(4 * 4 * D as i64));
     }
-    b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(16));
+    b.arg_tensor("ptr_plse", bb.clone() * hh.clone() * ss.clone() * Ext::c(16));
+    if lastc {
+        b.arg("ptr_counter", DType::Ptr, 208, 8);
+        b.arg("ptr_out", DType::Ptr, 224, 8);
+        b.arg_tensor("ptr_counter", bb.clone() * Ext::ka(128) * Ext::c(4));
+        b.arg_tensor("ptr_out", bb * hh * Ext::c(2 * D as i64));
+    }
 
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 16 * i });
     let ki = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargI32 { offset: 16 * i });
@@ -245,6 +263,8 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     const EPI_L: i32 = 32768;
     assert!(!fused || KT == 32, "decode16 fused: 32-key tiles (8 KB K / V per wave)");
     let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 3 * 8192 + 64) as i64, &[&kreg, &vreg]));
+    // last-arriver: the broadcast ticket (thread 0's old counter value)
+    let tk = lastc.then(|| lds.tile("TK", 16, amdgpu_tile::Layout::Linear));
     lds.commit(&mut b);
     // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
     let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
@@ -720,6 +740,108 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf);
     }
     b.end_if();
+    if let Some(tk) = &tk {
+        // ---- last-arriver combine: release, ticket, the last CTA of the (b, hk) merges ----
+        b.fence_release();
+        b.barrier();
+        let tid = b.let_(Op::WorkitemId);
+        let c0l = b.c_i32(0);
+        let c1l = b.c_i32(1);
+        let is0 = b.cmp_lt_i32(tid, c1l);
+        let one = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(c1l), b: Opnd::Val(c0l) });
+        let p_cnt = b.let_(Op::KernargPtr { offset: 208 });
+        let gofs = b.bind_i32((ev(bat) * ev(hkv_n) + ev(hk)) << 2);
+        let pc = b.ptr_add(p_cnt, gofs);
+        let old = b.atomic_add_u32(pc, 0, Opnd::Val(one));
+        let tkb = tk.base as i32;
+        let slot = amdgpu_tile::SlotIdx::new(0, 0);
+        tk.at(&slot).write(&mut b, |b| {
+            let a = b.bind_i32(ev(tid) * 0 + tkb);
+            let pred_old = old;
+            // (every thread writes; thread 0's value is read back: the others hold the same address only when tid = 0 - use tid 0's slot)
+            let _ = pred_old;
+            b.store_lds_b32(a, old);
+        });
+        b.wait_lds(0);
+        b.barrier();
+        let ticket = tk.at(&slot).read(&mut b, |b| { let a = b.c_i32(tkb); b.load_lds_b32(a) });
+        let sm1 = b.bind_i32(ev(s_n) - 1);
+        let is_last = b.let_(Op::CmpGeI32(Opnd::Val(ticket), Opnd::Val(sm1)));
+        let any = b.any_lane(is_last);
+        b.begin_if(Opnd::Val(any));
+        {
+            b.fence_acquire();
+            let zf = b.c_f32(0.0);
+            let c0 = b.c_i32(0);
+            let col = b.bind_i32(ev(tid).lshr(4));
+            let d0 = b.bind_i32((ev(tid) & 15) << 3);
+            let ohead = b.bind_i32(ev(hk) * ev(gsz) + ev(col).min(ev(gsz) - 1));
+            let prow = b.bind_i32((ev(bat) * ev(hq) + ev(ohead)) * ev(nsplit));
+            let r_po = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+            let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+            let ninf = b.c_f32(f32::NEG_INFINITY);
+            let mut st: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(ninf)), (DType::F32, Opnd::Val(zf))];
+            st.extend((0..8).map(|_| (DType::F32, Opnd::Val(zf))));
+            let v = b.begin_loop(&st);
+            let si = amdgpu_dsl::varx(v[0]);
+            let row = b.bind_i32(ev(prow) + si.clone());
+            let lo = b.bind_i32(ev(row) << 2);
+            let x = b.buffer_load_f32(r_l, lo, c0, 0);
+            let oo = b.bind_i32(ev(row) * (4 * D) + (ev(d0) << 2));
+            let o0 = b.buffer_load_b128(r_po, oo, c0, 0);
+            let o1 = b.buffer_load_b128(r_po, oo, c0, 16);
+            // online merge in natural-log units: m' = max(m, x), scale = e^(m - m'), w = e^(x - m')
+            let mn = b.max_f32(Opnd::Var(v[1]), x);
+            let mbits = b.bitcast_i32(mn);
+            let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
+            let mref = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(fin), a: Opnd::Val(mn), b: Opnd::Val(zf) });
+            let l2e = b.c_f32(std::f32::consts::LOG2_E);
+            let d1 = b.sub_f32(Opnd::Var(v[1]), mref);
+            let t1 = b.mul_f32(d1, l2e);
+            let sc = b.exp2_f32(t1);
+            let d2 = b.sub_f32(x, mref);
+            let t2 = b.mul_f32(d2, l2e);
+            let w = b.exp2_f32(t2);
+            let l1 = b.mul_f32(Opnd::Var(v[2]), sc);
+            let l2 = b.add_f32(l1, w);
+            for k in 0..8u8 {
+                let f = if k < 4 { o0 } else { o1 };
+                let ox = b.frag4_lane(f, k % 4);
+                let ox = b.bitcast_f32(ox);
+                let a1 = b.mul_f32(Opnd::Var(v[3 + k as usize]), sc);
+                let a2 = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(ox), Opnd::Val(a1)));
+                b.set_var(v[3 + k as usize], a2);
+            }
+            b.set_var(v[1], mn);
+            b.set_var(v[2], l2);
+            let n1 = b.bind_i32(si + 1);
+            b.set_var(v[0], n1);
+            let dn = b.bind_cond(ev(n1).ge(ev(nsplit)));
+            b.break_if(dn);
+            b.end_loop();
+            let tiny = b.c_f32(1e-30);
+            let den = b.max_f32(Opnd::Var(v[2]), tiny);
+            let rinv = b.rcp_f32(den);
+            let outv: Vec<ValueId> = (0..8usize).map(|k| b.mul_f32(Opnd::Var(v[3 + k]), rinv)).collect();
+            let w4: Vec<ValueId> = (0..4).map(|i| b.cvt_pk_bf16_f32(outv[2 * i], outv[2 * i + 1])).collect();
+            let f4 = b.pack4(w4[0], w4[1], w4[2], w4[3]);
+            let live = b.bind_cond(ev(col).lt(ev(gsz)));
+            let o_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(ohead)) * D + ev(d0)) << 1);
+            let bigo = b.c_i32(0x7fff_fff0);
+            let o_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(o_vo_r), b: Opnd::Val(bigo) });
+            let p_out = b.let_(Op::KernargPtr { offset: 224 });
+            let r_o = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * (2 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+            b.buffer_store_b128(r_o, o_vo, c0, 0, f4);
+            // the counter back to 0 for the next launch (thread 0)
+            let zc = b.c_i32(0);
+            let cvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(zc), b: Opnd::Val(bigo) });
+            let r_c = { let n = b.bind_i32((ev(bat) + 1) * ev(hkv_n) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_cnt, n) };
+            let cso = { let v = b.bind_i32(ev(gofs)); b.read_first_lane(v) };
+            let zcf = b.bitcast_f32(zc);
+            b.buffer_store_f32(r_c, cvo, cso, 0, zcf);
+        }
+        b.end_if();
+    }
     if let Some(e) = &epi {
         // ---- fused combine: thread t = (column t / 16, 8 d at 8 (t % 16)) merges the 4 wave partials, bf16 out ----
         b.wait_lds(0);
