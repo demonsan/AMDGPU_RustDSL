@@ -1,88 +1,88 @@
 # label<TAB>GB/s (median of the run that wrote it; regenerate with: bash tools/membound_perf.sh update)
-silu_mul d4096 corr+perf	6565.8
-silu_mul d1024	6734.5
-silu_mul d14336	6526.7
-silu_mul d24 corr	24.9
-gelu_tanh d4096	6396.4
-silu_mul_limit d4096 (limit 7)	6570.2
-swiglu_oai_mul d4096	6555.8
-silu (unary)	6119.5
-gelu_tanh (unary)	5649.7
-relu2 (unary)	6428.0
-sigmoid (unary)	6422.3
-add_bf16	6541.9
-cvt_f32_bf16	6623.5
-cvt_bf16_f32	6331.5
-quant_static	6121.4
-rmsnorm n4096	6124.3
-rmsnorm n1000	5722.3
-rmsnorm n200	5158.8
-add_rmsnorm n4096	5702.6
-layernorm n4096	5505.9
-layernorm n776	4494.8
-softmax n4096	5982.3
-softmax n1000	5548.1
-softmax n8192	5498.1
-quant_token n4096	6360.5
-quant_token n1000	5902.3
-quant_group128 n4096	6428.4
+silu_mul d4096 corr+perf	6574.3
+silu_mul d1024	6721.6
+silu_mul d14336	6530.2
+silu_mul d24 corr	24.7
+gelu_tanh d4096	6475.3
+silu_mul_limit d4096 (limit 7)	6570.5
+swiglu_oai_mul d4096	6509.9
+silu (unary)	6146.5
+gelu_tanh (unary)	5554.3
+relu2 (unary)	6505.4
+sigmoid (unary)	6340.1
+add_bf16	6467.4
+cvt_f32_bf16	6602.3
+cvt_bf16_f32	6322.7
+quant_static	6128.6
+rmsnorm n4096	6158.2
+rmsnorm n1000	5708.9
+rmsnorm n200	5306.9
+add_rmsnorm n4096	5758.4
+layernorm n4096	5539.2
+layernorm n776	4493.7
+softmax n4096	5983.3
+softmax n1000	5562.0
+softmax n8192	5517.8
+quant_token n4096	6386.8
+quant_token n1000	5906.9
+quant_group128 n4096	6456.0
 quant_group128 n640 corr	12.7
-quant_token_int8 n4096	6202.1
-quant_token_int8 n1000	5291.5
-dequant static	6389.3
-dequant token n4096	6007.3
-dequant group128 n4096	5952.1
-dequant token n1000 (odd tail)	5309.2
-silu_mul_quant d4096	5883.5
-silu_mul_quant d1000	5806.8
-rope_neox h32 d128	6426.0
-rope_gptj h32 d128	6324.5
-rope_neox h8 d128	6779.5
-rope_neox h40 d64 corr	61.2
-cache h8 d128	5046.6
-cache h5 d64 corr	62.1
-cache_blocked h8 d128 b16 random slots	867.8
-cache_blocked h8 d128 b16 contiguous slots	1419.5
-cache_blocked h8 d64 b64 corr	106.6
-argmax v32000 B=16384	3848.5
-argmax v128256 B=4096	4367.4
-sample v32000 B=16384	1251.0
-sample v128256 B=4096	722.2
+quant_token_int8 n4096	6216.0
+quant_token_int8 n1000	5275.3
+dequant static	6397.3
+dequant token n4096	6005.5
+dequant group128 n4096	5973.8
+dequant token n1000 (odd tail)	5275.6
+silu_mul_quant d4096	6005.3
+silu_mul_quant d1000	5861.4
+rope_neox h32 d128	6412.7
+rope_gptj h32 d128	6351.7
+rope_neox h8 d128	6798.2
+rope_neox h40 d64 corr	60.7
+cache h8 d128	5010.3
+cache h5 d64 corr	61.6
+cache_blocked h8 d128 b16 random slots	867.3
+cache_blocked h8 d128 b16 contiguous slots	1416.2
+cache_blocked h8 d64 b64 corr	105.2
+argmax v32000 B=16384	3830.7
+argmax v128256 B=4096	4390.6
+sample v32000 B=16384	1250.7
+sample v128256 B=4096	721.4
 sample v1000 corr	5.8
-moe_reduce k8 d7168 T=16384	6028.5
-moe_reduce k8 d4096 T=32768	5899.5
-moe_combine k8 d4096 T=32768	5962.8
-moe_reduce k6 d2048 corr	1587.5
-gated_rmsnorm bf16 n128 (heads)	6143.4
-gated_rmsnorm fp8 n128 (heads)	5626.6
-gated_rmsnorm bf16 n4096	5872.9
-gated_rmsnorm fp8 n4096	5219.3
-cache_fp8 h8 d128	5963.3
-add_rmsnorm_fp8 n4096	4265.5
-add_rmsnorm_fp8 n1000	3854.0
-qknorm_rope neox h40 d128	4229.8
-conv1d_update w4 s3 idx silu	3067.5
-moe_fused_gate e256 g8 tg4 k8 M=131072	638.2
+moe_reduce k8 d7168 T=16384	5966.6
+moe_reduce k8 d4096 T=32768	5903.7
+moe_combine k8 d4096 T=32768	5907.9
+moe_reduce k6 d2048 corr	1591.7
+gated_rmsnorm bf16 n128 (heads)	6177.8
+gated_rmsnorm fp8 n128 (heads)	5617.7
+gated_rmsnorm bf16 n4096	6024.3
+gated_rmsnorm fp8 n4096	5292.9
+cache_fp8 h8 d128	5968.8
+add_rmsnorm_fp8 n4096	4241.0
+add_rmsnorm_fp8 n1000	3854.5
+qknorm_rope neox h40 d128	4238.0
+conv1d_update w4 s3 idx silu	3129.1
+moe_fused_gate e256 g8 tg4 k8 M=131072	638.4
 moe_fused_gate e256 g8 tg4 k8 M=1001 (odd)	58.0
-topk_per_row decode k2048 B=256 L<=64K	323.7
-topk_per_row decode k2048 odd (ragged, ties)	33.1
-topk_per_row prefill k128 (ties)	25.0
-conv1d_fwd w4 silu B=128 L=512 uniform	2787.1
-conv1d_fwd split w4 silu B=128 L=512 uniform	2615.4
-conv1d_fwd w4 silu ragged B=256 (grid)	996.0
-conv1d_fwd w4 silu ragged B=256 (_sched)	2657.2
-conv1d_fwd split w4 silu ragged + states	398.2
-cache_blocked fp8 per-token h8 d128 b16 (i64 slots)	919.5
-qknorm_rope_kvcache neox bf16 h8 d128	5830.0
-qknorm_rope_kvcache neox fp8 h8 d128 (i64)	4726.7
-rmsnorm_quant_mxfp4 k4096 M=32768	2791.3
-mla cache flat bf16 r512 p64	4271.2
-mla cache seg fp8 r512 p64 b64 (i64)	3057.7
-silu_mul_bias d4096 E=64	9315.3
-gelu_mul_bias d2048 E=64	5107.0
-gelu (erf) unary	3058.4
-gelu_mul (erf) d4096	4118.1
-mxfp6 e2m3 k4096 M=32768	2920.6
-mxfp6 e3m2 k4096 M=32768	2915.7
-topk e128 k8 T=65536	1176.4
-topk renorm e256 k8 T=65536	1002.3
+topk_per_row decode k2048 B=256 L<=64K	324.3
+topk_per_row decode k2048 odd (ragged, ties)	33.2
+topk_per_row prefill k128 (ties)	24.9
+conv1d_fwd w4 silu B=128 L=512 uniform	2797.8
+conv1d_fwd split w4 silu B=128 L=512 uniform	2594.4
+conv1d_fwd w4 silu ragged B=256 (grid)	997.0
+conv1d_fwd w4 silu ragged B=256 (_sched)	2662.7
+conv1d_fwd split w4 silu ragged + states	399.2
+cache_blocked fp8 per-token h8 d128 b16 (i64 slots)	929.7
+qknorm_rope_kvcache neox bf16 h8 d128	5875.2
+qknorm_rope_kvcache neox fp8 h8 d128 (i64)	4766.8
+rmsnorm_quant_mxfp4 k4096 M=32768	2796.9
+mla cache flat bf16 r512 p64	4293.2
+mla cache seg fp8 r512 p64 b64 (i64)	3045.7
+silu_mul_bias d4096 E=64	9119.6
+gelu_mul_bias d2048 E=64	5090.2
+gelu (erf) unary	3055.5
+gelu_mul (erf) d4096	4112.8
+mxfp6 e2m3 k4096 M=32768	2904.9
+mxfp6 e3m2 k4096 M=32768	2904.6
+topk e128 k8 T=65536	1176.3
+topk renorm e256 k8 T=65536	1004.5

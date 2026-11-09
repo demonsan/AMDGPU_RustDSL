@@ -3,6 +3,7 @@
 //!
 //! * `quant_token_bf16_fp8_n<N>`   per-token dynamic: `scale[m] = max|x[m]| / 448`, `q = fp8(x / scale)`.    ABI x @0, q @8, scale @16 (f32 [M]), M @24 (i32)
 //! * `quant_group128_bf16_fp8_n<N>` per-group (128 elements = 16 lanes) dynamic: `scale[m][g]` f32 [M][N / 128] (N a multiple of 128).  same ABI, scale [M][N/128]
+//! * `situv2_mul_quant_fp8_d<D>`    aiter `situv2_and_mul_quant` (group_size == D): `y = beta tanh(g / beta) sigmoid(g) * linear_beta tanh(u / linear_beta)` with g = x[m][:D], u = x[m][D:], then per-token fp8. ABI + beta @28, linear_beta @32 (f32).
 //! * `silu_mul_quant_fp8_d<D>`     `y = silu(x[m][:D]) * x[m][D:]` (bf16 `[M][2D]`) then per-token dynamic fp8 of y.        same ABI, q [M][D], scale [M]
 //!
 //! N (D) a multiple of 8, 8..=8192; chunks past the row end are masked in the statistics and their stores dropped by the buffer descriptor.
@@ -16,6 +17,8 @@ pub enum QuantKind {
     Token,
     Group128,
     SiluMulToken,
+    /// SiTUv2 gate * up (aiter `situv2_and_mul_quant`), then per-token fp8; beta / linear_beta kernargs
+    SituMulToken,
     /// per-token int8: `scale = max|x| / 127`, `q = clamp(rne(x / scale), -127, 127)`
     TokenInt8,
 }
@@ -27,6 +30,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         (r, QuantKind::Group128, 128)
     } else if let Some(r) = name.strip_prefix("quant_token_bf16_fp8_n") {
         (r, QuantKind::Token, 8)
+    } else if let Some(r) = name.strip_prefix("situv2_mul_quant_fp8_d") {
+        (r, QuantKind::SituMulToken, 8)
     } else if let Some(r) = name.strip_prefix("silu_mul_quant_fp8_d") {
         (r, QuantKind::SiluMulToken, 8)
     } else {
@@ -101,11 +106,16 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
     b.arg("q", DType::Ptr, 8, 8);
     b.arg("scale", DType::Ptr, 16, 8);
     b.arg("m", DType::I32, 24, 4);
+    if kind == QuantKind::SituMulToken {
+        b.arg("beta", DType::F32, 28, 4);
+        b.arg("linear_beta", DType::F32, 32, 4);
+    }
     let mt = Ext::sym("MT");
     b.sym_range("MT", 1, 1 << 20);
     b.ka_is(24, mt.clone() * Ext::c(4));
     b.grid_is(0, mt.clone());
-    let in_row = if kind == QuantKind::SiluMulToken { 4 * n } else { 2 * n };
+    let two_in = matches!(kind, QuantKind::SiluMulToken | QuantKind::SituMulToken);
+    let in_row = if two_in { 4 * n } else { 2 * n };
     let n_scales = if kind == QuantKind::Group128 { n / 128 } else { 1 };
     b.arg_tensor("x", mt.clone() * Ext::c(4 * in_row));
     b.arg_tensor("q", mt.clone() * Ext::c(4 * n));
@@ -128,7 +138,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
     let vx = b.bind_i32(ev(row) * in_row as i32 + (lane.lane() << 4));
     let gx: Vec<ValueId> = (0..ngrp).map(|g| if g == 0 { vx } else { b.bind_i32(ev(vx) + 4096 * g as i32) }).collect();
     let xs: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(gx[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect();
-    let x2s: Option<Vec<ValueId>> = (kind == QuantKind::SiluMulToken).then(|| {
+    let x2s: Option<Vec<ValueId>> = two_in.then(|| {
         let v2 = b.bind_i32(ev(vx) + (2 * n) as i32);
         let g2: Vec<ValueId> = (0..ngrp).map(|g| if g == 0 { v2 } else { b.bind_i32(ev(v2) + 4096 * g as i32) }).collect();
         (0..nld).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(g2[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect()
@@ -145,6 +155,14 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
         })
         .collect();
     let zero = b.c_f32(0.0);
+    // SiTUv2 constants: tanh(x / beta) = 2 / (1 + 2^(-2 log2e x / beta)) - 1
+    let situ = (kind == QuantKind::SituMulToken).then(|| {
+        let (beta, lbeta) = (b.let_(Op::KernargF32 { offset: 28 }), b.let_(Op::KernargF32 { offset: 32 }));
+        let (rb, rl) = (b.rcp_f32(beta), b.rcp_f32(lbeta));
+        let c = b.c_f32(-2.0 * std::f32::consts::LOG2_E);
+        let (gm, um) = (b.mul_f32(c, rb), b.mul_f32(c, rl));
+        (beta, lbeta, gm, um)
+    });
     // the values to quantize (f32), 8 per chunk; the tail lanes of a partial chunk are zeroed (they must not enter any maximum)
     let mut ys: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
     for i in 0..nld {
@@ -153,8 +171,25 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
         if let Some(x2) = &x2s {
             let g = bf16x8_to_f32(b, x2[i]);
             for k in 0..8 {
-                let s = act(b, a[k], Act::Silu);
-                y[k] = b.mul_f32(s, g[k]);
+                if let Some((beta, lbeta, gm, um)) = situ {
+                    let one = b.c_f32(1.0);
+                    let two = b.c_f32(2.0);
+                    let nl = b.c_f32(-std::f32::consts::LOG2_E);
+                    let (eg, ig, iu) = (b.mul_f32(a[k], gm), b.mul_f32(a[k], nl), b.mul_f32(g[k], um));
+                    let (xg, xs, xu) = (b.exp2_f32(eg), b.exp2_f32(ig), b.exp2_f32(iu));
+                    let (dg, ds, du) = (b.add_f32(one, xg), b.add_f32(one, xs), b.add_f32(one, xu));
+                    let (rg, rs, ru) = (b.rcp_f32(dg), b.rcp_f32(ds), b.rcp_f32(du));
+                    // tanh = 2 r - 1; value = beta tanh_g sigmoid_g * linear_beta tanh_u
+                    let tg = b.let_(Op::FmaF32(Opnd::Val(two), Opnd::Val(rg), Opnd::F32(-1.0)));
+                    let tu = b.let_(Op::FmaF32(Opnd::Val(two), Opnd::Val(ru), Opnd::F32(-1.0)));
+                    let l = b.mul_f32(beta, tg);
+                    let l = b.mul_f32(l, rs);
+                    let r = b.mul_f32(lbeta, tu);
+                    y[k] = b.mul_f32(l, r);
+                } else {
+                    let s = act(b, a[k], Act::Silu);
+                    y[k] = b.mul_f32(s, g[k]);
+                }
             }
         }
         if let Some(c) = valid[i] {
@@ -176,7 +211,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
         b.buffer_store_c(r_q, Some(Opnd::Val(voff)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
     };
     match kind {
-        QuantKind::Token | QuantKind::SiluMulToken | QuantKind::TokenInt8 => {
+        QuantKind::Token | QuantKind::SiluMulToken | QuantKind::SituMulToken | QuantKind::TokenInt8 => {
             let mut part: Option<ValueId> = None;
             for i in 0..nld {
                 let a = abs8(b, &ys[i]);

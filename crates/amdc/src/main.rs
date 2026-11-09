@@ -631,6 +631,22 @@ fn main() -> ExitCode {
             let json = args.iter().any(|a| a == "--json");
             match amdgpu_compiler::compile_mir_alloc(&f) {
                 Ok((m, a)) if json => {
+                    // virtual register -> the IR value whose lowering defined it -> the builder call (diagnostics origin)
+                    let mut origin: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+                    for blk in &m.blocks {
+                        for i in &blk.insts {
+                            if let (Some(d), true) = (i.dst, i.origin != u32::MAX) {
+                                origin.entry(m.canon(d)).or_insert(i.origin);
+                            }
+                        }
+                    }
+                    let src_of = |s: &str| -> String {
+                        let r: Option<u32> = s.strip_prefix('r').and_then(|x| x.split(|c: char| !c.is_ascii_digit()).next()).and_then(|x| x.parse().ok());
+                        match r.and_then(|r| origin.get(&r).copied()) {
+                            Some(v) => format!("v{v}@{}", f.value_loc(v).unwrap_or_default()),
+                            None => String::new(),
+                        }
+                    };
                     let regs: Vec<String> = amdgpu_compiler::regplan::region_report(&m, &a)
                         .iter()
                         .map(|p| {
@@ -643,7 +659,7 @@ fn main() -> ExitCode {
                                 p.agpr_footprint_peak,
                                 p.at.0,
                                 p.at.1,
-                                p.live_at_peak.iter().take(32).map(|s| format!("\"{}\"", s.replace('"', "'"))).collect::<Vec<_>>().join(",")
+                                p.live_at_peak.iter().take(64).map(|s| format!("\"{} {}\"", s.replace('"', "'"), src_of(s))).collect::<Vec<_>>().join(",")
                             )
                         })
                         .collect();

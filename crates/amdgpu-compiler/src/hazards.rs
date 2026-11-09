@@ -812,7 +812,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                     }
                 }
             }
-            if emit && std::env::var("AMDC_WAW_DEBUG").is_ok() && (need_vm.is_some() || need_lg.is_some()) {
+            if emit && std::env::var("AMDC_WAW_DEBUG").map_or(false, |v| !v.is_empty()) && (need_vm.is_some() || need_lg.is_some()) {
                 eprintln!("inflight-waw:   wait vm {need_vm:?} lg {need_lg:?} before {:?} writes {writes:?}", inst.op);
             }
             if let Some(k) = need_vm {
@@ -871,7 +871,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
         }
     }
     let mut total = 0;
-    let dbg = std::env::var("AMDC_WAW_DEBUG").is_ok();
+    let dbg = std::env::var("AMDC_WAW_DEBUG").map_or(false, |v| !v.is_empty());
     for bi in 0..n {
         if dbg {
             eprintln!("inflight-waw: block {bi} ({}) enters with {} in-flight loads: {:?}", m.blocks[bi].label, entry[bi].len(), entry[bi].iter().map(|f| (f.vm, f.after, f.regs)).collect::<Vec<_>>());

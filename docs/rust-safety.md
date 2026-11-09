@@ -71,6 +71,8 @@ get_unchecked  unreachable_unchecked  asm!(  global_asm!(  std::ptr  core::ptr
 
 - 编译器是**单线程、纯函数式流水线**：`Function → MIR → 物理分配 → asm`，没有共享可变状态、没有线程、没有锁。
 - 唯一的外部输入是 `std::env` 的编译器开关（`AMDC_*`），在启动时读取，不参与跨调用状态。
+- 诊断用的线程局部状态只有两处，都是 safe 的 `thread_local!` + `RefCell`：lowering 的选项覆盖（测试用）与最近一次 lowering 的“虚拟寄存器 → IR 值”映射（`lower::last_vreg_origins`，只被 `diag` 读取，不影响代码生成）。
+- 源码位置用 `#[track_caller]` + `std::panic::Location` 记录（标准库 safe API），存在 `Function` 的旁表里，不进入 IR、编码与相等比较。
 - 输出只有 `std::fs::write` 的文本文件与 `std::process::Command` 调用外部 `llc`/`clang`（错误一律 `Result` 上抛）。
 - 因此 Rust 侧的 "数据竞争" 在结构上不存在（没有 `Sync` 共享可变对象）；GPU 侧的并发（wave/barrier）不是 Rust 数据竞争。
 
@@ -158,7 +160,9 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 | MIR verifier | `crates/amdgpu-compiler/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
 | `asm_check::check_lite_contract` | compiler | last-arriver 的 lite 契约（全部访问 sc1、ticket sc0、barrier 前排空） | `Err` |
 | `pin_check` | compiler | pinned 段的显式 padding 弱于编译器规则 → 拒绝 | `Err` |
-| hazard/wait pass | compiler | 值级 hazard、物理 WAR/WAW、宽存储数据 WAR、vmcnt/lgkmcnt | 插入等待或报错 |
+| hazard/wait pass | compiler | 值级 hazard、物理 WAR/WAW、宽存储数据 WAR、vmcnt/lgkmcnt、在途 load 的物理 WAW、转换目的选择等待态 | 插入等待或报错 |
+| `gpu_verify` / 协议引擎 | compiler | 越界（含 64 位移动描述符、屏蔽哨兵回绕 GV-BUF-WRAP）、wave 一致分支、LDS tile 生命周期与存储复用（GV-TILE-ALIAS-RACE）、启动寄存器预算 | `Err`（严格模式）+ 证书计数 |
+| 结构化诊断 | `crates/amdgpu-compiler/src/diag.rs` | 把上面所有失败转成 JSON（code、语句、区域、Rust 源码位置、值、修复建议）；手写 JSON，零依赖 | 只读 |
 
 **所有验证失败都是 `Result::Err`，不会 UB、不会生成"看起来对"的汇编。**
 

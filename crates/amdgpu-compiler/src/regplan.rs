@@ -107,9 +107,9 @@ pub fn region_report(m: &MFunction, a: &Alloc) -> Vec<RegionPeak> {
             by_name.push(RegionPeak { name: n.clone(), ..Default::default() });
         }
     }
-    if regions.is_empty() {
-        return by_name;
-    }
+    // the whole kernel as the last entry (`(kernel)`, every instruction; AGPRs listed too): the allocator's true peak
+    let root = by_name.len();
+    by_name.push(RegionPeak { name: "(kernel)".to_string(), ..Default::default() });
     let lout = live_out(m);
     for (bi, b) in m.blocks.iter().enumerate() {
         let mut live: HashSet<VReg> = lout[bi].clone();
@@ -123,7 +123,7 @@ pub fn region_report(m: &MFunction, a: &Alloc) -> Vec<RegionPeak> {
             for r in inst.uses() {
                 occ.push(m.canon(r));
             }
-            if inst.region != 0 {
+            {
                 occ.sort_unstable();
                 occ.dedup();
                 let (mut vfoot, mut vlive, mut afoot) = (0u32, 0u32, 0u32);
@@ -141,8 +141,9 @@ pub fn region_report(m: &MFunction, a: &Alloc) -> Vec<RegionPeak> {
                         }
                     }
                 }
-                for id in chain(m, inst.region) {
-                    let k = idx_of[&regions[id as usize - 1].0];
+                let mut targets: Vec<usize> = chain(m, inst.region).into_iter().map(|id| idx_of[&regions[id as usize - 1].0]).collect();
+                targets.push(root);
+                for k in targets {
                     let rp = &mut by_name[k];
                     rp.insts += 1;
                     rp.vgpr_live_peak = rp.vgpr_live_peak.max(vlive);
@@ -152,7 +153,7 @@ pub fn region_report(m: &MFunction, a: &Alloc) -> Vec<RegionPeak> {
                         rp.at = (bi, ii);
                         let mut l: Vec<(u32, String)> = occ
                             .iter()
-                            .filter_map(|&r| place(m, a, r).filter(|x| !x.0).map(|(_, p, w)| (p, format!("{}@v{}{}", m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}")), p, if w > 1 { format!("..v{}", p + w - 1) } else { String::new() }))))
+                            .filter_map(|&r| place(m, a, r).filter(|x| !x.0 || k == root).map(|(ag, p, w)| (p + if ag { 1000 } else { 0 }, format!("{}@{}{}{}", m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}")), if ag { "a" } else { "v" }, p, if w > 1 { format!("..{}{}", if ag { "a" } else { "v" }, p + w - 1) } else { String::new() }))))
                             .collect();
                         l.sort_by(|x, y| y.0.cmp(&x.0));
                         l.dedup();

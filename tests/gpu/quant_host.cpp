@@ -1,5 +1,5 @@
 // Quantization kernels (batch 2, docs/op-coverage-membound.md): per-token / per-group(128) dynamic fp8 and silu_mul + per-token fp8: correctness against a CPU reference and bandwidth.
-// usage: quant_host <co> <kernel> <mode: token|group128|silu_token> <M> <N> [iters]     (silu_token: N = D, input [M][2D])
+// usage: quant_host <co> <kernel> <mode: token|group128|silu_token|situ_token> <M> <N> [iters]     (silu_token: N = D, input [M][2D])
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -19,7 +19,8 @@ int main(int argc, char** argv) {
     if (argc < 6) { std::fprintf(stderr, "usage: %s <co> <kernel> <token|group128|silu_token> <M> <N> [iters]\n", argv[0]); return 2; }
     const char* co = argv[1]; const char* kn = argv[2]; std::string mode = argv[3];
     long M = std::atol(argv[4]); long N = std::atol(argv[5]); int iters = argc > 6 ? std::atoi(argv[6]) : 50;
-    const bool silu = mode == "silu_token", grp = mode == "group128", i8 = mode == "token_int8";
+    const bool situ = mode == "situ_token"; const float beta = argc > 7 ? (float)std::atof(argv[7]) : 4.0f, lbeta = argc > 8 ? (float)std::atof(argv[8]) : 25.0f;   // situ_token: SiTUv2 gate * up (situv2_mul_quant_fp8_d<D>), optional beta linear_beta
+const bool silu = mode == "silu_token" || situ, grp = mode == "group128", i8 = mode == "token_int8";
     const long in_cols = silu ? 2 * N : N, ns = grp ? N / 128 : 1;
     std::mt19937 rng(99); std::normal_distribution<float> nd(0.f, 2.f);
     std::vector<uint16_t> hx((size_t)M * in_cols);
@@ -29,7 +30,7 @@ int main(int argc, char** argv) {
     CK(hipMalloc(&dx, hx.size() * 2)); CK(hipMalloc(&dq, (size_t)M * N + 64)); CK(hipMalloc(&ds, (size_t)M * ns * 4 + 64));
     CK(hipMemcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice)); CK(hipMemset(dq, 0x55, (size_t)M * N + 64)); CK(hipMemset(ds, 0x77, (size_t)M * ns * 4 + 64));
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
-    struct __attribute__((packed)) { void* x; void* q; void* s; int32_t m; } args{dx, dq, ds, (int32_t)M};
+    struct __attribute__((packed)) { void* x; void* q; void* s; int32_t m; float beta, lbeta; } args{dx, dq, ds, (int32_t)M, beta, lbeta};
     size_t sz = sizeof(args);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     int grid = (int)((M + 3) / 4);
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
     for (long m = 0; m < M; ++m) {
         for (long k = 0; k < N; ++k) {
             double v;
-            if (silu) { double a = bf16_to_f32(hx[(size_t)m * in_cols + k]), g = bf16_to_f32(hx[(size_t)m * in_cols + N + k]); v = a / (1.0 + std::exp(-a)) * g; }
+            if (silu) { double a = bf16_to_f32(hx[(size_t)m * in_cols + k]), g = bf16_to_f32(hx[(size_t)m * in_cols + N + k]); v = situ ? (beta * std::tanh(a / beta) / (1.0 + std::exp(-a))) * (lbeta * std::tanh(g / lbeta)) : a / (1.0 + std::exp(-a)) * g; }
             else v = bf16_to_f32(hx[(size_t)m * in_cols + k]);
             y[k] = (float)v;
         }

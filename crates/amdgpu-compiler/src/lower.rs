@@ -741,7 +741,7 @@ impl Lowerer {
     /// directly - no copy, and no wait at the definition (the use-based wait accounting follows the new register, also across the loop
     /// back-edge). Legal only when nothing reads or writes the variable after the first of those loads.
     fn coalesce_why(&self, v: ValueId, why: &str) {
-        if std::env::var("AMDC_COALESCE_DEBUG").is_ok() {
+        if std::env::var("AMDC_COALESCE_DEBUG").map_or(false, |v| !v.is_empty()) {
             eprintln!("in-place reload of v{v} refused (check {why})");
         }
     }
@@ -1808,7 +1808,7 @@ impl Lowerer {
                             if self.use_counts.get(v).copied() == Some(1) && self.try_coalesce_lds_reload(*v, dst) {
                                 return Ok(());
                             }
-                            if std::env::var("AMDC_COALESCE_DEBUG").is_ok() {
+                            if std::env::var("AMDC_COALESCE_DEBUG").map_or(false, |v| !v.is_empty()) {
                                 eprintln!("set_var(v{v}): not in place (uses {:?}, def {:?})", self.use_counts.get(v), self.defs.get(v).map(|o| format!("{o:?}").chars().take(40).collect::<String>()));
                             }
                         }
