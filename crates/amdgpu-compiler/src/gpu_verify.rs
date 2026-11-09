@@ -226,6 +226,8 @@ struct An<'a> {
     /// caps of the store being linearized: a masked store's live arm runs only when `x < bound` (x linear, bound uniform)
     caps_cur: std::cell::RefCell<Vec<(SLin, Poly, bool)>>,
     gcaps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
+    /// set_vars waiting for the end of their statement list (stmt index, var, value)
+    pending_sets: Vec<(usize, VarId, Opnd)>,
     group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
@@ -1901,6 +1903,7 @@ impl<'a> An<'a> {
         // loop-exit facts: after `break_if(c)` the rest of this body runs only when c is false (a break condition is wave-uniform), so the
         // operand of a `x < k` / `x >= k` condition is refined until the end of the enclosing node list (`AMDC_NO_BREAK_FACTS=1`: off)
         let mut break_facts: Vec<Option<(Opnd, Option<AV>, Option<Itv>)>> = Vec::new();
+        let pend0 = self.pending_sets.len();
         let use_break = std::env::var("AMDC_NO_BREAK_FACTS").map_or(true, |v| v.is_empty());
         for n in nodes {
             match n {
@@ -1962,6 +1965,14 @@ impl<'a> An<'a> {
                     *idx += 1;
                 }
             }
+        }
+        // this list's set_vars, under its loop-exit facts
+        let sets: Vec<(usize, VarId, Opnd)> = self.pending_sets.drain(pend0..).collect();
+        for (i, var, value) in sets {
+            let saved = self.idx;
+            self.idx = i;
+            self.apply_set(i, &var, &value);
+            self.idx = saved;
         }
         for u in break_facts.into_iter().rev() {
             self.undo_fact(u);
@@ -2235,6 +2246,19 @@ impl<'a> An<'a> {
             Stmt::StoreLds2 { addr, off0, off1, b64, st64, .. } => self.check_lds2("ds_write2", addr, *off0, *off1, *b64, *st64),
             Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
             Stmt::SetVar { var, value } => {
+                // applied at the end of the enclosing statement list, so a later `break_if` of the same list refines the value (the back
+                // edge is reached only when the break was not taken)
+                self.pending_sets.push((i, *var, *value));
+            }
+            Stmt::BeginIf { .. } => self.tag = None,
+            Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
+            _ => {}
+        }
+    }
+
+    fn apply_set(&mut self, i: usize, var: &VarId, value: &Opnd) {
+        {
+            {
                 let nv = self.int_of(value);
                 if self.rep.quiet > 0 {
                     let e = match self.acc.get(var) {
@@ -2255,9 +2279,6 @@ impl<'a> An<'a> {
                     }
                 }
             }
-            Stmt::BeginIf { .. } => self.tag = None,
-            Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
-            _ => {}
         }
     }
 }
@@ -2397,7 +2418,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
