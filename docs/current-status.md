@@ -1,7 +1,7 @@
 # 当前状态总览（authoritative snapshot）
 
-本文件是仓库的**唯一权威当前状态快照**（v8.1，Main `f92dd8d9`：2026-11-07 整理之后——stage 库 / weaver / 算子图 / IR 文本往返已合入，实验分支归档为
-`archive/*` tag——再加 FMHA 的 XCD 感知 block 顺序）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
+本文件是仓库的**唯一权威当前状态快照**（v9，Main `ab394cd2`：在 v8.1（stage 库 / weaver / 算子图 / IR 文本往返、XCD 感知 block 顺序）之上，
+完成对照 aiter kernel zoo 的基础算子覆盖、TIRx 式 tile-op 层、64 位寻址与结构化诊断）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
 厂商事实在 [`vendor-spec.md`](vendor-spec.md)，设计规格在 [`design.md`](design.md)；历史逐轮记录与各代设计研究在
 [`archive/`](archive/README.md)（其中的数字、kernel 名与开关只代表当时的状态）。
 
@@ -31,17 +31,24 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   [`fusion-stage-library-design.md`](fusion-stage-library-design.md)）；编织区域带寄存器规划（[`weaver-regs.md`](weaver-regs.md)）与按区域调度策略
   （[`weaver-sched.md`](weaver-sched.md)），出厂 asm 不变。
 - **DSL IR 文本**：`amdc print-ir --stage dsl` 输出完整可解析的 `irv1`，`--from-ir` 编译手改文本；全部 kernel 往返后双后端 asm 与证书逐字节相同（[`ir-text.md`](ir-text.md)）。
-- `cargo test` **104 个测试目标 / 431 项全绿**。
-- 严格 GPU 语义证书：`--shipped` **26 trusted assumes / 100 trusted contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**。
+- **aiter 基础算子覆盖（v9）**：计算密集的 GEMM 族、attention（bf16 prefill / paged decode / MLA）、fused MoE、attention 反向、implicit-GEMM 卷积见
+  [`op-coverage-design.md`](op-coverage-design.md) §7（同进程同数据对照 aiter `.co`）；访存受限的逐元素 / norm / 量化 / RoPE / KV cache / MoE 辅助 / 采样 / top-k 见
+  [`op-coverage-membound.md`](op-coverage-membound.md) 的总表与 aiter 覆盖表（have / missing / why）；汇总见 §4.2。
+- **tile-op 层**（[`op-coverage-tileops.md`](op-coverage-tileops.md) §6.6）：访存宽度族、原子、跨 lane、类型转换（含 fp4 / fp6）、unscaled f8f6f4 / bf16 MFMA、
+  `v_pk_fma_f32`、片段视图与原地拼接、`tileop::ewise / apply2 / allreduce`，每条都过“属性表 → 双后端 → hazard oracle → 硬件探针”闭环。
+- **64 位寻址**：`ptr_mad` 把描述符基址移到 tile / expert / slot（> 4 GiB 张量），验证器证明移动后的描述符仍在 extent 内。
+- **结构化诊断**：`--json`、`amdc summary`、`amdc srcmap`（[`diagnostics.md`](diagnostics.md)）。
+- `cargo test` **116 个测试目标 / 488 项全绿**。
+- 严格 GPU 语义证书：`--shipped` **26 trusted assumes / 100 trusted contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**。
 
 ---
 
 ## 2. 编译器流水线
 
 ```
-DSL(Rust) ──► typed IR（区域树：Loop / If / Region / Stage + 编织区域标记；Op 82 种 / Stmt 48 种；irv1 文本可打印/解析）
+DSL(Rust) ──► typed IR（区域树：Loop / If / Region / Stage + 编织区域标记；Op 109 种 / Stmt 57 种；irv1 文本可打印/解析）
             ──► IR 验证器 + gpu_verify（共享符号算术 amdgpu-sym + 协议）
-            ──► lowering（profile 选项：scalarize / scalarize2 / waveuni / imm / edgepad …；指令按编织区域打标）──► 我们的 MIR（122 个 MOp，属性表 op_attrs）
+            ──► lowering（profile 选项：scalarize / scalarize2 / waveuni / imm / edgepad …；指令按编织区域打标）──► 我们的 MIR（413 个 MOp，属性表 op_attrs）
             ──► 我们的调度（块内 list scheduler、LDS 读提升、slotfill、sched_group 相位；按区域策略 authored / free）
             ──► 我们的线性扫描 RA（两阶段 + LDS spill + S4 描述符类 + AGPR 类 + 寄存器规划：pin / separate / share / ring / 区域上限）
             ──► [opt-in] hzfill：post-RA 用独立指令填 hazard 等待窗口
@@ -69,7 +76,7 @@ DSL(Rust) ──► typed IR（区域树：Loop / If / Region / Stage + 编织�
 `tools/llvm_build_llc.sh` 从同一 commit 链接 `libLLVM.so` 得到；ROCm 7.0.2（`llvm20`）作为备选方言。
 找不到 pin 的工具目录时 **llvm-tail 直接报错**，不静默降级。
 
-**指令覆盖**：122 个 MOp 全部有 own emit；除 12 个 own-only（属性表 `Backend::OwnOnly`）外都在 `llvm20.tbl` **和** `llvm24.tbl` 有行。
+**指令覆盖**：413 个 MOp 全部有 own emit；381 个在 `llvm20.tbl` **和** `llvm24.tbl` 有行，其余 32 个为 own-only（属性表 `Backend::OwnOnly`：LDS-DMA、DPP 等）。
 LDS-DMA、`buffer_load … lds`、DPP、`s_cselect`、`s_load_dwordx4` 等为 own-only（使用它们的 kernel 自动选 own 后端）。
 
 ### 2.1 GPU 语义验证（`gpu_verify`，`AMDC_GPU_VERIFY=off|warn|strict`）
@@ -150,7 +157,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | 中等形状 | `_t128` / split（guard 选择） | B2H8S2048 `_t128` **1067.4（1.05×）** |
 | 单 kernel 每 CU（64 blocks） | `_vs128` | **493.1（0.917×）** |
 
-### 4.2 Kernel 清单（`amdc list` 41 个 + 按名的出厂 kernel）
+### 4.2 Kernel 清单（`amdc list` 63 个 + 按名注册的参数化族）
 
 | Kernel | 状态 |
 |---|---|
@@ -159,7 +166,10 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | `mlp_fp8_ws_{fused,g1,g2}` | 融合 MLP 与两段对照（`crates/amdgpu-kernels/src/mlp/`；stage 实例 `gemm1_act` / `gemm2`） |
 | `mlp_fp8_ws_g1q_{relu,silu}` | GEMM + 通用 epilogue 链（alpha、bias、激活、行 amax、逐行 fp8 + scale）；见 §4.8 |
 | `rmsnorm_quant_fp8_n<N>`（N = 512…8192） | RMSNorm + 逐 token fp8 量化，4 个 stage（load → rms → quant → store）；见 §4.8 |
-| `probe_*` | 硬件/ISA 探针（`crates/amdgpu-kernels/src/probes/`），各自配 `tools/*_probe.sh` |
+| GEMM 族、MoE、卷积（`gemm/`） | `gemm_a8w8_rowcol_fp8*`、`gemm_a16w16_bf16*`、`gemm_a8w8_blockscale*`、split-K + `gemm_splitk_reduce_s<S>`、`gemm_a4w4_mxfp4*`、`gemm_a16w4_mxfp4`；`gemm_moe{1,2}_*`（bf16 / fp8 / fp8bs / fp4 / bf16w4、`_oss`）+ `moe_sum`；`conv{2,3}d_bf16_*`。数字见 [`op-coverage-design.md`](op-coverage-design.md) §7.4 / §7.6 / §7.8 |
+| attention（`fmha/`） | `fmha_fwd_hd<64/128/256>_bf16*` 与 `_v3[_causal][_ks]`、`pa_decode_bf16_*`、`pa_decode16_bf16_hd128_p<P>[_k64][_mtp][_f]`、`mla_decode_bf16_[hp_]p<P>`、`attn_combine_*`、`fmha_bwd_*`。§7.5 / §7.7 |
+| 访存受限（`eltwise/ rows/ norm/ dequant/ rope/ cache/ moe/ topk/ sampling/`） | 逐元素与激活、rmsnorm / layernorm / softmax 及融合量化、per-token / group / mx 量化与反量化、RoPE（含 qk-norm 融合）、KV cache 写（flash / 分块 / fp8 / MLA）、moe_sorting / reduce / combine / fused_gate、top-k、采样、causal conv1d。[`op-coverage-membound.md`](op-coverage-membound.md) |
+| `probe_*` | 硬件/ISA 探针（`crates/amdgpu-kernels/src/probes/`），各自配 `tools/*_probe.sh` / `tools/tileop_probe.sh` |
 | `gv_attack_*`、`gv_audit_*`、`probe_lds_oob` | 验证器必须拒绝 / 必须列入信任清单的用例（`crates/amdgpu-kernels/src/verifier_cases/`） |
 
 旧手写集、上一版 tile 库集（`dsl_*`）、`v3x`/`v3s` 实验变体、GEMM v3 与旧 MLP 变体已在 2026-11 整理中删除（结论保留在 [`archive/`](archive/README.md)）。
@@ -241,11 +251,27 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 | VMEM 宽存储数据 WAR | `global_store_dwordx4` 后数据寄存器被过早覆盖 → split 路径偶发损坏 | `pad_physical_war` 记录宽存储数据区间；STRESS 段回归 |
 | LDS-DMA 操作数等待放置（AGPR 工作中发现） | 静默误编译 | 见 [`agpr.md`](agpr.md) "Wait placement" 一节 |
 
+### 6.1 v9 新增的编译器正确性守卫（每条都有回归测试 / 探针）
+
+| 守卫 | 防住的错误 | 位置 |
+|---|---|---|
+| 在途读的物理 WAW（`pad_inflight_waw`） | 一条路径上结果已死的 load 仍在途时，RA 把它的寄存器交给别的值，晚到的 load 覆盖之（MLA decode 的 if / else、Vs128 的 `_ks`、死 load） | post-RA，`crates/amdgpu-compiler/tests/inflight_waw.rs` |
+| `ds_bpermute` / `ds_permute` / `ds_swizzle` 的 lgkm 等待 | 调度后的等待重算看不到这三类 LDS 返回值，结果未等就被读 | `op_attrs`（按 LDS 读计入 lgkmcnt），`probe_lane_p1` |
+| `any_lane` 极性 | 对逐 lane 条件取反再折叠进分支极性，"没有 lane 为真"被当成"有 lane 为假" | `lower_condition`，`probe_anylane`（9 种极性） |
+| 分支条件必须 wave 一致 | `begin_if` / `break_if` 的条件不一致时，wave 级分支的语义与作者意图不符；有意的"任一 lane"写 `any_lane(c)` | IR 验证器 `check_uniform_branches` |
+| 启动寄存器预算 | 大工作组时每 SIMD 的 wave 共享 512 个寄存器，超预算的 kernel 不能启动 | `regalloc::check_workgroup_budget`，调度器按预算重试 |
+| buffer 哨兵回绕（GV-BUF-WRAP） | 用 −16 这类哨兵屏蔽 lane 时，指令立即数把有效偏移绕回 0，被屏蔽的 lane 写进缓冲区 | `gpu_verify`，`gv_attack_buf_wrap` / `gv_ok_buf_sentinel` |
+| cvt scale 只用指数（E8M0） | scalef32 转换的常量 scale 不是 2 的幂时结果静默错误 | IR 验证器 |
+| fp4 / fp8 打包的目的选择 hazard | 写目的寄存器某一部分的 `v_cvt_scalef32_pk_*` 后紧跟读者需要 1 个等待态 | `hazards.rs`，`probe_fp4_chain` |
+| 视图的偏移（view snapshots） | `frag4_lane(var_slice4(v, k), i)` 丢掉切片偏移；循环变量的视图在变量被写后仍按 SSA 语义读取快照 | lowering，`tileops_ir.rs` |
+| LDS 存储复用（GV-TILE-ALIAS-RACE，`tileover-check` 分支） | `LdsPlan::tile_over` / overlays 复用的字节对其它 wave 仍活着；并找到 GEMM `lds_epilogue` 末轮预取 DMA 未等就复用 ring 的真实竞态 | `gpu_protocol`，`gpu_tiles.rs` |
+| MIR 导出的 `implicit-def dead` | 被当成读，导致循环内构造描述符时 SCC 的 live-in 错误、llc 中止 | `llvm_mir.rs` |
+
 ---
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **104 个测试目标 / 431 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
+- **测试**：`cargo test` **116 个测试目标 / 488 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`dpp`、`var_slice`、`var_semantics`、`regplan`、`sched_regions*`、`rust_safety` 等；kernel 相关（`crates/amdgpu-kernels/tests/`）：
   `tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`agpr`、`gpu_*`（语义/协议/攻击）、`gemm_mxfp8`、`tile_l*`、`region_ir`、
   `ir_text`（全部 kernel 的 irv1 往返）、`ir_print`、`hzfill`、`sched_kernels`；`amdc` 的 `jit`、`contract_host_truth`；布局层 `crates/amdgpu-layout/tests/`、
@@ -264,7 +290,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 104 个测试目标 / 431 项全绿
+bash tools/container/cargo.sh test                 # 期望 116 个测试目标 / 488 项全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 622a6c0d…
@@ -301,6 +327,10 @@ HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh
 |---|---|
 | `current-status.md` | **本文件：权威当前快照** |
 | [`design.md`](design.md) | Rust DSL 与自研编译器设计规格 |
+| [`fmha-case-study.md`](fmha-case-study.md) | 以 FMHA 为例：kernel 怎样构建与优化（新作者 / agent 入口） |
+| [`op-coverage-design.md`](op-coverage-design.md) / [`op-coverage-membound.md`](op-coverage-membound.md) / [`op-coverage-memtemplates.md`](op-coverage-memtemplates.md) / [`op-coverage-tileops.md`](op-coverage-tileops.md) | aiter 基础算子覆盖：迁移设计与批次状态 / 访存受限实测与覆盖表 / 访存模板 / tile-op 覆盖矩阵 |
+| [`diagnostics.md`](diagnostics.md) | 结构化诊断（`--json`、`summary`、`srcmap`） |
+| [`weave-capture.md`](weave-capture.md) | weave 捕获单元 |
 | [`layout-tour.md`](layout-tour.md) | 布局层入门教程 |
 | [`fmha-dsl-tour.md`](fmha-dsl-tour.md) | FMHA 逐段教程（DSL 特性 + Rust safe 保证） |
 | [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) | 路线 B 设计与 §9 as-built |

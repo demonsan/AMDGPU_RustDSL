@@ -48,9 +48,10 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 
 ## 3. DSL 与 typed IR
 
-- **入口**：`FnBuilder`（约 160 个公开方法）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
+- **入口**：`FnBuilder`（约 230 个公开方法，全部 `#[track_caller]`：每个值记下创建它的 Rust 调用点，存在 `Function::src_locs` 旁表里，不属于 IR，供诊断使用）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
 - **值模型**：`ValueId`（单次定义）、`VarId`（循环变量）、`Opnd`、`DType`（`F16/F32/I32/U32/I1/Ptr/Frag2/4/8/16/Rsrc`）。`Rsrc` 只存在于 SGPR 四元组。
 - **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（顺序语义：读到本迭代路径上最后一次 `set_var`，见 [`region-ir.md`](region-ir.md)）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
+- **分支条件**：`begin_if` / `break_if` 的条件必须可证 wave 一致（IR 验证器）；有意的“任一 lane 为真”分支写 `any_lane(c)`，`!any_lane(c)` 即“所有 lane 都不”。
 - **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`；`scalarize2` 另把一致的 `min`、一致比较上的 `select`（`s_cmp` + `s_cselect`）与 `readfirstlane` 结果留在 SGPR；`waveuni` 把 `tid >> 6` 视为一致），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
 - **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；scaled **16x16x128** f8f6f4（op_sel 选 E8M0 字节）；AGPR（acc_cd）形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
 - **组件化与编织**（`amdgpu-tile`）：kernel 由算子图生成骨架，slot 里放 stage 实例（[`opgraph.md`](opgraph.md)、[`fusion-stage-library-design.md`](fusion-stage-library-design.md)）；
@@ -78,7 +79,7 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 ## 4. MIR 与效应模型
 
 - `MFunction { blocks, vregs: Vec<RClass>, alias, loops, … }`；`RClass` = `V1/V2/V4/V8/V16`（VGPR 元组）、`A1/A2/A4/A8/A16`（AGPR 元组，见 [`agpr.md`](agpr.md)）、`S1/S2/S4`（SGPR；`S4` 为 4 对齐的 MUBUF 描述符四元组）。
-- `MInst { op: MOp, dst, srcs: Vec<Src>, imm, auto, pin }`。`auto` 标记由 wait 重算 pass 管理的等待；`pin` 标记手写（safe-asm）指令。
+- `MInst { op: MOp, dst, srcs: Vec<Src>, imm, auto, pin, skip_m0, region, cpol, origin }`。`auto` 标记由 wait 重算 pass 管理的等待；`pin` 标记手写（safe-asm）指令；`region` 是编织区域，`origin` 是产生它的 IR 值（只用于诊断与 `amdc srcmap`，不影响代码）。
 - **效应模型**（`sched/effects.rs`）是调度、RA 活跃性与 wait 重算共用的唯一事实来源：每条指令的读/写 **dword 槽**（`Slot = vreg·16 + dword`，含 `vcc/scc` 槽）、内存访问描述（空间 Global/Lds、读写、基址槽、偏移、大小）、fence 类别（Barrier / WaitVm / WaitLgkm / SetPrio / Nop）。MUBUF 访问以“未知基址”建模（恒 may-alias）；LDS 直达形式 = 全局读 + `Fence::Barrier`，无 VGPR 目的。
 - **MIR 验证器**（`mir::verify`）检查操作数类别与范围（如 `SBufferRsrc` 必须由 S2 构造 S4、buffer imm ≤ 4095）。
 
@@ -108,6 +109,7 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 - **分配策略链**：线性扫描（紧凑）→ 单寄存器从高位打包 → **两阶段**（宽元组优先，窄值按 dword 级精确活跃段填进空洞）；仍不够时由 lowering 驱动 remat（`remat1..4`）与 **LDS spill**（`ldsspill8..64`）。每一步失败才进入下一步；不会静默产生 spill 之外的降级。
 - **活跃性**：块级 + dword 级精确段（`precise_segments`），带“可达定义”剪枝（无可达定义的槽不占寄存器）；循环回边把 header 的 live-in 延伸到 latch。
 - **reaching-writer 检查**（两阶段结果的守卫，`check_reaching`）：路径感知——每个物理寄存器记录“当前写者 → 在该路径上先于它的写者集合（history）”。读槽 r 违规，当且仅当 (a) r 自己的值从未到达而他者到达，或 (b) 存在他者写者其 history 含 r（r 被写后在同一路径上被覆盖，即真实 clobber）。“他者的路径上 r 从未被写”（循环体内定义、循环后读取时经零趟路径）**不是**违规：该路径上读本就是未定义值。平坦的“写者集合 ≤ 1”判据会误拒任何持久循环变量。
+- **启动预算**（`check_workgroup_budget`）：每 SIMD 的 ceil(waves / 4) 个 wave 共享 512 个寄存器；超出按 “out of VGPRs” 处理，调度器按 `launch_vgpr_budget` 收紧后重试。
 - **MFMA 操作数检查**（`check_mfma_operand_aliasing`）：A/B 与 D 不得重叠，C/D 同址或不相交，起址对齐。
 - **S4 描述符类**：SGPR 四元组、4 对齐，参与普通 SGPR 分配与复用；描述符是普通 SSA 值，在值变化处重新构造。
 - **寄存器规划**（`Function::reg_plan` → `MFunction::reg_hints`）：线性扫描与两阶段打包共用一份 `Plan`——固定放置只取其基址、避开时间重叠的其他固定放置与已放置的 separate / ring 伙伴、share 伙伴空闲时优先；分配后 `regplan::check` 复核，区域上限超出按 "out of VGPRs" 处理（调度器先收紧压力重试）。`regplan::region_report` 给出每个区域的分配器真值峰值（`amdc regplan`）。空规划不改变任何输出。
@@ -123,6 +125,8 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
    - 在途 MFMA 的 **C 源** WAR；
    - 在途 MFMA 的 **目的** WAW/RAW 对*另一虚拟寄存器*（19/21 槽，沿 CFG 传播到后继块）；
    - **宽存储数据 WAR**：`global_store_dwordx4`/`buffer_store_dwordx4` 发射后 2 个等待态内不得有 VALU 写其数据寄存器（对应 LLVM `has12DWordStoreHazard`，gfx940+ 为 2）。
+   - **在途 load 的物理 WAW**（`pad_inflight_waw`）：沿 CFG 跟踪在途 VMEM / LDS / SMEM load 的物理目的寄存器（合并取并集、最小年龄），任何写其中寄存器的指令前插入最小的 `s_waitcnt`。值级等待看不到“结果在这条路径上已死、寄存器被 RA 交给别的值”的情况。
+   - **转换的目的部分选择**：写目的寄存器某一部分（op_sel 选 half / byte）的 `v_cvt_scalef32_pk_*` 后，下一个读者需要 1 个等待态（gfx950，LLVM 插 `s_nop 0`）。
 5. **`hzfill`（opt-in，调度 token）**：RA 与 hazard pass 之后，把 `s_nop` 等待窗口用上方或下方的独立指令填充（物理寄存器 / vcc / scc 无依赖、内存操作不越过内存操作、与 hazard 对无关），每次移动后重跑 hazard pass 确认无需新 padding。
 6. **`pin_check`**：对含 pinned 指令的 kernel，在调度后的 MIR 上用编译器自己的 hazard / wait / 半写模型复查——如果这些 pass 需要在 pinned run **内部**补 nop/wait，则编译失败（边界处的 padding 属正常）。
 
@@ -133,12 +137,14 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 | 物理 WAW vs 在途 MFMA 目的 | opt-in 组合下输出非确定（~2.7% 元素，6 次 6 个 md5） | 结果已死的 MFMA 其目的寄存器被 RA 分配给新值，MFMA 在 ~19–21 槽后落笔覆盖 | `pad_physical_war` 跟踪在途目的区间 |
 | VMEM 宽存储数据 WAR | 出厂 split 路径偶发数据损坏（~5%，时序扰动下 97%） | `global_store_dwordx4` 异步读数据 VGPR，后随 VALU 在 1 等待态内覆盖 | 宽存储数据区间 + 2 等待态（`_kvsplit` 仅 +4 `s_nop`） |
 | reaching-writer 误报 | 任何持久循环变量使两阶段 RA 编译失败 | 平坦写者集合把零趟路径当成歧义 | 路径感知检查（§6） |
+| 在途 load 的物理 WAW | MLA decode 大网格下随机 lane 的存储丢失；Vs128 `_ks` 非法地址 | 一条路径上结果已死的 load 仍在途，RA 复用其寄存器 | `pad_inflight_waw`（§7.4） |
+| bpermute 等待 | 冷启动时 voffset 是垃圾值 | 等待重算不认 `ds_bpermute` 的 LDS 返回值 | 计入 lgkmcnt |
 
 **一致性守卫**：`tail_invariance`（llvm-tail 与 own 的指令流除 nop/wait/`delay_alu` 外逐条相同）、`hazard_oracle`（约 1 万对指令的 own 模型 vs LLVM 插入量）、`hazard_classes`、`phys_waw`、`pin_check`、`pinning`、`smfmac_hazards`、`dma_hazards`。
 
 ## 8. 指令覆盖
 
-- **122 个 MOp** 都有 own emit；除 12 个 own-only 外都在 `llvm20.tbl` 和 `llvm24.tbl` 中有行（`Key[:kinds] | 签名 | MIR 文本`，`kinds` 区分寄存器/立即数源，最具体的行胜出），其余为 own-only（DMA / LDS 直达 / 16x16x128 scaled MFMA 等）。
+- **413 个 MOp** 都有 own emit；381 个在 `llvm20.tbl` 和 `llvm24.tbl` 中有行、32 个 own-only（`Key[:kinds] | 签名 | MIR 文本`，`kinds` 区分寄存器/立即数源，最具体的行胜出），其余为 own-only（DMA / LDS 直达 / 16x16x128 scaled MFMA 等）。
 - **own-only**：DMA（`global_load_lds*`）、LDS 直达的 `buffer_load … lds`、以及含它们的 kernel——LLVM MIR 对这些要么无法表达要么与我们的 m0 序列模型不符；`uses_own_only_ops` 据 MIR 实际内容判定，`auto` 后端据此选择。
 - 每个新增 MOp 的最小闭环：DSL op/stmt → lowering → emit → 效应/代价/hazard → 两个 `.tbl` 行（或登记 own-only）→ 探针 kernel 进 `kernel_names()`（覆盖 `asm_assembles`、`tail_invariance`、`llvm_tail`、`register_accounting`）→ 硬件探针。
 - 已知限制：`llvm20` 行是 `llvm24` 行的拷贝，仅由 llvm24 的 `llc` 做机器验证；hazard-oracle 跳过 S4 描述符操作（128 位 SGPR live-in 无法在其按块 live-in 中表达），这些操作由逐行机器验证和硬件探针覆盖。
@@ -152,11 +158,13 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 | 全局→LDS DMA | `global_load_lds_dwordx4/dword`：LDS 目的 = `M0` + imm + lane·size（`s_mov m0` + `s_nop 0`）；vmcnt 跟踪，效应上带 Barrier fence；own-only |
 | **MUBUF** | 见下 |
 | last-arriver / 内存序 | 完整契约见 [`last-arriver-memory-model.md`](last-arriver-memory-model.md) |
+| **64 位基址** | `ptr_mad(base, a, b)` = base + a·b（64 位，a / b 为无符号 32 位）：标量路径用 `s_mul_i32` / `s_mul_hi_u32` / `s_add_u32` / `s_addc_u32`，可直接作描述符基址；描述符随 tile / expert / slot 移动（> 4 GiB 张量）。验证器要求因子可证非负、移动后的 `base + num_records` ≤ extent |
 
 **MUBUF**（`buffer_load/store_dword{,x2,x4}`、`buffer_load_dword{,x4} … lds`）：
 
 - **描述符**：4 个连续 SGPR `[base lo, base hi & 0xffff, num_records, 0x00020000]`（dword3 在 gfx950 硬件验证）；由标量 kernarg 指针经 `s_mov/s_and/s_mov/s_mov` 构造；`buffer_rsrc`（size = 0xFFFFFFFF，关边界检查）、`buffer_desc(ptr, bytes)`、**`buffer_desc_dyn(ptr, runtime_bytes)`**（dword2 取自一致的 SGPR 值/循环变量，可在每块/每 tile 重新构造）。
 - **寻址**：`vaddr`（逐 lane 32 位字节偏移，或省略为 `off` 形式）+ `soffset`（一致 SGPR 值/循环变量，或 0..64 的内联常量）+ 12 位 `imm` + 需要时 `m0`；LDS 形式中 `imm` 同时加到内存地址与 LDS 目的。
+- **屏蔽哨兵**：被屏蔽的 lane 用越界偏移（如 `0x7fffff00`）让硬件丢弃访问；哨兵加上指令立即数后必须仍 ≥ `num_records`，否则 32 位有效偏移绕回、写进缓冲区（`gpu_verify` 的 GV-BUF-WRAP）。
 - **越界语义（gfx950 硬件验证）**：偏移 ≥ `num_records` 的读返回 0；写被丢弃；**LDS 直达形式把越界 lane 以 0 写入 LDS**（不是丢弃）。range check **不含 soffset**，大小须已包含意图中的基偏移。该语义使“最后一个 partial tile”无需 clamp 或分支。
 - **Hazard**：与 FLAT 同属 VMEM 类、占 vmcnt 槽；`buffer_store_dwordx4` 数据适用宽存储 WAR（数据是 MIR 源 0）；LDS 形式无 VGPR 目的、走与 `global_load_lds` 相同的 vmcnt 记账。
 - **LLVM 行**：`SBufferRsrc(Dyn)` 与全部 load/store（OFFEN/OFFSET，操作数序 `vaddr, srsrc, soffset, offset, cpol, swz`，内存操作数 `addrspace 8`）；两个 LDS 直达形式为 own-only。
@@ -175,11 +183,12 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 
 | 守卫 | 保证 |
 |---|---|
-| `cargo test`（104 个目标 / 431 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
+| `cargo test`（116 个目标 / 488 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
 | `register_accounting` / `mir_invariants` | 描述符声明了每个用到的寄存器；RA 从不 clobber 活值；已知错误类能被检出 |
 | `ir_text` / `tools/ir_roundtrip_check.sh` | 每个 kernel 经 irv1 文本往返后 `Function` 逐字段相等、双后端 asm 与严格证书逐字节相同 |
 | 硬件探针（`tools/*_probe.sh`） | 新原语的硬件语义（越界、半写、等待态、last-arriver、MUBUF、unscaled MFMA …） |
 | 测量协议 | 溯源核对 `.s/.co`、交错 A/B、同轮厂商、split 形状反复启动比对 md5 |
+| 结构化诊断（[`diagnostics.md`](diagnostics.md)） | 每条验证 / 编译失败都是带 code、语句、区域、Rust 源码位置与修复建议的 JSON；`amdc summary` / `srcmap` 让 agent 不读汇编也能定位 |
 
 ## 12. 设计结论（已量化）
 

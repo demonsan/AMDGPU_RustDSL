@@ -772,7 +772,7 @@
     - [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `mla_config` 负责选择形式和切分数 S。
   - 期间发现两个后端 bug：
     - `ds_bpermute` 之后缺少 lgkm 等待，tileops f841f0a2 已修复；
-    - if / else 中，else 路径读取了只在 then 路径上物化的寄存器，已报告后端。新版通过去掉该分支绕开。- **MoE stage 2**：
+    - if / else 中随机 lane 的存储丢失：根因是 then 路径的 Q 预取 load 在 else 路径上结果已死但仍在途，RA 把其寄存器交给 else 的临时值，晚到的 load 覆盖之；后端已用 post-RA 的在途 load 物理 WAW 守卫（`pad_inflight_waw`）修复（见 [`current-status.md`](current-status.md) §6.1）。新版此前通过去掉该分支绕开。- **MoE stage 2**：
   - bf16 原子累加：更慢（1528 vs 672 µs），且精度更差，未采纳。
   - bf16 中间结果（`_h`）：快 26%，误差属 bf16 量级。作为可选项，默认仍用 fp32 中间结果。
 
