@@ -1491,10 +1491,8 @@ pub fn by_name(name: &str) -> Option<Function> {
             } else {
                 (Elem::Bf16, Scales::None)
             };
-            // `_d3` suffix: the 3-slot ring (unit-scale forms)
-            let (n0, d3) = match n.strip_suffix("_d3") { Some(x) => (x, true), None => (n, false) };
             // `_bm64` suffix: block_m 64 (64-row tiles, sparse experts)
-            let (n0, bm64) = match n0.strip_suffix("_bm64") { Some(x) => (x, true), None => (n0, false) };
+            let (n0, bm64) = match n.strip_suffix("_bm64") { Some(x) => (x, true), None => (n, false) };
             // `_oss`: gpt-oss bias + clamped swiglu (stage 1) / bias (stage 2)
             let (n0, oss) = match n0.strip_suffix("_oss") { Some(x) => (x, true), None => (n0, false) };
             let st = if n0.starts_with("gemm_moe1") {
@@ -1513,6 +1511,9 @@ pub fn by_name(name: &str) -> Option<Function> {
             } else {
                 cfg
             };
+            // stage 1, block_m 64, unit scales (fp8 per-token / bf16): the 3-slot ring (fp8 D4096 I1024 E64 topk 8, same run: M 16 99.6 -> 92.7 us,
+            // M 64 110.0 -> 107.9, M 256 112.7 -> 112.4; stage 2 measured mixed, block_m 128 worse: unchanged)
+            let d3 = bm64 && matches!(st, MoeStage::Up { .. }) && matches!(scales, Scales::RowCol | Scales::None);
             let cfg = GemmConfig { depth3: d3, ..cfg };
             Some(gemm_mxfp8_bs(n, if bm64 { GemmConfig { cta_m: 64, ..cfg } } else { cfg }))
         }
