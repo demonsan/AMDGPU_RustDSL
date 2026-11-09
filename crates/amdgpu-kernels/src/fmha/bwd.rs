@@ -314,18 +314,27 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
+/// `_pair` (causal): CTA x takes key tiles x and nkt - 1 - x (equal work per CTA; the grid is halved) - for grids that still fill the CUs.
+pub fn fmha_bwd_dkdv_pair(name: &str) -> Function {
+    fmha_bwd_dkdv_x(name, true, true)
+}
+
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
+    fmha_bwd_dkdv_x(name, causal, false)
+}
+
+fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    b.grid_is(0, Ext::ka(176).ceil_div(128));
+    b.grid_is(0, if pair { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
     b.grid_is(1, Ext::ka(192));
     b.grid_is(2, Ext::sym("B"));
     // (sched's per-region strategies - reorder,ldshoist on the MFMA regions, reorder,hzfill on softmax / pack: 139.5 -> 114.4 us on the Gemm profile -
     // measured 102.2 vs 98.0 us on top of the Vs128 profile + tokens below: not declared; the region markers stay)
 
     let a = args(&mut b);
-    let (kt, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let (kt0, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let lane = Lane::new(&mut b);
     let gqa = {
         let mut q = b.c_i32(1);
@@ -338,6 +347,28 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
     let half = b.bind_i32(lane.half());
+    // LDS: Q / dO rings (2 x 16 KB), XOR-swizzled rows
+    let mut lds = LdsPlan::new();
+    let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
+    let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
+    lds.commit(&mut b);
+    // pair: key tiles x and nkt - 1 - x (the second only when distinct)
+    let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
+        let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
+        let kb_ = { let v = b.bind_i32(ev(nkt) - 1 - ev(kt0)); b.read_first_lane(v) };
+        let second = b.bind_cond(ev(kb_).gt(ev(kt0)));
+        vec![(kt0, None), (kb_, Some(second))]
+    } else {
+        vec![(kt0, None)]
+    };
+    for (kt, guard) in passes {
+    if let Some(g) = guard {
+        // the LDS rings are reused by the second pass: every wave is done with the first
+        b.wait_vm(0);
+        b.wait_lds(0);
+        b.barrier();
+        b.begin_if(Opnd::Val(g));
+    }
     let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
     let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
     let c0 = b.c_i32(0);
@@ -357,11 +388,6 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(a.scale, l2e);
 
-    // LDS: Q / dO rings (2 x 16 KB), XOR-swizzled rows
-    let mut lds = LdsPlan::new();
-    let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
-    let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
-    lds.commit(&mut b);
     let q_so0 = { let v = b.bind_i32((ev(bat) * ev(a.sq) * ev(a.hq) + ev(h)) * ROW); b.read_first_lane(v) };
     let qseq = { let v = b.bind_i32(ev(a.hq) * ROW); b.read_first_lane(v) };
     let l16 = b.bind_i32(lane.lane() & 15);
@@ -564,6 +590,10 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         }
     }
     b.end_if();
+    if guard.is_some() {
+        b.end_if();
+    }
+    }
     let mut f = b.finish();
     // the Vs128 profile + ldsink / wsink / ldahead32 tokens: dkdv 585 -> 407 us at B1 H16 4096² (same run; Gemm profile + tokens alone 1065 vs 1072,
     // Vs128 alone slower)
