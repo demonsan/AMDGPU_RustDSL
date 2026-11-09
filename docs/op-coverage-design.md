@@ -912,6 +912,21 @@ blockscale 128×128（`fp8bs`）的规则：
   - 单 kernel 版本：dS^T 经 LDS，K tile 只暂存一次，dQ 用 `buffer_atomic_add_f32` 累加，另加 dq_convert。结果正确，但 246 vs 237 µs、causal 274 vs 263，更慢。代码已从树中移除，保留为 tag `archive/bwd-fused`。
   - dkdv 的 causal key tile 配对：128 个 CTA 在 256 个 CU 上被减半后反而更慢。
 
+**编译策略（2026-11-09，已采纳）**：dq 与 dkdv 改用 `CompileProfile::Vs128` 加 `ldsink=1,wsink,ldahead32=1`。
+- dkdv：B1H16 4096² 从 585 µs 降到 407–411；B1H8 2048² 从 145 降到 98。单用 tokens 只有 1065 对 1072，单用 Vs128 更慢。
+- sched 的分区策略（`reorder,ldshoist` / `reorder,hzfill`）在 Gemm profile 上能把 139.5 降到 114.4，但叠加在 Vs128 + tokens 之上反而略慢（102.2 对 98.0），因此没有声明；区域 marker 保留。
+- 同次运行（ours / aiter）：
+
+| 形状 | ours | aiter | 比 |
+|---|--:|--:|--:|
+| B1H8 2048² | 177.2 µs | 141.9 µs | 0.80× |
+| B1H8 HK2 2048² causal | 195.3 µs | 163.8 µs | 0.84× |
+| B1H16 4096² | 681.1 µs | 465.0 µs | 0.68× |
+| B1H16 4096² causal | 672.5 µs | 335.8 µs | 0.50× |
+| B4H8 1024² causal | 123.9 µs | 116.6 µs | 0.94× |
+
+- causal 下 dkdv 只裁掉了前部 q tile：4096² 时 dkdv 为 460 µs，比非 causal 的 411 还多。这是下一个杠杆。
+
 **原因与方向**：
 - 余下的差距在 dkdv 的单 tile 效率：单独 139 µs，约等于厂商的总时间。
 - **寄存器是瓶颈（暂停）**：
