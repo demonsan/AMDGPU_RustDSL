@@ -9,7 +9,8 @@
 
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
-use amdgpu_tile::{ev, Layout as TLayout, Shared, SlotIdx};
+use crate::lds_decl::{private_at, ring_at, tile_at};
+use amdgpu_tile::{ev, Shared, SlotIdx};
 
 const T: i32 = 1024;
 const NEG: f32 = -3.0e38;
@@ -61,17 +62,10 @@ struct Tiles {
     wt: Shared,
 }
 
-fn tile_at(b: &mut FnBuilder, name: &str, base: i64, bytes: i64) -> Shared {
-    b.lds_tile(name, base, bytes);
-    Shared { name: name.to_string(), base, slot_stride: bytes, bytes, slots: 1, layout: TLayout::Linear, private: false }
-}
-
 fn declare_tiles(b: &mut FnBuilder) -> Tiles {
-    b.lds_private("WS", 0, 64, 16);
-    b.lds_ring("BLK", 1024, 64, 4);
     Tiles {
-        ws: Shared { name: "WS".into(), base: 0, slot_stride: 64, bytes: 64, slots: 16, layout: TLayout::Linear, private: true },
-        blk: Shared { name: "BLK".into(), base: 1024, slot_stride: 64, bytes: 64, slots: 4, layout: TLayout::Linear, private: false },
+        ws: private_at(b, "WS", 0, 64, 16),
+        blk: ring_at(b, "BLK", 1024, 64, 4),
         sc0: tile_at(b, "SC0", 1536, 4096),
         sc1: tile_at(b, "SC1", 5632, 4096),
         hist: tile_at(b, "HIST", 9728, 1280),

@@ -13,7 +13,8 @@
 //! `rem` elements equal to T. The row is read five times (the first from HBM, the others mostly from L2).
 
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Dpp, DppAluOp, DppCtrl, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::ev;
+use crate::lds_decl::tile_at;
+use amdgpu_tile::{ev, SlotIdx};
 
 pub fn by_name(name: &str) -> Option<Function> {
     let (rest, prefill, plain) = if let Some(r) = name.strip_prefix("topk_per_row_decode_f32_k") {
@@ -95,6 +96,13 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
         b.arg_tensor("seq_lens", rr * Ext::c(4));
     }
     b.lds(LDS);
+    // declared tiles (every LDS access is inside a protocol marker: `lds-untracked` 0); the histogram tile starts one word early (the "bin -1" read of the threads >= 256, masked)
+    let t_hist = tile_at(b, "HIST", (HIST - 4) as i64, 1284);
+    let t_wt = tile_at(b, "WT", WT as i64, 64);
+    let t_rb = tile_at(b, "RB", RES as i64, 12);
+    let t_cs = tile_at(b, "CS", CNT as i64, 16 + 4096);   // the two counters + the emit sink (one atomic target: the counter or the thread's own sink slot)
+    let hv = std::cell::Cell::new(0i32);   // a fresh HIST version per histogram build
+    let rv = std::cell::Cell::new(0i32);   // a fresh RB / WT version per scan_find
     let p_l = b.let_(Op::KernargPtr { offset: 0 });
     let p_i = b.let_(Op::KernargPtr { offset: idx_off });
     let stride_v = b.let_(Op::KernargI32 { offset: st_off });
@@ -210,23 +218,26 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                         b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(b1), b: Opnd::Val(sink_bin) })
                     };
                     let addr = b.bind_i32((ev(bsel) << 2) + HIST);
-                    b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false);
+                    t_hist.at(&SlotIdx::new(0, hv.get())).write(b, |b| b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false));
                 }
                 let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
                 b.set_var(vit, nx);
             });
         };
         let clear = |b: &mut FnBuilder| {
+            hv.set(hv.get() + 1);
             let a = b.bind_i32(ev(tcl4) + HIST);
-            b.store_lds(a, zero_i, MemTy::B32, false);
+            t_hist.at(&SlotIdx::new(0, hv.get())).write(b, |b| b.store_lds(a, zero_i, MemTy::B32, false));
             b.wait_lds(0);
             b.barrier();
         };
         // the descending scan of the 256 bins (thread t < 256 owns bin 255 - t): (bin, count of elements in higher bins) of the bin where the cumulative count reaches `tgt`
         let scan_find = |b: &mut FnBuilder, tgt: ValueId| -> (ValueId, ValueId) {
+            rv.set(rv.get() + 1);
+            let rs = SlotIdx::new(0, rv.get());
             let rb = b.bind_i32(255 - ev(tcl));
             let a_h = b.bind_i32((ev(rb) << 2) + HIST);
-            let v0 = b.load_lds(a_h, MemTy::B32);
+            let v0 = t_hist.at(&SlotIdx::new(0, hv.get())).read(b, |b| b.load_lds(a_h, MemTy::B32));
             b.wait_lds(0);
             let in256 = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 256);
             let v0z = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(v0), b: Opnd::I32(0) });
@@ -238,18 +249,18 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
             v = b.dpp_alu(DppAluOp::AddU32, Dpp { ctrl: DppCtrl::RowBcast31, row_mask: 0xc, bank_mask: 0xf, bound_zero: false }, v, v, v);
             let tot = b.read_lane(v, 63);
             let a_wt = b.bind_i32((ev(wave) << 2) + WT);
-            b.store_lds(a_wt, tot, MemTy::B32, false);
+            t_wt.at(&rs).write(b, |b| b.store_lds(a_wt, tot, MemTy::B32, false));
             let is0 = b.cmp(CmpPred::Eq, CmpTy::I32, tid, 0);
             let dflt_a = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(RES), b: Opnd::I32(RES + 8) });
-            b.store_lds(dflt_a, zero_i, MemTy::B32, false);
+            t_rb.at(&rs).write(b, |b| b.store_lds(dflt_a, zero_i, MemTy::B32, false));
             let dflt_b = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(RES + 4), b: Opnd::I32(RES + 8) });
-            b.store_lds(dflt_b, zero_i, MemTy::B32, false);
+            t_rb.at(&rs).write(b, |b| b.store_lds(dflt_b, zero_i, MemTy::B32, false));
             b.wait_lds(0);
             b.barrier();
             let mut tots = Vec::new();
             for w in 0..3i32 {
                 let a = b.c_i32(WT + 4 * w);
-                tots.push(b.load_lds(a, MemTy::B32));
+                tots.push(t_wt.at(&rs).read(b, |b| b.load_lds(a, MemTy::B32)));
             }
             b.wait_lds(0);
             let mut pre = b.c_i32(0);
@@ -267,15 +278,15 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
             let go = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(g12), b: Opnd::I32(0) });
             let wr = b.cmp(CmpPred::Ne, CmpTy::I32, go, 0);
             let addr_bin = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::I32(RES), b: Opnd::I32(RES + 8) });
-            b.store_lds(addr_bin, rb, MemTy::B32, false);
+            t_rb.at(&rs).write(b, |b| b.store_lds(addr_bin, rb, MemTy::B32, false));
             let addr_bef = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::I32(RES + 4), b: Opnd::I32(RES + 8) });
-            b.store_lds(addr_bef, ex, MemTy::B32, false);
+            t_rb.at(&rs).write(b, |b| b.store_lds(addr_bef, ex, MemTy::B32, false));
             b.wait_lds(0);
             b.barrier();
             let ra = b.c_i32(RES);
             let rb2 = b.c_i32(RES + 4);
-            let bin = b.load_lds(ra, MemTy::B32);
-            let bef = b.load_lds(rb2, MemTy::B32);
+            let bin = t_rb.at(&rs).read(b, |b| b.load_lds(ra, MemTy::B32));
+            let bef = t_rb.at(&rs).read(b, |b| b.load_lds(rb2, MemTy::B32));
             b.wait_lds(0);
             b.barrier();
             (bin, bef)
@@ -297,7 +308,7 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
         let is2 = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 2);
         let ca = b.bind_i32(CNT + (ev(tid) << 2));
         let ca = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is2), a: Opnd::Val(ca), b: Opnd::Val(sink_e) });
-        b.store_lds(ca, zero_i, MemTy::B32, false);
+        t_cs.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(ca, zero_i, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
         let cgt = b.c_i32(CNT);
@@ -329,8 +340,9 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                 let eq_c = b.cmp(CmpPred::Ne, CmpTy::I32, eq_ok, 0);
                 let ag = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(cgt), b: Opnd::Val(sink_e) });
                 let ae = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_c), a: Opnd::Val(ceq), b: Opnd::Val(sink_e) });
-                let sg = b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true).unwrap();
-                let se = b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true).unwrap();
+                // the returning counter atomics read-modify-write the words the clear produced
+                let sg = t_cs.at(&SlotIdx::new(0, 0)).read(b, |b| b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true)).unwrap();
+                let se = t_cs.at(&SlotIdx::new(0, 0)).read(b, |b| b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true)).unwrap();
                 let (sg, se) = (b.bitcast_i32(sg), b.bitcast_i32(se));
                 let eq_take = b.cmp(CmpPred::Lt, CmpTy::I32, se, rem);
                 let eq_take_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_take), a: Opnd::I32(1), b: Opnd::I32(0) });
