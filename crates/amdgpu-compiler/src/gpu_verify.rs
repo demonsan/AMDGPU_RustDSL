@@ -370,6 +370,10 @@ impl<'a> An<'a> {
                 if let Some(Op::ConstI32(c)) = def {
                     return Some((BTreeMap::new(), Poly::int(*c as i128)));
                 }
+                // an output of a declared workgroup bijection is a digit of its own
+                if self.f.contract.wg_maps.iter().any(|m| m.outs.contains(v)) {
+                    return atom(self.atom_key(*v), *o);
+                }
                 if !matches!(def, Some(Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ | Op::WorkitemId)) {
                     let it = self.int_of(o);
                     if it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0] {
@@ -753,7 +757,9 @@ impl<'a> An<'a> {
             // extents: docs/trust-inventory.md); an axis the kernel reads but the contract leaves open may hold several
             let defined = self.f.contract.grid_defs.iter().any(|(a, _)| *a as usize == ax);
             let read = self.defs.values().any(|op| matches!((ax, op), (0, Op::WorkgroupIdX) | (1, Op::WorkgroupIdY) | (2, Op::WorkgroupIdZ)));
-            if !seen && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
+            // ... or covered by a declared bijection whose outputs are all digits
+            let mapped = self.f.contract.wg_maps.iter().any(|m| m.axes.contains(&(ax as u8)) && m.outs.iter().all(|v| atoms.contains_key(&self.atom_key(*v))));
+            if !seen && !mapped && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
                 return Err("a workgroup axis that is not a digit".into());
             }
         }
@@ -2143,6 +2149,9 @@ pub fn verify_ir(f: &Function) -> Report {
         }
     }
     an.run();
+    for m in &f.contract.wg_maps {
+        an.rep.add("GV-ASSUME", Severity::Info, format!("wg_bijection {:?} over grid axes {:?}: TRUSTED ({})", m.outs, m.axes, m.reason));
+    }
     let (gw_ok, gw_bad) = an.global_disjointness();
     for _ in 0..gw_ok {
         an.rep.ok("global-write-disjoint");

@@ -23,6 +23,8 @@ pub fn kv_split_decode(b: &mut FnBuilder, z: ValueId, splits: ValueId, splits_ka
     let sp = b.bind_i32(ev(z) & ((I32::c(1) << ev(lg)) - 1));
     b.assume_trusted(bi, Ext::c(0), Ext::sym(batch_sym) - Ext::c(1), "batch = grid_z >> log2(splits) with grid_z = B * splits (grid_is): variable shift, no interval rule");
     b.assume_trusted(sp, Ext::c(0), Ext::ka(splits_ka) - Ext::c(1), "split index = grid_z & (splits - 1), splits a power of two: and with a variable mask");
+    // z is the workgroup z id at every caller: (batch, split) is a bijection of it
+    b.wg_bijection(&[bi, sp], &[2], "KV split: grid z = batch * splits + split with split < splits (a power of two)");
     (bi, sp, lg)
 }
 

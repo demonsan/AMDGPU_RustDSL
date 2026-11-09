@@ -1066,6 +1066,17 @@ pub struct Contract {
     pub buf_trusts: Vec<(String, String)>,
     /// (symbol name, lo, hi) bounds of free symbols.
     pub sym_ranges: Vec<(String, i64, i64)>,
+    /// Trusted facts: a tuple of values is an injective function of the workgroup id over the listed grid axes (e.g. an XCD raster, a
+    /// permutation of the tile grid). Used by the cross-workgroup store proof; counted in the trust ledger (`wg_bijection`).
+    pub wg_maps: Vec<WgMap>,
+}
+
+/// See `Contract::wg_maps`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WgMap {
+    pub outs: Vec<ValueId>,
+    pub axes: Vec<u8>,
+    pub reason: String,
 }
 
 /// One value set crossing a stage boundary (`StageContract`): the IR values (fragment registers), the element table they hold (`[t + threads v]`
@@ -1909,6 +1920,14 @@ impl FnBuilder {
     }
     /// Like `assume`, but for a loop variable whose range holds by a guard the analyzer cannot see (e.g. a counter bounded by the loop exit test): the induction
     /// check failing is NOT an error, the assumption is listed as TRUSTED with `reason`.
+    /// Trusted fact: `outs` (as a tuple) is an injective function of the workgroup id over grid `axes` - two different workgroups never get the
+    /// same tuple (an XCD raster permuting the tile grid, a block-order bijection). The cross-workgroup store proof may then use `outs` as the
+    /// workgroup digits of those axes. Counted in the trust ledger.
+    #[track_caller]
+    pub fn wg_bijection(&mut self, outs: &[ValueId], axes: &[u8], reason: &str) {
+        self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string() });
+    }
+
     #[track_caller]
     pub fn assume_trusted(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext, reason: &str) {
         self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
