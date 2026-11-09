@@ -1411,7 +1411,6 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
-        "gemm_a8w8_i8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128_splitk", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
