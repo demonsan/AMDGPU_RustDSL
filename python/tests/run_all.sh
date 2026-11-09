@@ -18,7 +18,7 @@ if [ -z "${AMDGPU_JIT_AMDC:-}" ]; then
 fi
 t0=$(date +%s)
 # every kernel a launcher can reach compiles (the dispatch rules over a shape grid, the Python-op instantiations, `amdc list`)
-bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test dispatch_compile -- --ignored --include-ignored > "$OUT/compile.log" 2>&1; comp=$?
+bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test dispatch_compile -- --include-ignored > "$OUT/compile.log" 2>&1; comp=$?
 python3 -m unittest discover -s python/tests -p 'test_unit.py' > "$OUT/unit.log" 2>&1; unit=$?
 python3 python/tests/ops_check.py "$@" > "$OUT/ops.log" 2>&1; ops=$?
 python3 python/tests/decode_check.py > "$OUT/decode.log" 2>&1; dec=$?

@@ -21,6 +21,11 @@ const TRANS_LATENCY: usize = 5;
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
 
+/// `AMDC_NO_FILL_VCC=1`: the old behaviour (no filling in front of a vcc consumer) for A/B measurements
+fn opt_fill_vcc() -> bool {
+    std::env::var("AMDC_NO_FILL_VCC").map_or(true, |v| v.is_empty())
+}
+
 fn is_transcendental(op: MOp) -> bool {
     crate::op_attrs::attrs(op).transcendental
 }
@@ -174,15 +179,15 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                 }
             }
-            let c_reg = match inst.op {
-                MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8 if inst.srcs.len() > 2 => match inst.srcs[2] {
-                    Src::Reg(r) => Some(canon(r)),
-                    _ => None,
-                },
-                MOp::VSmfmac16x16x128Fp8 if inst.srcs.len() > 3 => match inst.srcs[3] {
-                    Src::Reg(r) => Some(canon(r)),
-                    _ => None,
-                },
+            // the accumulator operand (srcC) of a matrix op: a dependent same-opcode MFMA accumulating in place is interlocked (back-to-back)
+            let c_reg = match crate::op_attrs::attrs(inst.op).mfma {
+                Some(ma) if ma.chain => {
+                    let idx = if ma.sparse { 3 } else { 2 };
+                    match inst.srcs.get(idx) {
+                        Some(Src::Reg(r)) => Some(canon(*r)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             for s in &inst.srcs {
@@ -213,7 +218,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, &hiw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
-            if earliest > cycle && !insts[i].op.consumes_vcc() {
+            // (a vcc consumer may be filled too, with instructions that neither read nor write vcc: they cannot disturb the compare it waits for)
+            let vcc_cons = insts[i].op.consumes_vcc();
+            if earliest > cycle && (!vcc_cons || opt_fill_vcc()) {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
@@ -222,8 +229,13 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                     let cand = &insts[j];
                     // pinned (hand-authored) instructions are never moved, and nothing is moved across them
+                    let touches_vcc = |op: MOp| {
+                        let at = crate::op_attrs::attrs(op);
+                        at.vcc_read || at.vcc_write || at.defines_vcc || at.consumes_vcc || op == MOp::VPtrAdd
+                    };
                     let mut ok = !cand.pin
                         && !insts[i..j].iter().any(|x| x.pin)
+                        && !(vcc_cons && touches_vcc(cand.op))
                         && movable(cand.op)
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, &aw, &hiw, cycle) <= cycle;
@@ -325,7 +337,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 // stale, 20 are needed), so it also applies to the default path; the other opcodes keep the table value
                 // outside strict mode.
                 let lat = if strict || is_scaled_mfma(inst.op) { latency + 1 } else { latency };
-                    ready.insert(canon(d), (cycle + lat, chains_in_place(inst.op)));
+                    // a zero-C MFMA (the first of an accumulation chain) chains like its accumulating form: the same instruction with srcC = 0
+                    let zero_c = crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| m.zero_c);
+                    ready.insert(canon(d), (cycle + lat, chains_in_place(inst.op) || zero_c));
                 }
             }
             if strict && inst.op.defines_vcc() {
@@ -883,4 +897,93 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
         }
     }
     total
+}
+
+/// One `s_nop` of the final code, classified (`amdc nops`): the hazard rule that most plausibly required it, the producer and the consumer.
+#[derive(Clone, Debug)]
+pub struct NopSite {
+    pub block: usize,
+    pub index: usize,
+    pub states: usize,
+    pub rule: &'static str,
+    pub producer: Option<MOp>,
+    pub consumer: Option<MOp>,
+    /// the IR value the consumer was lowered from (diagnostics origin; u32::MAX = none)
+    pub origin: u32,
+}
+
+/// Post-hoc classification of every `s_nop` of an allocated function: the next real instruction is the consumer; the closest earlier
+/// instruction (within the block, up to 32 back) whose result it reads (or whose vcc / whose register it overwrites) is the producer, and the
+/// producer's class names the rule: mfma-result, transcendental, valu-to-special-operand (MFMA operand / permlane / DPP / readfirstlane),
+/// vcc, pk-to-transcendental, accvgpr-read-to-ptr-add, cvt-dst-select, M0 (LDS DMA), else block-end / phys-WAR / other.
+pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
+    let alias = m.alias.clone();
+    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
+    let mut out = Vec::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if inst.op != MOp::SNop || inst.pin {
+                continue;
+            }
+            let states = inst.imm.max(0) as usize + 1;
+            // the consumer: the next non-nop instruction of the block
+            let cons = b.insts[ii + 1..].iter().find(|x| x.op != MOp::SNop);
+            let Some(c) = cons else {
+                out.push(NopSite { block: bi, index: ii, states, rule: "block-end", producer: None, consumer: None, origin: u32::MAX });
+                continue;
+            };
+            let reads: Vec<VReg> = c.uses().into_iter().map(canon).collect();
+            let cd = c.dst.map(canon);
+            let mut rule = "other";
+            let mut prod = None;
+            let at = crate::op_attrs::attrs(c.op);
+            if at.m0_src.is_some() && ii > 0 && matches!(b.insts[ii - 1].op, MOp::SMovM0 | MOp::SAddM0) {
+                rule = "m0-write-to-lds-dma";
+                prod = Some(b.insts[ii - 1].op);
+            } else {
+                // two passes: first a producer of a hazard class (an MFMA / transcendental / special VALU result the consumer reads), then any
+                let window: Vec<&MInst> = b.insts[..ii].iter().rev().filter(|x| x.op != MOp::SNop).take(32).collect();
+                let hazardous = |p: &MInst| {
+                    let pa = crate::op_attrs::attrs(p.op);
+                    pa.mfma.is_some() || pa.transcendental || cvt_dst_sel_write(p.op, p.imm) || (pa.valu_writer_delay.is_some() && at.reads_valu_hazard)
+                        || p.op == MOp::VAccvgprRead
+                };
+                let order: Vec<&MInst> = window.iter().copied().filter(|p| hazardous(p)).chain(window.iter().copied()).collect();
+                for p in order {
+                    let pa = crate::op_attrs::attrs(p.op);
+                    let pd = p.dst.map(canon);
+                    let reads_it = pd.map_or(false, |d| reads.contains(&d));
+                    if c.op.consumes_vcc() && (pa.defines_vcc || p.op == MOp::VPtrAdd) {
+                        rule = "vcc-write-to-vcc-read";
+                        prod = Some(p.op);
+                        break;
+                    }
+                    if reads_it || (pd.is_some() && pd == cd && pa.mfma.is_some()) {
+                        prod = Some(p.op);
+                        rule = if pa.mfma.is_some() {
+                            "mfma-result"
+                        } else if pa.transcendental {
+                            "transcendental-result"
+                        } else if cvt_dst_sel_write(p.op, p.imm) {
+                            "cvt-dst-select"
+                        } else if p.op == MOp::VAccvgprRead && c.op == MOp::VPtrAdd {
+                            "accvgpr-read-to-ptr-add"
+                        } else if matches!(p.op, MOp::VPkAddF32 | MOp::VPkMulF32) && at.transcendental {
+                            "pk-f32-to-transcendental"
+                        } else if pa.valu_writer_delay.is_some() && at.reads_valu_hazard {
+                            "valu-to-special-operand"
+                        } else {
+                            "other-dependence"
+                        };
+                        break;
+                    }
+                }
+            }
+            if prod.is_none() && rule == "other" {
+                rule = "no-local-producer (block edge / phys WAR)";
+            }
+            out.push(NopSite { block: bi, index: ii, states, rule, producer: prod, consumer: Some(c.op), origin: c.origin });
+        }
+    }
+    out
 }
