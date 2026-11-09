@@ -529,6 +529,45 @@ impl<'a> An<'a> {
         }
     }
 
+    /// `Some(axis)` when loop variable `v` starts at the workgroup id of `axis` and every `set_var` adds exactly the grid size of that axis
+    /// (`v = wg + k grid`): the values of different workgroups are disjoint residue classes.
+    fn persistent_axis(&self, v: VarId) -> Option<u8> {
+        let stmts = self.f.stmts();
+        let init = stmts.iter().find_map(|s| match s {
+            Stmt::BeginLoop { vars, init } => vars.iter().position(|x| *x == v).map(|k| init[k]),
+            _ => None,
+        })?;
+        let ax = match init {
+            Opnd::Val(x) => match self.defs.get(&x)? {
+                Op::WorkgroupIdX => 0u8,
+                Op::WorkgroupIdY => 1,
+                Op::WorkgroupIdZ => 2,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let grid = self.cx.sym_poly(Sym::Grid(ax));
+        let mut any = false;
+        for s in stmts.iter() {
+            if let Stmt::SetVar { var, value } = s {
+                if *var != v {
+                    continue;
+                }
+                any = true;
+                let Opnd::Val(x) = value else { return None };
+                let step = match self.defs.get(x)? {
+                    Op::AddI32(Opnd::Var(w), s) | Op::AddI32(s, Opnd::Var(w)) if *w == v => *s,
+                    _ => return None,
+                };
+                let p = self.point_of(&step)?;
+                if !(self.cx.le(&p, &grid) && self.cx.le(&grid, &p)) {
+                    return None;
+                }
+            }
+        }
+        any.then_some(ax)
+    }
+
     /// The exact (point) value of a uniform operand, if its interval is one polynomial.
     fn point_of(&self, o: &Opnd) -> Option<Poly> {
         // a lower bound that is also an upper bound (an interval keeps several candidate bounds)
@@ -986,6 +1025,13 @@ impl<'a> An<'a> {
         for k in atoms.keys().chain(covered.iter()) {
             if !k.0 && k.1 >= u64::MAX - 2 {
                 wg_axes[(u64::MAX - k.1) as usize] = true;
+            }
+            // a persistent-loop variable (starts at the workgroup id, steps by the grid size): distinct workgroups visit disjoint residue
+            // classes, so the variable is a workgroup digit of that axis
+            if k.0 {
+                if let Some(ax) = self.persistent_axis(VarId(k.1 as u32)) {
+                    wg_axes[ax as usize] = true;
+                }
             }
         }
         for (k, c) in &atoms {
