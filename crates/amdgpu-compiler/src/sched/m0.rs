@@ -58,6 +58,11 @@ fn is_m0_writer(op: MOp) -> bool {
 ///    (for the add form), nor is pinned - i.e. to just after the previous DMA (or the definition of its base).
 /// Returns (explicit writes, folded adds).
 pub fn explicit(m: &mut MFunction) -> (usize, usize) {
+    let env_off = |n: &str| std::env::var(n).map_or(false, |v| v == "0");
+    if env_off("AMDC_M0_EXPLICIT") {
+        return (0, 0);
+    }
+    let (no_fold, no_hoist) = (env_off("AMDC_M0_FOLD"), env_off("AMDC_M0_HOIST"));
     let alias = m.alias.clone();
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     let mut uses: std::collections::HashMap<VReg, u32> = std::collections::HashMap::new();
@@ -81,6 +86,10 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                     w.region = inst.region;
                     w.origin = inst.origin;
                     b.insts[i].skip_m0 = true;
+                    // the DMA no longer reads its M0 source register (the explicit write does): drop the operand, or the register would stay
+                    // live up to the DMA - and become an undefined use (live from the kernel entry) once the write folds its defining add
+                    let k = crate::op_attrs::attrs(b.insts[i].op).m0_src.expect("m0 operand");
+                    b.insts[i].srcs[k] = Src::Imm(0);
                     b.insts.insert(i, w);
                     made += 1;
                     i += 2;
@@ -109,7 +118,7 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                 continue;
             }
             // fold: the source defined by a single-use s_add_u32 in this block
-            if let Some(Src::Reg(r)) = b.insts[p].srcs.first().cloned() {
+            if let (false, Some(Src::Reg(r))) = (no_fold, b.insts[p].srcs.first().cloned()) {
                 let rc = canon(r);
                 if uses.get(&rc).copied() == Some(1) && !alias.contains_key(&r) {
                     if let Some(q) = (0..p).rev().find(|&q| b.insts[q].dst.map_or(false, |d| canon(d) == rc)) {
@@ -133,7 +142,7 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
             }
             // chained constant adds: s_add_u32 m0, s, k  with  s = s_add_u32 x, k2 (single use)  ->  s_add_u32 m0, x, k + k2
             loop {
-                if b.insts[p].op != MOp::SAddM0 {
+                if no_fold || b.insts[p].op != MOp::SAddM0 {
                     break;
                 }
                 let (Some(Src::Reg(s)), Some(Src::Imm(k))) = (b.insts[p].srcs.first().cloned(), b.insts[p].srcs.get(1).cloned()) else { break };
@@ -184,7 +193,7 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                 }
                 j -= 1;
             }
-            if j < start {
+            if j < start && !no_hoist {
                 let moved: Vec<MInst> = b.insts.drain(start..=p).collect();
                 for (k, z) in moved.into_iter().enumerate() {
                     b.insts.insert(j + k, z);
@@ -202,7 +211,7 @@ pub fn pad(m: &mut MFunction) -> usize {
     for b in &mut m.blocks {
         let mut i = 1;
         while i < b.insts.len() {
-            if m0_src(&b.insts[i]).is_some() && b.insts[i].skip_m0 && is_m0_writer(b.insts[i - 1].op) {
+            if crate::op_attrs::attrs(b.insts[i].op).m0_src.is_some() && b.insts[i].skip_m0 && is_m0_writer(b.insts[i - 1].op) {
                 b.insts.insert(i, MInst::new(MOp::SNop).imm(0));
                 n += 1;
                 i += 1;
