@@ -107,22 +107,11 @@ pub fn fmha_bwd_dot(name: &str) -> Function {
 }
 
 /// dQ per 128-query tile (see the module doc). Grid (ceil(SQ / 128), H, B), 4 waves x 32 queries.
-/// `_lpt` (causal): the LONGEST-FIRST launch order. The hardware dispatches workgroups in linear-id order and deals them to the 8 XCDs round-robin; with the tile index on x (fastest) the long and short tiles
-/// interleave in every XCD's queue and a long tile can start late (list scheduling without LPT order): at 512 CTAs on 256 CUs the causal dkdv takes 237 us in the dispatch model against the ideal 126 us. Here the grid
-/// is (H, B, tiles) with the tile index slowest and the heaviest tile first (dq: the highest query tile, dkdv: key tile 0), so every XCD queue is in decreasing-work order. The kernel is otherwise unchanged.
-pub fn fmha_bwd_dq_lpt(name: &str) -> Function {
-    fmha_bwd_dq_x(name, true, true)
-}
-
 pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
-    fmha_bwd_dq_x(name, causal, false)
-}
-
-fn fmha_bwd_dq_x(name: &str, causal: bool, lpt: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    if lpt {
+    if causal {
         b.grid_is(0, Ext::ka(192));
         b.grid_is(1, Ext::sym("B"));
         b.grid_is(2, Ext::ka(160).ceil_div(128));
@@ -132,7 +121,7 @@ fn fmha_bwd_dq_x(name: &str, causal: bool, lpt: bool) -> Function {
         b.grid_is(2, Ext::sym("B"));
     }
     let a = args(&mut b);
-    let (qt, h, bat) = if lpt {
+    let (qt, h, bat) = if causal {
         let nqt = { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) };
         let qz = b.let_(Op::WorkgroupIdZ);
         let q = { let v = b.bind_i32(ev(nqt) - 1 - ev(qz)); b.read_first_lane(v) };
@@ -140,7 +129,6 @@ fn fmha_bwd_dq_x(name: &str, causal: bool, lpt: bool) -> Function {
     } else {
         (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
     };
-    let qt = if causal && !lpt { let nqt = { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) }; snake8(&mut b, qt, nqt) } else { qt };
     let lane = Lane::new(&mut b);
     // GQA group G = H / HK (power of two): the KV head
     let gqa = {
@@ -339,31 +327,15 @@ fn fmha_bwd_dq_x(name: &str, causal: bool, lpt: bool) -> Function {
 
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
-/// Causal work balance across XCDs. Workgroups are dealt to the 8 XCDs round-robin by linear id (x fastest), so with the tile index on x, XCD j only ever gets the tiles j, j + 8, ... : the causal work of a tile
-/// ((16 - t) pairs of 64 queries for dkdv, t + 1 key tiles for dq) then differs by up to 2.4x between XCDs and the slowest XCD sets the time. The snake: in every full row of 8 tiles the odd rows run backwards,
-/// so XCD j gets tiles j and 15 - j (equal total work); the last partial row keeps the identity. `x`, `n` uniform.
-fn snake8(b: &mut FnBuilder, x: ValueId, n: ValueId) -> ValueId {
-    let xi = b.bind_i32(ev(x) + 0);
-    let full = b.bind_i32((ev(n).lshr(3)) << 3);
-    let odd = (ev(xi).lshr(3) & 1).eq(1);
-    let rev = b.bind_i32(odd.select_i32((ev(xi) & !7) + 7 - (ev(xi) & 7), ev(xi)));
-    let v = b.bind_i32(ev(xi).lt(ev(full)).select_i32(ev(rev), ev(xi)));
-    b.read_first_lane(v)
-}
-
-/// longest-first launch order, see `fmha_bwd_dq_lpt` (grid (H, B, key tiles), key tile 0 first)
-pub fn fmha_bwd_dkdv_lpt(name: &str) -> Function {
-    fmha_bwd_dkdv_x(name, true, true)
-}
-
+/// Causal launch order: LONGEST FIRST. The hardware takes workgroups in linear-id order and deals them to the 8 XCDs round-robin (32 CUs each, one CTA per CU at a time at this register budget). With the tile
+/// index on x (fastest) the long and short tiles interleave in every XCD queue and a long tile can start late: at 512 CTAs on 256 CUs the causal dkdv took 244 us where longest-first takes 144 us (the same dispatch
+/// model reproduces both: 237 vs 126 us; per-pair cost measured by ATT is the same isolated and under full load). So the causal kernels launch (H, B, tiles) with the tile index slowest and the heaviest tile first
+/// (dq: the highest query tile, dkdv: key tile 0). Non-causal tiles have equal work: unchanged (tiles, H, B).
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
-    fmha_bwd_dkdv_x(name, causal, false)
-}
-
-fn fmha_bwd_dkdv_x(name: &str, causal: bool, lpt: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
+    let lpt = causal;   // longest first (see above)
     if lpt {
         b.grid_is(0, Ext::ka(192));
         b.grid_is(1, Ext::sym("B"));
@@ -399,13 +371,8 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, lpt: bool) -> Function {
     let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
     let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
     lds.commit(&mut b);
-    // causal, key tile fastest: the XCD-balancing snake order
-    let kt = if causal && !lpt {
-        let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
-        snake8(&mut b, kt0, nkt)
-    } else {
-        kt0
-    };
+    let kt = kt0;
+    {
     let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
     let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
     let c0 = b.c_i32(0);
@@ -635,6 +602,7 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, lpt: bool) -> Function {
         }
     }
     b.end_if();
+    }
     let mut f = b.finish();
     // the Vs128 profile + ldsink / wsink / ldahead32 tokens: dkdv 585 -> 407 us at B1 H16 4096² (same run; Gemm profile + tokens alone 1065 vs 1072,
     // Vs128 alone slower)

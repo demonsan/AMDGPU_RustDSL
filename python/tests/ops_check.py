@@ -197,7 +197,10 @@ def check_quant_group(M=32, N=512):
     return r
 
 
-def act(a, kind):
+def act(a, kind, g=None):
+    if kind == "swiglu_oai":
+        gt, lin = min(a, 7.0), max(-7.0, min(g, 7.0))
+        return gt / (1 + math.exp(-1.702 * gt)) * (lin + 1.0)
     if kind == "silu":
         return a / (1 + math.exp(-a))
     if kind == "gelu":
@@ -213,8 +216,21 @@ def check_act_mul(M=16, D=512, kind="silu"):
     out = down_bf16(do, M * D)
     for m in range(M):
         for k in range(D):
-            ref = act(x[m * 2 * D + k], kind) * x[m * 2 * D + D + k]
+            a_, g_ = x[m * 2 * D + k], x[m * 2 * D + D + k]
+            ref = act(a_, kind, g_) if kind == "swiglu_oai" else act(a_, kind) * g_
             r.cmp(out[m * D + k], ref, abs(ref) / 128 * 1.05 + 1e-6)
+    return r
+
+
+def check_quant_static(n=8192, scale=0.01):
+    r = Res(f"quant_static_fp8 n={n}")
+    x = rand_bf16(n)
+    dx, do = up_bf16(x, (n,)), aj.DeviceBuffer((n,), "uint8")
+    aj.quant_static_fp8(dx, do, scale)
+    q = down_u8(do, n)
+    for i in range(n):
+        y = max(-448.0, min(448.0, x[i] / scale))
+        r.cmp(e4m3(q[i]), y, abs(y) / 16 * 1.02 + 2 ** -9)
     return r
 
 
@@ -432,6 +448,441 @@ def check_moe_reduce(T=8, K=8, D=512, weighted=True):
             r.cmp(out[tt * D + d], ref, abs(ref) / 128 * 1.02 + 1e-6 * mag + 1e-30)
     return r
 
+
+# ------------------------------------------------------------------------------------------------------------- compute ops
+def fp8_codes(n):
+    """random e4m3 codes with exponents 4..10 (no NaN), as tests/gpu/vendor_gemm_host.cpp"""
+    return [((R.randrange(2) << 7) | ((4 + R.randrange(7)) << 3) | R.randrange(8)) for _ in range(n)]
+
+
+def up_bytes(b, shape, dtype="uint8"):
+    return aj.DeviceBuffer(shape, dtype, itemsize=1, nbytes=len(b), data=bytes(b))
+
+
+def up_f32(vals, shape):
+    return aj.DeviceBuffer(shape, "float32", data=struct.pack(f"<{len(vals)}f", *vals))
+
+
+def check_gemm(kind="bf16", M=256, N=256, K=256, tile="auto", rows=4):
+    r = Res(f"gemm {kind} M={M} N={N} K={K} tile={tile}")
+    sa = sb = None
+    if kind == "bf16":
+        af, bf = [rbf(R.uniform(-1, 1)) for _ in range(M * K)], [rbf(R.uniform(-1, 1)) for _ in range(N * K)]
+        da = up_bf16(af, (M, K))
+        db = up_bytes(aj.shuffle_weight(struct.pack(f"<{N * K}H", *[bf16_bits(v) for v in bf]), N, K, 2), (N, K * 2))
+    elif kind in ("fp8_rowcol", "fp8_blockscale"):
+        ac, bc = fp8_codes(M * K), fp8_codes(N * K)
+        af, bf = [e4m3(c) for c in ac], [e4m3(c) for c in bc]
+        da, db = up_bytes(ac, (M, K)), up_bytes(aj.shuffle_weight(bytes(bc), N, K, 1), (N, K))
+        if kind == "fp8_rowcol":
+            sa, sb = [1e-3 * (1 + R.randrange(100) / 100) for _ in range(M)], [1e-3 * (1 + R.randrange(100) / 100) for _ in range(N)]
+        else:
+            sa = [2.0 ** -R.randrange(4) * (1 + R.randrange(8) / 8) for _ in range(M * (K // 128))]
+            sb = [2.0 ** -R.randrange(4) * (1 + R.randrange(8) / 8) for _ in range(N // 128 * (K // 128))]
+    else:  # mxfp4
+        ab, bb = bytes(R.randrange(256) for _ in range(M * K // 2)), bytes(R.randrange(256) for _ in range(N * K // 2))
+        af = [e2m1((ab[i // 2] >> (4 * (i % 2))) & 15) for i in range(M * K)]
+        bf = [e2m1((bb[i // 2] >> (4 * (i % 2))) & 15) for i in range(N * K)]
+        sa8, sb8 = bytes(120 + R.randrange(10) for _ in range(M * K // 32)), bytes(120 + R.randrange(10) for _ in range(N * K // 32))
+        da, db = up_bytes(ab, (M, K // 2)), up_bytes(aj.shuffle_weight(bb, N, K // 2, 1), (N, K // 2))
+        dsa, dsb = up_bytes(aj.shuffle_mx_scales(sa8, M, K), (M, K // 32)), up_bytes(aj.shuffle_mx_scales(sb8, N, K), (N, K // 32))
+    if kind in ("fp8_rowcol", "fp8_blockscale"):
+        dsa, dsb = up_f32(sa, (len(sa),)), up_f32(sb, (len(sb),))
+    elif kind == "bf16":
+        dsa = dsb = None
+    do = aj.DeviceBuffer((M, N), "bfloat16")
+    name, S = aj.gemm(da, db, do, kind=kind, a_scale=dsa, b_scale=dsb, K=K, tile=tile)
+    r.name += f" -> {name} S={S}"
+    out = down_bf16(do, M * N)
+    for ri in range(rows):
+        m = ri * (M - 1) // (rows - 1)
+        for n in range(N):
+            ref = mag = 0.0
+            if kind == "fp8_blockscale":
+                for kb in range(K // 128):
+                    p_ = sum(af[m * K + k] * bf[n * K + k] for k in range(kb * 128, kb * 128 + 128))
+                    s = sa[m * (K // 128) + kb] * sb[(n // 128) * (K // 128) + kb]
+                    ref += p_ * s
+                    mag += abs(p_ * s)
+            elif kind == "mxfp4":
+                for g in range(K // 32):
+                    p_ = sum(af[m * K + k] * bf[n * K + k] for k in range(g * 32, g * 32 + 32))
+                    s = 2.0 ** (sa8[m * (K // 32) + g] - 127) * 2.0 ** (sb8[n * (K // 32) + g] - 127)
+                    ref += p_ * s
+                    mag += abs(p_ * s)
+            else:
+                terms = [af[m * K + k] * bf[n * K + k] for k in range(K)]
+                ref, mag = sum(terms), sum(abs(x) for x in terms)
+                if kind == "fp8_rowcol":
+                    ref, mag = ref * sa[m] * sb[n], mag * sa[m] * sb[n]
+            # fp32 accumulation over K terms (+ one rounding per scaled block). The f8f6f4 MFMA sums a 128-term block with an internal precision of
+            # about 2^-10 of the block's term magnitude (visible under cancellation; also with unit scales and a single K block): the 2^-8 mag term
+            tol = 1e-2 * abs(ref) + (4.0 if kind in ("fp8_blockscale", "mxfp4") else 2.0) * K * 2 ** -24 * mag + 1e-6
+            if kind == "fp8_blockscale":
+                tol += 2 ** -8 * mag
+            r.cmp(out[m * N + n], ref, tol)
+    return r
+
+
+def attn_ref_row(q, k, v, b, h, qi, SQ, SK, H, HK, D, causal, scale):
+    hk = h // (H // HK)
+    qv = q[((b * SQ + qi) * H + h) * D:((b * SQ + qi) * H + h + 1) * D]
+    kmax = min(SK - 1, qi + SK - SQ) if causal else SK - 1
+    s = []
+    for kk in range(kmax + 1):
+        base = ((b * SK + kk) * HK + hk) * D
+        s.append(sum(qv[d] * k[base + d] for d in range(D)) * scale)
+    m = max(s)
+    p = [math.exp(x - m) for x in s]
+    l_ = sum(p)
+    o = [0.0] * D
+    for kk, w in enumerate(p):
+        base = ((b * SK + kk) * HK + hk) * D
+        for d in range(D):
+            o[d] += w * v[base + d]
+    return [x / l_ for x in o], m + math.log(l_)
+
+
+def check_prefill(B=1, H=4, HK=2, SQ=384, SK=1024, causal=False, rows=6):
+    D = 128
+    r = Res(f"prefill_bf16 B={B} H={H} HK={HK} SQ={SQ} SK={SK} causal={int(causal)}")
+    q, k, v = rand_bf16(B * SQ * H * D), rand_bf16(B * SK * HK * D), rand_bf16(B * SK * HK * D)
+    dq, dk, dv = up_bf16(q, (B, SQ, H, D)), up_bf16(k, (B, SK, HK, D)), up_bf16(v, (B, SK, HK, D))
+    do, dl = aj.DeviceBuffer((B, SQ, H, D), "bfloat16"), aj.DeviceBuffer((B, H, SQ), "float32")
+    name, S = aj.prefill_bf16(dq, dk, dv, do, causal=causal, lse=dl)
+    r.name += f" -> {name} S={S}"
+    out, lse = down_bf16(do, B * SQ * H * D), down_f32(dl, B * H * SQ)
+    scale = 1.0 / math.sqrt(D)
+    for c in range(rows):
+        b, h = R.randrange(B), (0 if c == 0 else H - 1 if c == 1 else R.randrange(H))
+        qi = 0 if c == 0 else SQ - 1 if c == 1 else R.randrange(SQ)
+        o, l_ = attn_ref_row(q, k, v, b, h, qi, SQ, SK, H, HK, D, causal, scale)
+        for d in range(D):
+            r.cmp(out[((b * SQ + qi) * H + h) * D + d], o[d], 1e-2 * abs(o[d]) + 1e-2)
+        r.cmp(lse[(b * H + h) * SQ + qi], l_, 1e-3 * abs(l_) + 1e-3)
+    return r
+
+
+def check_moe(M=16, K=2, E=8, D=1024, I=256, fp8=False, tokens=3):
+    r = Res(f"fused_moe {'fp8' if fp8 else 'bf16'} M={M} K={K} E={E} D={D} I={I}")
+    ids = []
+    for _ in range(M):
+        ids += R.sample(range(E), K)
+    wts = [R.random() for _ in range(M * K)]
+    if fp8:
+        xc, w1c, w2c = fp8_codes(M * D), fp8_codes(E * 2 * I * D), fp8_codes(E * D * I)
+        xs = [0.01 * (1 + R.random()) for _ in range(M)]
+        w1s = [0.002 * (1 + R.random()) for _ in range(E * 2 * I)]
+        w2s = [0.002 * (1 + R.random()) for _ in range(E * D)]
+        xf = [e4m3(c) * xs[i // D] for i, c in enumerate(xc)]
+        w1f = [e4m3(c) * w1s[i // D] for i, c in enumerate(w1c)]
+        w2f = [e4m3(c) * w2s[i // I] for i, c in enumerate(w2c)]
+        dx = up_bytes(xc, (M, D))
+        dw1 = up_bytes(aj.shuffle_weight(aj.moe_w1_interleave(bytes(w1c), E, I, D, 1), E * 2 * I, D, 1), (E * 2 * I, D))
+        dw2 = up_bytes(aj.shuffle_weight(bytes(w2c), E * D, I, 1), (E * D, I))
+        dxs = up_f32(xs, (M,))
+        dw1s = aj.DeviceBuffer((E * 2 * I,), "float32", data=aj.moe_w1_interleave(struct.pack(f"<{E * 2 * I}f", *w1s), E, I, 1, 4))
+        dw2s = up_f32(w2s, (E * D,))
+    else:
+        xf = rand_bf16(M * D)
+        w1f = [rbf(R.gauss(0, 0.05)) for _ in range(E * 2 * I * D)]
+        w2f = [rbf(R.gauss(0, 0.05)) for _ in range(E * D * I)]
+        dx = up_bf16(xf, (M, D))
+        dw1 = up_bytes(aj.shuffle_weight(aj.moe_w1_interleave(struct.pack(f"<{len(w1f)}H", *[bf16_bits(x) for x in w1f]), E, I, D, 2), E * 2 * I, D, 2), (E * 2 * I, D * 2))
+        dw2 = up_bytes(aj.shuffle_weight(struct.pack(f"<{len(w2f)}H", *[bf16_bits(x) for x in w2f]), E * D, I, 2), (E * D, I * 2))
+        dxs = dw1s = dw2s = None
+    di, dwt = up_i32(ids, (M, K)), up_f32(wts, (M, K))
+    do = aj.DeviceBuffer((M, D), "bfloat16")
+    bm = aj.fused_moe(dx, dw1, dw2, di, dwt, do, dtype="fp8" if fp8 else "bf16", x_scale=dxs, w1_scale=dw1s, w2_scale=dw2s, num_experts=E,
+                      inter=I)
+    r.name += f" block_m={bm}"
+    out = down_bf16(do, M * D)
+    for tt in R.sample(range(M), tokens):
+        xv = xf[tt * D:(tt + 1) * D]
+        acc, mag = [0.0] * D, [0.0] * D
+        for j in range(K):
+            e, w = ids[tt * K + j], wts[tt * K + j]
+            y = []
+            for i in range(I):
+                g = sum(xv[d] * w1f[(e * 2 * I + i) * D + d] for d in range(D))
+                u = sum(xv[d] * w1f[(e * 2 * I + I + i) * D + d] for d in range(D))
+                y.append(rbf(g / (1 + math.exp(-g)) * u))
+            for d in range(D):
+                s = sum(y[i] * w2f[(e * D + d) * I + i] for i in range(I))
+                acc[d] += w * s
+                mag[d] += abs(w * s) + w * sum(abs(y[i] * w2f[(e * D + d) * I + i]) for i in range(0, I, 8)) * 8 / I
+        for d in range(D):
+            tol = (0.04 if fp8 else 1e-2) * abs(acc[d]) + (0.03 if fp8 else 2e-3) * mag[d] + 1e-4
+            r.cmp(out[tt * D + d], acc[d], tol)
+    return r
+
+
+# ------------------------------------------------------------------------------------------------------------- remaining families
+def check_mla(B=2, H=16, CTX=256, P=16, heads=4):
+    r = Res(f"mla_decode B={B} H={H} CTX={CTX} P={P}")
+    maxp = -(-CTX // P)
+    npages = B * maxp
+    lens = [R.randint(CTX // 2, CTX) for _ in range(B)]
+    pages = list(range(npages))
+    R.shuffle(pages)
+    bt = [pages[b * maxp:(b + 1) * maxp] for b in range(B)]
+    q, kv = rand_bf16(B * H * 576), rand_bf16(npages * P * 576)
+    dq, dkv = up_bf16(q, (B, H, 576)), up_bf16(kv, (npages, P, 576))
+    dbt, dcl = up_i32([x for row in bt for x in row], (B, maxp)), up_i32(lens, (B,))
+    do = aj.DeviceBuffer((B, H, 512), "bfloat16")
+    name, S = aj.mla_decode(dq, dkv, dbt, dcl, do)
+    r.name += f" -> {name} S={S}"
+    out = down_bf16(do, B * H * 512)
+    sc = 1 / math.sqrt(576)
+    for b in range(B):
+        for h in R.sample(range(H), heads):
+            qv = q[(b * H + h) * 576:(b * H + h + 1) * 576]
+            rows = [((bt[b][key // P] * P + key % P) * 576) for key in range(lens[b])]
+            s = [sum(qv[d] * kv[base + d] for d in range(576)) * sc for base in rows]
+            m = max(s)
+            pp = [math.exp(x - m) for x in s]
+            l_ = sum(pp)
+            for d in range(512):
+                ref = sum(w * kv[base + d] for w, base in zip(pp, rows)) / l_
+                r.cmp(out[(b * H + h) * 512 + d], ref, 1e-2 * abs(ref) + 2e-2)
+    return r
+
+
+def sample_ref(row, inv_t, u, top_k, top_p):
+    V = len(row)
+    xs = [v * inv_t for v in row]
+    mx = max(xs)
+    p = [math.exp(x - mx) for x in xs]
+    keep = [True] * V
+    if top_k > 0:
+        kth = sorted(xs, reverse=True)[min(top_k, V) - 1]
+        keep = [x >= kth for x in xs]
+    if top_p < 1.0:
+        sk = sum(p[i] for i in range(V) if keep[i])
+        kv = sorted((xs[i] for i in range(V) if keep[i]), reverse=True)
+        cum, thr = 0.0, kv[-1]
+        for x in kv:
+            cum += math.exp(x - mx)
+            if cum >= top_p * sk:
+                thr = x
+                break
+        keep = [keep[i] and xs[i] >= thr for i in range(V)]
+    sk2 = sum(p[i] for i in range(V) if keep[i])
+    target, acc = min(u, 0.99999994) * sk2, 0.0
+    for i in range(V):
+        if keep[i]:
+            acc += p[i]
+            if acc >= target:
+                return i, p, keep, sk2
+    return V - 1, p, keep, sk2
+
+
+def check_sampling(B=8, V=1024, mode="sample", top_k=0, top_p=1.0, temp=0.8):
+    r = Res(f"{mode} B={B} V={V}" + (f" top_k={top_k} top_p={top_p}" if mode == "sample" else ""))
+    lg = [rbf(R.gauss(0, 3)) for _ in range(B * V)]
+    for b in range(B):
+        lg[b * V + (b * 7919) % V] = 30.0
+        if b % 3 == 0:
+            lg[b * V + (b * 104729) % V] = 30.0
+    dl, do = up_bf16(lg, (B, V)), aj.DeviceBuffer((B,), "int32")
+    if mode == "argmax":
+        aj.argmax(dl, do)
+    else:
+        us = [R.random() for _ in range(B)]
+        aj.sample(dl, up_f32(us, (B,)), do, temperature=temp, top_k=top_k, top_p=top_p)
+    got = struct.unpack(f"<{B}i", do.download())
+    for b in range(B):
+        row = lg[b * V:(b + 1) * V]
+        if mode == "argmax":
+            r.cmp(got[b], max(range(V), key=lambda i: (row[i], -i)), 0)
+            continue
+        ref, p, keep, sk2 = sample_ref(row, 1 / temp, us[b], top_k, top_p)
+        if got[b] != ref and 0 <= got[b] < V:
+            lo, hi = min(got[b], ref), max(got[b], ref)
+            between = sum(p[i] for i in range(lo + 1, hi + 1) if keep[i])
+            r.cmp(0 if between / sk2 < 2e-4 else 1, 0, 0)  # the kernel's float cumulative sums: neighbours at the boundary
+        else:
+            r.cmp(got[b], ref, 0)
+    return r
+
+
+def check_topk_per_row(mode="decode", B=4, stride=1024, K=128):
+    r = Res(f"topk_per_row_{mode} R={B} stride={stride} K={K}")
+    lg = [R.gauss(0, 1) for _ in range(B * stride)]
+    dl, di = up_f32(lg, (B, stride)), aj.DeviceBuffer((B, K), "int32")
+    if mode == "decode":
+        lens = [R.randint(K // 2, stride) for _ in range(B)]
+        aj.topk_per_row_decode(dl, up_i32(lens, (B,)), di)
+        spans = [(0, L) for L in lens]
+    else:
+        spans = []
+        for _ in range(B):
+            s0 = R.randrange(stride // 2)
+            spans.append((s0, R.randint(s0 + 1, stride)))
+        aj.topk_per_row_prefill(dl, up_i32([s for s, _ in spans], (B,)), up_i32([e for _, e in spans], (B,)), di)
+    ix = struct.unpack(f"<{B * K}i", di.download())
+    for b in range(B):
+        s0, e0 = spans[b]
+        L = e0 - s0
+        row = ix[b * K:(b + 1) * K]
+        n = min(K, L)
+        sel = row[:n]
+        r.cmp(len(set(sel)), n, 0)
+        r.cmp(sum(1 for c in sel if not (s0 <= c < e0)), 0, 0)
+        want = sorted((lg[b * stride + c] for c in range(s0, e0)), reverse=True)[:n]
+        r.cmp(0 if sorted((lg[b * stride + c] for c in sel if s0 <= c < e0), reverse=True) == want else 1, 0, 0)
+        r.cmp(sum(1 for c in row[n:] if c != -1), 0, 0)
+    return r
+
+
+def silu(x):
+    return x / (1 + math.exp(-x))
+
+
+def check_conv1d_fwd(dim=256, W=4, lens=(5, 13, 2), slots=4):
+    B, T = len(lens), sum(lens)
+    r = Res(f"causal_conv1d_fwd B={B} dim={dim} W={W}")
+    x, wt, bias = rand_bf16(T * dim), rand_bf16(dim * W, 0.5), rand_bf16(dim, 0.5)
+    st = rand_bf16(slots * dim * (W - 1))
+    cu = [0]
+    for L in lens:
+        cu.append(cu[-1] + L)
+    cidx = [2, 0, -1][:B]
+    hinit = [1, 0, 1][:B]
+    dx, dw, db = up_bf16(x, (T, dim)), up_bf16(wt, (dim, W)), up_bf16(bias, (dim,))
+    dst = up_bf16(st, (slots, dim, W - 1))
+    do = aj.DeviceBuffer((T, dim), "bfloat16")
+    do.fill(0)
+    aj.causal_conv1d_fwd(dx, dw, db, up_i32(cu, (B + 1,)), up_i32(cidx, (B,)), up_bytes(hinit, (B,)), dst, do, max_seqlen=max(lens))
+    out, st2 = down_bf16(do, T * dim), down_bf16(dst, slots * dim * (W - 1))
+    for b in range(B):
+        if cidx[b] < 0:
+            continue
+        for f in range(dim):
+            init = [st[(cidx[b] * dim + f) * (W - 1) + i] if hinit[b] else 0.0 for i in range(W - 1)]
+            seq = init + [x[(cu[b] + t) * dim + f] for t in range(lens[b])]
+            for t in range(lens[b]):
+                acc = bias[f] + sum(wt[f * W + i] * seq[t + i] for i in range(W))
+                ref = silu(acc)
+                r.cmp(out[(cu[b] + t) * dim + f], ref, abs(ref) / 64 + 1e-2)
+            for i in range(W - 1):
+                r.cmp(st2[(cidx[b] * dim + f) * (W - 1) + i], seq[len(seq) - (W - 1) + i], 0)
+    return r
+
+
+def check_conv1d_update(B=4, dim=256, W=4, SL=3, slots=6):
+    r = Res(f"causal_conv1d_update B={B} dim={dim} W={W} SL={SL}")
+    x, wt, bias, st = rand_bf16(B * dim), rand_bf16(dim * W, 0.5), rand_bf16(dim, 0.5), rand_bf16(slots * dim * SL)
+    idx = [3, -1, 0, 5][:B]
+    dx, dw, db, dst = up_bf16(x, (B, dim)), up_bf16(wt, (dim, W)), up_bf16(bias, (dim,)), up_bf16(st, (slots, dim, SL))
+    do = aj.DeviceBuffer((B, dim), "bfloat16")
+    do.fill(0)
+    aj.causal_conv1d_update(dx, dw, db, dst, do, state_indices=up_i32(idx, (B,)))
+    out, st2 = down_bf16(do, B * dim), down_bf16(dst, slots * dim * SL)
+    for b in range(B):
+        s = idx[b]
+        if s < 0:
+            continue
+        for c in range(dim):
+            row = st[(s * dim + c) * SL:(s * dim + c + 1) * SL]
+            xv = row[SL - (W - 1):] + [x[b * dim + c]]
+            ref = silu(bias[c] + sum(wt[c * W + j] * xv[j] for j in range(W)))
+            r.cmp(out[b * dim + c], ref, abs(ref) / 64 + 1e-2)
+            new = row[1:] + [x[b * dim + c]]
+            for l in range(SL):
+                r.cmp(st2[(s * dim + c) * SL + l], new[l], 0)
+    return r
+
+
+def check_gemm_w4(kind="a16w4", M=64, N=128, K=256, rows=4):
+    r = Res(f"gemm_w4 {kind} M={M} N={N} K={K}")
+    bb = bytes(R.randrange(256) for _ in range(N * K // 2))
+    bf = [e2m1((bb[i // 2] >> (4 * (i % 2))) & 15) for i in range(N * K)]
+    sb8 = bytes(124 + R.randrange(6) for _ in range(N * K // 32))
+    if kind == "a16w4":
+        af = [rbf((R.randrange(17) - 8) / 8) for _ in range(M * K)]
+        da = up_bf16(af, (M, K))
+        db = up_bytes(aj.shuffle_weight(aj.a16w4_permute(bb, N, K), N, K // 2, 1), (N, K // 2))
+        dsb, dsa, sa8 = up_bytes(sb8, (N, K // 32)), None, None
+    else:
+        ac = fp8_codes(M * K)
+        af = [e4m3(c) for c in ac]
+        sa8 = bytes(124 + R.randrange(6) for _ in range(M * K // 32))
+        da = up_bytes(ac, (M, K))
+        db = up_bytes(aj.shuffle_weight(bb, N, K // 2, 1), (N, K // 2))
+        dsa, dsb = up_bytes(aj.shuffle_mx_scales(sa8, M, K), (M, K // 32)), up_bytes(aj.shuffle_mx_scales(sb8, N, K), (N, K // 32))
+    do = aj.DeviceBuffer((M, N), "bfloat16")
+    aj.gemm_w4(da, db, do, b_scale=dsb, a_scale=dsa, kind=kind, K=K)
+    out = down_bf16(do, M * N)
+    for ri in range(rows):
+        m = ri * (M - 1) // (rows - 1)
+        for n in range(N):
+            ref = mag = 0.0
+            for g in range(K // 32):
+                p_ = sum(af[m * K + k] * bf[n * K + k] for k in range(g * 32, g * 32 + 32))
+                s = 2.0 ** (sb8[n * (K // 32) + g] - 127) * (2.0 ** (sa8[m * (K // 32) + g] - 127) if sa8 else 1.0)
+                ref += p_ * s
+                mag += abs(p_ * s)
+            r.cmp(out[m * N + n], ref, 1e-2 * abs(ref) + 2 ** -8 * mag + 1e-6)
+    return r
+
+
+def check_attn_bwd(B=1, H=2, HK=1, SQ=256, SK=256, causal=False, nrows=3):
+    D = 128
+    r = Res(f"attention_bwd B={B} H={H} HK={HK} SQ={SQ} SK={SK} causal={int(causal)}")
+    G = H // HK
+    q, k, v, dov = rand_bf16(B * SQ * H * D), rand_bf16(B * SK * HK * D), rand_bf16(B * SK * HK * D), rand_bf16(B * SQ * H * D)
+    sc = 1 / math.sqrt(D)
+    qi = lambda b, s, h: ((b * SQ + s) * H + h) * D
+    ki = lambda b, s, h: ((b * SK + s) * HK + h) * D
+    # CPU forward: P rows, O (bf16) and LSE
+    P_, O, L = {}, [0.0] * (B * SQ * H * D), [0.0] * (B * H * SQ)
+    for b in range(B):
+        for h in range(H):
+            for s in range(SQ):
+                kmax = min(SK - 1, s + SK - SQ) if causal else SK - 1
+                sc_ = [sum(q[qi(b, s, h) + d] * k[ki(b, kk, h // G) + d] for d in range(D)) * sc for kk in range(kmax + 1)]
+                m = max(sc_)
+                e = [math.exp(x - m) for x in sc_]
+                l_ = sum(e)
+                L[(b * H + h) * SQ + s] = m + math.log(l_)
+                p = [x / l_ for x in e]
+                P_[(b, h, s)] = p
+                for d in range(D):
+                    O[qi(b, s, h) + d] = rbf(sum(p[kk] * v[ki(b, kk, h // G) + d] for kk in range(len(p))))
+    dq_, dk_, dv_ = up_bf16(q, (B, SQ, H, D)), up_bf16(k, (B, SK, HK, D)), up_bf16(v, (B, SK, HK, D))
+    do_, dO_ = up_bf16(O, (B, SQ, H, D)), up_bf16(dov, (B, SQ, H, D))
+    dl = up_f32(L, (B, H, SQ))
+    gq, gk, gv = aj.DeviceBuffer((B, SQ, H, D), "bfloat16"), aj.DeviceBuffer((B, SK, H, D), "bfloat16"), aj.DeviceBuffer((B, SK, H, D), "bfloat16")
+    name = aj.attention_bwd_bf16(dq_, dk_, dv_, do_, dO_, dl, gq, gk, gv, causal=causal)
+    r.name += f" -> {name}"
+    GQ, GK, GV = down_bf16(gq, B * SQ * H * D), down_bf16(gk, B * SK * H * D), down_bf16(gv, B * SK * H * D)
+    dot = {}
+
+    def dS(b, h, s):
+        if (b, h, s) not in dot:
+            dot[(b, h, s)] = sum(dov[qi(b, s, h) + d] * O[qi(b, s, h) + d] for d in range(D))
+        p = P_[(b, h, s)]
+        dp = [sum(dov[qi(b, s, h) + d] * v[ki(b, kk, h // G) + d] for d in range(D)) for kk in range(len(p))]
+        return [p[kk] * (dp[kk] - dot[(b, h, s)]) for kk in range(len(p))]
+    for _ in range(nrows):
+        b, h, s = R.randrange(B), R.randrange(H), R.randrange(SQ)
+        ds = dS(b, h, s)
+        for d in range(D):
+            ref = sc * sum(ds[kk] * k[ki(b, kk, h // G) + d] for kk in range(len(ds)))
+            r.cmp(GQ[qi(b, s, h) + d], ref, 2e-2 * abs(ref) + 2e-2)
+    for _ in range(nrows):
+        b, h, kk = R.randrange(B), R.randrange(H), R.randrange(SK)
+        rows = [s for s in range(SQ) if len(P_[(b, h, s)]) > kk]
+        dss = {s: dS(b, h, s)[kk] for s in rows}
+        for d in range(D):
+            refk = sc * sum(dss[s] * q[qi(b, s, h) + d] for s in rows)
+            refv = sum(P_[(b, h, s)][kk] * dov[qi(b, s, h) + d] for s in rows)
+            o_ = ((b * SK + kk) * H + h) * D + d
+            r.cmp(GK[o_], refk, 2e-2 * abs(refk) + 2e-2)
+            r.cmp(GV[o_], refv, 2e-2 * abs(refv) + 2e-2)
+    return r
+
 CHECKS = [
     ("rmsnorm", check_rmsnorm),
     ("add_rmsnorm", check_add_rmsnorm),
@@ -444,6 +895,8 @@ CHECKS = [
     ("act_mul_silu", check_act_mul),
     ("act_mul_gelu", lambda: check_act_mul(kind="gelu")),
     ("act_mul_gelu_tanh", lambda: check_act_mul(kind="gelu_tanh")),
+    ("quant_static_fp8", check_quant_static),
+    ("act_mul_swiglu_oai", lambda: check_act_mul(kind="swiglu_oai")),
     ("silu_mul_quant_fp8", check_silu_mul_quant),
     ("rope_neox", check_rope),
     ("rope_gptj", lambda: check_rope(style="gptj")),
@@ -457,6 +910,28 @@ CHECKS = [
     ("moe_sorting", check_moe_sorting),
     ("moe_reduce", check_moe_reduce),
     ("moe_combine", lambda: check_moe_reduce(weighted=False)),
+    ("gemm_bf16", check_gemm),
+    ("gemm_bf16_256", lambda: check_gemm(tile=256)),
+    ("gemm_fp8_rowcol", lambda: check_gemm("fp8_rowcol")),
+    ("gemm_fp8_blockscale", lambda: check_gemm("fp8_blockscale", M=4096, N=4096, K=256, rows=2)),
+    ("gemm_fp8_blockscale_splitk", lambda: check_gemm("fp8_blockscale", M=256, N=1024, K=512)),
+    ("gemm_mxfp4", lambda: check_gemm("mxfp4", K=512)),
+    ("prefill_bf16", check_prefill),
+    ("prefill_bf16_causal", lambda: check_prefill(causal=True)),
+    ("fused_moe_bf16", check_moe),
+    ("fused_moe_fp8", lambda: check_moe(fp8=True)),
+    ("mla_decode", check_mla),
+    ("argmax", lambda: check_sampling(mode="argmax")),
+    ("sample", check_sampling),
+    ("sample_topkp", lambda: check_sampling(top_k=50, top_p=0.9)),
+    ("topk_per_row_decode", check_topk_per_row),
+    ("topk_per_row_prefill", lambda: check_topk_per_row(mode="prefill")),
+    ("causal_conv1d_fwd", check_conv1d_fwd),
+    ("causal_conv1d_update", check_conv1d_update),
+    ("gemm_a16w4", check_gemm_w4),
+    ("gemm_a8w4", lambda: check_gemm_w4("a8w4", M=128, N=128, K=512)),
+    ("attention_bwd", check_attn_bwd),
+    ("attention_bwd_causal", lambda: check_attn_bwd(causal=True)),
 ]
 
 

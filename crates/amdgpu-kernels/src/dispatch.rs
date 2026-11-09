@@ -73,12 +73,12 @@ pub fn decode16_kernel(page: u32, plan: Decode16Plan) -> (String, u32) {
     }
 }
 
-/// Causal attention backward: the longest-first forms `fmha_bwd_dq_hd128_bf16_causal_lpt` / `fmha_bwd_dkdv_hd128_bf16_causal_lpt` (grid
+/// Causal attention backward: the causal kernels (longest-first launch order built in: `fmha_bwd_dq_hd128_bf16_causal` / `fmha_bwd_dkdv_hd128_bf16_causal` grid
 /// (H, B, tiles), heaviest tile first: the hardware dispatcher takes workgroups in linear order, so long tiles start first). Same run vs the
 /// key-tile-fastest grid / the paired dkdv (archive/bwd-dkdv-pair): B1 H16 4096² 598 / 450 -> 407 us, B4 H8 2048² 323 / 249 -> 228,
 /// B1 H8 HK2 2048² 174 / 186 -> 167, B2 H8 HK2 1000x1500 118 / 151 -> 113.
 pub fn bwd_causal_kernels() -> (&'static str, &'static str) {
-    ("fmha_bwd_dq_hd128_bf16_causal_lpt", "fmha_bwd_dkdv_hd128_bf16_causal_lpt")
+    ("fmha_bwd_dq_hd128_bf16_causal", "fmha_bwd_dkdv_hd128_bf16_causal")
 }
 
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn bwd_causal_lpt_registered() {
+    fn bwd_causal_registered() {
         let (q, k) = super::bwd_causal_kernels();
         assert!(crate::registry::kernel_by_name(q).is_some() && crate::registry::kernel_by_name(k).is_some());
     }
