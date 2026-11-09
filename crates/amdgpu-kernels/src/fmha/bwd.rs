@@ -320,10 +320,11 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 /// ((16 - t) pairs of 64 queries for dkdv, t + 1 key tiles for dq) then differs by up to 2.4x between XCDs and the slowest XCD sets the time. The snake: in every full row of 8 tiles the odd rows run backwards,
 /// so XCD j gets tiles j and 15 - j (equal total work); the last partial row keeps the identity. `x`, `n` uniform.
 fn snake8(b: &mut FnBuilder, x: ValueId, n: ValueId) -> ValueId {
+    let xi = b.bind_i32(ev(x) + 0);
     let full = b.bind_i32((ev(n).lshr(3)) << 3);
-    let odd = (ev(x).lshr(3) & 1).eq(1);
-    let rev = b.bind_i32(odd.select_i32((ev(x) & !7) + 7 - (ev(x) & 7), ev(x)));
-    let v = b.bind_i32(ev(x).lt(ev(full)).select_i32(ev(rev), ev(x)));
+    let odd = (ev(xi).lshr(3) & 1).eq(1);
+    let rev = b.bind_i32(odd.select_i32((ev(xi) & !7) + 7 - (ev(xi) & 7), ev(xi)));
+    let v = b.bind_i32(ev(xi).lt(ev(full)).select_i32(ev(rev), ev(xi)));
     b.read_first_lane(v)
 }
 
