@@ -101,7 +101,7 @@ impl Report {
                 l.asm_opaque += 1;
                 continue;
             }
-            if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") || f.msg.contains("set_var") {
+            if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") {
                 continue;
             }
             if f.msg.contains("tile_trust_periodic") {
@@ -1873,7 +1873,7 @@ impl<'a> An<'a> {
                     // a trusted loop-variable range the analysis proves anyway (initial value inside, every set_var inside - checked at the
                     // set_vars) costs no trust: only an unproven initial value or step is counted (TRUSTED)
                     if init_ok {
-                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): initial value proven inside; an unproven set_var step is TRUSTED", self.idx, v.0, a.show());
+                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): initial value proven inside; counted only if a step is not proven", self.idx, v.0, a.show());
                         self.rep.add("GV-ASSUME", Severity::Info, m);
                     } else {
                         let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the initial value is not proven inside", self.idx, v.0, a.show());
