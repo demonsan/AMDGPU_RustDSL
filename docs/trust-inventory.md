@@ -184,6 +184,7 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 |---|---|
 | 冒险模型：`op_attrs` 的延迟、等待态、MFMA 原位链互锁（本轮扩展到 bf16 / f16 / i8 与 zero-C 起始） | 有 tbl 行的 MOp 对照 LLVM hazard oracle；own-only 的 MOp 只靠硬件探针（`probe_mfma_p1` 等） |
 | 等待计数 | `verify_waits`：每条路径上的 vmcnt / lgkmcnt |
+| VALU 写 SGPR 的冒险（本轮新增）| `pad_valu_sgpr`（RA 之后）：VMEM 读该 SGPR 需 5 个等待态，VALU 读需 2 个（LLVM GCNHazardRecognizer：checkVMEMHazards、hasVDecCoExecHazard）；`probe_valu_sgpr` 在硬件上复现了不加等待时读到过期 SGPR（2048 个值中错 1984 个）；LLVM 尾端在相同位置插入相同的 s_nop |
 | 在途 load 的物理 WAW、物理 WAR | RA 之后的 `pad_inflight_waw` / `pad_physical_war`（本轮的 MLA / Vs128 错误发生在这里，不在 gpu_verify 的范围） |
 | 均匀性分析（scalarize / waveuni） | 编译器自身的分析，没有独立证明 |
 | M0 / LDS-DMA 语义、调度器、LLVM 尾端、汇编器 | 门禁、探针、md5 回归 |
