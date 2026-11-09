@@ -73,13 +73,6 @@ pub fn decode16_kernel(page: u32, plan: Decode16Plan) -> (String, u32) {
     }
 }
 
-/// Causal attention backward: run the paired dkdv form (`fmha_bwd_dkdv_hd128_bf16_causal_pair`, key tiles x and nkt - 1 - x per CTA) when the
-/// unpaired grid ceil(SK / 128) H B is at least twice the CU count (the halved grid still fills the GPU). Measured: B1 H16 4096² dkdv 460 -> 276 us;
-/// B1 H8 2048² (128 CTAs) 119 -> 132 and B4 H8 1024² (256) 72 -> 81 (slower: kept unpaired).
-pub fn bwd_dkdv_pair(b: u64, h: u64, sk: u64, cus: u64) -> bool {
-    sk.div_ceil(128) * h * b >= 2 * cus
-}
-
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
 /// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
 /// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
@@ -201,12 +194,5 @@ mod tests {
         assert_eq!(decode16_plan(1, 8, 256), P::Fused);
         assert_eq!(decode16_kernel(16, P::LastC(4)), ("pa_decode16_bf16_hd128_p16_c".to_string(), 4));
         assert!(crate::kernel_by_name("pa_decode16_bf16_hd128_p16_c").is_some());
-    }
-
-    #[test]
-    fn bwd_dkdv_pair_rule() {
-        assert!(super::bwd_dkdv_pair(1, 16, 4096, 256));
-        assert!(!super::bwd_dkdv_pair(1, 8, 2048, 256));
-        assert!(!super::bwd_dkdv_pair(4, 8, 1024, 256));
     }
 }

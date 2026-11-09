@@ -327,30 +327,21 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
-/// `_pair` (causal): CTA x takes key tiles x and nkt - 1 - x (equal work per CTA; the grid is halved) - for grids that still fill the CUs.
 /// Causal launch order: LONGEST FIRST. The hardware takes workgroups in linear-id order and deals them to the 8 XCDs round-robin (32 CUs each, one CTA per CU at a time at this register budget). With the tile
 /// index on x (fastest) the long and short tiles interleave in every XCD queue and a long tile can start late: at 512 CTAs on 256 CUs the causal dkdv took 244 us where longest-first takes 144 us (the same dispatch
 /// model reproduces both: 237 vs 126 us; per-pair cost measured by ATT is the same isolated and under full load). So the causal kernels launch (H, B, tiles) with the tile index slowest and the heaviest tile first
 /// (dq: the highest query tile, dkdv: key tile 0). Non-causal tiles have equal work: unchanged (tiles, H, B).
-pub fn fmha_bwd_dkdv_pair(name: &str) -> Function {
-    fmha_bwd_dkdv_x(name, true, true)
-}
-
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
-    fmha_bwd_dkdv_x(name, causal, false)
-}
-
-fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    let lpt = causal && !pair;   // longest first (see above); the paired form keeps its (tiles, H, B) grid
+    let lpt = causal;   // longest first (see above)
     if lpt {
         b.grid_is(0, Ext::ka(192));
         b.grid_is(1, Ext::sym("B"));
         b.grid_is(2, Ext::ka(176).ceil_div(128));
     } else {
-        b.grid_is(0, if pair { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
+        b.grid_is(0, Ext::ka(176).ceil_div(128));
         b.grid_is(1, Ext::ka(192));
         b.grid_is(2, Ext::sym("B"));
     }
@@ -380,23 +371,8 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
     let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
     let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
     lds.commit(&mut b);
-    // pair: key tiles x and nkt - 1 - x (the second only when distinct)
-    let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
-        let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
-        let kb_ = { let v = b.bind_i32(ev(nkt) - 1 - ev(kt0)); b.read_first_lane(v) };
-        let second = b.bind_cond(ev(kb_).gt(ev(kt0)));
-        vec![(kt0, None), (kb_, Some(second))]
-    } else {
-        vec![(kt0, None)]
-    };
-    for (kt, guard) in passes {
-    if let Some(g) = guard {
-        // the LDS rings are reused by the second pass: every wave is done with the first
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        b.begin_if(Opnd::Val(g));
-    }
+    let kt = kt0;
+    {
     let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
     let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
     let c0 = b.c_i32(0);
@@ -626,9 +602,6 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
         }
     }
     b.end_if();
-    if guard.is_some() {
-        b.end_if();
-    }
     }
     let mut f = b.finish();
     // the Vs128 profile + ldsink / wsink / ldahead32 tokens: dkdv 585 -> 407 us at B1 H16 4096² (same run; Gemm profile + tokens alone 1065 vs 1072,
