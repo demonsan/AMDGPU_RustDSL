@@ -590,7 +590,11 @@
   - 我们的 LDS bank conflict 是厂商的 23–27×，SALU 是 10×；
   - 我们 SQ_WAIT_ANY 占比为 54–57%，厂商为 13–26%。
 - 按 Little 定律估算，B16 要跑满 HBM，每个 wave 大约需要 21 KB 数据在途，而我们只有一个 16 KB 的 tile 在途。
-- 下一步方向：K 直接加载到 VGPR、V 留在 LDS，以加深在途深度；同时修正 K/V 的 swizzle。
+- `archive/decode16-v2`：K 直接加载到 VGPR（8 次 b128），V 放进 3 个 slot 的 LDS ring（chunk 按 key % 16 做 XOR），页表项提前一个 tile 读出，循环按 3 展开。每个 wave 有 2 个 tile 在途，结果 bad=0。
+  - 第一版里页表的 b64 load 不能原地写回，产生了 vmcnt(0)；改成 b128 后修复。
+  - 但没有收益：B16 fused 为 32.5 µs（基线 32.7），B64 fused 为 91.9（基线 84.9），B8 S4 为 49.2（基线 47.0）。
+  - 结论：加深在途数据不是瓶颈。每 tile 约 640 条指令，每个 SIMD 只有 1 个 wave，依赖延迟全部暴露，折合每 tile 约 1.6–1.9 µs。
+- 下一步：削减每 tile 的指令数和依赖链，包括把 key、页、地址计算提出循环（P=16 时每个 tile 只涉及 2 个页），以及更大的 tile。需要 ATT 时间线来确认。
 
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
