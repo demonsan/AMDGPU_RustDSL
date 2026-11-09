@@ -474,7 +474,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
     // period check): declared trusted periodic (counted in the ledger)
     b.tile_trust_periodic("moe_scatter_ordered: WC versions 2 ch / 2 ch + 1 depend on the chunk counter; the nested rank loop repeats the same version");
     let t_wc = owned_at(b, "WC", wc as i64, 65536, 4, 4096);   // thread e owns column e: WC[w][e] at wc + 4 e + 4096 w
-    let t_cur = tile_at(b, "CURSOR", cursor as i64, 4096);
+    let t_cur = owned_at(b, "CURSOR", cursor as i64, 4096, 4, 4096);   // thread e owns word e: read-modify-write in place, one version per chunk
     let t_base = tile_at(b, "BASE", base_a as i64, 4096);
     let ptr: Vec<ValueId> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: 40 });
@@ -581,7 +581,9 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
             cs.push(t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).read(b, |b| b.load_lds(a, MemTy::B32)));
         }
         let ca = b.bind_i32(ev(tid4) + cursor);
-        let curv = t_cur.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(ca, MemTy::B32));
+        let v_cur = b.bind_i32(ev(chv) + 0);
+        let v_cur1 = b.bind_i32(ev(chv) + 1);
+        let curv = t_cur.at(&SlotIdx::new(0, Opnd::Val(v_cur))).read(b, |b| b.load_lds(ca, MemTy::B32));
         b.wait_lds(0);
         let mut run = b.c_i32(0);
         for w in 0..16i32 {
@@ -592,7 +594,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let ba = b.bind_i32(ev(tid4) + base_a);
         t_base.at(&SlotIdx::new(0, Opnd::Var(ch))).write(b, |b| b.store_lds(ba, curv, MemTy::B32, false));
         let adv = b.add_i32(curv, run);
-        t_cur.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(ca, adv, MemTy::B32, false));
+        t_cur.at(&SlotIdx::new(0, Opnd::Val(v_cur1))).write(b, |b| b.store_lds(ca, adv, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
         // [D] position = the expert's chunk base + the wave's exclusive prefix + the rank in the wave
