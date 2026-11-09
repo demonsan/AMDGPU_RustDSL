@@ -984,7 +984,8 @@
 | bf16 hd192/hd128 causal（配对） | B4 H16 2048² | 128 µs | 126 µs | 0.98 |
 | bf16 hd192/hd128 causal（配对） | B1 H128 1024² | 82.8 µs | 79.5 µs | 0.96 |
 | bf16 hd192/hd128 causal（`_np`） | B1 H16 4096² | 147 µs | 113 µs | 0.77 |
-| bf16 hd192/hd128 causal（`_np_q128`） | B1 H16 2048² | 65.3 µs | 49.3 µs | 0.75 |
+| bf16 hd192/hd128 causal（`_np_q128` + 区域策略） | B1 H16 2048² | 56.9 µs | 48.9 µs | 0.86 |
+| bf16 hd192/hd128（`_ks` S2 + 区域策略） | B1 H16 2048² | 64.4 µs | 46.7 µs | 0.73 |
 | bf16 hd192/hd128 causal（`_ks` S2 + q16 combine） | B1 H8 4096² | 89.1 µs | 84.4 µs | 0.95 |
 | bf16 反向（mask 只在需要的 tile，重测） | B4 H16 2048² | 638 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.77 |
 | bf16 反向 | B1 H16 4096² | 597 µs | 467 µs | 0.78 |
@@ -1008,6 +1009,8 @@
   - hd128 causal 在配对网格 P = 128（短 key）上胜出：B4 H16 1024² 51.5 → 40.6，B1 H32 HK8 2048² 77.2 → 65.1；P = 64 时 v1（32.9）仍最好，P = 256 时配对的 256 行形式最好（B8 H16 1024² 65.5 / 69.3）。新增 `fmha_fwd_hd128_bf16_v3_causal_q128`，`bf16_prefill_kernel`：短 key 且 P < CU/2 用 v1（阈值从 64 提到 128），CU/2 ≤ P < CU 且 key tile ≤ 16 用 `_causal_q128`；
   - hd192 causal 不配对、U ≤ CU/2 时胜出：B1 H16 2048² 72.1 → 65.7，B2 H16 1024² 42.3 → 39.8，B1 H8 2048² 65.9 → 60.9；U = 256 时更慢。新增 `fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128`。
   - hd192 小网格离厂商仍有 25% 左右（B1 H16 2048² causal 0.75，非 causal 0.61）；厂商 128 行 tile 的每 CU 效率更高，原因未归因。
+- **hd192 的调度区域（sched，2026-11-09）**：ATT 显示 hd192 的循环在调度器回退后按发射顺序运行（重排后需要 277 个活跃 dword > 256），且整数 VALU 约为厂商的 10 倍（循环内重算的 LDS 读偏移）。在 `Body` 的 `kv_stage` / `v_phase` / `m_phase` 上加 weave 区域标记，对 hd192 的非配对、非切分形式改为全核 `rewait`、只在 `m_phase` 与 `kv_stage` 内重排（softmax 阶段保持发射顺序）：B1 H16 2048² 非 causal 74 → 71.6 µs，causal `_np_q128` 64.7 → 56.8，B2 H32 4096² −2 % / −5 %。把读偏移改为按 chunk 现算（kr0 ^ (c << 5)）正确但 hd192 慢 12–15 %，已归档为 `archive/bf16v3-derived-offsets`。
+- 区域策略之后重新核对分发（µs）：非 causal B1 H16 2048² plain 73.0 / ks2 62.5，因此 S = 2 的条件从 32 个 key tile 放宽到 16；causal B1 H8 2048² np 64.2 / q128 52.6 / ks2 48.0，因此 U ≤ CU/4 且 key tile ≥ 16 时也用 `_causal_ks`。
 - **hd192 非 causal 小网格**：`hd192_prefill_kernel` 对 U ≤ CU/4 用 `_ks` S4，对 U < CU 且 key tile ≥ 32 用 S2（B1 H8 2048² 66.6 → 41.3 µs，厂商 32.5；4096² 134 → 112，厂商 88）；U = 128、16 个 key tile（B1 H16 2048²）切分不划算，不切。剩余差距是结构性的：我们 256 行 / 8 wave 的 tile 在小网格下每 CU 一个 workgroup，厂商用 128 行 / 4 wave。
 
 **性能待办**：

@@ -82,9 +82,9 @@ sec hd192 && for c in 0 1; do
         set -- $sh; u=$(( $1 * $2 * (($4 + 255) / 256) )); k=fmha_fwd_hd192_hd128_bf16_v3$s; pr=0; ks=""; rows=""
         kt=$((($5 + 127) / 128))
         if [ $c = 1 ]; then
-            if [ $u -ge 512 ]; then pr=1; elif [ $((2 * u)) -le 256 ] && [ $kt -ge 32 ]; then k=${k}_ks; ks=1; elif [ $((2 * u)) -le 256 ]; then k=${k}_np_q128; rows=128; else k=${k}_np; fi
+            if [ $u -ge 512 ]; then pr=1; elif [ $((2 * u)) -le 256 ] && { [ $kt -ge 32 ] || { [ $((4 * u)) -le 256 ] && [ $kt -ge 16 ]; }; }; then k=${k}_ks; ks=1; elif [ $((2 * u)) -le 256 ]; then k=${k}_np_q128; rows=128; else k=${k}_np; fi
         elif [ $((4 * u)) -le 256 ] && [ $kt -ge 16 ]; then k=${k}_ks; ks=2
-        elif [ $u -lt 256 ] && [ $kt -ge 32 ]; then k=${k}_ks; ks=1
+        elif [ $u -lt 256 ] && [ $kt -ge 16 ]; then k=${k}_ks; ks=1
         fi
         echo "   ours form: $k${ks:+ KS=$ks}"
         env DV=128 LSE=0 CHECK=4 ROWS=${rows:-256} BLOCK=$(( ${rows:-256} * 2 )) PAIR=$pr ${ks:+KS=$ks COMBINE_CO=$OUT/attn_combine_bf16_hd128_q16.co COMBINE_KN=attn_combine_bf16_hd128_q16} timeout 900 "$OUT/attn_host" ours "$OUT/$k.co" "$k" $sh $c 192 | grep -E "TF/s"
