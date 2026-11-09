@@ -292,6 +292,21 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let bvo = b.bind_i32(ev(key).lshr(page.trailing_zeros() as i32) << 2);
         b.buffer_load_f32(r_bt, bvo, bt_so, 0)
     };
+    // grouped path, per DMA i: the lane's in-page row offset (kk_i % pgsz) HK ROW + hk ROW and the K / V source-chunk swizzles (by the
+    // destination row: loop invariant); per tile only the group page base and the cap of rows past the range (min) remain
+    let hkrow = { let v = b.bind_i32(ev(hkv_n) * ROW); b.read_first_lane(v) };
+    let pgstride = { let v = b.bind_i32(ev(hkrow) * page); b.read_first_lane(v) };
+    let ginv: Vec<(ValueId, ValueId, ValueId)> = if grp_path {
+        (0..KT / 4)
+            .map(|i| {
+                let kk = b.bind_i32(kk_of(i));
+                let a = b.bind_i32((ev(kk) & (pgsz - 1)) * ev(hkrow) + ev(hk) * ROW);
+                (a, b.bind_i32((ev(l16) ^ (ev(kk) & 15)) << 4), b.bind_i32((ev(l16) ^ ((ev(kk) & 7) << 1)) << 4))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
@@ -324,6 +339,31 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
     let nv = lookups.len() as u8;
     let gclamped: Vec<ValueId> = gpages.iter().map(|&pv| { let pg = b.bitcast_i32(pv); b.bind_i32(ev(pg).max(0).min(ev(npages) - 1)) }).collect();
+    // grouped path: offset_i = min(tile row base + A_i, cap of the group) + group page base (the cap keeps a lane past k_hi on a row of
+    // the page of k_hi - 1 at or below it: real data, masked later)
+    let goff: Vec<(ValueId, ValueId)> = if grp_path {
+        let tb = { let v = b.bind_i32((ev(key_t) & (page - 1)) * ev(hkrow)); b.read_first_lane(v) };
+        let gbase: Vec<(ValueId, ValueId)> = (0..ngrp)
+            .map(|g| {
+                // the group's last key reaches k_hi - 1: cap at k_hi - 1's in-page row, else no cap (page - 1)
+                let lastk = ev(key_t) + (g * pgsz + pgsz - 1);
+                let cr = { let v = b.bind_i32(lastk.ge(ev(k_hi) - 1).select_i32((ev(k_hi) - 1).max(0) & (page - 1), amdgpu_dsl::I32::c(page - 1))); b.read_first_lane(v) };
+                let cap = { let v = b.bind_i32(ev(cr) * ev(hkrow) + ev(hk) * ROW); b.read_first_lane(v) };
+                let pb = b.bind_i32(ev(gclamped[g as usize]) * ev(pgstride));
+                (cap, pb)
+            })
+            .collect();
+        (0..KT / 4)
+            .map(|i| {
+                let (cap, pb) = gbase[grp_of(i) as usize];
+                let (a, sk, sv) = ginv[i as usize];
+                let o = b.bind_i32((ev(a) + ev(tb)).min(ev(cap)) + ev(pb));
+                (b.bind_i32(ev(o) + ev(sk)), b.bind_i32(ev(o) + ev(sv)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let rows: Vec<(ValueId, ValueId)> = lookups
         .iter()
         .enumerate()
@@ -348,7 +388,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             // (fp8: chunk ^ key % 8 within the 8-chunk row)
             let kvo = if blocked {
                 b.bind_i32(ev(rowoff) + (ev(l8) ^ (ev(kc) & 7)) * (16 * page))
-            } else if fp8 { b.bind_i32(ev(rowoff) + ((ev(l8) ^ (ev(kc) & 7)) << 4)) } else { b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4)) };
+            } else if fp8 { b.bind_i32(ev(rowoff) + ((ev(l8) ^ (ev(kc) & 7)) << 4)) } else if grp_path { goff[i].0 } else { b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4)) };
             let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
         }
@@ -418,8 +458,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         None => mev.write(&mut b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
                 // V tile swizzle: the 32-byte granule G of tile row r is stored at granule G ^ (r % 8) (the DMA lands lane-linear, so the swizzle is applied to the SOURCE chunk: l16 ^ 2 (r % 8))
-                let vsw = b.bind_i32((kk_of(i as i32) & 7) << 1);
-                let vvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ ev(vsw)) << 4));
+                let vvo = if grp_path { goff[i].1 } else { let vsw = b.bind_i32((kk_of(i as i32) & 7) << 1); b.bind_i32(ev(rowoff) + ((ev(l16) ^ ev(vsw)) << 4)) };
                 let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
                 b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
             }
