@@ -49,14 +49,6 @@ pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_all(name, page, kt, 0, false, true)
 }
 
-/// v2 (`pa_decode16v2_bf16_hd128_p<P>[_f]`, P >= 16): the vendor's deep-buffered structure. K goes straight into VGPRs (8 b128 loads per
-/// lane and 32-key tile: the A fragments of the QK MFMAs), V into a 3-slot private LDS ring (V^T by transposed reads, chunk ^ key % 16
-/// swizzle); the tile's pages (two per tile at P = 16) come from one uniform 8-byte block-table load, issued a tile earlier. Per wave
-/// tiles t + 1 and t + 2 are in flight while tile t computes (32 KB). Loop unrolled by 3 (K register sets / V slots / page words rotate).
-pub fn pa_decode16_v2(name: &str, page: i32, fused: bool) -> Function {
-    pa_decode16_gen(name, page, 32, 0, false, fused, true)
-}
-
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -75,11 +67,6 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 }
 
 fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
-    pa_decode16_gen(name, page, kt, kvm, mtp, fused, false)
-}
-
-fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool, v2: bool) -> Function {
-    assert!(!v2 || (kvm == 0 && !mtp && kt == 32 && page >= 16), "decode16 v2: bf16, qlen 1, 32-key tiles, P >= 16");
     assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
@@ -253,9 +240,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     // fp8: the staged fp8 V rows (converted into the bf16 V tile)
     let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
-    // v2: V slots 1, 2 of the ring (slot 0 = "V")
-    let vreg1 = v2.then(|| lds.private("V1", (KT * ROW) as i64, 4, &[]));
-    let vreg2 = v2.then(|| lds.private("V2", (KT * ROW) as i64, 4, &[]));
     // fused: wave w's normalized partial O [16 cols][128] f32 over its own K region (8 KB w) and its LSE [16] at the start of its own V
     // region (32 KB + 8 KB w): a wave writes only its own dead storage, before the barrier
     const EPI_L: i32 = 32768;
@@ -298,179 +282,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
-    let (m_v, l_v, ov) = if v2 {
-        let mvs3 = [vreg.mine(wv), vreg1.as_ref().unwrap().mine(wv), vreg2.as_ref().unwrap().mine(wv)];
-        // the swizzled V^T read offsets per 16-dim block db (row base (4 g + s / 4) ROW: chunk (2 db + (s % 4) / 2) ^ ((4 g + s / 4) % 16))
-        let vrow = b.bind_i32((ev(grp) * 4 + ev(l16).lshr(2)) * ROW);
-        let vch: Vec<ValueId> = (0..8i32)
-            .map(|db| b.bind_i32(ev(vrow) + ((((ev(l16) & 3).lshr(1) + 2 * db) ^ ((ev(grp) * 4 + ev(l16).lshr(2)) & 15)) << 4) + ((ev(l16) & 1) << 3)))
-            .collect();
-        // the tile's page pair (block-table entries key_t / P, + 1): one uniform 8-byte load
-        let pages = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32| -> ValueId {
-            let kc = b.bind_i32(key_t.min(ev(maxk)));
-            let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-            b.buffer_load_b64(r_bt, bvo, bt_so, 0)
-        };
-        let page_of = |b: &mut FnBuilder, pv: Opnd, second: amdgpu_dsl::I32| -> ValueId {
-            // P = 16: keys 16.. of the tile in the second page; P >= 32: one page
-            let p0 = b.frag2_lane(pv.clone(), 0);
-            let p0 = b.bitcast_i32(p0);
-            if page == 16 {
-                let p1 = b.frag2_lane(pv, 1);
-                let p1 = b.bitcast_i32(p1);
-                let c = b.bind_cond(second.ne(0));
-                let p = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(p1), b: Opnd::Val(p0) });
-                b.bind_i32(ev(p).max(0).min(ev(npages) - 1))
-            } else {
-                b.bind_i32(ev(p0).max(0).min(ev(npages) - 1))
-            }
-        };
-        // K of the tile at key_t into the register set kv (8 Frag4: blk 2 x c 4) and V into slot mv (version gen)
-        let issue = |b: &mut FnBuilder, key_t: ValueId, pv: Opnd, kv: &[VarId], gen: Opnd, mv: &amdgpu_tile::PrivRef<'_>| {
-            for blk in 0..NKB as i32 {
-                // the lane's key 16 blk + l % 16 (clamped into the range: masked later)
-                let key = b.bind_i32((ev(key_t) + 16 * blk + ev(l16)).min(ev(k_hi) - 1).max(0));
-                let pg = page_of(b, pv.clone(), amdgpu_dsl::I32::c(if page == 16 { blk } else { 0 }));
-                let row = b.bind_i32(((ev(pg) * page + (ev(key) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW + (ev(grp) << 4));
-                for c in 0..4usize {
-                    let l = b.buffer_load_b128(r_k, row, c0, (64 * c) as u32);
-                    let l = b.inplace(l);
-                    b.set_var(kv[4 * blk as usize + c], l);
-                }
-            }
-            let vbase = mv.base();
-            mv.write(b, gen, |b| {
-                for i in 0..KT / 4 {
-                    // issue i: keys 4 i + l / 16, chunk l % 16 (source chunk ^ key % 16)
-                    let key = b.bind_i32((ev(key_t) + kk_of(i)).min(ev(k_hi) - 1).max(0));
-                    let pg = page_of(b, pv.clone(), amdgpu_dsl::I32::c(if page == 16 { (i >= 4) as i32 } else { 0 }));
-                    let rowoff = b.bind_i32(((ev(pg) * page + (ev(key) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);
-                    let vvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(key) & 15)) << 4));
-                    let m0v = b.bind_i32(vbase.clone() + (i << 10));
-                    b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
-                }
-            });
-        };
-        let compute = |b: &mut FnBuilder, key_t: ValueId, kv: &[VarId], gen: Opnd, mv: &amdgpu_tile::PrivRef<'_>, m_v: VarId, l_v: VarId, ov: &[VarId], sv_: &[VarId]| {
-            for c in 0..4usize {
-                for blk in 0..NKB {
-                    b.var_mfma(sv_[blk], kind, Opnd::Var(kv[4 * blk + c]), qf[c], c == 0);
-                }
-            }
-            let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
-            let mut s: Vec<ValueId> = Vec::with_capacity(16);
-            for blk in 0..NKB {
-                for r in 0..4u8 {
-                    let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
-                    let x = b.bitcast_f32(x);
-                    let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
-                    s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
-                }
-            }
-            let mut mx = s[0];
-            for pair in s[1..].chunks(2) {
-                mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
-            }
-            let mt = group4(b, mx, true);
-            let mt = b.mul_f32(mt, csc);
-            let thr = b.c_f32(8.0);
-            let mlim = b.add_f32(Opnd::Var(m_v), thr);
-            let grow = b.cmp_lt_f32(mlim, mt);
-            let grow = b.any_lane(grow);
-            b.begin_if(Opnd::Val(grow));
-            {
-                let mn = b.max_f32(Opnd::Var(m_v), mt);
-                let dm = b.sub_f32(Opnd::Var(m_v), mn);
-                let alpha = b.exp2_f32(dm);
-                for v in ov {
-                    for r in 0..4u8 {
-                        let x = b.frag4_lane(Opnd::Var(*v), r);
-                        let x = b.bitcast_f32(x);
-                        let y = b.mul_f32(x, alpha);
-                        b.var_set_lane(*v, r, y);
-                    }
-                }
-                let l2 = b.mul_f32(Opnd::Var(l_v), alpha);
-                b.set_var(l_v, l2);
-                b.set_var(m_v, mn);
-            }
-            b.end_if();
-            let zf = b.c_f32(0.0);
-            let nm = b.sub_f32(zf, Opnd::Var(m_v));
-            let p: Vec<ValueId> = s.iter().map(|x| { let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(csc), Opnd::Val(nm))); b.exp2_f32(t) }).collect();
-            let mut ps = p[0];
-            for x in &p[1..] {
-                ps = b.add_f32(ps, *x);
-            }
-            let l_new = b.add_f32(Opnd::Var(l_v), ps);
-            b.set_var(l_v, l_new);
-            let vb = mv.base();
-            mv.read_back(b, gen, |b| {
-                let w: Vec<ValueId> = [(0usize, 0usize), (0, 2), (1, 0), (1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
-                let pf4 = b.pack4(w[0], w[1], w[2], w[3]);
-                for db in 0..8usize {
-                    let a0 = b.bind_i32(vb.clone() + ev(vch[db]));
-                    let a1 = b.bind_i32(vb.clone() + ev(vch[db]) + 16 * ROW);
-                    let vf = b.load_lds_tr_b16x2(a0, a1);
-                    b.var_mfma(ov[db], kind, vf, pf4, false);
-                }
-            });
-        };
-        // loop state: + 3 K register sets (8 Frag4 each) + 3 page words (Frag2)
-        let mut inits2 = inits.clone();
-        inits2.extend((0..24).map(|_| (DType::Frag4, Opnd::Val(zero4))));
-        // prologue: the pages of tiles 0, 1, 2
-        let pw: Vec<ValueId> = (0..3i32).map(|t| { let kt_ = ev(k_lo) + KT * t; pages(&mut b, kt_) }).collect();
-        inits2.extend(pw.iter().map(|p| (DType::Frag2, Opnd::Val(*p))));
-        let vars = b.begin_loop(&inits2);
-        let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
-        let ov: Vec<VarId> = vars[3..11].to_vec();
-        let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
-        let kset: Vec<Vec<VarId>> = (0..3).map(|s| vars[11 + NKB + 8 * s..11 + NKB + 8 * s + 8].to_vec()).collect();
-        let pvar: Vec<VarId> = vars[11 + NKB + 24..11 + NKB + 27].to_vec();
-        let itx = amdgpu_dsl::varx(it);
-        // first iteration: tiles 0 and 1 issued (this is inside the loop so the register sets are loop state: guarded by it == 0)
-        let first = b.bind_cond(itx.clone().eq(0));
-        b.begin_if(Opnd::Val(first));
-        {
-            b.wait_vm(0);
-            let k0 = { let v = b.bind_i32(ev(k_lo)); b.read_first_lane(v) };
-            let k1 = { let v = b.bind_i32(ev(k_lo) + KT); b.read_first_lane(v) };
-            let g0 = b.c_i32(0);
-            let g1 = b.c_i32(1);
-            issue(&mut b, k0, Opnd::Var(pvar[0]), &kset[0], Opnd::Val(g0), &mvs3[0]);
-            issue(&mut b, k1, Opnd::Var(pvar[1]), &kset[1], Opnd::Val(g1), &mvs3[1]);
-        }
-        b.end_if();
-        for ph in 0..3usize {
-            // tile t = it + ph (slot ph): pages of t + 3 into word ph, tile t + 2 into set / slot (ph + 2) % 3, then compute t
-            let t_ = b.bind_i32(itx.clone() + ph as i32);
-            let key_t = { let v = b.bind_i32(ev(k_lo) + (ev(t_) << LKT)); b.read_first_lane(v) };
-            let key_t2 = { let v = b.bind_i32(ev(key_t) + 2 * KT); b.read_first_lane(v) };
-            let p3 = { let kt3 = ev(key_t) + 3 * KT; pages(&mut b, kt3) };
-            let p3 = b.inplace(p3);
-            b.set_var(pvar[ph], p3);
-            let s2 = (ph + 2) % 3;
-            let gen2 = b.bind_i32(ev(t_) + 2);
-            // waits for page word t + 2 (older than tile t + 1's loads): tile t's loads are then complete too
-            b.wait_vm(17);
-            issue(&mut b, key_t2, Opnd::Var(pvar[s2]), &kset[s2], Opnd::Val(gen2), &mvs3[s2]);
-            b.wait_vm(33);
-            compute(&mut b, key_t, &kset[ph], Opnd::Val(t_), &mvs3[ph], m_v, l_v, &ov, &sv_);
-            let tn = b.bind_i32(ev(t_) + 1);
-            if ph == 2 {
-                b.set_var(it, tn);
-            }
-            // (the V slot of tile t is rewritten by tile t + 3 in the next phase: its reads complete first)
-            b.wait_lds(0);
-            let dn = b.bind_cond(ev(tn).ge(ev(ntile)));
-            b.break_if(dn);
-        }
-        b.end_loop();
-        b.wait_vm(0);
-        b.wait_lds(0);
-        (m_v, l_v, ov)
-    } else {
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..11].to_vec();
@@ -728,9 +539,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
     b.break_if(done);
     b.end_loop();
-    (m_v, l_v, ov)
-    };
-    let zf = b.c_f32(0.0);
     // ---- the split's partial: O / l (fp32, 4 consecutive d per lane and block) and LSE ----
     let lv = l_v_val(&mut b, l_v);
     let l_tot = group4(&mut b, lv, false);
