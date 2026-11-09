@@ -38,6 +38,7 @@ fn unmarked_lds_accesses_are_counted_not_silently_trusted() {
 fn same_address_global_stores() -> Function {
     let mut b = FnBuilder::new("trust_global_untracked", 64);
     b.arg("out", DType::Ptr, 0, 8);
+    b.grid_is(0, Ext::sym("N")); // N workgroups (an undefined axis the kernel never reads counts as one workgroup)
     b.arg_tensor("out", Ext::c(4));
     let p = b.let_(Op::KernargPtr { offset: 0 });
     let v = b.c_i32(1);
