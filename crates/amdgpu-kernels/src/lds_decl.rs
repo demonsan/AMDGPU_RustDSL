@@ -21,3 +21,10 @@ pub fn private_at(b: &mut FnBuilder, name: &str, base: i64, per_wave: i64, waves
     b.lds_private(name, base, per_wave, waves);
     Shared { name: name.to_string(), base, slot_stride: per_wave, bytes: per_wave, slots: waves, layout: Layout::Linear, private: true }
 }
+
+/// A thread-OWNED tile (`lds_owned`): thread `t` owns the bytes `base + t * col_stride + r * row_stride + [0, col_stride)`. A scope whose every access is provably at such an address is an owner event: a thread's own
+/// write -> read (the next version, in place) needs no barrier, other threads' columns stay ordinary shared accesses.
+pub fn owned_at(b: &mut FnBuilder, name: &str, base: i64, bytes: i64, col_stride: i64, row_stride: i64) -> Shared {
+    b.lds_owned(name, base, bytes, col_stride, row_stride);
+    Shared { name: name.to_string(), base, slot_stride: bytes, bytes, slots: 1, layout: Layout::Linear, private: false }
+}

@@ -13,7 +13,7 @@
 //!    inside a block the order of one expert's pairs is the arrival order. ABI: topk_ids @0, topk_weights @8, sorted_token_ids @16, sorted_weights @24, ws @32, M @40 (i32), P @44 (i32).
 
 use amdgpu_dsl::{AtomicOp, BinOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use crate::lds_decl::tile_at;
+use crate::lds_decl::{owned_at, tile_at};
 use amdgpu_tile::{ev, SlotIdx};
 
 const T: i32 = 1024;
@@ -473,7 +473,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
     // the WC versions depend on the chunk counter only; the data-dependent match loop inside a chunk executes the same marker with the same version several times (a non-constant step for the verifier's per-statement
     // period check): declared trusted periodic (counted in the ledger)
     b.tile_trust_periodic("moe_scatter_ordered: WC versions 2 ch / 2 ch + 1 depend on the chunk counter; the nested rank loop repeats the same version");
-    let t_wc = tile_at(b, "WC", wc as i64, 65536);
+    let t_wc = owned_at(b, "WC", wc as i64, 65536, 4, 4096);   // thread e owns column e: WC[w][e] at wc + 4 e + 4096 w
     let t_cur = tile_at(b, "CURSOR", cursor as i64, 4096);
     let t_base = tile_at(b, "BASE", base_a as i64, 4096);
     let ptr: Vec<ValueId> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
@@ -583,9 +583,6 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let ca = b.bind_i32(ev(tid4) + cursor);
         let curv = t_cur.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(ca, MemTy::B32));
         b.wait_lds(0);
-        // the prefix rewrites the column words just read (the column is the thread's own, but the protocol engine cannot see column ownership): the reads complete and a barrier separates them from the
-        // in-place writes, which are a new version
-        b.barrier();
         let mut run = b.c_i32(0);
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
