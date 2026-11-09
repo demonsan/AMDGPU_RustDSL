@@ -143,8 +143,8 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 
 The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm_blockscale", M, N, K)`,
 `dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)` (= `amdc dispatch …`, the functions of `crates/amdgpu-kernels/src/dispatch.rs`).
-Known: `gemm_a8w8_blockscale[_splitk]` carries the scaled K-block products at bf16 precision (up to 2^-8 of the larger block term under
-cancellation; reported, the check allows it).
+The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term block is summed to about 2^-10 of its term magnitude
+(visible under cancellation — also with unit scales and a single K block, so it is the instruction, not the kernel).
 
 `python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only; GEMM / prefill / MoE checks sample rows and tokens) runs every op on random data against a Python reference that follows the
 C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm,rope,qknorm_rope_kv,cache,cache_blocked,topk,moe_sorting,moe_reduce}_host.cpp`).
