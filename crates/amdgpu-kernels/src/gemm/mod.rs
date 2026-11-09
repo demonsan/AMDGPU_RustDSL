@@ -1441,6 +1441,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
         // 64 x 128 forms: the 3-slot ring (depth3: 256x7168x4096 19.8 -> 15.1 us, 1024x4096x8192 50.5 -> 47.0, 128x4096x8192 S4 16.0 -> 13.9)
+        // bf16 64 x 128 on the 3-slot ring (256x7168x4096 41.3 (128) -> 23.5 us, 128x4096x8192 74.0 -> 37.3)
+        "gemm_a16w16_bf16_64" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() })),
+        "gemm_a16w16_bf16_64_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() }.splitk())),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         // (fp8 per-token: 256x7168x4096 22.98 (128) -> 13.60 us, 1024x4096x8192 51.6 -> 46.0)
