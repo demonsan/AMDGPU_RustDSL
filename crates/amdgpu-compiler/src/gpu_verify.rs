@@ -684,7 +684,8 @@ impl<'a> An<'a> {
                             l = x.clone();
                         }
                     }
-                    let mut h = it.hi.first()?.clone();
+                    // no upper bound: a huge sentinel (only the TOP digit of the radix may be unbounded - its span is never compared)
+                    let mut h = it.hi.first().cloned().unwrap_or(Poly::int(1i128 << 100));
                     for x in it.hi.iter().skip(1) {
                         if self.cx.le(x, &h) {
                             h = x.clone();
