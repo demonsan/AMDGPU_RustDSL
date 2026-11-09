@@ -248,8 +248,6 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
         }
         // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot)
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        // visible: off <= lim - key0 (one compare of a constant per value)
-        let dlim = b.bind_i32(ev(lim) - ev(key0));
         let mut ds: Vec<ValueId> = Vec::with_capacity(32);
         for sb in 0..2usize {
             for r in 0..16u8 {
@@ -258,7 +256,7 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 let s = b.bitcast_f32(s);
                 let t = b.let_(Op::FmaF32(Opnd::Val(s), Opnd::Val(csc), Opnd::Val(nlse)));
                 let p = b.exp2_f32(t);
-                let keep = b.bind_cond(amdgpu_dsl::I32::c(off).le(ev(dlim)));
+                let keep = b.bind_cond((ev(key0) + off).le(ev(lim)));
                 let p = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(p), b: Opnd::Val(zf) });
                 let dp = b.frag16_lane(Opnd::Var(dp_vars[sb]), r);
                 let dp = b.bitcast_f32(dp);
