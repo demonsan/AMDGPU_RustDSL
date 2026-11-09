@@ -1072,7 +1072,7 @@ pub struct Contract {
 }
 
 /// See `Contract::wg_maps`.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct WgMap {
     pub outs: Vec<ValueId>,
     pub axes: Vec<u8>,
