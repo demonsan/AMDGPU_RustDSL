@@ -612,6 +612,13 @@
     - B16 `_f` 为 28.7 µs（上一轮 29.3），S2 为 27.5（27.9）；B8 S4 为 45.2（45.6）。
   - `archive/decode16-f8`：每个 CTA 8 个 wave（每个 SIMD 2 个）的 fused 形式，全面变慢：B16 为 30.6 µs（`_f` 28.6），B64 为 93.4（85.3），B128 为 98.4（81.8）。说明增加每个 SIMD 的 wave 数并不能隐藏剩下的延迟。
   - 剩余差距约 1.5×（B16）。每个 tile 仍有约 450 条指令，而厂商约 190 条。需要按厂商的结构重写：K 进 AGPR 并加载 64 个 key，按块做 softmax。
+  - 合入 Main 上 backend 的 lower-peep（min/max/med3 与 M0 外提）之后：B16 S2 为 27.2 µs（厂商 18.5，1.47×）。
+    - 只看 decode kernel（NOCOMB）：S2 约 20.1 µs，`_k64` S2 为 19.9 µs，均接近厂商的 18.5 µs。
+    - 差距主要来自 combine 的 launch（约 7 µs）。
+  - `archive/decode16-lastc`（`_c`）：在 split kernel 内用 last-arriver 做合并（per-group ticket，结果经 LDS 广播，由最后一个 CTA 合并），不再启动 combine kernel。
+    - 结果正确，strict 通过。
+    - 但极慢：full fence 版本在 B16 S1 为 128 µs；lite 版本（sc1 读写）同样约 100 µs 量级。原因未查明，可能是 sc1 / atomic 路径或 wbl2 的成本。
+  - 按照 lead 设的门槛（B16 ≤1.2×），decode 到此暂停；剩余的可做项是对 combine launch 的消除做 ATT/计数分析。
 
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
