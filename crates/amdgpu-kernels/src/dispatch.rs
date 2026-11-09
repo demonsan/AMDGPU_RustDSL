@@ -111,6 +111,12 @@ pub fn i8_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
     (64, s as u32)
 }
 
+/// bf16 A16W16 GEMM (`gemm_a16w16_bf16[_128|_64[_splitk]]`): the int8 rule (`i8_gemm_config`); the 64-row forms run the 3-slot ring.
+/// Same run: 128x4096x8192 S4 18.7 us (128 tile 74.0, 256 tile 133.0), 64x8192^2 S4 26.7 (133.4), 256x7168x4096 23.0 (41.3 / 69.1).
+pub fn bf16_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
+    i8_gemm_config(m, n, cus)
+}
+
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
 /// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
 /// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
