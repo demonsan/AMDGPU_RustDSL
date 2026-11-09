@@ -585,7 +585,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
     let epi_l = fused.then(|| b.bind_i32((ev(wv) << 6) + (ev(j) << 2) + EPI_L));
     if let (Some(e), Some(eo), Some(el)) = (&epi, epi_o, epi_l) {
-        e.at(&SlotIdx::new(0, 0)).write(&mut b, |b| {
+        e.at(&amdgpu_tile::SlotIdx::new(0, 0)).write(&mut b, |b| {
             for (db, f4) in ov_n.iter().enumerate() {
                 let a = b.bind_i32(ev(eo) + 64 * db as i32);
                 b.store_lds_b128(a, *f4);
@@ -603,7 +603,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         // an empty wave: O = 0, LSE = -inf
         let z = b.c_i32(0);
         let z4 = b.frag4(z, z, z, z);
-        e.at(&SlotIdx::new(0, 0)).write(&mut b, |b| {
+        e.at(&amdgpu_tile::SlotIdx::new(0, 0)).write(&mut b, |b| {
             for db in 0..8i32 {
                 let a = b.bind_i32(ev(eo) + 64 * db);
                 b.store_lds_b128(a, z4);
@@ -625,7 +625,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let tid = b.let_(Op::WorkitemId);
         let col = b.bind_i32(ev(tid).lshr(4));
         let d0 = b.bind_i32((ev(tid) & 15) << 3);
-        let (ls, os): (Vec<ValueId>, Vec<(ValueId, ValueId)>) = e.at(&SlotIdx::new(0, 0)).read(&mut b, |b| {
+        let (ls, os): (Vec<ValueId>, Vec<(ValueId, ValueId)>) = e.at(&amdgpu_tile::SlotIdx::new(0, 0)).read(&mut b, |b| {
             let ls = (0..4i32).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 64 * w)); b.load_lds_b32(a) }).collect();
             let os = (0..4i32)
                 .map(|w| {

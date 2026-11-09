@@ -119,7 +119,10 @@ int main(int argc, char** argv) {
         else if (fp8kv) { memcpy(&a[208], &ksc, 4); memcpy(&a[224], &vsc, 4); }
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
-        P_(0, dpo); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); memcpy(&a[96], &scale, 4); U(7, H); U(8, HK); U(9, maxp); U(10, npages); U(11, S); P_(12, dpl);
+        // FUSED=1 (ours `_f`, S = 1): the kernel writes the bf16 output itself (ptr slot 0), no combine
+        const bool fused = envi("FUSED", 0) != 0;
+        P_(0, fused ? (void*)dout : dpo); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); memcpy(&a[96], &scale, 4); U(7, H); U(8, HK); U(9, maxp); U(10, npages); U(11, S); P_(12, dpl);
+        if (fused) cfn = nullptr;
         ca.assign(16 * 6, 0);
         if (sinks) { void* ds = dev(sink); memcpy(&ca[80], &ds, 8); }
         memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
