@@ -18,8 +18,8 @@ mkdir -p "$OUT"
 sec() { [ -z "${ONLY:-}" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 emit() { "$AMDC" emit "$1" --backend own --out "$OUT/$1.s" >"$OUT/$1.log" 2>&1 && "$CLANG" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$OUT/$1.co" "$OUT/$1.s"; }
 vname() { strings "$1" | grep -m1 '^_ZN'; }
-for k in fmha_fwd_hd128_fp8pt_v3 fmha_fwd_hd128_fp8pt_v3_causal fmha_fwd_hd128_fp8pt_v3_kvsplit fmha_fwd_hd128_fp8pt_v3_causal_kvsplit fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h fmha_fwd_hd128_mxfp8_v3_vs128 fmha_fwd_hd128_bf16_v3 fmha_fwd_hd128_bf16_v3_ks fmha_fwd_hd128_bf16_v3_causal \
-         fmha_fwd_hd192_hd128_bf16_v3 fmha_fwd_hd192_hd128_bf16_v3_ks fmha_fwd_hd192_hd128_bf16_v3_causal fmha_fwd_hd192_hd128_bf16_v3_causal_np fmha_fwd_hd192_hd128_bf16_v3_causal_ks attn_combine_bf16_hd128_q16 fmha_bwd_dot_hd128_bf16 fmha_bwd_dq_hd128_bf16 fmha_bwd_dq_hd128_bf16_causal \
+for k in fmha_fwd_hd128_fp8pt_v3 fmha_fwd_hd128_fp8pt_v3_causal fmha_fwd_hd128_fp8pt_v3_kvsplit fmha_fwd_hd128_fp8pt_v3_causal_kvsplit fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h fmha_fwd_hd128_mxfp8_v3_vs128 fmha_fwd_hd128_bf16_v3 fmha_fwd_hd128_bf16_v3_ks fmha_fwd_hd128_bf16_v3_causal fmha_fwd_hd128_bf16_v3_causal_ks fmha_fwd_hd128_bf16_v3_causal_q128 fmha_fwd_hd128_bf16_causal \
+         fmha_fwd_hd192_hd128_bf16_v3 fmha_fwd_hd192_hd128_bf16_v3_ks fmha_fwd_hd192_hd128_bf16_v3_causal fmha_fwd_hd192_hd128_bf16_v3_causal_np fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128 fmha_fwd_hd192_hd128_bf16_v3_causal_ks attn_combine_bf16_hd128_q16 fmha_bwd_dot_hd128_bf16 fmha_bwd_dq_hd128_bf16 fmha_bwd_dq_hd128_bf16_causal \
          fmha_bwd_dkdv_hd128_bf16 fmha_bwd_dkdv_hd128_bf16_causal; do
     emit "$k" || echo "EMIT FAIL $k"
 done
@@ -52,17 +52,22 @@ done
 sec bf16 && echo "## bf16 v3 hd128"
 sec bf16 && for c in 0 1; do
     s=""; [ $c = 1 ] && s=_causal
-    for sh in "2 32 32 8192 8192" "4 16 16 2048 2048" "1 8 8 4096 4096"; do
+    for sh in "2 32 32 8192 8192" "4 16 16 2048 2048" "1 8 8 4096 4096" "4 16 16 1024 1024" "1 32 8 2048 2048" "2 16 16 1024 1024"; do
         echo "-- bf16 causal=$c $sh"
         v="$HSA/fmha_v3_fwd/fwd_hd128_bf16$s.co"
         LSE=0 CHECK=4 timeout 900 "$OUT/attn_host" vendor "$v" "$(vname "$v")" $sh $c | grep -E "TF/s"
         # non-causal: the key split of dispatch::bf16_prefill_key_splits (CUs = 256); causal: the paired kernel (its small-grid `_causal_ks`
         # target needs the backend SGPR fix of sgpr-fix to assemble)
-        set -- $sh; u=$(( $1 * $2 * (($4 + 255) / 256) )); n=1; k=fmha_fwd_hd128_bf16_v3$s; ks=""
-        if [ $c = 0 ]; then while [ $n -lt 4 ] && [ $((u * n)) -lt 256 ] && [ $((($5 + 127) / 128)) -ge $((4 * n)) ]; do n=$((n * 2)); done; fi
-        [ $n -gt 1 ] && { k=fmha_fwd_hd128_bf16_v3_ks; ks=$(( n == 2 ? 1 : 2 )); }
+        set -- $sh; u=$(( $1 * $2 * (($4 + 255) / 256) )); n=1; k=fmha_fwd_hd128_bf16_v3$s; ks=""; rows=256; pr1=$c; kt=$((($5 + 127) / 128))
+        if [ $c = 0 ]; then while [ $n -lt 4 ] && [ $((u * n)) -lt 256 ] && [ $kt -ge $((4 * n)) ]; do n=$((n * 2)); done
+        else p=$(( $1 * $2 * ((($4 + 255) / 256 + 1) / 2) ))
+            if [ $p -lt 128 ] && [ $kt -lt 16 ]; then k=fmha_fwd_hd128_bf16_causal; rows=128; pr1=0
+            elif [ $p -ge 128 ] && [ $p -lt 256 ] && [ $kt -le 16 ]; then k=${k}_q128; rows=128
+            elif [ $kt -ge 16 ]; then while [ $n -lt 4 ] && [ $((p * n)) -lt 256 ] && [ $kt -ge $((4 * n)) ]; do n=$((n * 2)); done; fi
+        fi
+        [ $n -gt 1 ] && { k=fmha_fwd_hd128_bf16_v3${s}_ks; ks=$(( n == 2 ? 1 : 2 )); }
         echo "   ours form: $k${ks:+ KS=$ks}"
-        env LSE=0 CHECK=4 ROWS=256 BLOCK=512 PAIR=$c ${ks:+KS=$ks COMBINE_CO=$OUT/attn_combine_bf16_hd128_q16.co} timeout 900 "$OUT/attn_host" ours "$OUT/$k.co" "$k" $sh $c | grep -E "TF/s"
+        env LSE=0 CHECK=4 ROWS=$rows BLOCK=$(( rows * 2 )) PAIR=$pr1 ${ks:+KS=$ks COMBINE_CO=$OUT/attn_combine_bf16_hd128_q16.co} timeout 900 "$OUT/attn_host" ours "$OUT/$k.co" "$k" $sh $c | grep -E "TF/s"
     done
 done
 
@@ -70,19 +75,19 @@ sec hd192 && echo "## bf16 v3 hd192/hd128 (MLA prefill, vendor 128 rows / 256 th
 sec hd192 && for c in 0 1; do
     s=""; [ $c = 1 ] && s=_causal
     v=$(ls "$HSA"/fmha_v3_fwd/fwd_hd192_hd128_bf16$s.co 2>/dev/null | head -1)
-    for sh in "1 16 16 4096 4096" "4 16 16 2048 2048" "1 8 8 4096 4096" "1 128 128 1024 1024"; do
+    for sh in "1 16 16 4096 4096" "4 16 16 2048 2048" "1 8 8 4096 4096" "1 128 128 1024 1024" "1 16 16 2048 2048"; do
         echo "-- hd192 causal=$c $sh"
         [ -n "$v" ] && ROWS=128 BLOCK=256 DV=128 LSE=0 CHECK=4 timeout 900 "$OUT/attn_host" vendor "$v" "$(vname "$v")" $sh $c 192 | grep -E "TF/s"
         # the form dispatch::hd192_prefill_kernel picks (CUs = 256): paired / unpaired (_np) / unpaired key split (_ks, S = 2)
-        set -- $sh; u=$(( $1 * $2 * (($4 + 255) / 256) )); k=fmha_fwd_hd192_hd128_bf16_v3$s; pr=0; ks=""
+        set -- $sh; u=$(( $1 * $2 * (($4 + 255) / 256) )); k=fmha_fwd_hd192_hd128_bf16_v3$s; pr=0; ks=""; rows=""
         kt=$((($5 + 127) / 128))
         if [ $c = 1 ]; then
-            if [ $u -ge 512 ]; then pr=1; elif [ $((2 * u)) -le 256 ] && [ $kt -ge 32 ]; then k=${k}_ks; ks=1; else k=${k}_np; fi
+            if [ $u -ge 512 ]; then pr=1; elif [ $((2 * u)) -le 256 ] && [ $kt -ge 32 ]; then k=${k}_ks; ks=1; elif [ $((2 * u)) -le 256 ]; then k=${k}_np_q128; rows=128; else k=${k}_np; fi
         elif [ $((4 * u)) -le 256 ] && [ $kt -ge 16 ]; then k=${k}_ks; ks=2
         elif [ $u -lt 256 ] && [ $kt -ge 32 ]; then k=${k}_ks; ks=1
         fi
         echo "   ours form: $k${ks:+ KS=$ks}"
-        env DV=128 LSE=0 CHECK=4 ROWS=256 BLOCK=512 PAIR=$pr ${ks:+KS=$ks COMBINE_CO=$OUT/attn_combine_bf16_hd128_q16.co COMBINE_KN=attn_combine_bf16_hd128_q16} timeout 900 "$OUT/attn_host" ours "$OUT/$k.co" "$k" $sh $c 192 | grep -E "TF/s"
+        env DV=128 LSE=0 CHECK=4 ROWS=${rows:-256} BLOCK=$(( ${rows:-256} * 2 )) PAIR=$pr ${ks:+KS=$ks COMBINE_CO=$OUT/attn_combine_bf16_hd128_q16.co COMBINE_KN=attn_combine_bf16_hd128_q16} timeout 900 "$OUT/attn_host" ours "$OUT/$k.co" "$k" $sh $c 192 | grep -E "TF/s"
     done
 done
 

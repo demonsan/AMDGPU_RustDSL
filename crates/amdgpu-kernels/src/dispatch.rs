@@ -134,11 +134,24 @@ pub fn mla_config(b: u64, h: u64) -> (bool, u32) {
 /// `bf16_prefill_key_splits`). Causal: the paired v3 (`_causal`, `_causal_ks` for small grids), except tiny grids (< 64 paired CTAs), where
 /// the 128-row v1 `fmha_fwd_hd128_bf16_causal` measured faster (B2 H8 HK2 1000 x 1300: 123 vs 94 TF/s). (hd64 / hd256, sliding window and
 /// varlen stay on the v1 family.)
+/// Causal re-measured 2026-11-09 with the assembling `_causal_ks` (backend SGPR fix) and the q16 combine (us; aiter / paired / v1 / ks2 / ks4):
+/// B1 H8 4096^2 91 / 119 / 98 / 86 / 74; 2048^2 52 / 69 / 49 / 51 / 42; B2 H8 HK2 1000 x 1300 47 / 63 / 36 / 50 / 43; B1 H16 4096^2
+/// 108 / 133 / 150 / 122 / 157; B4 H16 1024^2 42 / 51 / 51 / 59 / 86; B1 H8 8192^2 192 / 239 / 280 / 203 / 226. So: v1 only for tiny grids
+/// with short keys (< 16 key tiles), and no causal key split below 16 key tiles.
+/// With the 128-row / 64-key `_causal_q128` form (same run, us; aiter / paired / v1 / q128): B4 H16 1024^2 41.6 / 51.5 / 51.5 / 40.6;
+/// B1 H32 HK8 2048^2 62.7 / 77.2 / 81.7 / 65.1; B2 H16 1024^2 36.7 / 47.6 / 32.9 / 34.6; B4 H8 1024^2 36.9 / 47.2 / 32.9 / 34.4; B8 H16 1024^2
+/// 54.5 / 65.5 / 94.2 / 69.3; B1 H8 2048^2 (P = 32) keeps `_causal_ks` S4 (42.3 vs 51.4). With P = the paired 256-row grid: short keys and
+/// P < CUs / 2 -> v1; CUs / 2 <= P < CUs with <= 16 key tiles -> `_causal_q128`.
 pub fn bf16_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: u64) -> (&'static str, u32) {
-    if causal && b * h * sq.div_ceil(256).div_ceil(2) < 64 {
+    let short = sk.div_ceil(128) < 16;
+    let paired = b * h * sq.div_ceil(256).div_ceil(2);
+    if causal && paired < cus / 2 && short {
         return ("fmha_fwd_hd128_bf16_causal", 1);
     }
-    let s = bf16_prefill_key_splits(b, h, sq, sk, causal, cus);
+    if causal && paired >= cus / 2 && paired < cus && sk.div_ceil(128) <= 16 {
+        return ("fmha_fwd_hd128_bf16_v3_causal_q128", 1);
+    }
+    let s = if causal && short { 1 } else { bf16_prefill_key_splits(b, h, sq, sk, causal, cus) };
     let name = match (causal, s > 1) {
         (false, false) => "fmha_fwd_hd128_bf16_v3",
         (false, true) => "fmha_fwd_hd128_bf16_v3_ks",
@@ -190,6 +203,10 @@ pub fn hd192_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus:
         ("fmha_fwd_hd192_hd128_bf16_v3_causal", 1)
     } else if 2 * u <= cus && sk.div_ceil(128) >= 32 {
         ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2)
+    } else if 2 * u <= cus {
+        // the 128-row / 64-key form (same run, us; np / np_q128 / aiter): B1 H16 2048^2 72.1 / 65.7 / 50.3, B2 H16 1024^2 42.3 / 39.8 / 31.4,
+        // B1 H8 2048^2 65.9 / 60.9 / 45.4; at U = 256 it loses (B4 H16 1024^2 52.6 / 60.7)
+        ("fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128", 1)
     } else {
         ("fmha_fwd_hd192_hd128_bf16_v3_causal_np", 1)
     }
@@ -243,6 +260,13 @@ mod tests {
         assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, true, 256), ("fmha_fwd_hd128_bf16_v3_causal", 1));
         assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, false, 256), ("fmha_fwd_hd128_bf16_v3", 1));
         assert_eq!(bf16_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd128_bf16_v3_ks", 2));
+        assert_eq!(bf16_prefill_kernel(1, 8, 2048, 2048, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 4));
+        assert_eq!(bf16_prefill_kernel(1, 8, 4096, 4096, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 4));
+        assert_eq!(bf16_prefill_kernel(1, 16, 4096, 4096, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 2));
+        assert_eq!(bf16_prefill_kernel(4, 16, 1024, 1024, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_q128", 1));
+        assert_eq!(bf16_prefill_kernel(1, 32, 2048, 2048, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_q128", 1));
+        assert_eq!(bf16_prefill_kernel(2, 16, 1024, 1024, true, 256), ("fmha_fwd_hd128_bf16_causal", 1));
+        assert_eq!(bf16_prefill_kernel(8, 16, 1024, 1024, true, 256), ("fmha_fwd_hd128_bf16_v3_causal", 1));
     }
 
     #[test]
@@ -267,7 +291,7 @@ mod tests {
         assert_eq!(hd192_prefill_kernel(4, 16, 2048, 2048, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal", 1));
         assert_eq!(hd192_prefill_kernel(1, 128, 1024, 1024, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal", 1));
         assert_eq!(hd192_prefill_kernel(1, 16, 4096, 4096, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np", 1));
-        assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np", 1));
+        assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128", 1));
         assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2));
         assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2));
         assert_eq!(hd192_prefill_kernel(1, 8, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4));

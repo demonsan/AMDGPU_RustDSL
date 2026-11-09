@@ -34,6 +34,8 @@ struct Ring {
     kb_vo: Vec<ValueId>,
     /// hd192: the V row stride (K and V rows differ); None = `seqs` for both
     v_seqs: Option<ValueId>,
+    /// waves per group (the DMA block stride)
+    wpg: i32,
 }
 
 struct Body<'a> {
@@ -60,6 +62,9 @@ struct Body<'a> {
     p: Vec<ValueId>,
     /// the vendor's priority ping-pong: s_setprio 1 in the matrix phase, 0 in the softmax phase
     prio: bool,
+    /// keys per tile and its 32-key blocks
+    kt: i32,
+    nb: usize,
 }
 
 impl Body<'_> {
@@ -79,13 +84,13 @@ impl Body<'_> {
         let bases: Vec<ValueId> = kr.iter().map(|r| b.bind_i32(ev(*r) + kb.clone())).collect();
         let acc = self.ring.ks.at(slot).read(b, |b| {
             let rd = |b: &mut FnBuilder, c: usize| -> Vec<ValueId> {
-                (0..4).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
+                (0..self.nb as i32).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
             };
-            let mut acc: Vec<Option<ValueId>> = vec![None; 4];
+            let mut acc: Vec<Option<ValueId>> = vec![None; self.nb];
             let mut cur = rd(b, 0);
             for c in 0..8usize {
                 let nxt = (c + 1 < 8).then(|| rd(b, c + 1));
-                for blk in 0..4usize {
+                for blk in 0..self.nb {
                     match into {
                         Some(v) => b.var_mfma(v[blk], kind, cur[blk], qf[c], c == 0),
                         None => acc[blk] = Some(b.mfma(kind, cur[blk], qf[c], acc[blk].map(Opnd::Val))),
@@ -106,7 +111,7 @@ impl Body<'_> {
                 let mut acc = acc;
                 kbs.at(slot).read(b, |b| {
                     for c in 0..4usize {
-                        for blk in 0..4usize {
+                        for blk in 0..self.nb {
                             let a = b.bind_i32(ev(bases2[c]) + (blk as i32) * 32 * 128);
                             let kf = b.load_lds_b128(a);
                             match into {
@@ -143,8 +148,9 @@ impl Body<'_> {
                     .collect()
             };
             let mut cur = rd(b, 0);
-            for t in 0..8usize {
-                let nxt = (t + 1 < 8).then(|| rd(b, t + 1));
+            let steps = (self.kt / 16) as usize;
+            for t in 0..steps {
+                let nxt = (t + 1 < steps).then(|| rd(b, t + 1));
                 let pf = b.pack4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
                 for e in 0..4usize {
                     b.var_mfma(o[e], kind, cur[e], pf, false);
@@ -169,7 +175,7 @@ impl PipeBody for Body<'_> {
         let base = { let o = sh.at(slot).off_v(b); b.bind_i32(o + sh.base as i32) };
         sh.at(slot).write(b, |b| {
             for (i, v) in vo.iter().enumerate() {
-                let m0 = { let x = b.bind_i32(ev(base) + ((ev(r.wig) + 4 * i as i32) << 10)); b.read_first_lane(x) };
+                let m0 = { let x = b.bind_i32(ev(base) + ((ev(r.wig) + r.wpg * i as i32) << 10)); b.read_first_lane(x) };
                 b.buffer_load_lds_b128(rs, *v, so, m0, 0);
             }
         });
@@ -178,7 +184,7 @@ impl PipeBody for Body<'_> {
             let base2 = { let o = kbs.at(slot).off_v(b); b.bind_i32(o + kbs.base as i32) };
             kbs.at(slot).write(b, |b| {
                 for (i, v) in r.kb_vo.iter().enumerate() {
-                    let m0 = { let x = b.bind_i32(ev(base2) + ((ev(r.wig) + 4 * i as i32) << 10)); b.read_first_lane(x) };
+                    let m0 = { let x = b.bind_i32(ev(base2) + ((ev(r.wig) + r.wpg * i as i32) << 10)); b.read_first_lane(x) };
                     b.buffer_load_lds_b128(rs, *v, so, m0, 0);
                 }
             });
@@ -199,7 +205,7 @@ impl PipeBody for Body<'_> {
         self.m = Some(vars[0]);
         self.l = Some(vars[1]);
         self.o = vars[2..6].to_vec();
-        self.s = vars[6..10].to_vec();
+        self.s = vars[6..6 + self.nb].to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.prio {
@@ -209,11 +215,11 @@ impl PipeBody for Body<'_> {
         let s = self.s.clone();
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
         let key_t = b.bind_i32(t.key0());
-        let partial = b.bind_cond((ev(key_t) + (KT - 1)).gt(ev(self.lim_min)));
+        let partial = b.bind_cond((ev(key_t) + (self.kt - 1)).gt(ev(self.lim_min)));
         b.begin_if(Opnd::Val(partial));
         {
             let key0 = b.bind_i32(ev(key_t) + (ev(self.half) << 2));
-            for blk in 0..4usize {
+            for blk in 0..self.nb {
                 for r in 0..16u8 {
                     let off = 32 * blk as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                     let x = b.frag16_lane(Opnd::Var(s[blk]), r);
@@ -226,7 +232,7 @@ impl PipeBody for Body<'_> {
         }
         b.end_if();
         let mut sv: Vec<ValueId> = Vec::with_capacity(64);
-        for blk in 0..4usize {
+        for blk in 0..self.nb {
             for r in 0..16u8 {
                 let x = b.frag16_lane(Opnd::Var(s[blk]), r);
                 sv.push(b.bitcast_f32(x));
@@ -276,7 +282,7 @@ impl PipeBody for Body<'_> {
         let l_new = b.add_f32(Opnd::Var(l_v), ps);
         b.set_var(l_v, l_new);
         // P words in the PV order: step t (16 keys) = block t / 2, values 8 (t % 2) + 0..7
-        self.p = (0..8usize)
+        self.p = (0..(self.kt / 16) as usize)
             .flat_map(|t| {
                 let i0 = 16 * (t / 2) + 8 * (t % 2);
                 (0..4).map(move |j| (i0 + 2 * j, i0 + 2 * j + 1)).collect::<Vec<_>>()
@@ -311,8 +317,10 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
 pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Function {
     // hd192 causal (not the key-split form): the q-tile pairing with fresh lane partitions for the second pass (without them the pair does
     // not fit the VGPRs); `_np` names the unpaired form (small grids, `dispatch::hd192_prefill_kernel`)
-    let pair = dqk == 192 && !split && !name.ends_with("_np");
-    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair })
+    let pair = dqk == 192 && !split && !name.contains("_np");
+    // `_q128`: the 128-row / 64-key-tile form (mid-size causal grids, `dispatch`)
+    let small = name.ends_with("_q128");
+    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small })
 }
 
 /// Build options of `fmha_fwd_bf16_v3_d` (A/B variants).
@@ -322,6 +330,8 @@ pub struct V3Opts {
     pub fresh2: bool,
     /// hd192 causal pairs q tiles too
     pub pair192: bool,
+    /// 128 query rows (two groups of 2 waves) x 64-key tiles: 64 KB (hd192 80 KB) of LDS, two workgroups per CU
+    pub small: bool,
 }
 
 /// `fmha_fwd_bf16_v3_d` with build options.
@@ -330,7 +340,11 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let hd192 = dqk == 192;
     #[allow(non_snake_case)]
     let QROW = 2 * dqk;
-    let mut b = FnBuilder::new(name, 512);
+    // geometry: 256 query rows (two groups of 4 waves) x 128-key tiles, or (`opts.small`) 128 rows (two groups of 2 waves) x 64-key tiles:
+    // half the LDS (two workgroups per CU) and twice the q tiles, for grids that leave CUs idle
+    let (qr, kt, wpg) = if opts.small { (128i32, 64i32, 2i32) } else { (QR, KT, 4) };
+    let (qr_lg, kt_lg) = (qr.trailing_zeros() as i32, kt.trailing_zeros() as i32);
+    let mut b = FnBuilder::new(name, (2 * wpg * 64) as u32);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
     // (causal, also the causal key-split form: the Gemm profile measured faster (955 vs 915 TF/s at 8192², 350 vs 328 _ks S=2 at 4096²);
@@ -376,7 +390,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     b.ka_is(464, sq.clone() * Ext::c(4));
     // causal: the vendor's pairing (two q tiles per CTA); hd192 causal runs one q tile per CTA (the second pass's registers do not fit)
     let pair = causal && (!hd192 || opts.pair192);
-    b.grid_is(0, if pair { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
+    b.grid_is(0, if pair { sq.clone().ceil_div(qr as i64).ceil_div(2) } else { sq.clone().ceil_div(qr as i64) });
     b.grid_is(1, hh.clone());
     if split {
         b.arg("lg_s", DType::I32, 656, 4);
@@ -422,7 +436,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     // (XCD order of the (q tile, head) grid measured no gain: not used)
     let (qt, h, bat) = (qt0, h0, bat0);
     let lane = Lane::new(&mut b);
-    let roles = Roles::split(&mut b, &lane, 4);
+    let roles = Roles::split(&mut b, &lane, wpg as u32);
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
     let half = b.bind_i32(lane.half());
@@ -436,17 +450,17 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
 
     // ---- LDS: the K / V rings (2 slots x 32 KB each) ----
     let mut lds = LdsPlan::new();
-    let ks = lds.ring("K", (KT * ROW) as i64, 2, TLayout::Linear);
-    let vs = lds.ring("V", (KT * ROW) as i64, 2, TLayout::Linear);
+    let ks = lds.ring("K", (kt * ROW) as i64, 2, TLayout::Linear);
+    let vs = lds.ring("V", (kt * ROW) as i64, 2, TLayout::Linear);
     // hd192: the K rope ring (128 keys x 128 bytes per slot)
-    let kbs = hd192.then(|| lds.ring("KR", (KT * 128) as i64, 2, TLayout::Linear));
+    let kbs = hd192.then(|| lds.ring("KR", (kt * 128) as i64, 2, TLayout::Linear));
     lds.commit(&mut b);
     // DMA (per group, 4 waves): block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; K source chunk ^ (key % 16)
     let wig = roles.wave_in_group;
     let l16 = b.bind_i32(lane.lane() & 15);
     let k_so0 = { let v = b.bind_i32(ev(bat) * ev(k_bs) + ev(hkv) * ev(k_hs)); b.read_first_lane(v) };
     let v_so0 = { let v = b.bind_i32(ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs)); b.read_first_lane(v) };
-    let parts1 = lane_parts(&mut b, &lane, wig, l16, half, k_seqs, v_seqs, hd192);
+    let parts1 = lane_parts(&mut b, &lane, wig, wpg, l16, half, k_seqs, v_seqs, hd192);
     // the second pass of the paired causal form rebinds them (`fresh2`): reusing the first pass's values keeps them live through its last tile
     let fresh2 = pair && opts.fresh2;
     let (ks, vs) = (&ks, &vs);
@@ -460,11 +474,11 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let c0z = { let z = b.c_i32(0); b.read_first_lane(z) };
     let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
     // causal: the vendor's pairing - CTA x takes q tiles x and nt - 1 - x (equal work per CTA; the grid is halved)
-    let nt = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
+    let nt = { let v = b.bind_i32((ev(s_q) + (qr - 1)).lshr(qr_lg)); b.read_first_lane(v) };
     let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
         let qb = { let v = b.bind_i32(ev(nt) - 1 - ev(qt)); b.read_first_lane(v) };
         let second = b.bind_cond(ev(qb).gt(ev(qt)));
-        b.wg_union(&[qt, qb], &[0], Ext::c(0), Ext::ka(96).ceil_div(QR as i64) - Ext::c(1), "causal pairing: CTA x takes q tiles x and nt - 1 - x (the second only when nt - 1 - x > x), grid x = ceil(nt / 2): every q tile once");
+        b.wg_union(&[qt, qb], &[0], Ext::c(0), Ext::ka(96).ceil_div(qr as i64) - Ext::c(1), "causal pairing: CTA x takes q tiles x and nt - 1 - x (the second only when nt - 1 - x > x), grid x = ceil(nt / 2): every q tile once");
         vec![(qt, None), (qb, Some(second))]
     } else {
         vec![(qt, None)]
@@ -476,18 +490,18 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
         b.barrier();
         b.begin_if(Opnd::Val(g));
     }
-    let row = b.bind_i32((ev(qt) << 8) + (lane.wave() << 5) + lane.j());
+    let row = b.bind_i32((ev(qt) << qr_lg) + (lane.wave() << 5) + lane.j());
     let row_c = b.bind_i32(ev(row).min(ev(s_q) - 1));
     let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
     let qf: Vec<ValueId> = (0..if hd192 { 12 } else { 8 }).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
     // ---- key range: causal keys k <= q + SK - SQ ----
     let kv_end = if causal {
-        let v = b.bind_i32((((ev(qt) + 1) << 8) - 1 + ev(qoff) + 1).min(ev(s_kv)).max(0));
+        let v = b.bind_i32((((ev(qt) + 1) << qr_lg) - 1 + ev(qoff) + 1).min(ev(s_kv)).max(0));
         b.read_first_lane(v)
     } else {
         s_kv
     };
-    let ntk = { let v = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(7)); b.read_first_lane(v) };
+    let ntk = { let v = b.bind_i32((ev(kv_end) + (kt - 1)).lshr(kt_lg)); b.read_first_lane(v) };
     // split: this part's tiles [t_lo, t_hi) of ceil(ntk / S) each; keys relative to k_lo = 128 t_lo (the K / V origins move, the limits shift)
     let (nkv, kv_len, k_lo) = match (lg_s, part) {
         (Some(l), Some(pt)) => {
@@ -495,7 +509,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
             let t_lo = { let v = b.bind_i32((ev(pt) * ev(per)).min(ev(ntk))); b.read_first_lane(v) };
             let t_hi = { let v = b.bind_i32((ev(t_lo) + ev(per)).min(ev(ntk))); b.read_first_lane(v) };
             let n = { let v = b.bind_i32(ev(t_hi) - ev(t_lo)); b.read_first_lane(v) };
-            let klo = { let v = b.bind_i32(ev(t_lo) << 7); b.read_first_lane(v) };
+            let klo = { let v = b.bind_i32(ev(t_lo) << kt_lg); b.read_first_lane(v) };
             let len = { let v = b.bind_i32((ev(kv_end) - ev(klo)).max(0)); b.read_first_lane(v) };
             (n, len, Some(klo))
         }
@@ -503,7 +517,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     };
     let lim = b.bind_i32(if causal { (ev(row) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
     let lim_min = {
-        let v = b.bind_i32(if causal { ((ev(qt) << 8) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
+        let v = b.bind_i32(if causal { ((ev(qt) << qr_lg) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
         b.read_first_lane(v)
     };
     let (lim, lim_min, k_so, v_so) = match k_lo {
@@ -520,14 +534,14 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let fresh = (fresh2 && guard.is_some()).then(|| {
         let half2 = b.bind_i32(lane.half());
         let l16b = b.bind_i32(lane.lane() & 15);
-        (half2, lane_parts(&mut b, &lane, wig, l16b, half2, k_seqs, v_seqs, hd192))
+        (half2, lane_parts(&mut b, &lane, wig, wpg, l16b, half2, k_seqs, v_seqs, hd192))
     });
     let (half, lp) = match &fresh {
         Some((h, p)) => (*h, p),
         None => (half, &parts1),
     };
-    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: lp.k_vo.clone(), v_vo: lp.v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: lp.kb_vo.clone(), v_seqs: hd192.then_some(v_seqs) };
-    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, KT, Ext::ka(272).ceil_div(KT as i64));
+    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: lp.k_vo.clone(), v_vo: lp.v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: lp.kb_vo.clone(), v_seqs: hd192.then_some(v_seqs), wpg };
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, kt, Ext::ka(272).ceil_div(kt as i64));
     pipe.key_unclamped = true;
 
     let any = b.bind_cond(ev(nkv).gt(0));
@@ -535,7 +549,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     roles.each(&mut b, |b, role| {
         let mut body = Body {
             ring: &ring, kind, qf: &qf, kr: &lp.kr, kr2: &lp.kr2, vr: lp.vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true, kt, nb: (kt / 32) as usize,
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
@@ -780,8 +794,8 @@ struct LaneParts {
 /// DMA voffsets (per group, 4 waves: block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; source chunk ^ (key % 16)),
 /// the hd192 rope-part voffsets and the K / K-rope / V^T read offsets of the lane.
 #[allow(clippy::too_many_arguments)]
-fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, l16: ValueId, half: ValueId, k_seqs: ValueId, v_seqs: ValueId, hd192: bool) -> LaneParts {
-    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
+fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, wpg: i32, l16: ValueId, half: ValueId, k_seqs: ValueId, v_seqs: ValueId, hd192: bool) -> LaneParts {
+    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + wpg * i) << 2) + lane.lane().lshr(4))).collect();
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
     let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
@@ -789,7 +803,7 @@ fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, l16: ValueId, half: 
     let kb_vo: Vec<ValueId> = if hd192 {
         (0..4)
             .map(|i| {
-                let k = b.bind_i32(((ev(wig) + 4 * i) << 3) + lane.lane().lshr(3));
+                let k = b.bind_i32(((ev(wig) + wpg * i) << 3) + lane.lane().lshr(3));
                 b.bind_i32(ev(k) * ev(k_seqs) + 256 + (((lane.lane() & 7) ^ (ev(k) & 7)) << 4))
             })
             .collect()
