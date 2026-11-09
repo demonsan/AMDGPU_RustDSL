@@ -233,6 +233,205 @@ def check_silu_mul_quant(M=16, D=512):
     return r
 
 
+
+def up_i32(vals, shape, i64=False):
+    fmt = "q" if i64 else "i"
+    return aj.DeviceBuffer(shape, "int64" if i64 else "int32", itemsize=8 if i64 else 4, data=struct.pack(f"<{len(vals)}{fmt}", *vals))
+
+
+def cos_sin_table(P, R):
+    cs = [0.0] * (P * R)
+    for p in range(P):
+        for i in range(R // 2):
+            ang = p * 10000.0 ** (-2.0 * i / R)
+            cs[p * R + i], cs[p * R + R // 2 + i] = rbf(math.cos(ang)), rbf(math.sin(ang))
+    return cs
+
+
+def rope_ref(xv, cs, pos, P, D, neox):
+    if pos >= P:
+        return [0.0] * D
+    C = lambda j: cs[pos * D + j]
+    S = lambda j: cs[pos * D + D // 2 + j]
+    out = []
+    for i in range(D):
+        if neox:
+            j = i % (D // 2)
+            a, c = xv[j], xv[D // 2 + j]
+            out.append(a * C(j) - c * S(j) if i < D // 2 else c * C(j) + a * S(j))
+        else:
+            j = i // 2
+            a, c = xv[2 * j], xv[2 * j + 1]
+            out.append(a * C(j) - c * S(j) if i % 2 == 0 else c * C(j) + a * S(j))
+    return out
+
+
+def check_rope(T=16, H=8, D=128, P=64, style="neox", norm=False, eps=1e-6):
+    r = Res(f"{'qknorm_' if norm else ''}rope {style} T={T} H={H} D={D}")
+    x, cs, g = rand_bf16(T * H * D), cos_sin_table(P, D), rand_bf16(D)
+    pos = [R.randrange(P) for _ in range(T)]
+    pos[-1] = P + 5
+    dx, do, dp, dc, dg = up_bf16(x, (T, H, D)), aj.DeviceBuffer((T, H, D), "bfloat16"), up_i32(pos, (T,)), up_bf16(cs, (P, D)), up_bf16(g, (D,))
+    if norm:
+        aj.qknorm_rope(dx, do, dp, dc, dg, eps=eps, style=style)
+    else:
+        aj.rope(dx, do, dp, dc, style=style)
+    out = down_bf16(do, T * H * D)
+    for tt in range(T):
+        for h in range(H):
+            xv = x[(tt * H + h) * D:(tt * H + h + 1) * D]
+            if norm:
+                xv = rms_ref(xv, g, D, eps)
+            y = rope_ref(xv, cs, pos[tt], P, D, style == "neox")
+            for i in range(D):
+                r.cmp(out[(tt * H + h) * D + i], y[i], abs(y[i]) / 128 * 1.05 + 2e-3 + (abs(y[i]) / 64 if norm else 0))
+    return r
+
+
+def check_qknorm_rope_kvcache(T=16, H=8, D=128, P=64, S=64, fp8=False, i64=False, eps=1e-6):
+    r = Res(f"qknorm_rope_kvcache {'fp8' if fp8 else 'bf16'}{' i64' if i64 else ''} T={T} H={H} D={D} S={S}")
+    k, v, cs, g = rand_bf16(T * H * D), rand_bf16(T * H * D), cos_sin_table(P, D), rand_bf16(D)
+    pos = [R.randrange(P) for _ in range(T)]
+    perm = list(range(S))
+    R.shuffle(perm)
+    slots = [(-1 if t % 9 == 4 else perm[t]) for t in range(T)]
+    dk, dv, do = up_bf16(k, (T, H, D)), up_bf16(v, (T, H, D)), aj.DeviceBuffer((T, H, D), "bfloat16")
+    dp, dc, dg, ds = up_i32(pos, (T,)), up_bf16(cs, (P, D)), up_bf16(g, (D,)), up_i32(slots, (T,), i64)
+    esz = 1 if fp8 else 2
+    kc, vc = aj.DeviceBuffer((S, H, D), "uint8" if fp8 else "bfloat16", itemsize=esz), aj.DeviceBuffer((S, H, D), "uint8" if fp8 else "bfloat16", itemsize=esz)
+    kc.fill(0x55)
+    vc.fill(0x55)
+    ksc, vsc = 0.05, 0.02
+    aj.qknorm_rope_kvcache(dk, do, dp, dc, dg, dv, kc, vc, ds, eps=eps, k_scale=ksc if fp8 else None, v_scale=vsc if fp8 else None)
+    kb, vb = kc.download(), vc.download()
+    for tt in range(T):
+        if slots[tt] < 0:
+            continue
+        for h in range(H):
+            y = rope_ref(rms_ref(k[(tt * H + h) * D:(tt * H + h + 1) * D], g, D, eps), cs, pos[tt], P, D, True)
+            for i in range(D):
+                idx = (slots[tt] * H + h) * D + i
+                yv = v[(tt * H + h) * D + i]
+                if fp8:
+                    gk, gv = e4m3(kb[idx]) * ksc, e4m3(vb[idx]) * vsc
+                    sk, sv = max(-448 * ksc, min(448 * ksc, y[i])), max(-448 * vsc, min(448 * vsc, yv))
+                    r.cmp(gk, sk, abs(sk) / 16 * 1.05 + ksc * 2 ** -9 + abs(sk) / 64)
+                    r.cmp(gv, sv, abs(sv) / 16 * 1.05 + vsc * 2 ** -9)
+                else:
+                    gk = bf16(struct.unpack_from("<H", kb, idx * 2)[0])
+                    gv = bf16(struct.unpack_from("<H", vb, idx * 2)[0])
+                    r.cmp(gk, y[i], abs(y[i]) / 128 * 1.05 + 2e-3 + abs(y[i]) / 64)
+                    r.cmp(gv, yv, 0)
+    return r
+
+
+def check_reshape_cache(T=24, H=8, D=128, S=64, layout="flash", BS=16):
+    r = Res(f"reshape_cache {layout} T={T} H={H} D={D} S={S}")
+    k, v = rand_bf16(T * H * D), rand_bf16(T * H * D)
+    perm = list(range(S))
+    R.shuffle(perm)
+    slots = [(-1 if t % 7 == 3 else perm[t]) for t in range(T)]
+    dk, dv, ds = up_bf16(k, (T, H, D)), up_bf16(v, (T, H, D)), up_i32(slots, (T,))
+    if layout == "flash":
+        kc, vc = aj.DeviceBuffer((S, H, D), "bfloat16"), aj.DeviceBuffer((S, H, D), "bfloat16")
+    else:
+        NB = S // BS
+        kc, vc = aj.DeviceBuffer((NB, H, D // 8, BS, 8), "bfloat16"), aj.DeviceBuffer((NB, H, D, BS), "bfloat16")
+    kc.fill(0x55)
+    vc.fill(0x55)
+    aj.reshape_cache(dk, dv, kc, vc, ds, layout=layout)
+    kb, vb = kc.download(), vc.download()
+    for tt in range(T):
+        s = slots[tt]
+        if s < 0:
+            continue
+        blk, off = s // BS, s % BS
+        for h in range(H):
+            for d in range(D):
+                if layout == "flash":
+                    ki = vi = (s * H + h) * D + d
+                else:
+                    ki = (((blk * H + h) * (D // 8) + d // 8) * BS + off) * 8 + d % 8
+                    vi = ((blk * H + h) * D + d) * BS + off
+                r.cmp(bf16(struct.unpack_from("<H", kb, ki * 2)[0]), k[(tt * H + h) * D + d], 0)
+                r.cmp(bf16(struct.unpack_from("<H", vb, vi * 2)[0]), v[(tt * H + h) * D + d], 0)
+    return r
+
+
+def check_topk(T=32, E=128, K=8, renorm=False):
+    r = Res(f"topk_softmax{'_renorm' if renorm else ''} T={T} E={E} K={K}")
+    gt = rand_bf16(T * E, 2.0)
+    dg, dw, di = up_bf16(gt, (T, E)), aj.DeviceBuffer((T, K), "float32"), aj.DeviceBuffer((T, K), "int32")
+    aj.topk_softmax(dg, dw, di, renorm=renorm)
+    w, ix = down_f32(dw, T * K), list(struct.unpack(f"<{T * K}i", di.download()))
+    for tt in range(T):
+        row = gt[tt * E:(tt + 1) * E]
+        mx = max(row)
+        p = [math.exp(x - mx) for x in row]
+        s = sum(p)
+        p = [x / s for x in p]
+        order = sorted(range(E), key=lambda e: (-p[e], e))[:K]
+        tot = sum(p[e] for e in order)
+        for j in range(K):
+            r.cmp(ix[tt * K + j], order[j], 0)
+            wref = p[order[j]] / tot if renorm else p[order[j]]
+            r.cmp(w[tt * K + j], wref, 1e-5 + 2e-5 * wref)
+    return r
+
+
+def check_moe_sorting(M=40, E=64, K=2, BM=16):
+    r = Res(f"moe_sorting M={M} E={E} K={K} BM={BM}")
+    ids = [R.randrange(E) for _ in range(M * K)]
+    for i in range(0, M * K, 5):
+        ids[i] = 0  # skew
+    w = [R.random() for _ in range(M * K)]
+    maxp, nt, nnv, nts = aj.moe_sorting_sizes(M, E, K, BM)
+    di, dw = up_i32(ids, (M, K)), aj.DeviceBuffer((M, K), "float32", data=struct.pack(f"<{M * K}f", *w))
+    dsid, dsw = aj.DeviceBuffer((maxp,), "uint32"), aj.DeviceBuffer((maxp,), "float32")
+    deid, dnv, dts = aj.DeviceBuffer((nt,), "int32"), aj.DeviceBuffer((nnv,), "int32"), aj.DeviceBuffer((nts,), "int32")
+    aj.moe_sorting(di, dw, dsid, dsw, deid, dnv, dts, num_experts=E, block_m=BM)
+    sid = struct.unpack(f"<{maxp}I", dsid.download())
+    sw = struct.unpack(f"<{maxp}f", dsw.download())
+    eid, nv, ts = struct.unpack(f"<{nt}i", deid.download()), struct.unpack("<2i", dnv.download()), struct.unpack(f"<{nts}i", dts.download())
+    cnt = [ids.count(e) for e in range(E)]
+    off = [0]
+    for e in range(E):
+        off.append(off[-1] + -(-cnt[e] // BM) * BM)
+    total = off[E]
+    r.cmp(nv[0], total, 0)
+    r.cmp(nv[1], M, 0)
+    for e in range(E + 1):
+        r.cmp(ts[e], off[e] // BM, 0)
+    for j in range(nt):
+        ref = E
+        if j * BM < total:
+            ref = max(e for e in range(E) if off[e] <= j * BM and off[e + 1] > j * BM)
+        r.cmp(eid[j], ref, 0)
+    sentinel = (K << 24) | M
+    for e in range(E):
+        got = sorted((sid[q], struct.pack("<f", sw[q])) for q in range(off[e], off[e] + cnt[e]))
+        ref = sorted((((i % K) << 24) | (i // K), struct.pack("<f", w[i])) for i in range(M * K) if ids[i] == e)
+        r.cmp(0 if got == ref else 1, 0, 0)
+        for q in range(off[e] + cnt[e], off[e + 1]):
+            r.cmp(0 if (sid[q] == sentinel and sw[q] == 0.0) else 1, 0, 0)
+    return r
+
+
+def check_moe_reduce(T=8, K=8, D=512, weighted=True):
+    r = Res(f"moe_{'reduce' if weighted else 'combine'} T={T} K={K} D={D}")
+    x = rand_bf16(T * K * D)
+    w = [R.random() for _ in range(T * K)]
+    dx, do = up_bf16(x, (T, K, D)), aj.DeviceBuffer((T, D), "bfloat16")
+    dw = aj.DeviceBuffer((T, K), "float32", data=struct.pack(f"<{T * K}f", *w)) if weighted else None
+    aj.moe_reduce(dx, do, dw)
+    out = down_bf16(do, T * D)
+    for tt in range(T):
+        for d in range(D):
+            terms = [x[(tt * K + k) * D + d] * (w[tt * K + k] if weighted else 1.0) for k in range(K)]
+            ref, mag = sum(terms), sum(abs(a) for a in terms)
+            r.cmp(out[tt * D + d], ref, abs(ref) / 128 * 1.02 + 1e-6 * mag + 1e-30)
+    return r
+
 CHECKS = [
     ("rmsnorm", check_rmsnorm),
     ("add_rmsnorm", check_add_rmsnorm),
@@ -246,6 +445,18 @@ CHECKS = [
     ("act_mul_gelu", lambda: check_act_mul(kind="gelu")),
     ("act_mul_gelu_tanh", lambda: check_act_mul(kind="gelu_tanh")),
     ("silu_mul_quant_fp8", check_silu_mul_quant),
+    ("rope_neox", check_rope),
+    ("rope_gptj", lambda: check_rope(style="gptj")),
+    ("qknorm_rope", lambda: check_rope(norm=True)),
+    ("qknorm_rope_kvcache_bf16", check_qknorm_rope_kvcache),
+    ("qknorm_rope_kvcache_fp8_i64", lambda: check_qknorm_rope_kvcache(fp8=True, i64=True)),
+    ("reshape_cache_flash", check_reshape_cache),
+    ("reshape_cache_blocked", lambda: check_reshape_cache(layout="blocked")),
+    ("topk_softmax", check_topk),
+    ("topk_softmax_renorm", lambda: check_topk(E=256, renorm=True)),
+    ("moe_sorting", check_moe_sorting),
+    ("moe_reduce", check_moe_reduce),
+    ("moe_combine", lambda: check_moe_reduce(weighted=False)),
 ]
 
 
