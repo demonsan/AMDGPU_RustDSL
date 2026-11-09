@@ -1416,6 +1416,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
         "gemm_a8w8_blockscale" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale", GemmConfig::a8w8_blockscale())),
         "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
+        "gemm_a8w8_blockscale_64" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64", GemmConfig { cta_m: 64, ..GemmConfig::a8w8_blockscale() })),
+        "gemm_a8w8_blockscale_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64_splitk", GemmConfig { cta_m: 64, ..GemmConfig::a8w8_blockscale() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
         n if n.starts_with("moe_sum_bf16h_k") => n["moe_sum_bf16h_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16_x(n, k, true)),
