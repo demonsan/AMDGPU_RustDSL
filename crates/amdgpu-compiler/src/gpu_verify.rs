@@ -621,6 +621,15 @@ impl<'a> An<'a> {
         let ranges = rec.1.as_ref().and_then(|(atoms, _)| {
             let mut m = BTreeMap::new();
             for k in atoms.keys() {
+                // a `wg_union` index: the fact's range
+                if !k.0 && k.1 >= (1u64 << 62) && k.1 < (1u64 << 62) + 1024 {
+                    let wm = &self.f.contract.wg_maps[(k.1 - (1u64 << 62)) as usize];
+                    if let Some((lo, hi)) = &wm.range {
+                        let (il, ih) = (ext_itv(&self.cx, lo), ext_itv(&self.cx, hi));
+                        m.insert(*k, (il.lo.first()?.clone(), ih.hi.first()?.clone()));
+                        continue;
+                    }
+                }
                 let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
                 let mut r: Option<(Poly, Poly)> = None;
                 for o in insts {
