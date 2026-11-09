@@ -228,12 +228,8 @@ impl Pipeline {
         let vars = b.begin_loop(&inits);
         let (it, idx) = (vars[0], vars[1 + ns]);
         body.bind_state(&vars[1..1 + ns]);
-        b.assume_trusted(
-            it,
-            Ext::c(0),
-            self.nkv_bound.clone(),
-            "tile counter (tile::Pipeline): starts at 0 and the loop exits at it >= nkv - 1, so the body only runs with it <= nkv - 2 <= ceil(rows / tile_rows); the guard compares against a derived value the interval engine cannot relate to the bound",
-        );
+        // the loop-exit fact (it < nkv - 1 after the break) proves the counter range: a checked assume
+        b.assume(it, Ext::c(0), self.nkv_bound.clone());
         // wave-uniform: read_first_lane keeps the loop-exit compare scalar (s_cmp + s_cbranch_scc instead of v_cmp -> vcc + hazard nops)
         let nkv_m1 = if self.scalar_exit {
             let v = b.bind_i32(ev(self.nkv) - 1);
