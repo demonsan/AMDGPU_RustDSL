@@ -884,3 +884,84 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
     }
     total
 }
+
+/// One `s_nop` of the final code, classified (`amdc nops`): the hazard rule that most plausibly required it, the producer and the consumer.
+#[derive(Clone, Debug)]
+pub struct NopSite {
+    pub block: usize,
+    pub index: usize,
+    pub states: usize,
+    pub rule: &'static str,
+    pub producer: Option<MOp>,
+    pub consumer: Option<MOp>,
+    /// the IR value the consumer was lowered from (diagnostics origin; u32::MAX = none)
+    pub origin: u32,
+}
+
+/// Post-hoc classification of every `s_nop` of an allocated function: the next real instruction is the consumer; the closest earlier
+/// instruction (within the block, up to 32 back) whose result it reads (or whose vcc / whose register it overwrites) is the producer, and the
+/// producer's class names the rule: mfma-result, transcendental, valu-to-special-operand (MFMA operand / permlane / DPP / readfirstlane),
+/// vcc, pk-to-transcendental, accvgpr-read-to-ptr-add, cvt-dst-select, M0 (LDS DMA), else block-end / phys-WAR / other.
+pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
+    let alias = m.alias.clone();
+    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
+    let mut out = Vec::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if inst.op != MOp::SNop || inst.pin {
+                continue;
+            }
+            let states = inst.imm.max(0) as usize + 1;
+            // the consumer: the next non-nop instruction of the block
+            let cons = b.insts[ii + 1..].iter().find(|x| x.op != MOp::SNop);
+            let Some(c) = cons else {
+                out.push(NopSite { block: bi, index: ii, states, rule: "block-end", producer: None, consumer: None, origin: u32::MAX });
+                continue;
+            };
+            let reads: Vec<VReg> = c.uses().into_iter().map(canon).collect();
+            let cd = c.dst.map(canon);
+            let mut rule = "other";
+            let mut prod = None;
+            let at = crate::op_attrs::attrs(c.op);
+            if at.m0_src.is_some() && ii > 0 && matches!(b.insts[ii - 1].op, MOp::SMovM0 | MOp::SAddM0) {
+                rule = "m0-write-to-lds-dma";
+                prod = Some(b.insts[ii - 1].op);
+            } else {
+                for p in b.insts[..ii].iter().rev().filter(|x| x.op != MOp::SNop).take(32) {
+                    let pa = crate::op_attrs::attrs(p.op);
+                    let pd = p.dst.map(canon);
+                    let reads_it = pd.map_or(false, |d| reads.contains(&d));
+                    if c.op.consumes_vcc() && (pa.defines_vcc || p.op == MOp::VPtrAdd) {
+                        rule = "vcc-write-to-vcc-read";
+                        prod = Some(p.op);
+                        break;
+                    }
+                    if reads_it || (pd.is_some() && pd == cd && pa.mfma.is_some()) {
+                        prod = Some(p.op);
+                        rule = if pa.mfma.is_some() {
+                            "mfma-result"
+                        } else if pa.transcendental {
+                            "transcendental-result"
+                        } else if cvt_dst_sel_write(p.op, p.imm) {
+                            "cvt-dst-select"
+                        } else if p.op == MOp::VAccvgprRead && c.op == MOp::VPtrAdd {
+                            "accvgpr-read-to-ptr-add"
+                        } else if matches!(p.op, MOp::VPkAddF32 | MOp::VPkMulF32) && at.transcendental {
+                            "pk-f32-to-transcendental"
+                        } else if pa.valu_writer_delay.is_some() && at.reads_valu_hazard {
+                            "valu-to-special-operand"
+                        } else {
+                            "other-dependence"
+                        };
+                        break;
+                    }
+                }
+            }
+            if prod.is_none() && rule == "other" {
+                rule = "no-local-producer (block edge / phys WAR)";
+            }
+            out.push(NopSite { block: bi, index: ii, states, rule, producer: prod, consumer: Some(c.op), origin: c.origin });
+        }
+    }
+    out
+}
