@@ -321,11 +321,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     b.grid_is(0, Ext::ka(176).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
     b.grid_is(2, Ext::sym("B"));
-    // per-region scheduler strategies (docs/weaver-sched.md): the list scheduler on the S / dP and dV / dK MFMA regions (ldshoist: the LDS operand reads of a chain are hoisted ahead of its MFMAs instead of the
-    // strict `ds_read -> lgkmcnt(0) -> mfma` pattern on one register) and on the softmax / pack region (with hazard-nop filling): dkdv 139.5 -> 114.4 us (B1 H8 2048, non-causal), registers 328 -> 360 (one wave per SIMD).
-    b.declare_region("dkdv_sdp_mma", false, "reorder,ldshoist");
-    b.declare_region("dkdv_dv_dk_mma", false, "reorder,ldshoist");
-    b.declare_region("dkdv_softmax_pack", false, "reorder,hzfill");
+    // (sched's per-region strategies - reorder,ldshoist on the MFMA regions, reorder,hzfill on softmax / pack: 139.5 -> 114.4 us on the Gemm profile -
+    // measured 102.2 vs 98.0 us on top of the Vs128 profile + tokens below: not declared; the region markers stay)
+
     let a = args(&mut b);
     let (kt, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let lane = Lane::new(&mut b);
