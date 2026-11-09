@@ -998,6 +998,9 @@ pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
 /// not switchable (hardware: probe_valu_sgpr reads a stale soffset without it; tests/hazard_valu_sgpr.rs pins the padding).
 pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     use crate::sched::model::Pipe;
+    if testing::SKIP_VALU_SGPR.with(|s| s.get()) {
+        return 0;
+    }
     const VMEM_WAIT: usize = 5;
     const VALU_WAIT: usize = 2;
     let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;
@@ -1101,4 +1104,21 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
         m.blocks[bi].insts = out;
     }
     added
+}
+
+/// Mutation-testing hooks (NOT a user option): run a compilation with a correctness pass removed, to prove a regression test detects its
+/// absence. Thread-local and scoped; never set by the compiler itself.
+#[doc(hidden)]
+pub mod testing {
+    use std::cell::Cell;
+    thread_local! {
+        pub(crate) static SKIP_VALU_SGPR: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Runs `f` with `pad_valu_sgpr` disabled on this thread.
+    pub fn without_valu_sgpr<R>(f: impl FnOnce() -> R) -> R {
+        SKIP_VALU_SGPR.with(|s| s.set(true));
+        let r = f();
+        SKIP_VALU_SGPR.with(|s| s.set(false));
+        r
+    }
 }

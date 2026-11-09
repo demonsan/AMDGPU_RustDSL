@@ -25,12 +25,11 @@ fn reads_sgpr(l: &str, s: &str) -> bool {
     ops.split(',').skip(1).any(|o| o.trim().split_whitespace().next() == Some(s))
 }
 
-#[test]
-fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
-    let f = kernel_by_name("probe_valu_sgpr").expect("registered");
-    let asm = compile_with(&f, &OwnTail).expect("compiles").asm;
+/// Checks the asm: every VMEM read of a readfirstlane result >= 5 wait states after it, every VALU read >= 2. Returns the number of VMEM
+/// sites, or the first violation.
+fn check(asm: &str) -> Result<usize, String> {
     let lines: Vec<&str> = asm.lines().collect();
-    let (mut vmem_sites, mut valu_sites) = (0, 0);
+    let mut vmem_sites = 0;
     for (i, l) in lines.iter().enumerate() {
         let t = l.trim();
         let Some(rest) = t.strip_prefix("v_readfirstlane_b32 ") else { continue };
@@ -38,17 +37,17 @@ fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
         let mut gap = 0usize;
         for m in &lines[i + 1..] {
             let mt = m.trim();
-            // the register is redefined: stop
             if mt.split(' ').nth(1).map_or(false, |d| d.trim_end_matches(',') == s) && !mt.starts_with("buffer_") {
                 break;
             }
             if reads_sgpr(mt, &s) {
                 if mt.starts_with("buffer_") || mt.starts_with("global_") {
-                    assert!(gap >= 5, "VMEM read of {s} after {gap} wait states (need 5):\n{l}\n...\n{mt}");
+                    if gap < 5 {
+                        return Err(format!("VMEM read of {s} after {gap} wait states (need 5):\n{l}\n...\n{mt}"));
+                    }
                     vmem_sites += 1;
-                } else if mt.starts_with("v_") {
-                    assert!(gap >= 2, "VALU read of {s} after {gap} wait states (need 2):\n{l}\n...\n{mt}");
-                    valu_sites += 1;
+                } else if mt.starts_with("v_") && gap < 2 {
+                    return Err(format!("VALU read of {s} after {gap} wait states (need 2):\n{l}\n...\n{mt}"));
                 }
             }
             gap += states(mt);
@@ -57,6 +56,23 @@ fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
             }
         }
     }
-    assert!(vmem_sites >= 32, "the probe's readfirstlane -> soffset sites: {vmem_sites}");
-    let _ = valu_sites;
+    Ok(vmem_sites)
+}
+
+#[test]
+fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
+    let f = kernel_by_name("probe_valu_sgpr").expect("registered");
+    let asm = compile_with(&f, &OwnTail).expect("compiles").asm;
+    match check(&asm) {
+        Ok(n) => assert!(n >= 32, "the probe's readfirstlane -> soffset sites: {n}"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Mutation test: with the hazard pass removed the check above must FAIL (it would otherwise pass vacuously).
+#[test]
+fn the_check_bites_without_the_hazard_pass() {
+    let f = kernel_by_name("probe_valu_sgpr").expect("registered");
+    let asm = amdgpu_compiler::hazards::testing::without_valu_sgpr(|| compile_with(&f, &OwnTail).expect("compiles").asm);
+    assert!(check(&asm).is_err(), "the regression check did not detect the missing VALU-writes-SGPR padding");
 }
