@@ -1413,6 +1413,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_d3" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_d3", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_64_d3_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_d3_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
+        "gemm_a8w8_rowcol_fp8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64", GemmConfig { cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_rowcol_fp8_64_d3" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64_d3", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_128_d3" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128_d3", GemmConfig { elem: Elem::I8, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
@@ -1675,7 +1678,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
     let slots = if cfg.depth3 { 3 } else { 2 };
-    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) && !cfg.split_k && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
+    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
     let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
