@@ -573,6 +573,29 @@ impl<'a> An<'a> {
         any.then_some(ax)
     }
 
+    /// Known trailing zero bits of an integer operand (its values are multiples of 2^tz), capped at 30.
+    fn tz(&self, o: &Opnd, depth: usize) -> u32 {
+        if depth > 16 {
+            return 0;
+        }
+        let tzc = |c: i128| if c == 0 { 30 } else { (c.trailing_zeros()).min(30) };
+        match o {
+            Opnd::I32(c) => tzc(*c as i128),
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::ConstI32(c)) => tzc(*c as i128),
+                Some(Op::ShlI32(a, b)) => match self.int_of(b).point_const() {
+                    Some(s) if s.d == 1 && (0..31).contains(&s.n) => (self.tz(a, depth + 1) + s.n as u32).min(30),
+                    _ => 0,
+                },
+                Some(Op::AndI32(a, b)) => self.tz(a, depth + 1).max(self.tz(b, depth + 1)),
+                Some(Op::AddI32(a, b)) => self.tz(a, depth + 1).min(self.tz(b, depth + 1)),
+                Some(Op::MulI32(a, b)) => (self.tz(a, depth + 1) + self.tz(b, depth + 1)).min(30),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
     /// The exact (point) value of a uniform operand, if its interval is one polynomial.
     fn point_of(&self, o: &Opnd) -> Option<Poly> {
         // a lower bound that is also an upper bound (an interval keeps several candidate bounds)
@@ -1064,6 +1087,12 @@ impl<'a> An<'a> {
                 c.scale(Q::int(-1))
             } else {
                 return Err("a coefficient of unknown sign".into());
+            };
+            // an atom whose values are multiples of 2^z (known trailing zeros): the digit steps by c 2^z over (h - l) / 2^z steps
+            let z = if k.0 { 0 } else { self.atom_inst.borrow().get(k).and_then(|v| v.first().cloned()).map_or(0, |o| self.tz(&o, 0)) };
+            let (c, m) = match m.as_const() {
+                Some(q) if z > 0 && q.d == 1 => (c.scale(Q::int(1i128 << z)), Poly::int(q.n >> z)),
+                _ => (c, m),
             };
             digits.push((c, m));
         }
