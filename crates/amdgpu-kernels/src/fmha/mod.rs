@@ -824,7 +824,6 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         // the remap is a bijection of [0, X) x [0, H) (N % 8 == 0); the interval engine cannot follow the division: trusted contract facts
         b.assume_trusted(qt, Ext::c(0), Ext::ka(0x060).ceil_div(1 << rows_lg) - Ext::c(1), "XCD block order: the logical query tile M % X of the bijection M = (L % 8) N / 8 + L / 8 over [0, X H) lies in [0, X)");
         b.assume_trusted(hi, Ext::c(0), Ext::ka(0x140) - Ext::c(1), "XCD block order: the logical head M / X of the bijection over [0, X H) lies in [0, H)");
-        b.wg_bijection(&[qt, hi], &[0, 1], "XCD block order: (query tile, head) is a bijection of the workgroup (x, y) (the identity when the remap is off)");
         (qt, hi)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
