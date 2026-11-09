@@ -131,6 +131,28 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                     }
                 }
             }
+            // chained constant adds: s_add_u32 m0, s, k  with  s = s_add_u32 x, k2 (single use)  ->  s_add_u32 m0, x, k + k2
+            loop {
+                if b.insts[p].op != MOp::SAddM0 {
+                    break;
+                }
+                let (Some(Src::Reg(s)), Some(Src::Imm(k))) = (b.insts[p].srcs.first().cloned(), b.insts[p].srcs.get(1).cloned()) else { break };
+                let sc = canon(s);
+                if uses.get(&sc).copied() != Some(1) || alias.contains_key(&s) {
+                    break;
+                }
+                let Some(q) = (0..p).rev().find(|&q| b.insts[q].dst.map_or(false, |d| canon(d) == sc)) else { break };
+                let add = b.insts[q].clone();
+                let (Some(Src::Reg(x)), Some(Src::Imm(k2))) = (add.srcs.first().cloned(), add.srcs.get(1).cloned()) else { break };
+                if add.op != MOp::SAddU32 || add.pin || b.insts[q + 1..p].iter().any(|z| z.dst.map_or(false, |d| canon(d) == canon(x))) {
+                    break;
+                }
+                let sum = (k as i64 + k2 as i64) as i32 as i64;
+                b.insts[p].srcs = vec![Src::Reg(x), Src::Imm(sum)];
+                b.insts.remove(q);
+                p -= 1;
+                folded += 1;
+            }
             // hoist
             let srcs: Vec<VReg> = b.insts[p].uses().into_iter().map(|x| canon(x)).collect();
             let writes_scc = b.insts[p].op == MOp::SAddM0;
