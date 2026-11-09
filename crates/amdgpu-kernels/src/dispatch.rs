@@ -168,15 +168,24 @@ pub fn fp8pt_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus:
     (name, s as u32)
 }
 
-/// MLA prefill hd192/hd128 (`fmha_fwd_hd192_hd128_bf16_v3*`): the kernel and key splits. Non-causal: the plain kernel. Causal, by the
+/// MLA prefill hd192/hd128 (`fmha_fwd_hd192_hd128_bf16_v3*`): the kernel and key splits. Non-causal: the plain kernel, `_ks` on small grids. Causal, by the
 /// unpaired grid U = B H ceil(SQ / 256): U >= 2 CUs -> the paired `_causal` (B4 H16 2048^2 173 -> 130 us, B1 H128 1024^2 101 -> 80, vendor
 /// 128 / 82); smaller grids the unpaired `_causal_np` (B1 H16 4096^2 143 vs 156 paired, B2 H16 2048^2 89 vs 93), and when U <= CUs / 2 with
 /// >= 32 key tiles the unpaired key split `_causal_ks` S = 2 (B1 H8 4096^2 104 vs 121; B1 H16 2048^2, 16 key tiles, stays unsplit: 72 vs 75).
 pub fn hd192_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: u64) -> (&'static str, u32) {
+    let u = b * h * sq.div_ceil(256);
     if !causal {
+        // small grids: the key split `_ks` (fp32 partials + attn_combine_bf16_hd128_q16). U <= CUs / 4: S = 4 (B1 H8 2048^2 66.6 -> 41.3 us);
+        // U < CUs with >= 32 key tiles: S = 2 (B1 H8 4096^2 134 -> 112); U = CUs / 2 with 16 key tiles loses (B1 H16 2048^2 76.1 vs 78.9 with
+        // the one-row combine)
+        if 4 * u <= cus && sk.div_ceil(128) >= 16 {
+            return ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4);
+        }
+        if u < cus && sk.div_ceil(128) >= 32 {
+            return ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2);
+        }
         return ("fmha_fwd_hd192_hd128_bf16_v3", 1);
     }
-    let u = b * h * sq.div_ceil(256);
     if u >= 2 * cus {
         ("fmha_fwd_hd192_hd128_bf16_v3_causal", 1)
     } else if 2 * u <= cus && sk.div_ceil(128) >= 32 {
@@ -260,7 +269,10 @@ mod tests {
         assert_eq!(hd192_prefill_kernel(1, 16, 4096, 4096, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np", 1));
         assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np", 1));
         assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2));
-        assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3", 1));
+        assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2));
+        assert_eq!(hd192_prefill_kernel(1, 8, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4));
+        assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3", 1));
+        assert_eq!(hd192_prefill_kernel(1, 16, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3", 1));
     }
 
     #[test]

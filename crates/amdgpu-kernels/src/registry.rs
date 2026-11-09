@@ -109,7 +109,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("quant_mxfp6_e2m3_bf16_k") || n.starts_with("quant_mxfp6_e3m2_bf16_k") => crate::rows::mxfp6::by_name(n),
         n if n.starts_with("rmsnorm_quant_mxfp4_bf16_k") => crate::rows::mxnorm::by_name(n),
         n if n.starts_with("quant_mxfp4_bf16_k") || n.starts_with("quant_mxfp8_bf16_k") => crate::rows::mxquant::by_name(n),
-        "attn_combine_bf16_hd128_q" => Some(crate::fmha::bf16v3::attn_combine_bf16_hd128_q("attn_combine_bf16_hd128_q")),
+        "attn_combine_bf16_hd128_q16" => Some(crate::fmha::bf16v3::attn_combine_bf16_hd128_q16("attn_combine_bf16_hd128_q16")),
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
         "attn_combine_bf16_sink_hd128" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd128", 128, false, true)),
         "attn_combine_bf16_sink_hd64" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd64", 64, false, true)),

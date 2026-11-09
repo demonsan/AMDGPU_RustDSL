@@ -32,7 +32,7 @@ pub fn dispatched_names() -> BTreeSet<String> {
                     let (k, s) = bf16_prefill_kernel(b, h, sq, sk, causal, 256);
                     n.insert(k.to_string());
                     if s > 1 {
-                        n.insert("attn_combine_bf16_hd128_q".into());
+                        n.insert("attn_combine_bf16_hd128_q16".into());
                     }
                 }
             }
@@ -54,7 +54,7 @@ pub fn dispatched_names() -> BTreeSet<String> {
             let (k, s) = hd192_prefill_kernel(b, h, sq, sq, causal, 256);
             n.insert(k.to_string());
             if s > 1 {
-                n.insert("attn_combine_bf16_hd128_q".into());
+                n.insert("attn_combine_bf16_hd128_q16".into());
             }
         }
     }

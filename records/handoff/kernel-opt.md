@@ -34,8 +34,12 @@ docs in Chinese in `docs/op-coverage-design.md` (relative links, `python tools\c
   `dispatch::hd192_prefill_kernel`): 0.74 -> 0.96-1.01 at U >= 512, small grids 0.77-0.82. fp8pt KV split `_kvsplit` / `_causal_kvsplit` (ABI ext at
   0x290.., combine = mxfp8 combine8h; `dispatch::fp8pt_prefill_kernel`): B1 H8 4096^2 1.19 / causal 1.32, 2048^2 1.36 / 1.64. Rebinding on hd128
   causal measured neutral (not enabled). Pre-existing: `fmha_fwd_hd128_bf16_v3_causal_ks` does not assemble (SGPR 104) - backend fix on `sgpr-fix`.
-- Next candidates: hd192 small grids (non-causal B1H8 4096^2 0.66: try `_ks` in the dispatch; causal 0.77-0.82), re-measure bf16 hd128 causal small
-  grids after sgpr-fix, fp8pt gap attribution at large grids (0.90-0.97; ATT via sched), bwd 0.72-0.86.
+- Round 3: fp8pt `declare_region("v_phase", true, "")` after sched's ATT read (the m-scale pk_mul was scheduled ahead of the DMA issues):
+  large grids 0.93 -> 1.03 (non-causal 8192^2), causal 0.92 -> 0.97; new combine `attn_combine_bf16_hd128_q16` (replaces `_q`; 16 rows per
+  workgroup) and hd192 non-causal `_ks` in the dispatch: hd192 B1H8 4096^2 0.66 -> 0.81, causal `_ks` 0.82 -> 0.95, bf16 hd128 B1H8 4096^2 1.07.
+  `tools/att_fp8pt.sh` = ATT of fp8pt vs aiter. Python `prefill_bf16` switched to q16 (not run here: no torch on the node path I use).
+- Next candidates: re-measure bf16 hd128 causal small grids once sgpr-fix is in Main; hd192 small grids structurally need a 128-row / 4-wave form;
+  bwd 0.72-0.86.
 ## Open items across my areas (current same-run ratios vs aiter; >1 = ours faster)
 
 - **MXFP4 GEMM** 0.86-0.90× (8192³ 270 vs 242 µs). sched's attribution (docs/mxfp4-gemm-profile.md on origin/sched-mxfp4-prof): DMA-issue
