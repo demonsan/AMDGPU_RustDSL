@@ -616,7 +616,13 @@
 | bf16 | 128×4096×8192 | 18.7（64，S=4） | 116（256×256） | —（厂商的 split-K 形式未同测） |
 
 - fp8 per-token（rowcol）的 64 形式：256×7168×4096 从 23.0 降到 13.6，1024×4096×8192 从 51.6 降到 46.0（厂商没有对应的 .co）。
-- MoE、A16W4、A8W4 的 64-row 形式循环里还有 Mx32 scale 的 VMEM 读，尚未接入 3-slot ring。
+- **MoE**（2026-11-09）：单位 scale 的 stage 1、block_m 64 形式（fp8 per-token、bf16）改用 3-slot ring。
+  - 测试规模：D4096 I1024 E64 topk 8，同次运行。
+  - stage 1：M=16 从 99.6 µs 降到 92.7，M=64 从 110.0 降到 107.9，M=256 从 112.7 降到 112.4。
+  - 对照厂商 `fmoe_stage1 pertokenFp8 128x128_pf3`：M=16 为 100.2，M=256 为 116.9。
+  - decode 规模下 stage 1 约受带宽限制（每次约 5 TB/s 地读 W1），所以 3-slot 只带来个位数百分比的收益。
+  - stage 2 与 block_m 128 结果有好有坏，保持不变。
+- Mx32 的 MoE / A16W4 / A8W4 尚未接入（循环里有逐 tile 的 scale VMEM 读）。考虑到 decode 规模受带宽限制，收益预计也只有个位数百分比，暂缓。
 
 **批量 GEMM（覆盖补齐）**：`gemm_a16w16_bf16_bmm`、`gemm_a8w8_rowcol_fp8_bmm`、`gemm_mxfp8_bs_v4_bmm`（`GemmConfig.batched`）。
 - 网格 z = batch（kernarg 36）。各 batch 的 A、B、C 与 scale 都是稠密块，基址用 64 位 `ptr_mad` 移动；契约中每个张量乘以 BT。
