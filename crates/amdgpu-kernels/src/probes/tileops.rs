@@ -1381,3 +1381,67 @@ pub fn probe_fp6() -> Function {
     }
     b.finish()
 }
+
+/// `probe_i8_epi(in, out)`: the int8 GEMM epilogue path. For the two i8 MFMA shapes (16x16x64, 32x32x32): A, B fragments from `in` (as
+/// probe_mfma_p1), an accumulation chain acc = A x B (zero-C) + 3 x (A x B) (back-to-back in-place i32 accumulation), then per lane value
+/// f = cvt_f32_i32(acc) * 0.5 (out block 1, f32), g = cvt_f32_u32(acc & 0x7fffffff) (block 2, f32) and bf16 pairs cvt_pk_bf16_f32(f[2e], f[2e+1])
+/// (block 3, one dword per pair), each lane-major.
+pub fn probe_i8_epi() -> Function {
+    use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
+    let kinds = [MmaKind::new(S::M16N16K64, T::I8), MmaKind::new(S::M32N32K32, T::I8)];
+    let mut b = FnBuilder::new("probe_i8_epi", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    let out_bytes: u32 = kinds.iter().map(|k| (2 * 64 * 4 * k.acc_dwords()) + 64 * 2 * k.acc_dwords()).sum();
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const((kinds.len() * 2048) as i64));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(out_bytes as i64));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c16 = b.c_i32(16);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::Val(c16)));
+    let half = b.c_f32(0.5);
+    let mut obase = 0u32;
+    for (i, k) in kinds.iter().enumerate() {
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::I32((i * 2048) as i32) });
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off16) });
+        let fa = b.load_global(pa, 0, amdgpu_dsl::MemTy::B128);
+        let fb = b.load_global(pa, 1024, amdgpu_dsl::MemTy::B128);
+        let mut acc = b.mfma(*k, fa, fb, None);
+        for _ in 0..3 {
+            acc = b.mfma(*k, fa, fb, Some(Opnd::Val(acc)));
+        }
+        let n = k.acc_dwords();
+        let fs: Vec<ValueId> = (0..n as u8)
+            .map(|e| {
+                let x = if n == 4 { b.frag4_lane(acc, e) } else { b.frag16_lane(acc, e) };
+                let f = b.un(UnOp::CvtF32I32, x);
+                b.mul_f32(f, half)
+            })
+            .collect();
+        let gs: Vec<ValueId> = (0..n as u8)
+            .map(|e| {
+                let x = if n == 4 { b.frag4_lane(acc, e) } else { b.frag16_lane(acc, e) };
+                let m = b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(0x7fff_ffff)));
+                b.un(UnOp::CvtF32U32, m)
+            })
+            .collect();
+        let lane_f = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((4 * n) as i32)));
+        for (j, vals) in [&fs, &gs].iter().enumerate() {
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32((obase + j as u32 * 64 * 4 * n) as i32) });
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(lane_f) });
+            for (e, v) in vals.iter().enumerate() {
+                b.store_global(p, 4 * e as u32, *v, amdgpu_dsl::MemTy::B32, false);
+            }
+        }
+        let lane_h = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((2 * n) as i32)));
+        let p = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32((obase + 2 * 64 * 4 * n) as i32) });
+        let p = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(lane_h) });
+        for e in 0..(n / 2) as usize {
+            let w = b.cvt_pk_bf16_f32(fs[2 * e], fs[2 * e + 1]);
+            b.store_global(p, 4 * e as u32, w, amdgpu_dsl::MemTy::B32, false);
+        }
+        obase += 2 * 64 * 4 * n + 64 * 2 * n;
+    }
+    b.finish()
+}

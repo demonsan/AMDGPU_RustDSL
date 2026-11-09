@@ -1088,6 +1088,65 @@ def check_fp6(planes, out):
         ok_all &= bad == 0
     return ok_all
 
+# ---------------------------------------------------------------- probe_i8_epi (the int8 GEMM epilogue path)
+I8_KINDS = [k for k in MFMA_KINDS if k[3] == "i8"]
+
+def gen_i8_epi():
+    rnd = random.Random(78)
+    words = []
+    for name, M, K, ty, n in I8_KINDS:
+        for _ in range(2):
+            for l in range(LANES):
+                vals = [rnd.randint(-100, 100) for _ in range(16)]
+                x = 0
+                for i, v in enumerate(vals):
+                    x |= (v & 255) << (8 * i)
+                words += [(x >> (32 * j)) & 0xFFFFFFFF for j in range(4)]
+    return [words]
+
+def check_i8_epi(planes, out):
+    words = planes[0]
+    pos, obase, ok = 0, 0, True
+    for name, M, K, ty, n in I8_KINDS:
+        A = [[0] * K for _ in range(M)]
+        B = [[0] * M for _ in range(K)]
+        for which in range(2):
+            for l in range(LANES):
+                vals = dec_frag("i8", words[pos + 4 * l: pos + 4 * l + 4])
+                for i, v in enumerate(vals):
+                    kk = 16 * (l // M) + i
+                    if which == 0:
+                        A[l % M][kk] = v
+                    else:
+                        B[kk][l % M] = v
+            pos += 4 * LANES
+        D = [[4 * sum(A[r][k] * B[k][c] for k in range(K)) for c in range(M)] for r in range(M)]
+        def at(l, r):
+            if n == 4:
+                return D[4 * (l // 16) + r][l % 16]
+            return D[8 * (r // 4) + 4 * (l // 32) + r % 4][l % 32]
+        bad = [0, 0, 0]
+        for l in range(LANES):
+            for r in range(n):
+                d = at(l, r)
+                if f32(out[obase + l * n + r]) != d * 0.5:
+                    bad[0] += 1
+                if f32(out[obase + (LANES + l) * n + r]) != struct.unpack("<f", struct.pack("<f", float(d & 0x7FFFFFFF)))[0]:  # f32 rounding of the large (masked negative) values
+                    bad[1] += 1
+            for e in range(n // 2):
+                w = out[obase + 2 * LANES * n + l * (n // 2) + e]
+                for h in range(2):
+                    want = at(l, 2 * e + h) * 0.5
+                    wb = struct.unpack("<f", struct.pack("<I", ((struct.unpack("<I", struct.pack("<f", want))[0] + 0x7FFF + ((struct.unpack("<I", struct.pack("<f", want))[0] >> 16) & 1)) >> 16) << 16))[0]
+                    got = struct.unpack("<f", struct.pack("<I", ((w >> (16 * h)) & 0xFFFF) << 16))[0]
+                    if got != wb:
+                        bad[2] += 1
+        for j, form in enumerate(["cvt_f32_i32 x 0.5", "cvt_f32_u32", "cvt_pk_bf16_f32"]):
+            print(("ok   " if not bad[j] else "FAIL ") + f"{name} i32 chain (zero-C + 3 accumulates) -> {form}" + (f": {bad[j]} values" if bad[j] else ""))
+            ok &= not bad[j]
+        obase += 2 * LANES * n + LANES * n // 2
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -1113,6 +1172,7 @@ PROBES = {
     "probe_fp6": (gen_fp6, check_fp6, 100 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
+    "probe_i8_epi": (gen_i8_epi, check_i8_epi, sum(2 * LANES * 4 * k[4] + LANES * 2 * k[4] for k in I8_KINDS)),
 }
 
 def main():

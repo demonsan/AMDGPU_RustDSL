@@ -493,6 +493,47 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "nops" => {
+            // amdc nops <kernel> [--sites]: every s_nop of the final code classified by hazard rule / producer -> consumer (counts, wait states)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            match amdgpu_compiler::compile_mir_alloc(&f) {
+                Ok((m, _)) => {
+                    let sites = amdgpu_compiler::hazards::classify_nops(&m);
+                    let mut agg: std::collections::BTreeMap<(String, String, String), (usize, usize)> = std::collections::BTreeMap::new();
+                    for s in &sites {
+                        let e = agg.entry((s.rule.to_string(), s.producer.map_or("-".into(), |x| format!("{x:?}")), s.consumer.map_or("-".into(), |x| format!("{x:?}")))).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += s.states;
+                    }
+                    let mut rows: Vec<_> = agg.into_iter().collect();
+                    rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                    let (n, w): (usize, usize) = (sites.len(), sites.iter().map(|s| s.states).sum());
+                    println!("{}: {n} s_nop, {w} wait states (static)", f.name);
+                    println!("  {:>5} {:>6}  {:<40} {:<26} {}", "nops", "states", "rule", "producer", "consumer");
+                    for ((rule, p, c), (k, st)) in rows {
+                        println!("  {k:>5} {st:>6}  {rule:<40} {p:<26} {c}");
+                    }
+                    if args.iter().any(|a| a == "--sites") {
+                        for s in &sites {
+                            let loc = if s.origin != u32::MAX { f.value_loc(s.origin).unwrap_or_default() } else { String::new() };
+                            println!("  site b{} i{} s_nop {}: {} {:?} -> {:?} {loc}", s.block, s.index, s.states - 1, s.rule, s.producer, s.consumer);
+                        }
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "summary" => {
             // amdc summary <kernel> [--json]: resources, per-region instruction mix, waits / nops, certificate counts (docs/diagnostics.md)
             let Some(name) = args.get(1) else {

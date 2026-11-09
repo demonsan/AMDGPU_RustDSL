@@ -847,7 +847,7 @@ fn unscaled_fp8_mfma_chain_zero_and_c_forms() {
 }
 
 #[test]
-fn own_tail_chains_unscaled_mfma_without_nops_but_pads_after_the_zero_form() {
+fn own_tail_chains_unscaled_mfma_without_nops_from_the_zero_form_on() {
     use amdgpu_compiler::hazards::fix_value_hazards_opts;
     use amdgpu_compiler::mir::{Block, MFunction, RClass};
     let mk = |insts: Vec<MInst>| {
@@ -860,8 +860,13 @@ fn own_tail_chains_unscaled_mfma_without_nops_but_pads_after_the_zero_form() {
     let mut m = mk(vec![chain(MOp::VMfma32x32x64Fp8), chain(MOp::VMfma32x32x64Fp8)]);
     fix_value_hazards_opts(&mut m, true);
     assert!(m.blocks[0].insts.iter().all(|i| i.op != MOp::SNop), "{:?}", m.blocks[0].insts.iter().map(|i| i.op).collect::<Vec<_>>());
-    // zero form then accumulate (different opcode): padded for the result latency
+    // zero form then accumulate: the same machine instruction (srcC = inline 0), so the in-place chain is interlocked too (LLVM compares the
+    // opcode, which the zero form shares; hardware: the bf16 / fp8 chains of the op checks start with the zero form)
     let mut m = mk(vec![MInst::new(MOp::VMfma32x32x64Fp8Z).def(2).srcreg(0).srcreg(1), chain(MOp::VMfma32x32x64Fp8)]);
+    fix_value_hazards_opts(&mut m, true);
+    assert!(m.blocks[0].insts.iter().all(|i| i.op != MOp::SNop));
+    // ... but a VALU reader of the accumulator waits for the result latency
+    let mut m = mk(vec![chain(MOp::VMfma32x32x64Fp8), MInst::new(MOp::VMovB32).def(0).srcreg(2)]);
     fix_value_hazards_opts(&mut m, true);
     assert!(m.blocks[0].insts.iter().any(|i| i.op == MOp::SNop));
 }
