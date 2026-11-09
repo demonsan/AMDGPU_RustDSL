@@ -432,6 +432,7 @@ impl FromIr for WgMap {
             outs: FromIr::from_ir(v.field("outs")?)?,
             axes: FromIr::from_ir(v.field("axes")?)?,
             reason: FromIr::from_ir(v.field("reason")?)?,
+            union: FromIr::from_ir(v.field("union")?)?,
         })
     }
 }
@@ -440,6 +441,7 @@ impl IrIds for WgMap {
         for x in self.outs.iter_mut() { fv(x); }
         IrIds::ids(&mut self.axes, fv, fr);
         IrIds::ids(&mut self.reason, fv, fr);
+        IrIds::ids(&mut self.union, fv, fr);
     }
 }
 

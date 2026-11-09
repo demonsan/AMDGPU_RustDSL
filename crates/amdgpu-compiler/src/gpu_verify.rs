@@ -457,6 +457,10 @@ impl<'a> An<'a> {
     /// The key of a value atom: workgroup ids get fixed keys (u64::MAX - axis); any other value the hash of its structural signature, so the
     /// same expression recomputed for another store is the same digit (sound: the proof only needs every instance inside the key's range).
     fn atom_key(&self, v: ValueId) -> (bool, u64) {
+        // the outputs of a `wg_union` share one key (one index computed per store class)
+        if let Some(i) = self.f.contract.wg_maps.iter().position(|m| m.union && m.outs.contains(&v)) {
+            return (false, (1u64 << 62) + i as u64);
+        }
         match self.defs.get(&v) {
             Some(Op::WorkgroupIdX) => return (false, u64::MAX),
             Some(Op::WorkgroupIdY) => return (false, u64::MAX - 1),
