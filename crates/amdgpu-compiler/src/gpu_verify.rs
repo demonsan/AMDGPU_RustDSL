@@ -922,7 +922,7 @@ impl<'a> An<'a> {
                 if cx.le(&digits[j].0, &digits[i].0) {
                     digits.swap(i, j);
                 } else {
-                    return Err("incomparable coefficients".into());
+                    return Err(format!("incomparable coefficients {} vs {}", digits[i].0.show(), digits[j].0.show()));
                 }
             }
         }
@@ -932,7 +932,7 @@ impl<'a> An<'a> {
                 continue; // a single-valued digit
             }
             if !cx.le(&acc, c) {
-                return Err("digits overlap (radix)".into());
+                return Err(format!("digits overlap (radix): {} > {}", acc.show(), c.show()));
             }
             let Some(cm) = c.mul(m) else { return Err("polynomial too large".into()) };
             acc = acc.add(&cm);
