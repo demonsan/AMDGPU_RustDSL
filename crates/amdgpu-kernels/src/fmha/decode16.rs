@@ -296,12 +296,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         Vec::new()
     };
     let pgstride = { let v = b.bind_i32(ev(hkrow) * page); b.read_first_lane(v) };
-    // fast path, keys past the range: the row of key k_hi - 1 (its in-page offset and K swizzle; loop invariant per wave)
-    let clamp_kv = fastp.then(|| {
-        let kl = b.bind_i32((ev(k_hi) - 1).max(0) & (page - 1));
-        let r = b.bind_i32(ev(kl) * ev(hkrow) + ev(hk) * ROW);
-        (b.bind_i32(ev(r) + ((ev(l16) ^ (ev(kl) & 15)) << 4)), b.bind_i32(ev(r) + (ev(l16) << 4)))
-    });
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
@@ -311,13 +305,14 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    // fast path: the tile's pages by uniform loads (key min(key_t + 16 h, k_hi - 1): a lane past the range reads the row of k_hi - 1, in
-    // that same page), the voffsets by selects between the invariant and the clamped row offsets (no per-lane address math)
-    let full: Option<ValueId> = if fastp {
+    // fast path: a full tile (uniform)
+    let full = fastp.then(|| b.bind_cond((ev(key_t) + KT).le(ev(k_hi))));
+    if let Some(full) = full {
+        b.begin_if(Opnd::Val(full));
         let np = if page == 16 { 2 } else { 1 };
         let pbase: Vec<ValueId> = (0..np)
             .map(|h| {
-                let so = { let v = b.bind_i32(ev(bt_so) + (((ev(key_t) + 16 * h).min(ev(k_hi) - 1).max(0).min(ev(maxk))).lshr(page.trailing_zeros() as i32) << 2)); b.read_first_lane(v) };
+                let so = { let v = b.bind_i32(ev(bt_so) + ((ev(key_t) + 16 * h).lshr(page.trailing_zeros() as i32) << 2)); b.read_first_lane(v) };
                 let pv = b.buffer_load_f32(r_bt, c0, so, 0);
                 let pg = b.bitcast_i32(pv);
                 let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
@@ -331,34 +326,23 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             })
             .collect();
         let hsel = |i: i32| if page == 16 && i >= 4 { 1 } else { 0 };
-        let (ck, cv) = clamp_kv.unwrap();
-        let offs: Vec<(ValueId, ValueId)> = (0..KT / 4)
-            .map(|i| {
-                let live = b.bind_cond((ev(key_t) + kk_of(i)).lt(ev(k_hi)));
-                let ko = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(inv[i as usize].0), b: Opnd::Val(ck) });
-                let vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(inv[i as usize].1), b: Opnd::Val(cv) });
-                (ko, vo)
-            })
-            .collect();
         me.write(&mut b, Opnd::Var(it), |b| {
             for i in 0..KT / 4 {
-                let kvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(offs[i as usize].0));
+                let kvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(inv[i as usize].0));
                 let m0k = b.bind_i32(mbase.clone() + (i << 10));
                 b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
             }
         });
         mev.write(&mut b, Opnd::Var(it), |b| {
             for i in 0..KT / 4 {
-                let vvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(offs[i as usize].1));
+                let vvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(inv[i as usize].1));
                 let m0v = b.bind_i32(vbase0.clone() + (i << 10));
                 b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
             }
         });
-        Some(c0)
-    } else {
-        None
-    };
-    let lookups: Vec<(ValueId, ValueId)> = (0..if full.is_some() { 0 } else if fp8 { KT / 8 } else { KT / 4 })
+        b.else_();
+    }
+    let lookups: Vec<(ValueId, ValueId)> = (0..if fp8 { KT / 8 } else { KT / 4 })
         .map(|i| {
             // (fp8 rows of 128 bytes: 8 lanes per key, keys 8 i + l / 8)
             let key = if fp8 { b.bind_i32(ev(key_t) + (lane.lane().lshr(3)) + 8 * i) } else { b.bind_i32(ev(key_t) + kk_of(i)) };
@@ -383,7 +367,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         })
         .collect();
     let l8 = b.bind_i32(lane.lane() & 7);
-    if full.is_none() { me.write(&mut b, Opnd::Var(it), |b| {
+    me.write(&mut b, Opnd::Var(it), |b| {
         for (i, &(kc, rowoff)) in rows.iter().enumerate() {
             // (fp8: chunk ^ key % 8 within the 8-chunk row)
             let kvo = if blocked {
@@ -392,7 +376,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
         }
-    }); }
+    });
     // blocked: the per-key scales of the lane's 8 S values (keys 16 blk + 4 g + r of the tile): slot of key l % 32 by one block-table
     // load, shared by ds_bpermute; then the k / v scale loads (in flight behind the QK)
     let kvsc: Option<(Vec<ValueId>, Vec<ValueId>)> = blocked.then(|| {
@@ -455,7 +439,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                 }
             });
         }
-        None if full.is_some() => {}
         None => mev.write(&mut b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
                 let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
@@ -464,7 +447,9 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }),
     }
-    let nv = if full.is_some() { (KT / 4) as u8 } else { nv };
+    if full.is_some() {
+        b.end_if();
+    }
     b.wait_vm(nv);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
