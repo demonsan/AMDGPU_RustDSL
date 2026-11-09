@@ -379,7 +379,7 @@ impl<'a> An<'a> {
                         } else if y.0.is_empty() {
                             (y.1, x)
                         } else {
-                            return atom((false, v.0));
+                            return atom((false, *v));
                         };
                         let mut m = BTreeMap::new();
                         for (a, p) in atoms {
@@ -393,7 +393,7 @@ impl<'a> An<'a> {
                             let f = Q::int(1i128 << s.n);
                             Some((x.into_iter().map(|(k, p)| (k, p.scale(f))).collect(), c.scale(f)))
                         }
-                        _ => atom((false, v.0)),
+                        _ => atom((false, *v)),
                     },
                     // a masked store: the sentinel arm (an offset >= 2^30, dropped by the descriptor's range check, which the bounds proof
                     // establishes) writes nothing - only the live arm matters
@@ -404,10 +404,10 @@ impl<'a> An<'a> {
                         } else if big(a) {
                             self.slin(b, depth + 1)
                         } else {
-                            atom((false, v.0))
+                            atom((false, *v))
                         }
                     }
-                    _ => atom((false, v.0)),
+                    _ => atom((false, *v)),
                 }
             }
         }
