@@ -156,13 +156,15 @@ int main(int argc, char** argv) {
                         vv2[((((size_t)pg * HK + hk) * 2 + t / 8) * D + d) * 8 + t % 8] = vc[src];
                     }
         void *dk = dev(kv2), *dv = dev(vv2);
-        a.assign(272, 0);
+        a.assign(288, 0);
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
         P_(0, dout); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl);
         float sl = std::log2(std::exp(1.0f)) * scale;
         memcpy(&a[128], &sl, 4);
-        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D * 2); U(13, 16 * D * 2); U(14, 0); U(15, H / HK);
+        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D * 2); U(13, 16 * D * 2); U(14, QL - 1); U(15, H / HK);
+        // MTP (aiter pa_fwd: mtp = max_qlen - 1, ptr_QTP = qo_indptr [B + 1])
+        if (QL > 1) { std::vector<int> qtp(B + 1); for (int i = 0; i <= B; i++) qtp[i] = i * QL; void* dqtp = dev(qtp); P_(16, dqtp); }
         gx = HK; gy = B; gz = 1; blk = 256;
     }
     size_t asz = a.size(), csz = ca.size();
