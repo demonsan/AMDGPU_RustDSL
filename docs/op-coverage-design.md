@@ -975,12 +975,16 @@
 | bf16 v3 hd128 causal | B4 H16 2048² | 111 µs | 88.8 µs | 0.80 |
 | bf16 v3 hd128 causal（分发：`_causal_ks` S4 + q16 combine） | B1 H8 4096² | 74.4 µs | 91.2 µs | 1.23 |
 | bf16 v3 hd128 causal（`_causal_ks` S2） | B1 H16 4096² | 122 µs | 108 µs | 0.88 |
+| bf16 v3 hd128 causal（`_causal_q128`） | B4 H16 1024² | 41.3 µs | 41.6 µs | 1.01 |
+| bf16 v3 hd128 causal（`_causal_q128`） | B1 H32 HK8 2048² | 65.1 µs | 66.0 µs | 1.01 |
+| bf16 hd128 causal（v1，P = 64） | B2 H16 1024² | 32.9 µs | 36.5 µs | 1.11 |
 | bf16 hd192/hd128（MLA prefill） | B1 H16 4096² | 187 µs | 178 µs（fwd_hd192_hd128_bf16，128 行） | 0.95 |
 | bf16 hd192/hd128 | B4 H16 2048² | 206 µs | 189 µs | 0.91 |
 | bf16 hd192/hd128（`_ks` S2 + q16 combine） | B1 H8 4096²（128 CTA） | 112 µs | 90.3 µs | 0.81 |
 | bf16 hd192/hd128 causal（配对） | B4 H16 2048² | 128 µs | 126 µs | 0.98 |
 | bf16 hd192/hd128 causal（配对） | B1 H128 1024² | 82.8 µs | 79.5 µs | 0.96 |
 | bf16 hd192/hd128 causal（`_np`） | B1 H16 4096² | 147 µs | 113 µs | 0.77 |
+| bf16 hd192/hd128 causal（`_np_q128`） | B1 H16 2048² | 65.3 µs | 49.3 µs | 0.75 |
 | bf16 hd192/hd128 causal（`_ks` S2 + q16 combine） | B1 H8 4096² | 89.1 µs | 84.4 µs | 0.95 |
 | bf16 反向 | B4 H16 2048² | 670 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.74 |
 | bf16 反向 | B1 H16 4096² | 637 µs | 465 µs | 0.73 |
@@ -999,6 +1003,11 @@
 - 剩余短板：hd192 小网格（非 causal B1 H8 4096² 0.81、causal `_np` 0.77）、bf16 hd128 causal 中等网格（B4 H16 2048² 0.80、B4 H16 1024² 0.82：配对后 128–256 个 CTA，切分与配对都不再划算）、反向 0.72–0.86。
 - **bf16 hd128 causal 小网格**（SGPR 修复合入后，`_causal_ks` 可以汇编；同次运行，µs，厂商 / 配对 / v1 / ks2 / ks4）：B1 H8 4096² 91 / 119 / 98 / 86 / **74**；2048² 52 / 69 / 49 / 51 / **42**；B2 H8 HK2 1000×1300 47 / 63 / **36** / 50 / 43；B1 H16 4096² 108 / 133 / 150 / **122** / 157；B4 H16 1024² 42 / **51** / 51 / 59 / 86；B1 H8 8192² 192 / 239 / 280 / **203** / 226。据此 `bf16_prefill_kernel` 改为：v1 只用于配对 CTA < 64 且 key tile < 16 的情形，key tile < 16 时 causal 不切分（B1 H8 2048² 由 v1 49 改为 ks4 42 µs；B4 H16 1024² 由 ks2 59 改为配对 51 µs）。
 - **key-split 合并 kernel `attn_combine_bf16_hd128_q16`**（取代 `attn_combine_bf16_hd128_q`）：每个 workgroup 16 行、每线程 8 维（每份两次 16 字节读），一遍在线合并；旧版每行一个 workgroup、每线程每份一个 dword、两遍，受延迟限制（hd192 `_ks` B1 H8 4096² S2 的合并约 22 µs）。同次 A/B（µs，旧 / 新）：hd192 B1 H8 2048² S4 54.4 / 41.3，4096² S2 122.5 / 111.8，B4 H16 1024² S2 112 / 86，B1 H16 4096² S2 243 / 224。Python `prefill_bf16` 与 `attn_host` 默认改用它。
+- **128 行 / 64-key tile 形式（`_q128`，有界尝试）**：`V3Opts::small`：两组各 2 个 wave、每 CTA 128 行、64-key tile；LDS 64 KB（hd192 80 KB），每 CU 两个 workgroup。正确（bad=0，strict 0 错误）。同次测量（µs，现形式 / q128）：
+  - 非 causal 全部更慢（B4 H16 1024² 45.2 / 53.6，B2 H16 2048² 82.6 / 97.6，8192² 2039 / 2420），不采用；
+  - hd128 causal 在配对网格 P = 128（短 key）上胜出：B4 H16 1024² 51.5 → 40.6，B1 H32 HK8 2048² 77.2 → 65.1；P = 64 时 v1（32.9）仍最好，P = 256 时配对的 256 行形式最好（B8 H16 1024² 65.5 / 69.3）。新增 `fmha_fwd_hd128_bf16_v3_causal_q128`，`bf16_prefill_kernel`：短 key 且 P < CU/2 用 v1（阈值从 64 提到 128），CU/2 ≤ P < CU 且 key tile ≤ 16 用 `_causal_q128`；
+  - hd192 causal 不配对、U ≤ CU/2 时胜出：B1 H16 2048² 72.1 → 65.7，B2 H16 1024² 42.3 → 39.8，B1 H8 2048² 65.9 → 60.9；U = 256 时更慢。新增 `fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128`。
+  - hd192 小网格离厂商仍有 25% 左右（B1 H16 2048² causal 0.75，非 causal 0.61）；厂商 128 行 tile 的每 CU 效率更高，原因未归因。
 - **hd192 非 causal 小网格**：`hd192_prefill_kernel` 对 U ≤ CU/4 用 `_ks` S4，对 U < CU 且 key tile ≥ 32 用 S2（B1 H8 2048² 66.6 → 41.3 µs，厂商 32.5；4096² 134 → 112，厂商 88）；U = 128、16 个 key tile（B1 H16 2048²）切分不划算，不切。剩余差距是结构性的：我们 256 行 / 8 wave 的 tile 在小网格下每 CU 一个 workgroup，厂商用 128 行 / 4 wave。
 
 **性能待办**：
