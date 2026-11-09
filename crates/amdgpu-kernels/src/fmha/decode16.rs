@@ -302,12 +302,12 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // block-table loads per tile collapse to one wave-uniform load per group (the 64 lanes of every DMA hold 4 keys of the same group). The page of the clamped key (min(key, k_hi - 1)) is the page of the group's
     // first key clamped the same way.
     let grp_path = !fp8 && !blocked;
-    let gsz = page.min(KT);
-    let ngrp = if grp_path { KT / gsz } else { 0 };
+    let pgsz = page.min(KT);
+    let ngrp = if grp_path { KT / pgsz } else { 0 };
     let nla = if grp_path { ngrp } else { KT / 4 };
-    let grp_of = move |i: i32| (4 * i) / gsz;
+    let grp_of = move |i: i32| (4 * i) / pgsz;
     let group_page = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32, g: i32| -> ValueId {
-        let key = b.bind_i32((key_t + g * gsz).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+        let key = b.bind_i32((key_t + g * pgsz).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
         let bvo = b.bind_i32(ev(key).lshr(page.trailing_zeros() as i32) << 2);
         let pv = b.buffer_load_f32(r_bt, bvo, bt_so, 0);
         pv
