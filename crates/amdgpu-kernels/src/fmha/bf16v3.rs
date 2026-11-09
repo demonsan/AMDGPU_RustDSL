@@ -81,7 +81,9 @@ impl Body<'_> {
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, into: Option<&[VarId]>) -> Vec<ValueId> {
         let kb = self.kbase(b, slot);
         let (kind, qf, kr) = (self.kind, self.qf, self.kr);
-        let bases: Vec<ValueId> = kr.iter().map(|r| b.bind_i32(ev(*r) + kb.clone())).collect();
+        // chunk c of the lane's K row: kr0 ^ (c << 5) (the XOR swizzle term of chunk c is disjoint from the row and lane bits): one xor + one add
+        // per chunk instead of keeping (or rematerialising) 8-12 offsets per lane
+        let bases: Vec<ValueId> = (0..8).map(|c| b.bind_i32((ev(kr[0]) ^ I32::c((c as i32) << 5)) + kb.clone())).collect();
         let acc = self.ring.ks.at(slot).read(b, |b| {
             let rd = |b: &mut FnBuilder, c: usize| -> Vec<ValueId> {
                 (0..self.nb as i32).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
@@ -107,7 +109,7 @@ impl Body<'_> {
             Some(kbs) => {
                 let o = kbs.at(slot).off_v(b);
                 let kb2 = o + kbs.base as i32;
-                let bases2: Vec<ValueId> = self.kr2.iter().map(|r| b.bind_i32(ev(*r) + kb2.clone())).collect();
+                let bases2: Vec<ValueId> = (0..4).map(|c| b.bind_i32((ev(self.kr2[0]) ^ I32::c((c as i32) << 5)) + kb2.clone())).collect();
                 let mut acc = acc;
                 kbs.at(slot).read(b, |b| {
                     for c in 0..4usize {
@@ -132,7 +134,8 @@ impl Body<'_> {
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx) {
         let vb = self.vbase(b, slot);
         let kind = self.kind;
-        let bases: Vec<ValueId> = self.vr.iter().map(|v| b.bind_i32(ev(*v) + vb.clone())).collect();
+        // (dim block e, read r): vr0 ^ ((e << 6) | (r << 7)) + 2048 r (the swizzle terms are disjoint from the row / lane bits)
+        let bases: Vec<ValueId> = (0..8i32).map(|i| { let (e, r) = (i / 2, i % 2); b.bind_i32((ev(self.vr[0]) ^ I32::c((e << 6) | (r << 7))) + 2048 * r + vb.clone()) }).collect();
         let p = self.p.clone();
         let o = self.o.clone();
         self.ring.vs.at(slot).read(b, |b| {
@@ -661,10 +664,6 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     }
     }
     let mut f = b.finish();
-    // TEMP A/B: lowering options by name suffix
-    if name.contains("_xaf") {
-        f.lower_opts.push("addrfold".into());
-    }
     // the scheduler tokens also on the causal Gemm-profile build (+2 % at 8192², +1 % at 2048²)
     if !split || vs_policy {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
@@ -814,13 +813,14 @@ fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, wpg: i32, l16: Value
     } else {
         Vec::new()
     };
-    let kr2: Vec<ValueId> = if hd192 { (0..4).map(|c| b.bind_i32(lane.j() * 128 + (((ev(half) + 2 * c) ^ (lane.lane() & 7)) << 4))).collect() } else { Vec::new() };
+    // only chunk 0 of each offset family is kept: the others are derived where they are used (`Body::qk` / `Body::pv`)
+    let kr2: Vec<ValueId> = if hd192 { vec![b.bind_i32(lane.j() * 128 + ((ev(half) ^ (lane.lane() & 7)) << 4))] } else { Vec::new() };
     // read offsets (as bf16.rs)
-    let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
+    let kr: Vec<ValueId> = vec![b.bind_i32(lane.j() * ROW + ((ev(half) ^ (lane.lane() & 15)) << 4))];
     // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
     // the same key % 16), 16-byte chunk (4 e + 2 ((l % 32) / 16) + (s % 4) / 2) ^ (row % 16), byte 8 (s % 2)
-    let vr: Vec<ValueId> = (0..4)
-        .flat_map(|e| (0..2).map(move |r| (e, r)))
+    let vr: Vec<ValueId> = (0..1)
+        .flat_map(|e| (0..1).map(move |r| (e, r)))
         .map(|(e, r)| {
             let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
             let ch = b.bind_i32(4 * e + ((lane.lane() & 31).lshr(4) << 1) + (lane.lane() & 3).lshr(1));
