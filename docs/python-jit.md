@@ -141,8 +141,18 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 | `prefill_bf16(q, k, v, out, causal, lse=None, scale=None)` | `bf16_prefill_kernel` choice: `fmha_fwd_hd128_bf16_v3[_causal][_ks]` / `fmha_fwd_hd128_bf16_causal` (+ `attn_combine_bf16_hd128_q`) | q, out [B, SQ, H, 128], k, v [B, SK, HK, 128]; lse f32 [B, H, SQ] |
 | `fused_moe(x, w1, w2, topk_ids, topk_weights, out, dtype="bf16"\|"fp8", act, x_scale, w1_scale, w2_scale, num_experts, inter)` | `moe_sorting_*`, `gemm_moe1_<dt>_<act>[_bm64]`, `quant_token_bf16_fp8_n<I>` (fp8), `gemm_moe2_<dt>[_bm64]`, `moe_sum_bf16_k<K>` | W1 via `moe_w1_interleave` + `shuffle_weight`; block_m from `moe_block_m`; E ≥ 8, D % 1024 = 0 |
 
+| `mla_decode(q, kv_cache, block_table, context_lens, out, scale)` | `mla_decode_bf16_[hp_]p<P>` + `attn_combine_bf16_hd512` | q [B, H, 576], kv [pages, P, 576], out [B, H, 512]; form / splits from `mla_config` |
+| `argmax(logits, out)` / `sample(logits, u, out, temperature, top_k=0, top_p=1.0)` | `argmax_bf16_v<V>`, `sample[_topkp]_bf16_v<V>` | logits bf16 [B, V]; u f32 [B]; out i32 [B] |
+| `topk_per_row_decode(logits, seq_lens, indices, next_n)` / `topk_per_row_prefill(logits, row_starts, row_ends, indices)` | `topk_per_row_{decode,prefill}_f32_k<K>` | logits f32 [R, stride] → indices i32 [R, K] |
+| `causal_conv1d_fwd(x, weight, bias, cu_seqlens, cache_indices, has_initial, conv_states, out, max_seqlen, silu)` | `causal_conv1d_fwd_bf16_w<W>[_silu]` | varlen prefill, x [T, dim]; states [slots, dim, W-1] |
+| `causal_conv1d_update(x, weight, bias, state, out, state_indices=None, silu)` | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]` | decode, x [B, dim]; state [slots, dim, SL] |
+| `gemm_w4(a, b, out, b_scale, a_scale, kind="a16w4"\|"a8w4")` | `gemm_a16w4_mxfp4`, `gemm_a8w4_mxfp_128` | a16w4: B through `a16w4_permute` + `shuffle_weight` |
+| `attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, causal, scale)` | `fmha_bwd_dot` + `fmha_bwd_dq[_causal]` + `fmha_bwd_dkdv[_causal][_pair]` | dk, dv per query head [B, SK, H, 128]; pairing from `bwd_dkdv_pair` |
+
+Every other registered kernel is reachable through `launch(name, …)` directly (arguments by the names `amdc jit-info <name>` lists).
+
 The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm_blockscale", M, N, K)`,
-`dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)` (= `amdc dispatch …`, the functions of `crates/amdgpu-kernels/src/dispatch.rs`).
+`dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)`, `dispatch("mla", B, H)`, `dispatch("bwd_dkdv_pair", B, H, SK)` (= `amdc dispatch …`, the functions of `crates/amdgpu-kernels/src/dispatch.rs`).
 The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term block is summed to about 2^-10 of its term magnitude
 (visible under cancellation — also with unit scales and a single K block, so it is the instruction, not the kernel).
 
@@ -150,6 +160,10 @@ The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term b
 C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm,rope,qknorm_rope_kv,cache,cache_blocked,topk,moe_sorting,moe_reduce}_host.cpp`).
 
 ## Checks on the GPU node
+
+`HIP_VISIBLE_DEVICES=6 bash python/tests/run_all.sh [--full] [filters]` runs all of them (unit tests, `ops_check.py`, `decode_check.py`;
+`--full` adds `node_check.py`) and prints a table of every op check with an OVERALL line.
+
 
 ```bash
 python3 -m unittest discover -s python/tests -p 'test_unit.py'                 # host only
