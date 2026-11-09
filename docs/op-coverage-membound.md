@@ -418,3 +418,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 ## MXFP6 量化
 
 `quant_mxfp6_e2m3_bf16_k<K>`（fp6 e2m3，最大 7.5，共享指数 = floor(log2 amax) − 2）与 `quant_mxfp6_e3m2_bf16_k<K>`（e3m2，最大 28，−4），K % 256 = 0。一个 lane 量化一组 32 个元素：4 次 b128 加载，`v_cvt_scalef32_2xpk16_fp6_f32`（backend 新增的 `CvtOp::Scale2xPk16{Fp6,Bf6}F32`，两个 16 dword 的源会交错：偶数元素放第一个源、奇数元素放第二个源，码的顺序才是元素顺序），192 位结果存三个 b64，scale 字节存一个 u8。转换指令饱和并按最近偶数舍入。ABI：x @0、q @8、scale @16、M @24；网格 `(⌈K / 32 / 256⌉, M)` × 256 线程。主机测试 `tests/gpu/mxfp6_host.cpp`（CPU 参考：scale 字节必须一致，每个 6 位码解码后在半步长以内，含 4 倍离群值使 amax 变化）：K = 1024 / 4096 / 4352 / 7168，两种格式 `bad = 0`；`gpu_verify --strict` 0 错误，80 VGPR；K = 4096、M = 32768 约 129 µs（2.9 TB/s）。
+
+
+## 性能回归矩阵
+
+`tools/membound_perf.sh [check|update]`：在 GPU 节点上跑 `REPS` 遍（默认 3）`tools/b2_matrix.sh`（全部 batch-2 kernel 的正确性 + 带宽），取每个 case 的中位数，和提交进仓库的基线 `docs/membound_baseline.tsv`、以及 stream 屋顶线（6500 GB/s）对比，结果写成 `docs/membound-perf.md`；任何正确性失败或比基线低 `TOL`（默认 10 %，高于节点噪声 ±3 – 10 %）都会标成 REGRESSION 并让脚本以状态 1 退出。`update` 在有意改变性能的提交里重写基线。与 vendor（aiter）的同次运行对比仍然用 `tools/vendor_membound.sh`。
