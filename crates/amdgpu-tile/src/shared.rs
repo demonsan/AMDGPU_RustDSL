@@ -243,6 +243,15 @@ impl LdsPlan {
     pub fn tile(&mut self, name: &str, bytes: i64, layout: Layout) -> Shared {
         self.ring(name, bytes, 1, layout)
     }
+    /// A single shared tile reusing the storage of `overlays` (placed at the first one's base; they must be dead while the tile is used - e.g. a
+    /// cross-wave epilogue staging over the per-wave K / V regions after a barrier).
+    pub fn tile_over(&mut self, name: &str, bytes: i64, overlays: &[&Shared]) -> Shared {
+        let base = overlays.first().expect("tile_over: at least one overlay").base;
+        for o in overlays {
+            self.overlays.push((name.to_string(), o.name.clone()));
+        }
+        self.push(Shared { name: name.to_string(), base, slot_stride: bytes, bytes, slots: 1, layout: Layout::Linear, private: false })
+    }
     /// A per-wave private region (`waves` slices of `per_wave` bytes). With `overlays` non-empty it is placed at the base of the first buffer and reuses their storage
     /// (they must be dead when the region is used - e.g. the Q staging during the epilogue); otherwise it is allocated at the cursor.
     pub fn private(&mut self, name: &str, per_wave: i64, waves: u32, overlays: &[&Shared]) -> Shared {
