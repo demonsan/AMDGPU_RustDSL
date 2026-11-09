@@ -378,6 +378,19 @@ impl<'a> An<'a> {
                 }
                 match def {
                     Some(Op::AddI32(a, b)) => Some(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?)),
+                    // readfirstlane of a wave-uniform value is that value
+                    Some(Op::ReadFirstLane(a)) if self.uniform(a, 0) => self.slin(a, depth + 1),
+                    Some(Op::Tri(amdgpu_dsl::TriOp::Add3U32, a, b, c)) => {
+                        Some(slin_add(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?), self.slin(c, depth + 1)?))
+                    }
+                    Some(Op::Tri(amdgpu_dsl::TriOp::LshlAddU32, a, b, c)) => match self.int_of(b).point_const() {
+                        Some(s) if s.d == 1 && (0..31).contains(&s.n) => {
+                            let (x, k) = self.slin(a, depth + 1)?;
+                            let f = Q::int(1i128 << s.n);
+                            Some(slin_add((x.into_iter().map(|(kk, p)| (kk, p.scale(f))).collect(), k.scale(f)), self.slin(c, depth + 1)?))
+                        }
+                        _ => atom(self.atom_key(*v), *o),
+                    },
                     Some(Op::MulI32(a, b)) => {
                         let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
                         let (k, (atoms, c)) = if x.0.is_empty() {
@@ -404,7 +417,8 @@ impl<'a> An<'a> {
                     // a masked store: the sentinel arm (an offset >= 2^30, dropped by the descriptor's range check, which the bounds proof
                     // establishes) writes nothing - only the live arm matters
                     Some(Op::Select { a, b, .. }) => {
-                        let big = |o: &Opnd| self.int_of(o).lo.iter().any(|l| self.cx.le(&Poly::int(1 << 30), l));
+                        // (a negative constant is a huge unsigned buffer offset)
+                        let big = |o: &Opnd| matches!(o, Opnd::I32(c) if *c < 0) || self.int_of(o).lo.iter().any(|l| self.cx.le(&Poly::int(1 << 30), l));
                         if big(b) {
                             self.slin(a, depth + 1)
                         } else if big(a) {
@@ -471,6 +485,25 @@ impl<'a> An<'a> {
         };
         self.sig_memo.borrow_mut().insert(v, s.clone());
         s
+    }
+
+    /// Wave-uniform (every lane holds the same value): built from constants, kernargs, workgroup ids and readfirstlane results only.
+    fn uniform(&self, o: &Opnd, depth: usize) -> bool {
+        if depth > 24 {
+            return false;
+        }
+        match o {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Var(_) => false,
+            Opnd::Val(v) => match self.defs.get(v) {
+                None | Some(Op::WorkitemId) => false,
+                Some(Op::ReadFirstLane(_) | Op::KernargI32 { .. } | Op::ConstI32(_) | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ) => true,
+                Some(op @ (Op::AddI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::XorI32(..) | Op::MinI32(..) | Op::Select { .. } | Op::Bin(..) | Op::Tri(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..))) => {
+                    op.operands().iter().all(|x| self.uniform(x, depth + 1))
+                }
+                _ => false,
+            },
+        }
     }
 
     /// The pointer kernarg a pointer value derives from and its byte offset as a symbolic linear form.
