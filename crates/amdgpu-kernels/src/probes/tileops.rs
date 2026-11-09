@@ -1470,7 +1470,8 @@ pub fn probe_valu_sgpr() -> Function {
         let xi = b.bitcast_i32(x);
         let y = b.let_(Op::AddI32(Opnd::Val(xi), Opnd::Val(s)));
         let yf = b.bitcast_f32(y);
-        b.buffer_store_f32(r_out, l4, Opnd::I32(j * 256), 0, yf);
+        let vo = b.let_(Op::AddI32(Opnd::Val(l4), Opnd::I32(j * 256)));
+        b.buffer_store_f32(r_out, vo, Opnd::I32(0), 0, yf);
     }
     b.finish()
 }
