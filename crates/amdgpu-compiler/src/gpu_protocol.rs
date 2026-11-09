@@ -943,7 +943,9 @@ fn compatible(a: &Trace, b: &Trace) -> bool {
     a.path.iter().filter(|p| p.2).all(|pa| b.path.iter().filter(|p| p.2 && p.0 == pa.0).all(|pb| pb.1 == pa.1))
 }
 
-fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>) {
+fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
+    // OWNER events (lds_owned, every access proven in the issuing thread's own words): never conflict with each other across threads
+    let is_owner = |ev: &Ev| f.contract.tiles[ev.tile].owned.is_some() && owned.get(&ev.stmt).copied().unwrap_or(false);
     struct Info {
         role: usize,
         ev: Ev,
@@ -989,6 +991,16 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             continue;
         }
         let key = (c.ev.tile, c.ev.slot);
+        // an owner read of a version this thread wrote itself before (owner write, program order): the thread's own words, no barrier needed
+        if is_owner(&c.ev) && infos.iter().any(|p| p.ev.produce && is_owner(&p.ev) && p.role == c.role && (p.ev.tile, p.ev.slot) == key && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
+            for q in infos.iter().filter(|q| q.ev.produce && (q.ev.tile, q.ev.slot) == key && q.ev.ver != c.ev.ver && !is_owner(&q.ev)) {
+                let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
+                if overlap {
+                    diags.push(("GV-TILE-RACE", Severity::Error, c.ev.stmt, format!("stmt {}: owner read of `{}` (version {}) overlaps the shared write of version {} (stmt {}): no barrier separates them", c.ev.stmt, name(c.ev.tile), c.ev.ver, q.ev.ver, q.ev.stmt)));
+                }
+            }
+            continue;
+        }
         let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
         let stmt = c.ev.stmt;
         let gl = c.ev.global;
@@ -1039,11 +1051,15 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
         }
         for p in prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord) {
+            // another thread's owner write of this version touches only its own words, which an owner read never reads
+            if is_owner(&c.ev) && is_owner(&p.ev) {
+                continue;
+            }
             if !visible(p) {
                 diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] version {} at phase {}: the part produced by role {} (stmt {}) is not yet published (publish phase {}) {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.role, p.ev.stmt, p.publish.map_or("never".to_string(), |v| v.to_string()))));
             }
         }
-        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver) {
+        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver && !(is_owner(&c.ev) && is_owner(&q.ev))) {
             // the read window [c.ord, c.done_ord] against the write window [q.ord, q.publish) of ANY wave (same role included)
             let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
             if overlap {
@@ -1105,7 +1121,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     }
     for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
         for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private {
+            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
                 let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
                 if aw.0 < bw.1 && bw.0 < aw.1 {
                     diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
@@ -1186,6 +1202,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     }
     let div = divergent_ifs(f);
     let own_reuse = rep.own_reuse.clone();
+    let owned = rep.owned.clone();
     let mut diags: Vec<(&'static str, Severity, usize, String)> = Vec::new();
     let mut untagged: BTreeSet<usize> = BTreeSet::new();
     let mut checked = 0usize;
@@ -1197,7 +1214,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             for b in &t1 {
                 if compatible(a, b) {
                     paths += 1;
-                    check_pair(f, [a, b], n, &mut diags, &mut checked, &own_reuse);
+                    check_pair(f, [a, b], n, &mut diags, &mut checked, &own_reuse, &owned);
                 }
             }
         }

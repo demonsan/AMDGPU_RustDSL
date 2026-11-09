@@ -160,3 +160,85 @@ fn a_persistent_loop_stepping_by_one_is_not_proven() {
     assert!(r.proven.get("global-write-disjoint").is_none(), "{:?}", r.proven);
     assert_eq!(r.unchecked.get("global-write-untracked").copied(), Some(1));
 }
+
+/// sched's owner-exclusive columns (moe_scatter_ordered): WC[2 rows][128 threads] u32, thread t owning column t.
+/// [A] owner zeroing (v0) | barrier | [B] waves scatter to data-chosen columns of their row (v1) | barrier | [C] owner read (v1) then owner
+/// in-place rewrite (v2) with NO barrier between | barrier | [D] reads of other threads' columns (v2).
+/// `bad`: [C] rewrites the NEIGHBOUR's column - not owned: a race the checker must report.
+fn owned_columns(bad: bool) -> Function {
+    let mut b = FnBuilder::new("trust_owned", 128);
+    b.lds(1024);
+    b.lds_owned("WC", 0, 1024, 4, 512);
+    let tid = b.let_(Op::WorkitemId);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(6)));
+    let col = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let z = b.c_i32(0);
+    // [A]
+    b.tile_produce("WC", Opnd::I32(0), Opnd::I32(0));
+    for r in 0..2 {
+        let a = b.let_(Op::AddI32(Opnd::Val(col), Opnd::I32(512 * r)));
+        b.store_lds(a, z, amdgpu_dsl::MemTy::B32, false);
+    }
+    b.tile_end();
+    b.wait_lds(0);
+    b.barrier();
+    // [B]
+    b.tile_produce("WC", Opnd::I32(0), Opnd::I32(1));
+    let x = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(7)));
+    let x = b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(127)));
+    let x4 = b.let_(Op::ShlI32(Opnd::Val(x), Opnd::I32(2)));
+    let rw = b.let_(Op::ShlI32(Opnd::Val(wave), Opnd::I32(9)));
+    let a = b.let_(Op::AddI32(Opnd::Val(rw), Opnd::Val(x4)));
+    let one = b.c_i32(1);
+    b.store_lds(a, one, amdgpu_dsl::MemTy::B32, false);
+    b.tile_end();
+    b.wait_lds(0);
+    b.barrier();
+    // [C]
+    b.tile_consume("WC", Opnd::I32(0), Opnd::I32(1));
+    let mut vals = Vec::new();
+    for r in 0..2 {
+        let a = b.let_(Op::AddI32(Opnd::Val(col), Opnd::I32(512 * r)));
+        vals.push(b.load_lds(a, amdgpu_dsl::MemTy::B32));
+    }
+    b.tile_end();
+    b.wait_lds(0);
+    b.tile_produce("WC", Opnd::I32(0), Opnd::I32(2));
+    let wcol = if bad {
+        let n = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(1)));
+        let n = b.let_(Op::AndI32(Opnd::Val(n), Opnd::I32(127)));
+        b.let_(Op::ShlI32(Opnd::Val(n), Opnd::I32(2)))
+    } else {
+        col
+    };
+    for r in 0..2 {
+        let a = b.let_(Op::AddI32(Opnd::Val(wcol), Opnd::I32(512 * r)));
+        b.store_lds(a, vals[r as usize], amdgpu_dsl::MemTy::B32, false);
+    }
+    b.tile_end();
+    b.wait_lds(0);
+    b.barrier();
+    // [D]
+    b.tile_consume("WC", Opnd::I32(0), Opnd::I32(2));
+    let y = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+    let y = b.let_(Op::AndI32(Opnd::Val(y), Opnd::I32(127)));
+    let y4 = b.let_(Op::ShlI32(Opnd::Val(y), Opnd::I32(2)));
+    let a = b.let_(Op::AddI32(Opnd::Val(rw), Opnd::Val(y4)));
+    let _r = b.load_lds(a, amdgpu_dsl::MemTy::B32);
+    b.tile_end();
+    b.wait_lds(0);
+    b.finish()
+}
+
+#[test]
+fn owner_columns_need_no_barrier_between_a_threads_own_read_and_rewrite() {
+    let r = verify_ir(&owned_columns(false));
+    assert!(no_errors(&r), "{}", r.render());
+    assert_eq!(r.owned.values().filter(|v| **v).count(), 3, "{:?}", r.owned);
+}
+
+#[test]
+fn rewriting_a_neighbours_column_is_a_race() {
+    let r = verify_ir(&owned_columns(true));
+    assert!(!no_errors(&r), "{}", r.render());
+}
