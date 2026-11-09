@@ -2253,6 +2253,7 @@ fn moe_epilogue(
         let f = b.buffer_load_b128(rs, a, 0i32, 0);
         (0..4u8).map(|k| { let x = b.frag4_lane(f, k); b.bitcast_f32(x) }).collect()
     };
+    let mut orows: Vec<ValueId> = Vec::new();
     for i in 0..nm {
         let sr = b.bind_i32(ev(wm) * (wave_m as i32) + 16 * i as i32 + ev(rl));
         let vo = b.bind_i32(ev(sr) << 2);
@@ -2263,6 +2264,7 @@ fn moe_epilogue(
         let sw = if use_w { b.buffer_load_f32(mc.rsrc_sw, vo, so, 0) } else { b.c_f32(1.0) };
         let tok = b.bind_i32(ev(sid) & 0xff_ffff);
         let orow = b.bind_i32(ev(tok) * ev(mc.topk) + ev(sid).lshr(24));
+        orows.push(orow);
         let live = b.bind_cond(ev(tok).lt(ev(mc.mtok)));
         // per-token (A row) scale
         let xs = (cfg.scales == Scales::RowCol).then(|| {
@@ -2402,6 +2404,9 @@ fn moe_epilogue(
             }
         }
     }
+    // data fact (moe_sorting's output, counted): every live sorted row is one (token, slot) pair exactly once, so the output row token topk + slot
+    // is an injective function of (M tile = workgroup y, row in the tile); padding rows write nothing (masked stores)
+    b.wg_union(&orows, &[1], Ext::c(0), Ext::ka(140) * Ext::ka(128) - Ext::c(1), "data: moe_sorting lists every (token, slot) once (host contract)");
 }
 
 /// The LDS-staged epilogue: every accumulator (16 x 16, lane = row m, 4 consecutive n) is converted to bf16 and written to the wave's staging

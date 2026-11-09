@@ -1018,6 +1018,10 @@ pub struct TileDecl {
     pub private: bool,
     /// A global-memory region (`buf_region`): not LDS; its protocol (produce / release / complete / barrier-publish / acquire / consume) is checked by gpu_protocol.
     pub global: bool,
+    /// Thread-OWNED words (`lds_owned`): (col_stride, row_stride) - thread t owns the bytes `base + t col_stride + r row_stride + [0, col_stride)`.
+    /// A marker whose every access is proven to lie in the issuing thread's own words is an OWNER event: owner events of different waves never
+    /// touch the same bytes, and a thread's own write -> read is ordered by program order (no barrier needed between them).
+    pub owned: Option<(i64, i64)>,
 }
 
 /// A global-memory region of a pointer kernarg: bytes `[base, base + size)` of `arg` (v4 protocol model, intra-workgroup + the opt-in last-arriver pattern).
@@ -1069,6 +1073,17 @@ pub struct Contract {
     /// Trusted facts: a tuple of values is an injective function of the workgroup id over the listed grid axes (e.g. an XCD raster, a
     /// permutation of the tile grid). Used by the cross-workgroup store proof; counted in the trust ledger (`wg_bijection`).
     pub wg_maps: Vec<WgMap>,
+    /// Trusted facts: the `then` branch of an `if` on `cond` runs in exactly one workgroup of every group of workgroups that differ only along
+    /// `axes` (a last-arriver ticket). Used by the cross-workgroup store proof; counted in the trust ledger (`wg_winner`).
+    pub wg_winners: Vec<WgWinner>,
+}
+
+/// See `Contract::wg_winners`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WgWinner {
+    pub cond: ValueId,
+    pub axes: Vec<u8>,
+    pub reason: String,
 }
 
 /// See `Contract::wg_maps`.
@@ -1810,19 +1825,27 @@ impl FnBuilder {
     /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
     #[track_caller]
     pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false, owned: None });
     }
     /// Declares a ring of `slots` equal slots starting at `base`.
     #[track_caller]
     pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false, owned: None });
+    }
+    /// Declares a tile of thread-OWNED columns: `bytes` at `base`, thread t owning the bytes `base + t col_stride + r row_stride + [0, col_stride)`
+    /// for every row r (e.g. a [rows][threads] u32 table: col_stride 4, row_stride 4 x threads). Mark accesses with the usual tile markers; a
+    /// marker scope whose every access the verifier proves to be in the issuing thread's own words needs no barrier against the same thread's
+    /// other owner accesses and never races with other threads' owner accesses (accesses to other threads' words are ordinary shared events).
+    #[track_caller]
+    pub fn lds_owned(&mut self, name: &str, base: i64, bytes: i64, col_stride: i64, row_stride: i64) {
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: bytes, slots: 1, private: false, global: false, owned: Some((col_stride, row_stride)) });
     }
     /// Declares a per-WAVE private LDS region: `waves` slices of `size_per_wave` bytes at `base + wave * size_per_wave`. Mark accesses with `tile_produce/tile_consume(name,
     /// wave_key, version)` where `wave_key` is THE value the address is computed from (e.g. `base + wave_key * size + lane * 16`): the verifier proves the access lies in the
     /// slice of that very key (own wave) and that the wave reads only versions it produced and completed itself (no cross-wave publish is needed or assumed).
     #[track_caller]
     pub fn lds_private(&mut self, name: &str, base: i64, size_per_wave: i64, waves: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false, owned: None });
     }
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
     #[track_caller]
@@ -1846,7 +1869,7 @@ impl FnBuilder {
     /// release -> barrier -> acquire inside the workgroup; read before overwrite; generation consistency). `gen` follows the same affine/periodic rules as tile versions.
     #[track_caller]
     pub fn buf_region(&mut self, name: &str, arg: &str, base: Ext, size: Ext) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true, owned: None });
         self.f.contract.buf_regions.push(BufRegion { name: name.to_string(), arg: arg.to_string(), base, size });
     }
     /// The global writes issued from here (until `tile_end` / the next marker / barrier / control boundary) produce generation `gen` of the region.
@@ -1936,6 +1959,13 @@ impl FnBuilder {
     /// Trusted fact: `outs` are the same index (e.g. a q tile) as computed by different store classes of one workgroup (the paired causal
     /// tiles x and n - 1 - x, the second guarded by n - 1 - x > x), and the index is injective over (workgroup, class). The cross-workgroup
     /// store proof treats them as one digit covering `axes`. Counted in the trust ledger.
+    /// Trusted fact: the `then` branch of `if cond` runs in exactly ONE workgroup of each group of workgroups that differ only along grid `axes`
+    /// (the last arriver of a ticket counter shared by the group). Stores in that branch need no digit for those axes. Counted in the ledger.
+    #[track_caller]
+    pub fn wg_winner(&mut self, cond: ValueId, axes: &[u8], reason: &str) {
+        self.f.contract.wg_winners.push(WgWinner { cond, axes: axes.to_vec(), reason: reason.to_string() });
+    }
+
     #[track_caller]
     pub fn wg_union(&mut self, outs: &[ValueId], axes: &[u8], lo: Ext, hi: Ext, reason: &str) {
         self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string(), union: true, range: Some((lo, hi)) });
