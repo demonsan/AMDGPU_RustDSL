@@ -54,7 +54,9 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     } else {
         crate::regalloc::unified_budget(a.max_v, agprs)
     };
-    let sgpr = round_up(a.max_s, 8).max(8);
+    // the 8-register rounding must not pass the architectural limit: gfx950 accepts next_free_sgpr <= 102 (vcc is separate); the allocator
+    // never uses more than 102 (s0..s101), so a kernel with 97..102 SGPRs declares 102 (rounding to 104 made the assembler reject it)
+    let sgpr = round_up(a.max_s, 8).max(8).min(102);
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
     // it to be 64-byte aligned; without this the fields are read shifted and
