@@ -26,6 +26,16 @@ pub fn by_name(name: &str) -> Option<Function> {
 const T: i32 = 1024; // threads
 
 pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
+    moe_sorting_x(name, e, k, bm, true)
+}
+
+/// TEST ONLY (`tests/lds_tracked.rs`): the single-block sort WITHOUT the barrier that publishes the exclusive-offset (cursor) words before the padding loop reads other threads' words - the race the tile
+/// protocol found; `gpu-verify --strict` must reject it.
+pub fn moe_sorting_unpublished(name: &str, e: i64, k: i64, bm: i64) -> Function {
+    moe_sorting_x(name, e, k, bm, false)
+}
+
+fn moe_sorting_x(name: &str, e: i64, k: i64, bm: i64, publish_cursors: bool) -> Function {
     let mut fb = FnBuilder::new(name, T as u32);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -183,8 +193,10 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     b.buffer_store_f32(r_nv, nv_o, 0i32, 4, m_f);
     // the padding loop below reads OTHER threads' cursor words (the expert of its slot): the exclusive offsets must be published first (a barrier the tile protocol demanded: without it
     // the cross-wave read was an unsynchronised race that only worked because the writer waves ran ahead)
-    b.wait_lds(0);
-    b.barrier();
+    if publish_cursors {
+        b.wait_lds(0);
+        b.barrier();
+    }
     // padding entries (positions off_e + cnt .. off_e + padded of every expert, < BM each): slot q = e * BM + s over all the threads, the loop bound is uniform
     let sent = b.bind_i32(((k as i32) << 24) + ev(m_v));
     let fzero = b.c_f32(0.0);
