@@ -153,8 +153,8 @@ def _ones127(n):
 def attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, *, causal=False, scale=None, cus=256, stream=None, check=True):
     """Attention backward, head dim 128, bf16 BSHD: q, o, do, dq [B, SQ, H, 128], k, v [B, SK, HK, 128], lse f32 [B, H, SQ] (natural log, from
     the forward), dk, dv [B, SK, H, 128] PER QUERY HEAD (sum the G = H / HK heads of a group for GQA). Causal bottom-right aligned. Runs
-    ``fmha_bwd_dot`` (Dot = rowsum(dO O), workspace), ``fmha_bwd_dq[_causal]`` and ``fmha_bwd_dkdv[_causal | _causal_pair]`` (the pairing
-    from the dispatch rule). Returns the dkdv kernel."""
+    ``fmha_bwd_dot`` (Dot = rowsum(dO O), workspace), then ``fmha_bwd_dq`` / ``fmha_bwd_dkdv``; causal: the kernels of the dispatch rule
+    (``bwd_causal_kernels``: the longest-first forms ``*_causal_lpt``, grid (H, B, tiles) from their contracts). Returns the dkdv kernel."""
     rq, rk = as_ref(q), as_ref(k)
     B, SQ, H, D = rq.shape
     SK, HK = rk.shape[1], rk.shape[2]
@@ -166,11 +166,12 @@ def attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, *, causal=False, scale=N
     vals = {"q": rq, "k": rk, "v": v, "do": do, "lse": lse, "dot": dot, "dq": dq, "dk": dk, "dv": dv, "scale": sc, "SQ": SQ, "SK": SK, "H": H,
             "HK": HK, "o": o}
     syms = {"B": B}
-    sfx = "_causal" if causal else ""
+    if causal:
+        plan = dispatch("bwd_causal")
+        dqk, dkdv = plan["dq"], plan["dkdv"]
+    else:
+        dqk, dkdv = "fmha_bwd_dq_hd128_bf16", "fmha_bwd_dkdv_hd128_bf16"
     launch("fmha_bwd_dot_hd128_bf16", vals, syms=syms, stream=stream, check=check)
-    launch(f"fmha_bwd_dq_hd128_bf16{sfx}", vals, syms=syms, stream=stream, check=check)
-    dkdv = f"fmha_bwd_dkdv_hd128_bf16{sfx}"
-    if causal and dispatch("bwd_dkdv_pair", B, H, SK, "--cus", cus)["pair"]:
-        dkdv += "_pair"
+    launch(dqk, vals, syms=syms, stream=stream, check=check)
     launch(dkdv, vals, syms=syms, stream=stream, check=check)
     return dkdv

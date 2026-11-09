@@ -373,10 +373,10 @@ fn main() -> ExitCode {
                     println!("{{\"hp\":{hp},\"splits\":{s}}}");
                     ExitCode::SUCCESS
                 }
-                (Some("bwd_dkdv_pair"), Some(b), Some(h), Some(sk)) => {
-                    // amdc dispatch bwd_dkdv_pair <B> <H> <SK> [--cus N]: run the paired causal dkdv form?
-                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
-                    println!("{{\"pair\":{}}}", amdgpu_kernels::dispatch::bwd_dkdv_pair(b, h, sk, cus));
+                (Some("bwd_causal"), _, _, _) => {
+                    // amdc dispatch bwd_causal: the causal attention-backward dq / dkdv kernels (longest-first grids)
+                    let (dq, dkdv) = amdgpu_kernels::dispatch::bwd_causal_kernels();
+                    println!("{{\"dq\":\"{dq}\",\"dkdv\":\"{dkdv}\"}}");
                     ExitCode::SUCCESS
                 }
                 (Some("moe"), Some(m), Some(topk), Some(e)) => {
@@ -385,7 +385,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 _ => {
-                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E> | mla <B> <H> | bwd_dkdv_pair <B> <H> <SK> [--cus N]");
+                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E> | mla <B> <H> | bwd_causal");
                     ExitCode::from(2)
                 }
             }
