@@ -714,7 +714,7 @@ impl<'a> An<'a> {
 
     fn disjoint_group_why(&self, ss: &[&(u32, Option<SLin>, i128, ARanges)]) -> Result<(), String> {
         let cx = &self.cx;
-        // the union of the stores' atoms: an atom's coefficient must agree among the stores that use it; a store without it has digit value 0
+        // 1. the union of the stores' atoms: an atom's coefficient must agree among the stores that use it; a store without it has digit value 0
         let mut atoms: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
         let mut consts: Vec<Poly> = Vec::new();
         let mut size: i128 = 0;
@@ -731,15 +731,163 @@ impl<'a> An<'a> {
             consts.push(c.clone());
             size = size.max(s.2);
         }
-        // the per-store constants: differences to the first, split by monomial -> one pseudo digit per monomial (gcd stride)
-        let c0 = consts[0].clone();
+        // 2. every atom's range: hull over every store's instances (0 for a store that does not use it)
+        let mut ranges: BTreeMap<(bool, u64), (Poly, Poly)> = BTreeMap::new();
+        for k in atoms.keys() {
+            let mut r: Option<(Poly, Poly)> = None;
+            for s in ss {
+                let (l, h) = match s.3.as_ref() {
+                    None => return Err("atom without a range".into()),
+                    Some(m) => match m.get(k) {
+                        Some(x) => x.clone(),
+                        None => (Poly::int(0), Poly::int(0)),
+                    },
+                };
+                r = Some(match r {
+                    None => (l, h),
+                    Some((l0, h0)) => match (self.pmin(&l0, &l), self.pmax(&h0, &h)) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => return Err("incomparable atom ranges".into()),
+                    },
+                });
+            }
+            ranges.insert(*k, r.ok_or("no atom range")?);
+        }
+        let is_wg = |k: &(bool, u64)| (!k.0 && k.1 >= u64::MAX - 2) || self.f.contract.wg_maps.iter().any(|m| m.outs.iter().any(|v| self.atom_key(*v) == *k));
+        // 3. caps (`x < bound` on the live arm of a mask, or a clamp min(x, bound - 1)) present in every store with the same atoms (constants may
+        // differ): when the offset holds k * x, x's atoms become ONE digit (coefficient k, values [min x, bound - 1]) and each store's constant
+        // loses its k * (x constant) - provided x is injective in its atoms
         let mut digits: Vec<(Poly, Poly)> = Vec::new();
+        let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
+        let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        if caps_all.len() == ss.len() {
+            let mut used: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); ss.len()];
+            for (ci, cap0) in caps_all[0].iter().enumerate() {
+                let ((latoms, _), bound, clamp) = cap0;
+                if latoms.is_empty() || !latoms.keys().all(|k| atoms.contains_key(k)) {
+                    continue;
+                }
+                // the matching cap of every store (same atoms, bound and kind)
+                let mut picks: Vec<usize> = vec![ci];
+                for cs in caps_all.iter().skip(1) {
+                    match cs.iter().position(|c| c.0 .0 == *latoms && c.1 == *bound && c.2 == *clamp) {
+                        Some(p) => picks.push(p),
+                        None => break,
+                    }
+                }
+                if picks.len() != ss.len() {
+                    continue;
+                }
+                // k = offset coefficient / x coefficient, the same for every atom of x (x coefficients positive constants)
+                let mut kf: Option<Poly> = None;
+                let mut ok = true;
+                for (a, cl) in latoms {
+                    let Some(q) = cl.as_const() else {
+                        ok = false;
+                        break;
+                    };
+                    if q.n <= 0 {
+                        ok = false;
+                        break;
+                    }
+                    let kk = atoms[a].scale(Q::new(q.d, q.n));
+                    match &kf {
+                        None => kf = Some(kk),
+                        Some(k0) if *k0 == kk => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                let Some(kf) = kf else { continue };
+                if !ok || !cx.nonneg(&kf) {
+                    continue;
+                }
+                // x injective: its atoms sorted by coefficient form a radix with unit size
+                let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
+                xd.sort_by(|p, q| (p.0.n * q.0.d).cmp(&(q.0.n * p.0.d)));
+                let mut acc = Poly::int(1);
+                let mut inj = true;
+                for (c, m) in &xd {
+                    if !cx.le(&acc, &Poly::konst(*c)) {
+                        inj = false;
+                        break;
+                    }
+                    acc = acc.add(&m.scale(*c));
+                }
+                if !inj {
+                    continue;
+                }
+                // a clamp loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every x >= bound - 1 has u
+                // at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
+                if *clamp {
+                    let wgs: Vec<&(bool, u64)> = latoms.keys().filter(|k| is_wg(k)).collect();
+                    let top = latoms.iter().max_by(|p, q| {
+                        let (a, b) = (p.1.as_const().unwrap(), q.1.as_const().unwrap());
+                        (a.n * b.d).cmp(&(b.n * a.d))
+                    });
+                    let ok_clamp = match (wgs.as_slice(), top) {
+                        ([w], Some((tk, tc))) if *w == tk => cx.le(&ranges[tk].1.scale(tc.as_const().unwrap()), &bound.sub(&Poly::int(1))),
+                        ([], _) => true,
+                        _ => false,
+                    };
+                    if !ok_clamp {
+                        continue;
+                    }
+                }
+                // x's minimum over the stores (their own constants) and the per-store constant correction
+                let mut xmin: Option<Poly> = None;
+                for (si, p) in picks.iter().enumerate() {
+                    let lc = &caps_all[si][*p].0 .1;
+                    let mut m = lc.clone();
+                    for (a, cl) in latoms {
+                        m = m.add(&ranges[a].0.scale(cl.as_const().unwrap()));
+                    }
+                    xmin = match xmin {
+                        None => Some(m),
+                        Some(x0) => match self.pmin(&x0, &m) {
+                            Some(v) => Some(v),
+                            None => {
+                                ok = false;
+                                Some(x0)
+                            }
+                        },
+                    };
+                }
+                let Some(xmin) = xmin else { continue };
+                let span = bound.sub(&Poly::int(1)).sub(&xmin);
+                if !ok || !cx.nonneg(&span) {
+                    continue;
+                }
+                let mut fixed = Vec::with_capacity(ss.len());
+                for (si, p) in picks.iter().enumerate() {
+                    let Some(kd) = kf.mul(&caps_all[si][*p].0 .1) else {
+                        ok = false;
+                        break;
+                    };
+                    fixed.push(consts[si].sub(&kd));
+                }
+                if !ok || picks.iter().enumerate().any(|(si, p)| used[si].contains(p)) {
+                    continue;
+                }
+                for (si, p) in picks.iter().enumerate() {
+                    used[si].insert(*p);
+                }
+                consts = fixed;
+                for a in latoms.keys() {
+                    atoms.remove(a);
+                    covered.insert(*a);
+                }
+                digits.push((kf, span));
+            }
+        }
+        // 4. the per-store constants: differences to the first, split by monomial -> one pseudo digit per monomial (gcd stride)
+        let c0 = consts[0].clone();
         let mut by_mono: BTreeMap<Vec<Sym>, Vec<Q>> = BTreeMap::new();
         for c in &consts {
-            let d = c.sub(&c0);
-            for (mono, q) in &d.0 {
+            for mono in c.sub(&c0).0.keys() {
                 by_mono.entry(mono.clone()).or_default();
-                let _ = q;
             }
         }
         for (mono, qs) in by_mono.iter_mut() {
@@ -765,128 +913,15 @@ impl<'a> An<'a> {
                 digits.push((unit, Poly::int((hi - lo) / g)));
             }
         }
-        // every atom's range: hull over every store's instances (0 for a store that does not use it)
-        let mut ranges: BTreeMap<(bool, u64), (Poly, Poly)> = BTreeMap::new();
-        for k in atoms.keys() {
-            let mut r: Option<(Poly, Poly)> = None;
-            for s in ss {
-                let (l, h) = match s.3.as_ref() {
-                    None => return Err("atom without a range".into()),
-                    Some(m) => match m.get(k) {
-                        Some(x) => x.clone(),
-                        None => (Poly::int(0), Poly::int(0)),
-                    },
-                };
-                r = Some(match r {
-                    None => (l, h),
-                    Some((l0, h0)) => match (self.pmin(&l0, &l), self.pmax(&h0, &h)) {
-                        (Some(a), Some(b)) => (a, b),
-                        _ => return Err("incomparable atom ranges".into()),
-                    },
-                });
-            }
-            ranges.insert(*k, r.ok_or("no atom range")?);
-        }
-        // caps shared by every store (`x < bound` on the live arm of the masks): when the offset holds k * x, x's atoms become ONE digit
-        // (coefficient k, values [min x, bound - 1]) - provided x itself is injective in its atoms (a mixed radix of its own)
-        let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
-        let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
-        if let Some(first_caps) = caps_all.first() {
-            for cap in first_caps {
-                if !caps_all.iter().all(|cs| cs.contains(cap)) {
-                    continue;
-                }
-                let ((latoms, lconst), bound, clamp) = cap;
-                if latoms.is_empty() || !latoms.keys().all(|k| atoms.contains_key(k)) {
-                    continue;
-                }
-                // k = offset coefficient / x coefficient, the same for every atom of x
-                let mut kf: Option<Poly> = None;
-                let mut ok = true;
-                for (a, cl) in latoms {
-                    let Some(q) = cl.as_const() else { ok = false; break };
-                    if q.n <= 0 {
-                        ok = false;
-                        break;
-                    }
-                    let kk = atoms[a].scale(Q::new(q.d, q.n));
-                    match &kf {
-                        None => kf = Some(kk),
-                        Some(k0) if *k0 == kk => {}
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                let Some(kf) = kf else { continue };
-                if !ok || !cx.nonneg(&kf) {
-                    continue;
-                }
-                // x injective: its atoms sorted by (numeric) coefficient form a radix with unit size
-                let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
-                xd.sort_by(|p, q| (p.0.n * q.0.d).cmp(&(q.0.n * p.0.d)));
-                let mut acc = Poly::int(1);
-                let mut inj = true;
-                for (c, m) in &xd {
-                    let cp = Poly::konst(*c);
-                    if !cx.le(&acc, &cp) {
-                        inj = false;
-                        break;
-                    }
-                    acc = acc.add(&m.scale(*c));
-                }
-                if !inj {
-                    continue;
-                }
-                // a clamp (min(x, bound - 1)) loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every
-                // x >= bound - 1 has u at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
-                if *clamp {
-                    let is_wg = |k: &(bool, u64)| {
-                        (!k.0 && k.1 >= u64::MAX - 2) || self.f.contract.wg_maps.iter().any(|m| m.outs.iter().any(|v| self.atom_key(*v) == *k))
-                    };
-                    let wgs: Vec<&(bool, u64)> = latoms.keys().filter(|k| is_wg(k)).collect();
-                    let top = latoms.iter().max_by(|p, q| {
-                        let (a, b) = (p.1.as_const().unwrap(), q.1.as_const().unwrap());
-                        (a.n * b.d).cmp(&(b.n * a.d))
-                    });
-                    let ok_clamp = match (wgs.as_slice(), top) {
-                        ([w], Some((tk, tc))) if *w == tk => cx.le(&ranges[tk].1.scale(tc.as_const().unwrap()), &bound.sub(&Poly::int(1))),
-                        ([], _) => true,
-                        _ => false,
-                    };
-                    if !ok_clamp {
-                        continue;
-                    }
-                }
-                // x's minimum and the composite digit's span
-                let mut xmin = lconst.clone();
-                for (a, cl) in latoms {
-                    xmin = xmin.add(&ranges[a].0.scale(cl.as_const().unwrap()));
-                }
-                let span = bound.sub(&Poly::int(1)).sub(&xmin);
-                if !cx.nonneg(&span) {
-                    continue;
-                }
-                for a in latoms.keys() {
-                    atoms.remove(a);
-                    covered.insert(*a);
-                }
-                digits.push((kf, span));
-            }
-        }
+        // 5. the remaining atoms
         let mut wg_axes = [false; 3];
-        for k in &covered {
+        for k in atoms.keys().chain(covered.iter()) {
             if !k.0 && k.1 >= u64::MAX - 2 {
                 wg_axes[(u64::MAX - k.1) as usize] = true;
             }
         }
         for (k, c) in &atoms {
-            if !k.0 && k.1 >= u64::MAX - 2 {
-                wg_axes[(u64::MAX - k.1) as usize] = true;
-            }
-            let r: Option<(Poly, Poly)> = Some(ranges[k].clone());
-            let Some((l, h)) = r.as_ref().map(|(a, b)| (a, b)) else { return Err("no atom range".into()) };
+            let (l, h) = &ranges[k];
             let m = h.sub(l);
             if !cx.nonneg(&m) {
                 return Err("an atom range of unknown sign".into());
@@ -900,19 +935,25 @@ impl<'a> An<'a> {
             };
             digits.push((c, m));
         }
-        // every workgroup axis that can hold more than one workgroup must be a digit
+        // 6. every workgroup axis that can hold more than one workgroup must be a digit
         for (ax, seen) in wg_axes.iter().enumerate() {
             // an axis the contract leaves undefined and the kernel never reads is taken as one workgroup (a host contract like the grid
             // extents: docs/trust-inventory.md); an axis the kernel reads but the contract leaves open may hold several
             let defined = self.f.contract.grid_defs.iter().any(|(a, _)| *a as usize == ax);
             let read = self.defs.values().any(|op| matches!((ax, op), (0, Op::WorkgroupIdX) | (1, Op::WorkgroupIdY) | (2, Op::WorkgroupIdZ)));
             // ... or covered by a declared bijection whose outputs are all digits
-            let mapped = self.f.contract.wg_maps.iter().any(|m| m.axes.contains(&(ax as u8)) && m.outs.iter().all(|v| { let k = self.atom_key(*v); atoms.contains_key(&k) || covered.contains(&k) }));
+            let mapped = self.f.contract.wg_maps.iter().any(|m| {
+                m.axes.contains(&(ax as u8))
+                    && m.outs.iter().all(|v| {
+                        let k = self.atom_key(*v);
+                        atoms.contains_key(&k) || covered.contains(&k)
+                    })
+            });
             if !seen && !mapped && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
                 return Err("a workgroup axis that is not a digit".into());
             }
         }
-        // sort by coefficient (every pair must be comparable)
+        // 7. sort by coefficient (every pair must be comparable) and check the mixed radix
         let n = digits.len();
         for i in 0..n {
             for j in i + 1..n {
