@@ -190,6 +190,37 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 | M0 / LDS-DMA 语义、调度器、LLVM 尾端、汇编器 | 门禁、探针、md5 回归 |
 | 可达 kernel 能否编译 | `dispatch_compile` 测试；本轮 `bf16_v3_causal` 的 SGPR 溢出就是这类漏网 |
 
+### 5.1 冒险规则审计：LLVM GCNHazardRecognizer（gfx950）→ 本编译器
+
+逐条对照 LLVM `GCNHazardRecognizer.cpp`（PreEmitNoopsCommon 与 fixHazards 的全部检查），按 gfx950 的子目标谓词筛选：GFX9 代、
+`HasGFX940Insts` / `HasGFX950Insts`、gfx90a 的 MAI 规则。上一行就是本轮漏掉、已在硬件复现的那一条。
+
+| LLVM 规则（等待态） | gfx950 | 本编译器 | 结论 |
+|---|---|---|---|
+| checkVMEMHazards：VALU 写 SGPR → VMEM 读该 SGPR（5） | 适用（VI 代起） | `pad_valu_sgpr`（RA 后，物理 SGPR，跨块；SALU 中途改写也计） | 已覆盖（本轮新增；`probe_valu_sgpr` 硬件复现，`tests/hazard_valu_sgpr.rs` 回归） |
+| checkVALUHazards / VDecCoExec：VALU 写 SGPR 或 VCC → VALU 读（2） | 适用（GFX940 指令集） | SGPR：`pad_valu_sgpr`；VCC：`fix_value_hazards` 的 vccw（2） | 已覆盖 |
+| VDecCoExec：VALU 写 VGPR → v_readlane / v_readfirstlane 读（1） | 适用 | `valu_writer_delay` 对 readfirstlane 读者（2） | 已覆盖（比 LLVM 多 1，保守） |
+| VDecCoExec：VALU 写 EXEC → readlane / writelane（4） | 适用 | 不用 VALU 写 EXEC（v_cmpx 不生成） | 不适用 |
+| checkRWLaneHazards：VALU 写 SGPR 作 readlane / writelane 的 lane 选择（4） | 适用 | `VReadLane` / `VWriteLane` 只用立即数 lane | 不适用 |
+| TransForwarding：TRANS 结果 → 非 TRANS 的 VALU 读（1） | 适用（GFX940） | 超越函数结果延迟 `TRANS_LATENCY`（5，所有读者） | 已覆盖（保守） |
+| DstSel / CvtScale forwarding：op_sel 高半 / SDWA dst_sel / fp8·fp4 cvt 写 → 任何读或 WAW（1） | 适用（GFX940 / GFX950） | `cvt_dst_sel_write` → hiw（1） | 已覆盖；**有意偏离**：同一 dword 的 Lo / Hi 配对写不加等待（`probe_fp4_chain` 硬件实测）；fp4 SR 变体的 cvt 未生成 |
+| 12DWordStore：>8 字节 VMEM store 后 VALU 覆写数据 VGPR（gfx950：SGPR soffset 的 BUF 为 1，其余为 2） | 适用 | `wide_store_data`：2（物理寄存器，`pad_physical_war`） | 已覆盖（统一按 2，保守） |
+| checkDPPHazards：VALU 写 VGPR → DPP 读（2）；VALU 写 EXEC → DPP（5） | 适用 | DPP 读者 `valu_writer_delay`（2）；EXEC 只由 SALU 写 | 已覆盖 / 不适用 |
+| checkPermlaneHazards：VALU 写 VGPR → v_permlane 读（2）；v_cmpx 写 EXEC → permlane（4） | 适用（GFX950） | permlane 读者 `valu_writer_delay`（2）；不生成 v_cmpx | 已覆盖 / 不适用 |
+| checkMAIHazards：VALU 写 VGPR → MFMA 读（2；gfx950 scaled MFMA 再 +1） | 适用 | vw（2）；`scaled` +1（硬件确认） | 已覆盖 |
+| checkMAIHazards：XDL 写 → XDL 读 SrcA/B（NumPasses + 3，gfx950 再 +1：8 pass 12、16 pass 20）；SrcC 完全重叠且同 opcode（0） | 适用 | `mfma.latency`（12 / 20）；原位链互锁 | 已覆盖（非链一律满延迟，保守） |
+| checkMAIVALUHazards：XDL 写 VGPR → VALU / VMEM / DS 读（同上公式）；→ VALU 覆写 WAW（同上） | 适用 | ready map（所有读者）；在途目的寄存器 `pad_physical_war` | 已覆盖 |
+| checkMAIVALUHazards：XDL 读 SrcC → VALU 覆写 WAR（gfx940：16x16 7、32x32 15 量级） | 适用 | `pad_physical_war` 的 SrcC 窗口（12 / 21） | 已覆盖（保守） |
+| checkReadM0Hazards：SALU 写 M0 → LDS DMA（1） | 适用（GFX9） | `sched::m0::pad`（1） | 已覆盖 |
+| checkReadM0（SendMsg / GDS、MovRel / Interp、LDS direct） | 部分适用 | 不生成 s_sendmsg、GDS、movrel、interp；LDS direct 是 GFX11 | 不适用 |
+| checkSMRDHazards（VALU 写 → SMRD 读，4） | 只 SI | — | 不适用 |
+| checkDivFMasHazards、Get / SetReg、RFE、FPAtomicToDenorm、NSAtoVMEM | 适用或不适用 | 不生成 v_div_fmas、s_getreg / s_setreg、s_rfe、s_denorm_mode、NSA | 不适用 |
+| fixShift64HighRegBug（v_lshlrev_b64 等的位移量在块尾 VGPR） | 适用（gfx90a+） | 不生成 64 位 VALU 移位 | 不适用 |
+| checkInlineAsmHazards | — | 没有 inline asm；safe-asm 块由 `pin_check` 检查其内部等待 | 不适用 / 另行检查 |
+| fixHazards 的 GFX10 / GFX11 / GFX12 项：vcmpx-permlane、VMEM→SALU 写、SMEM→VALU 写、vcmpx-exec WAR、LDS-branch-VMEM WAR、LDS direct、partial forwarding、trans use、WMMA、mask write、export priority、getreg wait idle、scratch base | 不适用（谓词只对这些代为真） | — | 不适用 |
+
+结论：除本轮补上的 VALU 写 SGPR 两条外，gfx950 适用的 LLVM 规则都已覆盖，且本编译器的等待数不小于 LLVM；唯一有意偏离是 cvt 的 Lo / Hi 配对，有硬件实测支持。
+
 ## 6. 建议（按性价比）
 
 1. 采样 / top-k / moe_sorting 的 LDS 归约改用 LdsPlan tile 并加标记，使 `lds-untracked` 归零。

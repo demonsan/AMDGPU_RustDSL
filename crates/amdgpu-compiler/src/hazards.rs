@@ -994,13 +994,10 @@ pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
 ///     from the VALU write even when an SALU rewrote the register in between, so this pass does too.
 ///   * a VALU instruction reading it as an explicit operand (incl. a v_cndmask lane mask): 2 wait states (`checkVALUHazards`,
 ///     hasVDecCoExecHazard, "VALUWriteSGPRVALURead").
-/// Writes still pending at a block end are carried into the successors (to a fixpoint). Returns the wait states added.
-/// `AMDC_NO_VALU_SGPR=1`: off (A/B).
+/// Writes still pending at a block end are carried into the successors (to a fixpoint). Returns the wait states added. A correctness pass:
+/// not switchable (hardware: probe_valu_sgpr reads a stale soffset without it; tests/hazard_valu_sgpr.rs pins the padding).
 pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     use crate::sched::model::Pipe;
-    if std::env::var("AMDC_NO_VALU_SGPR").map_or(false, |v| v == "1") {
-        return 0;
-    }
     const VMEM_WAIT: usize = 5;
     const VALU_WAIT: usize = 2;
     let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;

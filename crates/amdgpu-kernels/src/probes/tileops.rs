@@ -1448,8 +1448,8 @@ pub fn probe_i8_epi() -> Function {
 
 /// `probe_valu_sgpr(in, out)`: the VALU-writes-SGPR hazards. 32 rounds j: a wave-uniform VALU value v_j = (tid >> 8) + 52 j (= 52 j for one
 /// wave) goes through `v_readfirstlane` into an SGPR that is used RIGHT AWAY as a buffer soffset (VMEM reader, 5 wait states) and as a VALU
-/// operand (2 wait states): out[j][lane] = in[lane + 13 j] + s_j. With the hazard padding off (AMDC_NO_VALU_SGPR=1) a stale SGPR shows up as
-/// a wrong element.
+/// operand (2 wait states): out[j][lane] = in[lane + 13 j] + s_j. Without the padding (hazards::pad_valu_sgpr) the hardware read a stale
+/// soffset: 1984 of 2048 elements wrong.
 pub fn probe_valu_sgpr() -> Function {
     let mut b = FnBuilder::new("probe_valu_sgpr", 64);
     b.arg("in", DType::Ptr, 0, 8);
