@@ -1409,7 +1409,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
-        "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", { let mut c = GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }; if let Ok(v) = std::env::var("TEMP_SM") { let p: Vec<&str> = v.split('/').collect(); c.pre_sync_mmas = p[0].parse().unwrap(); c.mid_sync_mmas = p[1].parse().unwrap(); c.acc_agpr = p[2].parse().unwrap(); if p.len() > 3 { c.cta_n = p[3].parse().unwrap(); } } c })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
