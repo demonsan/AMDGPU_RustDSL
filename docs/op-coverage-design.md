@@ -937,6 +937,14 @@ blockscale 128×128（`fp8bs`）的规则：
 - **XCD 均衡的 snake 顺序**（sched，causal 的 dkdv key tile 与 dq query tile）：每满 8 个 tile 的一行中，奇数行反向排列，使每个 XCD 拿到的工作量相同。
   - B4H8 2048² causal：dq 从 102.3 µs 降到 96.9，dkdv 不变；其余形状持平。
 - dq 的累加器固定到 AGPR：2048² 时 dq 从 71 µs 降到 65，但 4096² 时从 224 涨到 275，没有采纳。
+- **dkdv 每 SIMD 2 个 wave 不可行（算术推导，未写代码）**：
+  - 寄存器：2 个 wave 要求每个 wave 统一寄存器 ≤256，现为 236 VGPR + 128 AGPR = 364，需削减 108。K/V 移进 LDS 只能省 64；dK/dV 累加器的 128 个 AGPR 是必需的。
+  - LDS：2 个 4-wave CTA 意味着每个 CTA ≤80 KB。但 K/V 每 wave 要 16 KB（每 CTA 64 KB），加上共享的 Q/dO ring 64 KB，共 128 KB；即使 Q/dO 只留单 slot 也有 96 KB。改成 8-wave CTA 则要 128 + 64 = 192 KB，超过 160 KB。
+  - 若把 dK/dV 按维度拆给两个 wave（AGPR 减到 64），总量仍约 300。
+  - 结论：在当前 tile 形状下，K/V 进 LDS 只能缩短活跃区间，无法让占用率翻倍。
+- **dq 寄存器**（目标是每 SIMD 3 个 wave，需 ≤168；目前 245 VGPR，2 个 wave）：
+  - 按 32-key 半块流式计算 dS：VGPR 反而升到 256，时间持平，未采纳。
+  - 把 dQ 累加器固定到 AGPR：统一寄存器变为 265 > 256，掉到 1 个 wave，4096² 时变慢，未采纳。
 - 当前比值：2048² 为 0.83×，causal GQA 为 0.93×，B4 2048² causal 为 0.61×（dkdv 211 µs 对厂商总时间 200 µs，仍是瓶颈）。1000×1500 causal 为 1.13×，快于厂商。
 
 **原因与方向**：
