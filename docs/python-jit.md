@@ -147,7 +147,7 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 | `causal_conv1d_fwd(x, weight, bias, cu_seqlens, cache_indices, has_initial, conv_states, out, max_seqlen, silu)` | `causal_conv1d_fwd_bf16_w<W>[_silu]` | varlen prefill, x [T, dim]; states [slots, dim, W-1] |
 | `causal_conv1d_update(x, weight, bias, state, out, state_indices=None, silu)` | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]` | decode, x [B, dim]; state [slots, dim, SL] |
 | `gemm_w4(a, b, out, b_scale, a_scale, kind="a16w4"\|"a8w4")` | `gemm_a16w4_mxfp4`, `gemm_a8w4_mxfp_128` | a16w4: B through `a16w4_permute` + `shuffle_weight` |
-| `attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, causal, scale)` | `fmha_bwd_dot` + `fmha_bwd_dq` / `fmha_bwd_dkdv` (causal: `*_causal_lpt` from `bwd_causal_kernels`) | dk, dv per query head [B, SK, H, 128] |
+| `attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, causal, scale)` | `fmha_bwd_dot` + `fmha_bwd_dq` / `fmha_bwd_dkdv` (causal: `*_causal` from `bwd_causal_kernels`) | dk, dv per query head [B, SK, H, 128] |
 
 Every other registered kernel is reachable through `launch(name, …)` directly (arguments by the names `amdc jit-info <name>` lists).
 

@@ -154,7 +154,7 @@ def attention_bwd_bf16(q, k, v, o, do, lse, dq, dk, dv, *, causal=False, scale=N
     """Attention backward, head dim 128, bf16 BSHD: q, o, do, dq [B, SQ, H, 128], k, v [B, SK, HK, 128], lse f32 [B, H, SQ] (natural log, from
     the forward), dk, dv [B, SK, H, 128] PER QUERY HEAD (sum the G = H / HK heads of a group for GQA). Causal bottom-right aligned. Runs
     ``fmha_bwd_dot`` (Dot = rowsum(dO O), workspace), then ``fmha_bwd_dq`` / ``fmha_bwd_dkdv``; causal: the kernels of the dispatch rule
-    (``bwd_causal_kernels``: the longest-first forms ``*_causal_lpt``, grid (H, B, tiles) from their contracts). Returns the dkdv kernel."""
+    (``bwd_causal_kernels``: the causal kernels (longest-first launch order built in) ``*_causal``, grid (H, B, tiles) from their contracts). Returns the dkdv kernel."""
     rq, rk = as_ref(q), as_ref(k)
     B, SQ, H, D = rq.shape
     SK, HK = rk.shape[1], rk.shape[2]
