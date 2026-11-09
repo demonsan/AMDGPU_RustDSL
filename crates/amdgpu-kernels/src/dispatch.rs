@@ -6,13 +6,16 @@
 /// part) giving S CTAs >= CUs. Same run (us, ours / best aiter BpreShuffle tile): 1024x4096x8192 68.0 / 62.5 (was 71.4 with 128 S2),
 /// 512x7168x7168 60.3 / 51.3 (64.1), 256x7168x4096 S2 25.3 / 16.9 (29.4), 128x4096x8192 S4 20.9 / 22.3 (27.1), 64x8192^2 S4 22.5 / 23.0
 /// (27.2); 4096^3 and 2048x7168^2 stay 128 x 128 (122.7 / 129.3, 185.2 / 187.2).
+/// The 64-row forms run the 3-slot ring with the scales through the DMA stage (`GemmConfig::depth3`): 1024x4096x8192 64.1, 512x7168^2 51.0,
+/// 256x7168x4096 18.5 (S 1 now best; the rule's S 2 23.6), 128x4096x8192 S4 15.4, 64x8192^2 S4 19.2 us.
 pub fn blockscale_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
     if m.div_ceil(128) * n.div_ceil(128) >= 2 * cus {
         return (128, 1);
     }
     let c = m.div_ceil(64) * n.div_ceil(128);
+    // (3-slot 64-row forms: a grid of >= 3/4 of the CUs runs unsplit - 256x7168: S1 18.5 vs S2 23.6 us blockscale)
     let mut s = 1u64;
-    while s < 4 && c * s < cus && k % (256 * s) == 0 {
+    while s < 4 && c * s < cus && 4 * c < 3 * cus && k % (256 * s) == 0 {
         s *= 2;
     }
     (64, s as u32)
@@ -100,8 +103,9 @@ pub fn i8_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
         return (128, 1);
     }
     let c = m.div_ceil(64) * n.div_ceil(128);
+    // (3-slot 64-row forms: a grid of >= 3/4 of the CUs runs unsplit - 256x7168: S1 18.5 vs S2 23.6 us blockscale)
     let mut s = 1u64;
-    while s < 4 && c * s < cus {
+    while s < 4 && c * s < cus && 4 * c < 3 * cus {
         s *= 2;
     }
     (64, s as u32)
@@ -191,7 +195,7 @@ mod tests {
     #[test]
     fn blockscale_rule() {
         assert_eq!(blockscale_config(1024, 4096, 8192, 256), (64, 1));
-        assert_eq!(blockscale_config(256, 7168, 4096, 256), (64, 2));
+        assert_eq!(blockscale_config(256, 7168, 4096, 256), (64, 1));
         assert_eq!(blockscale_config(512, 7168, 7168, 256), (64, 1));
         assert_eq!(blockscale_config(128, 4096, 8192, 256), (64, 4));
         assert_eq!(blockscale_config(4096, 4096, 4096, 256), (128, 1));
