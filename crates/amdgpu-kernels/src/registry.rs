@@ -91,6 +91,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_bwd_dq_hd128_bf16" => Some(crate::fmha::bwd::fmha_bwd_dq("fmha_bwd_dq_hd128_bf16", false)),
         "fmha_bwd_dq_hd128_bf16_causal" => Some(crate::fmha::bwd::fmha_bwd_dq("fmha_bwd_dq_hd128_bf16_causal", true)),
         "fmha_bwd_dkdv_hd128_bf16" => Some(crate::fmha::bwd::fmha_bwd_dkdv("fmha_bwd_dkdv_hd128_bf16", false)),
+        "fmha_bwd_dq_hd128_bf16_causal_lpt" => Some(crate::fmha::bwd::fmha_bwd_dq_lpt("fmha_bwd_dq_hd128_bf16_causal_lpt")),
+        "fmha_bwd_dkdv_hd128_bf16_causal_lpt" => Some(crate::fmha::bwd::fmha_bwd_dkdv_lpt("fmha_bwd_dkdv_hd128_bf16_causal_lpt")),
         "fmha_bwd_dkdv_hd128_bf16_causal" => Some(crate::fmha::bwd::fmha_bwd_dkdv("fmha_bwd_dkdv_hd128_bf16_causal", true)),
         "fmha_bwd_dkdv_hd128_bf16_causal_pair" => Some(crate::fmha::bwd::fmha_bwd_dkdv_pair("fmha_bwd_dkdv_hd128_bf16_causal_pair")),
         "fmha_fwd_hd128_bf16_v3" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3("fmha_fwd_hd128_bf16_v3", false)),

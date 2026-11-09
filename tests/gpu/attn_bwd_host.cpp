@@ -131,10 +131,11 @@ int main(int argc, char** argv) {
         // ---- ours ----
         std::string cs = causal ? "_causal" : "";
         hipFunction_t fd = load(dir + "/fmha_bwd_dot_hd128_bf16.co", "fmha_bwd_dot_hd128_bf16");
-        hipFunction_t fq = load(dir + "/fmha_bwd_dq_hd128_bf16" + cs + ".co", "fmha_bwd_dq_hd128_bf16" + cs);
+        hipFunction_t fq = load(dir + "/fmha_bwd_dq_hd128_bf16" + cs + (envi("LPT", 0) && causal ? "_lpt" : "") + ".co", "fmha_bwd_dq_hd128_bf16" + cs + (envi("LPT", 0) && causal ? "_lpt" : ""));
         // PAIR=1 (causal): the paired dkdv form (`_causal_pair`, half the key-tile grid)
-        const bool pairk = causal && envi("PAIR", 0);
-        const std::string ks = cs + (pairk ? "_pair" : "");
+        const bool lpt = causal && envi("LPT", 0);   // LPT=1: the longest-first causal grids (H, B, tiles): fmha_bwd_dq / dkdv_hd128_bf16_causal_lpt
+        const bool pairk = causal && envi("PAIR", 0) && !lpt;
+        const std::string ks = cs + (pairk ? "_pair" : "") + (lpt ? "_lpt" : "");
         const int gk = pairk ? ((SK + 127) / 128 + 1) / 2 : (SK + 127) / 128;
         hipFunction_t fk = load(dir + "/fmha_bwd_dkdv_hd128_bf16" + ks + ".co", "fmha_bwd_dkdv_hd128_bf16" + ks);
         std::vector<uint8_t> a(16 * 15, 0);
@@ -144,8 +145,8 @@ int main(int argc, char** argv) {
         memcpy(&a[144], &scale, 4); U(10, SQ); U(11, SK); U(12, H); U(13, HK);
         auto run = [&]() {
             launch(fd, a, (SQ + 255) / 256, H, B);
-            launch(fq, a, (SQ + 127) / 128, H, B);
-            launch(fk, a, gk, H, B);
+            if (lpt) { launch(fq, a, H, B, (SQ + 127) / 128); launch(fk, a, H, B, gk); }
+            else { launch(fq, a, (SQ + 127) / 128, H, B); launch(fk, a, gk, H, B); }
         };
         run();
         HC(hipDeviceSynchronize());
@@ -162,7 +163,7 @@ int main(int argc, char** argv) {
         const char* nm[3] = {"dot", "dq", "dkdv"};
         for (int kk = 0; kk < 3; kk++) {
             HC(hipEventRecord(e0));
-            for (int i = 0; i < iters; i++) launch(fs[kk], a, gxs[kk], H, B);
+            for (int i = 0; i < iters; i++) { if (lpt && kk > 0) launch(fs[kk], a, H, B, gxs[kk]); else launch(fs[kk], a, gxs[kk], H, B); }
             HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
             float m2; HC(hipEventElapsedTime(&m2, e0, e1));
             printf("   %s: %.1f us\n", nm[kk], 1e3 * m2 / iters);
