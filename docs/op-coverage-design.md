@@ -925,7 +925,11 @@ blockscale 128×128（`fp8bs`）的规则：
 | B1H16 4096² causal | 672.5 µs | 335.8 µs | 0.50× |
 | B4H8 1024² causal | 123.9 µs | 116.6 µs | 0.94× |
 
-- causal 下 dkdv 只裁掉了前部 q tile：4096² 时 dkdv 为 460 µs，比非 causal 的 411 还多。这是下一个杠杆。
+- **causal dkdv 的 key tile 配对**：`fmha_bwd_dkdv_hd128_bf16_causal_pair`，由 `dispatch::bwd_dkdv_pair` 选择。
+  - 每个 CTA 处理第 x 个和第 nkt−1−x 个 key tile，网格减半，两个 pass 之间对 LDS ring 做一次 barrier。
+  - 选择规则：未配对时的网格 ≥ 2×CU 时才配对。
+  - B1H16 4096² causal：dkdv 从 460 µs 降到 276，总时间从 670 降到 487（厂商 330，比值从 0.50× 升到 0.68×）。
+  - 小网格时配对反而变慢：B1H8 2048² 为 119 → 132，B4H8 1024² 为 72 → 81，因此保持不配对。
 
 **原因与方向**：
 - 余下的差距在 dkdv 的单 tile 效率：单独 139 µs，约等于厂商的总时间。
