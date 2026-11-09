@@ -116,6 +116,9 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64, fp8: bool, slot64: bool) 
     let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
     let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
+    // data fact (host contract, counted): the valid slot_mapping entries are pairwise distinct, so the slot row is an injective function of the
+    // token (workgroup x token-in-block); invalid tokens write nothing (masked stores)
+    b.wg_union(&[sl], &[0], Ext::c(0), Ext::sym("S") - Ext::c(1), "data: valid slot_mapping entries are distinct (host contract)");
     let rowc = b.c_i32(orow as i32);
     let pkc = b.ptr_mad(ptrs[2], sl, rowc);
     let pvc = b.ptr_mad(ptrs[3], sl, rowc);
@@ -224,6 +227,9 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64, slot64: bool) 
     let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
     let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
+    // data fact (host contract, counted): the valid slot_mapping entries are pairwise distinct, so the slot row is an injective function of the
+    // token (workgroup x token-in-block); invalid tokens write nothing (masked stores)
+    b.wg_union(&[sl], &[0], Ext::c(0), Ext::sym("S") - Ext::c(1), "data: valid slot_mapping entries are distinct (host contract)");
     // the block, clamped to the last whole block (S = NB BS by the ABI: a no-op for valid slots; it lets the verifier prove the block descriptor in bounds)
     let blk = { let v = b.bind_i32(ev(sl).lshr(bsh).min(ev(s_v).lshr(bsh) - 1).max(0)); b.read_first_lane(v) };
     let off = b.bind_i32(ev(sl) & (bs as i32 - 1));
@@ -337,6 +343,9 @@ pub fn reshape_cache_blocked_fp8(name: &str, h: i64, d: i64, bs: i64, slot64: bo
     let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0)));
     let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
+    // data fact (host contract, counted): the valid slot_mapping entries are pairwise distinct, so the slot row is an injective function of the
+    // token (workgroup x token-in-block); invalid tokens write nothing (masked stores)
+    b.wg_union(&[sl], &[0], Ext::c(0), Ext::sym("S") - Ext::c(1), "data: valid slot_mapping entries are distinct (host contract)");
     let blk = { let v = b.bind_i32(ev(sl).lshr(bsh).min(ev(s_v).lshr(bsh) - 1).max(0)); b.read_first_lane(v) };
     let off = b.bind_i32(ev(sl) & (bs as i32 - 1));
     let bb = b.c_i32(blk_bytes as i32);
