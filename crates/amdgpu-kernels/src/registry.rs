@@ -85,6 +85,10 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("silu_mul_bf16_d") || n.starts_with("silu_mul_limit_bf16_d") || n.starts_with("swiglu_oai_mul_bf16_d") || n.contains("_mul_bias_bf16_d") && (n.starts_with("silu_") || n.starts_with("gelu_") || n.starts_with("swiglu_oai_")) || n == "gelu_bf16" || n.starts_with("gelu_mul_bf16_d") || matches!(n, "silu_bf16" | "gelu_tanh_bf16" | "gelu_fast_bf16" | "relu2_bf16" | "sigmoid_bf16") || n.starts_with("gelu_tanh_mul_bf16_d") || n == "add_bf16" || n == "cvt_f32_bf16" || n == "cvt_bf16_f32" || n == "quant_bf16_fp8_static" || n == "quant_bf16_fp8_static_rt" => crate::eltwise::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
+        "x_hd192_xaf" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("x_hd192_xaf", false, false, 192)),
+        "x_hd192c_np_q128_xaf" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("x_hd192c_np_q128_xaf", true, false, 192)),
+        "x_hd128_xaf" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("x_hd128_xaf", false, false, 128)),
+        "x_hd128c_xaf" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("x_hd128c_xaf", true, false, 128)),
         "fmha_fwd_hd128_fp8pt_v3" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3()),
         "fmha_fwd_hd128_fp8pt_v3_causal" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3_causal()),
         "fmha_fwd_hd128_fp8pt_v3_kvsplit" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3_kvsplit()),

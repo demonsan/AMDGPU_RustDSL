@@ -319,7 +319,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     // not fit the VGPRs); `_np` names the unpaired form (small grids, `dispatch::hd192_prefill_kernel`)
     let pair = dqk == 192 && !split && !name.contains("_np");
     // `_q128`: the 128-row / 64-key-tile form (mid-size causal grids, `dispatch`)
-    let small = name.ends_with("_q128");
+    let small = name.contains("_q128");
     fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small })
 }
 
@@ -661,6 +661,10 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     }
     }
     let mut f = b.finish();
+    // TEMP A/B: lowering options by name suffix
+    if name.contains("_xaf") {
+        f.lower_opts.push("addrfold".into());
+    }
     // the scheduler tokens also on the causal Gemm-profile build (+2 % at 8192², +1 % at 2048²)
     if !split || vs_policy {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
