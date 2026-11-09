@@ -990,6 +990,8 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SMemTime => vec![format!("s_memtime {}", spair(a, inst.dst.unwrap()))],
         MOp::SLoPart => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), a.phys[reg_of(&inst.srcs[0]) as usize])],
         MOp::SReadPhys => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), inst.imm)],
+        MOp::SMovM0 => vec![format!("s_mov_b32 m0, {}", src1_s(a, inst.srcs[0]))],
+        MOp::SAddM0 => vec![format!("s_add_u32 m0, {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SMovB32 => {
             let text = match inst.srcs.first() {
                 Some(s) => src1_s(a, *s),

@@ -90,7 +90,8 @@ fn is_mem(e: &Effects) -> bool {
 
 /// May the instruction take part in filling at all (as a mover or as an instruction hopped over)? Fences stop the scan.
 fn is_stop(i: &MInst, e: &Effects) -> bool {
-    i.pin || e.fence != Fence::None || e.pinned || matches!(i.op, MOp::SNop | MOp::SchedGroup | MOp::SEndpgm)
+    i.pin || e.fence != Fence::None || e.pinned || matches!(i.op, MOp::SNop | MOp::SchedGroup | MOp::SEndpgm | MOp::SMovM0 | MOp::SAddM0)
+        || crate::op_attrs::attrs(i.op).m0_src.is_some()
 }
 
 fn states(insts: &[MInst]) -> usize {

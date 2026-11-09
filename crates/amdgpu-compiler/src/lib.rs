@@ -209,6 +209,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 if m0_reuse_on(f) {
                     sched::m0::reuse(&mut m);
                 }
+                sched::m0::explicit(&mut m);
                 let pe = pin_check::check(&m);
                 if !pe.is_empty() {
                     return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
@@ -224,6 +225,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 hazards::pad_inflight_waw(&mut m, &a);
                 hazards::pad_physical_war(&mut m, &a);
                 hz(&mut m, &a, true);
+                sched::m0::pad(&mut m);
                 Ok(a)
             })();
             match attempt {
@@ -239,6 +241,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     if m0_reuse_on(f) {
         sched::m0::reuse(&mut m);
     }
+    sched::m0::explicit(&mut m);
     let pe = pin_check::check(&m);
     if !pe.is_empty() {
         return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
@@ -257,6 +260,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // pad the physical write-after-read hazard on every path, not only for scheduled code.
     hazards::pad_physical_war(&mut m, &alloc);
     hz(&mut m, &alloc, false);
+    sched::m0::pad(&mut m);
     Ok((m, alloc))
 }
 
