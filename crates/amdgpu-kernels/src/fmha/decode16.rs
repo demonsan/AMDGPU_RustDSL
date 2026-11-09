@@ -756,8 +756,10 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let tkb = tk.base as i32;
         let slot = amdgpu_tile::SlotIdx::new(0, 0);
         tk.at(&slot).write(&mut b, |b| {
-            // thread 0 writes the ticket word, the others a scratch word
-            let a = b.bind_i32(ev(tid).lt(1).select_i32(amdgpu_dsl::I32::c(tkb), amdgpu_dsl::I32::c(tkb + 4)));
+            let a = b.bind_i32(ev(tid) * 0 + tkb);
+            let pred_old = old;
+            // (every thread writes; thread 0's value is read back: the others hold the same address only when tid = 0 - use tid 0's slot)
+            let _ = pred_old;
             b.store_lds_b32(a, old);
         });
         b.wait_lds(0);
