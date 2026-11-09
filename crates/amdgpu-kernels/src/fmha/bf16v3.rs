@@ -164,6 +164,8 @@ impl Body<'_> {
 }
 impl PipeBody for Body<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        // (weave region markers: no code, the scheduler strategies of AMDC_SCHED_REGION / `declare_region` attach to these names, as in the MXFP8 kernels)
+        b.weave_region_begin("kv_stage");
         // group A stages K, group B stages V (each the whole 32 KB tile: 8 issues of 1 KB per wave)
         let r = self.ring;
         let (sh, vo, rs, so0) = match role {
@@ -189,6 +191,7 @@ impl PipeBody for Body<'_> {
                 }
             });
         }
+        b.weave_region_end();
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.s_init = self.qk(b, &t0.cur, None);
@@ -211,6 +214,7 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(0);
         }
+        b.weave_region_begin("v_phase");
         let (m_v, l_v) = (self.m.expect("m"), self.l.expect("l"));
         let s = self.s.clone();
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
@@ -289,16 +293,19 @@ impl PipeBody for Body<'_> {
             })
             .map(|(a, c)| b.cvt_pk_bf16_f32(p[a], p[c]))
             .collect();
+        b.weave_region_end();
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.prio {
             b.set_prio(1);
         }
+        b.weave_region_begin("m_phase");
         self.pv(b, &t.cur);
         if t.staged {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
         }
+        b.weave_region_end();
     }
 }
 
