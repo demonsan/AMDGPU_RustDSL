@@ -585,7 +585,7 @@
   - B16 fused 为 31.1 µs（未改前 32.7），但 split S2 不加 prefetch 仍有 28.6 µs，更快。
   - 大 batch 时因为占用率减半，反而变慢：B64 为 94.6 µs，未改前 84.9。
   - 因此 dispatch 中没有哪个形状会选它。
-- sched 的 rocprofv3 计数见 `docs/pa-decode16-profile.md`（batch2 分支）：
+- sched 的 rocprofv3 计数见 batch2 分支上的 pa-decode16-profile 文档：
   - 厂商把 160 KB LDS 全部用上，K 直接加载进寄存器；
   - 我们的 LDS bank conflict 是厂商的 23–27×，SALU 是 10×；
   - 我们 SQ_WAIT_ANY 占比为 54–57%，厂商为 13–26%。
