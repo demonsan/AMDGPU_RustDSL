@@ -197,7 +197,10 @@ def check_quant_group(M=32, N=512):
     return r
 
 
-def act(a, kind):
+def act(a, kind, g=None):
+    if kind == "swiglu_oai":
+        gt, lin = min(a, 7.0), max(-7.0, min(g, 7.0))
+        return gt / (1 + math.exp(-1.702 * gt)) * (lin + 1.0)
     if kind == "silu":
         return a / (1 + math.exp(-a))
     if kind == "gelu":
@@ -213,8 +216,21 @@ def check_act_mul(M=16, D=512, kind="silu"):
     out = down_bf16(do, M * D)
     for m in range(M):
         for k in range(D):
-            ref = act(x[m * 2 * D + k], kind) * x[m * 2 * D + D + k]
+            a_, g_ = x[m * 2 * D + k], x[m * 2 * D + D + k]
+            ref = act(a_, kind, g_) if kind == "swiglu_oai" else act(a_, kind) * g_
             r.cmp(out[m * D + k], ref, abs(ref) / 128 * 1.05 + 1e-6)
+    return r
+
+
+def check_quant_static(n=8192, scale=0.01):
+    r = Res(f"quant_static_fp8 n={n}")
+    x = rand_bf16(n)
+    dx, do = up_bf16(x, (n,)), aj.DeviceBuffer((n,), "uint8")
+    aj.quant_static_fp8(dx, do, scale)
+    q = down_u8(do, n)
+    for i in range(n):
+        y = max(-448.0, min(448.0, x[i] / scale))
+        r.cmp(e4m3(q[i]), y, abs(y) / 16 * 1.02 + 2 ** -9)
     return r
 
 
@@ -612,6 +628,8 @@ CHECKS = [
     ("act_mul_silu", check_act_mul),
     ("act_mul_gelu", lambda: check_act_mul(kind="gelu")),
     ("act_mul_gelu_tanh", lambda: check_act_mul(kind="gelu_tanh")),
+    ("quant_static_fp8", check_quant_static),
+    ("act_mul_swiglu_oai", lambda: check_act_mul(kind="swiglu_oai")),
     ("silu_mul_quant_fp8", check_silu_mul_quant),
     ("rope_neox", check_rope),
     ("rope_gptj", lambda: check_rope(style="gptj")),

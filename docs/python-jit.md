@@ -137,8 +137,16 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 | `topk_softmax(gating, weights, indices, renorm=False)` | `topk_softmax[_renorm]_bf16_e<E>_k<K>` | gating [T, E] bf16 → weights f32, indices i32 [T, K] |
 | `moe_sorting(topk_ids, topk_weights, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tile_start, num_experts, block_m)` | `moe_sorting_e<E>_k<K>_b<BM>` | sizes: `moe_sorting_sizes(M, E, K, BM)` |
 | `moe_reduce(x, out, weights=None)` | `moe_reduce_bf16_k<K>_d<D>` / `moe_combine_bf16_k<K>_d<D>` | x [T, K, D] → out [T, D] |
+| `gemm(a, b, out, kind="bf16"\|"fp8_rowcol"\|"fp8_blockscale"\|"mxfp4", a_scale, b_scale, splits="auto", tile="auto")` | `gemm_a16w16_bf16[_128]`, `gemm_a8w8_rowcol_fp8[_128]`, `gemm_a8w8_blockscale[_splitk]` + `gemm_splitk_reduce_s<S>`, `gemm_a4w4_mxfp4` | B preshuffled (`shuffle_weight`); blockscale split-K from `blockscale_split_k`; mxfp4 scales via `shuffle_mx_scales` |
+| `prefill_bf16(q, k, v, out, causal, lse=None, scale=None)` | `bf16_prefill_kernel` choice: `fmha_fwd_hd128_bf16_v3[_causal][_ks]` / `fmha_fwd_hd128_bf16_causal` (+ `attn_combine_bf16_hd128_q`) | q, out [B, SQ, H, 128], k, v [B, SK, HK, 128]; lse f32 [B, H, SQ] |
+| `fused_moe(x, w1, w2, topk_ids, topk_weights, out, dtype="bf16"\|"fp8", act, x_scale, w1_scale, w2_scale, num_experts, inter)` | `moe_sorting_*`, `gemm_moe1_<dt>_<act>[_bm64]`, `quant_token_bf16_fp8_n<I>` (fp8), `gemm_moe2_<dt>[_bm64]`, `moe_sum_bf16_k<K>` | W1 via `moe_w1_interleave` + `shuffle_weight`; block_m from `moe_block_m`; E ≥ 8, D % 1024 = 0 |
 
-`python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only) runs every op on random data against a Python reference that follows the
+The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm_blockscale", M, N, K)`,
+`dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)` (= `amdc dispatch …`, the functions of `crates/amdgpu-kernels/src/dispatch.rs`).
+Known: `gemm_a8w8_blockscale[_splitk]` carries the scaled K-block products at bf16 precision (up to 2^-8 of the larger block term under
+cancellation; reported, the check allows it).
+
+`python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only; GEMM / prefill / MoE checks sample rows and tokens) runs every op on random data against a Python reference that follows the
 C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm,rope,qknorm_rope_kv,cache,cache_blocked,topk,moe_sorting,moe_reduce}_host.cpp`).
 
 ## Checks on the GPU node
