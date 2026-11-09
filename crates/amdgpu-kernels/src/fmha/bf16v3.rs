@@ -363,7 +363,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     // code was the unscheduled fallback). Region-limited scheduling instead: waits recomputed everywhere (`rewait`), the list scheduler only on the K / V DMA issue and the matrix phase (the softmax phase, the
     // pressure peak, keeps its emission order): causal q128 B1 H16 2048^2 64.7 -> 56.4 us (-13 %), B2 H32 4096^2 625 -> 590; non-causal B1 H16 2048^2 73.1 -> 71.7, B2 H32 4096^2 684 -> 672
     // (the whole-kernel `rewait` alone is 7 % slower: the gain is the region reorder)
-    let hd192_regions = dqk == 192 && !opts.pair192 && !split;
+    let hd192_regions = dqk == 192 && !split && !(causal && opts.pair192);   // (`pair192` is set for the non-causal form too; only the causal one pairs)
     if hd192_regions {
         b.declare_region("m_phase", false, "reorder");
         b.declare_region("kv_stage", false, "reorder");
