@@ -1898,12 +1898,20 @@ impl<'a> An<'a> {
 
     /// Walks the region tree; `idx` is the statement index of the linearization (what findings print as `stmt N`).
     fn walk(&mut self, nodes: &[Node], idx: &mut usize) {
+        // loop-exit facts: after `break_if(c)` the rest of this body runs only when c is false (a break condition is wave-uniform), so the
+        // operand of a `x < k` / `x >= k` condition is refined until the end of the enclosing node list (`AMDC_NO_BREAK_FACTS=1`: off)
+        let mut break_facts: Vec<Option<(Opnd, Option<AV>, Option<Itv>)>> = Vec::new();
+        let use_break = std::env::var("AMDC_NO_BREAK_FACTS").map_or(true, |v| v.is_empty());
         for n in nodes {
             match n {
                 Node::S(st) => {
                     self.idx = *idx;
                     self.exec_stmt(st);
                     *idx += 1;
+                    if let (true, Stmt::BreakIf { cond }) = (use_break, st) {
+                        let u = self.branch_fact(cond, false);
+                        break_facts.push(u);
+                    }
                 }
                 Node::Loop { vars, init, body } => {
                     let begin = *idx;
@@ -1954,6 +1962,9 @@ impl<'a> An<'a> {
                     *idx += 1;
                 }
             }
+        }
+        for u in break_facts.into_iter().rev() {
+            self.undo_fact(u);
         }
     }
 
