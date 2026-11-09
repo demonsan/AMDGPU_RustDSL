@@ -113,20 +113,26 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - **掩码上限**：掩码写的活臂只在 `x < bound` 时执行；夹紧写 `min(x, bound - 1)` 也算，但要求 x 唯一的 workgroup 数字位在最高位，且 c_u·hi_u ≤ bound - 1。若偏移里含 k·x、x 自身对其原子是单射，就把 x 的原子合成一个数字位（系数 k，取值 [min x, bound - 1]）。各写的 x 常数可以不同，会从各自常数中扣除。
 - **`b.wg_bijection(outs, axes, reason)`**：受信事实，计入账本。声明 `outs` 这个元组是 workgroup id 在这些轴上的单射（例如 XCD 光栅、块序置换）；证明时把 `outs` 当作这些轴的数字位。只在它真正换来证明的地方使用：GEMM 光栅、mxfp8 FMHA 的 XCD 块序。
 
-已证明（出厂 / 常用）：
-- `gemm_mxfp8_bs_v4`、bf16 / blockscale GEMM；
-- mxfp8 FMHA `_vs128` / `_t128` / combine；
-- bf16 prefill v3、bwd dot / dq / dkdv；
-- rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample 的输出。
+其余规则：
+- **夹紧**：`min(x, y)` 也按夹紧处理。当 x 的 workgroup 数字位所在轴的 grid = ceil(bound / c) 时，夹紧总是落在本 workgroup 内。
+- **`b.wg_union(outs, axes, lo, hi, reason)`**：受信事实，计入账本。几类写各自算出的同一个索引（causal 配对的 q tile x 与 nt - 1 - x）在 (workgroup, 类) 上单射，取值 [lo, hi]；证明时把它们当作同一个数字位。
+- **decode16 的 G**：G 现为契约符号的点事实（`assume_trusted(q, G, G)`，替换原来的 [1, 16]，计数不变），使按 G 缩放的偏移保持线性。
 
-代价：账本上 `_vs128` / `_t128` 各 +1（XCD 块序），GEMM v4 +1（光栅），出厂合计 26 → 28。
+已证明（出厂 / 常用，全部写）：
+- `gemm_mxfp8_bs_v4`、bf16 / blockscale GEMM；
+- mxfp8 FMHA `_vs128` / `_t128` / `_kvsplit` / combine；
+- bf16 prefill v3（含 causal 配对）、bwd dot / dq / dkdv；
+- decode16 `_f`；`_c` 的 12 个写中证明 10 个；
+- MLA（两种形式）；
+- rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample。
+
+代价：出厂账本 26 → 29（`_vs128` / `_t128` 的 XCD 块序，`_kvsplit` 的 z 分解），GEMM v4 3 → 4（光栅）。
 
 仍未证明（原因 → 需要什么）：
-- `mxfp8 _kvsplit`：分片偏移的行复合位没有形成，系数不可比 → 需要分片行的上限形式；
-- causal v3：两类 tile 的写对同一原子系数不同 → 需要按写分组证明；
-- decode16 / MLA：G = H/HK 由 kernarg 的 select 得出，区间不是一个点 → 需要把 G 作为契约符号；
-- MoE GEMM / reshape_cache：行号或 slot 是数据（排序后的 token id、slot_mapping）→ 需要数据事实（互不相同）；
-- 持久化 `mlp_fp8_ws_fused`：tile 由循环变量 + workgroup 决定 → 需要循环关系。
+- decode16 `_c` 的末到者写（ticket 复位与最终输出）：只有末到者执行；需要把已验证的 last-arriver 协议当作该轴的覆盖；
+- `bf16_v3_ks`：分片原子的范围；
+- MoE GEMM / reshape_cache：行号或 slot 是数据 → 需要数据互异事实（受信、计数）；
+- 持久化 `mlp_fp8_ws_fused`：需要循环关系（#4）。
 
 **`lds-untracked`**：
 - 范围：不在任何 tile 标记内的 LDS 访问；
