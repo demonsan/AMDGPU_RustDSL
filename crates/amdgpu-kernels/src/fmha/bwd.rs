@@ -386,6 +386,8 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let mut lds = LdsPlan::new();
     let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
     let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
+    // the tile's LSE / Dot (64 queries x 4 bytes each), staged with Q / dO: a private copy per wave (512 bytes: LSE, then Dot)
+    let lds_ld = lds.ring("LD", 4 * 2 * KT as i64 * 4, 2, TLayout::Linear);
     lds.commit(&mut b);
     let kt = kt0;
     {
@@ -418,7 +420,19 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
             b.bind_i32(ev(r) * ev(qseq) + ((ev(l16) ^ (ev(r) & 15)) << 4))
         })
         .collect();
+    let ld_vo = b.bind_i32(lane.lane() << 2);
     let stage = |b: &mut FnBuilder, tile: ValueId, slot: i32, gen: Opnd| {
+        // LSE / Dot of the tile: one 4-byte DMA per lane each (lane = query), into this wave's private 512 bytes of the slot
+        {
+            let lso = { let v = b.bind_i32(ev(l_so) + (ev(tile) * KT << 2)); b.read_first_lane(v) };
+            let base = lds_ld.base as i32 + slot * 4 * 2 * KT * 4;
+            lds_ld.at(&SlotIdx::new(slot, gen.clone())).write(b, |b| {
+                for (j, r) in [r_l, r_d].into_iter().enumerate() {
+                    let m0 = { let x = b.bind_i32((lane.wave() << 9) + base + (j as i32) * KT * 4); b.read_first_lane(x) };
+                    b.buffer_load_lds_b32(r, ld_vo, lso, m0, 0);
+                }
+            });
+        }
         let so = { let v = b.bind_i32(ev(q_so0) + ev(tile) * KT * ev(qseq)); b.read_first_lane(v) };
         for (sh, r) in [(&qs, r_q), (&ds_, r_do)] {
             let base = sh.base as i32 + slot * KT * ROW;
@@ -541,6 +555,20 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
             }
         }
         b.end_if();
+        // the LSE / Dot of the lane's queries from this wave's staged copy (16-byte LDS reads: queries 32 sb + 8 g + 4 h .. + 3)
+        let ld_rd: Vec<(ValueId, ValueId)> = {
+            let ldb = b.bind_i32((lane.wave() << 9) + (ev(half) << 4) + (lds_ld.base as i32 + slot * 4 * 2 * KT * 4));
+            lds_ld.at(&SlotIdx::new(slot, Opnd::Var(it))).read(&mut b, |b| {
+                (0..8i32)
+                    .map(|i| {
+                        let (sb, g) = (i / 4, i % 4);
+                        let a0 = b.bind_i32(ev(ldb) + (32 * sb + 8 * g) * 4);
+                        let a1 = b.bind_i32(ev(ldb) + KT * 4 + (32 * sb + 8 * g) * 4);
+                        (b.load_lds_b128(a0), b.load_lds_b128(a1))
+                    })
+                    .collect()
+            })
+        };
         // P / dS packed to bf16 pairs as soon as a group of 4 values is done (word 8 sb + 2 g + u / 2): fewer live registers
         let mut p: Vec<ValueId> = Vec::with_capacity(16);
         let mut dsv: Vec<ValueId> = Vec::with_capacity(16);
@@ -549,10 +577,8 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 let mut pg: Vec<ValueId> = Vec::with_capacity(4);
                 let mut dg: Vec<ValueId> = Vec::with_capacity(4);
                 let qq = b.bind_i32(ev(q0) + (32 * sb + 8 * g) as i32);
-                // the 4 consecutive queries of this value group (4-aligned): one 16-byte load each; queries past SQ read 0 (masked anyway)
-                let qa = b.bind_i32(ev(qq) << 2);
-                let lv = b.buffer_load_b128(r_l, qa, l_so, 0);
-                let dv = b.buffer_load_b128(r_d, qa, l_so, 0);
+                // the 4 consecutive queries of this value group (4-aligned; queries past SQ read 0 or the next head's: masked anyway)
+                let (lv, dv) = ld_rd[4 * sb + g];
                 for u in 0..4usize {
                     let r = (4 * g + u) as u8;
                     let qv = b.bind_i32(ev(qq) + u as i32);
