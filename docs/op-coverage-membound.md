@@ -324,7 +324,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | **一元激活**（gelu_fast = tanh 形式、relu2、silu、sigmoid） | 有（新） | `gelu_fast_bf16` / `gelu_tanh_bf16` / `relu2_bf16` / `silu_bf16` / `sigmoid_bf16`（6.2 – 6.4 TB/s） |
 | | **gelu（erf 精确形式）**、`gelu_and_mul` | 有（新） | `gelu_bf16`、`gelu_mul_bf16_d<D>`：erfc 用 Numerical-Recipes 的 Chebyshev 拟合（相对误差 < 1.2e-7，尾部也准；`1 + erf` 按 z 的符号直接取 `erfc(|z|)` 或 `2 − erfc(|z|)`，没有相消） |
 | | **`*_and_mul_bias`（MoE 逐专家 bias）**：silu / gelu_tanh / gelu / swiglu | 有（新） | `{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`：按 `expert_ids[m]` 取该专家的 `[2][D]` bias 行，先加并舍入到 bf16（与 aiter 一致）再激活；expert id < 0 或 ≥ E 输出整行 0；ABI x @0、bias @8、expert_ids @16、out @24、M @32、E @36；D = 4096、M = 32768 约 143 µs |
-| | situv2_and_mul_quant | 缺 | aiter 内部的 silu + 量化变体，用法窄 |
+| | **situv2_and_mul_quant** | 有（新） | `situv2_mul_quant_fp8_d<D>`：`y = beta tanh(g / beta) sigmoid(g) · linear_beta tanh(u / linear_beta)`（g = 前半行、u = 后半行，`tanh(x) = 2 σ(2x) − 1`，无 clamp，与 aiter 独立 kernel 一致；MoE epilogue 里的 clamp 版本不在此处），再逐 token fp8；beta @28、linear_beta @32（f32 kernarg）；D = 4096、M = 65536：4.5 TB/s（每元素 3 次 exp2 + 3 次 rcp，VALU 受限） |
 | | scaled_silu_and_mul（输出 fp8，静态 scale） | 有（组合） | `silu_mul_quant_fp8_d<D>` 的静态 scale 变体可由 `quant_bf16_fp8_static` 接在后面；融合版缺 |
 | 位置编码 | rope neox / gptj，部分旋转（`_r<R>`），token 打包 | 有 | `rope_{neox,gptj}_bf16_h<H>_d<D>[_r<R>]` |
 | | **fused qk-norm + rope**（`fused_qk_norm_rope`，Qwen3 风格逐 head 归一化后旋转） | 有（新） | `qknorm_rope_{neox,gptj}_bf16_h<H>_d<D>`（全旋转）；q、k 各启动一次；H = 8 D = 128 5.7 TB/s |
