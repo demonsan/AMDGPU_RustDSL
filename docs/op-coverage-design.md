@@ -798,6 +798,21 @@
     | 64 / 64 / 8 / 2048 | 32 key，S=1 | 4182 GB/s | 5392 | 0.78× |
     | 4 / 32 / 4 / 8192 | 64 key，S=8 | 1352 GB/s | 1303 | 1.04× |
   - block-table 查表批量化：0.37× → 0.51×。
+  - **last-arriver 合并（`pa_decode16_bf16_hd128_p<P>_c`，v9）**：split 形式的 CTA 用 sc1 写穿存部分结果并 lite release，然后由一个 lane 取 (b, hk) 的 ticket（返回式 `buffer_atomic_add`，其余 lane 的偏移越界、在 L2 之前被丢弃），最后到达的 CTA acquire 后合并 S 份部分结果、直接写 bf16 输出——不需要 combine kernel。
+    - 第一版（`archive/decode16-lastc`）慢约 100 µs：ticket 原子由 CTA 的全部 256 个 lane 执行（非 0 lane 加 0，仍是 L2 原子），计数器相邻，B16 时约 3.2 万个同 cache line 原子串行化。改成单 lane 后：B16 ctx 2048 S1 128 → 30.3 µs，S4 353 → 26.3 µs。fence 本身只降为等待，不是瓶颈。
+    - 分发：[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `decode16_plan(B, HK, ctx)`。n = B·HK ≥ 256 时用 fused；更小的网格用 `_c`，S 取使 n·S ≥ 256 的最小 2 的幂，并限制每份至少 512 个 key（S ≤ ctx / 512）。
+    - 实测（H 64，HK 8，页 16，µs，同一次运行；旧规则 = split + combine kernel，n < 64 用 `_k64`；比 = 厂商 / ours）：
+
+      | B | ctx 1024 | ctx 2048 | ctx 8192 |
+      |---|---|---|---|
+      | 4 | `_c` S2 11.9（旧 18.6，厂商 8.0，0.67×） | `_c` S4 15.7（22.4，14.3，0.91×） | `_c` S8 28.8（33.0，35.7，**1.24×**） |
+      | 8 | `_c` S2 12.0（25.7，8.1，0.68×） | `_c` S4 19.6（31.5，14.8，0.75×） | `_c` S4 40.5（53.0，42.8，**1.06×**） |
+      | 16 | `_c` S2 15.8（24.0，11.0，0.70×） | `_c` S2 24.1（31.9，18.5，0.77×） | `_c` S2 89.8（98.6，88.3，0.98×） |
+      | 32 | fused 20.4（26.7，17.0，0.83×） | fused 35.8（42.1，31.2，0.87×） | fused 166.6（175.6，149.6，0.90×） |
+      | 64 | fused 33.9（不变，30.6，0.90×） | fused 83.8（不变，77.4，0.92×） | fused 303.0（不变，271.6，0.90×） |
+      | 128 | fused 81.9（不变，74.6，0.91×） | fused 157.8（不变，146.5，0.93×） | fused 588.3（不变，540.8，0.92×） |
+
+    - 网格内 `_c` S1 与 split 形式在每个点上都更慢。所有点 PA_OK；`_c` 严格验证 0 错误（2 / 19 / 0）。剩余差距在小 ctx（1024）：每个 wave 的指令下限（见 [`pa-decode16-profile.md`](pa-decode16-profile.md)）。
 - **MLA decode**：`mla_decode_bf16_p<P>` 已换成 16x16 版本，见 [`fmha/mla.rs`](../crates/amdgpu-kernels/src/fmha/mla.rs)。旧的 32 行版本保留为 tag `archive/mla-decode-v1`。combine 的部分数为 NS = 4·S。
   - 结构：
     - 每 CTA 负责 16 个 head，作为 16x16x32 MFMA 的 16 列；
