@@ -134,8 +134,9 @@ impl Body<'_> {
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx) {
         let vb = self.vbase(b, slot);
         let kind = self.kind;
-        // (dim block e, read r): vr0 ^ ((e << 6) | (r << 7)) + 2048 r (the swizzle terms are disjoint from the row / lane bits)
-        let bases: Vec<ValueId> = self.vr.iter().map(|v| b.bind_i32(ev(*v) + vb.clone())).collect();
+        // (dim block e, read r): vr0 ^ (e << 6) ^ (r << 7), + 2048 r (the swizzle terms touch only the 16-byte chunk bits 4..7, disjoint
+        // from the row and lane bits)
+        let bases: Vec<ValueId> = (0..8i32).map(|i| { let (e, r) = (i / 2, i % 2); b.bind_i32((ev(self.vr[0]) ^ I32::c((e << 6) ^ (r << 7))) + 2048 * r + vb.clone()) }).collect();
         let p = self.p.clone();
         let o = self.o.clone();
         self.ring.vs.at(slot).read(b, |b| {
@@ -819,8 +820,8 @@ fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, wpg: i32, l16: Value
     let kr: Vec<ValueId> = vec![b.bind_i32(lane.j() * ROW + ((ev(half) ^ (lane.lane() & 15)) << 4))];
     // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
     // the same key % 16), 16-byte chunk (4 e + 2 ((l % 32) / 16) + (s % 4) / 2) ^ (row % 16), byte 8 (s % 2)
-    let vr: Vec<ValueId> = (0..4)
-        .flat_map(|e| (0..2).map(move |r| (e, r)))
+    let vr: Vec<ValueId> = (0..1)
+        .flat_map(|e| (0..1).map(move |r| (e, r)))
         .map(|(e, r)| {
             let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
             let ch = b.bind_i32(4 * e + ((lane.lane() & 31).lshr(4) << 1) + (lane.lane() & 3).lshr(1));
