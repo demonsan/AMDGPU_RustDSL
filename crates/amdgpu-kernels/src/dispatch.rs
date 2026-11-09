@@ -134,11 +134,16 @@ pub fn mla_config(b: u64, h: u64) -> (bool, u32) {
 /// `bf16_prefill_key_splits`). Causal: the paired v3 (`_causal`, `_causal_ks` for small grids), except tiny grids (< 64 paired CTAs), where
 /// the 128-row v1 `fmha_fwd_hd128_bf16_causal` measured faster (B2 H8 HK2 1000 x 1300: 123 vs 94 TF/s). (hd64 / hd256, sliding window and
 /// varlen stay on the v1 family.)
+/// Causal re-measured 2026-11-09 with the assembling `_causal_ks` (backend SGPR fix) and the q16 combine (us; aiter / paired / v1 / ks2 / ks4):
+/// B1 H8 4096^2 91 / 119 / 98 / 86 / 74; 2048^2 52 / 69 / 49 / 51 / 42; B2 H8 HK2 1000 x 1300 47 / 63 / 36 / 50 / 43; B1 H16 4096^2
+/// 108 / 133 / 150 / 122 / 157; B4 H16 1024^2 42 / 51 / 51 / 59 / 86; B1 H8 8192^2 192 / 239 / 280 / 203 / 226. So: v1 only for tiny grids
+/// with short keys (< 16 key tiles), and no causal key split below 16 key tiles.
 pub fn bf16_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: u64) -> (&'static str, u32) {
-    if causal && b * h * sq.div_ceil(256).div_ceil(2) < 64 {
+    let short = sk.div_ceil(128) < 16;
+    if causal && b * h * sq.div_ceil(256).div_ceil(2) < 64 && short {
         return ("fmha_fwd_hd128_bf16_causal", 1);
     }
-    let s = bf16_prefill_key_splits(b, h, sq, sk, causal, cus);
+    let s = if causal && short { 1 } else { bf16_prefill_key_splits(b, h, sq, sk, causal, cus) };
     let name = match (causal, s > 1) {
         (false, false) => "fmha_fwd_hd128_bf16_v3",
         (false, true) => "fmha_fwd_hd128_bf16_v3_ks",
@@ -243,6 +248,10 @@ mod tests {
         assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, true, 256), ("fmha_fwd_hd128_bf16_v3_causal", 1));
         assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, false, 256), ("fmha_fwd_hd128_bf16_v3", 1));
         assert_eq!(bf16_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd128_bf16_v3_ks", 2));
+        assert_eq!(bf16_prefill_kernel(1, 8, 2048, 2048, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 4));
+        assert_eq!(bf16_prefill_kernel(1, 8, 4096, 4096, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 4));
+        assert_eq!(bf16_prefill_kernel(1, 16, 4096, 4096, true, 256), ("fmha_fwd_hd128_bf16_v3_causal_ks", 2));
+        assert_eq!(bf16_prefill_kernel(4, 16, 1024, 1024, true, 256), ("fmha_fwd_hd128_bf16_v3_causal", 1));
     }
 
     #[test]

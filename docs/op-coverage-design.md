@@ -972,7 +972,8 @@
 | bf16 v3 hd128（分发：`_ks` S2 + q16 combine） | B1 H8 4096² | 91.6 µs | 97.9 µs | 1.07 |
 | bf16 v3 hd128 causal | B2 H32 8192² | 1137 µs | 1023 µs | 0.90 |
 | bf16 v3 hd128 causal | B4 H16 2048² | 111 µs | 88.8 µs | 0.80 |
-| bf16 v3 hd128 causal | B1 H8 4096² | 120 µs | 90.5 µs | 0.75 |
+| bf16 v3 hd128 causal（分发：`_causal_ks` S4 + q16 combine） | B1 H8 4096² | 74.4 µs | 91.2 µs | 1.23 |
+| bf16 v3 hd128 causal（`_causal_ks` S2） | B1 H16 4096² | 122 µs | 108 µs | 0.88 |
 | bf16 hd192/hd128（MLA prefill） | B1 H16 4096² | 187 µs | 178 µs（fwd_hd192_hd128_bf16，128 行） | 0.95 |
 | bf16 hd192/hd128 | B4 H16 2048² | 206 µs | 189 µs | 0.91 |
 | bf16 hd192/hd128（`_ks` S2 + q16 combine） | B1 H8 4096²（128 CTA） | 112 µs | 90.3 µs | 0.81 |
@@ -994,7 +995,8 @@
 - MXFP8 一行是强制 `_vs128` 的单 kernel 比较；出厂分发（短序列 KV-split / `_t128`）的 25 形状矩阵为 0.93–1.06×，见 [`current-status.md`](current-status.md)。
 - 同一脚本里 bf16 反向非 causal 为 0.73–0.74×（交接记录的 0.83× 是不同形状与批次）；causal 4096² 0.86×。
 - fp8 per-tensor 的行在 authored 之后重测（只记录了比值）；其余 prefill 行为同日的同次运行。
-- 剩余短板：hd192 小网格（非 causal B1 H8 4096² 0.81、causal `_np` 0.77）、bf16 hd128 causal 小网格（分发目标 `_causal_ks` 待后端 SGPR 修复合入后重测；表中 0.75 为配对的普通形式）、反向 0.72–0.86。
+- 剩余短板：hd192 小网格（非 causal B1 H8 4096² 0.81、causal `_np` 0.77）、bf16 hd128 causal 中等网格（B4 H16 2048² 0.80、B4 H16 1024² 0.82：配对后 128–256 个 CTA，切分与配对都不再划算）、反向 0.72–0.86。
+- **bf16 hd128 causal 小网格**（SGPR 修复合入后，`_causal_ks` 可以汇编；同次运行，µs，厂商 / 配对 / v1 / ks2 / ks4）：B1 H8 4096² 91 / 119 / 98 / 86 / **74**；2048² 52 / 69 / 49 / 51 / **42**；B2 H8 HK2 1000×1300 47 / 63 / **36** / 50 / 43；B1 H16 4096² 108 / 133 / 150 / **122** / 157；B4 H16 1024² 42 / **51** / 51 / 59 / 86；B1 H8 8192² 192 / 239 / 280 / **203** / 226。据此 `bf16_prefill_kernel` 改为：v1 只用于配对 CTA < 64 且 key tile < 16 的情形，key tile < 16 时 causal 不切分（B1 H8 2048² 由 v1 49 改为 ks4 42 µs；B4 H16 1024² 由 ks2 59 改为配对 51 µs）。
 - **key-split 合并 kernel `attn_combine_bf16_hd128_q16`**（取代 `attn_combine_bf16_hd128_q`）：每个 workgroup 16 行、每线程 8 维（每份两次 16 字节读），一遍在线合并；旧版每行一个 workgroup、每线程每份一个 dword、两遍，受延迟限制（hd192 `_ks` B1 H8 4096² S2 的合并约 22 µs）。同次 A/B（µs，旧 / 新）：hd192 B1 H8 2048² S4 54.4 / 41.3，4096² S2 122.5 / 111.8，B4 H16 1024² S2 112 / 86，B1 H16 4096² S2 243 / 224。Python `prefill_bf16` 与 `attn_host` 默认改用它。
 - **hd192 非 causal 小网格**：`hd192_prefill_kernel` 对 U ≤ CU/4 用 `_ks` S4，对 U < CU 且 key tile ≥ 32 用 S2（B1 H8 2048² 66.6 → 41.3 µs，厂商 32.5；4096² 134 → 112，厂商 88）；U = 128、16 个 key tile（B1 H16 2048²）切分不划算，不切。剩余差距是结构性的：我们 256 行 / 8 wave 的 tile 在小网格下每 CU 一个 workgroup，厂商用 128 行 / 4 wave。
 
