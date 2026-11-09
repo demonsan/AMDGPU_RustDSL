@@ -659,44 +659,72 @@ impl<'a> An<'a> {
 
     fn disjoint_group_why(&self, ss: &[&(u32, Option<SLin>, i128, ARanges)]) -> Result<(), String> {
         let cx = &self.cx;
-        let Some(first) = ss[0].1.as_ref() else { return Err("no linear form".into()) };
-        let atoms = &first.0;
+        // the union of the stores' atoms: an atom's coefficient must agree among the stores that use it; a store without it has digit value 0
+        let mut atoms: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
         let mut consts: Vec<Poly> = Vec::new();
         let mut size: i128 = 0;
         for s in ss {
-            let Some((a, c)) = s.1.as_ref() else { return Err("reason 2".into()) };
-            if a != atoms {
-                return Err("reason 3".into());
+            let Some((a, c)) = s.1.as_ref() else { return Err("no linear form".into()) };
+            for (key, coef) in a {
+                match atoms.get(key) {
+                    Some(c0) if c0 != coef => return Err("an atom with different coefficients".into()),
+                    _ => {
+                        atoms.insert(*key, coef.clone());
+                    }
+                }
             }
             consts.push(c.clone());
             size = size.max(s.2);
         }
-        // the per-store constants: numeric differences to the first -> one pseudo digit (gcd stride)
+        // the per-store constants: differences to the first, split by monomial -> one pseudo digit per monomial (gcd stride)
         let c0 = consts[0].clone();
-        let mut diffs: Vec<i128> = Vec::new();
+        let mut digits: Vec<(Poly, Poly)> = Vec::new();
+        let mut by_mono: BTreeMap<Vec<Sym>, Vec<Q>> = BTreeMap::new();
         for c in &consts {
-            match c.sub(&c0).as_const() {
-                Some(q) if q.d == 1 => diffs.push(q.n),
-                _ => return Err("reason 4".into()),
+            let d = c.sub(&c0);
+            for (mono, q) in &d.0 {
+                by_mono.entry(mono.clone()).or_default();
+                let _ = q;
             }
         }
-        let lo = *diffs.iter().min().unwrap();
-        let hi = *diffs.iter().max().unwrap();
-        let g = diffs.iter().fold(0i128, |acc, d| gcd(acc, d - lo));
-        // digits: (coefficient >= 0, span >= 0)
-        let mut digits: Vec<(Poly, Poly)> = Vec::new();
-        if hi > lo {
-            digits.push((Poly::int(g), Poly::int((hi - lo) / g)));
+        for (mono, qs) in by_mono.iter_mut() {
+            for c in &consts {
+                qs.push(c.sub(&c0).0.get(mono).copied().unwrap_or(Q::int(0)));
+            }
+        }
+        for (mono, qs) in &by_mono {
+            if qs.iter().any(|q| q.d != 1) {
+                return Err("a fractional store constant".into());
+            }
+            let ns: Vec<i128> = qs.iter().map(|q| q.n).collect();
+            let lo = *ns.iter().min().unwrap();
+            let hi = *ns.iter().max().unwrap();
+            if hi > lo {
+                let g = ns.iter().fold(0i128, |acc, d| gcd(acc, d - lo));
+                let mut unit = std::collections::BTreeMap::new();
+                unit.insert(mono.clone(), Q::int(g));
+                let unit = Poly(unit);
+                if !cx.nonneg(&unit) {
+                    return Err("a store-constant stride of unknown sign".into());
+                }
+                digits.push((unit, Poly::int((hi - lo) / g)));
+            }
         }
         let mut wg_axes = [false; 3];
-        for (k, c) in atoms {
+        for (k, c) in &atoms {
             if !k.0 && k.1 >= u64::MAX - 2 {
                 wg_axes[(u64::MAX - k.1) as usize] = true;
             }
-            // the atom's range: hull over every store's instances
+            // the atom's range: hull over every store's instances (0 for a store that does not use it)
             let mut r: Option<(Poly, Poly)> = None;
             for s in ss {
-                let Some(Some((l, h))) = s.3.as_ref().map(|m| m.get(k).cloned()) else { return Err("atom without a range".into()) };
+                let (l, h) = match s.3.as_ref() {
+                    None => return Err("atom without a range".into()),
+                    Some(m) => match m.get(k) {
+                        Some(x) => x.clone(),
+                        None => (Poly::int(0), Poly::int(0)),
+                    },
+                };
                 r = Some(match r {
                     None => (l, h),
                     Some((l0, h0)) => match (self.pmin(&l0, &l), self.pmax(&h0, &h)) {
@@ -705,17 +733,17 @@ impl<'a> An<'a> {
                     },
                 });
             }
-            let Some((l, h)) = r.as_ref().map(|(a, b)| (a, b)) else { return Err("reason 5".into()) };
+            let Some((l, h)) = r.as_ref().map(|(a, b)| (a, b)) else { return Err("no atom range".into()) };
             let m = h.sub(l);
             if !cx.nonneg(&m) {
-                return Err("reason 6".into());
+                return Err("an atom range of unknown sign".into());
             }
             let c = if cx.nonneg(c) {
                 c.clone()
             } else if cx.nonneg(&c.scale(Q::int(-1))) {
                 c.scale(Q::int(-1))
             } else {
-                return Err("reason 7".into());
+                return Err("a coefficient of unknown sign".into());
             };
             digits.push((c, m));
         }
@@ -726,7 +754,7 @@ impl<'a> An<'a> {
             let defined = self.f.contract.grid_defs.iter().any(|(a, _)| *a as usize == ax);
             let read = self.defs.values().any(|op| matches!((ax, op), (0, Op::WorkgroupIdX) | (1, Op::WorkgroupIdY) | (2, Op::WorkgroupIdZ)));
             if !seen && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
-                return Err("reason 8".into());
+                return Err("a workgroup axis that is not a digit".into());
             }
         }
         // sort by coefficient (every pair must be comparable)
@@ -739,7 +767,7 @@ impl<'a> An<'a> {
                 if cx.le(&digits[j].0, &digits[i].0) {
                     digits.swap(i, j);
                 } else {
-                    return Err("reason 9".into());
+                    return Err("incomparable coefficients".into());
                 }
             }
         }
@@ -749,9 +777,9 @@ impl<'a> An<'a> {
                 continue; // a single-valued digit
             }
             if !cx.le(&acc, c) {
-                return Err("reason 10".into());
+                return Err("digits overlap (radix)".into());
             }
-            let Some(cm) = c.mul(m) else { return Err("reason 11".into()) };
+            let Some(cm) = c.mul(m) else { return Err("polynomial too large".into()) };
             acc = acc.add(&cm);
         }
         Ok(())
