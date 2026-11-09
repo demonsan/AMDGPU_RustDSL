@@ -101,7 +101,7 @@ fn python_op_names() -> BTreeSet<String> {
 
 /// Reachable kernels known not to compile (reported; each entry is re-checked below so the list cannot go stale).
 /// pa_decode16_bf16_hd128_p1_f: page size 1 runs out of SGPRs since the decode16 round-2 merge (7d483f4e).
-const KNOWN_BROKEN: &[&str] = &["pa_decode16_bf16_hd128_p1_f"];
+const KNOWN_BROKEN: &[&str] = &[];
 
 fn compile_all(names: &BTreeSet<String>) {
     let mut bad = Vec::new();
