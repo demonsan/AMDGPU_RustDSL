@@ -68,3 +68,49 @@ fn a_false_trusted_assume_is_counted_not_proven() {
     let r = verify_ir(&f);
     assert!(r.ledger().assume_trusted >= 1, "{}", r.render());
 }
+
+/// `out[wg * stride + lane * 4]` (one dword per lane, grid x = N workgroups, 64 lanes): with stride >= 256 no two workgroups share a byte.
+fn per_wg_stores(stride: i32, use_wg: bool) -> Function {
+    let mut b = FnBuilder::new("trust_gw", 64);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.grid_is(0, Ext::sym("N"));
+    b.arg_tensor("out", Ext::sym("N") * Ext::c(1024));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let lane = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let l4 = b.let_(Op::ShlI32(Opnd::Val(lane), Opnd::I32(2)));
+    let off = if use_wg {
+        let w = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(stride)));
+        b.let_(Op::AddI32(Opnd::Val(w), Opnd::Val(l4)))
+    } else {
+        l4
+    };
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
+    let v = b.c_i32(1);
+    b.store_global(q, 0, v, amdgpu_dsl::MemTy::B32, false);
+    b.finish()
+}
+
+#[test]
+fn disjoint_per_workgroup_stores_are_proven() {
+    let r = verify_ir(&per_wg_stores(256, true));
+    assert!(no_errors(&r), "{}", r.render());
+    assert_eq!(r.proven.get("global-write-disjoint").copied(), Some(1), "{:?} {:?}", r.proven, r.unchecked);
+    assert!(r.unchecked.get("global-write-untracked").is_none(), "{:?}", r.unchecked);
+}
+
+#[test]
+fn overlapping_workgroup_stores_are_not_proven() {
+    // stride 128 < 64 lanes x 4 bytes: workgroup w's upper half is workgroup w+1's lower half
+    let r = verify_ir(&per_wg_stores(128, true));
+    assert!(r.proven.get("global-write-disjoint").is_none(), "{:?}", r.proven);
+    assert_eq!(r.unchecked.get("global-write-untracked").copied(), Some(1));
+}
+
+#[test]
+fn stores_ignoring_a_multi_workgroup_axis_are_not_proven() {
+    // every workgroup of the N along x writes the same 256 bytes
+    let r = verify_ir(&per_wg_stores(256, false));
+    assert!(r.proven.get("global-write-disjoint").is_none(), "{:?}", r.proven);
+    assert_eq!(r.unchecked.get("global-write-untracked").copied(), Some(1));
+}
