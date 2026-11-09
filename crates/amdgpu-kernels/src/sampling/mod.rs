@@ -331,7 +331,8 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
             let scan_find = |b: &mut FnBuilder, tgt: ValueId, float: bool| -> (ValueId, ValueId) {
                 rv.set(rv.get() + 1);
                 let rs = SlotIdx::new(0, rv.get());
-                let rb = b.bind_i32(255 - ev(tcl));
+                // (threads >= 256 own no bin: their bin index clamps to 0 - the value is masked below - so that the read stays inside the HIST tile, provably)
+                let rb = b.bind_i32((255 - ev(tcl)).max(0));
                 let a_h = b.bind_i32((ev(rb) << 2) + hist);
                 let v0 = tl.hist.at(&SlotIdx::new(0, hv.get())).read(b, |b| b.load_lds(a_h, MemTy::B32));
                 b.wait_lds(0);
@@ -564,7 +565,8 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
             let own = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_own, MemTy::B32));
             let prev_i = b.bind_i32(ev(tid) - s);
             let okp = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
-            let pi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(okp), a: Opnd::Val(prev_i), b: Opnd::I32(0) });
+            // the neighbour below (clamped to 0 for the first s threads: masked by `okp` below; a max so that the address is provably inside the scan tile)
+            let pi = b.bind_i32(ev(prev_i).max(0));
             let a_pv = b.bind_i32((ev(pi) << 2) + cur);
             let pv = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
             b.wait_lds(0);
