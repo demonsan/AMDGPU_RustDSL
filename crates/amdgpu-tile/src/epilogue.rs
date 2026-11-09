@@ -102,7 +102,7 @@ pub fn combine_splits(b: &mut FnBuilder, ohat: ValueId, lse: ValueId, out: Value
     }
     let vars = b.begin_loop(&inits);
     let sv = vars[0];
-    b.assume(sv, amdgpu_dsl::Ext::c(0), split_bound); // checked: the loop-exit fact (s + 1 < splits after the break) proves it
+    b.assume_trusted(sv, amdgpu_dsl::Ext::c(0), split_bound, "split counter (tile::combine_splits): starts at 0 and the loop exits when s + 1 >= splits, so the body only runs with s <= splits - 1");
     let rs = b.bind_i32(amdgpu_dsl::varx(sv) * ev(rows));
     let lp = {
         let o = b.bind_i32((&ev(rs) + ev(row)) << 2);
