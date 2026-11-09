@@ -280,6 +280,9 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let fzero = b.c_f32(0.0);
     let sent_f = b.bitcast_f32(sent);
     let pad_iters = ((e * bm) as i32 + T - 1) / T;
+    // the exclusive offsets (C) are read by OTHER threads in the padding loop: their stores must complete before the barrier publishes them (the tile protocol found the missing wait: a barrier alone does
+    // not wait for the DS write)
+    b.wait_lds(0);
     b.barrier();
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let it = vars[0];
@@ -514,11 +517,14 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let eid = pair_expert(b, r_ids, i, ins, e);
         let wo = b.bind_i32(ev(i) << 2);
         let wf = b.buffer_load_f32(r_w, wo, 0i32, 0);
+        // WC versions: 2 ch (zeroed, counted), 2 ch + 1 (the prefix over the waves)
+        let v_cnt = b.bind_i32(ev(ch) << 1);
+        let v_pre = b.bind_i32((ev(ch) << 1) + 1);
         // [A] zero this thread's column of WC (all 16 waves' counts of expert `tid`)
         let zero = b.c_i32(0);
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            t_wc.at(&SlotIdx::new(0, Opnd::Var(ch))).write(b, |b| b.store_lds(a, zero, MemTy::B32, false));
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).write(b, |b| b.store_lds(a, zero, MemTy::B32, false));
         }
         b.wait_lds(0);
         b.barrier();
@@ -551,7 +557,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
             let wa0 = b.bind_i32(((ev(wave) << 10) + ev(e0c)) * 4 + wc);
             let dm = b.c_i32(dummy);
             let wa = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::Val(wa0), b: Opnd::Val(dm) });
-            t_wc.at(&SlotIdx::new(0, Opnd::Var(ch))).write(b, |b| b.store_lds(wa, cnt, MemTy::B32, false));
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).write(b, |b| b.store_lds(wa, cnt, MemTy::B32, false));
             let neq_lo = b.let_(Op::XorI32(Opnd::Val(eq_lo), Opnd::I32(-1)));
             let neq_hi = b.let_(Op::XorI32(Opnd::Val(eq_hi), Opnd::I32(-1)));
             let nl = b.let_(Op::AndI32(Opnd::Var(rl), Opnd::Val(neq_lo)));
@@ -568,16 +574,18 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let mut cs = Vec::new();
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            cs.push(t_wc.at(&SlotIdx::new(0, Opnd::Var(ch))).read(b, |b| b.load_lds(a, MemTy::B32)));
+            cs.push(t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).read(b, |b| b.load_lds(a, MemTy::B32)));
         }
         let ca = b.bind_i32(ev(tid4) + cursor);
         let curv = t_cur.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(ca, MemTy::B32));
         b.wait_lds(0);
+        // the prefix rewrites the column words just read (the column is the thread's own, but the protocol engine cannot see column ownership): the reads complete and a barrier separates them from the
+        // in-place writes, which are a new version
+        b.barrier();
         let mut run = b.c_i32(0);
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            // (in place: the thread rewrites the column words it just read: the same version, the column is its own)
-            t_wc.at(&SlotIdx::new(0, Opnd::Var(ch))).write(b, |b| b.store_lds(a, run, MemTy::B32, false));
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_pre))).write(b, |b| b.store_lds(a, run, MemTy::B32, false));
             run = b.add_i32(run, cs[w as usize]);
         }
         let ba = b.bind_i32(ev(tid4) + base_a);
@@ -590,7 +598,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let a_b = b.bind_i32((ev(eid) << 2) + base_a);
         let a_w = b.bind_i32(((ev(wave) << 10) + ev(eid)) * 4 + wc);
         let bse = t_base.at(&SlotIdx::new(0, Opnd::Var(ch))).read(b, |b| b.load_lds(a_b, MemTy::B32));
-        let wpre = t_wc.at(&SlotIdx::new(0, Opnd::Var(ch))).read(b, |b| b.load_lds(a_w, MemTy::B32));
+        let wpre = t_wc.at(&SlotIdx::new(0, Opnd::Val(v_pre))).read(b, |b| b.load_lds(a_w, MemTy::B32));
         b.wait_lds(0);
         let pos = b.bind_i32(ev(bse) + ev(wpre) + ev(rank));
         let q = if k == 1 {
