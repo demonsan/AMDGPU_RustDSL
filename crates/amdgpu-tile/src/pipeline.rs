@@ -139,6 +139,11 @@ pub struct Pipeline {
     pub late_tile1_vm: u8,
     /// loop-exit bound through read_first_lane (scalar compare)
     pub scalar_exit: bool,
+    /// `RegStaged` ring depth: 2 (default) or 3. Depth 3 = a 3-slot ring, three tiles per loop pass with static slots 0 / 1 / 2: iteration t
+    /// stages tile t + 3 into the slot of t and its top wait keeps the DMAs of tile t + 2 in flight (`s_waitcnt vmcnt(late_tile1_vm)`: the body
+    /// issues exactly `late_tile1_vm` VMEM ops per stage and none elsewhere in the loop); for small tiles whose compute per tile is shorter than
+    /// the memory latency.
+    pub rs_depth: u8,
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
@@ -147,7 +152,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2 }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -161,7 +166,7 @@ impl Pipeline {
             next: SlotIdx::new(1, 1),
             n2: match self.cadence {
                 Cadence::OneWindow => Some(SlotIdx::new(2, 2)),
-                Cadence::RegStaged => Some(SlotIdx::new(0, 2)),
+                Cadence::RegStaged => Some(SlotIdx::new(0, self.rs_depth as i32)),
                 Cadence::TwoPhaseOffset => None,
             },
             masked: false,
@@ -189,9 +194,15 @@ impl Pipeline {
             // tile 1 after the prologue stores; it lands behind the first tile and is published by the loop's first top barrier
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
+            if self.rs_depth == 3 {
+                // depth 3: tile 2 as well (clamped)
+                let key2 = b.let_i32(ev(self.nkv).gt(2).select_i32(2, ev(self.nkv) - 1) << self.lg());
+                body.stage(b, role, &key2, &SlotIdx::new(2, 2));
+            }
         }
-        // RegStaged: tile 1 is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here (`prologue_vm`)
-        b.wait_vm(if self.cadence == Cadence::RegStaged { self.late_tile1_vm } else { 0 });
+        // RegStaged: tile 1 (depth 3: and tile 2) is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here
+        let rs_late = if self.rs_depth == 3 { 2 * self.late_tile1_vm } else { self.late_tile1_vm };
+        b.wait_vm(if self.cadence == Cadence::RegStaged { rs_late } else { 0 });
         b.wait_lds(0);
         b.barrier();
         if self.cadence == Cadence::TwoPhaseOffset && role == Role::B {
@@ -233,6 +244,37 @@ impl Pipeline {
         };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
+        if self.cadence == Cadence::RegStaged && self.rs_depth == 3 {
+            // depth 3: tiles it, it + 1, it + 2 in slots 0, 1, 2; `idx` = the slot the loop left from
+            self.iter_rs(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true);
+            let one = b.c_i32(1);
+            b.set_var(idx, one);
+            let mid = b.bind_i32(varx(it) + 1);
+            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
+            b.break_if(stop1);
+            self.iter_rs(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true);
+            let two = b.c_i32(2);
+            b.set_var(idx, two);
+            let mid2 = b.bind_i32(varx(it) + 2);
+            let stop2 = b.bind_cond(!ev(mid2).lt(&nkv_m1));
+            b.break_if(stop2);
+            self.iter_rs(b, role, body, Opnd::Val(mid2), Opnd::I32(2), false, true);
+            let zero = b.c_i32(0);
+            b.set_var(idx, zero);
+            let it3 = b.bind_i32(varx(it) + 3);
+            b.set_var(it, it3);
+            let stop3 = b.bind_cond(!ev(it3).lt(&nkv_m1));
+            b.break_if(stop3);
+            b.end_loop();
+            let it_t = b.bind_i32(varx(it) + varx(idx));
+            let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
+            b.begin_if(is_tail);
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), true, false);
+            b.else_();
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), false, false);
+            b.end_if();
+            return;
+        }
         if self.cadence == Cadence::RegStaged {
             // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
             // between the halves) - the last tile is it + idx, in slot idx
@@ -292,10 +334,14 @@ impl Pipeline {
     fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool) {
         let nkv = ev(self.nkv);
         let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
-        let it_p2 = b.let_i32(amdgpu_dsl::ox(it) + 2);
-        let other = match slot {
-            Opnd::I32(k) => Opnd::I32(1 - k),
-            o => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
+        let d3 = self.rs_depth == 3;
+        // the tile staged in this iteration: t + depth, into the slot of t
+        let it_p2 = b.let_i32(amdgpu_dsl::ox(it) + if d3 { 3 } else { 2 });
+        let other = match (slot, d3) {
+            (Opnd::I32(k), false) => Opnd::I32(1 - k),
+            (Opnd::I32(k), true) => Opnd::I32((k + 1) % 3),
+            (o, false) => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
+            (o, true) => b.bind_opnd(&amdgpu_dsl::ox(o).lt(2).select_i32(amdgpu_dsl::ox(o) + 1, 0)),
         };
         let t = TileIt {
             it,
@@ -316,7 +362,8 @@ impl Pipeline {
             0 => key_n2 = Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << lg)),
             1 => body.pre_sync(b, role, &t),
             2 => {
-                b.wait_vm(0);
+                // (depth 3: the DMAs of t + 2, issued in the previous iteration, stay in flight)
+                b.wait_vm(if d3 { self.late_tile1_vm } else { 0 });
                 b.wait_lds(0);
                 body.post_wait(b, role, &t);
                 b.barrier();

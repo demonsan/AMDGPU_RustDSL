@@ -62,6 +62,9 @@ pub struct GemmConfig {
     /// MoE gpt-oss form (`_oss`): per-expert fp32 bias at kernarg 144 (stage 1 [E][2 n_out] gate then up; stage 2 [E][n_out]); stage 1's
     /// activation is the clamped swiglu (gate = min(g + bg, 7), up = clamp(u + bu, -7, 7), y = (up + 1) gate sigmoid(1.702 gate))
     pub moe_bias: bool,
+    /// 3-slot LDS ring (`Pipeline::rs_depth` 3): tile t + 3 is staged while t + 2 is still in flight (counted top wait) - small CTAs whose
+    /// per-tile compute is shorter than the memory latency. Unit-scale forms only (no other VMEM in the loop).
+    pub depth3: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -187,7 +190,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -1409,6 +1412,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_64_d3" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_d3", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_128_d3" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128_d3", GemmConfig { elem: Elem::I8, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
@@ -1669,7 +1674,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
 
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
-    let slots = 2;
+    let slots = if cfg.depth3 { 3 } else { 2 };
+    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) && !cfg.split_k && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
     let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
@@ -1900,6 +1906,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
+    if cfg.depth3 {
+        pipe.rs_depth = 3;
+    }
     // operand read partitions (the wave offset added to the bases)
     let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
     let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);
