@@ -386,6 +386,14 @@ impl<'a> An<'a> {
                 }
                 match def {
                     Some(Op::AddI32(a, b)) => Some(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?)),
+                    // min(x, y) with y a uniform point: the clamp cap x < y + 1 (see `disjoint_group_why`)
+                    Some(Op::MinI32(a, b)) if self.point_of(b).is_some() => {
+                        let bound = self.point_of(b).unwrap().add(&Poly::int(1));
+                        if let Some(l) = self.slin(a, depth + 1) {
+                            self.caps_cur.borrow_mut().push((l, bound, true));
+                        }
+                        self.slin(a, depth + 1)
+                    }
                     // readfirstlane of a wave-uniform value is that value
                     Some(Op::ReadFirstLane(a)) if self.uniform(a, 0) => self.slin(a, depth + 1),
                     Some(Op::Tri(amdgpu_dsl::TriOp::Add3U32, a, b, c)) => {
@@ -514,6 +522,12 @@ impl<'a> An<'a> {
         }
     }
 
+    /// The exact (point) value of a uniform operand, if its interval is one polynomial.
+    fn point_of(&self, o: &Opnd) -> Option<Poly> {
+        let it = self.int_of(o);
+        (it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0]).then(|| it.lo[0].clone())
+    }
+
     /// `cond == live` as `x < y`.
     fn lt_of(&self, cond: &Opnd, live: bool) -> Option<(Opnd, Opnd)> {
         let Opnd::Val(cv) = cond else { return None };
@@ -606,7 +620,19 @@ impl<'a> An<'a> {
                 let mut r: Option<(Poly, Poly)> = None;
                 for o in insts {
                     let it = self.int_of(&o);
-                    let (l, h) = (it.lo.first()?.clone(), it.hi.first()?.clone());
+                    // the tightest comparable bounds of the instance (an interval keeps several candidate bounds)
+                    let mut l = it.lo.first()?.clone();
+                    for x in it.lo.iter().skip(1) {
+                        if self.cx.le(&l, x) {
+                            l = x.clone();
+                        }
+                    }
+                    let mut h = it.hi.first()?.clone();
+                    for x in it.hi.iter().skip(1) {
+                        if self.cx.le(x, &h) {
+                            h = x.clone();
+                        }
+                    }
                     r = Some(match r {
                         None => (l, h),
                         Some((l0, h0)) => (self.pmin(&l0, &l)?, self.pmax(&h0, &h)?),
