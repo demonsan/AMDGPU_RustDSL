@@ -141,7 +141,8 @@ int main(int argc, char** argv) {
     const bool addm = false;
     // HALF=1: bf16 per-route intermediate (gemm_moe2_<dt>_h + moe_sum_bf16h_k<K>)
     const bool hm = envi("HALF", 0) != 0;
-    const std::string bms = BM == 64 ? "_bm64" : "";
+    // D3=1: the 3-slot-ring forms (`_d3`)
+    const std::string bms = std::string(BM == 64 ? "_bm64" : "") + (envi("D3", 0) ? "_d3" : "");
     hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act + bms), f2 = load("gemm_moe2_" + dt + (addm ? "_add" : hm ? "_h" : "") + bms),
                   fs = addm ? nullptr : load((hm ? "moe_sum_bf16h_k" : "moe_sum_bf16_k") + std::to_string(TK));
     // fp8: the stage-1 output re-quantized on the GPU between the stages (dynamic per token / per 128-group): rows::quant (co_dir)
