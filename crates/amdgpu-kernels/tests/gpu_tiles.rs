@@ -596,3 +596,96 @@ fn a_barrier_without_the_producers_wait_does_not_publish() {
     let r = verify_ir(&same_role(true, false));
     assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// REUSED LDS storage (LdsPlan::tile_over -> lds_reuse). kernel-opt's first fused decode16 epilogue: wave w wrote its LSE into a shared staging tile at
+// V_base + 64 w - inside wave 0's private V slice - while wave 0 could still be reading its V tile (no barrier between); the fixed version writes only
+// into the wave's OWN dead K / V slices (own-slice proof), or reuses after a barrier.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Reuse {
+    /// LSE of wave w at V_base + 64 w (lands in wave 0's slice): the race
+    Racy,
+    /// LSE of wave w at V_base + 1024 w (its own slice)
+    OwnSlice,
+    /// LSE at V_base + 64 w, but after wait_lds(0) + barrier
+    AfterBarrier,
+}
+
+fn tile_over_kernel(mode: Reuse) -> Function {
+    let mut b = FnBuilder::new("tile_over", 128);
+    b.lds(4096);
+    b.lds_private("K", 0, 1024, 2);
+    b.lds_private("V", 2048, 1024, 2);
+    b.lds_tile("EPI", 0, 4096);
+    b.lds_reuse("EPI", "K");
+    b.lds_reuse("EPI", "V");
+    let t = b.let_(Op::WorkitemId);
+    let wid = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(6)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(t), Opnd::I32(63)));
+    let c1024 = b.c_i32(1024);
+    let c16 = b.c_i32(16);
+    let l16 = b.mul_i32(lane, c16);
+    let kb = b.mul_i32(wid, c1024);
+    let ka = b.add_i32(kb, l16);
+    let vb = b.add_i32(kb, 2048);
+    let va = b.add_i32(vb, l16);
+    let z = b.c_i32(0);
+    let v = b.frag4(z, z, z, z);
+    for (name, a) in [("K", ka), ("V", va)] {
+        b.tile_produce(name, wid, Opnd::I32(0));
+        b.store_lds_b128(a, v);
+        b.tile_end();
+    }
+    b.wait_lds(0);
+    for (name, a) in [("K", ka), ("V", va)] {
+        b.tile_consume(name, wid, Opnd::I32(0));
+        let _r = b.load_lds_b128(a);
+        b.tile_end();
+    }
+    if mode == Reuse::AfterBarrier {
+        b.wait_lds(0);
+        b.barrier();
+    }
+    // the epilogue staging: this wave's partial "O" in its own K slice, its "LSE" in V
+    let c4 = b.c_i32(4);
+    let q = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(3)));
+    let q4 = b.mul_i32(q, c4);
+    let lse_base = match mode {
+        Reuse::OwnSlice => b.add_i32(kb, 2048),
+        _ => {
+            let c64 = b.c_i32(64);
+            let w64 = b.mul_i32(wid, c64);
+            b.add_i32(w64, 2048)
+        }
+    };
+    let la = b.add_i32(lse_base, q4);
+    b.tile_produce("EPI", Opnd::I32(0), Opnd::I32(0));
+    b.store_lds_b128(ka, v);
+    b.store_lds(la, z, amdgpu_dsl::MemTy::B32, false);
+    b.tile_end();
+    b.wait_lds(0);
+    b.barrier();
+    b.tile_consume("EPI", Opnd::I32(0), Opnd::I32(0));
+    let _e = b.load_lds(la, amdgpu_dsl::MemTy::B32);
+    b.tile_end();
+    b.finish()
+}
+
+#[test]
+fn reusing_storage_another_wave_may_still_read_is_rejected() {
+    let r = verify_ir(&tile_over_kernel(Reuse::Racy));
+    assert!(r.errors().iter().any(|e| e.code == "GV-TILE-ALIAS-RACE"), "{}", r.render());
+}
+
+#[test]
+fn reusing_only_the_writers_own_dead_slices_is_proven() {
+    let r = verify_ir(&tile_over_kernel(Reuse::OwnSlice));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+}
+
+#[test]
+fn reusing_storage_after_the_last_reads_and_a_barrier_is_proven() {
+    let r = verify_ir(&tile_over_kernel(Reuse::AfterBarrier));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+}

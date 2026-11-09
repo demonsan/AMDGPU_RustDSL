@@ -434,6 +434,7 @@ impl FromIr for Contract {
             ka_sets: FromIr::from_ir(v.field("ka_sets")?)?,
             tiles: FromIr::from_ir(v.field("tiles")?)?,
             tile_aliases: FromIr::from_ir(v.field("tile_aliases")?)?,
+            tile_reuses: FromIr::from_ir(v.field("tile_reuses")?)?,
             tile_trust: FromIr::from_ir(v.field("tile_trust")?)?,
             buf_regions: FromIr::from_ir(v.field("buf_regions")?)?,
             last_arrivers: FromIr::from_ir(v.field("last_arrivers")?)?,
@@ -451,6 +452,7 @@ impl IrIds for Contract {
         IrIds::ids(&mut self.ka_sets, fv, fr);
         IrIds::ids(&mut self.tiles, fv, fr);
         IrIds::ids(&mut self.tile_aliases, fv, fr);
+        IrIds::ids(&mut self.tile_reuses, fv, fr);
         IrIds::ids(&mut self.tile_trust, fv, fr);
         IrIds::ids(&mut self.buf_regions, fv, fr);
         IrIds::ids(&mut self.last_arrivers, fv, fr);

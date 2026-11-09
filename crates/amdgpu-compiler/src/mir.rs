@@ -546,6 +546,10 @@ pub enum MOp {
     SLoPart,
     SReadPhys,
     SMovB32,
+    /// `s_mov_b32 m0, src`: the explicit M0 write of the LDS-DMA loads that follow (sched::m0::explicit; own-only)
+    SMovM0,
+    /// `s_add_u32 m0, s0, s1`: the M0 write with the LDS base's add folded in (clobbers SCC)
+    SAddM0,
     SAddU32,
     SAddcU32,
     SMulI32,

@@ -1049,6 +1049,10 @@ pub struct Contract {
     /// LDS tiles / rings (v1.1 lifetime model) and the explicitly aliased pairs (allowed to overlap).
     pub tiles: Vec<TileDecl>,
     pub tile_aliases: Vec<(String, String)>,
+    /// (new, old): `new` REUSES the storage of `old` (time multiplexing: `LdsPlan::tile_over` / `private(.., overlays)`). Unlike a plain alias, the
+    /// protocol engine checks it: every write of one must be separated by a barrier from the other's accesses by any other wave, or provably stay
+    /// inside the writer's own slice of a private `old` (GV-TILE-ALIAS-RACE).
+    pub tile_reuses: Vec<(String, String)>,
     /// Explicit trust that the tile protocol is periodic in the loop iteration (see `tile_trust_periodic`): skips the affine-counter check.
     pub tile_trust: Option<String>,
     /// Global-memory regions, the last-arriver patterns and the per-region trust entries (name, reason) of the v4 protocol model.
@@ -1803,6 +1807,12 @@ impl FnBuilder {
     #[track_caller]
     pub fn lds_alias(&mut self, a: &str, b: &str) {
         self.f.contract.tile_aliases.push((a.to_string(), b.to_string()));
+    }
+    /// `new` reuses the storage of `old` (it may overlap it, like `lds_alias`), and the protocol engine CHECKS the reuse (see `Contract::tile_reuses`).
+    #[track_caller]
+    pub fn lds_reuse(&mut self, new: &str, old: &str) {
+        self.f.contract.tile_aliases.push((new.to_string(), old.to_string()));
+        self.f.contract.tile_reuses.push((new.to_string(), old.to_string()));
     }
     /// Trust entry for the tile simulator: the slot / version expressions are NOT plain affine counters (xor/add/and/mul by constants) but the protocol is periodic in
     /// the loop iteration by construction, so the simulated iterations (>= 10 and >= 2 x ring slots + 4) cover every launch. Listed as TRUSTED in the report.
