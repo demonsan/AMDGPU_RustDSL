@@ -240,13 +240,15 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     // fp8: the staged fp8 V rows (converted into the bf16 V tile)
     let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
-    // fused: the 4 waves' normalized partials O [16 cols][128] f32 (8 KB each) + LSE [16] (at 32 KB) over the dead K / V regions
+    // fused: wave w's normalized partial O [16 cols][128] f32 over its own K region (8 KB w) and its LSE [16] at the start of its own V
+    // region (32 KB + 8 KB w): a wave writes only its own dead storage, before the barrier
     const EPI_L: i32 = 32768;
-    let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 4 * 64) as i64, &[&kreg, &vreg]));
+    assert!(!fused || KT == 32, "decode16 fused: 32-key tiles (8 KB K / V per wave)");
+    let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 3 * 8192 + 64) as i64, &[&kreg, &vreg]));
     lds.commit(&mut b);
     // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
     let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
-    let epi_l = fused.then(|| b.bind_i32((ev(wv) << 6) + (ev(j) << 2) + EPI_L));
+    let epi_l = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 2) + EPI_L));
     let me = kreg.mine(wv);
     let mev = vreg.mine(wv);
     let mvs = vsreg.as_ref().map(|r| r.mine(wv));
@@ -630,7 +632,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let col = b.bind_i32(ev(tid).lshr(4));
         let d0 = b.bind_i32((ev(tid) & 15) << 3);
         let (ls, os): (Vec<ValueId>, Vec<(ValueId, ValueId)>) = e.at(&amdgpu_tile::SlotIdx::new(0, 0)).read(&mut b, |b| {
-            let ls = (0..4i32).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 64 * w)); b.load_lds_b32(a) }).collect();
+            let ls = (0..4i32).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 8192 * w)); b.load_lds_b32(a) }).collect();
             let os = (0..4i32)
                 .map(|w| {
                     let a = b.bind_i32((ev(col) << 9) + (ev(d0) << 2) + (w << 13));
