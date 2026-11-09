@@ -96,6 +96,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_bf16_v3_causal" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3("fmha_fwd_hd128_bf16_v3_causal", true)),
         "fmha_fwd_hd192_hd128_bf16_v3" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("fmha_fwd_hd192_hd128_bf16_v3", false, false, 192)),
         "fmha_fwd_hd192_hd128_bf16_v3_causal" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("fmha_fwd_hd192_hd128_bf16_v3_causal", true, false, 192)),
+        "fmha_fwd_hd192_hd128_bf16_v3_ks" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("fmha_fwd_hd192_hd128_bf16_v3_ks", false, true, 192)),
+        "fmha_fwd_hd192_hd128_bf16_v3_causal_ks" => Some(crate::fmha::bf16v3::fmha_fwd_bf16_v3_d("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", true, true, 192)),
         "fmha_fwd_hd128_bf16_v3_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_ks", false, true)),
         "fmha_fwd_hd128_bf16_v3_causal_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_causal_ks", true, true)),
         n if n.starts_with("rmsnorm_quant_mxfp4_bf16_k") => crate::rows::mxnorm::by_name(n),

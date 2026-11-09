@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
         kss.resize((size_t)HK * S_); vss.resize(kss.size());
         for (auto& s : kss) s = std::ldexp(1.0f, -(int)(rng() % 4));
         for (auto& s : vss) s = std::ldexp(1.0f, -(int)(rng() % 4));
+        if (envi("FP8UNIT", 0)) { std::fill(kss.begin(), kss.end(), 1.0f); std::fill(vss.begin(), vss.end(), 1.0f); }  // (debug: unit per-token scales)
         kq.assign(kc.size(), 0); vq.assign(vc.size(), 0);
         for (int pg = 0; pg < npages; pg++)
             for (int t = 0; t < P; t++)
@@ -123,6 +124,26 @@ int main(int argc, char** argv) {
         if (sinks) { void* ds = dev(sink); memcpy(&ca[80], &ds, 8); }
         memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
         gx = HK; gy = B; gz = S; blk = 256;
+    } else if (fp8mode == 2) {
+        // vendor pertokenFp8 (pa_bf16_pertokenFp8_*, P = 16): K [blk][hk][d / 16][16][16] and V [blk][hk][d][16] fp8 = the blocked layout
+        // built above; KQ / VQ f32 [HK][NB 16] per-token scales (kernarg names O Q K V BT CL KQ VQ sclg mblk batch Qs Bs KVs mtp GQA [QTP])
+        // (aiter asm PA: K_QScale / V_QScale [NB][HK][BS] f32 - pa_ps_fwd's stride_scale_page / stride_scale_blk)
+        std::vector<float> kv1(kss.size()), vv1(vss.size());
+        const size_t S_ = (size_t)npages * P;
+        for (int hk = 0; hk < HK; hk++)
+            for (size_t sl = 0; sl < S_; sl++) {
+                size_t d_ = ((sl / P) * HK + hk) * P + sl % P;
+                kv1[d_] = kss[hk * S_ + sl]; vv1[d_] = vss[hk * S_ + sl];
+            }
+        void *dk = dev(kq), *dv = dev(vq), *dks = dev(kv1), *dvs = dev(vv1);
+        a.assign(envi("VARGS", 272), 0);
+        auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
+        auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
+        P_(0, dout); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); P_(6, dks); P_(7, dvs);
+        float sl = std::log2(std::exp(1.0f)) * scale;
+        memcpy(&a[128], &sl, 4);
+        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D); U(13, 16 * D); U(14, envi("VMTP", 0)); U(15, H / HK);
+        gx = HK; gy = B; gz = 1; blk = 256;
     } else {
         // vendor layouts (x = 8 bf16 per 16 bytes): K [blk][hk][d / 8][16][8], V [blk][hk][16 / 8][d][8]
         std::vector<uint16_t> kv2(kc.size()), vv2(vc.size());
@@ -135,13 +156,15 @@ int main(int argc, char** argv) {
                         vv2[((((size_t)pg * HK + hk) * 2 + t / 8) * D + d) * 8 + t % 8] = vc[src];
                     }
         void *dk = dev(kv2), *dv = dev(vv2);
-        a.assign(272, 0);
+        a.assign(288, 0);
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
         P_(0, dout); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl);
         float sl = std::log2(std::exp(1.0f)) * scale;
         memcpy(&a[128], &sl, 4);
-        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D * 2); U(13, 16 * D * 2); U(14, 0); U(15, H / HK);
+        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D * 2); U(13, 16 * D * 2); U(14, QL - 1); U(15, H / HK);
+        // MTP (aiter pa_fwd: mtp = max_qlen - 1, ptr_QTP = qo_indptr [B + 1])
+        if (QL > 1) { std::vector<int> qtp(B + 1); for (int i = 0; i <= B; i++) qtp[i] = i * QL; void* dqtp = dev(qtp); P_(16, dqtp); }
         gx = HK; gy = B; gz = 1; blk = 256;
     }
     size_t asz = a.size(), csz = ca.size();

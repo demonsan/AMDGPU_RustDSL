@@ -583,6 +583,11 @@
 
 - 待办：causal 的负载均衡（配对 / 128 行 tile）以及小网格。
 
+**hd192 的 key-split（`fmha_fwd_hd192_hd128_bf16_v3[_causal]_ks`）**：
+- causal 2048² 时 KS=1 为 73 µs，不切分为 89 µs，有改善。
+- 非 causal 1024² 没有改善（41 µs 对 40 µs）。
+- 小网格的差距是结构性的：我们用 256 行 tile、单个 CTA 每 tile 约 3.8 µs 并带有固定开销，而厂商用 128 行、256 线程，需要另做 4 wave 的 128 行形式。
+
 **attention sinks 与 MTP decode**：
 - **sinks**：`attn_combine_bf16_sink_hd{128,64}`，ptr_sink 在 @80，为每个 head 一个 f32。
   - sink logit 只进入 softmax 的分母：M = max(maxₛ lseₛ, sink)，den += e^(sink−M)。
@@ -593,7 +598,13 @@
   - 非 MTP 的代码保持不变（md5 d032e715）。
 - 测试用 `pa_host` 的 `QLEN=q` / `SINK=1`：qlen 为 1、2、3、4，以及 qlen 3 加 sinks，全部 bad=0。
 - 性能：B64 ctx2048 HK16 时，qlen 1 / 2 / 4 分别为 179 / 190 / 207 µs，KV 只读一次。
-- 与 aiter `pa_bf16_noquant_gqa8_*_mtp_msk*` 的对照尚待完成。
+- 与厂商对比，aiter 为 `pa_bf16_noquant_gqa8_1tg_4w_mtp_msk1`，参数由 [asm_pa.cu](https://github.com/ROCm/aiter/blob/main/csrc/py_itfs_cu/asm_pa.cu) 给出：mtp = qlen−1，ptr_QTP 为 qo_indptr，在 @256。厂商结果 bad=0。
+- qlen=2，ours 取最佳 S：
+  - B16 ctx2048：30.4 µs，厂商 19.1 µs（0.63×）
+  - B64：105 µs，厂商 80 µs（0.76×）
+  - B4 ctx8192：37.9 µs，厂商 37.8 µs（1.0×）
+  - B128 ctx1024：115 µs，厂商 79 µs（0.68×）
+- 差距与 decode16 本身相同，属于 decode 性能待办。
 
 **fp8 KV 的 paged decode（per-tensor）**：`pa_decode16_fp8_hd128_p<P>`，即 `pa_decode16_x(.., fp8 = true)`。
 - cache 为 fp8 e4m3 [pages, P, HK, 128]，即 `reshape_cache_flash_fp8` 的布局；k_scale 在 @208，v_scale 在 @224。
@@ -609,7 +620,9 @@
   - 每个 key 的 scale：k 乘在 S 上，v 乘在 P 上（在行和之后）。key 的 slot 由一次块表读取加 ds_bpermute 得到。
   - 测试用 `FP8KV=2`，BS=16 和 BS=64 全部 bad=0。
   - 性能：B64 ctx2048 为 88 µs，B16 ctx4096 S4 为 59 µs。
-  - 与 aiter `pa_bf16_pertokenFp8_*` 的对照尚待完成：需要它的 kernarg 和 KV 布局。
+  - 与 aiter `pa_bf16_pertokenFp8_gqa8_2tg_4w[_hp|_uhp]` 对比。参数按 asm_pa.cu 设置：K/V 为 x=16 的分块布局，与 sched 的布局相同；scale 为 [NB][HK][BS]。
+    - 厂商的结果至今未与我们的 CPU 参考对上：即使 scale 全为 1，maxerr 仍为 2.1，原因待查（可能是厂商内部对 Q 做了量化，或某个布局细节不同）。
+    - 因此下面只是计时，正确性未经核实：B4 ctx2000 厂商 11.6 µs，ours 25.6；B16 ctx4096 为 21.6 对 59；B64 ctx2048 为 35 对 88。
 
 **A16W4（覆盖补齐，忠实语义）**：`gemm_a16w4_mxfp4`，即 `Elem::Bf16W4`，64×128 CTA。
 - A 为 bf16，精确保留；B 为 MXFP4，在主循环中反量化为 bf16，再走 bf16 MFMA。

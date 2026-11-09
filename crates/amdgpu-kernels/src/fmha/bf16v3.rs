@@ -309,7 +309,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
 /// MLA prefill (`fmha_fwd_hd192_hd128_bf16_v3[_causal]`, dqk = 192): Q / K head dim 192 (128 nope + 64 rope), V / O 128 (the vendor's
 /// fwd_hd192_hd128 ABI: qk_head_dim 192). K's rope part rides a second ring (rows of 128 bytes); QK runs 12 k-chunks.
 pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Function {
-    assert!(dqk == 128 || (dqk == 192 && !split), "bf16 v3: head dim 128, or 192 / 128 (non-split)");
+    assert!(dqk == 128 || dqk == 192, "bf16 v3: head dim 128, or 192 / 128");
     let hd192 = dqk == 192;
     #[allow(non_snake_case)]
     let QROW = 2 * dqk;
