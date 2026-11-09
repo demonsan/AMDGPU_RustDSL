@@ -179,15 +179,15 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                 }
             }
-            let c_reg = match inst.op {
-                MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8 if inst.srcs.len() > 2 => match inst.srcs[2] {
-                    Src::Reg(r) => Some(canon(r)),
-                    _ => None,
-                },
-                MOp::VSmfmac16x16x128Fp8 if inst.srcs.len() > 3 => match inst.srcs[3] {
-                    Src::Reg(r) => Some(canon(r)),
-                    _ => None,
-                },
+            // the accumulator operand (srcC) of a matrix op: a dependent same-opcode MFMA accumulating in place is interlocked (back-to-back)
+            let c_reg = match crate::op_attrs::attrs(inst.op).mfma {
+                Some(ma) if ma.chain => {
+                    let idx = if ma.sparse { 3 } else { 2 };
+                    match inst.srcs.get(idx) {
+                        Some(Src::Reg(r)) => Some(canon(*r)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             for s in &inst.srcs {
@@ -337,7 +337,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 // stale, 20 are needed), so it also applies to the default path; the other opcodes keep the table value
                 // outside strict mode.
                 let lat = if strict || is_scaled_mfma(inst.op) { latency + 1 } else { latency };
-                    ready.insert(canon(d), (cycle + lat, chains_in_place(inst.op)));
+                    // a zero-C MFMA (the first of an accumulation chain) chains like its accumulating form: the same instruction with srcC = 0
+                    let zero_c = crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| m.zero_c);
+                    ready.insert(canon(d), (cycle + lat, chains_in_place(inst.op) || zero_c));
                 }
             }
             if strict && inst.op.defines_vcc() {
