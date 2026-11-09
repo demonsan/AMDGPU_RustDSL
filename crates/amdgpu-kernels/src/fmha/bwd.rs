@@ -428,15 +428,18 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         b.wait_vm(0);
         b.wait_lds(0);
         b.barrier();
+        b.weave_region_begin("dkdv_stage");
         let last = b.bind_i32((ev(npair) << 1) - 1 + ev(qt0));
         let nxt = b.bind_i32((ev(tile) + 1).min(ev(last)));
         let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
         stage(&mut b, nxt, 1 - slot, gen_n);
+        b.weave_region_end();
         let qbase = qs.base as i32 + slot * KT * ROW;
         let dbase = ds_.base as i32 + slot * KT * ROW;
         let (qsl, dsl) = (qs.at(&SlotIdx::new(slot, Opnd::Var(it))), ds_.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S = Q K^T, dP = dO V^T (2 blocks of 32 queries; C lane = key, values = queries 32 sb + 8 (r / 4) + 4 h + r % 4)
         // S and dP interleaved: 4 independent accumulator chains (c outer)
+        b.weave_region_begin("dkdv_sdp_mma");
         for c in 0..8usize {
             qsl.read(&mut b, |b| {
                 for sb in 0..2usize {
@@ -453,7 +456,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 }
             });
         }
+        b.weave_region_end();
         // P = exp2(csc S - lse2[q]) (masked 0), dS = P (dP - Dot[q]); the per-query LSE / Dot: 4 consecutive queries per load
+        b.weave_region_begin("dkdv_softmax_pack");
         let q0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
         // P / dS packed to bf16 pairs as soon as a group of 4 values is done (word 8 sb + 2 g + u / 2): fewer live registers
         let mut p: Vec<ValueId> = Vec::with_capacity(16);
@@ -496,7 +501,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 }
             }
         }
+        b.weave_region_end();
         // dV^T += dO^T P, dK^T += Q^T dS: 4 steps of 16 queries x 4 blocks of 32 d (A by tr_b16 from the dO / Q tiles)
+        b.weave_region_begin("dkdv_dv_dk_mma");
         for (sl, base, src, acc) in [(&dsl, dbase, &p, &dvv), (&qsl, qbase, &dsv, &dkv)] {
             sl.read(&mut b, |b| {
                 for t in 0..4usize {
@@ -512,6 +519,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 }
             });
         }
+        b.weave_region_end();
     }
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
