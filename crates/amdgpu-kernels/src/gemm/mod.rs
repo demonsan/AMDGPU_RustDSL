@@ -1491,8 +1491,10 @@ pub fn by_name(name: &str) -> Option<Function> {
             } else {
                 (Elem::Bf16, Scales::None)
             };
+            // `_d3` suffix: the 3-slot ring (unit-scale forms)
+            let (n0, d3) = match n.strip_suffix("_d3") { Some(x) => (x, true), None => (n, false) };
             // `_bm64` suffix: block_m 64 (64-row tiles, sparse experts)
-            let (n0, bm64) = match n.strip_suffix("_bm64") { Some(x) => (x, true), None => (n, false) };
+            let (n0, bm64) = match n0.strip_suffix("_bm64") { Some(x) => (x, true), None => (n0, false) };
             // `_oss`: gpt-oss bias + clamped swiglu (stage 1) / bias (stage 2)
             let (n0, oss) = match n0.strip_suffix("_oss") { Some(x) => (x, true), None => (n0, false) };
             let st = if n0.starts_with("gemm_moe1") {
@@ -1511,6 +1513,7 @@ pub fn by_name(name: &str) -> Option<Function> {
             } else {
                 cfg
             };
+            let cfg = GemmConfig { depth3: d3, ..cfg };
             Some(gemm_mxfp8_bs(n, if bm64 { GemmConfig { cta_m: 64, ..cfg } } else { cfg }))
         }
         n if n.starts_with("gemm_splitk_reduce_s") => {
@@ -1708,7 +1711,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
     let slots = if cfg.depth3 { 3 } else { 2 };
-    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None | Scales::Block128) && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
+    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) || (cfg.scales == Scales::Block128 && cfg.moe.is_none())) && cfg.conv.is_none(), "depth3: unit-scale plain GEMMs");
     let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
