@@ -32,6 +32,8 @@ def _workspace(key, nbytes):
     buf = _ws.get(key)
     if buf is None or buf[1] < nbytes:
         if buf is not None:
+            from ._generic import invalidate_launch_memos
+            invalidate_launch_memos()
             _hip.free(buf[0])
         buf = _ws[key] = (_hip.malloc(nbytes), nbytes)
     return buf[0]
