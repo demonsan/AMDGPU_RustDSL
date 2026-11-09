@@ -913,6 +913,65 @@
   - bf16 原子累加：更慢（1528 vs 672 µs），且精度更差，未采纳。
   - bf16 中间结果（`_h`）：快 26%，误差属 bf16 量级。作为可选项，默认仍用 fp32 中间结果。
 
+**per-tensor FP8 prefill（`fmha_fwd_hd128_fp8pt_v3[_causal]`）**，见 [`fmha/fp8pt.rs`](../crates/amdgpu-kernels/src/fmha/fp8pt.rs)。
+- **ABI**：aiter `fmha_fwd_v3_args` 的 fp8bf16 形式（slot 5 softmax scale；slot 32–34 q / k / v descale 指针；35–40 为各自的 Bs / Hs 字节步长），与 `fwd_hd128_fp8[_causal].co` 同一网格（causal 为配对后的 ⌈nt/2⌉）。descale 按 (batch, KV head) 各一个 fp32；契约按稠密 [B, HK] 写，aiter 的 [1] 标量形式（步长 0）同样能跑，但不在契约内。
+- **结构**：直接用出厂 MXFP8 `_vs128` 的骨架（`skeleton_vs128` + `AttnBody3`：两组 4 wave 相位错开、MUBUF K / V staging、厂商两字参考配方加懒更新、两 smfmac 行和、LDS 转置 epilogue）。差异：
+  - 没有 MX scale：K-scale 的 ring / DMA / 读取全部去掉（`KvRing3::new_x(.., kscale = false)`，K 用单位 E8M0 字），Q scale 是一个统一的 E8M0 指数；
+  - softmax 因子 `c = scale·log2(e)·q_ds·k_ds = 2^e·m`（m ∈ [1, 2)）：2^e 进 Q 的 E8M0 scale，m 在 softmax 前以 fp32 乘到 S 上（每 tile 32 条 `v_pk_mul_f32`，`AttnBody3::pt_prepare`）；bias MFMA 吃 `b / m` 的两字编码（`bias_in`），所以 `m·S` 带的正是配方的参考值 b。编码误差约 2^-22 相对，是逐行常数，在 softmax 中抵消；
+  - v_ds 进输出 scale；
+  - `_causal`：右下对齐（k ≤ q + SK − SQ），厂商的 q tile 配对（CTA x 先算 x，再算 nt−1−x）；只有碰到对角线的 tile 走原地 mask 分支（每对 key 一条 `v_pk_fma`，S += hidden·(−1e30)，比较对象是常数，不占常驻寄存器）。SQ > SK 时看不到任何 key 的行输出 0（与参考和厂商一致）。
+- **配对的寄存器问题**：第一版两个 pass 共用 prelude 的 ring / roles，结果 VGPR 不够（`x_c_nomask` 256，加 mask 后分配失败）。用 `amdc regplan --json` 的 live-at-peak 来源定位：峰值在第 1 pass 的末尾 tile（不再 stage 的 peeled tile），第 2 pass 要用的 K / V DMA 地址寄存器（约 16 dword）被一直保活。改为第 2 pass 重建 roles 与 ring 的 lane 分区（`KvRing3::rebuilt`，同一 LDS 区域、新值）后为 252 VGPR。两 pass 改写为运行时循环（一份代码）的版本即使重建 ring 也放不下（循环不变量被 lds-spill 后仍失败），未采用。
+- **验证**：两个 kernel strict 均 0 错误。causal 起初报 42 个 `GV-PROTO-UNROLL-LIMIT`：两 pass × 版本 × 尾 tile × epilogue 的 `row0 < S` 分支超过协议模拟器的 64 条路径。epilogue 改为只用该条件保护全局 store（wave 私有的 LDS 转置无条件执行，`store_out3_lds_x(.., stores_only)`），路径数降到 20 以内，证书 12 / 31 / 0。出厂 kernel md5 不变（vs128 cd403880、t128 84269a3b、kvsplit 240ecbae、combine8h 24a95a51、gemm_mxfp8_bs_v4 e4369386）。
+- **对照工具**：[`fp8pt_host.cpp`](../tests/gpu/fp8pt_host.cpp)，同进程、同数据、交替计时；数据为 N(0,1) 按 (b, KV head) 量化（descale = amax/448）。判定沿用项目的厂商对齐准则（bad ≤ 厂商且 mean_err ≤ 1.10× 厂商）。
+- **厂商 descale 的观察**：厂商 `.co` 只有在标量 descale（步长 0）时与 CPU 参考一致；按 head 变化的 [B, HK] descale 下，它的 mean_err 是 1.8–3.2e-2（我们 1.3–2.2e-3），把 Hs 改成元素步长结果完全不变，说明它不读 Hs 步长 `[待核：厂商是否只取第一个 descale]`。因此性能与精度对比都用 `SCALAR_DS=1`。
+- **结果**（2026-11-09，GPU 5，同次运行，全部厂商对齐 PASS，ours/厂商 mean_err 0.97–1.04×）：
+
+  | 形状 | 非 causal ours / 厂商（TF/s） | 比 | causal ours / 厂商（TF/s） | 比 |
+  |---|--:|--:|--:|--:|
+  | B2 H32 8192² | 1825 / 1987 | 0.92 | 1636 / 1789 | 0.91 |
+  | B4 H16 2048² | 1462 / 1595 | 0.92 | 1099 / 1221 | 0.90 |
+  | B2 H32 HK8 4096² | 1853 / 1915 | 0.97 | 1520 / 1636 | 0.93 |
+  | B1 H8 4096²（64 CTA） | 1004 / 1138 | 0.88 | 382 / 499 | 0.77 |
+
+  - 厂商这个 kernel 用标准 exp 路径（每元素 `v_pk_fma` + `v_exp_f32` + `v_cvt_pk_fp8_f32`，VALU 行和）和不带 scale 的 MFMA；我们沿用 MXFP8 的位技巧配方，VALU 少得多，但仍慢 3–12%。差距的归因（ATT）还没做。
+  - 小形状（B2 H8 300×200 等，几十 µs 以内）约 0.62×，属启动与短序列 LUT 副本的开销。
+
+**attention 各族与厂商的当前比值汇总**（2026-11-09，GPU 5；prefill / 反向为同一次运行，脚本 [`attn_family_table.sh`](../tools/attn_family_table.sh)；全部 bad=0；比值 = 厂商时间 / ours，>1 表示 ours 更快）：
+
+| 族 | 形状 | ours | 厂商 | 比 |
+|---|---|--:|--:|--:|
+| MXFP8 `_vs128`（真实数据，强制 vs128） | B2 H32 8192² | 912 µs | 902 µs（fwd_hd128_mxfp8） | 0.99 |
+| MXFP8 | B1 H8 8192² | 120 µs | 115 µs | 0.96 |
+| MXFP8 | B4 H8 2048² | 39.4 µs | 40.0 µs | 1.02 |
+| fp8 per-tensor | B2 H32 8192² | 1205 µs | 1107 µs（fwd_hd128_fp8） | 0.92 |
+| fp8 per-tensor causal | B2 H32 8192² | 672 µs | 615 µs | 0.91 |
+| fp8 per-tensor | B1 H8 4096² | 68.4 µs | 60.4 µs | 0.88 |
+| fp8 per-tensor causal | B1 H8 4096² | 90.0 µs | 68.9 µs | 0.77 |
+| bf16 v3 hd128 | B2 H32 8192² | 2037 µs | 1950 µs（fwd_hd128_bf16） | 0.96 |
+| bf16 v3 hd128 | B4 H16 2048² | 172 µs | 154 µs | 0.89 |
+| bf16 v3 hd128 | B1 H8 4096² | 114 µs | 100 µs | 0.88 |
+| bf16 v3 hd128 causal | B2 H32 8192² | 1137 µs | 1023 µs | 0.90 |
+| bf16 v3 hd128 causal | B4 H16 2048² | 111 µs | 88.8 µs | 0.80 |
+| bf16 v3 hd128 causal | B1 H8 4096² | 120 µs | 90.5 µs | 0.75 |
+| bf16 hd192/hd128（MLA prefill） | B1 H16 4096² | 187 µs | 178 µs（fwd_hd192_hd128_bf16，128 行） | 0.95 |
+| bf16 hd192/hd128 | B4 H16 2048² | 206 µs | 189 µs | 0.91 |
+| bf16 hd192/hd128 causal | B1 H16 4096² | 147 µs | 114 µs | 0.77 |
+| bf16 hd192/hd128 causal | B4 H16 2048² | 171 µs | 127 µs | 0.74 |
+| bf16 反向 | B4 H16 2048² | 670 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.74 |
+| bf16 反向 | B1 H16 4096² | 637 µs | 465 µs | 0.73 |
+| bf16 反向 GQA4 | B4 H16 HK4 2048² | 671 µs | 490 µs | 0.73 |
+| bf16 反向 causal | B4 H16 2048² | 427 µs | 320 µs | 0.75 |
+| bf16 反向 causal | B1 H16 4096² | 392 µs | 339 µs | 0.86 |
+| bf16 反向 causal GQA4 | B4 H16 HK4 2048² | 422 µs | 304 µs | 0.72 |
+| paged decode（不同次，上文表） | B16 H64 HK8 ctx 2048 | 24.1 µs | 18.5 µs | 0.77 |
+| paged decode（不同次） | B64 ctx 2048 | 83.8 µs | 77.4 µs | 0.92 |
+| MLA decode H16 P1（不同次，上文） | B64 ctx ≤ 4096 | 76 µs | 47.7 µs | 0.63 |
+
+- decode 两族的 host 需要分发计划（`decode16_plan`、`mla_config`），没有放进同次脚本；数字取自上文 2026-11-08/09 的记录。
+- MXFP8 一行是强制 `_vs128` 的单 kernel 比较；出厂分发（短序列 KV-split / `_t128`）的 25 形状矩阵为 0.93–1.06×，见 [`current-status.md`](current-status.md)。
+- 同一脚本里 bf16 反向非 causal 为 0.73–0.74×（交接记录的 0.83× 是不同形状与批次）；causal 4096² 0.86×。
+- 共同的短板：causal 的小网格（B1 H8 4096²：fp8pt 0.77、bf16 0.75）与 hd192 causal（不配对，0.74–0.77）。上面的 `KvRing3::rebuilt` 做法（第二 pass 重建 lane 分区）可以直接用来尝试 hd192 causal 的配对，`fmha_fwd_bf16_v3_d` 用自己的 ring，需要同样的改法。
+
 **性能待办**：
 - prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
 - decode：每 wave 更大的块、私有环双缓冲、页表查找提到循环外、一 tile 多页时按页 DMA；
