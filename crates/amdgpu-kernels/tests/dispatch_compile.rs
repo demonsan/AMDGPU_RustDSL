@@ -1,4 +1,4 @@
-//! Every kernel a launcher can reach must compile: the names the dispatch rules produce over a grid of shapes (decode16, bf16 prefill, MLA,
+//! Every kernel a launcher can reach must compile and assemble: the names the dispatch rules produce over a grid of shapes (decode16, bf16 prefill, MLA,
 //! attention backward, fused MoE, the GEMM family) and the instantiations the Python ops pick at common shapes, own backend. A kernel on a
 //! dispatch path that no test compiled (fmha_fwd_hd128_bf16_v3_causal ran out of SGPRs for a week) must fail here.
 //!
@@ -103,14 +103,40 @@ fn python_op_names() -> BTreeSet<String> {
 /// pa_decode16_bf16_hd128_p1_f: page size 1 runs out of SGPRs since the decode16 round-2 merge (7d483f4e).
 const KNOWN_BROKEN: &[&str] = &[];
 
+/// Assembles `asm` with the real assembler (None when clang is not runnable here: the check is skipped).
+fn assemble(asm: &str, tag: &str) -> Option<Result<(), String>> {
+    let clang = amdgpu_compiler::backend::LlvmTools::locate().tool("clang");
+    if !std::process::Command::new(&clang).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("amdc-dc-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let s = dir.join("k.s");
+    std::fs::write(&s, asm).ok()?;
+    let out = std::process::Command::new(&clang)
+        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-c", "-o"])
+        .arg(dir.join("k.o"))
+        .arg(&s)
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.contains("error")).take(2).collect::<Vec<_>>().join(" | ")) })
+}
+
 fn compile_all(names: &BTreeSet<String>) {
     let mut bad = Vec::new();
     for k in names.iter().filter(|k| !KNOWN_BROKEN.contains(&k.as_str())) {
         match kernel_by_name(k) {
             None => bad.push(format!("{k}: not in the registry")),
             Some(f) => {
-                if let Err(e) = compile_with(&f, &OwnTail) {
-                    bad.push(format!("{k}: {}", e.lines().take(3).collect::<Vec<_>>().join(" | ")));
+                match compile_with(&f, &OwnTail) {
+                    Err(e) => bad.push(format!("{k}: {}", e.lines().take(3).collect::<Vec<_>>().join(" | "))),
+                    // the assembler too (descriptor fields such as next_free_sgpr are only range-checked there)
+                    Ok(c) => {
+                        if let Some(Err(e)) = assemble(&c.asm, k) {
+                            bad.push(format!("{k}: assembler: {e}"));
+                        }
+                    }
                 }
             }
         }
