@@ -875,6 +875,8 @@ struct Body {
     /// shuffled 1 x 32 scales: the MFMA scale-byte offset of the tile being computed (0 even tile, 2 odd tile of a pair: the pair's dword is
     /// loaded once, for the even tile, and kept)
     odd_by: std::cell::Cell<u8>,
+    /// the tail's one-time shift of the pair dwords has been emitted (per tail branch: reset by `iter` hooks below)
+    tail_shifted: std::cell::Cell<bool>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
@@ -1352,7 +1354,7 @@ impl PipeBody for Body {
     }
     /// The next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them.
     fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
-        self.set_parity(_t);
+        self.set_parity(b, _t);
         if self.cfg.mid_sync_mmas > 0 {
             let from = self.npre_done;
             self.early_mmas(b, from, from + self.cfg.mid_sync_mmas);
@@ -1360,7 +1362,7 @@ impl PipeBody for Body {
     }
     /// The first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there).
     fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
-        self.set_parity(_t);
+        self.set_parity(b, _t);
         let npre = self.cfg.pre_sync_mmas;
         self.early_mmas(b, 0, npre);
     }
@@ -1373,22 +1375,39 @@ impl PipeBody for Body {
             let off = b.add_i32(rec, ti);
             b.stamp_store(buf, off, 16, st);
         }
-        self.set_parity(t);
+        self.set_parity(b, t);
         self.compute_tile(b, t);
+        self.tail_shifted.set(false);
     }
 }
 
 impl Body {
-    /// The static ring slot of the tile (two tiles per pass: slot = tile parity).
+    /// The static ring slot of the tile (two tiles per pass: slot = tile parity); -1 in the peeled tail (runtime slot).
     fn slot_of(t: &TileIt) -> i32 {
         match t.cur.slot {
             Opnd::I32(s) => s,
-            _ => panic!("shuffled scales: static tile slots"),
+            _ => -1,
         }
     }
-    fn set_parity(&self, t: &TileIt) {
-        if self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) {
-            self.odd_by.set(2 * (Self::slot_of(t) & 1) as u8);
+    /// shuffled scales: the byte select of the tile; in the tail (runtime parity) the pair dwords are shifted down once instead (`shifted`)
+    fn set_parity(&self, b: &mut FnBuilder, t: &TileIt) {
+        if !self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) {
+            return;
+        }
+        match Self::slot_of(t) {
+            -1 => {
+                self.odd_by.set(0);
+                if !self.tail_shifted.get() {
+                    self.tail_shifted.set(true);
+                    let (_, _, sav, sbv) = self.rv.clone().expect("state bound");
+                    let sh = b.bind_i32(amdgpu_dsl::ox(t.cur.slot.clone()) << 4);
+                    for v in sav.iter().chain(sbv.iter()) {
+                        let w = b.bind_i32(amdgpu_dsl::varx(*v).lshr(ev(sh)));
+                        b.set_var(*v, w);
+                    }
+                }
+            }
+            s => self.odd_by.set(2 * (s & 1) as u8),
         }
     }
 }
@@ -1998,7 +2017,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         a_rd_x: (1..nimg).map(|k| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (k * a_bytes) as i32)).collect(); h }).collect(),
         a_hi: a_bytes as i32,
         w4_shift: (cfg.elem == Elem::Bf16W4).then(|| b.bind_i32((lane.lane().lshr(5)) << 3)),
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0),
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false),
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {
