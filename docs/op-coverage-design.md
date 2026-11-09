@@ -594,7 +594,20 @@
   - 第一版里页表的 b64 load 不能原地写回，产生了 vmcnt(0)；改成 b128 后修复。
   - 但没有收益：B16 fused 为 32.5 µs（基线 32.7），B64 fused 为 91.9（基线 84.9），B8 S4 为 49.2（基线 47.0）。
   - 结论：加深在途数据不是瓶颈。每 tile 约 640 条指令，每个 SIMD 只有 1 个 wave，依赖延迟全部暴露，折合每 tile 约 1.6–1.9 µs。
-- 下一步：削减每 tile 的指令数和依赖链，包括把 key、页、地址计算提出循环（P=16 时每个 tile 只涉及 2 个页），以及更大的 tile。需要 ATT 时间线来确认。
+- **削减指令数（已采纳）**：
+  - 以 sched 的 ATT 测量为准：我们每个 key 133 周期、18.6 条指令，厂商为 62 周期、5.9 条；每个 tile 有 41 个 s_nop。
+  - 合入了 sched 的页组查找：每个页组只做一次 wave 内统一的块表读取，并抽出 `fmha::paged` 辅助模块；同时合入 V 的 granule swizzle，使 bank conflict 降低 85–100%。
+  - 本分支另做两处修改：
+    - key 截断只用 min：`.max(0)` 会被降为 compare + select 加一个 s_nop。
+    - key mask 只施加在需要的那个 tile 上：用 uniform 分支，分支内只有 VALU，原地修改。
+  - 同次测量（µs，前为修改后，后为修改前）：
+    - B16 ctx2048：S2 为 27.9（28.6），`_f` 为 29.3（32.7）
+    - B64 `_f`：83.2（84.9）
+    - B128 ctx1024 `_f`：81.7（84.0）
+    - B8 ctx8192 S4：45.6（47.0）
+    - 厂商分别为 18.4 / 77.3 / 75.2 / 42.7。
+  - 测试：ctx 为 17、777、1337、2000，以及 P=64 时全部 bad=0；strict 无错误。split decode16 的 md5 由 d032e715 变为 9e212f51，`_f` 变为 a4c7902c。
+  - 剩余的差距是每个 tile 的 VALU（约 350 条）和 lgkm 等待，下一轮需要继续削减。
 
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
