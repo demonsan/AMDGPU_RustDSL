@@ -339,7 +339,6 @@ fn fmha_bwd_dq_x(name: &str, causal: bool, lpt: bool) -> Function {
 
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
-/// `_pair` (causal): CTA x takes key tiles x and nkt - 1 - x (equal work per CTA; the grid is halved) - for grids that still fill the CUs.
 /// Causal work balance across XCDs. Workgroups are dealt to the 8 XCDs round-robin by linear id (x fastest), so with the tile index on x, XCD j only ever gets the tiles j, j + 8, ... : the causal work of a tile
 /// ((16 - t) pairs of 64 queries for dkdv, t + 1 key tiles for dq) then differs by up to 2.4x between XCDs and the slowest XCD sets the time. The snake: in every full row of 8 tiles the odd rows run backwards,
 /// so XCD j gets tiles j and 15 - j (equal total work); the last partial row keeps the identity. `x`, `n` uniform.
@@ -352,20 +351,16 @@ fn snake8(b: &mut FnBuilder, x: ValueId, n: ValueId) -> ValueId {
     b.read_first_lane(v)
 }
 
-pub fn fmha_bwd_dkdv_pair(name: &str) -> Function {
-    fmha_bwd_dkdv_x(name, true, true, false)
-}
-
 /// longest-first launch order, see `fmha_bwd_dq_lpt` (grid (H, B, key tiles), key tile 0 first)
 pub fn fmha_bwd_dkdv_lpt(name: &str) -> Function {
-    fmha_bwd_dkdv_x(name, true, false, true)
+    fmha_bwd_dkdv_x(name, true, true)
 }
 
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
-    fmha_bwd_dkdv_x(name, causal, false, false)
+    fmha_bwd_dkdv_x(name, causal, false)
 }
 
-fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool, lpt: bool) -> Function {
+fn fmha_bwd_dkdv_x(name: &str, causal: bool, lpt: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
@@ -374,7 +369,7 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool, lpt: bool) -> Function 
         b.grid_is(1, Ext::sym("B"));
         b.grid_is(2, Ext::ka(176).ceil_div(128));
     } else {
-        b.grid_is(0, if pair { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
+        b.grid_is(0, Ext::ka(176).ceil_div(128));
         b.grid_is(1, Ext::ka(192));
         b.grid_is(2, Ext::sym("B"));
     }
@@ -404,26 +399,13 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool, lpt: bool) -> Function 
     let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
     let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
     lds.commit(&mut b);
-    // pair: key tiles x and nkt - 1 - x (the second only when distinct)
-    let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
+    // causal, key tile fastest: the XCD-balancing snake order
+    let kt = if causal && !lpt {
         let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
-        let kb_ = { let v = b.bind_i32(ev(nkt) - 1 - ev(kt0)); b.read_first_lane(v) };
-        let second = b.bind_cond(ev(kb_).gt(ev(kt0)));
-        vec![(kt0, None), (kb_, Some(second))]
-    } else if causal && !lpt {
-        let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
-        vec![(snake8(&mut b, kt0, nkt), None)]
+        snake8(&mut b, kt0, nkt)
     } else {
-        vec![(kt0, None)]
+        kt0
     };
-    for (kt, guard) in passes {
-    if let Some(g) = guard {
-        // the LDS rings are reused by the second pass: every wave is done with the first
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        b.begin_if(Opnd::Val(g));
-    }
     let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
     let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
     let c0 = b.c_i32(0);
@@ -653,10 +635,6 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool, lpt: bool) -> Function 
         }
     }
     b.end_if();
-    if guard.is_some() {
-        b.end_if();
-    }
-    }
     let mut f = b.finish();
     // the Vs128 profile + ldsink / wsink / ldahead32 tokens: dkdv 585 -> 407 us at B1 H16 4096² (same run; Gemm profile + tokens alone 1065 vs 1072,
     // Vs128 alone slower)

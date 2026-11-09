@@ -132,11 +132,9 @@ int main(int argc, char** argv) {
         std::string cs = causal ? "_causal" : "";
         hipFunction_t fd = load(dir + "/fmha_bwd_dot_hd128_bf16.co", "fmha_bwd_dot_hd128_bf16");
         hipFunction_t fq = load(dir + "/fmha_bwd_dq_hd128_bf16" + cs + (envi("LPT", 0) && causal ? "_lpt" : "") + ".co", "fmha_bwd_dq_hd128_bf16" + cs + (envi("LPT", 0) && causal ? "_lpt" : ""));
-        // PAIR=1 (causal): the paired dkdv form (`_causal_pair`, half the key-tile grid)
         const bool lpt = causal && envi("LPT", 0);   // LPT=1: the longest-first causal grids (H, B, tiles): fmha_bwd_dq / dkdv_hd128_bf16_causal_lpt
-        const bool pairk = causal && envi("PAIR", 0) && !lpt;
-        const std::string ks = cs + (pairk ? "_pair" : "") + (lpt ? "_lpt" : "");
-        const int gk = pairk ? ((SK + 127) / 128 + 1) / 2 : (SK + 127) / 128;
+        const std::string ks = cs + (lpt ? "_lpt" : "");
+        const int gk = (SK + 127) / 128;
         hipFunction_t fk = load(dir + "/fmha_bwd_dkdv_hd128_bf16" + ks + ".co", "fmha_bwd_dkdv_hd128_bf16" + ks);
         std::vector<uint8_t> a(16 * 15, 0);
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
