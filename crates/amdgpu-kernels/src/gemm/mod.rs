@@ -388,7 +388,9 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                     let (acc, x, y, sx, sy, ..) = ops(blk);
                     let xs = b.var_slice4(x, h);
                     let ys = b.var_slice4(y, h);
-                    b.var_mfma_scaled(acc, k, xs, ys, amdgpu_dsl::MmaScale { sa: Opnd::Var(sx), sb: Opnd::Var(sy), opsel: h | (h << 4) }, false);
+                    // (shuffled scales: `by` = 2 on the odd tile of a pair - its bytes are 2, 3 of the pair's dword)
+                    let sel = h + blk.5;
+                    b.var_mfma_scaled(acc, k, xs, ys, amdgpu_dsl::MmaScale { sa: Opnd::Var(sx), sb: Opnd::Var(sy), opsel: sel | (sel << 4) }, false);
                 }
             }
         }
@@ -870,6 +872,9 @@ struct Body {
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, Vec<ValueId>)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
+    /// shuffled 1 x 32 scales: the MFMA scale-byte offset of the tile being computed (0 even tile, 2 odd tile of a pair: the pair's dword is
+    /// loaded once, for the even tile, and kept)
+    odd_by: std::cell::Cell<u8>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
@@ -933,7 +938,8 @@ impl Body {
         if let (Some(mx), Some(sh)) = (&self.mx32, self.mx32.as_ref().and_then(|m| m.shuf.as_ref())) {
             // shuffled: the tile pair kb / 2 (256 bytes per block), the tile's half selected by a shift at the install
             let so = { let v = b.bind_i32(ev(kb).lshr(1) << 8); b.read_first_lane(v) };
-            let s = b.bind_i32((ev(kb) & 1) << 4);
+            // (the raw pair dword is installed: the tile's bytes are picked by the MFMA byte select, `odd_by`)
+            let s = b.c_i32(0);
             *sh.borrow_mut() = Some(s);
             let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_f32(rs, *v, so, 0)).collect() };
             return (ld(b, self.rsrc_sfa, &mx.voff_a), ld(b, self.rsrc_sfb, &mx.voff_b));
@@ -998,6 +1004,9 @@ impl Body {
     }
     /// The (word, byte) of the A scale of m block i in the `load_scales` words.
     fn sa_sel(&self, i: usize) -> (usize, u8) {
+        if self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) {
+            return (i, self.odd_by.get());
+        }
         if self.mx32.is_some() || self.bs128.is_some() {
             return (i, 0);
         }
@@ -1072,7 +1081,9 @@ impl Body {
             // mixed precision: the other A images of t + 1
             let next_hi: Vec<amdgpu_tile::LdsSlotPart> = if t.staged { self.a_rd_x.iter().map(|p| p.at(b, &self.a_s.at(&t.next))).collect() } else { Vec::new() };
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
-            let early = t.staged.then(|| self.load_scales(b, ox(t.it) + 1));
+            // shuffled scales: t + 1 odd shares t's pair dword (already installed): no load
+            let same_pair = self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) && Self::slot_of(t) == 0;
+            let early = (t.staged && !same_pair).then(|| self.load_scales(b, ox(t.it) + 1));
             ((next, next_hi), early)
         });
         let (next, next_hi) = next;
@@ -1341,6 +1352,7 @@ impl PipeBody for Body {
     }
     /// The next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them.
     fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        self.set_parity(_t);
         if self.cfg.mid_sync_mmas > 0 {
             let from = self.npre_done;
             self.early_mmas(b, from, from + self.cfg.mid_sync_mmas);
@@ -1348,6 +1360,7 @@ impl PipeBody for Body {
     }
     /// The first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there).
     fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        self.set_parity(_t);
         let npre = self.cfg.pre_sync_mmas;
         self.early_mmas(b, 0, npre);
     }
@@ -1360,7 +1373,23 @@ impl PipeBody for Body {
             let off = b.add_i32(rec, ti);
             b.stamp_store(buf, off, 16, st);
         }
+        self.set_parity(t);
         self.compute_tile(b, t);
+    }
+}
+
+impl Body {
+    /// The static ring slot of the tile (two tiles per pass: slot = tile parity).
+    fn slot_of(t: &TileIt) -> i32 {
+        match t.cur.slot {
+            Opnd::I32(s) => s,
+            _ => panic!("shuffled scales: static tile slots"),
+        }
+    }
+    fn set_parity(&self, t: &TileIt) {
+        if self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) {
+            self.odd_by.set(2 * (Self::slot_of(t) & 1) as u8);
+        }
     }
 }
 
@@ -1969,7 +1998,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         a_rd_x: (1..nimg).map(|k| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (k * a_bytes) as i32)).collect(); h }).collect(),
         a_hi: a_bytes as i32,
         w4_shift: (cfg.elem == Elem::Bf16W4).then(|| b.bind_i32((lane.lane().lshr(5)) << 3)),
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0),
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {
