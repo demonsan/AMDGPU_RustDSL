@@ -393,11 +393,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let kvo = if blocked {
                 b.bind_i32(ev(rowoff) + (ev(l8) ^ (ev(kc) & 7)) * (16 * page))
             } else if fp8 { b.bind_i32(ev(rowoff) + ((ev(l8) ^ (ev(kc) & 7)) << 4)) } else { b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4)) };
-            // one M0 write per 4 DMAs: the LDS destination is M0 + imm + 16 lane, the global address gets the same imm (taken off the lane offset)
-            let imm = ((i as i32) & 3) << 10;
-            let kvo = b.bind_i32(ev(kvo) - imm);
-            let m0k = b.bind_i32(mbase.clone() + (((i as i32) >> 2) << 12));
-            b.buffer_load_lds_b128(r_k, kvo, c0, m0k, imm as u32);
+            let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
+            b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
         }
     });
     // blocked: the per-key scales of the lane's 8 S values (keys 16 blk + 4 g + r of the tile): slot of key l % 32 by one block-table
@@ -456,19 +453,17 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let sb = ms.base();
             ms.write(&mut b, Opnd::Var(it), |b| {
                 for (i, &(_, rowoff)) in rows.iter().enumerate() {
-                    let imm = ((i as i32) & 3) << 10;
-                    let vvo = b.bind_i32(ev(rowoff) + (ev(l8) << 4) - imm);
-                    let m0v = b.bind_i32(sb.clone() + (((i as i32) >> 2) << 12));
-                    b.buffer_load_lds_b128(r_v, vvo, c0, m0v, imm as u32);
+                    let vvo = b.bind_i32(ev(rowoff) + (ev(l8) << 4));
+                    let m0v = b.bind_i32(sb.clone() + ((i as i32) << 10));
+                    b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
                 }
             });
         }
         None => mev.write(&mut b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
-                let imm = ((i as i32) & 3) << 10;
-                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4) - imm);
-                let m0v = b.bind_i32(vbase0.clone() + (((i as i32) >> 2) << 12));
-                b.buffer_load_lds_b128(r_v, vvo, c0, m0v, imm as u32);
+                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+                let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
+                b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
             }
         }),
     }
