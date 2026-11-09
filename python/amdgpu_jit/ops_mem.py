@@ -50,7 +50,8 @@ def rmsnorm_quant_fp8(x, gamma, q, scale, *, eps=1e-6, stream=None, check=True):
 
 
 def rmsnorm_quant_mxfp4(x, gamma, q, scale, *, eps=1e-6, stream=None, check=True):
-    """``y = rmsnorm(x) * gamma`` quantized to MXFP4: q [M, N/2] packed e2m1 (low nibble first), scale [M, N/32] E8M0 bytes."""
+    """``y = rmsnorm(x) * gamma`` quantized to MXFP4: q [M, N/2] packed e2m1 (low nibble first), scale [M, N/32] E8M0 bytes in the
+    shuffled a4w4 GEMM layout (group G of row m at (((m/16) (N/512) + G/16) 64 + 16 (G%4) + m%16) 4 + (G%16)/4); M a multiple of 16."""
     rx, M, N = _mn(x)
     _rows(as_ref(q), "q", N // 2, 1)
     _rows(as_ref(scale), "scale", N // 32, 1)

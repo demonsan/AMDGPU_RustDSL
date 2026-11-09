@@ -152,9 +152,13 @@ def check_rmsnorm_quant_mxfp4(M=32, N=512, eps=1e-6):
         for k in range(N):
             byte = q[(m * N + k) // 2]
             c = byte & 15 if k % 2 == 0 else byte >> 4
-            s = 2.0 ** (sc[m * (N // 32) + k // 32] - 127)
+            # the scales are in the shuffled a4w4 layout (tests/gpu/mxnorm_host.cpp): group G of row m at
+            # (((m / 16) TP + G / 16) 64 + 16 (G % 4) + m % 16) 4 + (G % 16) / 4, TP = N / 512
+            G, TP = k // 32, N // 512
+            w = G % 16
+            s = 2.0 ** (max(sc[(((m // 16) * TP + G // 16) * 64 + 16 * (w % 4) + m % 16) * 4 + w // 4], 1) - 127)
             # e2m1 steps are at most 2 units of the block scale (between 4 and 6); saturation at 6 s
-            r.cmp(e2m1(c) * s, max(-6 * s, min(6 * s, y[k])), 1.0 * s + 1e-6)
+            r.cmp(e2m1(c) * s, max(-6 * s, min(6 * s, y[k])), 1.01 * s + 1e-30)
     return r
 
 
