@@ -12,6 +12,7 @@ use std::process::ExitCode;
 fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
+    eprintln!("  amdc dispatch decode16 <B> <HK> <CTX> [--page P]   (the paged-decode launch plan as JSON)");
     eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
@@ -334,6 +335,28 @@ fn main() -> ExitCode {
                     None => { print!("{src}"); ExitCode::SUCCESS }
                 },
                 Err(e) => { eprintln!("skeleton: {e}"); ExitCode::from(1) }
+            }
+        }
+        "dispatch" => {
+            // amdc dispatch decode16 <B> <HK> <CTX> [--page P]: the launch plan of the paged decode (dispatch::decode16_plan) as JSON - the single
+            // rule the hosts (tools/pa_auto.sh, python amdgpu_jit.decode16_plan) follow
+            let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
+            match (args.get(1).map(|s| s.as_str()), num(2), num(3), num(4)) {
+                (Some("decode16"), Some(b), Some(hk), Some(ctx)) => {
+                    let page = args.windows(2).find(|w| w[0] == "--page").and_then(|w| w[1].parse::<u32>().ok()).unwrap_or(16);
+                    let plan = amdgpu_kernels::dispatch::decode16_plan(b, hk, ctx);
+                    let (kernel, s) = amdgpu_kernels::dispatch::decode16_kernel(page, plan);
+                    let form = match plan {
+                        amdgpu_kernels::dispatch::Decode16Plan::Fused => "fused",
+                        amdgpu_kernels::dispatch::Decode16Plan::LastC(_) => "lastc",
+                    };
+                    println!("{{\"kernel\":\"{kernel}\",\"form\":\"{form}\",\"splits\":{s},\"b\":{b},\"hk\":{hk},\"ctx\":{ctx},\"page\":{page}}}");
+                    ExitCode::SUCCESS
+                }
+                _ => {
+                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P]");
+                    ExitCode::from(2)
+                }
             }
         }
         "list" => {

@@ -655,6 +655,9 @@ pub enum Op {
     AtomicLds { op: AtomicOp, addr: Opnd, value: Opnd },
     /// global atomic returning the old value (`global_atomic_<op> ... sc0`)
     AtomicGlobal { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
+    /// returning buffer atomic (`buffer_atomic_add ... sc0`, AddU32): the old value. Lanes whose offset is out of range (`>= num_records`) are
+    /// dropped by the range check before reaching L2 and return 0 - a per-lane mask: e.g. only lane 0 takes a ticket (no same-address storm)
+    BufferAtomicRet { op: AtomicOp, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd },
     /// `v_readlane_b32`: lane `lane`'s value of `x` (wave-uniform result)
     ReadLane { x: Opnd, lane: u8 },
     /// `v_writelane_b32`: `old` with lane `lane` replaced by the (uniform) `x` (a non-uniform `x` is read from the first active lane)
@@ -710,6 +713,7 @@ impl Op {
             },
             Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => DType::I32,
             Op::AtomicLds { op, .. } | Op::AtomicGlobal { op, .. } => op.value_ty(),
+            Op::BufferAtomicRet { .. } => DType::I32,
             Op::DppAlu { op, .. } => match op {
                 DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32 => DType::F32,
                 _ => DType::I32,
@@ -815,6 +819,7 @@ impl Op {
             Op::Bpermute { addr, x, .. } | Op::Permute { addr, x, .. } => vec![*addr, *x],
             Op::AtomicLds { addr, value, .. } => vec![*addr, *value],
             Op::AtomicGlobal { base, value, .. } => vec![*base, *value],
+            Op::BufferAtomicRet { rsrc, voff, soff, value, .. } => { let mut v = vec![*rsrc, *soff, *value]; if let Some(x) = voff { v.push(*x); } v }
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
             Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Mfma { a, b, c, scale, .. } => {
@@ -2408,6 +2413,13 @@ impl FnBuilder {
     /// MUBUF atomic without return (`AddU32`, `AddF32`, `PkAddBf16`, `PkAddF16`).
     #[allow(clippy::too_many_arguments)]
     #[track_caller]
+    /// Returning `buffer_atomic_add` (sc0): the old value per lane. Out-of-range lanes are dropped (return 0) - mask the lanes that must not
+    /// take part with an out-of-range offset, e.g. `voff = select(tid == 0, off, 0x7fff_fff0)` for a single-lane ticket.
+    pub fn buffer_atomic_add_ret(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::BufferAtomicRet { op: AtomicOp::AddU32, rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, value: value.into() })
+    }
+
+    #[track_caller]
     pub fn buffer_atomic(&mut self, op: AtomicOp, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferAtomicNoRet { op, rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into() });
     }
@@ -3367,6 +3379,15 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Op::BufferAtomicRet { op, rsrc, voff, soff, imm, value } => {
+            if *op != AtomicOp::AddU32 {
+                e.push(format!("returning buffer atomic {op:?}: only AddU32"));
+            }
+            e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
             if let Err(x) = expect_dword(f, *value, "atomic value") {
                 e.push(x);
             }
@@ -4627,7 +4648,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                         Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
                         | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
-                        | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::AtomicAddU32 { .. }
+                        | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } | Op::AtomicAddU32 { .. }
                         | Op::Asm { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsTrB16 { .. } => false,
                         _ => op.operands().iter().all(|o| is_u(o, &u, &uvars)),
                     };

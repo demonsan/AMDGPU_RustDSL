@@ -28,31 +28,49 @@ pub fn bf16_prefill_key_splits(b: u64, h: u64, sq: u64, sk: u64, causal: bool, c
     s as u32
 }
 
-/// Paged decode with 16x16 MFMAs (`pa_decode16_bf16_hd128_p<P>[_k64]`, GQA G <= 16): (keys per tile, splits per wave group S). n = B HK
-/// work groups before the split: large n runs 32-key tiles (two CTAs per CU) with the smallest S giving n S >= 512; small grids (n < 64) run
-/// 64-key tiles with S up to 8. Measured (B, HK, ctx): (16, 8, 4096) 32-key S4 4035 GB/s vs 64-key best 3739; (64, 8, 2048) 32-key S1 4182 vs
-/// 3483; (4, 4, 8192) 64-key S8 1398 vs 32-key 1233.
-pub fn decode16_config(b: u64, hk: u64) -> (u32, u32) {
-    let n = b * hk;
-    if n < 64 {
-        let mut s = 1u64;
-        while s < 8 && n * s * 4 < 1024 {
-            s *= 2;
-        }
-        return (64, s as u32);
-    }
-    let mut s = 1u64;
-    while s < 16 && n * s < 512 {
-        s *= 2;
-    }
-    (32, s as u32)
+/// The decode16 kernel for a launch (bf16, hd128, G <= 16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decode16Plan {
+    /// `pa_decode16_bf16_hd128_p<P>_f`: S = 1, the CTA's 4 wave partials merged in LDS, bf16 out, no combine kernel
+    Fused,
+    /// `pa_decode16_bf16_hd128_p<P>_c` with S splits: the last-arriving CTA of a (b, hk) merges the S partials (single-lane ticket), no
+    /// combine kernel
+    LastC(u32),
 }
 
-/// decode16: run the fused form `pa_decode16_bf16_hd128_p<P>_f` (the 4 wave partials merged in LDS, bf16 out, no combine kernel) when the
-/// config is 32-key tiles with S = 1. Measured vs split S1 + combine: B64 ctx2048 84.9 vs 95.6 us, B128 ctx1024 84.0 vs 101.6, B256 ctx512
-/// 88.7 vs 116.6, B32 ctx4096 93.2 vs 99.8 (aiter 77.6 / 75.4 / 83.4 / 75.0).
-pub fn decode16_fused(b: u64, hk: u64) -> bool {
-    decode16_config(b, hk) == (32, 1)
+/// decode16 dispatch (B, HK, context length): grids of n = B HK >= 256 work groups run the fused form; smaller grids the last-arriver form
+/// `_c` with the smallest power-of-two S giving n S >= 256 CTAs, capped at ctx / 512 keys per split (at least 1; S = 1 runs the fused form).
+/// Measured (H 64, HK 8, page 16, us; same run; aiter `pa_bf16_noquant_gqa8_1tg_4w` in brackets) - the previous rule (split + combine
+/// kernel with S = smallest n S >= 512, 64-key tiles `_k64` for n < 64; removed) in parentheses:
+///   B4   ctx 1024 / 2048 / 8192: `_c` S2 11.9 / S4 15.7 / S8 28.8   (18.6 / 22.4 / 33.0)   [8.0 / 14.3 / 35.7]
+///   B8                          : `_c` S2 12.0 / S4 19.6 / S4 40.5   (25.7 / 31.5 / 53.0)   [8.1 / 14.8 / 42.8]
+///   B16                         : `_c` S2 15.8 / S2 24.1 / S2 89.8   (24.0 / 31.9 / 98.6)   [11.0 / 18.5 / 88.3]
+///   B32                         : fused  20.4 / 35.8 / 166.6        (26.7 / 42.1 / 175.6)  [17.0 / 31.2 / 149.6]
+///   B64, B128                   : fused (unchanged) 33.9 / 83.8 / 303.0, 81.9 / 157.8 / 588.3   [30.6 / 77.4 / 271.6, 74.6 / 146.5 / 540.8]
+/// (`_c` with S = 1 and the split forms were slower than these everywhere in the grid.)
+pub fn decode16_plan(b: u64, hk: u64, ctx: u64) -> Decode16Plan {
+    let n = b * hk;
+    if n >= 256 {
+        return Decode16Plan::Fused;
+    }
+    let cap = (ctx / 512).max(1);
+    let mut s = 1u64;
+    while n * s < 256 && s * 2 <= cap {
+        s *= 2;
+    }
+    if s == 1 {
+        Decode16Plan::Fused
+    } else {
+        Decode16Plan::LastC(s as u32)
+    }
+}
+
+/// The kernel name and split count of a decode16 plan for page size `page`.
+pub fn decode16_kernel(page: u32, plan: Decode16Plan) -> (String, u32) {
+    match plan {
+        Decode16Plan::Fused => (format!("pa_decode16_bf16_hd128_p{page}_f"), 1),
+        Decode16Plan::LastC(s) => (format!("pa_decode16_bf16_hd128_p{page}_c"), s),
+    }
 }
 
 /// Causal attention backward: run the paired dkdv form (`fmha_bwd_dkdv_hd128_bf16_causal_pair`, key tiles x and nkt - 1 - x per CTA) when the
@@ -158,13 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn decode16_rule() {
-        assert_eq!(decode16_config(16, 8), (32, 4));
-        assert_eq!(decode16_config(64, 8), (32, 1));
-        assert_eq!(decode16_config(4, 4), (64, 8));
-    }
-
-    #[test]
     fn prefill_rule() {
         assert_eq!(bf16_prefill_key_splits(1, 8, 4096, 4096, false, 256), 2);
         assert_eq!(bf16_prefill_key_splits(1, 8, 4096, 4096, true, 256), 4);
@@ -172,11 +183,24 @@ mod tests {
     }
 
     #[test]
-    fn decode16_fused_rule() {
-        assert!(super::decode16_fused(64, 8));
-        assert!(super::decode16_fused(256, 8));
-        assert!(!super::decode16_fused(16, 8));
-        assert!(!super::decode16_fused(4, 4));
+    fn decode16_plan_rule() {
+        use super::{decode16_kernel, decode16_plan, Decode16Plan as P};
+        // the measured winners of the grid in the doc comment
+        assert_eq!(decode16_plan(4, 8, 1024), P::LastC(2));
+        assert_eq!(decode16_plan(4, 8, 2048), P::LastC(4));
+        assert_eq!(decode16_plan(4, 8, 8192), P::LastC(8));
+        assert_eq!(decode16_plan(8, 8, 1024), P::LastC(2));
+        assert_eq!(decode16_plan(8, 8, 2048), P::LastC(4));
+        assert_eq!(decode16_plan(8, 8, 8192), P::LastC(4));
+        for ctx in [1024, 2048, 8192] {
+            assert_eq!(decode16_plan(16, 8, ctx), P::LastC(2));
+            for b in [32, 64, 128] {
+                assert_eq!(decode16_plan(b, 8, ctx), P::Fused);
+            }
+        }
+        assert_eq!(decode16_plan(1, 8, 256), P::Fused);
+        assert_eq!(decode16_kernel(16, P::LastC(4)), ("pa_decode16_bf16_hd128_p16_c".to_string(), 4));
+        assert!(crate::kernel_by_name("pa_decode16_bf16_hd128_p16_c").is_some());
     }
 
     #[test]

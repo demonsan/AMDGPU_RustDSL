@@ -497,6 +497,8 @@ pub enum MOp {
     GlobalAtomicAddRet,
     // buffer atomics (srcs: data, rsrc, voffset, soffset; imm offset) and packed 16-bit global atomics
     BufferAtomicAddU32,
+    /// returning form (`sc0`): the old value lands in the data register (tied: srcs[0] == dst)
+    BufferAtomicAddU32Ret,
     BufferAtomicAddF32,
     BufferAtomicPkAddBf16,
     BufferAtomicPkAddF16,
