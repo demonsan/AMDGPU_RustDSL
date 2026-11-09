@@ -65,8 +65,10 @@ pub fn decode16_plan(b: u64, hk: u64, ctx: u64) -> Decode16Plan {
     }
 }
 
-/// The kernel name and split count of a decode16 plan for page size `page`.
+/// The kernel name and split count of a decode16 plan for page size `page` (the last-arriver form exists for pages >= 16; smaller pages run
+/// the fused form).
 pub fn decode16_kernel(page: u32, plan: Decode16Plan) -> (String, u32) {
+    let plan = if page < 16 { Decode16Plan::Fused } else { plan };
     match plan {
         Decode16Plan::Fused => (format!("pa_decode16_bf16_hd128_p{page}_f"), 1),
         Decode16Plan::LastC(s) => (format!("pa_decode16_bf16_hd128_p{page}_c"), s),

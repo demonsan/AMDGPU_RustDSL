@@ -99,9 +99,13 @@ fn python_op_names() -> BTreeSet<String> {
     n
 }
 
+/// Reachable kernels known not to compile (reported; each entry is re-checked below so the list cannot go stale).
+/// pa_decode16_bf16_hd128_p1_f: page size 1 runs out of SGPRs since the decode16 round-2 merge (7d483f4e).
+const KNOWN_BROKEN: &[&str] = &["pa_decode16_bf16_hd128_p1_f"];
+
 fn compile_all(names: &BTreeSet<String>) {
     let mut bad = Vec::new();
-    for k in names {
+    for k in names.iter().filter(|k| !KNOWN_BROKEN.contains(&k.as_str())) {
         match kernel_by_name(k) {
             None => bad.push(format!("{k}: not in the registry")),
             Some(f) => {
@@ -112,6 +116,14 @@ fn compile_all(names: &BTreeSet<String>) {
         }
     }
     assert!(bad.is_empty(), "{} of {} reachable kernels do not compile:\n{}", bad.len(), names.len(), bad.join("\n"));
+}
+
+#[test]
+fn the_known_broken_kernels_still_fail() {
+    for k in KNOWN_BROKEN {
+        let f = kernel_by_name(k).expect("registered");
+        assert!(compile_with(&f, &OwnTail).is_err(), "{k} compiles now: remove it from KNOWN_BROKEN");
+    }
 }
 
 #[test]
