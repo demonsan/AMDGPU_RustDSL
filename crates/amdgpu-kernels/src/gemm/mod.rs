@@ -1419,7 +1419,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_pertensor_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_pertensor_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8_128", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
-        "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", { let mut c = GemmConfig::a4w4(); if let Ok(v) = std::env::var("TEMP_F4") { let p: Vec<&str> = v.split('/').collect(); c.pre_sync_mmas = p[0].parse().unwrap(); c.mid_sync_mmas = p[1].parse().unwrap(); c.acc_agpr = p[2].parse().unwrap(); if p.len() > 3 { c.sched = Box::leak(p[3].to_string().into_boxed_str()); } } c })),
+        "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         "gemm_a8w4_mxfp_128" => Some(gemm_mxfp8_bs("gemm_a8w4_mxfp_128", GemmConfig::a8w4_128())),
         "gemm_a16w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a16w4_mxfp4", GemmConfig::a16w4_128())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
