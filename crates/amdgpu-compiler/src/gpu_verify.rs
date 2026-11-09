@@ -34,11 +34,13 @@ pub struct Ledger {
     pub tile_trust: usize,
     /// `buf_trust` (region trust)
     pub region_trust: usize,
+    /// safe-asm blocks (`b.asm`, var asm): their internal memory accesses are not modelled (GV-ASM)
+    pub asm_opaque: usize,
 }
 
 impl Ledger {
     pub fn total(&self) -> usize {
-        self.assume_trusted + self.tile_trust + self.region_trust
+        self.assume_trusted + self.tile_trust + self.region_trust + self.asm_opaque
     }
 }
 
@@ -58,6 +60,9 @@ pub struct Report {
     pub proven: BTreeMap<&'static str, usize>,
     /// (marker statement, reused private region): every access of a tile_over marker avoids the region or stays in the writer's own slice
     pub own_reuse: BTreeMap<(usize, String), bool>,
+    /// Accesses that are bounds-checked but NOT race-checked, by kind (docs/trust-inventory.md): `lds-untracked` (an LDS access outside every
+    /// tile marker), `global-write-untracked` (a global / buffer store outside a `buf_region` marker: cross-workgroup disjointness is trusted)
+    pub unchecked: BTreeMap<&'static str, usize>,
     /// > 0 while the analyzer iterates a loop to a fixpoint: nothing is recorded.
     quiet: u32,
 }
@@ -67,6 +72,11 @@ impl Report {
         if self.quiet == 0 {
             let alias = crate::gpu_protocol::proto_alias(code, &msg);
             self.findings.push(Finding { code, severity, msg, alias });
+        }
+    }
+    pub(crate) fn unchecked_access(&mut self, what: &'static str) {
+        if self.quiet == 0 {
+            *self.unchecked.entry(what).or_insert(0) += 1;
         }
     }
     pub(crate) fn ok(&mut self, what: &'static str) {
@@ -87,6 +97,10 @@ impl Report {
     pub fn ledger(&self) -> Ledger {
         let mut l = Ledger::default();
         for f in &self.findings {
+            if f.code == "GV-ASM" {
+                l.asm_opaque += 1;
+                continue;
+            }
             if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") || f.msg.contains("set_var") {
                 continue;
             }
@@ -330,6 +344,13 @@ impl<'a> An<'a> {
         }
     }
 
+    /// A global store outside a `buf_region` marker: bounds-checked, but its disjointness from the other workgroups' stores is trusted.
+    fn note_global_store(&mut self, store: bool) {
+        if store && !self.tag.as_ref().map_or(false, |(ti, _, _)| self.f.contract.tiles[*ti].global) {
+            self.rep.unchecked_access("global-write-untracked");
+        }
+    }
+
     /// Under a tile marker, the access must lie inside the marked tile / ring (hull over the slot interval).
     fn tile_cover(&mut self, what: &str, addr: &Itv, size: i128) {
         let Some((ti, slot, slot_o)) = self.tag.clone() else {
@@ -490,6 +511,9 @@ impl<'a> An<'a> {
     }
 
     fn check_lds(&mut self, what: &str, addr: &Itv, size: i128) {
+        if self.tag.is_none() {
+            self.rep.unchecked_access("lds-untracked");
+        }
         self.tile_cover(what, addr, size);
         self.cur_addr = None;
         let limit = Itv::konst(self.f.lds_bytes as i128);
@@ -509,6 +533,7 @@ impl<'a> An<'a> {
             }
             return;
         }
+        self.note_global_store(store);
         let (arg, off) = match base {
             AV::Ptr { arg: Some(a), off } => (*a, off.clone()),
             _ => {
@@ -564,6 +589,7 @@ impl<'a> An<'a> {
             }
             return;
         }
+        self.note_global_store(store);
         let AV::Rsrc { arg, num, base: boff } = rsrc else {
             let m = format!("stmt {}: {what}: descriptor operand is not a known buffer descriptor", self.idx);
             self.rep.add("GV-GLB-PROV", Severity::Error, m);
