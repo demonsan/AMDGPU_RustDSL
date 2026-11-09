@@ -164,6 +164,8 @@ impl Body<'_> {
 }
 impl PipeBody for Body<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        // (weave region markers: no code, the scheduler strategies of AMDC_SCHED_REGION / `declare_region` attach to these names, as in the MXFP8 kernels)
+        b.weave_region_begin("kv_stage");
         // group A stages K, group B stages V (each the whole 32 KB tile: 8 issues of 1 KB per wave)
         let r = self.ring;
         let (sh, vo, rs, so0) = match role {
@@ -189,6 +191,7 @@ impl PipeBody for Body<'_> {
                 }
             });
         }
+        b.weave_region_end();
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.s_init = self.qk(b, &t0.cur, None);
@@ -211,6 +214,7 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(0);
         }
+        b.weave_region_begin("v_phase");
         let (m_v, l_v) = (self.m.expect("m"), self.l.expect("l"));
         let s = self.s.clone();
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
@@ -289,16 +293,19 @@ impl PipeBody for Body<'_> {
             })
             .map(|(a, c)| b.cvt_pk_bf16_f32(p[a], p[c]))
             .collect();
+        b.weave_region_end();
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.prio {
             b.set_prio(1);
         }
+        b.weave_region_begin("m_phase");
         self.pv(b, &t.cur);
         if t.staged {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
         }
+        b.weave_region_end();
     }
 }
 
@@ -352,6 +359,15 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     // (hd192 causal: the Gemm profile runs out of VGPRs - Vs128 for every hd192 form)
     let vs_policy = !causal || dqk == 192;
     b.compile_profile(if vs_policy { CompileProfile::Vs128 } else { CompileProfile::Gemm });
+    // hd192 (not the paired causal form, not the key split): the whole-kernel reordering list scheduler runs out of VGPRs (peak 277 > 256: three 16-dword accumulators live over the loop; the shipped
+    // code was the unscheduled fallback). Region-limited scheduling instead: waits recomputed everywhere (`rewait`), the list scheduler only on the K / V DMA issue and the matrix phase (the softmax phase, the
+    // pressure peak, keeps its emission order): causal q128 B1 H16 2048^2 64.7 -> 56.4 us (-13 %), B2 H32 4096^2 625 -> 590; non-causal B1 H16 2048^2 73.1 -> 71.7, B2 H32 4096^2 684 -> 672
+    // (the whole-kernel `rewait` alone is 7 % slower: the gain is the region reorder)
+    let hd192_regions = dqk == 192 && !split && !(causal && opts.pair192);   // (`pair192` is set for the non-causal form too; only the causal one pairs)
+    if hd192_regions {
+        b.declare_region("m_phase", false, "reorder");
+        b.declare_region("kv_stage", false, "reorder");
+    }
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -663,7 +679,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let mut f = b.finish();
     // the scheduler tokens also on the causal Gemm-profile build (+2 % at 8192², +1 % at 2048²)
     if !split || vs_policy {
-        f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+        f.sched_opts = Some(if hd192_regions { "ldsink=1,wsink,ldahead32=1,rewait" } else { "ldsink=1,wsink,ldahead32=1" }.to_string());
     }
     f
 }
