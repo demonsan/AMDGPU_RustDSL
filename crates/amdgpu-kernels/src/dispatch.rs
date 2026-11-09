@@ -86,7 +86,8 @@ pub fn bwd_causal_kernels() -> (&'static str, &'static str) {
     ("fmha_bwd_dq_hd128_bf16_causal", "fmha_bwd_dkdv_hd128_bf16_causal")
 }
 
-/// int8 A8W8 GEMM (`gemm_a8w8_i8[_128|_64[_splitk]]`, per-token x per-channel scales): (CTA rows, split-K S). 256 x 256 when that grid
+/// int8 A8W8 GEMM (`gemm_a8w8_i8[_128|_64[_splitk]]`, per-token x per-channel scales; the same rule picks `gemm_a8w8_rowcol_fp8[_128|_64[_splitk]]`):
+/// (CTA rows, split-K S). The 64-row forms run the 3-slot ring (`GemmConfig::depth3`). 256 x 256 when that grid
 /// fills the CUs, else 128 x 128 when that does, else 64 x 128 with the smallest S (<= 4, power of two) giving S CTAs >= CUs (S > 1:
 /// `gemm_a8w8_i8_64_splitk` + `gemm_splitk_reduce_s<S>_rc`). Same run vs the best aiter i8gemm tile: 4096^3 68.9 vs 112 us, 2048x4096^2
 /// 42.3 vs 55.2, 1024x4096x8192 51.9 vs 50.8, 512x7168x4096 23.6 vs 25.5, 256x7168x4096 20.0 vs 14.0, 128x4096x8192 (S 4) 16.2 vs 17.7,
