@@ -19,6 +19,7 @@ pub mod decode;
 pub mod decode16;
 pub mod paged;
 pub mod mla;
+pub mod fp8pt;
 mod skeleton_kvsplit;
 mod skeleton_t128;
 mod skeleton_vs128;
@@ -29,7 +30,7 @@ use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
 use amdgpu_tile::weave::Units;
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, StageContract, ValueId, VarId, I32};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, StageContract, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
 
@@ -59,6 +60,8 @@ pub fn vt_tr_source() -> LLayout {
 pub enum KdCopy3 {
     Dma(DmaPart),
     Vgpr(amdgpu_tile::rows::DwordRowsVgpr),
+    /// no K scales (per-tensor FP8: the unit word)
+    None,
 }
 
 /// The K-scale reader TV: thread (j = lane % 32, h = lane / 32 broadcast) x value (row group s) -> row `j + 32 s` of the 128-word tile.
@@ -80,8 +83,8 @@ pub struct KvRing3 {
     pub kdc: KdCopy3,
     pub kpart: LdsPart,
     pub vpart: LdsPart,
-    /// the K-scale words: lane (j, h) reads word j + 32 s (both lane halves read the same word: a broadcast TV layout)
-    pub kdpart: LdsPart,
+    /// the K-scale words: lane (j, h) reads word j + 32 s (both lane halves read the same word: a broadcast TV layout); None without K scales
+    pub kdpart: Option<LdsPart>,
     pub mma: TiledMma,
     /// MUBUF form of the K / V DMA (`_vs128`): SGPR per-tile advance, loop-invariant voffsets
     pub buf: Option<(amdgpu_tile::dma::BufForm, amdgpu_tile::dma::BufForm)>,
@@ -91,6 +94,10 @@ pub struct KvRing3 {
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        Self::new_x(b, io, blk, roles, slots, true)
+    }
+    /// `kscale = false`: no K-scale staging or reads (per-tensor FP8; the KD ring keeps its place so the LDS plan is the shipped one).
+    pub fn new_x(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
         let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
@@ -100,6 +107,23 @@ impl KvRing3 {
         let q0 = lds.tile("Q0", 16384, Layout::Linear);
         let epi = lds.private("epi", 4096, 8, &[&q1, &q0]);
         lds.commit(b);
+        Self::parts(b, io, blk, roles, slots, kscale, [ks, vs, kd, ones, q1, q0, epi])
+    }
+    /// The same ring (LDS regions) with every lane partition and copy rebuilt from `blk` / `roles` (fresh values: a second pass over the ring
+    /// does not keep the first pass's address registers live; the paired causal form).
+    pub fn rebuilt(&self, b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        let sh = [self.ks.clone(), self.vs.clone(), self.kd.clone(), self.ones.clone(), self.q1.clone(), self.q0.clone(), self.epi.clone()];
+        let mut r = Self::parts(b, io, blk, roles, slots, self.kdpart.is_some(), sh);
+        if self.buf.is_some() {
+            r.enable_buffer_dma(b);
+        }
+        if self.kd_buf.is_some() {
+            r.enable_buffer_kd(b);
+        }
+        r
+    }
+    fn parts(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool, sh: [Shared; 7]) -> KvRing3 {
+        let [ks, vs, kd, ones, q1, q0, epi] = sh;
         let lane = &blk.lane;
         let mut ctx = Ctx::new();
         let l = ctx.sym("lane", 0, 63, lane.lane());
@@ -114,13 +138,15 @@ impl KvRing3 {
         let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
         let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
-        let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]);
-        let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
-        let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
+        let kdpart = kscale.then(|| make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]));
+        let (kt, vt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v));
+        let kdt = kscale.then(|| blk.kv_tile(b, &io.ksc));
+        let (ksrc, vsrc) = (kt.row_source(b, 1), vt.row_source(b, 1));
+        let kdsrc = kdt.map(|t| t.row_source(b, 1));
         let wv = ev(roles.wave_in_group);
         let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
         let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
-        let kdc = if slots == 2 {
+        let kdc = if let Some(kdsrc) = kdsrc { if slots == 2 {
             // 128 rows x 4 bytes, one dword per lane: waves 0 / 1 stage rows 0..63 / 64..127, waves 2 / 3 repeat them (the wave index taken mod 2)
             let w2 = w.mod_c(2, &ctx.dyns);
             let wv2 = b.let_i32(ev(roles.wave_in_group) & 1);
@@ -128,6 +154,8 @@ impl KvRing3 {
         } else {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(amdgpu_tile::rows::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
+        } } else {
+            KdCopy3::None
         };
         KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, kd_buf: None }
     }
@@ -153,6 +181,7 @@ impl KvRing3 {
                 u.append(self.kdma.issue_buffer_units(b, kb, key0, &self.ks.at(slot)), &[]);
                 Some(u)
             }
+            (Role::A, KdCopy3::None, Some((kb, _)), _) => Some(self.kdma.issue_buffer_units(b, kb, key0, &self.ks.at(slot))),
             (Role::B, _, Some((_, vb)), _) => Some(self.vdma.issue_buffer_units(b, vb, key0, &self.vs.at(slot))),
             _ => None,
         }
@@ -177,6 +206,13 @@ impl KvRing3 {
                     Some(kb) => kd.issue_buffer(b, kb, key0, &self.kd.at(slot)),
                     None => kd.issue(b, key0, &self.kd.at(slot)),
                 }
+                match &self.buf {
+                    Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
+                    None => self.kdma.issue(b, key0, &self.ks.at(slot)),
+                }
+                None
+            }
+            (Role::A, KdCopy3::None) => {
                 match &self.buf {
                     Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
                     None => self.kdma.issue(b, key0, &self.ks.at(slot)),
@@ -246,6 +282,18 @@ pub struct AttnBody3<'a> {
     bias_tile: std::cell::Cell<Option<Opnd>>,
     /// the P words in `p` were handed over by a softmax STAGE (declared live-in of the matrix stage)
     p_staged: bool,
+    /// causal key mask (per-tensor FP8 `_causal`)
+    pub causal: Option<CausalMask>,
+}
+
+/// The causal mask of a block: key k of this lane's query row is visible when `k < min(row + qoff1, kv_len)` (computed in the masking branch); the
+/// tiles with a key at or past `lim_min` (the wave's smallest limit, wave-uniform) take the in-place masking branch.
+#[derive(Clone, Copy, Debug)]
+pub struct CausalMask {
+    /// SK - SQ + 1 (wave-uniform): the lane limit is min(row + qoff1, kv_len)
+    pub qoff1: ValueId,
+    pub lim_min: ValueId,
+    pub neg_big: ValueId,
 }
 
 /// The P hand-over of the softmax stage (16 packed fp8 words; element table: word index, the layout fingerprint of the in-place packing).
@@ -267,11 +315,75 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None }
+    }
+    /// The K-scale reader of `slot` (None without K scales).
+    fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
+        let r = self.ring;
+        r.kdpart.as_ref().map(|p| p.at(b, &r.kd.at(slot)))
+    }
+    /// The K-scale word of 32-key block `s`: read from the ring, or the unit word (per-tensor FP8).
+    fn kword(&self, b: &mut FnBuilder, kd: Option<&LdsSlotPart>, s: usize) -> ValueId {
+        match kd {
+            Some(p) => p.read(b, s),
+            None => self.blk.pt.expect("no K scales without the per-tensor scales").kunit,
+        }
+    }
+    /// The bias MFMA operand: the reference words themselves, or (per-tensor FP8) the two-word encoding of `b / m` (`b = 4 (hi + lo)`; the
+    /// encoding of `b / m` is `hi' + lo'` = (hi + lo) / m split into an f16 and its f16 residual).
+    fn bias_in(&self, b: &mut FnBuilder, bias: Opnd) -> Opnd {
+        let Some(pt) = self.blk.pt else { return bias };
+        let wu = b.frag2_lane(bias, 0);
+        let w = b.bitcast_i32(wu);
+        let c16 = b.c_i32(16);
+        let hi = b.let_(Op::CvtF16ToF32(Opnd::Val(w)));
+        let lo_s = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::Val(c16)));
+        let lo = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+        let s = b.add_f32(hi, lo);
+        let q = b.mul_f32(s, pt.inv_m);
+        let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
+        let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
+        let r = b.sub_f32(q, hq);
+        let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
+        let l_sh = b.shl_i32(l_raw, c16);
+        let wq = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
+        Opnd::Val(b.frag2(wq, wq))
+    }
+    /// Per-tensor FP8: S *= m (fp32), then the causal mask (in place, only on tiles that reach the wave's smallest limit).
+    fn pt_prepare(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, t: &TileIt) {
+        if let Some(pt) = self.blk.pt {
+            for a in &s.accs {
+                b.var_scale_pk(a.var, pt.m2);
+            }
+        }
+        if let Some(cm) = self.causal {
+            let key_t = b.bind_i32(t.key0());
+            let partial = b.bind_cond((ev(key_t) + 127).ge(ev(cm.lim_min)));
+            b.begin_if(Opnd::Val(partial));
+            // in place, two keys per v_pk_fma: S += hidden * (-1e30, -1e30) with hidden in {0, 1}; key (i, r) of the lane = key0 + g4 + 32 i +
+            // row_const(r) is visible iff its offset 32 i + row_const(r) < rel = lim - key0 - g4 (one compare against a constant per key)
+            let rel = b.bind_i32((&self.blk.row0 + self.blk.lane.j() + ev(cm.qoff1)).min(ev(self.blk.kv_len)) - t.key0() - ev(self.blk.g4));
+            let (z, one) = (b.c_f32(0.0), b.c_f32(1.0));
+            let nb2 = b.frag2_dup(cm.neg_big);
+            for (i, a) in s.accs.iter().enumerate() {
+                for r in (0..16u8).step_by(2) {
+                    let h: Vec<ValueId> = (0..2u8)
+                        .map(|d| {
+                            let ok = b.bind_cond(ev(rel).gt(C32x32F32::row_const(r + d) + 32 * i as i32));
+                            let x = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(z), b: Opnd::Val(one) });
+                            b.bitcast_i32(x)
+                        })
+                        .collect();
+                    let hp = b.frag2(h[0], h[1]);
+                    b.var_pk_fma(a.var, r, hp, nb2);
+                }
+            }
+            b.end_if();
+        }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
-    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: Opnd, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
+    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: Opnd, k: &LdsSlotPart, kd: Option<&LdsSlotPart>, s: usize) -> Option<ValueId> {
         let blk = self.blk;
         let start = match out {
             QkOut::Vars(t) => {
@@ -284,11 +396,11 @@ impl<'a> AttnBody3<'a> {
         };
         let k0 = k.read(b, 2 * s);
         let k1 = k.read(b, 2 * s + 1);
-        let kw = kd.read(b, s);
+        let kw = self.kword(b, kd, s);
         let q = &blk.q.frags;
         if let (true, QkOut::Vars(t)) = (self.kscale_sel, out) {
             // the vendor form: ONE shift by 8 x lane half, then the scaled MFMA picks byte 0 (k chunk 0) / byte 2 (k chunk 1) with op_sel
-            let w = b.bind_i32(ev(kw).lshr(ev(blk.sel.g8)));
+            let w = if blk.pt.is_some() { kw } else { b.bind_i32(ev(kw).lshr(ev(blk.sel.g8))) };
             if let (Some(bt), true) = (self.bias_tile.get(), s < 3) {
                 b.var_mfma_scale_c(t.accs[s].var, k0, q[0].v, bt, w, blk.sq[0]);
             } else {
@@ -297,7 +409,7 @@ impl<'a> AttnBody3<'a> {
             gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, w, blk.sq[1], 2, 0);
             return None;
         }
-        let (sk0, sk1) = blk.sel.pair(b, kw);
+        let (sk0, sk1) = if blk.pt.is_some() { (kw, kw) } else { blk.sel.pair(b, kw) };
         match out {
             QkOut::Vars(t) => {
                 gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, sk0, blk.sq[0], 0, 0);
@@ -317,7 +429,7 @@ impl<'a> AttnBody3<'a> {
         let mut u = Units::new();
         let once = self.biasonce && self.kscale_sel;
         let (_, (k, kd)) = u.capture(b, "qk.setup", |b| {
-            let parts = (r.kpart.at(b, &r.ks.at(slot)), r.kdpart.at(b, &r.kd.at(slot)));
+            let parts = (r.kpart.at(b, &r.ks.at(slot)), self.kd_at(b, slot));
             if once {
                 // the one bias MFMA writes S tile 3 (zero accumulator: no zero-fragment copies); tiles 0-2 take it as the C input of their first
                 // scaled MFMA, tile 3 accumulates in place last
@@ -331,7 +443,7 @@ impl<'a> AttnBody3<'a> {
                 if self.bias_tile.get().is_none() {
                     b.var_mfma_f16_z(s.accs[blk].var, self.sm.ones_f16, bias);
                 }
-                (k.read(b, 2 * blk), k.read(b, 2 * blk + 1), kd.read(b, blk))
+                (k.read(b, 2 * blk), k.read(b, 2 * blk + 1), self.kword(b, kd.as_ref(), blk))
             });
             u.capture(b, format!("qk.mma{blk}"), |b| self.qk_block_mma(b, &s, k0, k1, kw, blk));
         }
@@ -361,7 +473,7 @@ impl<'a> AttnBody3<'a> {
         let blk = self.blk;
         let q = &blk.q.frags;
         if self.kscale_sel {
-            let w = b.bind_i32(ev(kw).lshr(ev(blk.sel.g8)));
+            let w = if blk.pt.is_some() { kw } else { b.bind_i32(ev(kw).lshr(ev(blk.sel.g8))) };
             if let (Some(bt), true) = (self.bias_tile.get(), s < 3) {
                 b.var_mfma_scale_c(t.accs[s].var, k0, q[0].v, bt, w, blk.sq[0]);
             } else {
@@ -370,7 +482,7 @@ impl<'a> AttnBody3<'a> {
             gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, w, blk.sq[1], 2, 0);
             return;
         }
-        let (sk0, sk1) = blk.sel.pair(b, kw);
+        let (sk0, sk1) = if blk.pt.is_some() { (kw, kw) } else { blk.sel.pair(b, kw) };
         gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, sk0, blk.sq[0], 0, 0);
         gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, sk1, blk.sq[1], 0, 0);
     }
@@ -381,14 +493,14 @@ impl<'a> AttnBody3<'a> {
         }
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
-        let kd = r.kdpart.at(b, &r.kd.at(slot));
+        let kd = self.kd_at(b, slot);
         if let (true, true, QkOut::Vars(t)) = (self.biasonce, self.kscale_sel, &out) {
             // the one bias MFMA writes S tile 3 (zero accumulator: no zero-fragment copies); tiles 0-2 take it as the C input of their first
             // scaled MFMA, tile 3 accumulates in place last
             b.var_mfma_f16_z(t.accs[3].var, self.sm.ones_f16, bias);
             self.bias_tile.set(Some(Opnd::Var(t.accs[3].var)));
         }
-        let res = (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect();
+        let res = (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, kd.as_ref(), s)).collect();
         self.bias_tile.set(None);
         res
     }
@@ -413,7 +525,8 @@ impl PipeBody for AttnBody3<'_> {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
-        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), Opnd::Val(self.sm.bias_init));
+        let bias = self.bias_in(b, Opnd::Val(self.sm.bias_init));
+        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), bias);
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let [bias, la]: [(DType, Opnd); 2] = self.sm.state().try_into().expect("softmax state");
@@ -439,8 +552,12 @@ impl PipeBody for AttnBody3<'_> {
             // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
             // always rebases
             let mut u = Units::new();
+            if self.blk.pt.is_some() || self.causal.is_some() {
+                u.capture(b, "softmax.pt", |b| self.pt_prepare(b, &s, t));
+            }
             let (_, nb) = u.capture(b, "softmax.decide", |b| self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
             let (_, pw) = u.capture(b, "softmax.convert", |b| self.sm.convert(b, &s, mask.as_ref(), 0, 4));
+            let nb = if self.blk.pt.is_some() { u.capture(b, "softmax.pt_bias", |b| self.bias_in(b, nb)).1 } else { nb };
             let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
             let pw2 = pw.clone();
             amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
@@ -452,8 +569,13 @@ impl PipeBody for AttnBody3<'_> {
             self.p_staged = true;
             return;
         }
+        self.pt_prepare(b, &s, t);
         let nb = self.sm.decide(b, &s, &o, mask.as_ref());
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+        let nb = match self.bias_in(b, Opnd::Val(nb)) {
+            Opnd::Val(v) => v,
+            _ => unreachable!("bias_in of a value"),
+        };
         self.p.push(nb);
         self.p_staged = false;
     }
@@ -505,12 +627,12 @@ impl PipeBody for AttnBody3<'_> {
         // the window: conversion chunk i, then QK block i of the next tile (captured units, woven in this order)
         let bound = if t.staged { t.next.offset_scalars() } else { Vec::new() };
         let mut u = Units::new();
-        let parts = t.staged.then(|| u.capture(b, "window.qk.setup", |b| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next)))).1);
+        let parts = t.staged.then(|| u.capture(b, "window.qk.setup", |b| (r.kpart.at(b, &r.ks.at(&t.next)), self.kd_at(b, &t.next))).1);
         let mut w: Vec<ValueId> = Vec::with_capacity(16);
         for i in 0..4usize {
             w.extend(u.capture(b, format!("window.convert{i}"), |b| self.sm.convert(b, &s, mask.as_ref(), i, i + 1)).1);
             if let Some((k, kd)) = &parts {
-                u.capture(b, format!("window.qk.block{i}"), |b| self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i));
+                u.capture(b, format!("window.qk.block{i}"), |b| self.qk_block(b, &QkOut::Vars(&s), nb, k, kd.as_ref(), i));
             }
         }
         // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
@@ -770,7 +892,7 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
         ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
         None
     };
-    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs }
+    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, vsc: None, gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs }
 }
 
 /// `FmhaIo::block` with the Q fragments loaded through a TiledCopy: the B operand of the scaled 32x32x64 atom over the lane's (clamped) query row, two
@@ -785,6 +907,11 @@ pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
 /// blocks that share K / V share an L2. Applied when N % 8 == 0 and H <= 32 (the vendor's conditions; the head is recovered by at most 32
 /// compare-subtract steps), the plain order otherwise.
 pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> FmhaBlock {
+    block3_x_mode(io, b, rows_lg, xcd, None)
+}
+
+/// `block3_x` with the per-tensor mode.
+pub fn block3_x_mode(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool, pt: Option<PtMode>) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
         let x0u = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
         let y0u = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
@@ -828,6 +955,18 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
     };
+    block3_at(io, b, rows_lg, qtile, hidx, pt)
+}
+
+/// The per-tensor FP8 form of a block (`fp8pt`): the [B, HK] f32 descales and the softmax scale instead of the E8M0 Q scales; `causal`: the key
+/// range ends at the last visible key of the block (bottom-right alignment, keys k <= q + SK - SQ).
+#[derive(Clone, Copy, Debug)]
+pub struct PtMode {
+    pub causal: bool,
+}
+
+/// `block3_x` at a given (query tile, head).
+pub fn block3_at(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, qtile: ValueId, hidx: ValueId, pt: Option<PtMode>) -> FmhaBlock {
     let zz = b.let_(amdgpu_dsl::Op::WorkgroupIdZ);
     let lane = Lane::new(b);
     let kv_all = b.bind_i32(io.kv_len.clone());
@@ -839,6 +978,15 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
             let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
             (bi, kv_eff, ev(key_lo), Some(si))
         }
+    };
+    let causal = matches!(pt, Some(PtMode { causal: true }));
+    let kv_len = if causal {
+        // the block's last visible key + 1 = min(256 (qtile + 1) + SK - SQ, SK), at least 1 (rows that see no key: undefined output)
+        let v = b.bind_i32((((ev(qtile) + 1) << rows_lg) + (ev(kv_all) - io.s_len.clone())).min(ev(kv_all)).max(1));
+        let r = b.read_first_lane(v);
+        b.let_(Op::AddI32(Opnd::Val(r), Opnd::I32(0)))
+    } else {
+        kv_len
     };
     let row0 = b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5));
     let row = b.let_i32(&row0 + lane.j());
@@ -868,18 +1016,48 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         frags.push(Frag::<B32x32x64Fp8>::from_words(b, &w));
     }
     let q = frag::RowFrags { frags: [frags[0], frags[1]], words };
-    let qdp = io.qsc.tile(origin).clamp(1, io.s_len.clone(), s_last.clone()).ptr(b, &[I32::c(0), row.clone(), I32::c(0), I32::c(0)]);
-    let qd_raw = b.load_f32(qdp, 0);
-    let qd = b.bitcast_i32(qd_raw);
-    let sel = frag::ScaleSel::new(b, &lane);
-    let (sq0, sq1) = sel.pair(b, qd);
-    let sq = [b.bind_i32(ev(sq0) - 9), b.bind_i32(ev(sq1) - 9)];
-    let vd = b.load_f32(io.ptr_vd, 0);
-    let kvh = components::gqa_kv_head(b, hidx, io.gqa, "HK");
+    let (sel, sq, vd, kvh, ptsc) = if pt.is_none() {
+        let qdp = io.qsc.tile(origin).clamp(1, io.s_len.clone(), s_last.clone()).ptr(b, &[I32::c(0), row.clone(), I32::c(0), I32::c(0)]);
+        let qd_raw = b.load_f32(qdp, 0);
+        let qd = b.bitcast_i32(qd_raw);
+        let sel = frag::ScaleSel::new(b, &lane);
+        let (sq0, sq1) = sel.pair(b, qd);
+        let sq = [b.bind_i32(ev(sq0) - 9), b.bind_i32(ev(sq1) - 9)];
+        let vd = b.load_f32(io.ptr_vd, 0);
+        let kvh = components::gqa_kv_head(b, hidx, io.gqa, "HK");
+        (sel, sq, vd, kvh, None)
+    } else {
+        let sel = frag::ScaleSel::new(b, &lane);
+        let kvh = components::gqa_kv_head(b, hidx, io.gqa, "HK");
+        // the [B, HK] descales of this (batch, KV head)
+        let at = |b: &mut FnBuilder, t: &Tensor| {
+            let off = b.bind_i32(t.offset(&[ev(bidx), ev(kvh)]));
+            let p = b.ptr_add(t.ptr, off);
+            b.load_f32(p, 0)
+        };
+        let qd = at(b, &io.qsc);
+        let kd = at(b, &io.ksc);
+        let vd = at(b, io.vsc.as_ref().expect("fp8pt: the V descale tensor"));
+        let scale = b.let_(Op::KernargF32 { offset: 0x050 });
+        let l2e = b.c_f32(std::f32::consts::LOG2_E);
+        let c0 = b.mul_f32(scale, l2e);
+        let c1 = b.mul_f32(c0, qd);
+        let c = b.mul_f32(c1, kd);
+        // c = 2^(ex - 127) m: the E8M0 Q scale ex - 9 (S in units of 1/512 as the MX kernels), m = c with the exponent of 1.0
+        let cb = b.bitcast_i32(c);
+        let ex = b.bind_i32(((ev(cb).lshr(23) & 255) - 9).max(0));
+        let mb = b.bind_i32((ev(cb) & 0x007F_FFFF) | 0x3F80_0000);
+        let m = b.bitcast_f32(mb);
+        let inv_m = b.rcp_f32(m);
+        let m2 = b.frag2_dup(m);
+        let kunit = b.c_i32(0x7F7F_7F7F);
+        (sel, [ex, ex], vd, kvh, Some(io::PtScale { m2, inv_m, kunit }))
+    };
     let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
     let g4 = b.bind_i32(C32x32F32::half_base(&lane));
-    FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4 }
+    let (kv_clamp, ntiles_total) = if causal { (kv_all, nkv) } else { (kv_len, ntiles_total) };
+    FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4, pt: ptsc }
 }
 
 /// The bf16 epilogue through a TiledCopy: the C layout of the scaled 32x32x64 atom (O^T: rows = dims, columns = queries) stored with
@@ -915,6 +1093,13 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
 /// (`ds_read_b128`, 8 lanes per row) and stored as 4 x 16-byte segments of the output rows: 8 `global_store_dwordx4` per wave (the vendor count)
 /// instead of 16 `global_store_dwordx2`.
 pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
+    store_out3_lds_x(io, b, blk, epi, wid, o, fin, false)
+}
+
+/// `store_out3_lds`; `stores_only`: the `row0 < S` guard covers only the global stores (the wave-private LDS transpose runs unconditionally),
+/// so the epilogue adds no protocol-relevant branch (the paired causal form keeps the verifier's path enumeration within its 64 paths).
+#[allow(clippy::too_many_arguments)]
+pub fn store_out3_lds_x(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId, stores_only: bool) {
     b.barrier();
     let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
     let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
@@ -927,7 +1112,9 @@ pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Sha
     let wpart = make_tiled_copy(DS_WRITE_B32, wtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
     let rtv = make_layout(tup![tup![8, 8], tup![8, 4]], tup![tup![8, 64], tup![1, 512]]);
     let rpart = make_tiled_copy(DS_READ_B128, rtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
-    b.begin_if(Opnd::Val(live));
+    if !stores_only {
+        b.begin_if(Opnd::Val(live));
+    }
     let me = epi.mine(wid);
     let wp = wpart.at_private(b, &me);
     let rp = rpart.at_private(b, &me);
@@ -954,12 +1141,23 @@ pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Sha
             }
         }
         b.wait_lds(0);
+        if stores_only {
+            let vs: Vec<ValueId> = (0..gptr.len()).map(|i| rp.read(b, i, 0)).collect();
+            b.begin_if(Opnd::Val(live));
+            for (g, v) in gptr.iter().zip(vs) {
+                b.store_f32x4(*g, (128 * pr) as u32, v);
+            }
+            b.end_if();
+            continue;
+        }
         for (i, g) in gptr.iter().enumerate() {
             let v = rp.read(b, i, 0);
             b.store_f32x4(*g, (128 * pr) as u32, v);
         }
     }
-    b.end_if();
+    if !stores_only {
+        b.end_if();
+    }
 }
 
 /// The KV-split partial epilogue with the private transpose scratch on TiledCopies: the C layout written as 2 x `ds_write_b32` per 4 dims into a

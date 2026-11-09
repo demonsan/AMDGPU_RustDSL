@@ -21,6 +21,8 @@ pub struct FmhaIo {
     pub qsc: Tensor,
     pub ksc: Tensor,
     pub ptr_vd: ValueId,
+    /// per-tensor FP8 (`fp8pt`): the V descale [B, HK] f32 (the MX kernels: None, one scalar at `ptr_vd`)
+    pub vsc: Option<Tensor>,
     pub gqa: ValueId,
     /// number of query heads H
     pub heads: ValueId,
@@ -93,7 +95,7 @@ impl FmhaIo {
             ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
             None
         };
-        FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, gqa, heads, s_len: s.val().unwrap(), kv_len: skv.val().unwrap(), kvs }
+        FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, vsc: None, gqa, heads, s_len: s.val().unwrap(), kv_len: skv.val().unwrap(), kvs }
     }
 
     /// Block ids, lane ids, this lane's query row (clamped), the resident Q fragments + scales, the KV head and the key range (all keys).
@@ -134,7 +136,7 @@ impl FmhaIo {
         let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
         b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
         let g4 = b.bind_i32(C32x32F32::half_base(&lane));
-        FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4 }
+        FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp: kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4, pt: None }
     }
 }
 
@@ -150,6 +152,8 @@ pub struct FmhaBlock {
     pub s_last: I32,
     /// keys of this block (relative to its first key `key_lo`) / number of 128-key tiles; tiles of the whole sequence
     pub kv_len: ValueId,
+    /// the K / V copies clamp their rows to `kv_clamp - 1` (= `kv_len`; the paired causal form: all keys, its ring serves both passes)
+    pub kv_clamp: ValueId,
     pub key_lo: I32,
     pub nkv: ValueId,
     pub ntiles_total: ValueId,
@@ -161,13 +165,28 @@ pub struct FmhaBlock {
     pub vd: ValueId,
     /// `4 (lane >> 5)`: key offset of this lane half in a C32x32 accumulator
     pub g4: ValueId,
+    /// per-tensor FP8 scales (`fp8pt`)
+    pub pt: Option<PtScale>,
+}
+
+/// Per-tensor FP8 attention (`fmha_fwd_hd128_fp8pt_v3`): the softmax exponent factor `c = scale log2(e) q_ds k_ds = 2^e m` (m in [1, 2)). 2^e rides
+/// the E8M0 Q scale of the scaled QK MFMA (the K scale is the unit word), m multiplies S in fp32 before the softmax; the reference words entering
+/// the bias MFMA encode `b / m`, so `m S` carries the reference `b` of the recipe.
+#[derive(Clone, Copy, Debug)]
+pub struct PtScale {
+    /// (m, m)
+    pub m2: ValueId,
+    /// 1 / m
+    pub inv_m: ValueId,
+    /// the unit E8M0 K-scale word 0x7F7F7F7F
+    pub kunit: ValueId,
 }
 
 impl FmhaBlock {
     /// A K/V-shaped tensor (rows = keys) as a tile of this block's KV head, rows clamped to the last key.
     pub fn kv_tile(&self, b: &mut FnBuilder, t: &Tensor) -> TileView {
-        let last = b.let_i32(ev(self.kv_len) - 1);
-        t.tile(vec![ev(self.bidx), self.key_lo.clone(), ev(self.kvh), I32::c(0)]).clamp(1, ev(self.kv_len), last)
+        let last = b.let_i32(ev(self.kv_clamp) - 1);
+        t.tile(vec![ev(self.bidx), self.key_lo.clone(), ev(self.kvh), I32::c(0)]).clamp(1, ev(self.kv_clamp), last)
     }
 }
 
