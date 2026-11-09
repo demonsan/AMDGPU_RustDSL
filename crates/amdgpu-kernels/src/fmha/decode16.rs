@@ -543,7 +543,8 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
     // the swizzled granule offsets of the 8 d blocks (hoisted): (db ^ (r0 % 8)) * 32, r0 = 4 grp + l16 / 4
     let r0m = b.bind_i32(((ev(grp) << 2) + ev(l16).lshr(2)) & 7);
-    let vgran: Vec<ValueId> = if grp_path { (0..8i32).map(|db| b.bind_i32((ev(r0m) ^ db) << 5)).collect() } else { Vec::new() };
+    // (the per-granule base registers are hoisted: the loop's reads keep a constant row offset, which the ds_read immediate absorbs)
+    let vgran: Vec<ValueId> = if grp_path { (0..8i32).map(|db| { let g = b.bind_i32((ev(r0m) ^ db) << 5); b.bind_i32(ev(vb) + ev(g)) }).collect() } else { Vec::new() };
     // blocked: the V^T row (d 16 db + l % 16) bytes of keys 4 g .. 4 g + 3 and 16 + 4 g ..
     let vtb = blocked.then(|| b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3)));
     mev.read_back(&mut b, Opnd::Var(it), |b| {
@@ -561,7 +562,7 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                 } else {
                     // (the swizzle exists on the bf16 flash path only: the fp8 forms convert their V rows into an unswizzled bf16 tile)
                     let (a0, a1) = if grp_path {
-                        (b.bind_i32(ev(vb) + (32 * t as i32) * ROW + ev(vgran[db as usize])), b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + ev(vgran[db as usize])))
+                        (b.bind_i32(ev(vgran[db as usize]) + (32 * t as i32) * ROW), b.bind_i32(ev(vgran[db as usize]) + (32 * t as i32 + 16) * ROW))
                     } else {
                         (b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db), b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db))
                     };
