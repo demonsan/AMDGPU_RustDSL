@@ -541,7 +541,8 @@ impl<'a> An<'a> {
     /// `cond ? a : b` is `min(a, y - 1)`: cond is `a < y` and b is exactly y - 1 (both uniform points).
     fn is_clamp(&self, cond: &Opnd, a: &Opnd, b: &Opnd) -> bool {
         let Some((x, y)) = self.lt_of(cond, true) else { return false };
-        if x != *a {
+        let same = x == *a || matches!((x, a), (Opnd::Val(p), Opnd::Val(q)) if self.sig(p, 0) == self.sig(*q, 0));
+        if !same {
             return false;
         }
         let (iy, ib) = (self.int_of(&y), self.int_of(b));
