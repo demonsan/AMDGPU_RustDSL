@@ -280,22 +280,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // loop state: it, m, l, O^T (8 blocks of 16 d), S^T (4 blocks of 16 keys)
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
-    // fast path (bf16, qlen 1, P >= 16): full tiles (no key past the range) need no clamps / masks; per issue i the lane's in-page row
-    // offset ((4 i + l / 16) % P HK + hk) ROW and its K / V voffsets are loop invariant, the tile's pages (1 or 2) come from uniform loads
-    let fastp = kvm == 0 && !mtp && page >= 16 && KT == 32;
-    let hkrow = b.bind_i32(ev(hkv_n) * ROW);
-    let inv: Vec<(ValueId, ValueId)> = if fastp {
-        (0..KT / 4)
-            .map(|i| {
-                let kk = b.bind_i32(kk_of(i));
-                let r = b.bind_i32((ev(kk) & (page.min(32) - 1)) * ev(hkrow) + ev(hk) * ROW);
-                (b.bind_i32(ev(r) + ((ev(l16) ^ (ev(kk) & 15)) << 4)), b.bind_i32(ev(r) + (ev(l16) << 4)))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let pgstride = { let v = b.bind_i32(ev(hkrow) * page); b.read_first_lane(v) };
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
@@ -305,43 +289,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    // fast path: a full tile (uniform)
-    let full = fastp.then(|| b.bind_cond((ev(key_t) + KT).le(ev(k_hi))));
-    if let Some(full) = full {
-        b.begin_if(Opnd::Val(full));
-        let np = if page == 16 { 2 } else { 1 };
-        let pbase: Vec<ValueId> = (0..np)
-            .map(|h| {
-                let so = { let v = b.bind_i32(ev(bt_so) + ((ev(key_t) + 16 * h).lshr(page.trailing_zeros() as i32) << 2)); b.read_first_lane(v) };
-                let pv = b.buffer_load_f32(r_bt, c0, so, 0);
-                let pg = b.bitcast_i32(pv);
-                let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-                // (P > 32: the tile's offset inside its page, key_t % P rows)
-                if page > 32 {
-                    let inp = { let v = b.bind_i32((ev(key_t) & (page - 1)) * ev(hkrow)); b.read_first_lane(v) };
-                    b.bind_i32(ev(pg) * ev(pgstride) + ev(inp))
-                } else {
-                    b.bind_i32(ev(pg) * ev(pgstride))
-                }
-            })
-            .collect();
-        let hsel = |i: i32| if page == 16 && i >= 4 { 1 } else { 0 };
-        me.write(&mut b, Opnd::Var(it), |b| {
-            for i in 0..KT / 4 {
-                let kvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(inv[i as usize].0));
-                let m0k = b.bind_i32(mbase.clone() + (i << 10));
-                b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
-            }
-        });
-        mev.write(&mut b, Opnd::Var(it), |b| {
-            for i in 0..KT / 4 {
-                let vvo = b.bind_i32(ev(pbase[hsel(i)]) + ev(inv[i as usize].1));
-                let m0v = b.bind_i32(vbase0.clone() + (i << 10));
-                b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
-            }
-        });
-        b.else_();
-    }
     let lookups: Vec<(ValueId, ValueId)> = (0..if fp8 { KT / 8 } else { KT / 4 })
         .map(|i| {
             // (fp8 rows of 128 bytes: 8 lanes per key, keys 8 i + l / 8)
@@ -447,9 +394,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }),
     }
-    if full.is_some() {
-        b.end_if();
-    }
     b.wait_vm(nv);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
@@ -481,27 +425,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(16);
-    if fastp {
-        // the key mask only on the tile that needs it (uniform branch; in place)
-        let part = b.bind_cond((ev(key_t) + KT).gt(ev(k_hi)));
-        b.begin_if(Opnd::Val(part));
-        for blk in 0..NKB {
-            for r in 0..4u8 {
-                let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
-                let x = b.bitcast_f32(x);
-                let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
-                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) });
-                b.var_set_lane(sv_[blk], r, y);
-            }
-        }
-        b.end_if();
-        for blk in 0..NKB {
-            for r in 0..4u8 {
-                let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
-                s.push(b.bitcast_f32(x));
-            }
-        }
-    } else {
     for blk in 0..NKB {
         for r in 0..4u8 {
             let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
@@ -510,7 +433,6 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
             s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
         }
-    }
     }
     let mut mx = s[0];
     for pair in s[1..].chunks(2) {
