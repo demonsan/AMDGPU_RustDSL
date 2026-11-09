@@ -405,6 +405,9 @@ impl Lowerer {
             dce_cmp_pairs(&mut self.mir);
             fuse_minmax3(&mut self.mir);
         }
+        if opt_on("maskreg") || std::env::var("AMDC_MASKREG").map_or(false, |v| v == "1") {
+            mask_cmp_pairs(&mut self.mir);
+        }
         // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
         // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
         dce_full(&mut self.mir, true);
@@ -3992,6 +3995,72 @@ fn fold_select_cmp(m: &mut MFunction) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `maskreg`: a compare into vcc whose only readers are `v_cndmask`s becomes a compare into its own SGPR pair (`v_cmp_*_e64 s[..]`) read by
+/// `v_cndmask_b32_e64 .., s[..]`: independent masks no longer serialize on vcc, so the hazard filler can cover a compare's wait states with
+/// the next compares instead of `s_nop`. A compare is converted only when every vcc reader up to the next vcc definition in its block is a
+/// `v_cndmask` (and the vcc does not reach the block's end).
+fn mask_cmp_pairs(m: &mut MFunction) {
+    let mask_op = |op: MOp| match op {
+        MOp::VCmpLtI32 => Some(MOp::VCmpMaskLtI32),
+        MOp::VCmpGeI32 => Some(MOp::VCmpMaskGeI32),
+        MOp::VCmpGtI32 => Some(MOp::VCmpMaskGtI32),
+        MOp::VCmpNeI32 => Some(MOp::VCmpMaskNeU32),
+        MOp::VCmpLtF32 => Some(MOp::VCmpMaskLtF32),
+        _ => None,
+    };
+    let defs_vcc = |op: MOp| op.defines_vcc() || op == MOp::VPtrAdd;
+    for bi in 0..m.blocks.len() {
+        let n = m.blocks[bi].insts.len();
+        let mut i = 0;
+        while i < n {
+            let inst = &m.blocks[bi].insts[i];
+            let Some(mop) = mask_op(inst.op) else {
+                i += 1;
+                continue;
+            };
+            // (VOP3 takes no literal constant on gfx9: only inline immediates may stay)
+            let literal = inst.srcs.iter().any(|s| matches!(s, Src::Imm(k) if !is_inline_const(*k)));
+            if inst.dst.is_some() || inst.pin || inst.srcs.len() != 2 || literal {
+                i += 1;
+                continue;
+            }
+            // readers up to the next vcc definition
+            let mut readers = Vec::new();
+            let mut ok = false;
+            let mut j = i + 1;
+            while j < n {
+                let x = &m.blocks[bi].insts[j];
+                if x.op.consumes_vcc() {
+                    if x.op == MOp::VCndmask && x.srcs.len() == 2 && !x.pin {
+                        readers.push(j);
+                    } else {
+                        break;
+                    }
+                }
+                if defs_vcc(x.op) {
+                    ok = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !ok || readers.is_empty() {
+                i += 1;
+                continue;
+            }
+            let s = m.vregs.len() as VReg;
+            m.vregs.push(RClass::S2);
+            let b = &mut m.blocks[bi];
+            b.insts[i].op = mop;
+            b.insts[i].dst = Some(s);
+            for r in readers {
+                b.insts[r].op = MOp::VCndmaskM;
+                b.insts[r].srcs.push(Src::Reg(s));
+            }
+            i += 1;
         }
     }
 }

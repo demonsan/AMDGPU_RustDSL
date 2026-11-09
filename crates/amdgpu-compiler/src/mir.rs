@@ -274,6 +274,9 @@ pub enum MOp {
     /// Compare into an SGPR PAIR instead of vcc (`v_cmp_*_e64 s[a:b], x, y`): several masks can be in flight, so the 2 wait states
     /// between a compare and its `v_cndmask` can be covered by the next compares (`maskreg`).
     VCmpMaskLtI32,
+    VCmpMaskGeI32,
+    VCmpMaskGtI32,
+    VCmpMaskLtF32,
     /// `v_cndmask_b32_e64 d, a, b, s[mask]`: srcs = [false value, true value, mask pair].
     VCndmaskM,
     VCmpNeI32,
