@@ -58,6 +58,8 @@ struct Ev {
     global: bool,
     /// every read of a consume event was a coherent (sc1) load
     coherent: bool,
+    /// the iteration of the OUTERMOST enclosing loop when the event opened (-1 outside loops): the period claim is checked per outer iteration
+    outer: i64,
 }
 
 struct Trace {
@@ -231,6 +233,8 @@ struct Sim<'a> {
     dpos: usize,
     taken: Vec<(usize, bool, bool)>,
     loop_depth: usize,
+    /// iteration index of the outermost loop being simulated (-1 outside loops)
+    outer: i64,
     in_role: bool,
     unsupported: &'a mut Vec<(usize, String)>,
 }
@@ -316,7 +320,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -414,7 +418,10 @@ impl<'a> Sim<'a> {
                         self.vars.insert(*v, k);
                     }
                     self.loop_depth += 1;
-                    for _ in 0..self.n {
+                    for it in 0..self.n {
+                        if self.loop_depth == 1 {
+                            self.outer = it as i64;
+                        }
                         self.exec_loop_body(i + 1, close);
                         if self.break_taken {
                             break;
@@ -422,6 +429,9 @@ impl<'a> Sim<'a> {
                     }
                     self.break_taken = false;
                     self.loop_depth -= 1;
+                    if self.loop_depth == 0 {
+                        self.outer = -1;
+                    }
                     self.close();
                     i = close + 1;
                     continue;
@@ -884,11 +894,27 @@ fn period_bits(f: &Function) -> (u32, u32) {
 /// and the version must advance by a constant over `p` iterations.
 fn verify_period_claim(f: &Function, traces: &[&Trace], p: usize) -> Result<(), String> {
     for (role, t) in traces.iter().enumerate() {
-        let mut by_stmt: HashMap<usize, Vec<(i64, i64)>> = HashMap::new();
+        let mut by_stmt: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::new();
         for ev in &t.evs {
-            by_stmt.entry(ev.stmt).or_default().push((ev.slot, ev.ver));
+            by_stmt.entry(ev.stmt).or_default().push((ev.slot, ev.ver, ev.outer));
         }
-        for (stmt, seq) in by_stmt {
+        for (stmt, execs) in by_stmt {
+            // a marker inside an inner (data-dependent) loop runs 0..n times per outer iteration: when every execution within one outer iteration
+            // has the same slot and version, the sequence to check is one entry per outer iteration (the period is a property of the outer loop);
+            // otherwise every execution counts, as before
+            let mut per_iter: Vec<(i64, (i64, i64))> = Vec::new();
+            let mut uniform = true;
+            for (s, v, o) in &execs {
+                match per_iter.last() {
+                    Some((lo, sv)) if *lo == *o => {
+                        if *sv != (*s, *v) {
+                            uniform = false;
+                        }
+                    }
+                    _ => per_iter.push((*o, (*s, *v))),
+                }
+            }
+            let seq: Vec<(i64, i64)> = if uniform && per_iter.len() < execs.len() { per_iter.iter().map(|x| x.1).collect() } else { execs.iter().map(|x| (x.0, x.1)).collect() };
             if seq.len() < p + 2 {
                 continue;
             }
@@ -916,7 +942,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 64 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
