@@ -214,6 +214,10 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     let vars = b.begin_loop(&inits);
     let it = vars[0];
     let dqv: Vec<VarId> = vars[1..5].to_vec();
+    // the dQ^T accumulators in AGPRs (as dkdv's dK / dV): the VGPRs stay for S / dP and the operands
+    for v in &dqv {
+        b.pin_agpr(*v);
+    }
     let sv_vars: Vec<VarId> = vars[5..7].to_vec();
     let dp_vars: Vec<VarId> = vars[7..9].to_vec();
     let itx = amdgpu_dsl::varx(it);
