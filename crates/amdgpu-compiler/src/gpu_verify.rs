@@ -1599,7 +1599,14 @@ impl<'a> An<'a> {
                     }
                     let div = Q::new(1, 1i128 << k.n);
                     let mut lo: Vec<Poly> = vec![Poly::int(0)];
-                    lo.extend(x.lo.iter().map(|p| p.add(&Poly::int(-((1i128 << k.n) - 1))).scale(div)));
+                    // (values are integers: a constant lower bound rounds up)
+                    lo.extend(x.lo.iter().map(|p| {
+                        let q = p.add(&Poly::int(-((1i128 << k.n) - 1))).scale(div);
+                        match q.as_const() {
+                            Some(c) => Poly::int((c.n + c.d - 1).div_euclid(c.d)),
+                            None => q,
+                        }
+                    }));
                     AV::Int(Itv { lo: cap(lo), hi: cap(x.hi.iter().map(|p| { let q = p.scale(div); match q.floor_const() { Some(k) => Poly::int(k), None => q } }).collect()) })
                 }
                 _ => AV::Int(Itv::top()),
