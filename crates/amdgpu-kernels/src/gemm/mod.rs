@@ -726,34 +726,6 @@ fn dma_plan_rows_pad(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
     finish_dma_p(b, ctx, out, 1056)
 }
 
-/// A-tile DMA for the SWIZZLED row-major LDS image (fp4): 1 KB blocks of 8 whole 128-byte rows (pitch 1024), the 16-byte chunk c of row r
-/// stored at chunk c ^ (r % 8) (Swizzle::cute(3, 4, 3)): lane -> row lane / 8, LDS chunk lane % 8 = source chunk (lane % 8) ^ (lane / 8).
-/// The fragment reads of 16 consecutive rows then hit distinct banks (the padded image conflicts 4-way on the 16-row ds_read_b128 phases).
-fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
-    let issues = rows * 128 / 1024 / waves;
-    let d = &ctx.dyns;
-    let tid_id = match s_tid {
-        Ix::Sym(s) => *s,
-        _ => unreachable!(),
-    };
-    let mut out = Vec::new();
-    for q in 0..issues {
-        let blk = s_tid.div_c(64, d).mul_c(issues).add_c(q);
-        let lane = s_tid.mod_c(64, d);
-        let r = blk.mul_c(8).add(&lane.div_c(8, d));
-        let k = lane.mod_c(8, d).xor(&lane.div_c(8, d)).mul_c(16);
-        let g = glob.crd2idx(&tup![r.clone(), k.clone()], d);
-        for th in [0i64, 1, 7, 8, 9, 63, 64, 100, 127, 255].into_iter().filter(|t| *t < 64 * waves) {
-            let env = |s: u32| if s == tid_id { th } else { proof_k };
-            let (bb, ll) = (issues * (th / 64) + q, th % 64);
-            let want = glob.crd2idx(&tup![8 * bb + ll / 8, 16 * ((ll % 8) ^ (ll / 8))], d).eval(&env);
-            assert_eq!(g.eval(&env), want, "swizzled A DMA thread {th} issue {q}");
-        }
-        out.push(g);
-    }
-    finish_dma_p(b, ctx, out, 1024)
-}
-
 /// The scale panel: every K group's scales of the CTA in LDS, written once in the prologue (`prologue_stores`).
 struct Panel {
     sh: Shared,
@@ -1677,9 +1649,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
     let slots = 2;
-    // fp4: the swizzled A image (pitch 1024, chunk ^ row % 8) instead of the padded one (conflict-free 16-row fragment reads)
-    let a_swz = cfg.elem == Elem::Fp4 && cfg.moe.is_none() && cfg.conv.is_none();
-    let a_bytes = cta_m / 8 * if a_swz { 1024 } else { 1056 };
+    let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
     let a_s = lds.ring("A", nimg * a_bytes, slots, amdgpu_tile::Layout::Linear);
@@ -1701,12 +1671,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
 
     // ---- operand reads: the 16-row blocks of the wave (padded A: a 16-row block = two 1056-byte blocks of 8 rows; B 2048 bytes) ----
     let view = ComposedLayout::new(Swizzle::none(), smem_block());
-    let a_view = if a_swz {
-        ComposedLayout::new(Swizzle::cute(3, 4, 3), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1024], 1]))
-    } else {
-        ComposedLayout::new(Swizzle::none(), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1056], 1]))
-    };
-    let a_blk = if a_swz { 2048 } else { 2112 };
+    let a_view = ComposedLayout::new(Swizzle::none(), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1056], 1]));
+    let a_blk = 2112;
     let a_place: Vec<i64> = (0..wave_m / 16).map(|i| a_blk * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
     // ---- DMA (A row-major into the padded image, B preshuffled), wave parts of M0, CTA origins ----
@@ -1766,7 +1732,6 @@ impl skeleton_v4::V4Slots for GemmSlots {
             conv_rt = Some(ConvRt { cfg: cc, rows, di, h, w, c, zero });
             Dma { issues: out, pitch: 1056, gather: true }
         }
-        None if a_swz => dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4),
         None => dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4),
         Some(mc) => {
             let mc = mc.clone();
