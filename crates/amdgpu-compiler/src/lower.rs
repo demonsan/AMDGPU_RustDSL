@@ -400,7 +400,10 @@ impl Lowerer {
         self.resolve_reg_plan();
         if opt_on("cmpfold") {
             fold_select_cmp(&mut self.mir);
+            // select(a < b, a, b) and friends become v_min / v_max (no vcc, no v_cmp -> v_cndmask hazard), clamp chains v_med3 / min3 / max3
+            select_minmax(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
+            fuse_minmax3(&mut self.mir);
         }
         // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
         // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
@@ -3936,7 +3939,7 @@ fn fold_select_cmp(m: &mut MFunction) {
                     break;
                 }
                 let c = &b.insts[j];
-                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32) && c.dst.is_none() {
+                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32 | MOp::VCmpLtU32 | MOp::VCmpGtU32 | MOp::VCmpGeU32 | MOp::VCmpLeI32 | MOp::VCmpLeU32 | MOp::VCmpGtF32 | MOp::VCmpGeF32 | MOp::VCmpLeF32) && c.dst.is_none() {
                     mat.insert(inst.dst.unwrap(), (c.op, c.srcs.clone(), j));
                 }
                 continue;
@@ -4999,4 +5002,207 @@ thread_local! {
 /// (virtual register, value) pairs of the most recent `lower` on this thread (diagnostics).
 pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {
     LAST_ORIGINS.with(|o| o.borrow().clone())
+}
+
+/// `v_cmp x, y ; v_cndmask d, b, a` (d = vcc ? a : b) with {a, b} = {x, y}: a min / max of x and y. Rewritten to one v_min / v_max when nothing
+/// else reads that vcc; the compare then has no reader and is removed. Saves the compare, the vcc hazard wait states before the cndmask and keeps
+/// vcc free. f32: identical for ordered operands (a NaN operand: v_min / v_max return the other operand, the select returned b).
+fn select_minmax(m: &mut MFunction) {
+    use MOp::*;
+    // (compare, select-a-is-x gives) -> (op when a == x, op when a == y)
+    let pick = |c: MOp| -> Option<(MOp, MOp)> {
+        Some(match c {
+            VCmpLtI32 | VCmpLeI32 => (VMinI32, VMaxI32),
+            VCmpGtI32 | VCmpGeI32 => (VMaxI32, VMinI32),
+            VCmpLtU32 | VCmpLeU32 => (VMinU32, VMaxU32),
+            VCmpGtU32 | VCmpGeU32 => (VMaxU32, VMinU32),
+            VCmpLtF32 | VCmpLeF32 => (VMinF32, VMaxF32),
+            VCmpGtF32 | VCmpGeF32 => (VMaxF32, VMinF32),
+            _ => return None,
+        })
+    };
+    let mut next_vreg = m.vregs.len() as VReg;
+    let mut new_classes: Vec<RClass> = Vec::new();
+    for b in &mut m.blocks {
+        let mut i = 0;
+        while i < b.insts.len() {
+            let c = b.insts[i].clone();
+            let Some((op_ax, op_ay)) = pick(c.op) else {
+                i += 1;
+                continue;
+            };
+            if c.dst.is_some() || c.srcs.len() != 2 || c.pin {
+                i += 1;
+                continue;
+            }
+            // the select: the next instruction that touches vcc must be a v_cndmask with a register `a` operand; only const movs may sit between
+            let mut k = i + 1;
+            while k < b.insts.len() && b.insts[k].op == VMovB32 && matches!(b.insts[k].srcs.first(), Some(Src::Imm(_))) {
+                k += 1;
+            }
+            if k >= b.insts.len() || b.insts[k].op != VCndmask || b.insts[k].pin {
+                i += 1;
+                continue;
+            }
+            let s = b.insts[k].clone();
+            let (Some(d), Some(Src::Reg(a))) = (s.dst, s.srcs.get(1).cloned()) else {
+                i += 1;
+                continue;
+            };
+            let bs = s.srcs[0].clone();
+            let same = |p: &Src, q: &Src| match (p, q) {
+                (Src::Reg(x), Src::Reg(y)) => x == y,
+                (Src::Imm(x), Src::Imm(y)) => x == y,
+                _ => false,
+            };
+            let (x, y) = (&c.srcs[0], &c.srcs[1]);
+            let op = if same(&Src::Reg(a), x) && same(&bs, y) {
+                op_ax
+            } else if same(&Src::Reg(a), y) && same(&bs, x) {
+                op_ay
+            } else {
+                i += 1;
+                continue;
+            };
+            // no other reader of this vcc: scan forward until the next vcc writer
+            let mut other = false;
+            for z in b.insts.iter().skip(k + 1) {
+                let at = crate::op_attrs::attrs(z.op);
+                if at.vcc_read || at.consumes_vcc {
+                    other = true;
+                    break;
+                }
+                if at.vcc_write || at.defines_vcc {
+                    break;
+                }
+            }
+            if other || matches!(b.term, Term::CondGoto { .. }) && !b.insts.iter().skip(k + 1).any(|z| { let at = crate::op_attrs::attrs(z.op); at.vcc_write || at.defines_vcc }) {
+                i += 1;
+                continue;
+            }
+            // operands: registers (an inline-constant `b` is materialised: still one instruction less and no vcc hazard)
+            let mut pre: Option<MInst> = None;
+            let bo = match bs {
+                Src::Reg(r) => r,
+                Src::Imm(v) => {
+                    let r = next_vreg;
+                    next_vreg += 1;
+                    new_classes.push(RClass::V1);
+                    pre = Some(MInst::new(VMovB32).def(r).src(Src::Imm(v)));
+                    r
+                }
+            };
+            let mut mm = MInst::new(op).def(d).srcreg(a).srcreg(bo);
+            mm.region = s.region;
+            mm.origin = s.origin;
+            b.insts[k] = mm;
+            if let Some(p) = pre {
+                b.insts.insert(k, p);
+            }
+            b.insts.remove(i); // the compare: its only reader is gone
+            i += 1;
+        }
+    }
+    m.vregs.extend(new_classes);
+}
+
+/// `min(max(x, lo), hi)` with constant lo <= hi -> `v_med3(x, lo, hi)`; `min(min(a, b), c)` -> `v_min3`, `max(max(a, b), c)` -> `v_max3` (the inner
+/// result used once, in the same block).
+fn fuse_minmax3(m: &mut MFunction) {
+    use MOp::*;
+    let mut uses: HashMap<VReg, u32> = HashMap::new();
+    for b in &m.blocks {
+        for inst in &b.insts {
+            for r in inst.uses() {
+                *uses.entry(m.canon(r)).or_insert(0) += 1;
+            }
+        }
+    }
+    let alias = m.alias.clone();
+    for b in &mut m.blocks {
+        // constants defined in this block (v_mov r, imm)
+        let mut konst: HashMap<VReg, i64> = HashMap::new();
+        let mut def_at: HashMap<VReg, usize> = HashMap::new();
+        let mut dead = vec![false; b.insts.len()];
+        for i in 0..b.insts.len() {
+            let inst = b.insts[i].clone();
+            if let Some(d) = inst.dst {
+                konst.remove(&d);
+                if inst.op == VMovB32 {
+                    if let Some(Src::Imm(v)) = inst.srcs.first() {
+                        konst.insert(d, *v);
+                    }
+                }
+            }
+            let outer = inst.op;
+            let pair = match outer {
+                VMinI32 => Some((VMaxI32, VMed3I32, VMinI32, VMin3I32)),
+                VMinU32 => Some((VMaxU32, VMed3U32, VMinU32, VMin3U32)),
+                VMinF32 => Some((VMaxF32, VMed3F32, VMinF32, VMin3F32)),
+                VMaxI32 => Some((VMaxI32, VMax3I32, VMaxI32, VMax3I32)),
+                VMaxU32 => Some((VMaxU32, VMax3U32, VMaxU32, VMax3U32)),
+                VMaxF32 => Some((VMaxF32, VMax3F32, VMaxF32, VMax3F32)),
+                _ => None,
+            };
+            if let (Some((inner_max, med3, same_inner, three)), Some(d), 2) = (pair, inst.dst, inst.srcs.len()) {
+                let regs: Vec<VReg> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(*r) } else { None }).collect();
+                if regs.len() == 2 {
+                    for (ti, oi) in [(0usize, 1usize), (1, 0)] {
+                        let (t, other) = (regs[ti], regs[oi]);
+                        let Some(&j) = def_at.get(&t) else { continue };
+                        if dead[j] || alias.contains_key(&t) || uses.get(&t).copied().unwrap_or(0) != 1 || b.insts[j].pin {
+                            continue;
+                        }
+                        let inner = b.insts[j].clone();
+                        let iregs: Vec<VReg> = inner.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(*r) } else { None }).collect();
+                        if iregs.len() != 2 || inner.srcs.len() != 2 {
+                            continue;
+                        }
+                        // the inner operands must not be redefined between j and i
+                        let redefined = b.insts[j + 1..i].iter().any(|z| z.dst.map_or(false, |x| iregs.contains(&x)));
+                        if redefined {
+                            continue;
+                        }
+                        let new = if matches!(outer, VMinI32 | VMinU32 | VMinF32) && inner.op == inner_max {
+                            // min(max(x, lo), hi): lo, hi constants with lo <= hi
+                            let (x, lo) = match (konst.get(&iregs[0]), konst.get(&iregs[1])) {
+                                (None, Some(l)) => (iregs[0], (iregs[1], *l)),
+                                (Some(l), None) => (iregs[1], (iregs[0], *l)),
+                                _ => continue,
+                            };
+                            let Some(&hi) = konst.get(&other) else { continue };
+                            let ok = match outer {
+                                VMinI32 => (lo.1 as i32) <= (hi as i32),
+                                VMinU32 => (lo.1 as u32) <= (hi as u32),
+                                _ => f32::from_bits(lo.1 as u32) <= f32::from_bits(hi as u32),
+                            };
+                            if !ok {
+                                continue;
+                            }
+                            MInst::new(med3).def(d).srcreg(x).srcreg(lo.0).srcreg(other)
+                        } else if inner.op == same_inner {
+                            MInst::new(three).def(d).srcreg(iregs[0]).srcreg(iregs[1]).srcreg(other)
+                        } else {
+                            continue;
+                        };
+                        let mut new = new;
+                        new.region = inst.region;
+                        new.origin = inst.origin;
+                        b.insts[i] = new;
+                        dead[j] = true;
+                        break;
+                    }
+                }
+            }
+            if let Some(d) = b.insts[i].dst {
+                def_at.insert(d, i);
+            }
+        }
+        let mut k = 0;
+        b.insts.retain(|_| {
+            let keep = !dead[k];
+            k += 1;
+            keep
+        });
+    }
 }
