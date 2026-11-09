@@ -470,6 +470,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let (wc, cursor, base_a, dummy) = (0i32, 65536i32, 69632i32, 65532i32);
     b.lds(73736);
     // declared tiles: WC (version = the chunk index: zeroed, counted, prefix-summed in place by the owning thread, read by the positions), CURSOR (initialised once, advanced in place), BASE (rewritten every chunk, version = the chunk index)
+    // the WC versions depend on the chunk counter only; the data-dependent match loop inside a chunk executes the same marker with the same version several times (a non-constant step for the verifier's per-statement\n    // period check): declared trusted periodic (counted in the ledger)\n    b.tile_trust_periodic("moe_scatter_ordered: WC versions 2 ch / 2 ch + 1 depend on the chunk counter; the nested rank loop repeats the same version");
     let t_wc = tile_at(b, "WC", wc as i64, 65536);
     let t_cur = tile_at(b, "CURSOR", cursor as i64, 4096);
     let t_base = tile_at(b, "BASE", base_a as i64, 4096);
