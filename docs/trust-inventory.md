@@ -104,7 +104,12 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - Python `amdgpu_jit.launch` 在每个调用签名的第一次启动时逐条求值并检查，违反时抛出 `ContractError` 并指出是哪一条；
 - C++ 主机程序（`tests/gpu/*_host.cpp`）和外部启动器不检查。
 
-**能否补**：可以加一个 `amdc check-launch` 命令（kernarg / grid / 大小 → 违反项），供非 Python 调用方使用。尚未做。
+**非 Python 调用方（本轮新增）**：`amdc check-launch <kernel> --ka OFF=V,... --grid X,Y,Z --size ARG=BYTES,... [--sym NAME=V,...]` 对一次具体启动逐条求值主机契约：
+- 符号从 grid / kernarg 的直接定义或 `sym·c` 形式解出；
+- 输出 `VIOLATED`（违反）、`unchecked`（缺输入）和汇总；
+- 有违反时退出码为 1。
+
+例如 GEMM v4 在 grid (16, 8) 下报告 `kernarg 0x18 = 4096, the contract requires MT·256 = 2048`。
 
 ## 4. 做了越界检查、没做竞争检查（本轮新增计数）
 
@@ -172,7 +177,7 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 ## 6. 建议（按性价比）
 
 1. 采样 / top-k / moe_sorting 的 LDS 归约改用 LdsPlan tile 并加标记，使 `lds-untracked` 归零。
-2. 增加 `amdc check-launch`，让 C++ 主机和外部启动器也能检查主机契约。
+2. `amdc check-launch`（已做，见 §3）。
 3. 全局写不相交证明（已做，见 §4）：下一步补双射事实（XCD 光栅）与步长下界，覆盖 GEMM / attention。
 4. 区间引擎接入循环退出条件和 `x >> log2(g)` 这类关系，可去掉 §1(b) 的大部分 `assume_trusted`。
 5. 调试模式把 `assume` / `assume_trusted` 编成运行时断言（违反时写调试缓冲区），覆盖 §1(a)。
