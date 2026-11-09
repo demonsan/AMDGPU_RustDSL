@@ -548,10 +548,27 @@ fn main() -> ExitCode {
                     syms.entry(n.clone()).or_insert(grid[*ax as usize]);
                 }
             }
-            for (off, e) in &c.ka_defs {
-                if let (amdgpu_dsl::Ext::Sym(n), Some(v)) = (e, ka.get(off)) {
-                    syms.entry(n.clone()).or_insert(*v);
+            // ... and `sym * c` / `c * sym` definitions are solved for the symbol
+            fn solve(e: &amdgpu_dsl::Ext, v: i64, syms: &mut std::collections::HashMap<String, i64>) {
+                use amdgpu_dsl::Ext as E;
+                match e {
+                    E::Sym(n) => {
+                        syms.entry(n.clone()).or_insert(v);
+                    }
+                    E::Mul(a, b) => match (a.as_ref(), b.as_ref()) {
+                        (x, E::Const(k)) | (E::Const(k), x) if *k != 0 && v % k == 0 => solve(x, v / k, syms),
+                        _ => {}
+                    },
+                    _ => {}
                 }
+            }
+            for (off, e) in &c.ka_defs {
+                if let Some(v) = ka.get(off) {
+                    solve(e, *v, &mut syms);
+                }
+            }
+            for (ax, e) in &c.grid_defs {
+                solve(e, grid[*ax as usize], &mut syms);
             }
             fn ev(e: &amdgpu_dsl::Ext, ka: &std::collections::HashMap<u32, i64>, grid: &[i64; 3], syms: &std::collections::HashMap<String, i64>) -> Result<i64, String> {
                 use amdgpu_dsl::Ext as E;
