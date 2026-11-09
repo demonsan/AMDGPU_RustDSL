@@ -111,12 +111,24 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    b.grid_is(0, Ext::ka(160).ceil_div(128));
-    b.grid_is(1, Ext::ka(192));
-    b.grid_is(2, Ext::sym("B"));
+    if causal {
+        b.grid_is(0, Ext::ka(192));
+        b.grid_is(1, Ext::sym("B"));
+        b.grid_is(2, Ext::ka(160).ceil_div(128));
+    } else {
+        b.grid_is(0, Ext::ka(160).ceil_div(128));
+        b.grid_is(1, Ext::ka(192));
+        b.grid_is(2, Ext::sym("B"));
+    }
     let a = args(&mut b);
-    let (qt, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
-    let qt = if causal { let nqt = { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) }; snake8(&mut b, qt, nqt) } else { qt };
+    let (qt, h, bat) = if causal {
+        let nqt = { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) };
+        let qz = b.let_(Op::WorkgroupIdZ);
+        let q = { let v = b.bind_i32(ev(nqt) - 1 - ev(qz)); b.read_first_lane(v) };
+        (q, b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY))
+    } else {
+        (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
+    };
     let lane = Lane::new(&mut b);
     // GQA group G = H / HK (power of two): the KV head
     let gqa = {
@@ -316,18 +328,10 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
 /// `_pair` (causal): CTA x takes key tiles x and nkt - 1 - x (equal work per CTA; the grid is halved) - for grids that still fill the CUs.
-/// Causal work balance across XCDs. Workgroups are dealt to the 8 XCDs round-robin by linear id (x fastest), so with the tile index on x, XCD j only ever gets the tiles j, j + 8, ... : the causal work of a tile
-/// ((16 - t) pairs of 64 queries for dkdv, t + 1 key tiles for dq) then differs by up to 2.4x between XCDs and the slowest XCD sets the time. The snake: in every full row of 8 tiles the odd rows run backwards,
-/// so XCD j gets tiles j and 15 - j (equal total work); the last partial row keeps the identity. `x`, `n` uniform.
-fn snake8(b: &mut FnBuilder, x: ValueId, n: ValueId) -> ValueId {
-    let xi = b.bind_i32(ev(x) + 0);
-    let full = b.bind_i32((ev(n).lshr(3)) << 3);
-    let odd = (ev(xi).lshr(3) & 1).eq(1);
-    let rev = b.bind_i32(odd.select_i32((ev(xi) & !7) + 7 - (ev(xi) & 7), ev(xi)));
-    let v = b.bind_i32(ev(xi).lt(ev(full)).select_i32(ev(rev), ev(xi)));
-    b.read_first_lane(v)
-}
-
+/// Causal launch order: LONGEST FIRST. The hardware takes workgroups in linear-id order and deals them to the 8 XCDs round-robin (32 CUs each, one CTA per CU at a time at this register budget). With the tile
+/// index on x (fastest) the long and short tiles interleave in every XCD queue and a long tile can start late: at 512 CTAs on 256 CUs the causal dkdv took 244 us where longest-first takes 144 us (the same dispatch
+/// model reproduces both: 237 vs 126 us; per-pair cost measured by ATT is the same isolated and under full load). So the causal kernels launch (H, B, tiles) with the tile index slowest and the heaviest tile first
+/// (dq: the highest query tile, dkdv: key tile 0). Non-causal tiles have equal work: unchanged (tiles, H, B).
 pub fn fmha_bwd_dkdv_pair(name: &str) -> Function {
     fmha_bwd_dkdv_x(name, true, true)
 }
@@ -340,14 +344,25 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    b.grid_is(0, if pair { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
-    b.grid_is(1, Ext::ka(192));
-    b.grid_is(2, Ext::sym("B"));
+    let lpt = causal && !pair;   // longest first (see above); the paired form keeps its (tiles, H, B) grid
+    if lpt {
+        b.grid_is(0, Ext::ka(192));
+        b.grid_is(1, Ext::sym("B"));
+        b.grid_is(2, Ext::ka(176).ceil_div(128));
+    } else {
+        b.grid_is(0, if pair { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
+        b.grid_is(1, Ext::ka(192));
+        b.grid_is(2, Ext::sym("B"));
+    }
     // (sched's per-region strategies - reorder,ldshoist on the MFMA regions, reorder,hzfill on softmax / pack: 139.5 -> 114.4 us on the Gemm profile -
     // measured 102.2 vs 98.0 us on top of the Vs128 profile + tokens below: not declared; the region markers stay)
 
     let a = args(&mut b);
-    let (kt0, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let (kt0, h, bat) = if lpt {
+        (b.let_(Op::WorkgroupIdZ), b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY))
+    } else {
+        (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
+    };
     let lane = Lane::new(&mut b);
     let gqa = {
         let mut q = b.c_i32(1);
@@ -371,9 +386,6 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
         let kb_ = { let v = b.bind_i32(ev(nkt) - 1 - ev(kt0)); b.read_first_lane(v) };
         let second = b.bind_cond(ev(kb_).gt(ev(kt0)));
         vec![(kt0, None), (kb_, Some(second))]
-    } else if causal {
-        let nkt = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
-        vec![(snake8(&mut b, kt0, nkt), None)]
     } else {
         vec![(kt0, None)]
     };
