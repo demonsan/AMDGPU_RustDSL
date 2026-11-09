@@ -499,7 +499,8 @@ def check_gemm(kind="bf16", M=256, N=256, K=256, tile="auto", rows=4):
                 ref, mag = sum(terms), sum(abs(x) for x in terms)
                 if kind == "fp8_rowcol":
                     ref, mag = ref * sa[m] * sb[n], mag * sa[m] * sb[n]
-            r.cmp(out[m * N + n], ref, 1e-2 * abs(ref) + 2.0 * K * 2 ** -24 * mag + 1e-6)
+            # fp32 accumulation over K terms (+ the per-block scale products of the scaled kinds: one more rounding per block)
+            r.cmp(out[m * N + n], ref, 1e-2 * abs(ref) + (4.0 if kind in ('fp8_blockscale', 'mxfp4') else 2.0) * K * 2 ** -24 * mag + 1e-6)
     return r
 
 
@@ -542,7 +543,7 @@ def check_prefill(B=1, H=4, HK=2, SQ=384, SK=1024, causal=False, rows=6):
     return r
 
 
-def check_moe(M=16, K=2, E=4, D=1024, I=256, fp8=False, tokens=3):
+def check_moe(M=16, K=2, E=8, D=1024, I=256, fp8=False, tokens=3):
     r = Res(f"fused_moe {'fp8' if fp8 else 'bf16'} M={M} K={K} E={E} D={D} I={I}")
     ids = []
     for _ in range(M):

@@ -164,9 +164,11 @@ def prefill_bf16(q, k, v, out, *, causal=False, lse=None, scale=None, cus=256, s
     # grid: the q tiles and heads from the contract, z = B S
     _, scal = pack_fast(kern.info, {n: (x if isinstance(x, (int, float)) else 0) for n, x in vals.items()})
     ka = scalars_to_ka(kern.info, scal)
-    g = list(contract_grid(kern.info, ka, infer_syms(kern.info, ka)))
+    syms = {"BB": B} if "BB" in [s["name"] for s in kern.info.contract.get("syms", [])] else {}
+    syms = infer_syms(kern.info, ka, None, syms)
+    g = list(contract_grid(kern.info, ka, syms))
     g[2] = B * S
-    launch(name, vals, grid=tuple(g), stream=stream, check=check)
+    launch(name, vals, grid=tuple(g), syms=syms, stream=stream, check=check)
     if S > 1:
         launch("attn_combine_bf16_hd128_q", ptrs=[out, vals["ptr_po"], vals["ptr_plse"], lse], scalars=[H, SQ, S, int(want_lse)], grid=(SQ, H, B), stream=stream, check=check)
     return name, S
@@ -180,7 +182,7 @@ def fused_moe(x, w1, w2, topk_ids, topk_weights, out, *, dtype="bf16", act="silu
     ``shuffle_weight``; w2 = W2 [E, D, I] through ``shuffle_weight``; fp8: per-row weight scales w1_scale f32 [E, 2I] (interleaved like
     W1), w2_scale [E, D]. topk_ids int32 / topk_weights f32 [M, K]; out [M, D] bf16. The routing sort, stage 1 (act * up, bf16 [M, K, I]),
     the per-token fp8 re-quantization (fp8), stage 2 (weighted, f32 [M, K, D]) and the top-k sum run as kernels on the stream; the
-    intermediates live in a workspace. block_m from the dispatch rule. D % 1024 == 0, I % 128 == 0, M K % 4 == 0 (fp8). Returns block_m."""
+    intermediates live in a workspace. block_m from the dispatch rule. E >= 8, D % 1024 == 0, I % 128 == 0, M K % 4 == 0 (fp8). Returns block_m."""
     rx, ri = as_ref(x), as_ref(topk_ids)
     M, D = rx.shape
     K = ri.shape[1]
