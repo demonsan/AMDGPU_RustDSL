@@ -678,7 +678,13 @@ impl<'a> An<'a> {
                 for o in insts {
                     let it = self.int_of(&o);
                     // the tightest comparable bounds of the instance (an interval keeps several candidate bounds)
-                    let mut l = it.lo.first()?.clone();
+                    // a persistent-loop variable (wg + k grid, k >= 0) is >= 0 even when the loop widened its interval
+                    let persistent = matches!(o, Opnd::Var(v) if self.persistent_axis(v).is_some());
+                    let mut l = match it.lo.first() {
+                        Some(x) => x.clone(),
+                        None if persistent => Poly::int(0),
+                        None => return None,
+                    };
                     for x in it.lo.iter().skip(1) {
                         if self.cx.le(&l, x) {
                             l = x.clone();
