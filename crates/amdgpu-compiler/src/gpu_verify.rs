@@ -56,6 +56,8 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// Number of accesses proven in bounds, by space.
     pub proven: BTreeMap<&'static str, usize>,
+    /// (marker statement, reused private region): every access of a tile_over marker avoids the region or stays in the writer's own slice
+    pub own_reuse: BTreeMap<(usize, String), bool>,
     /// > 0 while the analyzer iterates a loop to a fixpoint: nothing is recorded.
     quiet: u32,
 }
@@ -199,6 +201,8 @@ struct An<'a> {
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
     tag: Option<(usize, Itv, Opnd)>,
+    /// statement index of the open tile marker (reuse proofs are recorded per marker)
+    tag_stmt: usize,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
     acc: HashMap<VarId, Itv>,
@@ -380,6 +384,22 @@ impl<'a> An<'a> {
             }
             return;
         }
+        // a tile that REUSES private regions (tile_over): record, per reused region, whether every access of this marker either avoids the region
+        // or lies in the slice of the wave key the region's own markers use (this wave's own, dead-for-itself storage) - gpu_protocol exempts such writes
+        let reused: Vec<usize> = self
+            .f
+            .contract
+            .tile_reuses
+            .iter()
+            .filter(|(n, _)| *n == t.name)
+            .filter_map(|(_, o)| self.f.contract.tiles.iter().position(|x| &x.name == o && x.private))
+            .collect();
+        for pi in reused {
+            let p = self.f.contract.tiles[pi].clone();
+            let own = self.own_slice_of(&p, addr, size);
+            let e = self.rep.own_reuse.entry((self.tag_stmt, p.name.clone())).or_insert(true);
+            *e &= own;
+        }
         let reg = slot.scale(Q::int(t.slot_size as i128)).add_const(t.base as i128);
         let lo_ok = reg.lo.iter().any(|r| addr.lo.iter().any(|a| self.cx.le(r, a)));
         let hi_ok = addr.hi.iter().any(|h| reg.hi.iter().any(|rh| self.cx.le(&h.add(&Poly::int(size)), &rh.add(&Poly::int(t.slot_size as i128)))));
@@ -389,6 +409,38 @@ impl<'a> An<'a> {
             let m = format!("stmt {}: {what}: LDS access {} (+{size}) is not provably inside tile `{}` (slot interval {}, slot size {}, base {})", self.idx, addr.show(), t.name, slot.show(), t.slot_size, t.base);
             self.rep.add("GV-TILE-ESCAPE", Severity::Error, m);
         }
+    }
+
+    /// The current access (`cur_addr`, interval `addr`) avoids the private region `p` entirely, or lies inside the slice of the wave key its own markers
+    /// use (one key operand for all of them; else false).
+    fn own_slice_of(&self, p: &amdgpu_dsl::TileDecl, addr: &Itv, size: i128) -> bool {
+        let (lo, hi) = (p.base as i128, (p.base + p.slot_size * p.slots as i64) as i128);
+        let below = addr.hi.iter().any(|h| self.cx.le(&h.add(&Poly::int(size)), &Poly::int(lo)));
+        let above = addr.lo.iter().any(|l| self.cx.le(&Poly::int(hi), l));
+        if below || above {
+            return true;
+        }
+        let mut keys: Vec<Opnd> = Vec::new();
+        for s in self.f.stmts() {
+            if let Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } = s {
+                if *tile == p.name && !keys.contains(slot) {
+                    keys.push(*slot);
+                }
+            }
+        }
+        let [key] = keys.as_slice() else { return false };
+        let Some((key_atoms, key_c)) = self.lin(key) else { return false };
+        let Some(((mut atoms, c), imm)) = self.cur_addr.clone().and_then(|(o, imm)| self.lin(&o).map(|l| (l, imm))) else { return false };
+        for (k, v) in key_atoms {
+            *atoms.entry(k).or_insert(0) -= v * p.slot_size as i128;
+        }
+        atoms.retain(|_, v| *v != 0);
+        let mut r = Itv::konst(c + imm - key_c * p.slot_size as i128 - p.base as i128);
+        for ((is_var, id), coef) in atoms {
+            let o = if is_var { Opnd::Var(amdgpu_dsl::VarId(id)) } else { Opnd::Val(id) };
+            r = r.add(&self.int_of(&o).scale(Q::int(coef)));
+        }
+        self.prove_range(&r, size, &Itv::konst(p.slot_size as i128)).is_ok()
     }
 
     /// Linear form over atoms (values / loop variables that are not +, constant*, << constant of others): atom coefficients and a constant.
@@ -1373,6 +1425,7 @@ impl<'a> An<'a> {
             Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
             Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
                 self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot), *slot));
+                self.tag_stmt = self.idx;
             }
             Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
             Stmt::StoreU16 { base, byte_off, .. } => {
@@ -1602,7 +1655,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

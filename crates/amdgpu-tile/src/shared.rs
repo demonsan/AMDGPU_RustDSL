@@ -296,7 +296,12 @@ impl LdsPlan {
                 if real_overlap && !ov {
                     panic!("LdsPlan: `{}` {:?} and `{}` {:?} really overlap but no time multiplexing was declared (overlays)", x.name, x.footprint(), y.name, y.footprint());
                 }
-                if decl_overlap || ov {
+                if ov {
+                    // declared time multiplexing: a checked reuse (the protocol engine proves the reused bytes dead for every other wave)
+                    let (new, old) = if self.overlays.iter().any(|(a, c)| a == &x.name && c == &y.name) { (&x.name, &y.name) } else { (&y.name, &x.name) };
+                    b.lds_reuse(new, old);
+                    aliases.push((x.name.clone(), y.name.clone()));
+                } else if decl_overlap {
                     b.lds_alias(&x.name, &y.name);
                     aliases.push((x.name.clone(), y.name.clone()));
                 }

@@ -943,7 +943,7 @@ fn compatible(a: &Trace, b: &Trace) -> bool {
     a.path.iter().filter(|p| p.2).all(|pa| b.path.iter().filter(|p| p.2 && p.0 == pa.0).all(|pb| pb.1 == pa.1))
 }
 
-fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize) {
+fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>) {
     struct Info {
         role: usize,
         ev: Ev,
@@ -1051,6 +1051,59 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
         }
     }
+    // REUSED storage (`lds_reuse`: LdsPlan::tile_over / private(.., overlays)): the new declaration lives in bytes of the old one, so a write of one must
+    // not overlap in time (barrier phases) any access of the other by another wave - the reused range must be dead for EVERY wave that reads it (its
+    // reads completed and a barrier between) - unless the write provably stays in the writer's own slice of a private old region (gpu_verify's
+    // `own_reuse` proof: the wave's own storage, dead for itself by program order). A private region counts as its whole extent (the simulation does
+    // not track wave keys); plain `lds_alias` declarations (overlapping declared extents of interleaved rings) are not reuses and are not checked here.
+    let tiles = &f.contract.tiles;
+    let reuse = |x: usize, y: usize| {
+        let (a, b) = (&tiles[x].name, &tiles[y].name);
+        f.contract.tile_reuses.iter().any(|(p, q)| (p == a && q == b) || (p == b && q == a))
+    };
+    let range = |ev: &Ev| -> (i64, i64) {
+        let t = &tiles[ev.tile];
+        if t.private {
+            (t.base, t.base + t.slot_size * t.slots as i64)
+        } else {
+            (t.base + t.slot_size * ev.slot, t.base + t.slot_size * (ev.slot + 1))
+        }
+    };
+    // a write of a shared reuse tile proven to stay in the writer's own slice of the private region `p`
+    let own = |w: &Info, p: usize| w.ev.produce && !tiles[w.ev.tile].private && tiles[p].private && own_reuse.get(&(w.ev.stmt, tiles[p].name.clone())).copied().unwrap_or(false);
+    for (i, a) in infos.iter().enumerate() {
+        for b in infos.iter().skip(i + 1) {
+            if a.ev.tile == b.ev.tile || !(a.ev.produce || b.ev.produce) || a.ev.global || b.ev.global || !reuse(a.ev.tile, b.ev.tile) {
+                continue;
+            }
+            let (ta, tb) = (&tiles[a.ev.tile], &tiles[b.ev.tile]);
+            if ta.private && tb.private && ta.base == tb.base && ta.slot_size == tb.slot_size {
+                continue; // same per-wave slicing: each wave only touches its own slice of both
+            }
+            if own(a, b.ev.tile) || own(b, a.ev.tile) {
+                continue;
+            }
+            let (ra, rb) = (range(&a.ev), range(&b.ev));
+            if !(ra.0 < rb.1 && rb.0 < ra.1) {
+                continue;
+            }
+            // access windows in barrier phases: a write lasts until it is published, a read until it is completed
+            let win = |x: &Info| -> (u32, u32) { if x.ev.produce { (x.ev.ord, x.publish.unwrap_or(u32::MAX)) } else { (x.ev.ord, x.done_ord.saturating_add(1)) } };
+            let (wa, wb) = (win(a), win(b));
+            if wa.0 < wb.1 && wb.0 < wa.1 {
+                let what = |x: &Info| if x.ev.produce { "write" } else { "read" };
+                diags.push((
+                    "GV-TILE-ALIAS-RACE",
+                    Severity::Error,
+                    a.ev.stmt.max(b.ev.stmt),
+                    format!(
+                        "stmt {} / stmt {}: the {} of `{}` (role {}, phases {}..{}) and the {} of `{}` (role {}, phases {}..{}) may touch the same LDS bytes in [{}, {}): `{}` reuses the storage of `{}` (tile_over / overlays) but no barrier separates them and the write is not provably inside the writer's own slice - the reused range may still be live for another wave (complete the last reads with wait_lds(0) and put a barrier before reusing it, or write only the own wave's slice)",
+                        a.ev.stmt, b.ev.stmt, what(a), name(a.ev.tile), a.role, wa.0, wa.1, what(b), name(b.ev.tile), b.role, wb.0, wb.1, ra.0.max(rb.0), ra.1.min(rb.1), name(a.ev.tile), name(b.ev.tile)
+                    ),
+                ));
+            }
+        }
+    }
     for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
         for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
             if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private {
@@ -1133,6 +1186,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
         }
     }
     let div = divergent_ifs(f);
+    let own_reuse = rep.own_reuse.clone();
     let mut diags: Vec<(&'static str, Severity, usize, String)> = Vec::new();
     let mut untagged: BTreeSet<usize> = BTreeSet::new();
     let mut checked = 0usize;
@@ -1144,7 +1198,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             for b in &t1 {
                 if compatible(a, b) {
                     paths += 1;
-                    check_pair(f, [a, b], n, &mut diags, &mut checked);
+                    check_pair(f, [a, b], n, &mut diags, &mut checked, &own_reuse);
                 }
             }
         }
