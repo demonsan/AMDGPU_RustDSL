@@ -21,6 +21,11 @@ const TRANS_LATENCY: usize = 5;
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
 
+/// `AMDC_NO_FILL_VCC=1`: the old behaviour (no filling in front of a vcc consumer) for A/B measurements
+fn opt_fill_vcc() -> bool {
+    std::env::var("AMDC_NO_FILL_VCC").map_or(true, |v| v.is_empty())
+}
+
 fn is_transcendental(op: MOp) -> bool {
     crate::op_attrs::attrs(op).transcendental
 }
@@ -213,7 +218,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, &hiw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
-            if earliest > cycle && !insts[i].op.consumes_vcc() {
+            // (a vcc consumer may be filled too, with instructions that neither read nor write vcc: they cannot disturb the compare it waits for)
+            let vcc_cons = insts[i].op.consumes_vcc();
+            if earliest > cycle && (!vcc_cons || opt_fill_vcc()) {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
@@ -222,8 +229,13 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                     let cand = &insts[j];
                     // pinned (hand-authored) instructions are never moved, and nothing is moved across them
+                    let touches_vcc = |op: MOp| {
+                        let at = crate::op_attrs::attrs(op);
+                        at.vcc_read || at.vcc_write || at.defines_vcc || at.consumes_vcc || op == MOp::VPtrAdd
+                    };
                     let mut ok = !cand.pin
                         && !insts[i..j].iter().any(|x| x.pin)
+                        && !(vcc_cons && touches_vcc(cand.op))
                         && movable(cand.op)
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, &aw, &hiw, cycle) <= cycle;
@@ -927,7 +939,15 @@ pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
                 rule = "m0-write-to-lds-dma";
                 prod = Some(b.insts[ii - 1].op);
             } else {
-                for p in b.insts[..ii].iter().rev().filter(|x| x.op != MOp::SNop).take(32) {
+                // two passes: first a producer of a hazard class (an MFMA / transcendental / special VALU result the consumer reads), then any
+                let window: Vec<&MInst> = b.insts[..ii].iter().rev().filter(|x| x.op != MOp::SNop).take(32).collect();
+                let hazardous = |p: &MInst| {
+                    let pa = crate::op_attrs::attrs(p.op);
+                    pa.mfma.is_some() || pa.transcendental || cvt_dst_sel_write(p.op, p.imm) || (pa.valu_writer_delay.is_some() && at.reads_valu_hazard)
+                        || p.op == MOp::VAccvgprRead
+                };
+                let order: Vec<&MInst> = window.iter().copied().filter(|p| hazardous(p)).chain(window.iter().copied()).collect();
+                for p in order {
                     let pa = crate::op_attrs::attrs(p.op);
                     let pd = p.dst.map(canon);
                     let reads_it = pd.map_or(false, |d| reads.contains(&d));
