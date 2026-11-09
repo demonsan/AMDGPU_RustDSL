@@ -367,13 +367,25 @@ fn main() -> ExitCode {
                     println!("{{\"splits\":{}}}", amdgpu_kernels::dispatch::blockscale_split_k(m, n, k, cus));
                     ExitCode::SUCCESS
                 }
+                (Some("mla"), Some(b), Some(h), _) => {
+                    // amdc dispatch mla <B> <H>: (head-parallel form?, splits) of the MLA decode
+                    let (hp, s) = amdgpu_kernels::dispatch::mla_config(b, h);
+                    println!("{{\"hp\":{hp},\"splits\":{s}}}");
+                    ExitCode::SUCCESS
+                }
+                (Some("bwd_dkdv_pair"), Some(b), Some(h), Some(sk)) => {
+                    // amdc dispatch bwd_dkdv_pair <B> <H> <SK> [--cus N]: run the paired causal dkdv form?
+                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
+                    println!("{{\"pair\":{}}}", amdgpu_kernels::dispatch::bwd_dkdv_pair(b, h, sk, cus));
+                    ExitCode::SUCCESS
+                }
                 (Some("moe"), Some(m), Some(topk), Some(e)) => {
                     // amdc dispatch moe <M> <TOPK> <E>: block_m of the routing sort and the gemm_moe kernels
                     println!("{{\"block_m\":{}}}", amdgpu_kernels::dispatch::moe_block_m(m, topk, e));
                     ExitCode::SUCCESS
                 }
                 _ => {
-                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E>");
+                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E> | mla <B> <H> | bwd_dkdv_pair <B> <H> <SK> [--cus N]");
                     ExitCode::from(2)
                 }
             }
