@@ -172,7 +172,8 @@ int main(int argc, char** argv) {
     void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
         HC(hipModuleLaunchKernel(fn, gx, gy, gz, blk, 1, 1, 0, nullptr, nullptr, cfg));
-        if (cfn) HC(hipModuleLaunchKernel(cfn, H, B * QL, 1, 128, 1, 1, 0, nullptr, nullptr, ccfg));
+        // (NOCOMB=1: time the decode kernel alone - the check then reads stale output, use for timing only)
+        if (cfn && !envi("NOCOMB", 0)) HC(hipModuleLaunchKernel(cfn, H, B * QL, 1, 128, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
     HC(hipDeviceSynchronize());
