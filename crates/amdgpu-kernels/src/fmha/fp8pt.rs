@@ -13,8 +13,10 @@
 use super::*;
 use amdgpu_tile::tensor::{Dim, KArgs, Stride};
 
-/// The 656-byte ABI of the vendor's fp8 fmha_v3 with the per-tensor descales and its host contract.
-fn declare_io_pt(b: &mut FnBuilder, pair: bool) -> FmhaIo {
+/// The 656-byte ABI of the vendor's fp8 fmha_v3 with the per-tensor descales and its host contract. `kvsplit`: our extension behind it
+/// (0x290 fp16 partials Ohat, 0x298 partial log-sum-exp, 0x2A0 splits in {2, 4, 8}, 0x2A4 rows_total = B S H; grid z = B splits) - the
+/// partial layout of the MXFP8 `_kvsplit`, merged by `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h`.
+fn declare_io_pt(b: &mut FnBuilder, pair: bool, kvsplit: bool) -> FmhaIo {
     let ka = &mut KArgs::new();
     let gqa = ka.i32(b, "s_gqa", 0x0B0);
     b.ka_range(0x0B0, 1, 16);
@@ -24,7 +26,7 @@ fn declare_io_pt(b: &mut FnBuilder, pair: bool) -> FmhaIo {
     let heads = ka.i32(b, "s_q_head_num", 0x140);
     let h = Dim::Ka { off: 0x140, val: heads };
     let (hk, d) = (Dim::sym("HK"), Dim::c(128));
-    let bat = Dim::grid(2);
+    let bat = if kvsplit { Dim::sym("B") } else { Dim::grid(2) };
     let bshd = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
         ka.tensor(name, off, eb, vec![bat.clone(), n.clone(), hh.clone(), d.clone()], vec![Stride::Ka(st[0].0, st[0].1), Stride::Ka(st[1].0, st[1].1), Stride::Ka(st[2].0, st[2].1), Stride::Unit])
             .external_contract()
@@ -45,7 +47,7 @@ fn declare_io_pt(b: &mut FnBuilder, pair: bool) -> FmhaIo {
     // the contract, from the layouts (bytes), as `declare_io`
     let mut ctx = Ctx::new();
     let big = i64::MAX / 4;
-    let cb = ctx.sym_ext("grid_z", 1, big, None, Ext::grid_z());
+    let cb = if kvsplit { ctx.sym_ext("B", 1, big, None, Ext::sym("B")) } else { ctx.sym_ext("grid_z", 1, big, None, Ext::grid_z()) };
     let kas = |ctx: &mut Ctx, name: &str, off: u32| ctx.sym_ext(name, 0, big, None, Ext::ka(off));
     let (cs, cskv, ch) = (kas(&mut ctx, "S", 0x060), kas(&mut ctx, "SK", 0x110), kas(&mut ctx, "H", 0x140));
     let chk = ctx.sym_ext("HK", 1, big, None, Ext::sym("HK"));
@@ -63,8 +65,20 @@ fn declare_io_pt(b: &mut FnBuilder, pair: bool) -> FmhaIo {
     b.grid_is(1, Ext::ka(0x140));
     // causal: two q tiles per block (the vendor's pairing), the grid is halved
     b.grid_is(0, if pair { Ext::ka(0x060).ceil_div(256).ceil_div(2) } else { Ext::ka(0x060).ceil_div(256) });
+    let kvs = kvsplit.then(|| {
+        let splits = ka.dim(b, "kvs_splits", 0x2A0, 1, i64::MAX).val().expect("splits");
+        let rows_total = ka.dim(b, "kvs_rows_total", 0x2A4, 1, i64::MAX).val().expect("rows");
+        b.grid_is(2, Ext::sym("B") * Ext::ka(0x2A0));
+        b.ka_is(0x2A4, Ext::sym("B") * Ext::ka(0x060) * Ext::ka(0x140));
+        let ohat = ka.ptr(b, "ptr_ohat", 0x290);
+        let lse = ka.ptr(b, "ptr_lse_part", 0x298);
+        // fp16 partials in an fp32-sized allocation (as the MXFP8 split)
+        b.arg_tensor("ptr_ohat", Ext::ka(0x2A0) * Ext::ka(0x2A4) * Ext::c(128 * 4));
+        b.arg_tensor("ptr_lse_part", Ext::ka(0x2A0) * Ext::ka(0x2A4) * Ext::c(4));
+        io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total), splits_off: 0x2A0 }
+    });
     let ptr_vd = vsc.ptr;
-    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, vsc: Some(vsc), gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs: None }
+    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, vsc: Some(vsc), gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs }
 }
 
 /// The context of the per-tensor kernels.
@@ -90,7 +104,8 @@ fn pt_pipeline(blk: &FmhaBlock) -> Pipeline {
 
 /// The causal mask of the block: lane limit min(row + SK - SQ + 1, kv_len), the wave's smallest limit (its first row) wave-uniform.
 fn causal_mask(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock) -> CausalMask {
-    let qoff = b.bind_i32(io.kv_len.clone() - io.s_len.clone());
+    // a KV split: keys relative to the split's first key
+    let qoff = if blk.split.is_some() { b.bind_i32(io.kv_len.clone() - io.s_len.clone() - blk.key_lo.clone()) } else { b.bind_i32(io.kv_len.clone() - io.s_len.clone()) };
     let lm = b.bind_i32((&blk.row0 + ev(qoff) + 1).min(ev(blk.kv_len)));
     let lim_min = rfl(b, lm);
     let neg_big = b.c_f32(-1.0e30);
@@ -117,12 +132,34 @@ fn run_pass(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, ring
             body.causal = cm;
             pipe.run(b, role, &mut body);
             let mut fin = body.out_scale(b);
+            let mut any = None;
             if causal {
-                // SQ > SK: rows above the diagonal see no key (l = 0): O = 0 (as the reference / the vendor), not 0 * inf
+                // SQ > SK: rows above the diagonal see no key (l = 0): O = 0 (as the reference / the vendor), not 0 * inf; a causal split: rows
+                // with no key in this part, and every row of an empty part
                 let l = body.sm.l_total(b);
                 let z = b.c_f32(0.0);
-                let any = b.cmp_lt_f32(z, l);
-                fin = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(any), a: Opnd::Val(fin), b: Opnd::Val(z) });
+                let a = b.cmp_lt_f32(z, l);
+                fin = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(a), a: Opnd::Val(fin), b: Opnd::Val(z) });
+                if let Some(e) = blk.split_empty {
+                    let keep = b.bind_cond(ev(e).eq(0));
+                    fin = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(fin), b: Opnd::Val(z) });
+                    any = Some((a, Some(keep)));
+                } else {
+                    any = Some((a, None));
+                }
+            }
+            if io.kvs.is_some() {
+                let l = body.sm.l_total(b);
+                let mut lse = body.sm.lse(b, l);
+                if let Some((a, keep)) = any {
+                    let ninf = b.c_f32(f32::NEG_INFINITY);
+                    lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(a), a: Opnd::Val(lse), b: Opnd::Val(ninf) });
+                    if let Some(k) = keep {
+                        lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(k), a: Opnd::Val(lse), b: Opnd::Val(ninf) });
+                    }
+                }
+                store_partial3(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin, lse);
+                return;
             }
             // causal (two passes): the guard covers only the global stores (verifier path count)
             store_out3_lds_x(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin, causal);
@@ -134,7 +171,7 @@ impl skeleton_vs128::Vs128Slots for PtSlots {
     type Cx = PtCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> PtCx {
         b.compile_profile(CompileProfile::Vs128);
-        let io = declare_io_pt(b, self.causal);
+        let io = declare_io_pt(b, self.causal, false);
         let mode = Some(PtMode { causal: self.causal });
         // non-causal: the XCD block order of `_vs128`; causal (paired): the plain order
         let blk = if self.causal {
@@ -201,4 +238,47 @@ pub fn fmha_fwd_hd128_fp8pt_v3_causal() -> Function {
 fn rfl(b: &mut FnBuilder, v: ValueId) -> ValueId {
     let r = b.read_first_lane(v);
     b.let_(Op::AddI32(Opnd::Val(r), Opnd::I32(0)))
+}
+
+/// The `_kvsplit` slots for the per-tensor FP8 kernels (small grids): the q tile's key range (causal: up to its diagonal) cut into
+/// `splits` parts (grid z = B splits), fp16 partials + log-sum-exp, merged by `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h`. One q tile per
+/// block (no pairing), the `_vs128` body (MUBUF staging, ping-pong priorities, one bias MFMA).
+pub(crate) struct PtKvSlots {
+    causal: bool,
+}
+
+impl skeleton_kvsplit::KvsplitSlots for PtKvSlots {
+    type Cx = PtCx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> PtCx {
+        b.compile_profile(CompileProfile::Vs128);
+        let io = declare_io_pt(b, false, true);
+        let (x, y) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY));
+        let blk = block3_at(&io, b, 8, x, y, Some(PtMode { causal: self.causal }));
+        let roles = Roles::split(b, &blk.lane, 4);
+        let mut ring = KvRing3::new_x(b, &io, &blk, &roles, 2, false);
+        ring.enable_buffer_dma(b);
+        let pipe = pt_pipeline(&blk);
+        let lut = blk.lut_copy(b);
+        PtCx { io, blk, roles, ring, pipe: Some(pipe), lut }
+    }
+    fn pipeline(&mut self, _b: &mut FnBuilder, cx: &mut PtCx) -> Pipeline {
+        cx.pipe.take().expect("the pipeline is taken once")
+    }
+    fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut PtCx, pipe: &Pipeline) {
+        run_pass(b, &cx.io, &cx.blk, &cx.roles, &cx.ring, pipe, cx.lut, self.causal);
+    }
+}
+
+/// Per-tensor FP8 prefill, KV split (phase 1; the combine is `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h`).
+pub fn fmha_fwd_hd128_fp8pt_v3_kvsplit() -> Function {
+    let mut f = skeleton_kvsplit::build_kvsplit("fmha_fwd_hd128_fp8pt_v3_kvsplit", &mut PtKvSlots { causal: false });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
+}
+
+/// Per-tensor FP8 prefill, causal, KV split over each q tile's visible keys.
+pub fn fmha_fwd_hd128_fp8pt_v3_causal_kvsplit() -> Function {
+    let mut f = skeleton_kvsplit::build_kvsplit("fmha_fwd_hd128_fp8pt_v3_causal_kvsplit", &mut PtKvSlots { causal: true });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
 }

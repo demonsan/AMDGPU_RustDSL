@@ -30,8 +30,12 @@ docs in Chinese in `docs/op-coverage-design.md` (relative links, `python tools\c
   `KvRing3::rebuilt` (fresh lane partitions over the same LDS) fixed the paired causal form (OOM -> 252 VGPR); `amdc regplan <k> --json` live_at_peak
   gives the IR origin of every live vreg at the peak. (2) The verifier's tile-protocol simulation enumerates <= 64 paths over runtime ifs containing
   LDS / barriers; `store_out3_lds_x(.., stores_only = true)` keeps the epilogue guard out of that count.
-- Next candidates: hd192 causal pairing with the `rebuilt` idea (bf16v3 has its own `Ring`; 0.74-0.77 now), causal small grids (0.75-0.77), fp8pt
-  gap attribution (ATT, ask sched), bwd 0.72-0.86.
+- Round 2 (same day): hd192 causal pairing (`lane_parts` + `V3Opts::fresh2` in bf16v3.rs; `_causal` paired, new `_causal_np`;
+  `dispatch::hd192_prefill_kernel`): 0.74 -> 0.96-1.01 at U >= 512, small grids 0.77-0.82. fp8pt KV split `_kvsplit` / `_causal_kvsplit` (ABI ext at
+  0x290.., combine = mxfp8 combine8h; `dispatch::fp8pt_prefill_kernel`): B1 H8 4096^2 1.19 / causal 1.32, 2048^2 1.36 / 1.64. Rebinding on hd128
+  causal measured neutral (not enabled). Pre-existing: `fmha_fwd_hd128_bf16_v3_causal_ks` does not assemble (SGPR 104) - backend fix on `sgpr-fix`.
+- Next candidates: hd192 small grids (non-causal B1H8 4096^2 0.66: try `_ks` in the dispatch; causal 0.77-0.82), re-measure bf16 hd128 causal small
+  grids after sgpr-fix, fp8pt gap attribution at large grids (0.90-0.97; ATT via sched), bwd 0.72-0.86.
 ## Open items across my areas (current same-run ratios vs aiter; >1 = ours faster)
 
 - **MXFP4 GEMM** 0.86-0.90× (8192³ 270 vs 242 µs). sched's attribution (docs/mxfp4-gemm-profile.md on origin/sched-mxfp4-prof): DMA-issue

@@ -38,6 +38,8 @@ pub struct KvsArgs {
     pub lse: ValueId,
     pub splits: ValueId,
     pub rows_total: ValueId,
+    /// kernarg offset of `splits` (the contract symbol of the split count)
+    pub splits_off: u32,
 }
 
 impl FmhaIo {
@@ -90,7 +92,7 @@ impl FmhaIo {
             // fp16 partials in an fp32-sized allocation (the host serves both widths)
             b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
             b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
-            Some(KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
+            Some(KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total), splits_off: 0x280 })
         } else {
             ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
             None
@@ -136,7 +138,7 @@ impl FmhaIo {
         let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
         b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
         let g4 = b.bind_i32(C32x32F32::half_base(&lane));
-        FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp: kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4, pt: None }
+        FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp: kv_len, key_lo, nkv, ntiles_total, split, split_empty: None, q, sq, sel, vd, g4, pt: None }
     }
 }
 
@@ -159,6 +161,8 @@ pub struct FmhaBlock {
     pub ntiles_total: ValueId,
     /// KV split index of this block
     pub split: Option<ValueId>,
+    /// causal KV split: this split lies past the block's key range (1 / 0); its partial is discarded (log-sum-exp -inf)
+    pub split_empty: Option<ValueId>,
     pub q: RowFrags,
     pub sq: [ValueId; 2],
     pub sel: ScaleSel,

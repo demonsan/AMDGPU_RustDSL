@@ -887,7 +887,7 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
         let lse = ka.ptr(b, "ptr_lse", 0x278);
         b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
         b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
-        Some(io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
+        Some(io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total), splits_off: 0x280 })
     } else {
         ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
         None
@@ -971,23 +971,32 @@ pub fn block3_at(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, qtile: ValueId, h
     let lane = Lane::new(b);
     let kv_all = b.bind_i32(io.kv_len.clone());
     let ntiles_total = b.bind_i32((ev(kv_all) + 127).lshr(7));
-    let (bidx, kv_len, key_lo, split) = match &io.kvs {
-        None => (zz, kv_all, I32::c(0), None),
-        Some(kv) => {
-            let (bi, si, lg) = components::kv_split_decode(b, zz, kv.splits, 0x280, "B");
-            let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
-            (bi, kv_eff, ev(key_lo), Some(si))
-        }
-    };
     let causal = matches!(pt, Some(PtMode { causal: true }));
-    let kv_len = if causal {
+    let kv_end = if causal {
         // the block's last visible key + 1 = min(256 (qtile + 1) + SK - SQ, SK), at least 1 (rows that see no key: undefined output)
         let v = b.bind_i32((((ev(qtile) + 1) << rows_lg) + (ev(kv_all) - io.s_len.clone())).min(ev(kv_all)).max(1));
         let r = b.read_first_lane(v);
         b.let_(Op::AddI32(Opnd::Val(r), Opnd::I32(0)))
     } else {
-        kv_len
+        kv_all
     };
+    let mut split_empty = None;
+    let (bidx, kv_len, key_lo, split) = match &io.kvs {
+        None => (zz, kv_all, I32::c(0), None),
+        Some(kv) => {
+            let (bi, si, lg) = components::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
+            if causal {
+                // the split covers this block's causal key range (kv_end, computed above); a split past it is empty
+                let (key_lo, kv_eff, empty) = components::kv_split_range_var(b, kv_end, si, lg, 0x110);
+                split_empty = Some(empty);
+                (bi, kv_eff, ev(key_lo), Some(si))
+            } else {
+                let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
+                (bi, kv_eff, ev(key_lo), Some(si))
+            }
+        }
+    };
+    let kv_len = if causal && io.kvs.is_none() { kv_end } else { kv_len };
     let row0 = b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5));
     let row = b.let_i32(&row0 + lane.j());
     let s_last = b.let_i32(&io.s_len - 1);
@@ -1056,8 +1065,14 @@ pub fn block3_at(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, qtile: ValueId, h
     let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
     let g4 = b.bind_i32(C32x32F32::half_base(&lane));
-    let (kv_clamp, ntiles_total) = if causal { (kv_all, nkv) } else { (kv_len, ntiles_total) };
-    FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4, pt: ptsc }
+    // causal: the LUT-copy decision counts the block's tiles; the paired form's ring reads the whole sequence (kv_clamp = SK), the split form
+    // stays inside its part
+    let (kv_clamp, ntiles_total) = match (causal, io.kvs.is_some()) {
+        (true, false) => (kv_all, nkv),
+        (true, true) => (kv_len, b.bind_i32((ev(kv_end) + 127).lshr(7))),
+        _ => (kv_len, ntiles_total),
+    };
+    FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, kv_clamp, key_lo, nkv, ntiles_total, split, split_empty, q, sq, sel, vd, g4, pt: ptsc }
 }
 
 /// The bf16 epilogue through a TiledCopy: the C layout of the scaled 32x32x64 atom (O^T: rows = dims, columns = queries) stored with

@@ -309,6 +309,23 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
 /// MLA prefill (`fmha_fwd_hd192_hd128_bf16_v3[_causal]`, dqk = 192): Q / K head dim 192 (128 nope + 64 rope), V / O 128 (the vendor's
 /// fwd_hd192_hd128 ABI: qk_head_dim 192). K's rope part rides a second ring (rows of 128 bytes); QK runs 12 k-chunks.
 pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Function {
+    // hd192 causal (not the key-split form): the q-tile pairing with fresh lane partitions for the second pass (without them the pair does
+    // not fit the VGPRs); `_np` names the unpaired form (small grids, `dispatch::hd192_prefill_kernel`)
+    let pair = dqk == 192 && !split && !name.ends_with("_np");
+    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair })
+}
+
+/// Build options of `fmha_fwd_bf16_v3_d` (A/B variants).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct V3Opts {
+    /// the paired causal form rebinds the lane partitions (DMA voffsets, read offsets) for its second pass
+    pub fresh2: bool,
+    /// hd192 causal pairs q tiles too
+    pub pair192: bool,
+}
+
+/// `fmha_fwd_bf16_v3_d` with build options.
+pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts: V3Opts) -> Function {
     assert!(dqk == 128 || dqk == 192, "bf16 v3: head dim 128, or 192 / 128");
     let hd192 = dqk == 192;
     #[allow(non_snake_case)]
@@ -358,7 +375,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     b.ka_is(416, sq.clone() * hh.clone() * rowb.clone());
     b.ka_is(464, sq.clone() * Ext::c(4));
     // causal: the vendor's pairing (two q tiles per CTA); hd192 causal runs one q tile per CTA (the second pass's registers do not fit)
-    let pair = causal && !hd192;
+    let pair = causal && (!hd192 || opts.pair192);
     b.grid_is(0, if pair { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
     b.grid_is(1, hh.clone());
     if split {
@@ -429,35 +446,10 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let l16 = b.bind_i32(lane.lane() & 15);
     let k_so0 = { let v = b.bind_i32(ev(bat) * ev(k_bs) + ev(hkv) * ev(k_hs)); b.read_first_lane(v) };
     let v_so0 = { let v = b.bind_i32(ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs)); b.read_first_lane(v) };
-    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
-    let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
-    // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
-    let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
-    // hd192 rope part: 1 KB block bi = w + 4 i (i < 4) = keys 8 bi + lane / 8, chunk lane % 8 (source dims 128 + 8 chunk ..: byte 256 +), ^ key % 8
-    let kb_vo: Vec<ValueId> = if hd192 {
-        (0..4)
-            .map(|i| {
-                let k = b.bind_i32(((ev(wig) + 4 * i) << 3) + lane.lane().lshr(3));
-                b.bind_i32(ev(k) * ev(k_seqs) + 256 + (((lane.lane() & 7) ^ (ev(k) & 7)) << 4))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let kr2: Vec<ValueId> = if hd192 { (0..4).map(|c| b.bind_i32(lane.j() * 128 + (((ev(half) + 2 * c) ^ (lane.lane() & 7)) << 4))).collect() } else { Vec::new() };
+    let parts1 = lane_parts(&mut b, &lane, wig, l16, half, k_seqs, v_seqs, hd192);
+    // the second pass of the paired causal form rebinds them (`fresh2`): reusing the first pass's values keeps them live through its last tile
+    let fresh2 = pair && opts.fresh2;
     let (ks, vs) = (&ks, &vs);
-    // read offsets (as bf16.rs)
-    let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
-    // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
-    // the same key % 16), 16-byte chunk (4 e + 2 ((l % 32) / 16) + (s % 4) / 2) ^ (row % 16), byte 8 (s % 2)
-    let vr: Vec<ValueId> = (0..4)
-        .flat_map(|e| (0..2).map(move |r| (e, r)))
-        .map(|(e, r)| {
-            let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
-            let ch = b.bind_i32(4 * e + ((lane.lane() & 31).lshr(4) << 1) + (lane.lane() & 3).lshr(1));
-            b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((lane.lane() & 1) << 3))
-        })
-        .collect();
 
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(scale, c_l2e);
@@ -523,7 +515,17 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
         }
         None => (lim, lim_min, k_so0, v_so0),
     };
-    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: k_vo.clone(), v_vo: v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: kb_vo.clone(), v_seqs: hd192.then_some(v_seqs) };
+    // pass 2 of the paired form with `fresh2`: its own lane partitions
+    let fresh = (fresh2 && guard.is_some()).then(|| {
+        let half2 = b.bind_i32(lane.half());
+        let l16b = b.bind_i32(lane.lane() & 15);
+        (half2, lane_parts(&mut b, &lane, wig, l16b, half2, k_seqs, v_seqs, hd192))
+    });
+    let (half, lp) = match &fresh {
+        Some((h, p)) => (*h, p),
+        None => (half, &parts1),
+    };
+    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: lp.k_vo.clone(), v_vo: lp.v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: lp.kb_vo.clone(), v_seqs: hd192.then_some(v_seqs) };
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, KT, Ext::ka(272).ceil_div(KT as i64));
     pipe.key_unclamped = true;
 
@@ -531,7 +533,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
         let mut body = Body {
-            ring: &ring, kind, qf: &qf, kr: &kr, kr2: &kr2, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
+            ring: &ring, kind, qf: &qf, kr: &lp.kr, kr2: &lp.kr2, vr: lp.vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
             s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
         };
         pipe.run(b, role, &mut body);
@@ -755,4 +757,49 @@ pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     }
     b.end_if();
     b.finish()
+}
+
+/// The lane partitions of the K / V staging and reads (bound values).
+struct LaneParts {
+    k_vo: Vec<ValueId>,
+    v_vo: Vec<ValueId>,
+    kb_vo: Vec<ValueId>,
+    kr2: Vec<ValueId>,
+    kr: Vec<ValueId>,
+    vr: Vec<ValueId>,
+}
+
+/// DMA voffsets (per group, 4 waves: block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; source chunk ^ (key % 16)),
+/// the hd192 rope-part voffsets and the K / K-rope / V^T read offsets of the lane.
+#[allow(clippy::too_many_arguments)]
+fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, l16: ValueId, half: ValueId, k_seqs: ValueId, v_seqs: ValueId, hd192: bool) -> LaneParts {
+    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
+    let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
+    // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
+    let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
+    // hd192 rope part: 1 KB block bi = w + 4 i (i < 4) = keys 8 bi + lane / 8, chunk lane % 8 (source dims 128 + 8 chunk ..: byte 256 +), ^ key % 8
+    let kb_vo: Vec<ValueId> = if hd192 {
+        (0..4)
+            .map(|i| {
+                let k = b.bind_i32(((ev(wig) + 4 * i) << 3) + lane.lane().lshr(3));
+                b.bind_i32(ev(k) * ev(k_seqs) + 256 + (((lane.lane() & 7) ^ (ev(k) & 7)) << 4))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kr2: Vec<ValueId> = if hd192 { (0..4).map(|c| b.bind_i32(lane.j() * 128 + (((ev(half) + 2 * c) ^ (lane.lane() & 7)) << 4))).collect() } else { Vec::new() };
+    // read offsets (as bf16.rs)
+    let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
+    // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
+    // the same key % 16), 16-byte chunk (4 e + 2 ((l % 32) / 16) + (s % 4) / 2) ^ (row % 16), byte 8 (s % 2)
+    let vr: Vec<ValueId> = (0..4)
+        .flat_map(|e| (0..2).map(move |r| (e, r)))
+        .map(|(e, r)| {
+            let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
+            let ch = b.bind_i32(4 * e + ((lane.lane() & 31).lshr(4) << 1) + (lane.lane() & 3).lshr(1));
+            b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((lane.lane() & 1) << 3))
+        })
+        .collect();
+    LaneParts { k_vo, v_vo, kb_vo, kr2, kr, vr }
 }
