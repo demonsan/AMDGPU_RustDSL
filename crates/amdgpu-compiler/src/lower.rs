@@ -4010,7 +4010,15 @@ pub fn maskreg_on() -> bool {
 }
 
 pub fn mask_cmp_pairs(m: &mut MFunction) {
+    // AMDC_MASKREG_OPS=lt,ge,gt,ne,ltf: restrict the converted compares (bisection)
+    let only = std::env::var("AMDC_MASKREG_OPS").ok().filter(|s| !s.is_empty());
+    let allowed = |tag: &str| only.as_ref().map_or(true, |s| s.split(',').any(|x| x == tag));
     let mask_op = |op: MOp| match op {
+        MOp::VCmpLtI32 if !allowed("lt") => None,
+        MOp::VCmpGeI32 if !allowed("ge") => None,
+        MOp::VCmpGtI32 if !allowed("gt") => None,
+        MOp::VCmpNeI32 if !allowed("ne") => None,
+        MOp::VCmpLtF32 if !allowed("ltf") => None,
         MOp::VCmpLtI32 => Some(MOp::VCmpMaskLtI32),
         MOp::VCmpGeI32 => Some(MOp::VCmpMaskGeI32),
         MOp::VCmpGtI32 => Some(MOp::VCmpMaskGtI32),
