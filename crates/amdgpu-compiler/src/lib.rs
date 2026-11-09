@@ -214,6 +214,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 if !pe.is_empty() {
                     return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
                 }
+                // after the scheduler (it would cluster the compares and keep many masks live), before the hazard filler (which interleaves them)
+                if lower::maskreg_on() {
+                    lower::mask_cmp_pairs(&mut m);
+                }
                 hazards::fix_value_hazards_opts(&mut m, true);
                 let errs = mir::verify(&m);
                 if !errs.is_empty() {
@@ -245,6 +249,9 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let pe = pin_check::check(&m);
     if !pe.is_empty() {
         return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
+    }
+    if lower::maskreg_on() {
+        lower::mask_cmp_pairs(&mut m);
     }
     hazards::fix_value_hazards(&mut m);
     let errs = mir::verify(&m);

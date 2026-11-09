@@ -405,9 +405,6 @@ impl Lowerer {
             dce_cmp_pairs(&mut self.mir);
             fuse_minmax3(&mut self.mir);
         }
-        if opt_on("maskreg") || std::env::var("AMDC_MASKREG").map_or(false, |v| v == "1") {
-            mask_cmp_pairs(&mut self.mir);
-        }
         // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
         // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
         dce_full(&mut self.mir, true);
@@ -4003,7 +4000,16 @@ fn fold_select_cmp(m: &mut MFunction) {
 /// `v_cndmask_b32_e64 .., s[..]`: independent masks no longer serialize on vcc, so the hazard filler can cover a compare's wait states with
 /// the next compares instead of `s_nop`. A compare is converted only when every vcc reader up to the next vcc definition in its block is a
 /// `v_cndmask` (and the vcc does not reach the block's end).
-fn mask_cmp_pairs(m: &mut MFunction) {
+/// Is the `maskreg` conversion on (the `maskreg` lowering option, or AMDC_MASKREG=1 / 0 to force)?
+pub fn maskreg_on() -> bool {
+    match std::env::var("AMDC_MASKREG").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => opt_on("maskreg"),
+    }
+}
+
+pub fn mask_cmp_pairs(m: &mut MFunction) {
     let mask_op = |op: MOp| match op {
         MOp::VCmpLtI32 => Some(MOp::VCmpMaskLtI32),
         MOp::VCmpGeI32 => Some(MOp::VCmpMaskGeI32),
