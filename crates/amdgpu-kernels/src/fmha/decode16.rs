@@ -49,12 +49,6 @@ pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_all(name, page, kt, 0, false, true)
 }
 
-/// `_la` / `_fla` (lookahead): the block-table lookups of tile t + 1 are issued right after tile t's DMAs and carried in the loop state, so
-/// a tile's chain is DMA -> wait -> compute (one memory latency instead of two).
-pub fn pa_decode16_la(name: &str, page: i32, fused: bool) -> Function {
-    pa_decode16_gen(name, page, 32, 0, false, fused, true)
-}
-
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -73,11 +67,6 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 }
 
 fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
-    pa_decode16_gen(name, page, kt, kvm, mtp, fused, false)
-}
-
-fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool, la: bool) -> Function {
-    assert!(!la || (kvm == 0 && !mtp), "decode16 lookahead: bf16, qlen 1");
     assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
@@ -291,42 +280,16 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // loop state: it, m, l, O^T (8 blocks of 16 d), S^T (4 blocks of 16 keys)
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
-    // lookahead: page of key key_t + kk_of(i) for the next tile (index i)
-    let lookup = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32, i: i32| -> (ValueId, ValueId) {
-        let key = b.bind_i32(key_t + kk_of(i));
-        let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-        let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-        (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
-    };
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
-    if la {
-        for i in 0..KT / 4 {
-            let (_, pv) = lookup(&mut b, ev(k_lo), i);
-            let pi = b.bitcast_i32(pv);
-            inits.push((DType::I32, Opnd::Val(pi)));
-        }
-    }
     let vars = b.begin_loop(&inits);
-    let la_vars: Vec<VarId> = if la { vars[11 + NKB..11 + NKB + (KT / 4) as usize].to_vec() } else { Vec::new() };
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..11].to_vec();
     let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    let lookups: Vec<(ValueId, ValueId)> = if la {
-        // the carried pages (issued in the previous iteration / the prologue)
-        (0..KT / 4)
-            .map(|i| {
-                let key = b.bind_i32(ev(key_t) + kk_of(i));
-                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-                let pg = b.bind_i32(amdgpu_dsl::varx(la_vars[i as usize]) + 0);
-                let pgf = b.bitcast_f32(pg);
-                (kc, pgf)
-            })
-            .collect()
-    } else { (0..if fp8 { KT / 8 } else { KT / 4 })
+    let lookups: Vec<(ValueId, ValueId)> = (0..if fp8 { KT / 8 } else { KT / 4 })
         .map(|i| {
             // (fp8 rows of 128 bytes: 8 lanes per key, keys 8 i + l / 8)
             let key = if fp8 { b.bind_i32(ev(key_t) + (lane.lane().lshr(3)) + 8 * i) } else { b.bind_i32(ev(key_t) + kk_of(i)) };
@@ -334,7 +297,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
         })
-        .collect() };
+        .collect();
     // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
     let nv = lookups.len() as u8;
     let rows: Vec<(ValueId, ValueId)> = lookups
@@ -431,9 +394,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }),
     }
-    // lookahead: the next tile's pages (in flight behind this tile's compute; QK still waits only for K)
-    let next_pages: Vec<ValueId> = if la { (0..KT / 4).map(|i| { let kt_n = ev(key_t) + KT; lookup(&mut b, kt_n, i).1 }).collect() } else { Vec::new() };
-    b.wait_vm(nv + next_pages.len() as u8);
+    b.wait_vm(nv);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
     me.read_back(&mut b, Opnd::Var(it), |b| {
@@ -573,10 +534,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }
     });
-    for (v, p) in la_vars.iter().zip(&next_pages) {
-        let pi = b.bitcast_i32(*p);
-        b.set_var(*v, pi);
-    }
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
