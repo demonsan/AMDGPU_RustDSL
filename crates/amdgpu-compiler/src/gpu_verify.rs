@@ -217,6 +217,9 @@ struct An<'a> {
     tag: Option<(usize, Itv, Opnd)>,
     /// statement index of the open tile marker (reuse proofs are recorded per marker)
     tag_stmt: usize,
+    /// plain global / buffer stores outside `buf_region` markers (statement -> pointer kernarg, symbolic linear byte offset, size): the
+    /// cross-workgroup disjointness proof runs over them at the end
+    gstores: BTreeMap<usize, (u32, Option<SLin>, i128)>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
     acc: HashMap<VarId, Itv>,
@@ -344,12 +347,255 @@ impl<'a> An<'a> {
         }
     }
 
-    /// A global store outside a `buf_region` marker: bounds-checked, but its disjointness from the other workgroups' stores is trusted.
-    fn note_global_store(&mut self, store: bool) {
-        if store && !self.tag.as_ref().map_or(false, |(ti, _, _)| self.f.contract.tiles[*ti].global) {
-            self.rep.unchecked_access("global-write-untracked");
+    // ---------------------------------------------------------------------------------------------------------------- cross-workgroup stores
+    /// Symbolic linear form: atom -> coefficient (a polynomial over the contract symbols), plus a constant polynomial. Uniform values with an
+    /// exact (point) interval are constants; workgroup ids, lane-derived values and loop variables are atoms.
+    fn slin(&self, o: &Opnd, depth: usize) -> Option<SLin> {
+        if depth > 32 {
+            return None;
+        }
+        let atom = |k: (bool, u32)| Some((BTreeMap::from([(k, Poly::int(1))]), Poly::int(0)));
+        match o {
+            Opnd::I32(c) => Some((BTreeMap::new(), Poly::int(*c as i128))),
+            Opnd::F32(_) => None,
+            Opnd::Var(v) => atom((true, v.0)),
+            Opnd::Val(v) => {
+                let def = self.defs.get(v);
+                if let Some(Op::ConstI32(c)) = def {
+                    return Some((BTreeMap::new(), Poly::int(*c as i128)));
+                }
+                if !matches!(def, Some(Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ | Op::WorkitemId)) {
+                    let it = self.int_of(o);
+                    if it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0] {
+                        return Some((BTreeMap::new(), it.lo[0].clone()));
+                    }
+                }
+                match def {
+                    Some(Op::AddI32(a, b)) => Some(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?)),
+                    Some(Op::MulI32(a, b)) => {
+                        let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
+                        let (k, (atoms, c)) = if x.0.is_empty() {
+                            (x.1, y)
+                        } else if y.0.is_empty() {
+                            (y.1, x)
+                        } else {
+                            return atom((false, v.0));
+                        };
+                        let mut m = BTreeMap::new();
+                        for (a, p) in atoms {
+                            m.insert(a, p.mul(&k)?);
+                        }
+                        Some((m, c.mul(&k)?))
+                    }
+                    Some(Op::ShlI32(a, b)) => match self.int_of(b).point_const() {
+                        Some(s) if s.d == 1 && (0..31).contains(&s.n) => {
+                            let (x, c) = self.slin(a, depth + 1)?;
+                            let f = Q::int(1i128 << s.n);
+                            Some((x.into_iter().map(|(k, p)| (k, p.scale(f))).collect(), c.scale(f)))
+                        }
+                        _ => atom((false, v.0)),
+                    },
+                    // a masked store: the sentinel arm (an offset >= 2^30, dropped by the descriptor's range check, which the bounds proof
+                    // establishes) writes nothing - only the live arm matters
+                    Some(Op::Select { a, b, .. }) => {
+                        let big = |o: &Opnd| self.int_of(o).lo.iter().any(|l| self.cx.le(&Poly::int(1 << 30), l));
+                        if big(b) {
+                            self.slin(a, depth + 1)
+                        } else if big(a) {
+                            self.slin(b, depth + 1)
+                        } else {
+                            atom((false, v.0))
+                        }
+                    }
+                    _ => atom((false, v.0)),
+                }
+            }
         }
     }
+
+    /// The pointer kernarg a pointer value derives from and its byte offset as a symbolic linear form.
+    fn ptr_slin(&self, o: &Opnd, depth: usize) -> Option<(u32, SLin)> {
+        if depth > 32 {
+            return None;
+        }
+        let Opnd::Val(v) = o else { return None };
+        match self.defs.get(v)? {
+            Op::KernargPtr { offset } => Some((*offset, (BTreeMap::new(), Poly::int(0)))),
+            Op::PtrAdd { base, byte_off } => {
+                let (arg, l) = self.ptr_slin(base, depth + 1)?;
+                Some((arg, slin_add(l, self.slin(byte_off, depth + 1)?)))
+            }
+            Op::PtrMadU32 { base, a, b } => {
+                let (arg, l) = self.ptr_slin(base, depth + 1)?;
+                let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
+                let (k, (atoms, c2)) = if x.0.is_empty() {
+                    (x.1, y)
+                } else if y.0.is_empty() {
+                    (y.1, x)
+                } else {
+                    return None;
+                };
+                let mut m = BTreeMap::new();
+                for (at, p) in atoms {
+                    m.insert(at, p.mul(&k)?);
+                }
+                Some((arg, slin_add(l, (m, c2.mul(&k)?))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Records a plain global store (not under a `buf_region` marker) for the cross-workgroup disjointness proof.
+    fn record_store(&mut self, base: Option<(u32, SLin)>, extra: Option<SLin>, imm: i128, size: i128) {
+        if self.rep.quiet > 0 || self.tag.as_ref().map_or(false, |(ti, _, _)| self.f.contract.tiles[*ti].global) {
+            return;
+        }
+        let rec = match (base, extra) {
+            (Some((arg, l)), Some(e)) => {
+                let (a, c) = slin_add(l, e);
+                (arg, Some((a, c.add(&Poly::int(imm)))))
+            }
+            (Some((arg, _)), None) => (arg, None),
+            _ => (u32::MAX, None),
+        };
+        self.gstores.insert(self.idx, (rec.0, rec.1, size));
+    }
+
+    fn record_global_store(&mut self, base: &Opnd, byte_off: i128, size: i128) {
+        let b = self.ptr_slin(base, 0);
+        let e = b.as_ref().map(|_| (BTreeMap::new(), Poly::int(0)));
+        self.record_store(b, e, byte_off, size);
+    }
+
+    fn record_buffer_store(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
+        let base = match rsrc {
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::BufferRsrc { base, .. } | Op::BufferRsrcDyn { base, .. }) => self.ptr_slin(base, 0),
+                _ => None,
+            },
+            _ => None,
+        };
+        let extra = (|| {
+            let a = match voff {
+                Some(o) => self.slin(o, 0)?,
+                None => (BTreeMap::new(), Poly::int(0)),
+            };
+            Some(slin_add(a, self.slin(soff, 0)?))
+        })();
+        self.record_store(base, extra, imm, size);
+    }
+
+    /// Cross-workgroup disjointness of the recorded stores, per pointer argument: the offset map (workgroup ids, lane values, loop variables
+    /// and the per-store constants as digits) is injective - sorted by coefficient, every coefficient is at least the span of the smaller digits
+    /// plus the access size (a mixed radix) - and every workgroup axis that can exceed 1 is one of its digits, so two different workgroups can
+    /// never write the same byte. Returns the number of stores proven / not proven.
+    fn global_disjointness(&self) -> (usize, usize) {
+        let mut by_arg: BTreeMap<u32, Vec<&(u32, Option<SLin>, i128)>> = BTreeMap::new();
+        for s in self.gstores.values() {
+            by_arg.entry(s.0).or_default().push(s);
+        }
+        let (mut ok, mut bad) = (0, 0);
+        for (arg, ss) in by_arg {
+            if arg != u32::MAX && self.disjoint_group(&ss) {
+                ok += ss.len();
+            } else {
+                bad += ss.len();
+            }
+        }
+        (ok, bad)
+    }
+
+    fn disjoint_group(&self, ss: &[&(u32, Option<SLin>, i128)]) -> bool {
+        let cx = &self.cx;
+        let Some(first) = ss[0].1.as_ref() else { return false };
+        let atoms = &first.0;
+        let mut consts: Vec<Poly> = Vec::new();
+        let mut size: i128 = 0;
+        for s in ss {
+            let Some((a, c)) = s.1.as_ref() else { return false };
+            if a != atoms {
+                return false;
+            }
+            consts.push(c.clone());
+            size = size.max(s.2);
+        }
+        // the per-store constants: numeric differences to the first -> one pseudo digit (gcd stride)
+        let c0 = consts[0].clone();
+        let mut diffs: Vec<i128> = Vec::new();
+        for c in &consts {
+            match c.sub(&c0).as_const() {
+                Some(q) if q.d == 1 => diffs.push(q.n),
+                _ => return false,
+            }
+        }
+        let lo = *diffs.iter().min().unwrap();
+        let hi = *diffs.iter().max().unwrap();
+        let g = diffs.iter().fold(0i128, |acc, d| gcd(acc, d - lo));
+        // digits: (coefficient >= 0, span >= 0)
+        let mut digits: Vec<(Poly, Poly)> = Vec::new();
+        if hi > lo {
+            digits.push((Poly::int(g), Poly::int((hi - lo) / g)));
+        }
+        let mut wg_axes = [false; 3];
+        for (k, c) in atoms {
+            let o = if k.0 { Opnd::Var(VarId(k.1)) } else { Opnd::Val(k.1) };
+            if !k.0 {
+                match self.defs.get(&k.1) {
+                    Some(Op::WorkgroupIdX) => wg_axes[0] = true,
+                    Some(Op::WorkgroupIdY) => wg_axes[1] = true,
+                    Some(Op::WorkgroupIdZ) => wg_axes[2] = true,
+                    _ => {}
+                }
+            }
+            let it = self.int_of(&o);
+            let (Some(l), Some(h)) = (it.lo.first(), it.hi.first()) else { return false };
+            let m = h.sub(l);
+            if !cx.nonneg(&m) {
+                return false;
+            }
+            let c = if cx.nonneg(c) {
+                c.clone()
+            } else if cx.nonneg(&c.scale(Q::int(-1))) {
+                c.scale(Q::int(-1))
+            } else {
+                return false;
+            };
+            digits.push((c, m));
+        }
+        // every workgroup axis that can hold more than one workgroup must be a digit
+        for (ax, seen) in wg_axes.iter().enumerate() {
+            if !seen && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
+                return false;
+            }
+        }
+        // sort by coefficient (every pair must be comparable)
+        let n = digits.len();
+        for i in 0..n {
+            for j in i + 1..n {
+                if cx.le(&digits[i].0, &digits[j].0) {
+                    continue;
+                }
+                if cx.le(&digits[j].0, &digits[i].0) {
+                    digits.swap(i, j);
+                } else {
+                    return false;
+                }
+            }
+        }
+        let mut acc = Poly::int(size);
+        for (c, m) in &digits {
+            if m.0.is_empty() {
+                continue; // a single-valued digit
+            }
+            if !cx.le(&acc, c) {
+                return false;
+            }
+            let Some(cm) = c.mul(m) else { return false };
+            acc = acc.add(&cm);
+        }
+        true
+    }
+
 
     /// Under a tile marker, the access must lie inside the marked tile / ring (hull over the slot interval).
     fn tile_cover(&mut self, what: &str, addr: &Itv, size: i128) {
@@ -533,7 +779,6 @@ impl<'a> An<'a> {
             }
             return;
         }
-        self.note_global_store(store);
         let (arg, off) = match base {
             AV::Ptr { arg: Some(a), off } => (*a, off.clone()),
             _ => {
@@ -589,7 +834,7 @@ impl<'a> An<'a> {
             }
             return;
         }
-        self.note_global_store(store);
+        let _ = store;
         let AV::Rsrc { arg, num, base: boff } = rsrc else {
             let m = format!("stmt {}: {what}: descriptor operand is not a known buffer descriptor", self.idx);
             self.rep.add("GV-GLB-PROV", Severity::Error, m);
@@ -1459,22 +1704,27 @@ impl<'a> An<'a> {
             }
             Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
             Stmt::StoreU16 { base, byte_off, .. } => {
+                self.record_global_store(base, *byte_off as i128, 2);
                 let b = self.av_of(base);
                 self.check_global("store_u16", &b, *byte_off as i128, 2, true)
             }
             Stmt::StoreF32 { base, byte_off, .. } | Stmt::StoreF32Wt { base, byte_off, .. } => {
+                self.record_global_store(base, *byte_off as i128, 4);
                 let b = self.av_of(base);
                 self.check_global("store_f32", &b, *byte_off as i128, 4, true)
             }
             Stmt::StoreF32x2 { base, byte_off, .. } => {
+                self.record_global_store(base, *byte_off as i128, 8);
                 let b = self.av_of(base);
                 self.check_global("store_f32x2", &b, *byte_off as i128, 8, true)
             }
             Stmt::StoreF32x4 { base, byte_off, .. } => {
+                self.record_global_store(base, *byte_off as i128, 16);
                 let b = self.av_of(base);
                 self.check_global("store_f32x4", &b, *byte_off as i128, 16, true)
             }
             Stmt::BufferStore { rsrc, voff, soff, imm, dwords, .. } => {
+                self.record_buffer_store(rsrc, voff, soff, *imm as i128, 4 * *dwords as i128);
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer store", &r, voff, soff, *imm as i128, 4 * *dwords as i128, true);
             }
@@ -1503,10 +1753,12 @@ impl<'a> An<'a> {
             Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
         Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
             Stmt::StoreGlobalN { base, byte_off, ty, .. } => {
+                self.record_global_store(base, *byte_off as i128, ty.bytes() as i128);
                 let b = self.av_of(base);
                 self.check_global("global store", &b, *byte_off as i128, ty.bytes() as i128, true)
             }
             Stmt::BufferStoreN { rsrc, voff, soff, imm, ty, .. } => {
+                self.record_buffer_store(rsrc, voff, soff, *imm as i128, ty.bytes() as i128);
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer store", &r, voff, soff, *imm as i128, ty.bytes() as i128, true);
             }
@@ -1685,7 +1937,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
@@ -1702,6 +1954,13 @@ pub fn verify_ir(f: &Function) -> Report {
         }
     }
     an.run();
+    let (gw_ok, gw_bad) = an.global_disjointness();
+    for _ in 0..gw_ok {
+        an.rep.ok("global-write-disjoint");
+    }
+    for _ in 0..gw_bad {
+        an.rep.unchecked_access("global-write-untracked");
+    }
     let has_asm = an.has_asm;
     let mut rep = an.rep;
     if has_asm {
@@ -1716,6 +1975,29 @@ pub fn verify_ir(f: &Function) -> Report {
 
 // --------------------------------------------------------------------------------------------------------------------------------------------
 // MIR level: register legality + path-sensitive wait / lifetime
+
+/// Symbolic linear form of an i32 value: atom (is_var, id) -> coefficient polynomial, plus a constant polynomial.
+type SLin = (std::collections::BTreeMap<(bool, u32), Poly>, Poly);
+
+fn slin_add(x: SLin, y: SLin) -> SLin {
+    let (mut a, c1) = x;
+    for (k, v) in y.0 {
+        let e = a.entry(k).or_insert(Poly::int(0));
+        *e = e.add(&v);
+    }
+    a.retain(|_, v| !v.0.is_empty());
+    (a, c1.add(&y.1))
+}
+
+fn gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
 
 const VGPR_LIMIT: u32 = 256;
 const SGPR_LIMIT: u32 = 102;
