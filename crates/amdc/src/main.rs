@@ -353,8 +353,27 @@ fn main() -> ExitCode {
                     println!("{{\"kernel\":\"{kernel}\",\"form\":\"{form}\",\"splits\":{s},\"b\":{b},\"hk\":{hk},\"ctx\":{ctx},\"page\":{page}}}");
                     ExitCode::SUCCESS
                 }
+                (Some("prefill_bf16"), Some(b), Some(h), Some(sq)) => {
+                    // amdc dispatch prefill_bf16 <B> <H> <SQ> <SK> <causal 0|1> [--cus N]
+                    let (sk, causal) = (num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0);
+                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
+                    let (kernel, s) = amdgpu_kernels::dispatch::bf16_prefill_kernel(b, h, sq, sk, causal, cus);
+                    println!("{{\"kernel\":\"{kernel}\",\"splits\":{s}}}");
+                    ExitCode::SUCCESS
+                }
+                (Some("gemm_blockscale"), Some(m), Some(n), Some(k)) => {
+                    // amdc dispatch gemm_blockscale <M> <N> <K> [--cus N]: the split-K factor of gemm_a8w8_blockscale
+                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
+                    println!("{{\"splits\":{}}}", amdgpu_kernels::dispatch::blockscale_split_k(m, n, k, cus));
+                    ExitCode::SUCCESS
+                }
+                (Some("moe"), Some(m), Some(topk), Some(e)) => {
+                    // amdc dispatch moe <M> <TOPK> <E>: block_m of the routing sort and the gemm_moe kernels
+                    println!("{{\"block_m\":{}}}", amdgpu_kernels::dispatch::moe_block_m(m, topk, e));
+                    ExitCode::SUCCESS
+                }
                 _ => {
-                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P]");
+                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E>");
                     ExitCode::from(2)
                 }
             }
