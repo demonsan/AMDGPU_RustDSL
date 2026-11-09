@@ -108,8 +108,8 @@ pub fn fmha_bwd_dot(name: &str) -> Function {
 
 /// dQ per 128-query tile (see the module doc). Grid (ceil(SQ / 128), H, B), 4 waves x 32 queries.
 pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
+    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
-    b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(160).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
@@ -315,8 +315,8 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
+    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
-    b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(176).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
