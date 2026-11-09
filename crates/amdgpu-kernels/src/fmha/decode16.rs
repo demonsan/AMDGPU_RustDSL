@@ -43,6 +43,12 @@ pub fn pa_decode16_mtp(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_kvm(name, page, kt, 0, true)
 }
 
+/// `_f` (fused combine, S = 1): the CTA's 4 wave partials are merged in LDS (over the dead K / V regions) and the bf16 output O [B, H, D] is
+/// written at ptr_po (slot 0) - no partials, no combine kernel.
+pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
+    pa_decode16_all(name, page, kt, 0, false, true)
+}
+
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -57,6 +63,11 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
 }
 
 fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Function {
+    pa_decode16_all(name, page, kt, kvm, mtp, false)
+}
+
+fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
+    assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
     assert!(!fp8 || kt == 32, "decode16 fp8: 32-key tiles");
@@ -119,7 +130,12 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     }
     b.arg_tensor("ptr_bt", bb.clone() * mp * Ext::c(4));
     b.arg_tensor("ptr_cl", bb.clone() * Ext::c(4));
-    b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(4 * 4 * D as i64));
+    if fused {
+        b.ka_is(176, Ext::c(1));
+        b.arg_tensor("ptr_po", bb.clone() * hh.clone() * Ext::c(2 * D as i64));
+    } else {
+        b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(4 * 4 * D as i64));
+    }
     b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(16));
 
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 16 * i });
@@ -224,7 +240,15 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     // fp8: the staged fp8 V rows (converted into the bf16 V tile)
     let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
+    // fused: wave w's normalized partial O [16 cols][128] f32 over its own K region (8 KB w) and its LSE [16] at the start of its own V
+    // region (32 KB + 8 KB w): a wave writes only its own dead storage, before the barrier
+    const EPI_L: i32 = 32768;
+    assert!(!fused || KT == 32, "decode16 fused: 32-key tiles (8 KB K / V per wave)");
+    let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 3 * 8192 + 64) as i64, &[&kreg, &vreg]));
     lds.commit(&mut b);
+    // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
+    let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
+    let epi_l = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 2) + EPI_L));
     let me = kreg.mine(wv);
     let mev = vreg.mine(wv);
     let mvs = vsreg.as_ref().map(|r| r.mine(wv));
@@ -527,8 +551,25 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     let big = b.c_i32(0x7fff_fff0);
     let po_vo_r = b.bind_i32(ev(row_po) + (ev(grp) << 4));
     let po_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(po_vo_r), b: Opnd::Val(big) });
-    let r_po = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    for db in 0..8usize {
+    let ov_n: Vec<ValueId> = if fused {
+        (0..8usize)
+            .map(|db| {
+                let v: Vec<ValueId> = (0..4u8)
+                    .map(|k| {
+                        let x = b.frag4_lane(Opnd::Var(ov[db]), k);
+                        let x = b.bitcast_f32(x);
+                        let y = b.mul_f32(x, inv);
+                        b.bitcast_i32(y)
+                    })
+                    .collect();
+                b.frag4(v[0], v[1], v[2], v[3])
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let r_po = if fused { c0 } else { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+    for db in 0..if fused { 0 } else { 8usize } {
         let v: Vec<ValueId> = (0..4u8)
             .map(|k| {
                 let x = b.frag4_lane(Opnd::Var(ov[db]), k);
@@ -545,12 +586,35 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     let ln2 = b.c_f32(std::f32::consts::LN_2);
     let lse0 = b.mul_f32(x, ln2);
     let lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(lse0), b: Opnd::Val(neg_inf) });
-    let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
-    let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
-    let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
-    b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
+    if let (Some(e), Some(eo), Some(el)) = (&epi, epi_o, epi_l) {
+        e.at(&amdgpu_tile::SlotIdx::new(0, 0)).write(&mut b, |b| {
+            for (db, f4) in ov_n.iter().enumerate() {
+                let a = b.bind_i32(ev(eo) + 64 * db as i32);
+                b.store_lds_b128(a, *f4);
+            }
+            let li = b.bitcast_i32(lse);
+            b.store_lds_b32(el, li);
+        });
+    } else {
+        let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+        let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
+        let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
+        b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
+    }
     b.else_();
-    {
+    if let (Some(e), Some(eo), Some(el)) = (&epi, epi_o, epi_l) {
+        // an empty wave: O = 0, LSE = -inf
+        let z = b.c_i32(0);
+        let z4 = b.frag4(z, z, z, z);
+        e.at(&amdgpu_tile::SlotIdx::new(0, 0)).write(&mut b, |b| {
+            for db in 0..8i32 {
+                let a = b.bind_i32(ev(eo) + 64 * db);
+                b.store_lds_b128(a, z4);
+            }
+            let ni = b.bitcast_i32(neg_inf);
+            b.store_lds_b32(el, ni);
+        });
+    } else {
         let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
         let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
         let big = b.c_i32(0x7fff_fff0);
@@ -558,6 +622,65 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
         b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf);
     }
     b.end_if();
+    if let Some(e) = &epi {
+        // ---- fused combine: thread t = (column t / 16, 8 d at 8 (t % 16)) merges the 4 wave partials, bf16 out ----
+        b.wait_lds(0);
+        b.barrier();
+        let zf = b.c_f32(0.0);
+        let c0 = b.c_i32(0);
+        let tid = b.let_(Op::WorkitemId);
+        let col = b.bind_i32(ev(tid).lshr(4));
+        let d0 = b.bind_i32((ev(tid) & 15) << 3);
+        let (ls, os): (Vec<ValueId>, Vec<(ValueId, ValueId)>) = e.at(&amdgpu_tile::SlotIdx::new(0, 0)).read(&mut b, |b| {
+            let ls = (0..4i32).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 8192 * w)); b.load_lds_b32(a) }).collect();
+            let os = (0..4i32)
+                .map(|w| {
+                    let a = b.bind_i32((ev(col) << 9) + (ev(d0) << 2) + (w << 13));
+                    let a1 = b.bind_i32(ev(a) + 16);
+                    (b.load_lds_b128(a), b.load_lds_b128(a1))
+                })
+                .collect();
+            (ls, os)
+        });
+        let ls: Vec<ValueId> = ls.into_iter().map(|x| b.bitcast_f32(x)).collect();
+        let mut mx = ls[0];
+        for x in &ls[1..] {
+            mx = b.max_f32(mx, *x);
+        }
+        let mbits = b.bitcast_i32(mx);
+        let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
+        let mm = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(fin), a: Opnd::Val(mx), b: Opnd::Val(zf) });
+        let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
+        let ws: Vec<ValueId> = ls.iter().map(|x| { let d = b.sub_f32(*x, mm); let t = b.mul_f32(d, c_l2e); b.exp2_f32(t) }).collect();
+        let mut wsum = ws[0];
+        for x in &ws[1..] {
+            wsum = b.add_f32(wsum, *x);
+        }
+        let tiny = b.c_f32(1e-30);
+        let den = b.max_f32(wsum, tiny);
+        let rinv = b.rcp_f32(den);
+        let mut outv: Vec<ValueId> = Vec::with_capacity(8);
+        for k in 0..8u8 {
+            let mut acc = zf;
+            for w in 0..4usize {
+                let f = if k < 4 { os[w].0 } else { os[w].1 };
+                let x = b.frag4_lane(f, k % 4);
+                let x = b.bitcast_f32(x);
+                acc = b.let_(Op::FmaF32(Opnd::Val(ws[w]), Opnd::Val(x), Opnd::Val(acc)));
+            }
+            outv.push(b.mul_f32(acc, rinv));
+        }
+        let w: Vec<ValueId> = (0..4).map(|i| b.cvt_pk_bf16_f32(outv[2 * i], outv[2 * i + 1])).collect();
+        let f4 = b.pack4(w[0], w[1], w[2], w[3]);
+        // column col -> head hk G + col (live col < G)
+        let live = b.bind_cond(ev(col).lt(ev(gsz)));
+        let ohead = b.bind_i32(ev(hk) * ev(gsz) + ev(col).min(ev(gsz) - 1));
+        let o_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(ohead)) * D + ev(d0)) << 1);
+        let bigo = b.c_i32(0x7fff_fff0);
+        let o_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(o_vo_r), b: Opnd::Val(bigo) });
+        let r_o = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * (2 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+        b.buffer_store_b128(r_o, o_vo, c0, 0, f4);
+    }
     b.finish()
 }
 

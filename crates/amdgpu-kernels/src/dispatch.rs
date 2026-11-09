@@ -48,6 +48,13 @@ pub fn decode16_config(b: u64, hk: u64) -> (u32, u32) {
     (32, s as u32)
 }
 
+/// decode16: run the fused form `pa_decode16_bf16_hd128_p<P>_f` (the 4 wave partials merged in LDS, bf16 out, no combine kernel) when the
+/// config is 32-key tiles with S = 1. Measured vs split S1 + combine: B64 ctx2048 84.9 vs 95.6 us, B128 ctx1024 84.0 vs 101.6, B256 ctx512
+/// 88.7 vs 116.6, B32 ctx4096 93.2 vs 99.8 (aiter 77.6 / 75.4 / 83.4 / 75.0).
+pub fn decode16_fused(b: u64, hk: u64) -> bool {
+    decode16_config(b, hk) == (32, 1)
+}
+
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
 /// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
 /// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
@@ -155,5 +162,13 @@ mod tests {
         assert_eq!(bf16_prefill_key_splits(1, 8, 4096, 4096, false, 256), 2);
         assert_eq!(bf16_prefill_key_splits(1, 8, 4096, 4096, true, 256), 4);
         assert_eq!(bf16_prefill_key_splits(2, 32, 8192, 8192, false, 256), 1);
+    }
+
+    #[test]
+    fn decode16_fused_rule() {
+        assert!(super::decode16_fused(64, 8));
+        assert!(super::decode16_fused(256, 8));
+        assert!(!super::decode16_fused(16, 8));
+        assert!(!super::decode16_fused(4, 4));
     }
 }

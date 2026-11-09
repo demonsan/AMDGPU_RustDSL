@@ -564,6 +564,21 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**decode16 的 fused 形式（`pa_decode16_bf16_hd128_p<P>_f`，`dispatch::decode16_fused`）**：
+- 适用于 S = 1。CTA 内 4 个 wave 的归一化 partial（O 和 LSE）写到各自已不再使用的 K/V 区域（`LdsPlan::tile_over`），barrier 之后在 LDS 中合并，直接写出 bf16 O。不再需要 partial，也不再启动 combine kernel。
+- 注意：overlay 的约定是每个 wave 只写自己的存储。第一版把 LSE 写进了 wave 0 的 V 区域，形成跨 wave 竞争；verifier 信任 overlay 的声明，没有发现这个问题。
+- 对比（µs）：
+
+| 形状 | fused | split S1 + combine | aiter |
+|---|---|---|---|
+| B64 ctx2048 | 84.9 | 95.6 | 77.6 |
+| B128 ctx1024 | 84.0 | 101.6 | 75.4 |
+| B256 ctx512 | 88.7 | 116.6 | 83.4 |
+| B32 ctx4096 | 93.2 | 99.8 | 75.0 |
+
+- 也就是大 batch 时达到厂商的 0.80–0.94×。
+- 小 batch 仍需 S ≥ 2，例如 B16 S2 为 28.6 µs，厂商 18.4 µs；其中 combine 的 launch 占 4–10 µs。
+
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
 - K 的 rope 部分放在第二个 ring（KR，行宽 128 字节，chunk 按 key % 8 做 XOR），由 group A 负责 staging（每个 wave 多 4 次 DMA）；QK 共 12 个 k-chunk。
