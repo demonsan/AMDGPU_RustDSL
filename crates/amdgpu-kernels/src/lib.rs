@@ -13,6 +13,7 @@ pub mod dequant;
 pub mod eltwise;
 pub mod norm;
 pub mod rope;
+pub mod lds_decl;
 pub mod sampling;
 pub mod topk;
 pub mod rows;
