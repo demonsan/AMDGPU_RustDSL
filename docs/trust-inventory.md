@@ -55,6 +55,14 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - 分析能证明的受信循环变量范围不再计入账本：只有初值或某一步仍未证明时才计数。
 - 效果：`tile::Pipeline` 的计数器（`_vs128` / `_t128` / GEMM）和 `combine_splits` 的计数器已被证明。出厂证书 29 → 22，GEMM v4 4 → 3。`_kvsplit` 的计数器仍受信（计数）。
 
+### 结构性受信事实（全部计入账本）
+
+| 事实 | 含义 | 使用处 |
+|---|---|---|
+| `wg_bijection(outs, axes, r)` | 元组是 workgroup id 的单射 | GEMM XCD 光栅；mxfp8 FMHA XCD 块序；KV-split z 分解；reshape_cache 分块布局 (block, offset)（数据：slot 互不相同） |
+| `wg_union(outs, axes, lo, hi, r)` | 各写类各自算出的同一个索引在 (workgroup, 类) 上单射 | causal 配对 q tile；reshape_cache flash 的 slot；MoE GEMM 输出行（数据：moe_sorting 每个 (token, slot) 只列一次） |
+| `wg_winner(cond, axes, r)` | `if cond` 分支在沿 axes 的每组 workgroup 中只有一个执行 | decode16 `_c` 的末到者（同一计数器上 ticket S − 1） |
+
 ### 其余账本项
 
 | 项 | 用途 | 现状 |
@@ -75,6 +83,13 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - kernel 代码中不再手写 `lds_alias`。
 
 **`lds_private`**：每次访问都要证明落在本 wave 自己的 key 切片内（tile-cover）。
+
+**`lds_owned(name, base, bytes, col_stride, row_stride)`（本轮新增）**：线程 t 拥有 `base + t·col_stride + r·row_stride + [0, col_stride)` 这些字节。
+- 标记作用域内的每次访问都会被检查：地址必须是 `base + col_stride·tid + k·row_stride + r`，其中 0 ≤ r ≤ col_stride − size，且 row_stride ≥ 线程数 × col_stride。
+- 全部通过的标记是 owner 事件：不同线程的 owner 事件互不冲突；同一线程先写后读按程序顺序，不需要 barrier。
+- 访问其他线程的列仍是普通共享事件，照常检查。
+- 测试：读自己的列后原地改写、中间不加 barrier → 通过；改写邻居的列 → 报竞争。
+- 用途：sched 的 `moe_scatter_ordered`，可去掉为过检加的 barrier 和 `tile_trust_periodic`。
 
 **`buf_last_arriver`**：
 - 检查模式本身：fence / ticket / acquire 的位置、读多个切片；
@@ -136,9 +151,9 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 代价：出厂账本 26 → 29（`_vs128` / `_t128` 的 XCD 块序，`_kvsplit` 的 z 分解），GEMM v4 3 → 4（光栅）。
 
 仍未证明（原因 → 需要什么）：
-- decode16 `_c` 的末到者写（ticket 复位与最终输出）：只有末到者执行；需要把已验证的 last-arriver 协议当作该轴的覆盖；
+- （已解决）decode16 `_c` 的末到者写：`wg_winner`，12 / 12 已证明；
 - `bf16_v3_ks`：分片原子的范围；
-- MoE GEMM / reshape_cache：行号或 slot 是数据 → 需要数据互异事实（受信、计数）；
+- （已解决）MoE GEMM、reshape_cache flash / blocked：数据互异事实（计数）+ 已知低位为零的原子按 c·2^z 步进；尚余 `reshape_cache_blocked_fp8` 的逐块 scale 写；
 - （已解决）持久化 `mlp_fp8_ws_fused`：循环变量从 workgroup id 出发、每步加 grid 大小（v = wg + k·grid），不同 workgroup 走不相交的剩余类，可作为该轴的数字位；32 / 32 已证明。
 
 **`lds-untracked`**：
