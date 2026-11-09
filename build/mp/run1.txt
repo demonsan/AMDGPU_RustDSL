@@ -1,0 +1,92 @@
+﻿silu_mul d4096 corr+perf | bad=0 OK | 6565.8 GB/s
+silu_mul d1024 | bad=0 OK | 6734.5 GB/s
+silu_mul d14336 | bad=0 OK | 6526.7 GB/s
+silu_mul d24 corr | bad=0 OK | 24.9 GB/s
+gelu_tanh d4096 | bad=0 OK | 6396.4 GB/s
+silu_mul_limit d4096 (limit 7) | bad=0 OK | 6570.2 GB/s
+swiglu_oai_mul d4096 | bad=0 OK | 6555.8 GB/s
+silu (unary) | bad=0 OK | 6119.5 GB/s
+gelu_tanh (unary) | bad=0 OK | 5649.7 GB/s
+relu2 (unary) | bad=0 OK | 6428.0 GB/s
+sigmoid (unary) | bad=0 OK | 6422.3 GB/s
+add_bf16 | bad=0 OK | 6541.9 GB/s
+cvt_f32_bf16 | bad=0 OK | 6623.5 GB/s
+cvt_bf16_f32 | bad=0 OK | 6331.5 GB/s
+quant_static | bad=0 OK | 6121.4 GB/s
+rmsnorm n4096 | bad=0 OK | 6124.3 GB/s
+rmsnorm n1000 | bad=0 OK | 5722.3 GB/s
+rmsnorm n200 | bad=0 OK | 5158.8 GB/s
+add_rmsnorm n4096 | bad=0 OK | 5702.6 GB/s
+layernorm n4096 | bad=0 OK | 5505.9 GB/s
+layernorm n776 | bad=0 OK | 4494.8 GB/s
+softmax n4096 | bad=0 OK | 5982.3 GB/s
+softmax n1000 | bad=0 OK | 5548.1 GB/s
+softmax n8192 | bad=0 OK | 5498.1 GB/s
+quant_token n4096 | bad=0 OK | 6360.5 GB/s
+quant_token n1000 | bad=0 OK | 5902.3 GB/s
+quant_group128 n4096 | bad=0 OK | 6428.4 GB/s
+quant_group128 n640 corr | bad=0 OK | 12.7 GB/s
+quant_token_int8 n4096 | bad=0 OK | 6202.1 GB/s
+quant_token_int8 n1000 | bad=0 OK | 5291.5 GB/s
+dequant static | bad=0 OK | 6389.3 GB/s
+dequant token n4096 | bad=0 OK | 6007.3 GB/s
+dequant group128 n4096 | bad=0 OK | 5952.1 GB/s
+dequant token n1000 (odd tail) | bad=0 OK | 5309.2 GB/s
+silu_mul_quant d4096 | bad=0 OK | 5883.5 GB/s
+silu_mul_quant d1000 | bad=0 OK | 5806.8 GB/s
+rope_neox h32 d128 | bad=0 OK | 6426.0 GB/s
+rope_gptj h32 d128 | bad=0 OK | 6324.5 GB/s
+rope_neox h8 d128 | bad=0 OK | 6779.5 GB/s
+rope_neox h40 d64 corr | bad=0 OK | 61.2 GB/s
+cache h8 d128 | bad=0 OK | 5046.6 GB/s
+cache h5 d64 corr | bad=0 OK | 62.1 GB/s
+cache_blocked h8 d128 b16 random slots | bad=0 OK | 867.8 GB/s
+cache_blocked h8 d128 b16 contiguous slots | bad=0 OK | 1419.5 GB/s
+cache_blocked h8 d64 b64 corr | bad=0 OK | 106.6 GB/s
+moe_sorting e128 k8 b32 M=37 | bad=0 OK | 12.05 us
+moe_sorting e128 k8 b32 M=1001 skew+invalid | bad=0 OK | 14.76 us
+moe_sorting e64 k2 b16 M=513 | bad=0 OK | 10.53 us
+moe_sorting e256 k8 b128 M=4096 | bad=0 OK | 52.26 us
+moe_sorting e385 k6 b32 M=777 | bad=0 OK | 17.92 us
+argmax v32000 B=16384 | bad=0 OK | 3848.5 GB/s
+argmax v128256 B=4096 | bad=0 OK | 4367.4 GB/s
+sample v32000 B=16384 | bad=0 OK | 1251.0 GB/s
+sample v128256 B=4096 | bad=0 OK | 722.2 GB/s
+sample v1000 corr | bad=0 OK | 5.8 GB/s
+moe_reduce k8 d7168 T=16384 | bad=0 OK | 6028.5 GB/s
+moe_reduce k8 d4096 T=32768 | bad=0 OK | 5899.5 GB/s
+moe_combine k8 d4096 T=32768 | bad=0 OK | 5962.8 GB/s
+moe_reduce k6 d2048 corr | bad=0 OK | 1587.5 GB/s
+gated_rmsnorm bf16 n128 (heads) | bad=0 OK | 6143.4 GB/s
+gated_rmsnorm fp8 n128 (heads) | bad=0 OK | 5626.6 GB/s
+gated_rmsnorm bf16 n4096 | bad=0 OK | 5872.9 GB/s
+gated_rmsnorm fp8 n4096 | bad=0 OK | 5219.3 GB/s
+cache_fp8 h8 d128 | bad=0 OK | 5963.3 GB/s
+add_rmsnorm_fp8 n4096 | bad=0 OK | 4265.5 GB/s
+add_rmsnorm_fp8 n1000 | bad=0 OK | 3854.0 GB/s
+qknorm_rope neox h40 d128 | bad=0 OK | 4229.8 GB/s
+conv1d_update w4 s3 idx silu | bad=0 OK | 3067.5 GB/s
+moe_fused_gate e256 g8 tg4 k8 M=131072 | bad=0 OK | 638.2 GB/s
+moe_fused_gate e256 g8 tg4 k8 M=1001 (odd) | bad=0 OK | 58.0 GB/s
+topk_per_row decode k2048 B=256 L<=64K | bad=0 OK | 323.7 GB/s
+topk_per_row decode k2048 odd (ragged, ties) | bad=0 OK | 33.1 GB/s
+topk_per_row prefill k128 (ties) | bad=0 OK | 25.0 GB/s
+conv1d_fwd w4 silu B=128 L=512 uniform | bad=0 OK | 2787.1 GB/s
+conv1d_fwd split w4 silu B=128 L=512 uniform | bad=0 OK | 2615.4 GB/s
+conv1d_fwd w4 silu ragged B=256 (grid) | bad=0 OK | 996.0 GB/s
+conv1d_fwd w4 silu ragged B=256 (_sched) | bad=0 OK | 2657.2 GB/s
+conv1d_fwd split w4 silu ragged + states | bad=0 OK | 398.2 GB/s
+cache_blocked fp8 per-token h8 d128 b16 (i64 slots) | bad=0 OK | 919.5 GB/s
+qknorm_rope_kvcache neox bf16 h8 d128 | bad=0 OK | 5830.0 GB/s
+qknorm_rope_kvcache neox fp8 h8 d128 (i64) | bad=0 OK | 4726.7 GB/s
+rmsnorm_quant_mxfp4 k4096 M=32768 | bad=0 OK | 2791.3 GB/s
+mla cache flat bf16 r512 p64 | bad=0 OK | 4271.2 GB/s
+mla cache seg fp8 r512 p64 b64 (i64) | bad=0 OK | 3057.7 GB/s
+silu_mul_bias d4096 E=64 | bad=0 OK | 9315.3 GB/s
+gelu_mul_bias d2048 E=64 | bad=0 OK | 5107.0 GB/s
+gelu (erf) unary | bad=0 OK | 3058.4 GB/s
+gelu_mul (erf) d4096 | bad=0 OK | 4118.1 GB/s
+mxfp6 e2m3 k4096 M=32768 | bad=0 OK | 2920.6 GB/s
+mxfp6 e3m2 k4096 M=32768 | bad=0 OK | 2915.7 GB/s
+topk e128 k8 T=65536 | bad=0 OK | 1176.4 GB/s
+topk renorm e256 k8 T=65536 | bad=0 OK | 1002.3 GB/s
