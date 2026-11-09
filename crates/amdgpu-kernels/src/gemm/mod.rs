@@ -151,7 +151,7 @@ impl Elem {
     /// K elements per 128-byte tile
     fn per_tile(self) -> i64 {
         match self {
-            Elem::Fp8 | Elem::Fp8Bs => 128,
+            Elem::Fp8 | Elem::Fp8Bs | Elem::I8 => 128,
             Elem::Bf16 => 64,
             Elem::Fp4 | Elem::Fp8W4 | Elem::Bf16W4 => 256,
         }
