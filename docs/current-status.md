@@ -1,7 +1,7 @@
 # 当前状态总览（authoritative snapshot）
 
-本文件是仓库的**唯一权威当前状态快照**（v9，Main `ab394cd2`：在 v8.1（stage 库 / weaver / 算子图 / IR 文本往返、XCD 感知 block 顺序）之上，
-完成对照 aiter kernel zoo 的基础算子覆盖、TIRx 式 tile-op 层、64 位寻址与结构化诊断）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
+本文件是仓库的**唯一权威当前状态快照**（v9.2，Main `08cd00a4`：在 v9（对照 aiter kernel zoo 的基础算子覆盖、TIRx 式 tile-op 层、64 位寻址、
+结构化诊断）之上，本轮补上跨工作组写不相交证明、信任清单、Python 算子层与启动开销、一批正确性修复，见 §1.1）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
 厂商事实在 [`vendor-spec.md`](vendor-spec.md)，设计规格在 [`design.md`](design.md)；历史逐轮记录与各代设计研究在
 [`archive/`](archive/README.md)（其中的数字、kernel 名与开关只代表当时的状态）。
 
@@ -15,14 +15,14 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`，Main `b97c7aae`）：`_vs128` `80f4a72c`、`_t128` `5e3d12aa`、`_kvsplit` `c9dbf396`、`_kvsplit_combine8h` `24a95a51`（v9 的 lowering 窥孔：select → v_min / v_max / med3、显式并上提的 M0 写；`port_gate` 全部 PASS，见 §6.2）。
+  asm md5（`--backend own`，Main `08cd00a4`）：`_vs128` `dd009e44`、`_t128` `84269a3b`、`_kvsplit` `240ecbae`、`_kvsplit_combine8h` `24a95a51`（v9.2：nop 填充与 M0 修复改变了 `_t128` / `_kvsplit`，VALU 写 SGPR 的冒险填充又改变了 `_vs128`，见 §6.3；`port_gate` 全部 PASS）。
 - **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-08，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**740 TF/s（1.025× 厂商）**；
   铺满网格 B4H8S2048 **1804（0.976×）** / B1H8S8192 **2416（0.988×）** / B2H8S2048 **1279（0.978×）**；`_vs128` 每 CU 64 blocks **694（0.959×）**；`_t128` B2H8S2048 layout 中位数 **1173（0.901×）**。
   25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.929–1.063×，几何平均 **0.992**（之前 0.980）。最近一步是厂商的 XCD 感知 block 顺序（K/V 的 L2 命中率 20 % → 77 %，[`fmha-wave-org.md`](fmha-wave-org.md)）。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
   快速路径成本，旧的 0.92× 口径偏乐观；这一轮的改进（懒更新、≥ 4 tile 用厂商配方、真实数据分派、bias 单次 MFMA 且无零片段拷贝、`ldsink` / `wsink`）
   与否定结果（copy 路径、3 槽环、厂商 copy 形态、重平衡）见 [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) 与 [`lgkm-lookahead.md`](lgkm-lookahead.md)。
 - **MXFP8 blockscale GEMM**：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels/src/gemm/`）对照 aiter PR #6696 4-wave pin-AGPR，4096×4096×8192：
-  **0.978–0.994×** 厂商（`tools/gemm_gate.sh` PASS，§4.7；v9 加入 epilogue 前的 `wait_vm(0)` 与 lowering 窥孔后 0.978–0.981×）；asm md5 `ff430295`。
+  **0.978–0.994×** 厂商（`tools/gemm_gate.sh` PASS，§4.7；v9 加入 epilogue 前的 `wait_vm(0)` 与 lowering 窥孔后 0.978–0.981×）；asm md5 `e4369386`。
 - **融合 MLP**：`mlp_fp8_ws_{fused,g1,g2}`（`crates/amdgpu-kernels/src/mlp/`），布局层 P 交接证明见 [`fusion-layout-handoff.md`](fusion-layout-handoff.md)。
 - **AGPR 已支持**（寄存器类 A1–A16、acc_cd MFMA、`ds_read_b128 → AGPR`、`v_accvgpr_*`、统一 512 寄存器预算与 hazard）：[`agpr.md`](agpr.md)。
 - **主机侧生成**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）。
@@ -38,8 +38,28 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `v_pk_fma_f32`、片段视图与原地拼接、`tileop::ewise / apply2 / allreduce`，每条都过“属性表 → 双后端 → hazard oracle → 硬件探针”闭环。
 - **64 位寻址**：`ptr_mad` 把描述符基址移到 tile / expert / slot（> 4 GiB 张量），验证器证明移动后的描述符仍在 extent 内。
 - **结构化诊断**：`--json`、`amdc summary`、`amdc srcmap`（[`diagnostics.md`](diagnostics.md)）。
-- `cargo test` **116 个测试目标 / 494 项全绿**。
-- 严格 GPU 语义证书：`--shipped` **26 trusted assumes / 100 trusted contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**。
+- `cargo test` **121 个测试目标 / 519 项全绿**；Python 节点检查 `python/tests/run_all.sh`：52 / 52 算子检查 + 可达 kernel 编译 / 汇编扫描 PASS。
+- 严格 GPU 语义证书：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**。
+  信任清单与每一项的去留见 [`trust-inventory.md`](trust-inventory.md)。
+
+### 1.1 v9.2 本轮（2026-11-09 / 10）
+
+- **与厂商的比值（同进程同数据，比 = 厂商时间 / ours）**，详见 [`op-coverage-design.md`](op-coverage-design.md) §7.4–§7.8 的汇总表与 [`op-coverage-membound.md`](op-coverage-membound.md) 的总表：
+
+  | 族 | 比值 |
+  |---|---|
+  | 出厂 MXFP8 FMHA（`port_gate`，本轮最后一次） | KV-split B1H8S2048 1.028×；`_vs128` B4H8S2048 0.955×、B1H8S8192 0.981×、每 CU 0.952×（8 布局中位数 0.943×）；`_t128` 0.900× |
+  | GEMM 族（§7.4） | int8 per-token 1.01–1.63×；blockscale 0.91–1.45×（split-K 小 M 1.45×）；bf16 0.96×；MXFP4 0.86–0.90× |
+  | attention prefill（§7.5） | fp8 per-tensor 1.07–1.74×（小网格走 KV split）；bf16 v3 hd128 0.89–1.07×，causal 0.80–1.23×；MLA prefill hd192 0.73–0.98× |
+  | decode（§7.5） | paged decode16 0.67–1.24×（小 B 长 ctx 走 last-arriver `_c`）；MLA decode H16 约 0.63× |
+  | fused MoE（§7.6） | fp8 per-token stage 1 0.93–1.14× |
+  | attention 反向（§7.7） | 0.77–0.97× |
+  | 访存受限（membound 总表） | 逐元素 / norm / 量化 / RoPE 达流带宽的 90–103 %；与 aiter 同轮：silu_mul 1.07–1.18×、fp8 per-token 1.08×、group128 1.10×、int8 1.04–1.26× |
+
+- **正确性修复**（每条都有回归测试或硬件探针，§6.3）：GEMM LDS epilogue 复用 ring 前未等末轮预取 DMA 的竞态；VALU 写 SGPR 后 VMEM / VALU 读的冒险（`_vs128` 等 8 个 kernel 缺等待，硬件复现）；`moe_sorting` / `moe_scan` 的 LDS 竞态；描述符 SGPR 上限（`next_free_sgpr` 104 不能汇编）。
+- **信任清单与写不相交证明**（[`trust-inventory.md`](trust-inventory.md)）：每个普通全局 / buffer 写要么被证明跨工作组不相交，要么计为"已查越界、未查竞争"。出厂 FMHA、GEMM、MLP 全部写已证明；结构性事实 `wg_bijection` / `wg_union` / `wg_winner` 与数据互异事实都计入账本；循环退出事实与持久循环剩余类把出厂证书从 26 降到 21；`amdc check-launch` 供非 Python 调用方检查主机契约；线程独占 LDS 列（`lds_owned`）与按外层迭代的周期检查去掉了 `moe_scatter_ordered` 的全部信任。
+- **冒险规则审计**：逐条对照 LLVM `GCNHazardRecognizer` 的 gfx950 规则（[`trust-inventory.md`](trust-inventory.md) §5.1），只有 VALU 写 SGPR 两条缺失，已补上并有变异测试。
+- **Python 算子层**（[`python-jit.md`](python-jit.md)）：`launch(kernel, …)` 可调用任意注册 kernel 并按已验证的契约检查；`ops_mem.py` / `ops_more.py` 覆盖 norm、量化、RoPE、KV cache、MoE、GEMM、prefill、MLA decode、采样、top-k、卷积、反向；预备启动（`_hip.Prepared`）把每次调用的主机时间从 23–57 µs 降到 5.5–9.3 µs。
 
 ---
 
@@ -102,10 +122,12 @@ amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发�
 
 区间分析的位级规则（`x ^ y`、`x & m` 的可能置位位）与盒子检验都有攻击测试（`crates/amdgpu-compiler/tests/gv_bits.rs`、`sym_branch.rs`）。
 
-**信任预算（证书逐条列出）**：`--shipped`（v3 四个）26 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0。
+**信任预算（证书逐条列出）**：`--shipped`（v3 四个）21 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0（逐项清单 [`trust-inventory.md`](trust-inventory.md)）。
 每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
 
-**未证明/范围外（诚实清单）**：跨工作组数据竞争与别名、i32 回绕（A3 假设）、从内存加载的指针/索引、safe-asm 块内部访存、
+**跨工作组写**：普通全局 / buffer 写的跨工作组不相交由符号线性偏移 + 混合进制检查证明（出厂 kernel 全部写已证明；未证明的写计为 `global-write-untracked`，见 [`trust-inventory.md`](trust-inventory.md) §4）。
+
+**未证明/范围外（诚实清单）**：原子与 last-arriver 以外的跨工作组读写依赖、i32 回绕（A3 假设）、从内存加载的指针/索引（以计数的数据互异事实代替）、safe-asm 块内部访存（计为 `asm_opaque`）、
 tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` 的模拟器仍按线性化下标工作。
 
 **v4 协议模型**：**到达**（`s_barrier`）、**完成**（`wait_vm/wait_lds/fence_release`，`vmcnt(n)` 按"其后至少 n 条更新的 LDS-direct DMA"计数）、
@@ -157,7 +179,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | 中等形状 | `_t128` / split（guard 选择） | B2H8S2048 `_t128` **1067.4（1.05×）** |
 | 单 kernel 每 CU（64 blocks） | `_vs128` | **493.1（0.917×）** |
 
-### 4.2 Kernel 清单（`amdc list` 63 个 + 按名注册的参数化族）
+### 4.2 Kernel 清单（`amdc list` 65 个 + 按名注册的参数化族）
 
 | Kernel | 状态 |
 |---|---|
@@ -274,11 +296,22 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 - 指令数 / `s_nop` 个数 / nop 等待态（前 → 后）：`pa_decode16_bf16_hd128_p16` 963 / 55 / 143 → 883 / 23 / 79；`mla_decode_bf16_p1` 2286 / 121 / 427 → 2174 / 83 / 385；`_t128` 4911 / 141 / 318 → 4864 / 96 / 274；`_kvsplit` 10025 / 230 / 640 → 9987 / 193 / 602；`_vs128` 9365 / 214 / 604 → 9359 / 210 / 600；GEMM v4 1800 / 36 / 76 → 1788 / 24 / 64。
 - 门禁：`port_gate` OVERALL PASS（B1H8S2048 742 TF/s 1.017×、B4H8S2048 1855 0.975×、B1H8S8192 2415 0.983×、每 CU `_vs128` 699 0.954×、`_t128` 1172 0.902×）；`gemm_gate` PASS 0.978×。
 
+
+### 6.3 v9.2 的正确性修复（每条都有回归测试 / 探针）
+
+| 修复 | 错误 | 回归 |
+|---|---|---|
+| GEMM LDS epilogue 等待末轮预取（`wait_vm(0)`） | `lds_epilogue` 复用 ring 存储时末轮的预取 DMA 仍在途（由 GV-TILE-ALIAS-RACE 发现） | `gpu_tiles.rs`（GV-TILE-ALIAS-RACE）；`gemm_gate` PASS |
+| VALU 写 SGPR 的冒险（`hazards::pad_valu_sgpr`） | `v_readfirstlane` 等写 SGPR 后 VMEM 读需 5 个等待态、VALU 读需 2 个；`_vs128`、bf16 v3 / `_ks`、反向 dq / dkdv、`reshape_cache`、`topk_per_row` 等 8 个 kernel 缺等待。硬件探针 `probe_valu_sgpr`：不加等待时 2048 个值错 1984 个 | `tests/hazard_valu_sgpr.rs`（含去掉该 pass 后检查必须失败的变异测试）；`_vs128` md5 `cd403880 → dd009e44`，`port_gate` PASS |
+| `moe_sorting` / `moe_scan` 的 LDS 竞态 | 跨 wave 的游标读前缺 barrier；`moe_scan` 的偏移写在发布 barrier 前未完成；原地前缀更新与读者无版本分隔 | LDS 改走声明的 tile（协议验证），barrier 变异测试；`lds_owned` 之后去掉了额外 barrier |
+| 描述符 SGPR 上限 | `next_free_sgpr` 按 8 取整到 104 > 102，`fmha_fwd_hd128_bf16_v3_causal_ks` 无法汇编 | `dispatch_compile.rs` 检查描述符字段并对每个可达 kernel 汇编 + 链接 |
+| M0 显式写的悬空使用 | 未定义的 M0 使用让一个寄存器从入口一直活着，bf16 v3 causal SGPR 不够 | `dispatch_compile.rs` |
+
 ---
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **116 个测试目标 / 494 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
+- **测试**：`cargo test` **121 个测试目标 / 519 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`dpp`、`var_slice`、`var_semantics`、`regplan`、`sched_regions*`、`rust_safety` 等；kernel 相关（`crates/amdgpu-kernels/tests/`）：
   `tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`agpr`、`gpu_*`（语义/协议/攻击）、`gemm_mxfp8`、`tile_l*`、`region_ir`、
   `ir_text`（全部 kernel 的 irv1 往返）、`ir_print`、`hzfill`、`sched_kernels`；`amdc` 的 `jit`、`contract_host_truth`；布局层 `crates/amdgpu-layout/tests/`、
@@ -297,14 +330,17 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 116 个测试目标 / 494 项全绿
+bash tools/container/cargo.sh test                 # 期望 121 个测试目标 / 519 项全绿
 
 # 发射 kernel 并汇编
-bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 80f4a72c…
+bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 dd009e44…
 clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o vs128.co vs128.s
 
 # 严格证书
-bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --shipped --strict   # 26 / 100 / 0
+bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --shipped --strict   # 21 / 100 / 0
+
+# 一次具体启动的主机契约检查（非 Python 调用方）
+bash tools/container/cargo.sh run -q --bin amdc -- check-launch gemm_mxfp8_bs_v4 --ka 0x18=4096,0x1c=4096,0x20=8192 --grid 16,16,1
 
 # DSL IR 文本：打印 → 编辑 → 检查 → 编译（docs/ir-text.md）
 bash tools/container/cargo.sh run -q --bin amdc -- print-ir fmha_fwd_hd128_mxfp8_v3_t128 --stage dsl --out t128.ir
@@ -352,7 +388,7 @@ HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh
 | [`fmha-wave-org.md`](fmha-wave-org.md) / [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) / [`lgkm-lookahead.md`](lgkm-lookahead.md) / [`fmha-4wave-design.md`](fmha-4wave-design.md) / [`fmha-weaver-parity.md`](fmha-weaver-parity.md) | FMHA 设计记录：wave 组织与 XCD 顺序 / 厂商 copy 流 / lgkm 等待策略 / 4-wave 原型（搁置）/ weaver 铺满场景实验（均为负） |
 | [`functional-proofs.md`](functional-proofs.md) / [`stamps.md`](stamps.md) / [`mfma-ceiling.md`](mfma-ceiling.md) / [`mfma-dep-probe.md`](mfma-dep-probe.md) / [`isa-probes-smfmac-tr.md`](isa-probes-smfmac-tr.md) | 功能证明 / kernel 内时间戳 / MFMA 发射上限 / MFMA 依赖探针 / ISA one-hot 探针 |
 | [`tirx-comparison.md`](tirx-comparison.md) / [`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) / [`ir-text-roundtrip-design.md`](ir-text-roundtrip-design.md) | 与 TVM TIRx 的对照（当前状态）/ IR 梳理（TIRx + SF Tensor）/ IR 文本往返设计 |
-| [`gpu-semantics-verifier.md`](gpu-semantics-verifier.md) / [`gpu-semantic-protocol.md`](gpu-semantic-protocol.md) | GPU 语义验证器 / 四轴协议模型 |
+| [`gpu-semantics-verifier.md`](gpu-semantics-verifier.md) / [`gpu-semantic-protocol.md`](gpu-semantic-protocol.md) / [`trust-inventory.md`](trust-inventory.md) | GPU 语义验证器 / 四轴协议模型 / 信任清单、写不相交证明与冒险规则审计 |
 | [`last-arriver-memory-model.md`](last-arriver-memory-model.md) | last-arriver 原语与内存序契约 |
 | [`agpr.md`](agpr.md) | AGPR 支持 |
 | [`host-gen.md`](host-gen.md) / [`hostgen-json-schema.md`](hostgen-json-schema.md) | 主机侧生成 |

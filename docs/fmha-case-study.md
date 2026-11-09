@@ -158,7 +158,7 @@ amdc emit --from-ir vs128.ir --out vs128.s        # 不改 Rust，直接拿编�
 - wait / barrier 完整；
 - stage 交接。
 
-它不能证明的事实必须写成 `assume_trusted`（带理由），并列入证书。当前出厂四个 kernel 合计 **26 trusted assumes / 100 trusted contracts / 0 unproven**；其中 2 条是 XCD 顺序重映射后 tile / head 的范围事实。
+它不能证明的事实必须写成 `assume_trusted`（带理由），并列入证书。当前出厂四个 kernel 合计 **21 trusted assumes / 100 trusted contracts / 0 unproven**（逐项见 [`trust-inventory.md`](trust-inventory.md)）；其中 2 条是 XCD 顺序重映射后 tile / head 的范围事实。
 
 ### 1.7 主机侧
 

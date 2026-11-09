@@ -35,7 +35,7 @@ kernel 编译器，出货 FMHA / GEMM / MLP / RMSNorm 并与厂商同轮对比�
 | tile op | 可分派的 IR 算子（按 scope / layout / target 选实现） | tile 层与 stage 库是 Rust 函数，展开后进 IR；stage 边界以 `Node::Stage` + `StageContract` 进 IR | 部分（§4.5） |
 | 代码生成 | CUDA C → NVRTC；寄存器分配与调度由 NVIDIA 完成 | 全自研：lowering → MIR → 调度（list / slotfill / 按区域策略）→ RA（AGPR、寄存器规划）→ hazard / wait → asm；LLVM 仅可选 post-RA 尾段 | 有意不同（§5） |
 | 同步 | 同步由调用方写；完成协议照文档 | 作者写 barrier 与 tile 协议标记；编译器插 `s_waitcnt`；验证器证明四轴协议 | 有意不同（§5） |
-| 正确性 | 结构化 IR + 外部 checker + 远期形式化 | 内建 `gpu_verify` + 严格证书（`--shipped` 26 / 100 / 0）+ 功能证明 + 门禁 | 有意不同（§5） |
+| 正确性 | 结构化 IR + 外部 checker + 远期形式化 | 内建 `gpu_verify` + 严格证书（`--shipped` 21 / 100 / 0）+ 功能证明 + 门禁 | 有意不同（§5） |
 | 剖析 | IKET → Perfetto 时间线 | `s_memtime` stamps + ATT 脚本 + rocprof 工作流 | 推迟（§6） |
 | 主机互操作 | TVM-FFI 绑定，直接接 PyTorch | `amdc gen-host`（C++ 头 + JSON）；Python JIT 以子进程调 `amdc` + ROCm clang | 有意不同（§5） |
 

@@ -357,7 +357,7 @@ softmax 不维护运行最大值，而是维护参考点 `b`（两个 f16 字，
 | 层次 | 机制 |
 |---|---|
 | 构建期 | TV 覆盖性、连续对齐、swizzle 双射、S→P 方向搜索断言、行和方案证明；算子图检查（`check_kernel`：节点、代价类） |
-| 编译期 | GPU 语义验证器：访存在界内、LDS 环的 (槽, 代) 协议、wait / barrier；GV-STAGE 检查 stage 交接；`--strict` 只允许证书里列出的可信假设（当前全部出厂 kernel 26 / 100 / 0） |
+| 编译期 | GPU 语义验证器：访存在界内、LDS 环的 (槽, 代) 协议、wait / barrier；GV-STAGE 检查 stage 交接；`--strict` 只允许证书里列出的可信假设（当前全部出厂 kernel 21 / 100 / 0） |
 | 测试 | 方向、行和、厂商配方递推（functional proofs）、weave / stage registry / opgraph、IR 文本 round-trip（全部 kernel round-trip 并发射相同汇编） |
 | GPU | `tools/port_gate.sh`：精度与厂商对齐、确定性、压力、性能 |
 
