@@ -109,6 +109,31 @@ Arguments: torch tensors (any 1-byte dtype for fp8 / E8M0, any 2-byte dtype for 
 or `RawPtr(ptr, shape, itemsize)`. All must be contiguous and 16-byte aligned (scales: 4). Stream: the explicit `stream` (an integer handle or
 an object with `cuda_stream`), else torch's current stream when torch tensors are passed, else the null stream.
 
+## Generic launch and the memory-bound ops
+
+**`launch(kernel, args=None, *, ptrs=None, scalars=None, grid=None, syms=None, spec=None, stream=None, check=True)`** calls any registered
+kernel from its `amdc jit-info`: arguments by name (`args`) or positionally (`ptrs` = tensors for the pointer arguments in offset order,
+`scalars` = numbers for the scalar arguments in offset order). The contract's free symbols come from the scalar relations (`ka_is`, e.g.
+`m = 4·MT`), the grid from the contract's grid expressions; the launch is checked against the verified contract (allocation sizes
+included), so a row count that is not a multiple of a CTA's rows is reported as the violated relation. The ops below are thin wrappers
+(`python/amdgpu_jit/ops_mem.py`) that pick the kernel for the shape:
+
+| op | kernel | tensors |
+|---|---|---|
+| `rmsnorm(x, gamma, out, eps)` | `rmsnorm_bf16_n<N>` | x, out [M, N] bf16; gamma [N] |
+| `add_rmsnorm(x, res, gamma, out, res_out, eps)` | `add_rmsnorm_bf16_n<N>` | res_out = x + res |
+| `add_rmsnorm_quant_fp8(x, res, gamma, out, res_out, scale, eps)` | `add_rmsnorm_fp8_n<N>` | out [M, N] fp8, scale [M] f32 |
+| `rmsnorm_quant_fp8(x, gamma, q, scale, eps)` | `rmsnorm_quant_fp8_n<N>` | per-token fp8 |
+| `rmsnorm_quant_mxfp4(x, gamma, q, scale, eps)` | `rmsnorm_quant_mxfp4_bf16_k<N>` | q [M, N/2] e2m1, scale E8M0 in the shuffled a4w4 layout; M % 16 = 0 |
+| `quant_per_token(x, q, scale, dtype="fp8"\|"int8")` | `quant_token_bf16_<dtype>_n<N>` | scale [M] f32 = max / (448 \| 127) |
+| `quant_per_group128(x, q, scale)` | `quant_group128_bf16_fp8_n<N>` | scale [M, N/128] f32 |
+| `quant_static_fp8(x, out, scale)` | `quant_bf16_fp8_static` | per-tensor scale (float) |
+| `act_mul(x, out, act="silu"\|"gelu"\|"gelu_tanh"\|"swiglu_oai")` | `<act>_mul_bf16_d<D>` | x [M, 2D] → out [M, D] |
+| `silu_mul_quant_fp8(x, q, scale)` | `silu_mul_quant_fp8_d<D>` | q [M, D] fp8, scale [M] f32 |
+
+`python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only) runs every op on random data against a Python reference that follows the
+C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm}_host.cpp`).
+
 ## Checks on the GPU node
 
 ```bash
