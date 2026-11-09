@@ -15,7 +15,6 @@ pub mod graph;
 pub mod bf16;
 pub mod bf16v3;
 pub mod bwd;
-pub mod bwdf;
 pub mod decode;
 pub mod decode16;
 pub mod paged;
