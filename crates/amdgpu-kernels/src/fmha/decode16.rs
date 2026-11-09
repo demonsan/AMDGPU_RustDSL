@@ -307,7 +307,8 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         (0..KT / 4)
             .map(|i| {
                 let key = b.bind_i32(ev(key_t) + kk_of(i));
-                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+                // (key >= 0 and k_hi > k_lo >= 0 inside the loop: min only - `.max(0)` lowers to a compare + select pair with an s_nop)
+                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).min(ev(maxk)));
                 (kc, gpages[grp_of(i) as usize])
             })
             .collect()
@@ -455,11 +456,31 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(16);
+    // grouped path: the key mask only on the tile that needs it (uniform branch, VALU only, in place)
+    let mask_in_place = grp_path && !mtp;
+    if mask_in_place {
+        let part = b.bind_cond((ev(key_t) + KT).gt(ev(kmax)));
+        b.begin_if(Opnd::Val(part));
+        for blk in 0..NKB {
+            for r in 0..4u8 {
+                let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
+                let x = b.bitcast_f32(x);
+                let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
+                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) });
+                b.var_set_lane(sv_[blk], r, y);
+            }
+        }
+        b.end_if();
+    }
     for blk in 0..NKB {
         for r in 0..4u8 {
             let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
             let x = b.bitcast_f32(x);
             let x = match &kvsc { Some((ks, _)) => b.mul_f32(x, ks[4 * blk + r as usize]), None => x };
+            if mask_in_place {
+                s.push(x);
+                continue;
+            }
             let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
             s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
         }
