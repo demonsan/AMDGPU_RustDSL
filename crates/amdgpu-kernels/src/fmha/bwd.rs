@@ -492,6 +492,9 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
         // P = exp2(csc S - lse2[q]) (masked 0), dS = P (dP - Dot[q]); the per-query LSE / Dot: 4 consecutive queries per load
         b.weave_region_begin("dkdv_softmax_pack");
         let q0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
+        // the lane's visible query offsets relative to q0: [dlo, qhi) (causal: key <= q + SK - SQ; all: q < SQ)
+        let qhi = b.bind_i32(ev(a.sq) - ev(q0));
+        let dlo = b.bind_i32(ev(key) - ev(qoff) - ev(q0));
         // P / dS packed to bf16 pairs as soon as a group of 4 values is done (word 8 sb + 2 g + u / 2): fewer live registers
         let mut p: Vec<ValueId> = Vec::with_capacity(16);
         let mut dsv: Vec<ValueId> = Vec::with_capacity(16);
@@ -515,12 +518,17 @@ fn fmha_bwd_dkdv_x(name: &str, causal: bool, pair: bool) -> Function {
                     let lse2 = b.mul_f32(lse, l2e);
                     let x = b.sub_f32(x, lse2);
                     let pv = b.exp2_f32(x);
-                    let vis = if causal {
-                        b.bind_cond((ev(qv).lt(ev(a.sq)).select_i32(1, 0) & ev(key).le(ev(qv) + ev(qoff)).select_i32(1, 0)).eq(1))
+                    // visible: c = qv - q0 (a constant) in [dlo, qhi): one compare + select per bound (no per-value integer arithmetic)
+                    let _ = qv;
+                    let cst = (32 * sb + 8 * g + u) as i32;
+                    let in_q = b.bind_cond(amdgpu_dsl::I32::c(cst).lt(ev(qhi)));
+                    let pv = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_q), a: Opnd::Val(pv), b: Opnd::Val(zf) });
+                    let pv = if causal {
+                        let in_k = b.bind_cond(amdgpu_dsl::I32::c(cst).ge(ev(dlo)));
+                        b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_k), a: Opnd::Val(pv), b: Opnd::Val(zf) })
                     } else {
-                        b.bind_cond(ev(qv).lt(ev(a.sq)))
+                        pv
                     };
-                    let pv = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(vis), a: Opnd::Val(pv), b: Opnd::Val(zf) });
                     let dp = b.frag16_lane(Opnd::Var(dp_vars[sb]), r);
                     let dp = b.bitcast_f32(dp);
                     let y = b.sub_f32(dp, dot);
