@@ -752,8 +752,14 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let one = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(c1l), b: Opnd::Val(c0l) });
         let p_cnt = b.let_(Op::KernargPtr { offset: 208 });
         let gofs = b.bind_i32((ev(bat) * ev(hkv_n) + ev(hk)) << 2);
-        let pc = b.ptr_add(p_cnt, gofs);
-        let old = b.atomic_add_u32(pc, 0, Opnd::Val(one));
+        // ONE lane takes the ticket: the other 255 lanes' offsets are out of range and dropped before L2 (an atomic by every lane - even
+        // adding 0 - serializes 256 same-cache-line atomics per CTA: ~100 us at B16)
+        let ncnt = { let v = b.bind_i32((ev(bat) + 1) * ev(hkv_n) * 4); b.read_first_lane(v) };
+        let r_cnt = b.buffer_desc_dyn(p_cnt, ncnt);
+        let bigc = b.c_i32(0x7fff_fff0);
+        let cvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(gofs), b: Opnd::Val(bigc) });
+        let _ = one;
+        let old = b.buffer_atomic_add_ret(r_cnt, cvo, c0l, 0, c1l);
         let tkb = tk.base as i32;
         let slot = amdgpu_tile::SlotIdx::new(0, 0);
         tk.at(&slot).write(&mut b, |b| {
