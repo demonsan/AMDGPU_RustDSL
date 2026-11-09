@@ -48,6 +48,13 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 
 能否检查：可以，但要换更强的抽象域——关系域、循环退出条件进入归纳。现在逐条计数。
 
+### 循环退出事实（#4，本轮新增）
+
+- `break_if(c)` 之后，同一语句表的其余部分只在 c 为假时执行（break 条件是 wave 一致的）。`x < k` / `x >= k` 的操作数在此期间被收紧。
+- `set_var` 在其语句表末尾生效，所以同一表里稍后的 break 也收紧回边上的值。
+- 分析能证明的受信循环变量范围不再计入账本：只有初值或某一步仍未证明时才计数。
+- 效果：`tile::Pipeline` 的计数器（`_vs128` / `_t128` / GEMM）和 `combine_splits` 的计数器已被证明。出厂证书 29 → 22，GEMM v4 4 → 3。`_kvsplit` 的计数器仍受信（计数）。
+
 ### 其余账本项
 
 | 项 | 用途 | 现状 |
@@ -132,7 +139,7 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - decode16 `_c` 的末到者写（ticket 复位与最终输出）：只有末到者执行；需要把已验证的 last-arriver 协议当作该轴的覆盖；
 - `bf16_v3_ks`：分片原子的范围；
 - MoE GEMM / reshape_cache：行号或 slot 是数据 → 需要数据互异事实（受信、计数）；
-- 持久化 `mlp_fp8_ws_fused`：需要循环关系（#4）。
+- （已解决）持久化 `mlp_fp8_ws_fused`：循环变量从 workgroup id 出发、每步加 grid 大小（v = wg + k·grid），不同 workgroup 走不相交的剩余类，可作为该轴的数字位；32 / 32 已证明。
 
 **`lds-untracked`**：
 - 范围：不在任何 tile 标记内的 LDS 访问；
