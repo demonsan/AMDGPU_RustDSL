@@ -624,6 +624,8 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         // ---- fused combine: thread t = (column t / 16, 8 d at 8 (t % 16)) merges the 4 wave partials, bf16 out ----
         b.wait_lds(0);
         b.barrier();
+        let zf = b.c_f32(0.0);
+        let c0 = b.c_i32(0);
         let tid = b.let_(Op::WorkitemId);
         let col = b.bind_i32(ev(tid).lshr(4));
         let d0 = b.bind_i32((ev(tid) & 15) << 3);
