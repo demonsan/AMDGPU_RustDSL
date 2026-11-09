@@ -547,6 +547,8 @@
 - 依据 sched 的 ATT 与计数器：差距的约 60% 在 DMA 发射背压（`VMEM_TA_ADDR_FIFO_FULL` 为厂商的 16×），VMEM 指令比厂商多 53%，其中三分之一是 scale 读。
 - 做法：shuffled 布局下，一个 dword 本来就同时含有一对 tile 的 scale 字节。现在只在偶数 tile 读这个 dword 并原样安装；奇数 tile 不再读，改用 MFMA 的字节选择（opsel 字节 2、3）取出自己的 scale。尾部 tile 的奇偶在运行时才知道，那时把这个 dword 移位一次。
 - 同次运行：8192³ 从 296 µs 降到 273–277（对 f4gemm 为 0.88×），4096³ 从 44 降到 40.5–42，4096×8192×4096 从 95.6 降到 87，1024×4096×1536 从 16.1 降到 14.7。均 bad=0，`_128` 也 bad=0。
+- sched 复测（scale 成对读取之后）：DMA 发射停顿仍占剩余差距的 52%，TA FIFO 满为厂商的 10–14×，主要集中在 B 的 DMA；s_nop 占 23%；每个 MFMA 29.0 周期，厂商为 19.9。
+- 试过但未采纳：B 直接从 global 读进寄存器 tile（`_rb`，从 `archive/mxfp4-regb` 移植到 scale 成对读取的版本上）。每个 wave 每个 tile 的 VMEM 指令从 8 条 DMA 变成 16 条 b128 load。结果全面慢约 3%：8192³ 为 282 对 273–276 µs，4096³ 为 43–44.5 对 41–43。保留为 tag `archive/mxfp4-regb2`。
 - 试过但未采纳：A 的 LDS 镜像改用 swizzle（chunk ^ row%8）替代 padding，bank conflict 降了 73%，但时间没有稳定变好（4096×8192 慢 2–4%）。保留为 tag `archive/mxfp4-a-swizzle`。
 
 **批量 GEMM（覆盖补齐）**：`gemm_a16w16_bf16_bmm`、`gemm_a8w8_rowcol_fp8_bmm`、`gemm_mxfp8_bs_v4_bmm`（`GemmConfig.batched`）。
