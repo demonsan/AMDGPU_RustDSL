@@ -86,7 +86,58 @@ def contract_grid(info, ka, syms):
     return tuple(g)
 
 
+def fast_id(x):
+    """A cheap identity of a tensor argument for the launch memo: the object and its current data pointer (a different tensor, a view or a
+    reallocation changes it)."""
+    if isinstance(x, (int, float)):
+        return x
+    p = getattr(x, "ptr", None)
+    if p is None:
+        dp = getattr(x, "data_ptr", None)
+        p = dp() if dp is not None else None
+    return (id(x), p, tuple(getattr(x, "shape", ())))
+
+
+_memo = {}
+
+
+def invalidate_launch_memos():
+    """Forget every prepared launch (a workspace they point into was reallocated)."""
+    _memo.clear()
+    from . import ops
+
+    ops._pd_memo.clear()
+_MEMO_MAX = 4096
+
+
+def _stream_of(objs, stream):
+    if stream is not None:
+        return int(getattr(stream, "cuda_stream", stream))
+    for o in objs:
+        if type(o).__module__.startswith("torch"):
+            import torch
+
+            return torch.cuda.current_stream().cuda_stream
+    return 0
+
+
 def launch(kernel, args=None, *, ptrs=None, scalars=None, grid=None, syms=None, spec=None, stream=None, check=True):
+    # fast path: the same call signature (kernel, tensors by identity + data pointer, scalars, grid, syms) relaunches its prepared kernarg
+    key = (kernel, tuple((n, fast_id(v)) for n, v in (args or {}).items()), tuple(fast_id(v) for v in (ptrs or ())), tuple(scalars or ()),
+           None if grid is None else tuple(grid), None if syms is None else tuple(sorted(syms.items())), None if spec is None else repr(spec), check)
+    hit = _memo.get(key)
+    if hit is not None:
+        objs = list((args or {}).values()) + list(ptrs or ())
+        hit.launch(_stream_of(objs, stream))
+        return hit.result
+    kern, prep = _launch_slow(kernel, args, ptrs, scalars, grid, syms, spec, stream, check)
+    if len(_memo) > _MEMO_MAX:
+        _memo.clear()
+    _memo[key] = prep
+    return kern
+
+
+def _launch_slow(kernel, args, ptrs, scalars, grid, syms, spec, stream, check):
     """Launches ``kernel`` (a registered name). Arguments either by name (``args``: name -> tensor-like or number) or positionally
     (``ptrs``: tensor-likes for the pointer arguments in offset order, ``scalars``: numbers for the scalar arguments in offset order).
     ``grid`` / ``syms`` default to what the contract implies. Returns the Kernel."""
@@ -127,5 +178,6 @@ def launch(kernel, args=None, *, ptrs=None, scalars=None, grid=None, syms=None, 
         except ContractError as e:
             raise ContractError(f"{kernel}: cannot derive the launch grid ({e}); pass grid= / syms= (the scalar arguments must satisfy "
                                 f"the kernel's relations, e.g. row counts a multiple of the rows per CTA)") from None
-    kern.launch(vals, grid, syms, sizes, current_stream(refs, stream), check)
-    return kern
+    prep = kern.prepare(vals, grid, syms, sizes, check, result=kern)
+    prep.launch(current_stream(refs, stream))
+    return kern, prep

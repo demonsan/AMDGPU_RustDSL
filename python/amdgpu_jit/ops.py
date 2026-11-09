@@ -79,6 +79,8 @@ def _ws(key, nbytes):
     buf = _workspace.get(key)
     if buf is None or buf[1] < nbytes:
         if buf is not None:
+            from ._generic import invalidate_launch_memos
+            invalidate_launch_memos()  # prepared launches may point into the old buffer
             _hip.free(buf[0])
         buf = _workspace[key] = (_hip.malloc(nbytes), nbytes)
     return buf[0]
@@ -172,6 +174,8 @@ def _ws_zeroed(key, nbytes):
     buf = _workspace.get(key)
     if buf is None or buf[1] < nbytes:
         if buf is not None:
+            from ._generic import invalidate_launch_memos
+            invalidate_launch_memos()
             _hip.free(buf[0])
         ptr = _hip.malloc(nbytes)
         _hip.memset(ptr, 0, nbytes)
@@ -193,6 +197,12 @@ def paged_decode_bf16(q, k_cache, v_cache, block_table, context_lens, out, *, sc
     its split count come from the single dispatch rule (``decode16_plan``): the fused form for B HK >= 256, else the last-arriver form
     (``_c``; partials and the ticket counters live in a persistent workspace). Returns (kernel_name, splits).
     """
+    from ._generic import _stream_of, fast_id
+    key = (tuple(fast_id(x) for x in (q, k_cache, v_cache, block_table, context_lens, out)), scale, max_context, check)
+    hit = _pd_memo.get(key)
+    if hit is not None:
+        hit.launch(_stream_of((q, out), stream))
+        return hit.result
     rq, rk, rv, rbt, rcl, ro = (as_ref(x) for x in (q, k_cache, v_cache, block_table, context_lens, out))
     B, H, Dq = rq.shape
     NP, P, HK, Dk = rk.shape
@@ -232,5 +242,12 @@ def paged_decode_bf16(q, k_cache, v_cache, block_table, context_lens, out, *, sc
         sizes["ptr_counter"] = cnt_bytes
         vals["ptr_out"] = ro.ptr
         sizes["ptr_out"] = ro.cap
-    kern.launch(_present(kern, vals), (HK, B, S), {"G": H // HK, "B": B}, sizes, st, check)
+    prep = kern.prepare(_present(kern, vals), (HK, B, S), {"G": H // HK, "B": B}, sizes, check, result=(name, S))
+    prep.launch(st)
+    if len(_pd_memo) > 1024:
+        _pd_memo.clear()
+    _pd_memo[key] = prep
     return name, S
+
+
+_pd_memo = {}

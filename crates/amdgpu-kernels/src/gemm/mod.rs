@@ -866,6 +866,9 @@ struct Body {
     odd_by: std::cell::Cell<u8>,
     /// the tail's one-time shift of the pair dwords has been emitted (per tail branch: reset by `iter` hooks below)
     tail_shifted: std::cell::Cell<bool>,
+    /// depth3 + Block128: the per-tile fp32 scales go through the DMA stage into the SC ring (two dword DMAs per wave: A rows of the CTA,
+    /// B block; only wave 0's are real, the others land in their own 512-byte part of the slot): (ring, A voffset, B voffset)
+    sc_dma: Option<(Shared, ValueId, ValueId, ValueId, ValueId)>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
@@ -906,7 +909,18 @@ impl Body {
     }
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
     /// word i / 4: `sa_sel`) and the B scale (the dword-expanded panel: byte 0, no shift).
-    fn load_scales(&self, b: &mut FnBuilder, kb: I32) -> (Vec<ValueId>, Vec<ValueId>) {
+    fn load_scales(&self, b: &mut FnBuilder, kb: I32, slot: &SlotIdx) -> (Vec<ValueId>, Vec<ValueId>) {
+        if let Some((sc, _, _, _, rd)) = &self.sc_dma {
+            // depth3 + Block128: the tile's scales from its SC slot (A row of the lane per m block, the B block's float at +256)
+            let nm = self.n_a();
+            let p = sc.at(slot);
+            let base = { let o = p.off_v(b); b.bind_i32(o + sc.base as i32) };
+            return p.read(b, |b| {
+                let sa: Vec<ValueId> = (0..nm).map(|i| { let a = b.bind_i32(ev(base) + ev(*rd) + 64 * i as i32); let v = b.load_lds_b32(a); b.bitcast_f32(v) }).collect();
+                let sb = { let a = b.bind_i32(ev(base) + 256); let v = b.load_lds_b32(a); b.bitcast_f32(v) };
+                (sa, vec![sb])
+            });
+        }
         if self.cfg.scales == Scales::RowCol || self.cfg.scales == Scales::None {
             // unit E8M0 scales (127 in every byte): the fp32 row / column scales are applied in the epilogue
             let (u, v) = self.unit.expect("unit scales");
@@ -1028,7 +1042,7 @@ impl Body {
     /// The whole tile `t` into registers (prologue: tile 0).
     fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
-        let (sa, sb) = self.load_scales(b, ox(t.it));
+        let (sa, sb) = self.load_scales(b, ox(t.it), &t.cur);
         let sa: Vec<ValueId> = sa.into_iter().map(|v| self.scale_word(b, v)).collect();
         let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
@@ -1074,7 +1088,7 @@ impl Body {
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
             // shuffled scales: t + 1 odd shares t's pair dword (already installed): no load
             let same_pair = self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) && Self::slot_of(t) == 0;
-            let early = (t.staged && !same_pair).then(|| self.load_scales(b, ox(t.it) + 1));
+            let early = (t.staged && !same_pair).then(|| self.load_scales(b, ox(t.it) + 1, &t.next));
             ((next, next_hi), early)
         });
         let (next, next_hi) = next;
@@ -1269,6 +1283,20 @@ impl Body {
                 u.capture(b, format!("ab.{uname}.{q}"), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
             }
         }
+        if let Some((sc, va, vb, wofs, _)) = &self.sc_dma {
+            // the tile's scales: soffset = 4 kb (+ the split's first tile), M0 = the wave's 512-byte part of the slot (A at +0, B at +256)
+            let (_, (so, m0a, m0b)) = u.capture(b, "ab.SC.setup", |b| {
+                let kb = key0.clone().lshr(7);
+                let kb = match self.zb { Some(zb) => kb + ev(zb), None => kb };
+                let so = { let v = b.bind_i32(kb << 2); b.read_first_lane(v) };
+                let o = sc.at(slot).off_v(b);
+                let m0a = { let v = b.bind_i32(o + sc.base as i32 + ev(*wofs)); b.read_first_lane(v) };
+                let m0b = { let v = b.bind_i32(ev(m0a) + 256); b.read_first_lane(v) };
+                (so, m0a, m0b)
+            });
+            u.capture(b, "ab.SC.a", |b| sc.at(slot).write(b, |b| b.load_buffer_lds(self.rsrc_sfa, *va, so, m0a, 0, 1)));
+            u.capture(b, "ab.SC.b", |b| sc.at(slot).write(b, |b| b.load_buffer_lds(self.rsrc_sfb, *vb, so, m0b, 0, 1)));
+        }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
         amdgpu_tile::stage::StageInst::new("move.ab_stage", amdgpu_tile::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
     }}
@@ -1413,6 +1441,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
         // 64 x 128 forms: the 3-slot ring (depth3: 256x7168x4096 19.8 -> 15.1 us, 1024x4096x8192 50.5 -> 47.0, 128x4096x8192 S4 16.0 -> 13.9)
+        // bf16 64 x 128 on the 3-slot ring (256x7168x4096 41.3 (128) -> 23.5 us, 128x4096x8192 74.0 -> 37.3)
+        "gemm_a16w16_bf16_64" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() })),
+        "gemm_a16w16_bf16_64_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() }.splitk())),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         // (fp8 per-token: 256x7168x4096 22.98 (128) -> 13.60 us, 1024x4096x8192 51.6 -> 46.0)
@@ -1424,8 +1455,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_blockscale" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale", GemmConfig::a8w8_blockscale())),
         "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
         // the mid / small-M forms (`dispatch::blockscale_config`)
-        "gemm_a8w8_blockscale_64" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64", GemmConfig { cta_m: 64, ..GemmConfig::a8w8_blockscale() })),
-        "gemm_a8w8_blockscale_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64_splitk", GemmConfig { cta_m: 64, ..GemmConfig::a8w8_blockscale() }.splitk())),
+        "gemm_a8w8_blockscale_64" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_blockscale() })),
+        "gemm_a8w8_blockscale_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_blockscale() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
         n if n.starts_with("moe_sum_bf16h_k") => n["moe_sum_bf16h_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16_x(n, k, true)),
@@ -1677,7 +1708,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
     let slots = if cfg.depth3 { 3 } else { 2 };
-    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
+    assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None | Scales::Block128) && cfg.moe.is_none() && cfg.conv.is_none()), "depth3: unit-scale plain GEMMs");
     let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
@@ -1910,6 +1941,10 @@ impl skeleton_v4::V4Slots for GemmSlots {
     pipe.scalar_exit = true;
     if cfg.depth3 {
         pipe.rs_depth = 3;
+        if cfg.scales == Scales::Block128 {
+            // (the two scale DMAs per wave and stage)
+            pipe.late_tile1_vm += 2;
+        }
     }
     // operand read partitions (the wave offset added to the bases)
     let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
@@ -2009,12 +2044,25 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
         Mx32 { voff_a, voff_b, shift, shuf: cfg.scale_shuf.then(|| std::cell::RefCell::new(None)) }
     });
+    // depth3 + Block128: the scale DMA voffsets (wave 0: A row of the CTA per lane, lane 0 the B block; others out of range) and the lane's
+    // read offset (4 (wm wave_m + lane % 16), + 64 per m block)
+    let sc_dma = (cfg.depth3 && cfg.scales == Scales::Block128).then(|| {
+        assert!(cta_m == 64 && cta_n == 128, "depth3 blockscale: 64 x 128 CTAs");
+        let big = b.c_i32(0x7fff_fff0);
+        let w0 = b.bind_cond(lane.wave().eq(0));
+        let va = { let v = b.bind_i32(((ev(by) << lg_m) + lane.lane()).min(ev(m_v) - 1) * ev(kb_v) << 2); b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(w0), a: Opnd::Val(v), b: Opnd::Val(big) }) };
+        let l0 = b.bind_cond((lane.wave() + lane.lane()).eq(0));
+        let vb = { let v = b.bind_i32(((ev(bx) << lg_n).lshr(7)) * ev(kb_v) << 2); b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l0), a: Opnd::Val(v), b: Opnd::Val(big) }) };
+        let wofs = { let v = b.bind_i32(lane.wave() << 9); b.read_first_lane(v) };
+        let rd = b.bind_i32((ev(wm) * (wave_m as i32) + (lane.lane() & 15)) << 2);
+        (sc_s.clone(), va, vb, wofs, rd)
+    });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
         a_rd_x: (1..nimg).map(|k| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (k * a_bytes) as i32)).collect(); h }).collect(),
         a_hi: a_bytes as i32,
         w4_shift: (cfg.elem == Elem::Bf16W4).then(|| b.bind_i32((lane.lane().lshr(5)) << 3)),
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false),
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false), sc_dma,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {

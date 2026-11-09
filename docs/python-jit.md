@@ -159,6 +159,20 @@ The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term b
 `python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only; GEMM / prefill / MoE checks sample rows and tokens) runs every op on random data against a Python reference that follows the
 C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm,rope,qknorm_rope_kv,cache,cache_blocked,topk,moe_sorting,moe_reduce}_host.cpp`).
 
+## Launch overhead
+
+Every op keeps a *prepared launch* per call signature (the tensors by identity, data pointer and shape, the scalars, the grid): the kernarg
+segment is packed and checked against the contract once, later calls with the same signature are one `hipModuleLaunchKernel`
+(`_hip.Prepared`). A reallocated workspace invalidates them. Host time per call (`python3 python/tests/launch_overhead.py`, MI355X,
+contract check on / off):
+
+| op | before | after |
+|---|--:|--:|
+| `paged_decode_bf16` B64 (fused) | 26.6 / 19.2 µs | 5.8 / 5.5 µs |
+| `paged_decode_bf16` B4 (last-arriver S4) | 23.6 / 20.2 µs | 5.5 / 5.5 µs |
+| `rmsnorm` 64x4096 (generic `launch`) | 29.2 / 22.2 µs | 6.5 / 6.2 µs |
+| `gemm` bf16 256^3 | 57.4 / 40.2 µs | 9.3 / 9.3 µs |
+
 ## Checks on the GPU node
 
 `HIP_VISIBLE_DEVICES=6 bash python/tests/run_all.sh [--full] [filters]` runs all of them (unit tests, `ops_check.py`, `decode_check.py`;
