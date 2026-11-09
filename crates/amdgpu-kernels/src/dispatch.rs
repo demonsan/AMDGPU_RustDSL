@@ -6,6 +6,8 @@
 /// part) giving S CTAs >= CUs. Same run (us, ours / best aiter BpreShuffle tile): 1024x4096x8192 68.0 / 62.5 (was 71.4 with 128 S2),
 /// 512x7168x7168 60.3 / 51.3 (64.1), 256x7168x4096 S2 25.3 / 16.9 (29.4), 128x4096x8192 S4 20.9 / 22.3 (27.1), 64x8192^2 S4 22.5 / 23.0
 /// (27.2); 4096^3 and 2048x7168^2 stay 128 x 128 (122.7 / 129.3, 185.2 / 187.2).
+/// The 64-row forms run the 3-slot ring with the scales through the DMA stage (`GemmConfig::depth3`): 1024x4096x8192 64.1, 512x7168^2 51.0,
+/// 256x7168x4096 18.5 (S 1 now best; the rule's S 2 23.6), 128x4096x8192 S4 15.4, 64x8192^2 S4 19.2 us.
 pub fn blockscale_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
     if m.div_ceil(128) * n.div_ceil(128) >= 2 * cus {
         return (128, 1);
