@@ -96,6 +96,15 @@ size (torch storage, `DeviceBuffer(nbytes=…)`) is what the contract check uses
 `tests/gpu/ref_host.cpp` (`select_path`, fitted on realistic data): a KV split with s = 4 when ntiles ≥ 16 and N256 ≤ 64, s = 2 when ntiles ≥ 32 and
 N256 ≤ 128 (N256 = `ceil(S/256)·H·B`, ntiles = `ceil(SK/128)`), else `_t128` when N256 ≤ 64, else `_vs128`; the KV-split partials live in a persistent per-stream workspace. Returns `(path, splits)`.
 
+**`paged_decode_bf16(q, k_cache, v_cache, block_table, context_lens, out, *, scale=None, max_context=None, stream=None, check=True)`** —
+paged-KV decode (one new token per sequence), bf16, head dim 128: `q [B, H, 128]`, `k_cache` / `v_cache [num_pages, P, HK, 128]` (NHD pages,
+P a power of two ≥ 16), `block_table [B, max_pages]` int32, `context_lens [B]` int32, `out [B, H, 128]`; G = H / HK ≤ 16; `scale` defaults
+to 1/√128. The kernel and split count come from the single dispatch rule (`decode16_plan`, also `amdgpu_jit.decode16_plan(b, hk, ctx)`):
+the fused form when B·HK ≥ 256, else the last-arriver `_c` form with S splits (partials and the zero-initialised ticket counters live in a
+persistent workspace; the kernel resets the counters). `max_context` only steers that choice (default `max_pages·P`). Returns
+`(kernel, splits)`. `python3 python/tests/decode_check.py` is the torch-free example and node check (stdlib only: random bf16 data, shuffled
+block tables, pa_host's CPU reference): both forms bad = 0.
+
 Arguments: torch tensors (any 1-byte dtype for fp8 / E8M0, any 2-byte dtype for bf16), objects with `__dlpack__` (GPU device), `DeviceBuffer`,
 or `RawPtr(ptr, shape, itemsize)`. All must be contiguous and 16-byte aligned (scales: 4). Stream: the explicit `stream` (an integer handle or
 an object with `cuda_stream`), else torch's current stream when torch tensors are passed, else the null stream.
