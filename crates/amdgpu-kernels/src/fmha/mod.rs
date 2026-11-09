@@ -349,13 +349,9 @@ impl<'a> AttnBody3<'a> {
         let wq = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
         Opnd::Val(b.frag2(wq, wq))
     }
-    /// Per-tensor FP8: S *= m (fp32), then the causal mask (in place, only on tiles that reach the wave's smallest limit).
+    /// The causal mask (in place, only on tiles that reach the wave's smallest limit). (The per-tensor m scale of S is applied where S is
+    /// produced: `prologue_compute` and the end of `m_phase`.)
     fn pt_prepare(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, t: &TileIt) {
-        if let Some(pt) = self.blk.pt {
-            for a in &s.accs {
-                b.var_scale_pk(a.var, pt.m2);
-            }
-        }
         if let Some(cm) = self.causal {
             let key_t = b.bind_i32(t.key0());
             let partial = b.bind_cond((ev(key_t) + 127).ge(ev(cm.lim_min)));
@@ -527,6 +523,23 @@ impl PipeBody for AttnBody3<'_> {
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         let bias = self.bias_in(b, Opnd::Val(self.sm.bias_init));
         self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), bias);
+        if let Some(pt) = self.blk.pt {
+            // tile 0: the m scale on the S values (two dwords per v_pk_mul_f32)
+            self.s_init = self
+                .s_init
+                .clone()
+                .into_iter()
+                .map(|v| {
+                    let parts: Vec<Opnd> = (0..8u8)
+                        .map(|k| {
+                            let p = b.frag_slice(v, 2 * k, 2);
+                            Opnd::Val(b.pk_mul_f32(p, pt.m2))
+                        })
+                        .collect();
+                    b.frag_cat(&parts)
+                })
+                .collect();
+        }
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let [bias, la]: [(DType, Opnd); 2] = self.sm.state().try_into().expect("softmax state");
@@ -614,6 +627,15 @@ impl PipeBody for AttnBody3<'_> {
                 (Vec::new(), s)
             })
             .emit(b);
+        if let (Some(pt), true) = (self.blk.pt, t.staged) {
+            // per-tensor FP8: the next tile's S scaled by m at the end of the matrix phase, where it is produced. At the start of the softmax
+            // phase (the first version) the 32 v_pk_mul lengthened the VALU phase that both ping-pong groups wait on (sched's ATT: VALU stall
+            // 1.12 M vs 0.25 M for the vendor); moved here, same run: B2 H32 8192^2 1083 -> 933 us (1.20x aiter), causal 640 -> 556, B4 H16
+            // 2048^2 90 -> 71, KV split B1 H8 4096^2 51 -> 44 / causal 48.5 -> 39.7
+            for a in &s.accs {
+                b.var_scale_pk(a.var, pt.m2);
+            }
+        }
     }
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let r = self.ring;

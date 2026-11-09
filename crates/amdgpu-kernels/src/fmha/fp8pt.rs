@@ -114,6 +114,7 @@ fn causal_mask(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock) -> CausalMask {
 }
 
 /// One pass over the block's q tile: the vs128 dispatch (versions x roles) with the per-tensor body.
+#[allow(clippy::too_many_arguments)]
 fn run_pass(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, ring: &KvRing3, pipe: &Pipeline, lut: ValueId, causal: bool) {
     let cm = causal.then(|| causal_mask(b, io, blk));
     versioned(b, lut, |b, lut| {
