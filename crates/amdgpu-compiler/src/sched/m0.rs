@@ -153,17 +153,30 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                 p -= 1;
                 folded += 1;
             }
-            // hoist
-            let srcs: Vec<VReg> = b.insts[p].uses().into_iter().map(|x| canon(x)).collect();
-            let writes_scc = b.insts[p].op == MOp::SAddM0;
-            let mut j = p;
+            // hoist: the M0 write, together with the single-use SALU instruction right above it that computes its source (e.g. a recomputed
+            // `s_mul_i32 base, wave, size`), up to the previous M0 user / the definition of their inputs / an SCC reader
+            let mut start = p;
+            if p > 0 {
+                let z = &b.insts[p - 1];
+                let feeds = z.dst.map_or(false, |d| b.insts[p].uses().iter().any(|u| canon(*u) == canon(d)) && uses.get(&canon(d)).copied() == Some(1) && !alias.contains_key(&d));
+                let salu = matches!(z.op, MOp::SMulI32 | MOp::SAddU32 | MOp::SMovB32 | MOp::SAndB32 | MOp::SLshrB32);
+                if feeds && salu && !z.pin && !crate::op_attrs::attrs(z.op).scc_read {
+                    start = p - 1;
+                }
+            }
+            let group: Vec<MInst> = b.insts[start..=p].to_vec();
+            let gdefs: Vec<VReg> = group.iter().filter_map(|z| z.dst.map(|d| canon(d))).collect();
+            let gsrcs: Vec<VReg> = group.iter().flat_map(|z| z.uses()).map(|x| canon(x)).filter(|x| !gdefs.contains(x)).collect();
+            let writes_scc = group.iter().any(|z| crate::op_attrs::attrs(z.op).scc_write);
+            let mut j = start;
             while j > 0 {
                 let z = &b.insts[j - 1];
                 let at = crate::op_attrs::attrs(z.op);
                 let blocks = z.pin
                     || is_m0_writer(z.op)
                     || at.m0_src.is_some()
-                    || z.dst.map_or(false, |d| srcs.contains(&canon(d)))
+                    || z.dst.map_or(false, |d| gsrcs.contains(&canon(d)) || gdefs.contains(&canon(d)))
+                    || z.uses().iter().any(|u| gdefs.contains(&canon(*u)))
                     || (writes_scc && (at.scc_read || at.scc_write))
                     || matches!(z.op, MOp::SchedGroup);
                 if blocks {
@@ -171,9 +184,11 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                 }
                 j -= 1;
             }
-            if j < p {
-                let w = b.insts.remove(p);
-                b.insts.insert(j, w);
+            if j < start {
+                let moved: Vec<MInst> = b.insts.drain(start..=p).collect();
+                for (k, z) in moved.into_iter().enumerate() {
+                    b.insts.insert(j + k, z);
+                }
             }
             p += 1;
         }
