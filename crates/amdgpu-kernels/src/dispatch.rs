@@ -194,14 +194,18 @@ pub fn hd192_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus:
         if 4 * u <= cus && sk.div_ceil(128) >= 16 {
             return ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4);
         }
-        if u < cus && sk.div_ceil(128) >= 32 {
+        // re-measured after sched's region policy (2026-11-09, us; plain / ks2): B1 H16 2048^2 73.0 / 62.5, B1 H8 4096^2 132.6 / 111.7: S = 2 from
+        // 16 key tiles
+        if u < cus && sk.div_ceil(128) >= 16 {
             return ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2);
         }
         return ("fmha_fwd_hd192_hd128_bf16_v3", 1);
     }
     if u >= 2 * cus {
         ("fmha_fwd_hd192_hd128_bf16_v3_causal", 1)
-    } else if 2 * u <= cus && sk.div_ceil(128) >= 32 {
+    } else if 2 * u <= cus && (sk.div_ceil(128) >= 32 || (4 * u <= cus && sk.div_ceil(128) >= 16)) {
+        // (re-measured after the region policy, us; np / np_q128 / ks2: B1 H8 2048^2 64.2 / 52.6 / 48.0, B1 H8 4096^2 120.3 / 103.1 / 89.2;
+        // B1 H16 2048^2 70.3 / 57.1 / 59.3)
         ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2)
     } else if 2 * u <= cus {
         // the 128-row / 64-key form (same run, us; np / np_q128 / aiter): B1 H16 2048^2 72.1 / 65.7 / 50.3, B2 H16 1024^2 42.3 / 39.8 / 31.4,
@@ -295,7 +299,9 @@ mod tests {
         assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2));
         assert_eq!(hd192_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2));
         assert_eq!(hd192_prefill_kernel(1, 8, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4));
-        assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3", 1));
+        assert_eq!(hd192_prefill_kernel(1, 16, 2048, 2048, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3_ks", 2));
+        assert_eq!(hd192_prefill_kernel(1, 8, 2048, 2048, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 2));
+        assert_eq!(hd192_prefill_kernel(2, 16, 1024, 1024, true, 256), ("fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128", 1));
         assert_eq!(hd192_prefill_kernel(1, 16, 4096, 4096, false, 256), ("fmha_fwd_hd192_hd128_bf16_v3", 1));
     }
 

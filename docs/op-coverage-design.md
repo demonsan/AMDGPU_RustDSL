@@ -984,14 +984,15 @@
 | bf16 hd192/hd128 causal（配对） | B4 H16 2048² | 128 µs | 126 µs | 0.98 |
 | bf16 hd192/hd128 causal（配对） | B1 H128 1024² | 82.8 µs | 79.5 µs | 0.96 |
 | bf16 hd192/hd128 causal（`_np`） | B1 H16 4096² | 147 µs | 113 µs | 0.77 |
-| bf16 hd192/hd128 causal（`_np_q128`） | B1 H16 2048² | 65.3 µs | 49.3 µs | 0.75 |
+| bf16 hd192/hd128 causal（`_np_q128` + 区域策略） | B1 H16 2048² | 56.9 µs | 48.9 µs | 0.86 |
+| bf16 hd192/hd128（`_ks` S2 + 区域策略） | B1 H16 2048² | 64.4 µs | 46.7 µs | 0.73 |
 | bf16 hd192/hd128 causal（`_ks` S2 + q16 combine） | B1 H8 4096² | 89.1 µs | 84.4 µs | 0.95 |
-| bf16 反向 | B4 H16 2048² | 670 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.74 |
-| bf16 反向 | B1 H16 4096² | 637 µs | 465 µs | 0.73 |
-| bf16 反向 GQA4 | B4 H16 HK4 2048² | 671 µs | 490 µs | 0.73 |
-| bf16 反向 causal | B4 H16 2048² | 427 µs | 320 µs | 0.75 |
-| bf16 反向 causal | B1 H16 4096² | 392 µs | 339 µs | 0.86 |
-| bf16 反向 causal GQA4 | B4 H16 HK4 2048² | 422 µs | 304 µs | 0.72 |
+| bf16 反向（mask 只在需要的 tile，重测） | B4 H16 2048² | 638 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.77 |
+| bf16 反向 | B1 H16 4096² | 597 µs | 467 µs | 0.78 |
+| bf16 反向 GQA4 | B4 H16 HK4 2048² | 635 µs | 493 µs | 0.78 |
+| bf16 反向 causal | B4 H16 2048² | 382 µs | 320 µs | 0.84 |
+| bf16 反向 causal | B1 H16 4096² | 354 µs | 342 µs | 0.97 |
+| bf16 反向 causal GQA4 | B4 H16 HK4 2048² | 386 µs | 305 µs | 0.79 |
 | paged decode（不同次，上文表） | B16 H64 HK8 ctx 2048 | 24.1 µs | 18.5 µs | 0.77 |
 | paged decode（不同次） | B64 ctx 2048 | 83.8 µs | 77.4 µs | 0.92 |
 | MLA decode H16 P1（不同次，上文） | B64 ctx ≤ 4096 | 76 µs | 47.7 µs | 0.63 |
@@ -1008,6 +1009,8 @@
   - hd128 causal 在配对网格 P = 128（短 key）上胜出：B4 H16 1024² 51.5 → 40.6，B1 H32 HK8 2048² 77.2 → 65.1；P = 64 时 v1（32.9）仍最好，P = 256 时配对的 256 行形式最好（B8 H16 1024² 65.5 / 69.3）。新增 `fmha_fwd_hd128_bf16_v3_causal_q128`，`bf16_prefill_kernel`：短 key 且 P < CU/2 用 v1（阈值从 64 提到 128），CU/2 ≤ P < CU 且 key tile ≤ 16 用 `_causal_q128`；
   - hd192 causal 不配对、U ≤ CU/2 时胜出：B1 H16 2048² 72.1 → 65.7，B2 H16 1024² 42.3 → 39.8，B1 H8 2048² 65.9 → 60.9；U = 256 时更慢。新增 `fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128`。
   - hd192 小网格离厂商仍有 25% 左右（B1 H16 2048² causal 0.75，非 causal 0.61）；厂商 128 行 tile 的每 CU 效率更高，原因未归因。
+- **hd192 的调度区域（sched，2026-11-09）**：ATT 显示 hd192 的循环在调度器回退后按发射顺序运行（重排后需要 277 个活跃 dword > 256），且整数 VALU 约为厂商的 10 倍（循环内重算的 LDS 读偏移）。在 `Body` 的 `kv_stage` / `v_phase` / `m_phase` 上加 weave 区域标记，对 hd192 的非配对、非切分形式改为全核 `rewait`、只在 `m_phase` 与 `kv_stage` 内重排（softmax 阶段保持发射顺序）：B1 H16 2048² 非 causal 74 → 71.6 µs，causal `_np_q128` 64.7 → 56.8，B2 H32 4096² −2 % / −5 %。把读偏移改为按 chunk 现算（kr0 ^ (c << 5)）正确但 hd192 慢 12–15 %，已归档为 `archive/bf16v3-derived-offsets`。
+- 区域策略之后重新核对分发（µs）：非 causal B1 H16 2048² plain 73.0 / ks2 62.5，因此 S = 2 的条件从 32 个 key tile 放宽到 16；causal B1 H8 2048² np 64.2 / q128 52.6 / ks2 48.0，因此 U ≤ CU/4 且 key tile ≥ 16 时也用 `_causal_ks`。
 - **hd192 非 causal 小网格**：`hd192_prefill_kernel` 对 U ≤ CU/4 用 `_ks` S4，对 U < CU 且 key tile ≥ 32 用 S2（B1 H8 2048² 66.6 → 41.3 µs，厂商 32.5；4096² 134 → 112，厂商 88）；U = 128、16 个 key tile（B1 H16 2048²）切分不划算，不切。剩余差距是结构性的：我们 256 行 / 8 wave 的 tile 在小网格下每 CU 一个 workgroup，厂商用 128 行 / 4 wave。
 
 **性能待办**：
@@ -1177,6 +1180,22 @@ blockscale 128×128（`fp8bs`）的规则：
 | B1 H32 2048²，causal | 223.4 µs（88.5 + 126.0） | 194.8 µs | 0.87 |
 | B2 H8 1024²，causal | 93.8 µs（36.5 + 51.0） | 107.6 µs | **1.15** |
 
+**更新（2026-11-09 晚）：mask 只在需要的 tile 上做**（ATT：dq 的 MFMA 流超出理想值 61%，其中 lgkmcnt 57%、VALU 33%；asm 里非 causal 的 dq 也对每个元素做 key 下标的 add + cmp + cndmask）：
+- dq：key mask 改为 uniform 分支，只在达到本 wave 最小上限的 tile 上执行，把被遮住的 S 原地置 −∞（P = 0）；其余 tile 不再有逐元素的比较 / 选择。
+- dkdv：query 越界（尾 tile）与 causal（对角线以下）的 mask 同样改为 uniform 分支内原地置 −∞；P 的指数参数改为 `fma(s, csc, −log2e·lse)`（每元素少一条 VALU）。
+- 同次 A/B（µs，总计 / dq / dkdv，前 → 后，全部 bad=0，strict 0 错误）：B1 H8 2048² 162.8 → 146.6（dq 64.1 → 53.7，dkdv 89.5 → 84.1）；causal 155.4 → 136.6；B4 H16 2048² causal 423 → 390；B2 H8 HK2 1000×1500 causal 105.9 → 95.5；B1 H8 777×1300 92.9 → 84.1。
+- 改动后与 aiter 同次运行（`attn_family_table.sh ONLY=bwd`）：
+
+| 形状 | ours | aiter | 比 |
+|---|--:|--:|--:|
+| B4 H16 2048² | 637.7 µs | 494.0 µs | 0.77 |
+| B1 H16 4096² | 597.1 µs | 467.4 µs | 0.78 |
+| B4 H16 HK4 2048² | 634.5 µs | 492.7 µs | 0.78 |
+| B4 H16 2048² causal | 381.9 µs | 319.9 µs | 0.84 |
+| B1 H16 4096² causal | 354.2 µs | 342.0 µs | 0.97 |
+| B4 H16 HK4 2048² causal | 386.0 µs | 304.7 µs | 0.79 |
+| B1 H8 2048²（A/B 运行） | 146.6 µs | 141.0 µs | 0.96 |
+| B1 H8 2048² causal（A/B 运行） | 136.6 µs | 163.1 µs | 1.19 |
 正确性：ours 全部 `bad=0`，`gpu_verify --strict` 0 错误；厂商在 SQ ≠ SK 且不是 128 的整数倍的形状（B2 H8 HK2 1000 × 1500，causal）上自己有 dk / dv 错误（`dk=196 dv=177` bad），ours 没有。
 
 ### 7.8 批次 5b（implicit-GEMM 卷积）状态：2d / 3d bf16 覆盖完成
