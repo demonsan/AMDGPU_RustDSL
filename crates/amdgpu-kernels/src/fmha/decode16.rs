@@ -298,24 +298,54 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
         (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
     };
+    // page groups (bf16 flash layout): k_lo is a multiple of KT, so a tile's keys fall into KT / min(page, KT) groups of consecutive keys that share ONE page (page 16, KT 32: 2 pages); the 8 per-lane
+    // block-table loads per tile collapse to one wave-uniform load per group (the 64 lanes of every DMA hold 4 keys of the same group). The page of the clamped key (min(key, k_hi - 1)) is the page of the group's
+    // first key clamped the same way.
+    let grp_path = !fp8 && !blocked;
+    let gsz = page.min(KT);
+    let ngrp = if grp_path { KT / gsz } else { 0 };
+    let nla = if grp_path { ngrp } else { KT / 4 };
+    let grp_of = move |i: i32| (4 * i) / gsz;
+    let group_page = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32, g: i32| -> ValueId {
+        let key = b.bind_i32((key_t + g * gsz).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+        let bvo = b.bind_i32(ev(key).lshr(page.trailing_zeros() as i32) << 2);
+        let pv = b.buffer_load_f32(r_bt, bvo, bt_so, 0);
+        pv
+    };
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     if la {
-        for i in 0..KT / 4 {
-            let (_, pv) = lookup(&mut b, ev(k_lo), i);
+        for i in 0..nla {
+            let pv = if grp_path { group_page(&mut b, ev(k_lo), i) } else { lookup(&mut b, ev(k_lo), i).1 };
             let pi = b.bitcast_i32(pv);
             inits.push((DType::I32, Opnd::Val(pi)));
         }
     }
     let vars = b.begin_loop(&inits);
-    let la_vars: Vec<VarId> = if la { vars[11 + NKB..11 + NKB + (KT / 4) as usize].to_vec() } else { Vec::new() };
+    let la_vars: Vec<VarId> = if la { vars[11 + NKB..11 + NKB + nla as usize].to_vec() } else { Vec::new() };
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..11].to_vec();
     let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    let lookups: Vec<(ValueId, ValueId)> = if la {
+    // grouped pages (bf16 flash): one load per page group (or the carried ones), the raw value shared by the group's DMAs
+    let gpages: Vec<ValueId> = if !grp_path {
+        Vec::new()
+    } else if la {
+        (0..ngrp).map(|g| { let pg = b.bind_i32(amdgpu_dsl::varx(la_vars[g as usize]) + 0); b.bitcast_f32(pg) }).collect()
+    } else {
+        (0..ngrp).map(|g| group_page(&mut b, ev(key_t), g)).collect()
+    };
+    let lookups: Vec<(ValueId, ValueId)> = if grp_path {
+        (0..KT / 4)
+            .map(|i| {
+                let key = b.bind_i32(ev(key_t) + kk_of(i));
+                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+                (kc, gpages[grp_of(i) as usize])
+            })
+            .collect()
+    } else if la {
         // the carried pages (issued in the previous iteration / the prologue)
         (0..KT / 4)
             .map(|i| {
@@ -337,11 +367,17 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         .collect() };
     // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
     let nv = lookups.len() as u8;
+    let gclamped: Vec<ValueId> = gpages.iter().map(|&pv| { let pg = b.bitcast_i32(pv); b.bind_i32(ev(pg).max(0).min(ev(npages) - 1)) }).collect();
     let rows: Vec<(ValueId, ValueId)> = lookups
         .iter()
-        .map(|&(kc, pv)| {
-            let pg = b.bitcast_i32(pv);
-            let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
+        .enumerate()
+        .map(|(i, &(kc, pv))| {
+            let pg = if grp_path {
+                gclamped[grp_of(i as i32) as usize]
+            } else {
+                let pg = b.bitcast_i32(pv);
+                b.bind_i32(ev(pg).max(0).min(ev(npages) - 1))
+            };
             if blocked {
                 // blocked K [NB][HK][D / 16][BS][16]: the key's first 16-byte chunk (chunk j at + j BS 16)
                 (kc, b.bind_i32((ev(pg) * ev(hkv_n) + ev(hk)) * (D * page) + ((ev(kc) & (page - 1)) << 4)))
@@ -432,7 +468,11 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         }),
     }
     // lookahead: the next tile's pages (in flight behind this tile's compute; QK still waits only for K)
-    let next_pages: Vec<ValueId> = if la { (0..KT / 4).map(|i| { let kt_n = ev(key_t) + KT; lookup(&mut b, kt_n, i).1 }).collect() } else { Vec::new() };
+    let next_pages: Vec<ValueId> = if la {
+        if grp_path { (0..ngrp).map(|g| group_page(&mut b, ev(key_t) + KT, g)).collect() } else { (0..KT / 4).map(|i| { let kt_n = ev(key_t) + KT; lookup(&mut b, kt_n, i).1 }).collect() }
+    } else {
+        Vec::new()
+    };
     b.wait_vm(nv + next_pages.len() as u8);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
