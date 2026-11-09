@@ -402,7 +402,7 @@ def check_moe_sorting(M=40, E=64, K=2, BM=16):
     r.cmp(nv[1], M, 0)
     for e in range(E + 1):
         r.cmp(ts[e], off[e] // BM, 0)
-    for j in range(nt):
+    for j in range(maxp // BM):  # (the allocation is ceil(maxp / BM) tiles; the kernel writes the floor, as tests/gpu/moe_sorting_host.cpp checks)
         ref = E
         if j * BM < total:
             ref = max(e for e in range(E) if off[e] <= j * BM and off[e + 1] > j * BM)
