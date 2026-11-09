@@ -81,6 +81,10 @@ pub fn explicit(m: &mut MFunction) -> (usize, usize) {
                     w.region = inst.region;
                     w.origin = inst.origin;
                     b.insts[i].skip_m0 = true;
+                    // the DMA no longer reads its M0 source register (the explicit write does): drop the operand, or the register would stay
+                    // live up to the DMA - and become an undefined use (live from the kernel entry) once the write folds its defining add
+                    let k = crate::op_attrs::attrs(b.insts[i].op).m0_src.expect("m0 operand");
+                    b.insts[i].srcs[k] = Src::Imm(0);
                     b.insts.insert(i, w);
                     made += 1;
                     i += 2;
@@ -202,7 +206,7 @@ pub fn pad(m: &mut MFunction) -> usize {
     for b in &mut m.blocks {
         let mut i = 1;
         while i < b.insts.len() {
-            if m0_src(&b.insts[i]).is_some() && b.insts[i].skip_m0 && is_m0_writer(b.insts[i - 1].op) {
+            if crate::op_attrs::attrs(b.insts[i].op).m0_src.is_some() && b.insts[i].skip_m0 && is_m0_writer(b.insts[i - 1].op) {
                 b.insts.insert(i, MInst::new(MOp::SNop).imm(0));
                 n += 1;
                 i += 1;
