@@ -697,7 +697,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             })
             .collect();
         let f4 = b.frag4(v[0], v[1], v[2], v[3]);
-        b.buffer_store_b128(r_po, po_vo, c0, (16 * db as u32) * 4, f4);
+        // (last-arriver: write-through sc1 stores - the lite release needs no L2 write-back)
+        if lastc { b.buffer_store_c(r_po, Some(Opnd::Val(po_vo)), c0, (16 * db as u32) * 4, f4, amdgpu_dsl::MemTy::B128, false, amdgpu_dsl::CachePolicy { sc0: false, sc1: true, nt: false }) } else { b.buffer_store_b128(r_po, po_vo, c0, (16 * db as u32) * 4, f4) };
     }
     let lg2 = b.log2_f32(l_tot);
     let x = b.add_f32(Opnd::Var(m_v), lg2);
@@ -717,7 +718,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
         let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
         let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
-        b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
+        if lastc { let li = b.bitcast_i32(lse); b.buffer_store_c(r_l, Some(Opnd::Val(l_vo)), c0, 0, li, amdgpu_dsl::MemTy::B32, false, amdgpu_dsl::CachePolicy { sc0: false, sc1: true, nt: false }) } else { b.buffer_store_f32(r_l, l_vo, c0, 0, lse) };
     }
     b.else_();
     if let (Some(e), Some(eo), Some(el)) = (&epi, epi_o, epi_l) {
@@ -737,12 +738,12 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
         let big = b.c_i32(0x7fff_fff0);
         let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
-        b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf);
+        if lastc { let ni = b.bitcast_i32(neg_inf); b.buffer_store_c(r_l, Some(Opnd::Val(l_vo)), c0, 0, ni, amdgpu_dsl::MemTy::B32, false, amdgpu_dsl::CachePolicy { sc0: false, sc1: true, nt: false }) } else { b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf) };
     }
     b.end_if();
     if let Some(tk) = &tk {
         // ---- last-arriver combine: release, ticket, the last CTA of the (b, hk) merges ----
-        b.fence_release();
+        b.fence_release_lite();
         b.barrier();
         let tid = b.let_(Op::WorkitemId);
         let c0l = b.c_i32(0);
@@ -768,7 +769,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let any = b.any_lane(is_last);
         b.begin_if(Opnd::Val(any));
         {
-            b.fence_acquire();
+            b.fence_acquire_lite();
             let zf = b.c_f32(0.0);
             let c0 = b.c_i32(0);
             let col = b.bind_i32(ev(tid).lshr(4));
@@ -784,10 +785,12 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let si = amdgpu_dsl::varx(v[0]);
             let row = b.bind_i32(ev(prow) + si.clone());
             let lo = b.bind_i32(ev(row) << 2);
-            let x = b.buffer_load_f32(r_l, lo, c0, 0);
+            let sc1 = amdgpu_dsl::CachePolicy { sc0: false, sc1: true, nt: false };
+            let x = b.buffer_load_c(r_l, Some(Opnd::Val(lo)), c0, 0, amdgpu_dsl::MemTy::B32, sc1);
+            let x = b.bitcast_f32(x);
             let oo = b.bind_i32(ev(row) * (4 * D) + (ev(d0) << 2));
-            let o0 = b.buffer_load_b128(r_po, oo, c0, 0);
-            let o1 = b.buffer_load_b128(r_po, oo, c0, 16);
+            let o0 = b.buffer_load_c(r_po, Some(Opnd::Val(oo)), c0, 0, amdgpu_dsl::MemTy::B128, sc1);
+            let o1 = b.buffer_load_c(r_po, Some(Opnd::Val(oo)), c0, 16, amdgpu_dsl::MemTy::B128, sc1);
             // online merge in natural-log units: m' = max(m, x), scale = e^(m - m'), w = e^(x - m')
             let mn = b.max_f32(Opnd::Var(v[1]), x);
             let mbits = b.bitcast_i32(mn);
