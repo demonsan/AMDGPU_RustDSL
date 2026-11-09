@@ -172,6 +172,10 @@ class Kernel:
         buf = self.kernarg(values, grid, syms or {}, sizes or {}, check)
         _hip.launch(self.func, grid, self.info.block, buf, stream)
 
+    def prepare(self, values, grid, syms=None, sizes=None, check=True, result=None):
+        """Pack + validate once; the returned ``_hip.Prepared`` relaunches with one HIP call."""
+        return _hip.Prepared(self.func, grid, self.info.block, self.kernarg(values, grid, syms or {}, sizes or {}, check), result)
+
     def launch_raw(self, kernarg: bytes, grid, stream=None):
         _hip.launch(self.func, grid, self.info.block, kernarg, stream)
 
