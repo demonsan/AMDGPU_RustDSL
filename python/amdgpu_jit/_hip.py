@@ -151,6 +151,28 @@ def launch(func, grid, block, kernarg: bytes, stream=None):
         check(rc, "hipModuleLaunchKernel")
 
 
+class Prepared:
+    """A launch with everything resolved (function, grid, block, the kernarg segment and its ctypes launch parameters): ``launch(stream)`` is
+    one ``hipModuleLaunchKernel`` call. The ops keep these per call signature (same tensors, same shape, same scalars)."""
+
+    __slots__ = ("func", "g", "bl", "buf", "size", "extra", "result")
+
+    def __init__(self, func, grid, block, kernarg: bytes, result=None):
+        self.func = func
+        self.g = (tuple(grid) + (1, 1, 1))[:3]
+        self.bl = (tuple(block) + (1, 1, 1))[:3]
+        self.buf = ctypes.create_string_buffer(kernarg, len(kernarg))
+        self.size = ctypes.c_size_t(len(kernarg))
+        self.extra = _ExtraArr(1, ctypes.addressof(self.buf), 2, ctypes.addressof(self.size), 3)
+        self.result = result
+
+    def launch(self, stream=None):
+        g, bl = self.g, self.bl
+        rc = (_lib or lib()).hipModuleLaunchKernel(self.func, g[0], g[1], g[2], bl[0], bl[1], bl[2], 0, stream or None, None, self.extra)
+        if rc:
+            check(rc, "hipModuleLaunchKernel")
+
+
 class Event:
     def __init__(self):
         e = ctypes.c_void_p()
