@@ -76,7 +76,6 @@ fn the_scanner_sees_the_known_toolboxes() {
     // guards the test itself: the allowlisted files do contain env reads (if a refactor removes them, drop the allowlist entry)
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (suffix, _) in ALLOW {
-        let p = root.join("..").join(suffix.replace("amdgpu-kernels/", "amdgpu-kernels/").trim_start_matches("amdgpu-kernels/").to_string());
         let p = if suffix.starts_with("amdgpu-tile/") { root.join("..").join(suffix) } else { root.join(suffix.trim_start_matches("amdgpu-kernels/")) };
         let src = fs::read_to_string(&p).unwrap_or_else(|_| panic!("allowlisted file {} missing", p.display()));
         assert!(src.lines().any(|l| !env_names(l.split("//").next().unwrap_or("")).is_empty()), "{suffix}: no env read any more; remove the allowlist entry");
