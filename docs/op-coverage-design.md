@@ -579,6 +579,36 @@
 - 也就是大 batch 时达到厂商的 0.80–0.94×。
 - 小 batch 仍需 S ≥ 2，例如 B16 S2 为 28.6 µs，厂商 18.4 µs；其中 combine 的 launch 占 4–10 µs。
 
+**decode16 小 batch 的实验（均未采纳，已归档）**：
+- `archive/decode16-lookahead`：把下一 tile 的块表查找放进循环状态，没有收益。
+- `archive/decode16-prefetch`（`_pf` / `_fpf`）：每个 wave 两个 K/V slot（32 KB），tile t+1 的 DMA 在 tile t 计算之前发出，每 CU 1 个 CTA。
+  - B16 fused 为 31.1 µs（未改前 32.7），但 split S2 不加 prefetch 仍有 28.6 µs，更快。
+  - 大 batch 时因为占用率减半，反而变慢：B64 为 94.6 µs，未改前 84.9。
+  - 因此 dispatch 中没有哪个形状会选它。
+- sched 的 rocprofv3 计数见 batch2 分支上的 pa-decode16-profile 文档：
+  - 厂商把 160 KB LDS 全部用上，K 直接加载进寄存器；
+  - 我们的 LDS bank conflict 是厂商的 23–27×，SALU 是 10×；
+  - 我们 SQ_WAIT_ANY 占比为 54–57%，厂商为 13–26%。
+- 按 Little 定律估算，B16 要跑满 HBM，每个 wave 大约需要 21 KB 数据在途，而我们只有一个 16 KB 的 tile 在途。
+- `archive/decode16-v2`：K 直接加载到 VGPR（8 次 b128），V 放进 3 个 slot 的 LDS ring（chunk 按 key % 16 做 XOR），页表项提前一个 tile 读出，循环按 3 展开。每个 wave 有 2 个 tile 在途，结果 bad=0。
+  - 第一版里页表的 b64 load 不能原地写回，产生了 vmcnt(0)；改成 b128 后修复。
+  - 但没有收益：B16 fused 为 32.5 µs（基线 32.7），B64 fused 为 91.9（基线 84.9），B8 S4 为 49.2（基线 47.0）。
+  - 结论：加深在途数据不是瓶颈。每 tile 约 640 条指令，每个 SIMD 只有 1 个 wave，依赖延迟全部暴露，折合每 tile 约 1.6–1.9 µs。
+- **削减指令数（已采纳）**：
+  - 以 sched 的 ATT 测量为准：我们每个 key 133 周期、18.6 条指令，厂商为 62 周期、5.9 条；每个 tile 有 41 个 s_nop。
+  - 合入了 sched 的页组查找：每个页组只做一次 wave 内统一的块表读取，并抽出 `fmha::paged` 辅助模块；同时合入 V 的 granule swizzle，使 bank conflict 降低 85–100%。
+  - 本分支另做两处修改：
+    - key 截断只用 min：`.max(0)` 会被降为 compare + select 加一个 s_nop。
+    - key mask 只施加在需要的那个 tile 上：用 uniform 分支，分支内只有 VALU，原地修改。
+  - 同次测量（µs，前为修改后，后为修改前）：
+    - B16 ctx2048：S2 为 27.9（28.6），`_f` 为 29.3（32.7）
+    - B64 `_f`：83.2（84.9）
+    - B128 ctx1024 `_f`：81.7（84.0）
+    - B8 ctx8192 S4：45.6（47.0）
+    - 厂商分别为 18.4 / 77.3 / 75.2 / 42.7。
+  - 测试：ctx 为 17、777、1337、2000，以及 P=64 时全部 bad=0；strict 无错误。split decode16 的 md5 由 d032e715 变为 9e212f51，`_f` 变为 a4c7902c。
+  - 剩余的差距是每个 tile 的 VALU（约 350 条）和 lgkm 等待，下一轮需要继续削减。
+
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
 - K 的 rope 部分放在第二个 ring（KR，行宽 128 字节，chunk 按 key % 8 做 XOR），由 group A 负责 staging（每个 wave 多 4 次 DMA）；QK 共 12 个 k-chunk。

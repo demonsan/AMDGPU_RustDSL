@@ -280,6 +280,18 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // loop state: it, m, l, O^T (8 blocks of 16 d), S^T (4 blocks of 16 keys)
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
+    // page groups (bf16 flash layout): k_lo is a multiple of KT, so a tile's keys fall into KT / min(page, KT) groups of consecutive keys that share ONE page (page 16, KT 32: 2 pages); the 8 per-lane
+    // block-table loads per tile collapse to one wave-uniform load per group (the 64 lanes of every DMA hold 4 keys of the same group). The page of the clamped key (min(key, k_hi - 1)) is the page of the group's
+    // first key clamped the same way.
+    let grp_path = !fp8 && !blocked;
+    let pgsz = page.min(KT);
+    let ngrp = if grp_path { KT / pgsz } else { 0 };
+    let grp_of = move |i: i32| (4 * i) / pgsz;
+    let group_page = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32, g: i32| -> ValueId {
+        let key = b.bind_i32((key_t + g * pgsz).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+        let bvo = b.bind_i32(ev(key).lshr(page.trailing_zeros() as i32) << 2);
+        b.buffer_load_f32(r_bt, bvo, bt_so, 0)
+    };
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
@@ -289,7 +301,18 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    let lookups: Vec<(ValueId, ValueId)> = (0..if fp8 { KT / 8 } else { KT / 4 })
+    // grouped pages (bf16 flash): one load per page group, the raw value shared by the group's DMAs
+    let gpages: Vec<ValueId> = if grp_path { (0..ngrp).map(|g| group_page(&mut b, ev(key_t), g)).collect() } else { Vec::new() };
+    let lookups: Vec<(ValueId, ValueId)> = if grp_path {
+        (0..KT / 4)
+            .map(|i| {
+                let key = b.bind_i32(ev(key_t) + kk_of(i));
+                // (key >= 0 and k_hi > k_lo >= 0 inside the loop: min only - `.max(0)` lowers to a compare + select pair with an s_nop)
+                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).min(ev(maxk)));
+                (kc, gpages[grp_of(i) as usize])
+            })
+            .collect()
+    } else { (0..if fp8 { KT / 8 } else { KT / 4 })
         .map(|i| {
             // (fp8 rows of 128 bytes: 8 lanes per key, keys 8 i + l / 8)
             let key = if fp8 { b.bind_i32(ev(key_t) + (lane.lane().lshr(3)) + 8 * i) } else { b.bind_i32(ev(key_t) + kk_of(i)) };
@@ -297,14 +320,20 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
         })
-        .collect();
+        .collect() };
     // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
     let nv = lookups.len() as u8;
+    let gclamped: Vec<ValueId> = gpages.iter().map(|&pv| { let pg = b.bitcast_i32(pv); b.bind_i32(ev(pg).max(0).min(ev(npages) - 1)) }).collect();
     let rows: Vec<(ValueId, ValueId)> = lookups
         .iter()
-        .map(|&(kc, pv)| {
-            let pg = b.bitcast_i32(pv);
-            let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
+        .enumerate()
+        .map(|(i, &(kc, pv))| {
+            let pg = if grp_path {
+                gclamped[grp_of(i as i32) as usize]
+            } else {
+                let pg = b.bitcast_i32(pv);
+                b.bind_i32(ev(pg).max(0).min(ev(npages) - 1))
+            };
             if blocked {
                 // blocked K [NB][HK][D / 16][BS][16]: the key's first 16-byte chunk (chunk j at + j BS 16)
                 (kc, b.bind_i32((ev(pg) * ev(hkv_n) + ev(hk)) * (D * page) + ((ev(kc) & (page - 1)) << 4)))
@@ -388,7 +417,9 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         }
         None => mev.write(&mut b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
-                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+                // V tile swizzle: the 32-byte granule G of tile row r is stored at granule G ^ (r % 8) (the DMA lands lane-linear, so the swizzle is applied to the SOURCE chunk: l16 ^ 2 (r % 8))
+                let vsw = b.bind_i32((kk_of(i as i32) & 7) << 1);
+                let vvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ ev(vsw)) << 4));
                 let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
                 b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
             }
@@ -425,11 +456,31 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(16);
+    // grouped path: the key mask only on the tile that needs it (uniform branch, VALU only, in place)
+    let mask_in_place = grp_path && !mtp;
+    if mask_in_place {
+        let part = b.bind_cond((ev(key_t) + KT).gt(ev(kmax)));
+        b.begin_if(Opnd::Val(part));
+        for blk in 0..NKB {
+            for r in 0..4u8 {
+                let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
+                let x = b.bitcast_f32(x);
+                let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
+                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) });
+                b.var_set_lane(sv_[blk], r, y);
+            }
+        }
+        b.end_if();
+    }
     for blk in 0..NKB {
         for r in 0..4u8 {
             let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
             let x = b.bitcast_f32(x);
             let x = match &kvsc { Some((ks, _)) => b.mul_f32(x, ks[4 * blk + r as usize]), None => x };
+            if mask_in_place {
+                s.push(x);
+                continue;
+            }
             let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
             s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
         }
@@ -511,6 +562,10 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // blocked: P times the per-key V scales (the row sum l is unscaled)
     let p: Vec<ValueId> = match &kvsc { Some((_, vs)) => p.iter().zip(vs).map(|(x, s)| b.mul_f32(*x, *s)).collect(), None => p };
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
+    // the swizzled granule offsets of the 8 d blocks (hoisted): (db ^ (r0 % 8)) * 32, r0 = 4 grp + l16 / 4
+    let r0m = b.bind_i32(((ev(grp) << 2) + ev(l16).lshr(2)) & 7);
+    // (the per-granule base registers are hoisted: the loop's reads keep a constant row offset, which the ds_read immediate absorbs)
+    let vgran: Vec<ValueId> = if grp_path { (0..8i32).map(|db| { let g = b.bind_i32((ev(r0m) ^ db) << 5); b.bind_i32(ev(vb) + ev(g)) }).collect() } else { Vec::new() };
     // blocked: the V^T row (d 16 db + l % 16) bytes of keys 4 g .. 4 g + 3 and 16 + 4 g ..
     let vtb = blocked.then(|| b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3)));
     mev.read_back(&mut b, Opnd::Var(it), |b| {
@@ -526,8 +581,12 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                     let hi = b.load_lds_b64(a1);
                     b.cat_frag4(lo, hi)
                 } else {
-                    let a0 = b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db);
-                    let a1 = b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db);
+                    // (the swizzle exists on the bf16 flash path only: the fp8 forms convert their V rows into an unswizzled bf16 tile)
+                    let (a0, a1) = if grp_path {
+                        (b.bind_i32(ev(vgran[db as usize]) + (32 * t as i32) * ROW), b.bind_i32(ev(vgran[db as usize]) + (32 * t as i32 + 16) * ROW))
+                    } else {
+                        (b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db), b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db))
+                    };
                     b.load_lds_tr_b16x2(a0, a1)
                 };
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
