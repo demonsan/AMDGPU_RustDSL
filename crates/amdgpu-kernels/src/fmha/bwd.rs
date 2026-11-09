@@ -214,9 +214,14 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     };
     let npair = { let v = b.bind_i32((ev(kv_end) + 127).lshr(7)); b.read_first_lane(v) };
     let lim = b.bind_i32(if causal { (ev(row) + ev(a.sk) - ev(a.sq)).min(ev(a.sk) - 1) } else { ev(a.sk) - 1 });
+    // the wave's smallest limit (its first query row; wave-uniform)
+    let lim_min = {
+        let v = b.bind_i32(if causal { ((ev(qt) << 7) + (lane.wave() << 5) + ev(a.sk) - ev(a.sq)).min(ev(a.sk) - 1) } else { ev(a.sk) - 1 });
+        b.read_first_lane(v)
+    };
+    let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let zero16 = b.frag_zero(DType::Frag16);
-    let zf = b.c_f32(0.0);
 
     let any = b.bind_cond(ev(npair).gt(0));
     b.begin_if(Opnd::Val(any));
@@ -259,18 +264,29 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 }
             });
         }
-        // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot)
+        // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot). The key mask only on the tiles that reach the wave's smallest
+        // limit (uniform branch): masked S = -inf in place (P = 0); the other tiles carry no per-element compare / select
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        let mut ds: Vec<ValueId> = Vec::with_capacity(32);
+        let partial = b.bind_cond((ev(tile) * KT + (KT - 1)).gt(ev(lim_min)));
+        b.begin_if(Opnd::Val(partial));
         for sb in 0..2usize {
             for r in 0..16u8 {
                 let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                 let s = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
                 let s = b.bitcast_f32(s);
+                let keep = b.bind_cond((ev(key0) + off).le(ev(lim)));
+                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(s), b: Opnd::Val(neg_inf) });
+                b.var_set_lane(sv_vars[sb], r, y);
+            }
+        }
+        b.end_if();
+        let mut ds: Vec<ValueId> = Vec::with_capacity(32);
+        for sb in 0..2usize {
+            for r in 0..16u8 {
+                let s = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
+                let s = b.bitcast_f32(s);
                 let t = b.let_(Op::FmaF32(Opnd::Val(s), Opnd::Val(csc), Opnd::Val(nlse)));
                 let p = b.exp2_f32(t);
-                let keep = b.bind_cond((ev(key0) + off).le(ev(lim)));
-                let p = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(p), b: Opnd::Val(zf) });
                 let dp = b.frag16_lane(Opnd::Var(dp_vars[sb]), r);
                 let dp = b.bitcast_f32(dp);
                 let x = b.sub_f32(dp, dot);
@@ -436,9 +452,12 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     };
     let npair = { let v = b.bind_i32((((ev(a.sq) + (KT - 1)).lshr(6) - ev(qt0)).max(0) + 1).lshr(1)); b.read_first_lane(v) };
     let qoff = b.bind_i32(ev(a.sk) - ev(a.sq));
+    // the wave's largest key (wave-uniform) and the masking constants
+    let kmax_w = { let v = b.bind_i32(ev(key) - lane.j() + 31); b.read_first_lane(v) };
+    let neg_inf = b.c_f32(f32::NEG_INFINITY);
+    let nl2e = b.c_f32(-std::f32::consts::LOG2_E);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let zero16 = b.frag_zero(DType::Frag16);
-    let zf = b.c_f32(0.0);
     let big = b.c_i32(0x7fff_fff0);
     let live = b.bind_cond(ev(key).lt(ev(a.sk)));
     let o_vo = b.bind_i32(((ev(bat) * ev(a.sk) + ev(key)) * ev(a.hq) + ev(h)) * ROW + (ev(half) << 3));
@@ -499,6 +518,29 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         // the lane's visible query offsets relative to q0: [dlo, qhi) (causal: key <= q + SK - SQ; all: q < SQ)
         let qhi = b.bind_i32(ev(a.sq) - ev(q0));
         let dlo = b.bind_i32(ev(key) - ev(qoff) - ev(q0));
+        // the masks only on the tiles that need them (uniform branch): the tail tile (queries past SQ) and, causal, the tiles below the wave's
+        // diagonal; masked S = -inf in place (P = 0, dS = 0), the other tiles carry no per-element compare / select
+        let tail = b.bind_i32((ev(tile) * KT + (KT - 1)).ge(ev(a.sq)).select_i32(1, 0));
+        let diag = if causal { b.bind_i32((ev(tile) * KT).lt(ev(kmax_w) - ev(qoff)).select_i32(1, 0)) } else { b.bind_i32(amdgpu_dsl::I32::c(0)) };
+        let partial = b.bind_cond((ev(tail) + ev(diag)).gt(0));
+        b.begin_if(Opnd::Val(partial));
+        for sb in 0..2usize {
+            for r in 0..16u8 {
+                let cst = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
+                let s = b.frag16_lane(Opnd::Var(s_vars[sb]), r);
+                let s = b.bitcast_f32(s);
+                let in_q = b.bind_cond(amdgpu_dsl::I32::c(cst).lt(ev(qhi)));
+                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_q), a: Opnd::Val(s), b: Opnd::Val(neg_inf) });
+                let y = if causal {
+                    let in_k = b.bind_cond(amdgpu_dsl::I32::c(cst).ge(ev(dlo)));
+                    b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_k), a: Opnd::Val(y), b: Opnd::Val(neg_inf) })
+                } else {
+                    y
+                };
+                b.var_set_lane(s_vars[sb], r, y);
+            }
+        }
+        b.end_if();
         // P / dS packed to bf16 pairs as soon as a group of 4 values is done (word 8 sb + 2 g + u / 2): fewer live registers
         let mut p: Vec<ValueId> = Vec::with_capacity(16);
         let mut dsv: Vec<ValueId> = Vec::with_capacity(16);
@@ -518,21 +560,11 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                     let dot = { let x = b.frag4_lane(dv, u as u8); b.bitcast_f32(x) };
                     let s = b.frag16_lane(Opnd::Var(s_vars[sb]), r);
                     let s = b.bitcast_f32(s);
-                    let x = b.mul_f32(s, csc);
-                    let lse2 = b.mul_f32(lse, l2e);
-                    let x = b.sub_f32(x, lse2);
+                    // P = exp2(csc S - log2(e) lse): one mul + one fma per value (the masks were applied to S above)
+                    let nlse2 = b.mul_f32(lse, nl2e);
+                    let x = b.let_(Op::FmaF32(Opnd::Val(s), Opnd::Val(csc), Opnd::Val(nlse2)));
                     let pv = b.exp2_f32(x);
-                    // visible: c = qv - q0 (a constant) in [dlo, qhi): one compare + select per bound (no per-value integer arithmetic)
                     let _ = qv;
-                    let cst = (32 * sb + 8 * g + u) as i32;
-                    let in_q = b.bind_cond(amdgpu_dsl::I32::c(cst).lt(ev(qhi)));
-                    let pv = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_q), a: Opnd::Val(pv), b: Opnd::Val(zf) });
-                    let pv = if causal {
-                        let in_k = b.bind_cond(amdgpu_dsl::I32::c(cst).ge(ev(dlo)));
-                        b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(in_k), a: Opnd::Val(pv), b: Opnd::Val(zf) })
-                    } else {
-                        pv
-                    };
                     let dp = b.frag16_lane(Opnd::Var(dp_vars[sb]), r);
                     let dp = b.bitcast_f32(dp);
                     let y = b.sub_f32(dp, dot);
