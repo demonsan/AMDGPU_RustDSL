@@ -340,9 +340,9 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                 let eq_c = b.cmp(CmpPred::Ne, CmpTy::I32, eq_ok, 0);
                 let ag = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(cgt), b: Opnd::Val(sink_e) });
                 let ae = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_c), a: Opnd::Val(ceq), b: Opnd::Val(sink_e) });
-                // the returning counter atomics read-modify-write the words the clear produced
-                let sg = t_cs.at(&SlotIdx::new(0, 0)).read(b, |b| b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true)).unwrap();
-                let se = t_cs.at(&SlotIdx::new(0, 0)).read(b, |b| b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true)).unwrap();
+                // the returning counter atomics are read-modify-writes of the counter / sink words: produce (same version as the clear)
+                let sg = t_cs.at(&SlotIdx::new(0, 0)).write(b, |b| b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true)).unwrap();
+                let se = t_cs.at(&SlotIdx::new(0, 0)).write(b, |b| b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true)).unwrap();
                 let (sg, se) = (b.bitcast_i32(sg), b.bitcast_i32(se));
                 let eq_take = b.cmp(CmpPred::Lt, CmpTy::I32, se, rem);
                 let eq_take_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_take), a: Opnd::I32(1), b: Opnd::I32(0) });
