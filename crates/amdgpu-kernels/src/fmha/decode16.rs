@@ -244,6 +244,9 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     const EPI_L: i32 = 32768;
     let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 4 * 64) as i64, &[&kreg, &vreg]));
     lds.commit(&mut b);
+    // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
+    let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
+    let epi_l = fused.then(|| b.bind_i32((ev(wv) << 6) + (ev(j) << 2) + EPI_L));
     let me = kreg.mine(wv);
     let mev = vreg.mine(wv);
     let mvs = vsreg.as_ref().map(|r| r.mine(wv));
@@ -581,16 +584,14 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let ln2 = b.c_f32(std::f32::consts::LN_2);
     let lse0 = b.mul_f32(x, ln2);
     let lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(lse0), b: Opnd::Val(neg_inf) });
-    // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
-    let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
-    let epi_l = fused.then(|| b.bind_i32((ev(wv) << 6) + (ev(j) << 2) + EPI_L));
     if let (Some(e), Some(eo), Some(el)) = (&epi, epi_o, epi_l) {
         e.at(&amdgpu_tile::SlotIdx::new(0, 0)).write(&mut b, |b| {
             for (db, f4) in ov_n.iter().enumerate() {
                 let a = b.bind_i32(ev(eo) + 64 * db as i32);
                 b.store_lds_b128(a, *f4);
             }
-            b.store_lds_b32(el, lse);
+            let li = b.bitcast_i32(lse);
+            b.store_lds_b32(el, li);
         });
     } else {
         let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
@@ -608,7 +609,8 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                 let a = b.bind_i32(ev(eo) + 64 * db);
                 b.store_lds_b128(a, z4);
             }
-            b.store_lds_b32(el, neg_inf);
+            let ni = b.bitcast_i32(neg_inf);
+            b.store_lds_b32(el, ni);
         });
     } else {
         let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
