@@ -506,15 +506,27 @@ impl<'a> An<'a> {
     }
 
     fn disjoint_group(&self, ss: &[&(u32, Option<SLin>, i128)]) -> bool {
+        let r = self.disjoint_group_why(ss);
+        if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+            let show = |l: &Option<SLin>| match l {
+                Some((a, c)) => format!("{} + {}", a.iter().map(|(k, p)| format!("{}{}*({})", if k.0 { "var" } else { "v" }, k.1, p.show())).collect::<Vec<_>>().join(" + "), c.show()),
+                None => "<no linear form>".into(),
+            };
+            eprintln!("gw: arg 0x{:x}: {} stores: {:?}; first: {}", ss[0].0, ss.len(), r, show(&ss[0].1));
+        }
+        r.is_ok()
+    }
+
+    fn disjoint_group_why(&self, ss: &[&(u32, Option<SLin>, i128)]) -> Result<(), String> {
         let cx = &self.cx;
-        let Some(first) = ss[0].1.as_ref() else { return false };
+        let Some(first) = ss[0].1.as_ref() else { return Err("no linear form".into()) };
         let atoms = &first.0;
         let mut consts: Vec<Poly> = Vec::new();
         let mut size: i128 = 0;
         for s in ss {
-            let Some((a, c)) = s.1.as_ref() else { return false };
+            let Some((a, c)) = s.1.as_ref() else { return Err("reason 2".into()) };
             if a != atoms {
-                return false;
+                return Err("reason 3".into());
             }
             consts.push(c.clone());
             size = size.max(s.2);
@@ -525,7 +537,7 @@ impl<'a> An<'a> {
         for c in &consts {
             match c.sub(&c0).as_const() {
                 Some(q) if q.d == 1 => diffs.push(q.n),
-                _ => return false,
+                _ => return Err("reason 4".into()),
             }
         }
         let lo = *diffs.iter().min().unwrap();
@@ -548,24 +560,24 @@ impl<'a> An<'a> {
                 }
             }
             let it = self.int_of(&o);
-            let (Some(l), Some(h)) = (it.lo.first(), it.hi.first()) else { return false };
+            let (Some(l), Some(h)) = (it.lo.first(), it.hi.first()) else { return Err("reason 5".into()) };
             let m = h.sub(l);
             if !cx.nonneg(&m) {
-                return false;
+                return Err("reason 6".into());
             }
             let c = if cx.nonneg(c) {
                 c.clone()
             } else if cx.nonneg(&c.scale(Q::int(-1))) {
                 c.scale(Q::int(-1))
             } else {
-                return false;
+                return Err("reason 7".into());
             };
             digits.push((c, m));
         }
         // every workgroup axis that can hold more than one workgroup must be a digit
         for (ax, seen) in wg_axes.iter().enumerate() {
             if !seen && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
-                return false;
+                return Err("reason 8".into());
             }
         }
         // sort by coefficient (every pair must be comparable)
@@ -578,7 +590,7 @@ impl<'a> An<'a> {
                 if cx.le(&digits[j].0, &digits[i].0) {
                     digits.swap(i, j);
                 } else {
-                    return false;
+                    return Err("reason 9".into());
                 }
             }
         }
@@ -588,12 +600,12 @@ impl<'a> An<'a> {
                 continue; // a single-valued digit
             }
             if !cx.le(&acc, c) {
-                return false;
+                return Err("reason 10".into());
             }
-            let Some(cm) = c.mul(m) else { return false };
+            let Some(cm) = c.mul(m) else { return Err("reason 11".into()) };
             acc = acc.add(&cm);
         }
-        true
+        Ok(())
     }
 
 
