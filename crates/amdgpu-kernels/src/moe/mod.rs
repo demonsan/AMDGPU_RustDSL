@@ -131,34 +131,34 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     b.barrier();
     let mut cur = offs0;
     let mut s = 1i32;
-    let mut step = 0i32;   // the version of the tile `cur`
+    let mut ver = 0i32;   // the version of the tile `cur`
     while s < 512 {
         let nxt = if cur == offs0 { offs1 } else { offs0 };
         let (cur_t, nxt_t) = if cur == offs0 { (&t_s0, &t_s1) } else { (&t_s1, &t_s0) };
         let a_own = b.bind_i32(ev(tid4) + cur);
-        let own = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_own, MemTy::B32));
+        let own = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_own, MemTy::B32));
         let prev_i = b.bind_i32(ev(tid) - s);
         let ok = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
         // (a max, not a select: the address is provably inside the scan tile; masked by `ok` below)
         let pi = b.bind_i32(ev(prev_i).max(0));
         let a_pv = b.bind_i32((ev(pi) << 2) + cur);
-        let pv = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
+        let pv = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
         b.wait_lds(0);
         let add = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(pv), b: Opnd::I32(0) });
         let sum = b.add_i32(own, add);
         let a_nx = b.bind_i32(ev(tid4) + nxt);
-        nxt_t.at(&SlotIdx::new(0, step + 1)).write(b, |b| b.store_lds(a_nx, sum, MemTy::B32, false));
+        nxt_t.at(&SlotIdx::new(0, ver + 1)).write(b, |b| b.store_lds(a_nx, sum, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
         cur = nxt;
-        step += 1;
+        ver += 1;
         s *= 2;
     }
     let cur_t = if cur == offs0 { &t_s0 } else { &t_s1 };
     let a_incl = b.bind_i32(ev(tid4) + cur);
-    let incl = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_incl, MemTy::B32));
+    let incl = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_incl, MemTy::B32));
     let a_tot = b.c_i32(cur + 4 * (e as i32 - 1));
-    let total = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_tot, MemTy::B32));
+    let total = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_tot, MemTy::B32));
     b.wait_lds(0);
     let off_e = b.bind_i32(ev(incl) - ev(padded));                                     // this expert's first padded position
     let a_c = b.bind_i32(ev(tid4) + offc);
@@ -206,7 +206,7 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let a_s = b.bind_i32((ev(exc) << 2) + cur);
         let oe = t_c.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(a_c, MemTy::B32));
         let ce = t_a.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(a_n, MemTy::B32));
-        let ie = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_s, MemTy::B32));
+        let ie = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_s, MemTy::B32));
         b.wait_lds(0);
         // the expert's padded size = incl - off; pad slot s is real iff cnt + s < padded
         let pe = b.bind_i32(ev(ie) - ev(oe));
@@ -250,7 +250,7 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
         for step in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
             let cand = b.bind_i32(ev(pos) + step);
             let ca = b.bind_i32(((ev(cand) - 1) << 2) + cur);
-            let v = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(ca, MemTy::B32));
+            let v = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(ca, MemTy::B32));
             b.wait_lds(0);
             let le = b.cmp(CmpPred::Le, CmpTy::I32, v, x);
             pos = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(le), a: Opnd::Val(cand), b: Opnd::Val(pos) });
