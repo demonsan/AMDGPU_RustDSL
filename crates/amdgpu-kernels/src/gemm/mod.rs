@@ -2296,7 +2296,10 @@ fn lds_epilogue(
         let sb: Vec<ValueId> = (0..nn).map(|j| b.buffer_load_b128(rs_b, vb, 0i32, (64 * j) as u32)).collect();
         (sa, sb)
     });
-    // every wave is done with the ring / panel storage the staging reuses
+    // every wave is done with the ring / panel storage the staging reuses: its reads completed (wait_lds) AND the last loop iteration's prefetch DMAs
+    // into the ring have landed (wait_vm: an LDS-direct load still in flight would overwrite the staged C - out-of-range lanes write zeros), then the barrier
+    // (GV-TILE-ALIAS-RACE found the missing wait_vm)
+    b.wait_vm(0);
     b.wait_lds(0);
     b.barrier();
     let wid = b.bind_i32(lane.wave());
