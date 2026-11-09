@@ -115,3 +115,48 @@ fn stores_ignoring_a_multi_workgroup_axis_are_not_proven() {
     assert!(r.proven.get("global-write-disjoint").is_none(), "{:?}", r.proven);
     assert_eq!(r.unchecked.get("global-write-untracked").copied(), Some(1));
 }
+
+/// A persistent loop: `t = wg; loop { out[t * 256 + lane * 4] = 1; t += step; if t >= n break }` with step = the grid size (a residue
+/// class per workgroup: disjoint) or step 1 (overlapping).
+fn persistent(step_is_grid: bool) -> Function {
+    let mut b = FnBuilder::new("trust_persistent", 64);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg("step", DType::I32, 8, 4);
+    b.arg("n", DType::I32, 12, 4);
+    b.grid_is(0, Ext::sym("G"));
+    b.ka_is(8, Ext::sym("G"));
+    b.ka_range(12, 1, 1 << 20);
+    b.arg_tensor("out", (Ext::ka(12) + Ext::sym("G")) * Ext::c(256));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let step = if step_is_grid { b.let_(Op::KernargI32 { offset: 8 }) } else { b.c_i32(1) };
+    let n = b.let_(Op::KernargI32 { offset: 12 });
+    let lane = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(wg))]);
+    let t = Opnd::Var(vars[0]);
+    let row = b.let_(Op::ShlI32(t, Opnd::I32(8)));
+    let l4 = b.let_(Op::ShlI32(Opnd::Val(lane), Opnd::I32(2)));
+    let off = b.let_(Op::AddI32(Opnd::Val(row), Opnd::Val(l4)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
+    let v = b.c_i32(1);
+    b.store_global(q, 0, v, amdgpu_dsl::MemTy::B32, false);
+    let next = b.let_(Op::AddI32(t, Opnd::Val(step)));
+    b.set_var(vars[0], next);
+    let done = b.let_(Op::CmpGeI32(Opnd::Val(next), Opnd::Val(n)));
+    b.break_if(Opnd::Val(done));
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn a_persistent_loop_stepping_by_the_grid_is_proven() {
+    let r = verify_ir(&persistent(true));
+    assert_eq!(r.proven.get("global-write-disjoint").copied(), Some(1), "{:?} {:?}\n{}", r.proven, r.unchecked, r.render());
+}
+
+#[test]
+fn a_persistent_loop_stepping_by_one_is_not_proven() {
+    let r = verify_ir(&persistent(false));
+    assert!(r.proven.get("global-write-disjoint").is_none(), "{:?}", r.proven);
+    assert_eq!(r.unchecked.get("global-write-untracked").copied(), Some(1));
+}

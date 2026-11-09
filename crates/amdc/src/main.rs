@@ -496,6 +496,150 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "check-launch" => {
+            // amdc check-launch <kernel> [--ka OFF=V,...] [--grid X,Y,Z] [--size ARG=BYTES,...] [--sym NAME=V,...]: the host contract of the
+            // kernel (the facts its certificate assumes) evaluated for one concrete launch - for launchers that do not go through Python
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone()).unwrap_or_default();
+            let parse_i = |s: &str| -> Option<i64> {
+                let s = s.trim();
+                if let Some(h) = s.strip_prefix("0x") { i64::from_str_radix(h, 16).ok() } else { s.parse().ok() }
+            };
+            let mut ka: std::collections::HashMap<u32, i64> = Default::default();
+            for kv in opt("--ka").split(',').filter(|s| !s.is_empty()) {
+                let Some((k, v)) = kv.split_once('=') else { eprintln!("--ka: OFF=V"); return ExitCode::from(2) };
+                match (parse_i(k), parse_i(v)) {
+                    (Some(k), Some(v)) => {
+                        ka.insert(k as u32, v);
+                    }
+                    _ => {
+                        eprintln!("--ka: bad entry {kv}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let mut grid = [1i64; 3];
+            for (i, g) in opt("--grid").split(',').filter(|s| !s.is_empty()).enumerate().take(3) {
+                grid[i] = parse_i(g).unwrap_or(1);
+            }
+            let mut sizes: std::collections::HashMap<String, i64> = Default::default();
+            for kv in opt("--size").split(',').filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    sizes.insert(k.to_string(), parse_i(v).unwrap_or(-1));
+                }
+            }
+            let mut syms: std::collections::HashMap<String, i64> = Default::default();
+            for kv in opt("--sym").split(',').filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    syms.insert(k.to_string(), parse_i(v).unwrap_or(-1));
+                }
+            }
+            let c = &f.contract;
+            // symbols a definition names directly (grid_is(axis, B), ka_is(off, G)) are read off the launch
+            for (ax, e) in &c.grid_defs {
+                if let amdgpu_dsl::Ext::Sym(n) = e {
+                    syms.entry(n.clone()).or_insert(grid[*ax as usize]);
+                }
+            }
+            // ... and `sym * c` / `c * sym` definitions are solved for the symbol
+            fn solve(e: &amdgpu_dsl::Ext, v: i64, syms: &mut std::collections::HashMap<String, i64>) {
+                use amdgpu_dsl::Ext as E;
+                match e {
+                    E::Sym(n) => {
+                        syms.entry(n.clone()).or_insert(v);
+                    }
+                    E::Mul(a, b) => match (a.as_ref(), b.as_ref()) {
+                        (x, E::Const(k)) | (E::Const(k), x) if *k != 0 && v % k == 0 => solve(x, v / k, syms),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            for (off, e) in &c.ka_defs {
+                if let Some(v) = ka.get(off) {
+                    solve(e, *v, &mut syms);
+                }
+            }
+            for (ax, e) in &c.grid_defs {
+                solve(e, grid[*ax as usize], &mut syms);
+            }
+            fn ev(e: &amdgpu_dsl::Ext, ka: &std::collections::HashMap<u32, i64>, grid: &[i64; 3], syms: &std::collections::HashMap<String, i64>) -> Result<i64, String> {
+                use amdgpu_dsl::Ext as E;
+                Ok(match e {
+                    E::Const(c) => *c,
+                    E::Ka(o) => *ka.get(o).ok_or(format!("kernarg 0x{o:x} not given (--ka 0x{o:x}=V)"))?,
+                    E::Grid(a) => grid[*a as usize],
+                    E::Sym(n) => *syms.get(n).ok_or(format!("symbol {n} not given (--sym {n}=V)"))?,
+                    E::Add(a, b) => ev(a, ka, grid, syms)? + ev(b, ka, grid, syms)?,
+                    E::Sub(a, b) => ev(a, ka, grid, syms)? - ev(b, ka, grid, syms)?,
+                    E::Mul(a, b) => ev(a, ka, grid, syms)? * ev(b, ka, grid, syms)?,
+                    E::CeilDiv(a, k) => (ev(a, ka, grid, syms)? + k - 1).div_euclid(*k),
+                    E::FloorDiv(a, k) => ev(a, ka, grid, syms)?.div_euclid(*k),
+                })
+            }
+            let mut bad: Vec<String> = Vec::new();
+            let mut ok = 0usize;
+            let mut skipped: Vec<String> = Vec::new();
+            for (n, lo, hi) in &c.sym_ranges {
+                match syms.get(n) {
+                    Some(v) if v < lo || v > hi => bad.push(format!("symbol {n} = {v} outside [{lo}, {hi}]")),
+                    Some(_) => ok += 1,
+                    None => skipped.push(format!("symbol {n} (not given)")),
+                }
+            }
+            for (ax, e) in &c.grid_defs {
+                match ev(e, &ka, &grid, &syms) {
+                    Ok(w) if w != grid[*ax as usize] => bad.push(format!("grid[{ax}] = {}, the contract requires {e:?} = {w}", grid[*ax as usize])),
+                    Ok(_) => ok += 1,
+                    Err(m) => skipped.push(format!("grid[{ax}]: {m}")),
+                }
+            }
+            for (off, e) in &c.ka_defs {
+                match (ka.get(off), ev(e, &ka, &grid, &syms)) {
+                    (Some(v), Ok(w)) if *v != w => bad.push(format!("kernarg 0x{off:x} = {v}, the contract requires {e:?} = {w}")),
+                    (Some(_), Ok(_)) => ok += 1,
+                    (None, _) => skipped.push(format!("kernarg 0x{off:x} (not given)")),
+                    (_, Err(m)) => skipped.push(format!("kernarg 0x{off:x}: {m}")),
+                }
+            }
+            for (off, lo, hi) in &c.ka_ranges {
+                match ka.get(off) {
+                    Some(v) if v < lo || v > hi => bad.push(format!("kernarg 0x{off:x} = {v} outside [{lo}, {hi}]")),
+                    Some(_) => ok += 1,
+                    None => skipped.push(format!("kernarg 0x{off:x} (not given)")),
+                }
+            }
+            for (off, vals) in &c.ka_sets {
+                match ka.get(off) {
+                    Some(v) if !vals.contains(v) => bad.push(format!("kernarg 0x{off:x} = {v} not one of {vals:?}")),
+                    Some(_) => ok += 1,
+                    None => skipped.push(format!("kernarg 0x{off:x} (not given)")),
+                }
+            }
+            for x in &c.extents {
+                match (sizes.get(&x.arg), ev(&x.alloc, &ka, &grid, &syms)) {
+                    (Some(s), Ok(need)) if *s < need => bad.push(format!("argument `{}`: {s} bytes allocated, the contract needs {:?} = {need}", x.arg, x.alloc)),
+                    (Some(_), Ok(_)) => ok += 1,
+                    (None, _) => skipped.push(format!("argument `{}` size (--size {}=BYTES)", x.arg, x.arg)),
+                    (_, Err(m)) => skipped.push(format!("argument `{}`: {m}", x.arg)),
+                }
+            }
+            for b in &bad {
+                println!("VIOLATED  {b}");
+            }
+            for s in &skipped {
+                println!("unchecked {s}");
+            }
+            println!("{}: {ok} contract fact(s) hold, {} violated, {} not checked (missing inputs)", f.name, bad.len(), skipped.len());
+            if bad.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
+        }
         "nops" => {
             // amdc nops <kernel> [--sites]: every s_nop of the final code classified by hazard rule / producer -> consumer (counts, wait states)
             let Some(name) = args.get(1) else {

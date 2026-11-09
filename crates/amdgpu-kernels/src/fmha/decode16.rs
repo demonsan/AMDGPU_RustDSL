@@ -182,7 +182,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             r = b.bind_i32(ev(r) - ev(take) * ev(xb));
         }
         let q = b.read_first_lane(q);
-        b.assume_trusted(q, Ext::c(1), Ext::c(16), "GQA group G = H / HK in [1, 16] (contract H = HK G)");
+        // the quotient IS the contract symbol G (H = HK G, ka_is above): a point fact, so G-scaled offsets stay linear for the store proof
+        b.assume_trusted(q, Ext::sym("G"), Ext::sym("G"), "GQA group G = H / HK (contract H = HK G; G in [1, 16])");
         q
     };
     let j = b.bind_i32(lane.lane() & 15);

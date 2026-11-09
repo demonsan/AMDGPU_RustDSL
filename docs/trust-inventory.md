@@ -48,6 +48,13 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 
 能否检查：可以，但要换更强的抽象域——关系域、循环退出条件进入归纳。现在逐条计数。
 
+### 循环退出事实（#4，本轮新增）
+
+- `break_if(c)` 之后，同一语句表的其余部分只在 c 为假时执行（break 条件是 wave 一致的）。`x < k` / `x >= k` 的操作数在此期间被收紧。
+- `set_var` 在其语句表末尾生效，所以同一表里稍后的 break 也收紧回边上的值。
+- 分析能证明的受信循环变量范围不再计入账本：只有初值或某一步仍未证明时才计数。
+- 效果：`tile::Pipeline` 的计数器（`_vs128` / `_t128` / GEMM）和 `combine_splits` 的计数器已被证明。出厂证书 29 → 22，GEMM v4 4 → 3。`_kvsplit` 的计数器仍受信（计数）。
+
 ### 其余账本项
 
 | 项 | 用途 | 现状 |
@@ -97,7 +104,12 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - Python `amdgpu_jit.launch` 在每个调用签名的第一次启动时逐条求值并检查，违反时抛出 `ContractError` 并指出是哪一条；
 - C++ 主机程序（`tests/gpu/*_host.cpp`）和外部启动器不检查。
 
-**能否补**：可以加一个 `amdc check-launch` 命令（kernarg / grid / 大小 → 违反项），供非 Python 调用方使用。尚未做。
+**非 Python 调用方（本轮新增）**：`amdc check-launch <kernel> --ka OFF=V,... --grid X,Y,Z --size ARG=BYTES,... [--sym NAME=V,...]` 对一次具体启动逐条求值主机契约：
+- 符号从 grid / kernarg 的直接定义或 `sym·c` 形式解出；
+- 输出 `VIOLATED`（违反）、`unchecked`（缺输入）和汇总；
+- 有违反时退出码为 1。
+
+例如 GEMM v4 在 grid (16, 8) 下报告 `kernarg 0x18 = 4096, the contract requires MT·256 = 2048`。
 
 ## 4. 做了越界检查、没做竞争检查（本轮新增计数）
 
@@ -109,13 +121,30 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - 掩码写的哨兵臂（≥ 2^30 或负常数，被描述符范围检查丢弃，这一点已由越界证明确立）不算写；
 - `AMDC_GW_DEBUG=1 amdc gpu-verify <k>` 逐参数打印失败原因和原子签名。
 
-已证明：rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample 的输出。
+补充规则：
+- **掩码上限**：掩码写的活臂只在 `x < bound` 时执行；夹紧写 `min(x, bound - 1)` 也算，但要求 x 唯一的 workgroup 数字位在最高位，且 c_u·hi_u ≤ bound - 1。若偏移里含 k·x、x 自身对其原子是单射，就把 x 的原子合成一个数字位（系数 k，取值 [min x, bound - 1]）。各写的 x 常数可以不同，会从各自常数中扣除。
+- **`b.wg_bijection(outs, axes, reason)`**：受信事实，计入账本。声明 `outs` 这个元组是 workgroup id 在这些轴上的单射（例如 XCD 光栅、块序置换）；证明时把 `outs` 当作这些轴的数字位。只在它真正换来证明的地方使用：GEMM 光栅、mxfp8 FMHA 的 XCD 块序。
+
+其余规则：
+- **夹紧**：`min(x, y)` 也按夹紧处理。当 x 的 workgroup 数字位所在轴的 grid = ceil(bound / c) 时，夹紧总是落在本 workgroup 内。
+- **`b.wg_union(outs, axes, lo, hi, reason)`**：受信事实，计入账本。几类写各自算出的同一个索引（causal 配对的 q tile x 与 nt - 1 - x）在 (workgroup, 类) 上单射，取值 [lo, hi]；证明时把它们当作同一个数字位。
+- **decode16 的 G**：G 现为契约符号的点事实（`assume_trusted(q, G, G)`，替换原来的 [1, 16]，计数不变），使按 G 缩放的偏移保持线性。
+
+已证明（出厂 / 常用，全部写）：
+- `gemm_mxfp8_bs_v4`、bf16 / blockscale GEMM；
+- mxfp8 FMHA `_vs128` / `_t128` / `_kvsplit` / combine；
+- bf16 prefill v3（含 causal 配对）、bwd dot / dq / dkdv；
+- decode16 `_f`；`_c` 的 12 个写中证明 10 个；
+- MLA（两种形式）；
+- rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample。
+
+代价：出厂账本 26 → 29（`_vs128` / `_t128` 的 XCD 块序，`_kvsplit` 的 z 分解），GEMM v4 3 → 4（光栅）。
 
 仍未证明（原因 → 需要什么）：
-- GEMM / MoE GEMM / mlp（XCD 光栅：tile 坐标是 workgroup id 的置换，由 `assume_trusted` 声明）→ 需要"双射"这种事实形式；
-- decode16 / MLA / reshape_cache（G = H/HK 由 kernarg 的 select 得出，区间不是一个点；slot_mapping 是数据）→ 需要把 G 作为契约符号；
-- bf16 prefill / bwd（系数含 kernarg 步长，与常数不可比）→ 需要步长的契约下界；
-- mxfp8 FMHA（XCD 块序）同 GEMM。
+- decode16 `_c` 的末到者写（ticket 复位与最终输出）：只有末到者执行；需要把已验证的 last-arriver 协议当作该轴的覆盖；
+- `bf16_v3_ks`：分片原子的范围；
+- MoE GEMM / reshape_cache：行号或 slot 是数据 → 需要数据互异事实（受信、计数）；
+- （已解决）持久化 `mlp_fp8_ws_fused`：循环变量从 workgroup id 出发、每步加 grid 大小（v = wg + k·grid），不同 workgroup 走不相交的剩余类，可作为该轴的数字位；32 / 32 已证明。
 
 **`lds-untracked`**：
 - 范围：不在任何 tile 标记内的 LDS 访问；
@@ -148,7 +177,7 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 ## 6. 建议（按性价比）
 
 1. 采样 / top-k / moe_sorting 的 LDS 归约改用 LdsPlan tile 并加标记，使 `lds-untracked` 归零。
-2. 增加 `amdc check-launch`，让 C++ 主机和外部启动器也能检查主机契约。
+2. `amdc check-launch`（已做，见 §3）。
 3. 全局写不相交证明（已做，见 §4）：下一步补双射事实（XCD 光栅）与步长下界，覆盖 GEMM / attention。
 4. 区间引擎接入循环退出条件和 `x >> log2(g)` 这类关系，可去掉 §1(b) 的大部分 `assume_trusted`。
 5. 调试模式把 `assume` / `assume_trusted` 编成运行时断言（违反时写调试缓冲区），覆盖 §1(a)。

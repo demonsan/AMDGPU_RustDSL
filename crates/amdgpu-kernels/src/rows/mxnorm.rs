@@ -57,7 +57,11 @@ fn rmsnorm_mxfp4(name: &str, k: i64) -> Function {
     b.arg_tensor("gamma", Ext::c(2 * k));
     b.arg_tensor("q", m.clone() * Ext::c(k / 2));
     b.arg_tensor("scale", m * Ext::c(k / 32));
-    b.lds(256);
+    // the four-wave row-sum exchange (16 rows x 4 waves x f32) is a declared tile: written once per wave slice, read after the barrier
+    let mut lds = amdgpu_tile::LdsPlan::new();
+    let rs_tile = lds.tile("RS", 256, amdgpu_tile::Layout::Linear);
+    lds.commit(&mut b);
+    let rs_slot = amdgpu_tile::SlotIdx::new(0, 0);
     let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
     let (p_x, p_g, p_q, p_s) = (kp(&mut b, 0), kp(&mut b, 8), kp(&mut b, 16), kp(&mut b, 24));
     let m_v = b.let_(Op::KernargI32 { offset: 32 });
@@ -114,13 +118,13 @@ fn rmsnorm_mxfp4(name: &str, k: i64) -> Function {
     // the four waves: 16 rows x 4 partial sums through LDS
     let slot = b.bind_i32(((ev(wave) << 4) + ev(r)) << 2);
     let rs_i = b.bitcast_i32(row_sum);
-    b.store_lds(slot, rs_i, MemTy::B32, false);
+    rs_tile.at(&rs_slot).write(&mut b, |b| b.store_lds(slot, rs_i, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let mut tot = b.c_f32(0.0);
     for w in 0..4i32 {
         let a = b.bind_i32(((ev(r)) << 2) + 64 * w);
-        let v = b.load_lds(a, MemTy::B32);
+        let v = rs_tile.at(&rs_slot).read(&mut b, |b| b.load_lds(a, MemTy::B32));
         b.wait_lds(0);
         let vf = b.bitcast_f32(v);
         tot = b.add_f32(tot, vf);

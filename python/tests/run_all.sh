@@ -17,7 +17,8 @@ if [ -z "${AMDGPU_JIT_AMDC:-}" ]; then
   export AMDGPU_JIT_AMDC="${AMD_CARGO_TARGET:-/tmp/amd-rust-dsl-target}/release/amdc"
 fi
 t0=$(date +%s)
-# every kernel a launcher can reach compiles (the dispatch rules over a shape grid, the Python-op instantiations, `amdc list`)
+# every kernel a launcher can reach compiles, passes the descriptor limits and assembles + links to a code object (the dispatch rules over a
+# shape grid, the Python-op instantiations, `amdc list`)
 bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test dispatch_compile -- --include-ignored > "$OUT/compile.log" 2>&1; comp=$?
 python3 -m unittest discover -s python/tests -p 'test_unit.py' > "$OUT/unit.log" 2>&1; unit=$?
 python3 python/tests/ops_check.py "$@" > "$OUT/ops.log" 2>&1; ops=$?
@@ -42,7 +43,7 @@ for n, s, d in rows:
     print(f"| {n.ljust(w)} | {s:6} | {d} |")
 npass = sum(1 for r in rows if r[1] == "PASS")
 cmp_ok = comp == "0"
-print(f"\nop checks: {npass} / {len(rows)} PASS;  kernel compile sweep: {'PASS' if cmp_ok else 'FAIL (see compile.log)'};  unit tests: {'PASS' if unit == '0' else 'FAIL'};  node_check: {nc};  {secs} s;  logs: {out}/")
+print(f"\nop checks: {npass} / {len(rows)} PASS;  kernel compile + assemble sweep: {'PASS' if cmp_ok else 'FAIL (see compile.log)'};  unit tests: {'PASS' if unit == '0' else 'FAIL'};  node_check: {nc};  {secs} s;  logs: {out}/")
 ok = npass == len(rows) and rows and unit == "0" and nc != "FAIL" and cmp_ok
 print("OVERALL:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

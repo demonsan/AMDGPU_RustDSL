@@ -1682,6 +1682,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let py = b.bind_i32(ev(by0) + ev(s) * (ev(ny) - ev(by0)));
         b.assume_trusted(px, Ext::c(0), Ext::sym("NT") - Ext::c(1), "XCD raster: (px, py) is a permutation of the 16 x 16 tile grid when the select applies (N = 16 cta_n, M = 16 cta_m: 4 x 4 blocks, 2 per XCD), the identity (workgroup ids) otherwise");
         b.assume_trusted(py, Ext::c(0), Ext::sym("MT") - Ext::c(1), "XCD raster: see px");
+        b.wg_bijection(&[px, py], &[0, 1], "XCD raster: (px, py) is a permutation of the tile grid (the identity unless N = 16 cta_n, M = 16 cta_m)");
         (px, py)
     };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);

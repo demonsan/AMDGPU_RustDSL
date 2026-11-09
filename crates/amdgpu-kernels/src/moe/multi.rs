@@ -13,7 +13,8 @@
 //!    inside a block the order of one expert's pairs is the arrival order. ABI: topk_ids @0, topk_weights @8, sorted_token_ids @16, sorted_weights @24, ws @32, M @40 (i32), P @44 (i32).
 
 use amdgpu_dsl::{AtomicOp, BinOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::ev;
+use crate::lds_decl::tile_at;
+use amdgpu_tile::{ev, SlotIdx};
 
 const T: i32 = 1024;
 const WS_ROW: i32 = 256; // bytes per expert row of the workspace (64 slots)
@@ -81,6 +82,7 @@ pub fn moe_count(name: &str, e: i64, k: i64) -> Function {
     b.arg_tensor("topk_ids", mm * Ext::c(4 * k));
     b.arg_tensor("ws", Ext::c(e * WS_ROW as i64));
     b.lds(4096);
+    let t_a = tile_at(b, "A", 0, 4096);   // the per-expert counts: zeroed, counted by atomics (one version), read after the barrier
     let (p_ids, p_ws) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }));
     let m_v = b.let_(Op::KernargI32 { offset: 16 });
     let per = b.let_(Op::KernargI32 { offset: 20 });
@@ -91,7 +93,7 @@ pub fn moe_count(name: &str, e: i64, k: i64) -> Function {
     let r_ws = b.buffer_desc(p_ws, (e * WS_ROW as i64) as u32);
     let tid4 = b.bind_i32(ev(tid) << 2);
     let zero = b.c_i32(0);
-    b.store_lds(tid4, zero, MemTy::B32, false);
+    t_a.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(tid4, zero, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let base = b.bind_i32(ev(bx) * ev(per));
@@ -111,14 +113,14 @@ pub fn moe_count(name: &str, e: i64, k: i64) -> Function {
         }
         for eid in eids {
             let a = b.bind_i32(ev(eid) << 2);
-            b.atomic_lds(AtomicOp::AddU32, a, 1i32, false);
+            t_a.at(&SlotIdx::new(0, 0)).write(b, |b| b.atomic_lds(AtomicOp::AddU32, a, 1i32, false));
         }
         let nx = b.let_(Op::AddI32(Opnd::Var(it), Opnd::I32(1)));
         b.set_var(it, nx);
     });
     b.wait_lds(0);
     b.barrier();
-    let cnt = b.load_lds(tid4, MemTy::B32);
+    let cnt = t_a.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(tid4, MemTy::B32));
     b.wait_lds(0);
     let in_e = b.cmp(CmpPred::Lt, CmpTy::I32, tid, e as i32);
     let o0 = b.bind_i32(ev(tid) * WS_ROW + (ev(bx) << 2));
@@ -152,6 +154,11 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
     // LDS: A = counts, S0 / S1 = scan ping-pong, C = offsets; 1024 dwords each
     b.lds(4 * 4 * 1024);
     let (offa, offs0, offs1, offc) = (0i32, 4096i32, 8192i32, 12288i32);
+    // declared tiles (see `moe_sorting`): A 0 (counts), S0 / S1 ping-pong (step j writes the other tile as version j + 1), C 0 (the exclusive offsets, published by the barrier before the padding loop)
+    let t_a = tile_at(b, "A", offa as i64, 4096);
+    let t_s0 = tile_at(b, "S0", offs0 as i64, 4096);
+    let t_s1 = tile_at(b, "S1", offs1 as i64, 4096);
+    let t_c = tile_at(b, "C", offc as i64, 4096);
     let ptr: Vec<ValueId> = (0..6).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: 48 });
     let g_v = b.let_(Op::KernargI32 { offset: 52 });
@@ -196,43 +203,48 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
         cnt = b.add_i32(cnt, *c);
     }
     let a_cnt = b.bind_i32(ev(tid4) + offa);
-    b.store_lds(a_cnt, cnt, MemTy::B32, false);
+    t_a.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a_cnt, cnt, MemTy::B32, false));
     // 2. padded counts and the inclusive scan over experts (Hillis-Steele in LDS)
     let padded0 = b.bind_i32(((ev(cnt) + (bm - 1) as i32) >> (bm.trailing_zeros() as i32)) << (bm.trailing_zeros() as i32));
     let padded = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(padded0), b: Opnd::I32(0) });
     let a_s0 = b.bind_i32(ev(tid4) + offs0);
-    b.store_lds(a_s0, padded, MemTy::B32, false);
+    t_s0.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a_s0, padded, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let mut cur = offs0;
     let mut s = 1i32;
+    let mut ver = 0i32;   // the version of the tile `cur`
     while s < 512 {
         let nxt = if cur == offs0 { offs1 } else { offs0 };
+        let (cur_t, nxt_t) = if cur == offs0 { (&t_s0, &t_s1) } else { (&t_s1, &t_s0) };
         let a_own = b.bind_i32(ev(tid4) + cur);
-        let own = b.load_lds(a_own, MemTy::B32);
+        let own = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_own, MemTy::B32));
         let prev_i = b.bind_i32(ev(tid) - s);
         let ok = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
-        let pi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(prev_i), b: Opnd::I32(0) });
+        // (a max, not a select: provably inside the scan tile; masked by `ok` below)
+        let pi = b.bind_i32(ev(prev_i).max(0));
         let a_pv = b.bind_i32((ev(pi) << 2) + cur);
-        let pv = b.load_lds(a_pv, MemTy::B32);
+        let pv = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
         b.wait_lds(0);
         let add = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(pv), b: Opnd::I32(0) });
         let sum = b.add_i32(own, add);
         let a_nx = b.bind_i32(ev(tid4) + nxt);
-        b.store_lds(a_nx, sum, MemTy::B32, false);
+        nxt_t.at(&SlotIdx::new(0, ver + 1)).write(b, |b| b.store_lds(a_nx, sum, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
         cur = nxt;
+        ver += 1;
         s *= 2;
     }
+    let cur_t = if cur == offs0 { &t_s0 } else { &t_s1 };
     let a_incl = b.bind_i32(ev(tid4) + cur);
-    let incl = b.load_lds(a_incl, MemTy::B32);
+    let incl = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_incl, MemTy::B32));
     let a_tot = b.c_i32(cur + 4 * (e as i32 - 1));
-    let total = b.load_lds(a_tot, MemTy::B32);
+    let total = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_tot, MemTy::B32));
     b.wait_lds(0);
     let off_e = b.bind_i32(ev(incl) - ev(padded));
     let a_c = b.bind_i32(ev(tid4) + offc);
-    b.store_lds(a_c, off_e, MemTy::B32, false);
+    t_c.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a_c, off_e, MemTy::B32, false));
     // 3. ws[e][g] = off_e + the pairs of the earlier blocks (exclusive prefix over g), 16 x b128 stores
     let mut run = off_e;
     for q in 0..16usize {
@@ -268,6 +280,9 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let fzero = b.c_f32(0.0);
     let sent_f = b.bitcast_f32(sent);
     let pad_iters = ((e * bm) as i32 + T - 1) / T;
+    // the exclusive offsets (C) are read by OTHER threads in the padding loop: their stores must complete before the barrier publishes them (the tile protocol found the missing wait: a barrier alone does
+    // not wait for the DS write)
+    b.wait_lds(0);
     b.barrier();
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let it = vars[0];
@@ -282,9 +297,9 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let a_c = b.bind_i32((ev(exc) << 2) + offc);
         let a_n = b.bind_i32((ev(exc) << 2) + offa);
         let a_s = b.bind_i32((ev(exc) << 2) + cur);
-        let oe = b.load_lds(a_c, MemTy::B32);
-        let ce = b.load_lds(a_n, MemTy::B32);
-        let ie = b.load_lds(a_s, MemTy::B32);
+        let oe = t_c.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(a_c, MemTy::B32));
+        let ce = t_a.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(a_n, MemTy::B32));
+        let ie = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_s, MemTy::B32));
         b.wait_lds(0);
         let pe = b.bind_i32(ev(ie) - ev(oe));
         let pos = b.bind_i32(ev(oe) + ev(ce) + ev(sl));
@@ -325,7 +340,7 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
         for step in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
             let cand = b.bind_i32(ev(pos) + step);
             let ca = b.bind_i32(((ev(cand) - 1) << 2) + cur);
-            let v = b.load_lds(ca, MemTy::B32);
+            let v = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(ca, MemTy::B32));
             b.wait_lds(0);
             let le = b.cmp(CmpPred::Le, CmpTy::I32, v, x);
             pos = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(le), a: Opnd::Val(cand), b: Opnd::Val(pos) });
@@ -361,6 +376,7 @@ pub fn moe_scatter(name: &str, e: i64, k: i64, bm: i64) -> Function {
     b.arg_tensor("sorted_weights", maxp * Ext::c(4));
     b.arg_tensor("ws", Ext::c(e * WS_ROW as i64));
     b.lds(4096);
+    let t_cur = tile_at(b, "CUR", 0, 4096);   // the per-expert cursors: initialised from ws, advanced by returning atomics (one version)
     let ptr: Vec<ValueId> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: 40 });
     let per = b.let_(Op::KernargI32 { offset: 44 });
@@ -383,7 +399,7 @@ pub fn moe_scatter(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(o0), b: Opnd::Val(oob) });
     let base_f = b.buffer_load_f32(r_ws, o, 0i32, 0);
     let base_i = b.bitcast_i32(base_f);
-    b.store_lds(tid4, base_i, MemTy::B32, false);
+    t_cur.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(tid4, base_i, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let magic = ((1u64 << 32) + k as u64 - 1) / k as u64;
@@ -404,7 +420,7 @@ pub fn moe_scatter(name: &str, e: i64, k: i64, bm: i64) -> Function {
             let wo = b.bind_i32(ev(i) << 2);
             let wf = b.buffer_load_f32(r_w, wo, 0i32, 0);
             let a = b.bind_i32(ev(eid) << 2);
-            let pos = b.atomic_lds(AtomicOp::AddU32, a, 1i32, true).unwrap();
+            let pos = t_cur.at(&SlotIdx::new(0, 0)).write(b, |b| b.atomic_lds(AtomicOp::AddU32, a, 1i32, true)).unwrap();
             items.push((i, eid, wf, pos));
         }
         b.wait_lds(0);
@@ -450,8 +466,16 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
     b.arg_tensor("sorted_weights", maxp * Ext::c(4));
     b.arg_tensor("ws", Ext::c(e * WS_ROW as i64));
     // LDS: WC[16 waves][1024] (per-wave expert counts, then their exclusive prefix over the waves), CURSOR[1024], BASE[1024], one dummy dword
-    let (wc, cursor, base_a, dummy) = (0i32, 65536i32, 69632i32, 73728i32);
+    // the dummy sink word is the (junk) column of the sentinel expert 1023 of the last wave row, inside WC: the select between a real count slot and the sink then stays inside one tile
+    let (wc, cursor, base_a, dummy) = (0i32, 65536i32, 69632i32, 65532i32);
     b.lds(73736);
+    // declared tiles: WC (version = the chunk index: zeroed, counted, prefix-summed in place by the owning thread, read by the positions), CURSOR (initialised once, advanced in place), BASE (rewritten every chunk, version = the chunk index)
+    // the WC versions depend on the chunk counter only; the data-dependent match loop inside a chunk executes the same marker with the same version several times (a non-constant step for the verifier's per-statement
+    // period check): declared trusted periodic (counted in the ledger)
+    b.tile_trust_periodic("moe_scatter_ordered: WC versions 2 ch / 2 ch + 1 depend on the chunk counter; the nested rank loop repeats the same version");
+    let t_wc = tile_at(b, "WC", wc as i64, 65536);
+    let t_cur = tile_at(b, "CURSOR", cursor as i64, 4096);
+    let t_base = tile_at(b, "BASE", base_a as i64, 4096);
     let ptr: Vec<ValueId> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: 40 });
     let per = b.let_(Op::KernargI32 { offset: 44 });
@@ -477,7 +501,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let base_f = b.buffer_load_f32(r_ws, o, 0i32, 0);
     let base_i = b.bitcast_i32(base_f);
     let a_cur = b.bind_i32(ev(tid4) + cursor);
-    b.store_lds(a_cur, base_i, MemTy::B32, false);
+    t_cur.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a_cur, base_i, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let magic = ((1u64 << 32) + k as u64 - 1) / k as u64;
@@ -496,11 +520,15 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let eid = pair_expert(b, r_ids, i, ins, e);
         let wo = b.bind_i32(ev(i) << 2);
         let wf = b.buffer_load_f32(r_w, wo, 0i32, 0);
+        // WC versions: 2 ch (zeroed, counted), 2 ch + 1 (the prefix over the waves)
+        let chv = b.let_(Op::AddI32(Opnd::Var(ch), Opnd::I32(0)));
+        let v_cnt = b.bind_i32(ev(chv) << 1);
+        let v_pre = b.bind_i32((ev(chv) << 1) + 1);
         // [A] zero this thread's column of WC (all 16 waves' counts of expert `tid`)
         let zero = b.c_i32(0);
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            b.store_lds(a, zero, MemTy::B32, false);
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).write(b, |b| b.store_lds(a, zero, MemTy::B32, false));
         }
         b.wait_lds(0);
         b.barrier();
@@ -533,7 +561,7 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
             let wa0 = b.bind_i32(((ev(wave) << 10) + ev(e0c)) * 4 + wc);
             let dm = b.c_i32(dummy);
             let wa = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::Val(wa0), b: Opnd::Val(dm) });
-            b.store_lds(wa, cnt, MemTy::B32, false);
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).write(b, |b| b.store_lds(wa, cnt, MemTy::B32, false));
             let neq_lo = b.let_(Op::XorI32(Opnd::Val(eq_lo), Opnd::I32(-1)));
             let neq_hi = b.let_(Op::XorI32(Opnd::Val(eq_hi), Opnd::I32(-1)));
             let nl = b.let_(Op::AndI32(Opnd::Var(rl), Opnd::Val(neq_lo)));
@@ -550,28 +578,31 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let mut cs = Vec::new();
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            cs.push(b.load_lds(a, MemTy::B32));
+            cs.push(t_wc.at(&SlotIdx::new(0, Opnd::Val(v_cnt))).read(b, |b| b.load_lds(a, MemTy::B32)));
         }
         let ca = b.bind_i32(ev(tid4) + cursor);
-        let curv = b.load_lds(ca, MemTy::B32);
+        let curv = t_cur.at(&SlotIdx::new(0, 0)).read(b, |b| b.load_lds(ca, MemTy::B32));
         b.wait_lds(0);
+        // the prefix rewrites the column words just read (the column is the thread's own, but the protocol engine cannot see column ownership): the reads complete and a barrier separates them from the
+        // in-place writes, which are a new version
+        b.barrier();
         let mut run = b.c_i32(0);
         for w in 0..16i32 {
             let a = b.bind_i32(ev(wc_col) + 4096 * w);
-            b.store_lds(a, run, MemTy::B32, false);
+            t_wc.at(&SlotIdx::new(0, Opnd::Val(v_pre))).write(b, |b| b.store_lds(a, run, MemTy::B32, false));
             run = b.add_i32(run, cs[w as usize]);
         }
         let ba = b.bind_i32(ev(tid4) + base_a);
-        b.store_lds(ba, curv, MemTy::B32, false);
+        t_base.at(&SlotIdx::new(0, Opnd::Var(ch))).write(b, |b| b.store_lds(ba, curv, MemTy::B32, false));
         let adv = b.add_i32(curv, run);
-        b.store_lds(ca, adv, MemTy::B32, false);
+        t_cur.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(ca, adv, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
         // [D] position = the expert's chunk base + the wave's exclusive prefix + the rank in the wave
         let a_b = b.bind_i32((ev(eid) << 2) + base_a);
         let a_w = b.bind_i32(((ev(wave) << 10) + ev(eid)) * 4 + wc);
-        let bse = b.load_lds(a_b, MemTy::B32);
-        let wpre = b.load_lds(a_w, MemTy::B32);
+        let bse = t_base.at(&SlotIdx::new(0, Opnd::Var(ch))).read(b, |b| b.load_lds(a_b, MemTy::B32));
+        let wpre = t_wc.at(&SlotIdx::new(0, Opnd::Val(v_pre))).read(b, |b| b.load_lds(a_w, MemTy::B32));
         b.wait_lds(0);
         let pos = b.bind_i32(ev(bse) + ev(wpre) + ev(rank));
         let q = if k == 1 {

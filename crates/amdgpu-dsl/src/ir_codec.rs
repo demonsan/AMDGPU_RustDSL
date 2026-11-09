@@ -425,6 +425,28 @@ impl IrIds for LastArriver {
     }
 }
 
+impl FromIr for WgMap {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("WgMap")?;
+        Ok(WgMap {
+            outs: FromIr::from_ir(v.field("outs")?)?,
+            axes: FromIr::from_ir(v.field("axes")?)?,
+            reason: FromIr::from_ir(v.field("reason")?)?,
+            union: FromIr::from_ir(v.field("union")?)?,
+            range: FromIr::from_ir(v.field("range")?)?,
+        })
+    }
+}
+impl IrIds for WgMap {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        for x in self.outs.iter_mut() { fv(x); }
+        IrIds::ids(&mut self.axes, fv, fr);
+        IrIds::ids(&mut self.reason, fv, fr);
+        IrIds::ids(&mut self.union, fv, fr);
+        IrIds::ids(&mut self.range, fv, fr);
+    }
+}
+
 impl FromIr for Contract {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         v.expect_struct("Contract")?;
@@ -442,6 +464,7 @@ impl FromIr for Contract {
             last_arrivers: FromIr::from_ir(v.field("last_arrivers")?)?,
             buf_trusts: FromIr::from_ir(v.field("buf_trusts")?)?,
             sym_ranges: FromIr::from_ir(v.field("sym_ranges")?)?,
+            wg_maps: FromIr::from_ir(v.field("wg_maps")?)?,
         })
     }
 }
@@ -460,6 +483,7 @@ impl IrIds for Contract {
         IrIds::ids(&mut self.last_arrivers, fv, fr);
         IrIds::ids(&mut self.buf_trusts, fv, fr);
         IrIds::ids(&mut self.sym_ranges, fv, fr);
+        IrIds::ids(&mut self.wg_maps, fv, fr);
     }
 }
 
