@@ -379,13 +379,20 @@ impl<'a> An<'a> {
                     return atom(self.atom_key(*v), *o);
                 }
                 if !matches!(def, Some(Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ | Op::WorkitemId)) {
-                    let it = self.int_of(o);
-                    if it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0] {
-                        return Some((BTreeMap::new(), it.lo[0].clone()));
+                    if let Some(p) = self.point_of(o) {
+                        return Some((BTreeMap::new(), p));
                     }
                 }
                 match def {
                     Some(Op::AddI32(a, b)) => Some(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?)),
+                    // min(x, y) with y a uniform point: the clamp cap x < y + 1 (see `disjoint_group_why`)
+                    Some(Op::MinI32(a, b)) if self.point_of(b).is_some() => {
+                        let bound = self.point_of(b).unwrap().add(&Poly::int(1));
+                        if let Some(l) = self.slin(a, depth + 1) {
+                            self.caps_cur.borrow_mut().push((l, bound, true));
+                        }
+                        self.slin(a, depth + 1)
+                    }
                     // readfirstlane of a wave-uniform value is that value
                     Some(Op::ReadFirstLane(a)) if self.uniform(a, 0) => self.slin(a, depth + 1),
                     Some(Op::Tri(amdgpu_dsl::TriOp::Add3U32, a, b, c)) => {
@@ -450,6 +457,10 @@ impl<'a> An<'a> {
     /// The key of a value atom: workgroup ids get fixed keys (u64::MAX - axis); any other value the hash of its structural signature, so the
     /// same expression recomputed for another store is the same digit (sound: the proof only needs every instance inside the key's range).
     fn atom_key(&self, v: ValueId) -> (bool, u64) {
+        // the outputs of a `wg_union` share one key (one index computed per store class)
+        if let Some(i) = self.f.contract.wg_maps.iter().position(|m| m.union && m.outs.contains(&v)) {
+            return (false, (1u64 << 62) + i as u64);
+        }
         match self.defs.get(&v) {
             Some(Op::WorkgroupIdX) => return (false, u64::MAX),
             Some(Op::WorkgroupIdY) => return (false, u64::MAX - 1),
@@ -514,6 +525,13 @@ impl<'a> An<'a> {
         }
     }
 
+    /// The exact (point) value of a uniform operand, if its interval is one polynomial.
+    fn point_of(&self, o: &Opnd) -> Option<Poly> {
+        // a lower bound that is also an upper bound (an interval keeps several candidate bounds)
+        let it = self.int_of(o);
+        it.lo.iter().find(|l| it.hi.contains(l)).cloned()
+    }
+
     /// `cond == live` as `x < y`.
     fn lt_of(&self, cond: &Opnd, live: bool) -> Option<(Opnd, Opnd)> {
         let Opnd::Val(cv) = cond else { return None };
@@ -527,7 +545,8 @@ impl<'a> An<'a> {
     /// `cond ? a : b` is `min(a, y - 1)`: cond is `a < y` and b is exactly y - 1 (both uniform points).
     fn is_clamp(&self, cond: &Opnd, a: &Opnd, b: &Opnd) -> bool {
         let Some((x, y)) = self.lt_of(cond, true) else { return false };
-        if x != *a {
+        let same = x == *a || matches!((x, a), (Opnd::Val(p), Opnd::Val(q)) if self.sig(p, 0) == self.sig(*q, 0));
+        if !same {
             return false;
         }
         let (iy, ib) = (self.int_of(&y), self.int_of(b));
@@ -602,11 +621,32 @@ impl<'a> An<'a> {
         let ranges = rec.1.as_ref().and_then(|(atoms, _)| {
             let mut m = BTreeMap::new();
             for k in atoms.keys() {
+                // a `wg_union` index: the fact's range
+                if !k.0 && k.1 >= (1u64 << 62) && k.1 < (1u64 << 62) + 1024 {
+                    let wm = &self.f.contract.wg_maps[(k.1 - (1u64 << 62)) as usize];
+                    if let Some((lo, hi)) = &wm.range {
+                        let (il, ih) = (ext_itv(&self.cx, lo), ext_itv(&self.cx, hi));
+                        m.insert(*k, (il.lo.first()?.clone(), ih.hi.first()?.clone()));
+                        continue;
+                    }
+                }
                 let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
                 let mut r: Option<(Poly, Poly)> = None;
                 for o in insts {
                     let it = self.int_of(&o);
-                    let (l, h) = (it.lo.first()?.clone(), it.hi.first()?.clone());
+                    // the tightest comparable bounds of the instance (an interval keeps several candidate bounds)
+                    let mut l = it.lo.first()?.clone();
+                    for x in it.lo.iter().skip(1) {
+                        if self.cx.le(&l, x) {
+                            l = x.clone();
+                        }
+                    }
+                    let mut h = it.hi.first()?.clone();
+                    for x in it.hi.iter().skip(1) {
+                        if self.cx.le(x, &h) {
+                            h = x.clone();
+                        }
+                    }
                     r = Some(match r {
                         None => (l, h),
                         Some((l0, h0)) => (self.pmin(&l0, &l)?, self.pmax(&h0, &h)?),
@@ -760,12 +800,16 @@ impl<'a> An<'a> {
         let mut digits: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
         let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
+        if dbg {
+            eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
+        }
         if caps_all.len() == ss.len() {
             let mut used: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); ss.len()];
             for (ci, cap0) in caps_all[0].iter().enumerate() {
                 let ((latoms, _), bound, clamp) = cap0;
                 if latoms.is_empty() || !latoms.keys().all(|k| atoms.contains_key(k)) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 1"); } continue; }
                 }
                 // the matching cap of every store (same atoms, bound and kind)
                 let mut picks: Vec<usize> = vec![ci];
@@ -776,7 +820,7 @@ impl<'a> An<'a> {
                     }
                 }
                 if picks.len() != ss.len() {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 2"); } continue; }
                 }
                 // k = offset coefficient / x coefficient, the same for every atom of x (x coefficients positive constants)
                 let mut kf: Option<Poly> = None;
@@ -802,7 +846,7 @@ impl<'a> An<'a> {
                 }
                 let Some(kf) = kf else { continue };
                 if !ok || !cx.nonneg(&kf) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 3"); } continue; }
                 }
                 // x injective: its atoms sorted by coefficient form a radix with unit size
                 let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
@@ -817,7 +861,7 @@ impl<'a> An<'a> {
                     acc = acc.add(&m.scale(*c));
                 }
                 if !inj {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 4"); } continue; }
                 }
                 // a clamp loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every x >= bound - 1 has u
                 // at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
@@ -828,12 +872,32 @@ impl<'a> An<'a> {
                         (a.n * b.d).cmp(&(b.n * a.d))
                     });
                     let ok_clamp = match (wgs.as_slice(), top) {
-                        ([w], Some((tk, tc))) if *w == tk => cx.le(&ranges[tk].1.scale(tc.as_const().unwrap()), &bound.sub(&Poly::int(1))),
+                        ([w], Some((tk, tc))) if *w == tk => {
+                            let c = tc.as_const().unwrap();
+                            cx.le(&ranges[tk].1.scale(c), &bound.sub(&Poly::int(1))) || {
+                                // a workgroup axis with grid = ceil(bound / c): c (grid - 1) <= bound - 1 always
+                                !tk.0 && tk.1 >= u64::MAX - 2 && c.d == 1 && {
+                                    let ax = (u64::MAX - tk.1) as u8;
+                                    self.f.contract.grid_defs.iter().any(|(a2, e)| {
+                                        *a2 == ax
+                                            && matches!(e, Ext::CeilDiv(inner, kk) if *kk as i128 == c.n && match inner.as_ref() {
+                                                Ext::Ka(off) => *bound == Poly::sym(Sym::Ka(*off)),
+                                                Ext::Sym(n) => *bound == Poly::sym(Sym::Named(n.clone())),
+                                                _ => false,
+                                            })
+                                    })
+                                }
+                            }
+                        }
                         ([], _) => true,
                         _ => false,
                     };
+                    if dbg && !ok_clamp {
+                        let tops = top.map(|(k, c)| format!("{:x} c={} hi={}", k.1, c.show(), ranges[k].1.show()));
+                        eprintln!("gw:   clamp: wg atoms {:?}, top {:?}, bound {}", wgs.iter().map(|k| format!("{:x}", k.1)).collect::<Vec<_>>(), tops, bound.show());
+                    }
                     if !ok_clamp {
-                        continue;
+                        { if dbg { eprintln!("gw:   cap {ci} rejected at 5"); } continue; }
                     }
                 }
                 // x's minimum over the stores (their own constants) and the per-store constant correction
@@ -858,7 +922,7 @@ impl<'a> An<'a> {
                 let Some(xmin) = xmin else { continue };
                 let span = bound.sub(&Poly::int(1)).sub(&xmin);
                 if !ok || !cx.nonneg(&span) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 6"); } continue; }
                 }
                 let mut fixed = Vec::with_capacity(ss.len());
                 for (si, p) in picks.iter().enumerate() {
@@ -869,7 +933,7 @@ impl<'a> An<'a> {
                     fixed.push(consts[si].sub(&kd));
                 }
                 if !ok || picks.iter().enumerate().any(|(si, p)| used[si].contains(p)) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 7"); } continue; }
                 }
                 for (si, p) in picks.iter().enumerate() {
                     used[si].insert(*p);

@@ -1072,11 +1072,16 @@ pub struct Contract {
 }
 
 /// See `Contract::wg_maps`.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct WgMap {
     pub outs: Vec<ValueId>,
     pub axes: Vec<u8>,
     pub reason: String,
+    /// `wg_union`: the outputs are ONE index computed differently per store class (e.g. the paired causal q tiles x and n - 1 - x), injective
+    /// over (workgroup, class); otherwise the tuple of outputs is injective over the workgroup
+    pub union: bool,
+    /// `wg_union`: the index range [lo, hi] (part of the fact)
+    pub range: Option<(Ext, Ext)>,
 }
 
 /// One value set crossing a stage boundary (`StageContract`): the IR values (fragment registers), the element table they hold (`[t + threads v]`
@@ -1925,7 +1930,15 @@ impl FnBuilder {
     /// workgroup digits of those axes. Counted in the trust ledger.
     #[track_caller]
     pub fn wg_bijection(&mut self, outs: &[ValueId], axes: &[u8], reason: &str) {
-        self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string() });
+        self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string(), union: false, range: None });
+    }
+
+    /// Trusted fact: `outs` are the same index (e.g. a q tile) as computed by different store classes of one workgroup (the paired causal
+    /// tiles x and n - 1 - x, the second guarded by n - 1 - x > x), and the index is injective over (workgroup, class). The cross-workgroup
+    /// store proof treats them as one digit covering `axes`. Counted in the trust ledger.
+    #[track_caller]
+    pub fn wg_union(&mut self, outs: &[ValueId], axes: &[u8], lo: Ext, hi: Ext, reason: &str) {
+        self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string(), union: true, range: Some((lo, hi)) });
     }
 
     #[track_caller]

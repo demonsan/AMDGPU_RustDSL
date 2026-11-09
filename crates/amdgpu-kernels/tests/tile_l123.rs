@@ -357,7 +357,7 @@ fn kv_split_and_gqa_components_verify() {
     let f = b.finish();
     assert!(errs(&f).is_empty(), "{:?}", errs(&f));
     let r = analyse(&f).unwrap();
-    assert_eq!(r.ledger().assume_trusted, 7, "the components' trusted facts are counted in the certificate");
+    assert_eq!(r.ledger().assume_trusted, 8, "the components' trusted facts (7 ranges + the split bijection) are counted in the certificate");
 }
 
 // ---- `_t128` staging: K and V of the same rows with one shared row clamp, K scales through a VGPR written after the DMA wait ----------------------------------------
