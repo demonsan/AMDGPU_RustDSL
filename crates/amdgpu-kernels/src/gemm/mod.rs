@@ -1409,6 +1409,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
         "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128_splitk", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
@@ -2053,6 +2054,17 @@ impl skeleton_v4::V4Slots for GemmSlots {
             b.pin_agpr(*v);
         }
     }
+    if cfg.elem == Elem::I8 {
+        // int8: the i32 accumulators to f32 in place (every epilogue below - split-K partials, the scaled LDS epilogue - is the fp32 one)
+        for acc in &body.acc {
+            for r in 0..4u8 {
+                let x = b.frag4_lane(Opnd::Var(*acc), r);
+                let x = b.bitcast_i32(x);
+                let f = b.un(amdgpu_dsl::UnOp::CvtF32I32, x);
+                b.var_set_lane(*acc, r, f);
+            }
+        }
+    }
     if let Some(mc) = cx.moe.clone() {
         let (rsa, rsb) = cx.rsrc_sfa_e.expect("descriptors");
         moe_epilogue(b, &ctx, &mma, &body.acc, s_lane, &mc, cfg, rsa, rsb, ptr_c, m_v, n_v, bx, wm, wn, wave_m, wave_n);
@@ -2087,17 +2099,6 @@ impl skeleton_v4::V4Slots for GemmSlots {
             b.store_f32x4(bases[bi], imm as u32, Opnd::Var(*acc));
         }
         return;
-    }
-    if cfg.elem == Elem::I8 {
-        // int8: the i32 accumulators to f32 in place (the scaled epilogue below is the fp32 one)
-        for acc in &body.acc {
-            for r in 0..4u8 {
-                let x = b.frag4_lane(Opnd::Var(*acc), r);
-                let x = b.bitcast_i32(x);
-                let f = b.un(amdgpu_dsl::UnOp::CvtF32I32, x);
-                b.var_set_lane(*acc, r, f);
-            }
-        }
     }
     if let Some(epi) = &epi {
         let rowcol = (cfg.scales == Scales::RowCol).then_some((body.rsrc_sfa, body.rsrc_sfb));
