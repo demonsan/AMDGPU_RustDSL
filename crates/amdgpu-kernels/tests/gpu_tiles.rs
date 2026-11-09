@@ -689,3 +689,78 @@ fn reusing_storage_after_the_last_reads_and_a_barrier_is_proven() {
     let r = verify_ir(&tile_over_kernel(Reuse::AfterBarrier));
     assert!(r.errors().is_empty(), "{}", errors(&r));
 }
+
+
+/// Per-OUTER-iteration period check (gpu_protocol::verify_period_claim): an outer loop over `ver` produces version `ver` of a one-slot tile;
+/// an inner loop with a data-dependent trip count (kernarg `m`) re-reads it. `same_version`: every inner read expects `ver` (the marker repeats
+/// one version per outer iteration: periodic per outer iteration, provable without tile_trust_periodic). Otherwise the inner loop produces and
+/// reads version `100 ver + j` (versions differ within one outer iteration: no grouping, the per-execution step is not constant -> not proven).
+fn nested_reread(same_version: bool) -> Function {
+    let mut b = FnBuilder::new("nested_reread", 64);
+    b.lds(256);
+    b.arg("n", DType::I32, 0, 4);
+    b.arg("m", DType::I32, 4, 4);
+    b.lds_tile("T", 0, 256);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let m = b.let_(Op::KernargI32 { offset: 4 });
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let z = b.c_i32(0);
+    let outer = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let ver = Opnd::Var(outer[0]);
+    if same_version {
+        b.tile_produce("T", Opnd::I32(0), ver);
+        b.store_lds(a, z, amdgpu_dsl::MemTy::B32, false);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+    }
+    let inner = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let j = Opnd::Var(inner[0]);
+    if same_version {
+        b.tile_consume("T", Opnd::I32(0), ver);
+        let _x = b.load_lds(a, amdgpu_dsl::MemTy::B32);
+        b.tile_end();
+        b.wait_lds(0);
+    } else {
+        let h = b.let_(Op::MulI32(ver, Opnd::I32(100)));
+        let v = b.let_(Op::AddI32(Opnd::Val(h), j));
+        b.tile_produce("T", Opnd::I32(0), Opnd::Val(v));
+        b.store_lds(a, z, amdgpu_dsl::MemTy::B32, false);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+        b.tile_consume("T", Opnd::I32(0), Opnd::Val(v));
+        let _x = b.load_lds(a, amdgpu_dsl::MemTy::B32);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+    }
+    let j1 = b.let_(Op::AddI32(j, Opnd::I32(1)));
+    b.set_var(inner[0], j1);
+    let stop_j = b.let_(Op::CmpGeI32(Opnd::Val(j1), Opnd::Val(m)));
+    b.break_if(Opnd::Val(stop_j));
+    b.end_loop();
+    if same_version {
+        b.barrier();
+    }
+    let v1 = b.let_(Op::AddI32(ver, Opnd::I32(1)));
+    b.set_var(outer[0], v1);
+    let stop = b.let_(Op::CmpGeI32(Opnd::Val(v1), Opnd::Val(n)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn a_marker_repeated_by_an_inner_loop_is_periodic_per_outer_iteration() {
+    let r = verify_ir(&nested_reread(true));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert_eq!(r.ledger().total(), 0, "no tile_trust_periodic needed: {}", r.render());
+}
+
+#[test]
+fn versions_that_differ_within_an_outer_iteration_are_not_grouped() {
+    let r = verify_ir(&nested_reread(false));
+    assert!(r.errors().iter().any(|e| e.msg.contains("not a constant step")), "expected the period claim to fail per execution:\n{}", r.render());
+}
