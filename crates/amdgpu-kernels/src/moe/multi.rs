@@ -518,8 +518,9 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let wo = b.bind_i32(ev(i) << 2);
         let wf = b.buffer_load_f32(r_w, wo, 0i32, 0);
         // WC versions: 2 ch (zeroed, counted), 2 ch + 1 (the prefix over the waves)
-        let v_cnt = b.bind_i32(ev(ch) << 1);
-        let v_pre = b.bind_i32((ev(ch) << 1) + 1);
+        let chv = b.let_(Op::AddI32(Opnd::Var(ch), Opnd::I32(0)));
+        let v_cnt = b.bind_i32(ev(chv) << 1);
+        let v_pre = b.bind_i32((ev(chv) << 1) + 1);
         // [A] zero this thread's column of WC (all 16 waves' counts of expert `tid`)
         let zero = b.c_i32(0);
         for w in 0..16i32 {
