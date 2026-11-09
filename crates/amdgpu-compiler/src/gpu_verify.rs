@@ -224,9 +224,9 @@ struct An<'a> {
     atom_inst: std::cell::RefCell<HashMap<(bool, u64), Vec<Opnd>>>,
     sig_memo: std::cell::RefCell<HashMap<ValueId, String>>,
     /// caps of the store being linearized: a masked store's live arm runs only when `x < bound` (x linear, bound uniform)
-    caps_cur: std::cell::RefCell<Vec<(SLin, Poly)>>,
-    gcaps: BTreeMap<usize, Vec<(SLin, Poly)>>,
-    group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly)>>>>,
+    caps_cur: std::cell::RefCell<Vec<(SLin, Poly, bool)>>,
+    gcaps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
+    group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
     acc: HashMap<VarId, Itv>,
@@ -428,11 +428,15 @@ impl<'a> An<'a> {
                         // (a negative constant is a huge unsigned buffer offset)
                         let big = |o: &Opnd| matches!(o, Opnd::I32(c) if *c < 0) || self.int_of(o).lo.iter().any(|l| self.cx.le(&Poly::int(1 << 30), l));
                         if big(b) {
-                            self.note_cap(cond, true, depth);
+                            self.note_cap(cond, true, depth, false);
                             self.slin(a, depth + 1)
                         } else if big(a) {
-                            self.note_cap(cond, false, depth);
+                            self.note_cap(cond, false, depth, false);
                             self.slin(b, depth + 1)
+                        } else if self.is_clamp(cond, a, b) {
+                            // min(x, bound - 1) as `x < bound ? x : bound - 1`: a clamp cap (see `disjoint_group_why`)
+                            self.note_cap(cond, true, depth, true);
+                            self.slin(a, depth + 1)
                         } else {
                             atom(self.atom_key(*v), *o)
                         }
@@ -499,20 +503,36 @@ impl<'a> An<'a> {
 
     /// The live arm of a masked store runs only where `cond == live`: a condition `x < bound` (bound a uniform value with an exact interval)
     /// caps the linear value x - recorded for the store being linearized (`disjoint_group_why` turns it into one composite digit).
-    fn note_cap(&self, cond: &Opnd, live: bool, depth: usize) {
-        let Opnd::Val(cv) = cond else { return };
-        let (x, y) = match (self.defs.get(cv), live) {
-            (Some(Op::CmpLtI32(x, y)), true) | (Some(Op::CmpGeI32(x, y)), false) => (*x, *y),
-            (Some(Op::NotI1(c)), l) => return self.note_cap(c, !l, depth),
-            _ => return,
-        };
+    fn note_cap(&self, cond: &Opnd, live: bool, depth: usize, clamp: bool) {
+        let Some((x, y)) = self.lt_of(cond, live) else { return };
         let it = self.int_of(&y);
         if !(it.lo.len() == 1 && it.hi.len() == 1 && it.lo[0] == it.hi[0]) {
             return;
         }
         if let Some(l) = self.slin(&x, depth + 1) {
-            self.caps_cur.borrow_mut().push((l, it.lo[0].clone()));
+            self.caps_cur.borrow_mut().push((l, it.lo[0].clone(), clamp));
         }
+    }
+
+    /// `cond == live` as `x < y`.
+    fn lt_of(&self, cond: &Opnd, live: bool) -> Option<(Opnd, Opnd)> {
+        let Opnd::Val(cv) = cond else { return None };
+        match (self.defs.get(cv), live) {
+            (Some(Op::CmpLtI32(x, y)), true) | (Some(Op::CmpGeI32(x, y)), false) => Some((*x, *y)),
+            (Some(Op::NotI1(c)), l) => self.lt_of(c, !l),
+            _ => None,
+        }
+    }
+
+    /// `cond ? a : b` is `min(a, y - 1)`: cond is `a < y` and b is exactly y - 1 (both uniform points).
+    fn is_clamp(&self, cond: &Opnd, a: &Opnd, b: &Opnd) -> bool {
+        let Some((x, y)) = self.lt_of(cond, true) else { return false };
+        if x != *a {
+            return false;
+        }
+        let (iy, ib) = (self.int_of(&y), self.int_of(b));
+        let point = |i: &Itv| i.lo.len() == 1 && i.hi.len() == 1 && i.lo[0] == i.hi[0];
+        point(&iy) && point(&ib) && ib.lo[0] == iy.lo[0].sub(&Poly::int(1))
     }
 
     /// Wave-uniform (every lane holds the same value): built from constants, kernargs, workgroup ids and readfirstlane results only.
@@ -652,7 +672,7 @@ impl<'a> An<'a> {
     /// never write the same byte. Returns the number of stores proven / not proven.
     fn global_disjointness(&self) -> (usize, usize) {
         let mut by_arg: BTreeMap<u32, Vec<&(u32, Option<SLin>, i128, ARanges)>> = BTreeMap::new();
-        let mut caps_by_arg: BTreeMap<u32, Vec<Vec<(SLin, Poly)>>> = BTreeMap::new();
+        let mut caps_by_arg: BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>> = BTreeMap::new();
         for (i, s) in &self.gstores {
             by_arg.entry(s.0).or_default().push(s);
             caps_by_arg.entry(s.0).or_default().push(self.gcaps.get(i).cloned().unwrap_or_default());
@@ -776,7 +796,7 @@ impl<'a> An<'a> {
                 if !caps_all.iter().all(|cs| cs.contains(cap)) {
                     continue;
                 }
-                let ((latoms, lconst), bound) = cap;
+                let ((latoms, lconst), bound, clamp) = cap;
                 if latoms.is_empty() || !latoms.keys().all(|k| atoms.contains_key(k)) {
                     continue;
                 }
@@ -818,6 +838,26 @@ impl<'a> An<'a> {
                 }
                 if !inj {
                     continue;
+                }
+                // a clamp (min(x, bound - 1)) loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every
+                // x >= bound - 1 has u at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
+                if *clamp {
+                    let is_wg = |k: &(bool, u64)| {
+                        (!k.0 && k.1 >= u64::MAX - 2) || self.f.contract.wg_maps.iter().any(|m| m.outs.iter().any(|v| self.atom_key(*v) == *k))
+                    };
+                    let wgs: Vec<&(bool, u64)> = latoms.keys().filter(|k| is_wg(k)).collect();
+                    let top = latoms.iter().max_by(|p, q| {
+                        let (a, b) = (p.1.as_const().unwrap(), q.1.as_const().unwrap());
+                        (a.n * b.d).cmp(&(b.n * a.d))
+                    });
+                    let ok_clamp = match (wgs.as_slice(), top) {
+                        ([w], Some((tk, tc))) if *w == tk => cx.le(&ranges[tk].1.scale(tc.as_const().unwrap()), &bound.sub(&Poly::int(1))),
+                        ([], _) => true,
+                        _ => false,
+                    };
+                    if !ok_clamp {
+                        continue;
+                    }
                 }
                 // x's minimum and the composite digit's span
                 let mut xmin = lconst.clone();
