@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
         int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};
         for (int i = 0; i < 10; i++) a.u32(24 + 4 * i, iv[i]);
         a.ptr(64, nullptr); a.ptr(72, nullptr); a.u32(80, M); a.u32(84, K * 2 / 128); a.u32(88, 0); a.u32(92, 0); a.b.resize(96);
-    } else if (fam == "ours_v4_rowcol_fp8") {
+    } else if (fam == "ours_v4_rowcol_fp8" || fam == "ours_v4_i8") {
         // our v4 structure, 96-byte ABI: A, B (preshuffled), C, M N K batch, strides, sfa = row scales f32 [M], sfb = column scales f32 [N], KT
         dSA = dev(sa_row); dSB = dev(sb_col);
         a.ptr(0, dA); a.ptr(8, dB); a.ptr(16, dC);

@@ -129,6 +129,9 @@ pub enum Elem {
     /// bf16: two `v_mfma_f32_16x16x32_bf16` per block and K tile (one per 16-byte half of the operand fragments; A and B halves share the K
     /// permutation, so the sum is unchanged)
     Bf16,
+    /// int8 (`gemm_a8w8_i8`, per-token x per-channel fp32 scales): two `v_mfma_i32_16x16x64_i8` per block and K tile (one per 16-byte half of
+    /// the fragments, the shared K permutation as `Bf16`); the i32 accumulators are converted to f32 before the scaled epilogue
+    I8,
     /// fp8 e4m3 with fp32 block scales (`Scales::Block128`): one zero-C scaled MFMA (unit E8M0) per block and K tile, then acc += t sa sb
     Fp8Bs,
     /// fp4 e2m1 (two per byte, low nibble first): two scaled `v_mfma_scale_f32_16x16x128_f8f6f4` (fp4 x fp4) per block and 128-byte K tile
@@ -148,7 +151,7 @@ impl Elem {
     /// K elements per 128-byte tile
     fn per_tile(self) -> i64 {
         match self {
-            Elem::Fp8 | Elem::Fp8Bs => 128,
+            Elem::Fp8 | Elem::Fp8Bs | Elem::I8 => 128,
             Elem::Bf16 => 64,
             Elem::Fp4 | Elem::Fp8W4 | Elem::Bf16W4 => 256,
         }
@@ -391,6 +394,17 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                     // (shuffled scales: `by` = 2 on the odd tile of a pair - its bytes are 2, 3 of the pair's dword)
                     let sel = h + blk.5;
                     b.var_mfma_scaled(acc, k, xs, ys, amdgpu_dsl::MmaScale { sa: Opnd::Var(sx), sb: Opnd::Var(sy), opsel: sel | (sel << 4) }, false);
+                }
+            }
+        }
+        Elem::I8 => {
+            let k = amdgpu_dsl::MmaKind::new(amdgpu_dsl::MmaShape::M16N16K64, amdgpu_dsl::MmaTy::I8);
+            for h in 0..2u8 {
+                for blk in blocks {
+                    let (acc, x, y, ..) = ops(blk);
+                    let xs = b.var_slice4(x, h);
+                    let ys = b.var_slice4(y, h);
+                    b.var_mfma(acc, k, xs, ys, false);
                 }
             }
         }
@@ -1393,6 +1407,10 @@ pub fn by_name(name: &str) -> Option<Function> {
     match name {
         "gemm_mxfp8_bs_v4" => Some(gemm_mxfp8_bs_v4()),
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
+        "gemm_a8w8_i8" => Some(gemm_mxfp8_bs("gemm_a8w8_i8", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol() })),
+        "gemm_a8w8_i8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_128", GemmConfig { elem: Elem::I8, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
@@ -2035,6 +2053,17 @@ impl skeleton_v4::V4Slots for GemmSlots {
     if let Some((bv, av, _, _)) = &body.rv {
         for v in bv.iter().chain(av.iter()) {
             b.pin_agpr(*v);
+        }
+    }
+    if cfg.elem == Elem::I8 {
+        // int8: the i32 accumulators to f32 in place (every epilogue below - split-K partials, the scaled LDS epilogue - is the fp32 one)
+        for acc in &body.acc {
+            for r in 0..4u8 {
+                let x = b.frag4_lane(Opnd::Var(*acc), r);
+                let x = b.bitcast_i32(x);
+                let f = b.un(amdgpu_dsl::UnOp::CvtF32I32, x);
+                b.var_set_lane(*acc, r, f);
+            }
         }
     }
     if let Some(mc) = cx.moe.clone() {

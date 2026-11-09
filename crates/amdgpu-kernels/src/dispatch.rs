@@ -83,6 +83,26 @@ pub fn bwd_causal_kernels() -> (&'static str, &'static str) {
     ("fmha_bwd_dq_hd128_bf16_causal", "fmha_bwd_dkdv_hd128_bf16_causal")
 }
 
+/// int8 A8W8 GEMM (`gemm_a8w8_i8[_128|_64[_splitk]]`, per-token x per-channel scales): (CTA rows, split-K S). 256 x 256 when that grid
+/// fills the CUs, else 128 x 128 when that does, else 64 x 128 with the smallest S (<= 4, power of two) giving S CTAs >= CUs (S > 1:
+/// `gemm_a8w8_i8_64_splitk` + `gemm_splitk_reduce_s<S>_rc`). Same run vs the best aiter i8gemm tile: 4096^3 68.9 vs 112 us, 2048x4096^2
+/// 42.3 vs 55.2, 1024x4096x8192 51.9 vs 50.8, 512x7168x4096 23.6 vs 25.5, 256x7168x4096 20.0 vs 14.0, 128x4096x8192 (S 4) 16.2 vs 17.7,
+/// 64x8192^2 (S 4) 19.1 vs 18.9.
+pub fn i8_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
+    if (m / 256) * (n / 256) >= cus {
+        return (256, 1);
+    }
+    if m.div_ceil(128) * n.div_ceil(128) >= cus {
+        return (128, 1);
+    }
+    let c = m.div_ceil(64) * n.div_ceil(128);
+    let mut s = 1u64;
+    while s < 4 && c * s < cus {
+        s *= 2;
+    }
+    (64, s as u32)
+}
+
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
 /// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
 /// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
@@ -210,5 +230,14 @@ mod tests {
     fn bwd_causal_registered() {
         let (q, k) = super::bwd_causal_kernels();
         assert!(crate::registry::kernel_by_name(q).is_some() && crate::registry::kernel_by_name(k).is_some());
+    }
+
+    #[test]
+    fn i8_gemm_rule() {
+        assert_eq!(super::i8_gemm_config(4096, 4096, 256), (256, 1));
+        assert_eq!(super::i8_gemm_config(2048, 4096, 256), (128, 1));
+        assert_eq!(super::i8_gemm_config(512, 7168, 256), (64, 1));
+        assert_eq!(super::i8_gemm_config(128, 4096, 256), (64, 4));
+        assert_eq!(super::i8_gemm_config(64, 8192, 256), (64, 4));
     }
 }

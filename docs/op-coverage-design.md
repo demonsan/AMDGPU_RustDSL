@@ -551,6 +551,25 @@
 - 试过但未采纳：B 直接从 global 读进寄存器 tile（`_rb`，从 `archive/mxfp4-regb` 移植到 scale 成对读取的版本上）。每个 wave 每个 tile 的 VMEM 指令从 8 条 DMA 变成 16 条 b128 load。结果全面慢约 3%：8192³ 为 282 对 273–276 µs，4096³ 为 43–44.5 对 41–43。保留为 tag `archive/mxfp4-regb2`。
 - 试过但未采纳：A 的 LDS 镜像改用 swizzle（chunk ^ row%8）替代 padding，bank conflict 降了 73%，但时间没有稳定变好（4096×8192 慢 2–4%）。保留为 tag `archive/mxfp4-a-swizzle`。
 
+**int8 A8W8 GEMM**（2026-11-09；`gemm_a8w8_i8`、`_128`、`_64`、`_64_splitk`，分发规则见 `dispatch::i8_gemm_config`）：
+- 结构沿用 v4 模板，新增 `Elem::I8`：每个块、每个 128 字节 K tile 做两条 `v_mfma_i32_16x16x64_i8`，K 的排列方式与 bf16 相同。
+- 在任何 epilogue 之前（包括 split-K 的 partial），先把 i32 累加器原地转成 f32（`v_cvt_f32_i32`），之后直接走 per-token × per-channel 的 fp32 epilogue。
+- host：`vendor_gemm_host` 的 `ours_v4_i8`（96 字节 ABI，与 rowcol_fp8 相同）。所有形状 bad=0，strict 无错误。
+- 同次运行，与 aiter i8gemm 各 tile 中最好的一个对比（µs）：
+
+| 形状 | ours | aiter 最佳 | 比 |
+|---|--:|--:|--:|
+| 8192³ | 426 | 651（128 tile） | 1.53 |
+| 4096³ | 68.9 | 112 | 1.63 |
+| 2048×4096² | 42.3 | 55.2 | 1.31 |
+| 1024×4096×8192 | 51.9 | 50.8 | 0.98 |
+| 512×7168×4096 | 23.6 | 25.5 | 1.08 |
+| 256×7168×4096 | 20.0 | 14.0（64 tile） | 0.70 |
+| 128×4096×8192（S=4） | 16.2 | 17.7 | 1.09 |
+| 64×8192²（S=4） | 19.1 | 18.9 | 0.99 |
+
+- 256×7168 是唯一明显落后的形状：厂商的 64×128 tile 不切 K，每个 CU 的效率更高。
+
 **批量 GEMM（覆盖补齐）**：`gemm_a16w16_bf16_bmm`、`gemm_a8w8_rowcol_fp8_bmm`、`gemm_mxfp8_bs_v4_bmm`（`GemmConfig.batched`）。
 - 网格 z = batch（kernarg 36）。各 batch 的 A、B、C 与 scale 都是稠密块，基址用 64 位 `ptr_mad` 移动；契约中每个张量乘以 BT。
 - 测试用 [`vendor_gemm_host.cpp`](../tests/gpu/vendor_gemm_host.cpp) 的 `BATCH=n`：最后一个 batch 放参考数据，其余填充垃圾，检查最后一个 batch 的输出。
