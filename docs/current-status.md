@@ -15,14 +15,14 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`）：`_vs128` `622a6c0d`、`_t128` `dc210951`、`_kvsplit` `41f151fc`、`_kvsplit_combine8h` `24a95a51`（Main `bf08b7b0`：`_vs128` / `_t128` 加了 XCD 感知的 block 顺序）。
+  asm md5（`--backend own`，Main `b97c7aae`）：`_vs128` `80f4a72c`、`_t128` `5e3d12aa`、`_kvsplit` `c9dbf396`、`_kvsplit_combine8h` `24a95a51`（v9 的 lowering 窥孔：select → v_min / v_max / med3、显式并上提的 M0 写；`port_gate` 全部 PASS，见 §6.2）。
 - **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-08，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**740 TF/s（1.025× 厂商）**；
   铺满网格 B4H8S2048 **1804（0.976×）** / B1H8S8192 **2416（0.988×）** / B2H8S2048 **1279（0.978×）**；`_vs128` 每 CU 64 blocks **694（0.959×）**；`_t128` B2H8S2048 layout 中位数 **1173（0.901×）**。
   25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.929–1.063×，几何平均 **0.992**（之前 0.980）。最近一步是厂商的 XCD 感知 block 顺序（K/V 的 L2 命中率 20 % → 77 %，[`fmha-wave-org.md`](fmha-wave-org.md)）。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
   快速路径成本，旧的 0.92× 口径偏乐观；这一轮的改进（懒更新、≥ 4 tile 用厂商配方、真实数据分派、bias 单次 MFMA 且无零片段拷贝、`ldsink` / `wsink`）
   与否定结果（copy 路径、3 槽环、厂商 copy 形态、重平衡）见 [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) 与 [`lgkm-lookahead.md`](lgkm-lookahead.md)。
 - **MXFP8 blockscale GEMM**：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels/src/gemm/`）对照 aiter PR #6696 4-wave pin-AGPR，4096×4096×8192：
-  **0.988–0.994×** 厂商（`tools/gemm_gate.sh` PASS，§4.7）；asm md5 `14df28e4`。
+  **0.978–0.994×** 厂商（`tools/gemm_gate.sh` PASS，§4.7；v9 加入 epilogue 前的 `wait_vm(0)` 与 lowering 窥孔后 0.978–0.981×）；asm md5 `ff430295`。
 - **融合 MLP**：`mlp_fp8_ws_{fused,g1,g2}`（`crates/amdgpu-kernels/src/mlp/`），布局层 P 交接证明见 [`fusion-layout-handoff.md`](fusion-layout-handoff.md)。
 - **AGPR 已支持**（寄存器类 A1–A16、acc_cd MFMA、`ds_read_b128 → AGPR`、`v_accvgpr_*`、统一 512 寄存器预算与 hazard）：[`agpr.md`](agpr.md)。
 - **主机侧生成**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）。
@@ -38,7 +38,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `v_pk_fma_f32`、片段视图与原地拼接、`tileop::ewise / apply2 / allreduce`，每条都过“属性表 → 双后端 → hazard oracle → 硬件探针”闭环。
 - **64 位寻址**：`ptr_mad` 把描述符基址移到 tile / expert / slot（> 4 GiB 张量），验证器证明移动后的描述符仍在 extent 内。
 - **结构化诊断**：`--json`、`amdc summary`、`amdc srcmap`（[`diagnostics.md`](diagnostics.md)）。
-- `cargo test` **116 个测试目标 / 488 项全绿**。
+- `cargo test` **116 个测试目标 / 494 项全绿**。
 - 严格 GPU 语义证书：`--shipped` **26 trusted assumes / 100 trusted contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**。
 
 ---
@@ -206,7 +206,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | B2H8S2048 `_t128` | **1067.4** | 1.05× |
 
 BUILD / VERIFY（0 错误）/ ACC16 / ACC64（厂商对齐，四条路径）/ DET / STRESS 全部 PASS：**OVERALL PASS**。
-（v7.0 门禁时的 asm md5 为 `763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`；当前出厂 `_vs128` / `_t128` / `_kvsplit` / `combine8h` 为 `622a6c0d` / `dc210951` / `41f151fc` / `24a95a51`（stage / weaver / 骨架重写前后逐字节相同；之后 `_vs128` / `_t128` 加入 XCD 顺序，见 [`fmha-wave-org.md`](fmha-wave-org.md)）。）`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
+（v7.0 门禁时的 asm md5 为 `763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`；v8.1 出厂为 `622a6c0d` / `dc210951` / `41f151fc` / `24a95a51`（stage / weaver / 骨架重写前后逐字节相同；之后 `_vs128` / `_t128` 加入 XCD 顺序，见 [`fmha-wave-org.md`](fmha-wave-org.md)）；v9 为 `80f4a72c` / `5e3d12aa` / `c9dbf396` / `24a95a51`。）`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
 LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（A/B 记录见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9.4）。
 
 ### 4.7 MXFP8 blockscale GEMM
@@ -264,14 +264,21 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 | cvt scale 只用指数（E8M0） | scalef32 转换的常量 scale 不是 2 的幂时结果静默错误 | IR 验证器 |
 | fp4 / fp8 打包的目的选择 hazard | 写目的寄存器某一部分的 `v_cvt_scalef32_pk_*` 后紧跟读者需要 1 个等待态 | `hazards.rs`，`probe_fp4_chain` |
 | 视图的偏移（view snapshots） | `frag4_lane(var_slice4(v, k), i)` 丢掉切片偏移；循环变量的视图在变量被写后仍按 SSA 语义读取快照 | lowering，`tileops_ir.rs` |
-| LDS 存储复用（GV-TILE-ALIAS-RACE，`tileover-check` 分支） | `LdsPlan::tile_over` / overlays 复用的字节对其它 wave 仍活着；并找到 GEMM `lds_epilogue` 末轮预取 DMA 未等就复用 ring 的真实竞态 | `gpu_protocol`，`gpu_tiles.rs` |
+| LDS 存储复用（GV-TILE-ALIAS-RACE） | `LdsPlan::tile_over` / overlays 复用的字节对其它 wave 仍活着；并找到 GEMM `lds_epilogue` 末轮预取 DMA 未等就复用 ring 的真实竞态 | `gpu_protocol`，`gpu_tiles.rs` |
 | MIR 导出的 `implicit-def dead` | 被当成读，导致循环内构造描述符时 SCC 的 live-in 错误、llc 中止 | `llvm_mir.rs` |
+
+### 6.2 v9 的 lowering 窥孔（出厂 md5 因此改变，门禁全过）
+
+- `select(cmp(x, y), x, y)`（i32 / u32 / f32，lt / le / gt / ge，两种顺序）→ 一条 `v_min` / `v_max`：去掉 v_cmp、vcc 与 cmp → cndmask 的等待态；`min(max(x, lo), hi)`（常量 lo ≤ hi）→ `v_med3`，min / max 链 → `min3` / `max3`。
+- LDS-DMA 的 M0 写变成显式 MIR 指令：单次使用的基址加法（含连续的常量加）折进 `s_add_u32 m0, x, k`，连同单次使用的 SALU 源上提到前一个 M0 使用者之后；只有中间没有指令时才保留 `s_nop 0`。
+- 指令数 / `s_nop` 个数 / nop 等待态（前 → 后）：`pa_decode16_bf16_hd128_p16` 963 / 55 / 143 → 883 / 23 / 79；`mla_decode_bf16_p1` 2286 / 121 / 427 → 2174 / 83 / 385；`_t128` 4911 / 141 / 318 → 4864 / 96 / 274；`_kvsplit` 10025 / 230 / 640 → 9987 / 193 / 602；`_vs128` 9365 / 214 / 604 → 9359 / 210 / 600；GEMM v4 1800 / 36 / 76 → 1788 / 24 / 64。
+- 门禁：`port_gate` OVERALL PASS（B1H8S2048 742 TF/s 1.017×、B4H8S2048 1855 0.975×、B1H8S8192 2415 0.983×、每 CU `_vs128` 699 0.954×、`_t128` 1172 0.902×）；`gemm_gate` PASS 0.978×。
 
 ---
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **116 个测试目标 / 488 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
+- **测试**：`cargo test` **116 个测试目标 / 494 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`dpp`、`var_slice`、`var_semantics`、`regplan`、`sched_regions*`、`rust_safety` 等；kernel 相关（`crates/amdgpu-kernels/tests/`）：
   `tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`agpr`、`gpu_*`（语义/协议/攻击）、`gemm_mxfp8`、`tile_l*`、`region_ir`、
   `ir_text`（全部 kernel 的 irv1 往返）、`ir_print`、`hzfill`、`sched_kernels`；`amdc` 的 `jit`、`contract_host_truth`；布局层 `crates/amdgpu-layout/tests/`、
@@ -290,10 +297,10 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 116 个测试目标 / 488 项全绿
+bash tools/container/cargo.sh test                 # 期望 116 个测试目标 / 494 项全绿
 
 # 发射 kernel 并汇编
-bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 622a6c0d…
+bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 80f4a72c…
 clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o vs128.co vs128.s
 
 # 严格证书
