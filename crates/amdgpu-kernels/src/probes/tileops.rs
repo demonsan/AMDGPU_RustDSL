@@ -1464,7 +1464,7 @@ pub fn probe_valu_sgpr() -> Function {
     let hi = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(8)));
     let l4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
     for j in 0..32i32 {
-        let v = b.let_(Op::AddI32(Opnd::Val(hi), Opnd::I32(52 * j)));
+        let v = b.let_(Op::XorI32(Opnd::Val(hi), Opnd::I32(52 * j))); // (xor: not folded into a scalar add after the readfirstlane)
         let s = b.read_first_lane(v);
         let x = b.buffer_load_f32(r_in, l4, s, 0);
         let xi = b.bitcast_i32(x);
