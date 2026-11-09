@@ -579,6 +579,19 @@
 - 也就是大 batch 时达到厂商的 0.80–0.94×。
 - 小 batch 仍需 S ≥ 2，例如 B16 S2 为 28.6 µs，厂商 18.4 µs；其中 combine 的 launch 占 4–10 µs。
 
+**decode16 小 batch 的实验（均未采纳，已归档）**：
+- `archive/decode16-lookahead`：把下一 tile 的块表查找放进循环状态，没有收益。
+- `archive/decode16-prefetch`（`_pf` / `_fpf`）：每个 wave 两个 K/V slot（32 KB），tile t+1 的 DMA 在 tile t 计算之前发出，每 CU 1 个 CTA。
+  - B16 fused 为 31.1 µs（未改前 32.7），但 split S2 不加 prefetch 仍有 28.6 µs，更快。
+  - 大 batch 时因为占用率减半，反而变慢：B64 为 94.6 µs，未改前 84.9。
+  - 因此 dispatch 中没有哪个形状会选它。
+- sched 的 rocprofv3 计数见 `docs/pa-decode16-profile.md`（batch2 分支）：
+  - 厂商把 160 KB LDS 全部用上，K 直接加载进寄存器；
+  - 我们的 LDS bank conflict 是厂商的 23–27×，SALU 是 10×；
+  - 我们 SQ_WAIT_ANY 占比为 54–57%，厂商为 13–26%。
+- 按 Little 定律估算，B16 要跑满 HBM，每个 wave 大约需要 21 KB 数据在途，而我们只有一个 16 KB 的 tile 在途。
+- 下一步方向：K 直接加载到 VGPR、V 留在 LDS，以加深在途深度；同时修正 K/V 的 swizzle。
+
 **MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
 - K 的 rope 部分放在第二个 ring（KR，行宽 128 字节，chunk 按 key % 8 做 XOR），由 group A 负责 staging（每个 wave 多 4 次 DMA）；QK 共 12 个 k-chunk。
