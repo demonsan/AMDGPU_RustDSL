@@ -543,6 +543,12 @@
   - 16384³：3188 → 2006 µs。
   - 对 aiter f4gemm 从 0.60 / 0.63× 提到 0.83 / 0.82×。
 - **试过但未采纳**：寄存器 B，即 B 从 global 原地重载进 AGPR，依赖后端的 in-place reload。它只带来 +1% / 0，已从树中移除，保留为 tag `archive/mxfp4-regb`。将来若做 256 字节的 A tile，可从这个 tag 起步，因为它腾出了 B 的 ring。
+**MXFP4 每对 tile 只读一次 scale**（2026-11-09）：
+- 依据 sched 的 ATT 与计数器：差距的约 60% 在 DMA 发射背压（`VMEM_TA_ADDR_FIFO_FULL` 为厂商的 16×），VMEM 指令比厂商多 53%，其中三分之一是 scale 读。
+- 做法：shuffled 布局下，一个 dword 本来就同时含有一对 tile 的 scale 字节。现在只在偶数 tile 读这个 dword 并原样安装；奇数 tile 不再读，改用 MFMA 的字节选择（opsel 字节 2、3）取出自己的 scale。尾部 tile 的奇偶在运行时才知道，那时把这个 dword 移位一次。
+- 同次运行：8192³ 从 296 µs 降到 273–277（对 f4gemm 为 0.88×），4096³ 从 44 降到 40.5–42，4096×8192×4096 从 95.6 降到 87，1024×4096×1536 从 16.1 降到 14.7。均 bad=0，`_128` 也 bad=0。
+- 试过但未采纳：A 的 LDS 镜像改用 swizzle（chunk ^ row%8）替代 padding，bank conflict 降了 73%，但时间没有稳定变好（4096×8192 慢 2–4%）。保留为 tag `archive/mxfp4-a-swizzle`。
+
 **批量 GEMM（覆盖补齐）**：`gemm_a16w16_bf16_bmm`、`gemm_a8w8_rowcol_fp8_bmm`、`gemm_mxfp8_bs_v4_bmm`（`GemmConfig.batched`）。
 - 网格 z = batch（kernarg 36）。各 batch 的 A、B、C 与 scale 都是稠密块，基址用 64 位 `ptr_mad` 移动；契约中每个张量乘以 BT。
 - 测试用 [`vendor_gemm_host.cpp`](../tests/gpu/vendor_gemm_host.cpp) 的 `BATCH=n`：最后一个 batch 放参考数据，其余填充垃圾，检查最后一个 batch 的输出。
