@@ -1147,6 +1147,28 @@ def check_i8_epi(planes, out):
         obase += 2 * LANES * n + LANES * n // 2
     return ok
 
+# ---------------------------------------------------------------- probe_valu_sgpr (VALU-writes-SGPR hazards)
+def gen_valu_sgpr():
+    return [[(i * 7 + 3) & 0xFFFFFFFF for i in range(4096)]]
+
+def check_valu_sgpr(planes, out):
+    inp = planes[0]
+    bad = 0
+    first = None
+    for j in range(32):
+        for l in range(LANES):
+            s = 52 * j
+            want = (inp[l + s // 4] + s) & 0xFFFFFFFF
+            got = out[j * LANES + l]
+            if got != want:
+                bad += 1
+                first = first or (j, l, want, got)
+    if bad:
+        print(f"FAIL valu-sgpr: {bad} of {32 * LANES} wrong, e.g. round {first[0]} lane {first[1]} want {first[2]} got {first[3]}")
+        return False
+    print(f"ok   valu-sgpr: readfirstlane -> buffer soffset / VALU operand, {32 * LANES} values")
+    return True
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -1172,6 +1194,7 @@ PROBES = {
     "probe_fp6": (gen_fp6, check_fp6, 100 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
+    "probe_valu_sgpr": (gen_valu_sgpr, check_valu_sgpr, 32 * LANES * 4),
     "probe_i8_epi": (gen_i8_epi, check_i8_epi, sum(2 * LANES * 4 * k[4] + LANES * 2 * k[4] for k in I8_KINDS)),
 }
 

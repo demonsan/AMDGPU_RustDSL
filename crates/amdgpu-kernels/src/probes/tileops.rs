@@ -1445,3 +1445,32 @@ pub fn probe_i8_epi() -> Function {
     }
     b.finish()
 }
+
+/// `probe_valu_sgpr(in, out)`: the VALU-writes-SGPR hazards. 32 rounds j: a wave-uniform VALU value v_j = (tid >> 8) + 52 j (= 52 j for one
+/// wave) goes through `v_readfirstlane` into an SGPR that is used RIGHT AWAY as a buffer soffset (VMEM reader, 5 wait states) and as a VALU
+/// operand (2 wait states): out[j][lane] = in[lane + 13 j] + s_j. With the hazard padding off (AMDC_NO_VALU_SGPR=1) a stale SGPR shows up as
+/// a wrong element.
+pub fn probe_valu_sgpr() -> Function {
+    let mut b = FnBuilder::new("probe_valu_sgpr", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(4096 * 4));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(32 * 64 * 4));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let r_in = b.buffer_desc(inp, 4096 * 4);
+    let r_out = b.buffer_desc(out, 32 * 64 * 4);
+    let tid = b.let_(Op::WorkitemId);
+    let hi = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(8)));
+    let l4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    for j in 0..32i32 {
+        let v = b.let_(Op::AddI32(Opnd::Val(hi), Opnd::I32(52 * j)));
+        let s = b.read_first_lane(v);
+        let x = b.buffer_load_f32(r_in, l4, s, 0);
+        let xi = b.bitcast_i32(x);
+        let y = b.let_(Op::AddI32(Opnd::Val(xi), Opnd::Val(s)));
+        let yf = b.bitcast_f32(y);
+        b.buffer_store_f32(r_out, l4, Opnd::I32(j * 256), 0, yf);
+    }
+    b.finish()
+}
