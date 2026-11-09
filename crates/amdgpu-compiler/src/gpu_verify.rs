@@ -228,6 +228,8 @@ struct An<'a> {
     gcaps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
     /// set_vars waiting for the end of their statement list (stmt index, var, value)
     pending_sets: Vec<(usize, VarId, Opnd)>,
+    /// trusted loop-variable assumes already counted in the ledger
+    trusted_counted: std::collections::HashSet<VarId>,
     group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
@@ -1868,8 +1870,16 @@ impl<'a> An<'a> {
                 self.vars.insert(*v, a.clone());
                 if let Some(r) = trusted {
                     self.assumed_trusted.insert(*v, r.clone());
-                    let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the induction is not checked", self.idx, v.0, a.show());
-                    self.rep.add("GV-ASSUME", Severity::Info, m);
+                    // a trusted loop-variable range the analysis proves anyway (initial value inside, every set_var inside - checked at the
+                    // set_vars) costs no trust: only an unproven initial value or step is counted (TRUSTED)
+                    if init_ok {
+                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): initial value proven inside; an unproven set_var step is TRUSTED", self.idx, v.0, a.show());
+                        self.rep.add("GV-ASSUME", Severity::Info, m);
+                    } else {
+                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the initial value is not proven inside", self.idx, v.0, a.show());
+                        self.rep.add("GV-ASSUME", Severity::Info, m);
+                        self.trusted_counted.insert(*v);
+                    }
                 } else if init_ok {
                     let m = format!("stmt {}: assume var{} in {}: initial value proven inside; every set_var is checked against it (an unproven step is an error)", self.idx, v.0, a.show());
                     self.rep.add("GV-ASSUME", Severity::Info, m);
@@ -2270,8 +2280,11 @@ impl<'a> An<'a> {
                 if let Some(a) = self.assumed.get(var).cloned() {
                     if !nv.within(&a, &self.cx) {
                         if let Some(r) = self.assumed_trusted.get(var).cloned() {
-                            let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
-                            self.rep.add("GV-ASSUME", Severity::Info, m);
+                            // counted once per variable
+                            if self.rep.quiet == 0 && self.trusted_counted.insert(*var) {
+                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
+                                self.rep.add("GV-ASSUME", Severity::Info, m);
+                            }
                         } else {
                             let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {}: the assumption is not inductive (a loop-carried assume that the loop itself can violate is a proof hole; weaken it, or use assume_trusted(.., reason) when a guard the analyzer cannot see bounds it)", var.0, nv.show(), a.show());
                             self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
@@ -2418,7 +2431,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), trusted_counted: Default::default(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
