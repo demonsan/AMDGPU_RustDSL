@@ -385,13 +385,14 @@ fn the_trust_ledger_counts_every_escape_by_kind_and_aggregates() {
     let r = verify_ir(&trusting_kernel());
     assert!(r.errors().is_empty(), "{}", errors(&r));
     let l = r.ledger();
-    assert_eq!(l, Ledger { assume_trusted: 1, tile_trust: 1, region_trust: 1, asm_opaque: 0 }, "{}", r.render());
-    assert_eq!(l.total(), 3);
+    // the trusted counter is PROVEN by the loop-exit fact (nx < 4 at the back edge): it costs no trust
+    assert_eq!(l, Ledger { assume_trusted: 0, tile_trust: 1, region_trust: 1, asm_opaque: 0 }, "{}", r.render());
+    assert_eq!(l.total(), 2);
     // aggregation over reports (what the certificate line prints)
     let total: usize = [verify_ir(&trusting_kernel()), verify_ir(&trusting_kernel())].iter().map(|r| r.ledger().total()).sum();
-    assert_eq!(total, 6);
+    assert_eq!(total, 4);
     // the trust findings carry the GV-PROTO-TRUST name
-    assert!(r.findings.iter().filter(|f| f.alias == "GV-PROTO-TRUST").count() >= 3, "{}", r.render());
+    assert!(r.findings.iter().filter(|f| f.alias == "GV-PROTO-TRUST").count() >= 2, "{}", r.render());
 }
 
 #[test]

@@ -101,7 +101,7 @@ impl Report {
                 l.asm_opaque += 1;
                 continue;
             }
-            if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") || f.msg.contains("set_var") {
+            if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") {
                 continue;
             }
             if f.msg.contains("tile_trust_periodic") {
@@ -226,6 +226,10 @@ struct An<'a> {
     /// caps of the store being linearized: a masked store's live arm runs only when `x < bound` (x linear, bound uniform)
     caps_cur: std::cell::RefCell<Vec<(SLin, Poly, bool)>>,
     gcaps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
+    /// set_vars waiting for the end of their statement list (stmt index, var, value)
+    pending_sets: Vec<(usize, VarId, Opnd)>,
+    /// trusted loop-variable assumes already counted in the ledger
+    trusted_counted: std::collections::HashSet<VarId>,
     group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
@@ -525,6 +529,45 @@ impl<'a> An<'a> {
         }
     }
 
+    /// `Some(axis)` when loop variable `v` starts at the workgroup id of `axis` and every `set_var` adds exactly the grid size of that axis
+    /// (`v = wg + k grid`): the values of different workgroups are disjoint residue classes.
+    fn persistent_axis(&self, v: VarId) -> Option<u8> {
+        let stmts = self.f.stmts();
+        let init = stmts.iter().find_map(|s| match s {
+            Stmt::BeginLoop { vars, init } => vars.iter().position(|x| *x == v).map(|k| init[k]),
+            _ => None,
+        })?;
+        let ax = match init {
+            Opnd::Val(x) => match self.defs.get(&x)? {
+                Op::WorkgroupIdX => 0u8,
+                Op::WorkgroupIdY => 1,
+                Op::WorkgroupIdZ => 2,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let grid = self.cx.sym_poly(Sym::Grid(ax));
+        let mut any = false;
+        for s in stmts.iter() {
+            if let Stmt::SetVar { var, value } = s {
+                if *var != v {
+                    continue;
+                }
+                any = true;
+                let Opnd::Val(x) = value else { return None };
+                let step = match self.defs.get(x)? {
+                    Op::AddI32(Opnd::Var(w), s) | Op::AddI32(s, Opnd::Var(w)) if *w == v => *s,
+                    _ => return None,
+                };
+                let p = self.point_of(&step)?;
+                if !(self.cx.le(&p, &grid) && self.cx.le(&grid, &p)) {
+                    return None;
+                }
+            }
+        }
+        any.then_some(ax)
+    }
+
     /// The exact (point) value of a uniform operand, if its interval is one polynomial.
     fn point_of(&self, o: &Opnd) -> Option<Poly> {
         // a lower bound that is also an upper bound (an interval keeps several candidate bounds)
@@ -635,13 +678,20 @@ impl<'a> An<'a> {
                 for o in insts {
                     let it = self.int_of(&o);
                     // the tightest comparable bounds of the instance (an interval keeps several candidate bounds)
-                    let mut l = it.lo.first()?.clone();
+                    // a persistent-loop variable (wg + k grid, k >= 0) is >= 0 even when the loop widened its interval
+                    let persistent = matches!(o, Opnd::Var(v) if self.persistent_axis(v).is_some());
+                    let mut l = match it.lo.first() {
+                        Some(x) => x.clone(),
+                        None if persistent => Poly::int(0),
+                        None => return None,
+                    };
                     for x in it.lo.iter().skip(1) {
                         if self.cx.le(&l, x) {
                             l = x.clone();
                         }
                     }
-                    let mut h = it.hi.first()?.clone();
+                    // no upper bound: a huge sentinel (only the TOP digit of the radix may be unbounded - its span is never compared)
+                    let mut h = it.hi.first().cloned().unwrap_or(Poly::int(1i128 << 100));
                     for x in it.hi.iter().skip(1) {
                         if self.cx.le(x, &h) {
                             h = x.clone();
@@ -982,6 +1032,13 @@ impl<'a> An<'a> {
         for k in atoms.keys().chain(covered.iter()) {
             if !k.0 && k.1 >= u64::MAX - 2 {
                 wg_axes[(u64::MAX - k.1) as usize] = true;
+            }
+            // a persistent-loop variable (starts at the workgroup id, steps by the grid size): distinct workgroups visit disjoint residue
+            // classes, so the variable is a workgroup digit of that axis
+            if k.0 {
+                if let Some(ax) = self.persistent_axis(VarId(k.1 as u32)) {
+                    wg_axes[ax as usize] = true;
+                }
             }
         }
         for (k, c) in &atoms {
@@ -1866,8 +1923,16 @@ impl<'a> An<'a> {
                 self.vars.insert(*v, a.clone());
                 if let Some(r) = trusted {
                     self.assumed_trusted.insert(*v, r.clone());
-                    let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the induction is not checked", self.idx, v.0, a.show());
-                    self.rep.add("GV-ASSUME", Severity::Info, m);
+                    // a trusted loop-variable range the analysis proves anyway (initial value inside, every set_var inside - checked at the
+                    // set_vars) costs no trust: only an unproven initial value or step is counted (TRUSTED)
+                    if init_ok {
+                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): initial value proven inside; counted only if a step is not proven", self.idx, v.0, a.show());
+                        self.rep.add("GV-ASSUME", Severity::Info, m);
+                    } else {
+                        let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the initial value is not proven inside", self.idx, v.0, a.show());
+                        self.rep.add("GV-ASSUME", Severity::Info, m);
+                        self.trusted_counted.insert(*v);
+                    }
                 } else if init_ok {
                     let m = format!("stmt {}: assume var{} in {}: initial value proven inside; every set_var is checked against it (an unproven step is an error)", self.idx, v.0, a.show());
                     self.rep.add("GV-ASSUME", Severity::Info, m);
@@ -1898,12 +1963,21 @@ impl<'a> An<'a> {
 
     /// Walks the region tree; `idx` is the statement index of the linearization (what findings print as `stmt N`).
     fn walk(&mut self, nodes: &[Node], idx: &mut usize) {
+        // loop-exit facts: after `break_if(c)` the rest of this body runs only when c is false (a break condition is wave-uniform), so the
+        // operand of a `x < k` / `x >= k` condition is refined until the end of the enclosing node list (`AMDC_NO_BREAK_FACTS=1`: off)
+        let mut break_facts: Vec<Option<(Opnd, Option<AV>, Option<Itv>)>> = Vec::new();
+        let pend0 = self.pending_sets.len();
+        let use_break = std::env::var("AMDC_NO_BREAK_FACTS").map_or(true, |v| v.is_empty());
         for n in nodes {
             match n {
                 Node::S(st) => {
                     self.idx = *idx;
                     self.exec_stmt(st);
                     *idx += 1;
+                    if let (true, Stmt::BreakIf { cond }) = (use_break, st) {
+                        let u = self.branch_fact(cond, false);
+                        break_facts.push(u);
+                    }
                 }
                 Node::Loop { vars, init, body } => {
                     let begin = *idx;
@@ -1954,6 +2028,17 @@ impl<'a> An<'a> {
                     *idx += 1;
                 }
             }
+        }
+        // this list's set_vars, under its loop-exit facts
+        let sets: Vec<(usize, VarId, Opnd)> = self.pending_sets.drain(pend0..).collect();
+        for (i, var, value) in sets {
+            let saved = self.idx;
+            self.idx = i;
+            self.apply_set(i, &var, &value);
+            self.idx = saved;
+        }
+        for u in break_facts.into_iter().rev() {
+            self.undo_fact(u);
         }
     }
 
@@ -2224,6 +2309,19 @@ impl<'a> An<'a> {
             Stmt::StoreLds2 { addr, off0, off1, b64, st64, .. } => self.check_lds2("ds_write2", addr, *off0, *off1, *b64, *st64),
             Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
             Stmt::SetVar { var, value } => {
+                // applied at the end of the enclosing statement list, so a later `break_if` of the same list refines the value (the back
+                // edge is reached only when the break was not taken)
+                self.pending_sets.push((i, *var, *value));
+            }
+            Stmt::BeginIf { .. } => self.tag = None,
+            Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
+            _ => {}
+        }
+    }
+
+    fn apply_set(&mut self, i: usize, var: &VarId, value: &Opnd) {
+        {
+            {
                 let nv = self.int_of(value);
                 if self.rep.quiet > 0 {
                     let e = match self.acc.get(var) {
@@ -2235,8 +2333,11 @@ impl<'a> An<'a> {
                 if let Some(a) = self.assumed.get(var).cloned() {
                     if !nv.within(&a, &self.cx) {
                         if let Some(r) = self.assumed_trusted.get(var).cloned() {
-                            let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
-                            self.rep.add("GV-ASSUME", Severity::Info, m);
+                            // counted once per variable
+                            if self.rep.quiet == 0 && self.trusted_counted.insert(*var) {
+                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
+                                self.rep.add("GV-ASSUME", Severity::Info, m);
+                            }
                         } else {
                             let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {}: the assumption is not inductive (a loop-carried assume that the loop itself can violate is a proof hole; weaken it, or use assume_trusted(.., reason) when a guard the analyzer cannot see bounds it)", var.0, nv.show(), a.show());
                             self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
@@ -2244,9 +2345,6 @@ impl<'a> An<'a> {
                     }
                 }
             }
-            Stmt::BeginIf { .. } => self.tag = None,
-            Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
-            _ => {}
         }
     }
 }
@@ -2386,7 +2484,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), trusted_counted: Default::default(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
