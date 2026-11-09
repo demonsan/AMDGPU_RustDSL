@@ -309,14 +309,15 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let pages = |b: &mut FnBuilder, key_t: amdgpu_dsl::I32| -> ValueId {
             let kc = b.bind_i32(key_t.min(ev(maxk)));
             let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-            b.buffer_load_b64(r_bt, bvo, bt_so, 0)
+            // (16 bytes: the in-place loop-variable reload is a b128 form; entries past the table read 0)
+            b.buffer_load_b128(r_bt, bvo, bt_so, 0)
         };
         let page_of = |b: &mut FnBuilder, pv: Opnd, second: amdgpu_dsl::I32| -> ValueId {
             // P = 16: keys 16.. of the tile in the second page; P >= 32: one page
-            let p0 = b.frag2_lane(pv.clone(), 0);
+            let p0 = b.frag4_lane(pv.clone(), 0);
             let p0 = b.bitcast_i32(p0);
             if page == 16 {
-                let p1 = b.frag2_lane(pv, 1);
+                let p1 = b.frag4_lane(pv, 1);
                 let p1 = b.bitcast_i32(p1);
                 let c = b.bind_cond(second.ne(0));
                 let p = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(p1), b: Opnd::Val(p0) });
@@ -421,7 +422,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         inits2.extend((0..24).map(|_| (DType::Frag4, Opnd::Val(zero4))));
         // prologue: the pages of tiles 0, 1, 2
         let pw: Vec<ValueId> = (0..3i32).map(|t| { let kt_ = ev(k_lo) + KT * t; pages(&mut b, kt_) }).collect();
-        inits2.extend(pw.iter().map(|p| (DType::Frag2, Opnd::Val(*p))));
+        inits2.extend(pw.iter().map(|p| (DType::Frag4, Opnd::Val(*p))));
         let vars = b.begin_loop(&inits2);
         let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
         let ov: Vec<VarId> = vars[3..11].to_vec();
