@@ -73,11 +73,12 @@ pub fn decode16_kernel(page: u32, plan: Decode16Plan) -> (String, u32) {
     }
 }
 
-/// Causal attention backward: run the paired dkdv form (`fmha_bwd_dkdv_hd128_bf16_causal_pair`, key tiles x and nkt - 1 - x per CTA) when the
-/// unpaired grid ceil(SK / 128) H B is at least twice the CU count (the halved grid still fills the GPU). Measured: B1 H16 4096² dkdv 460 -> 276 us;
-/// B1 H8 2048² (128 CTAs) 119 -> 132 and B4 H8 1024² (256) 72 -> 81 (slower: kept unpaired).
-pub fn bwd_dkdv_pair(b: u64, h: u64, sk: u64, cus: u64) -> bool {
-    sk.div_ceil(128) * h * b >= 2 * cus
+/// Causal attention backward: the longest-first forms `fmha_bwd_dq_hd128_bf16_causal_lpt` / `fmha_bwd_dkdv_hd128_bf16_causal_lpt` (grid
+/// (H, B, tiles), heaviest tile first: the hardware dispatcher takes workgroups in linear order, so long tiles start first). Same run vs the
+/// key-tile-fastest grid / the paired dkdv (archive/bwd-dkdv-pair): B1 H16 4096² 598 / 450 -> 407 us, B4 H8 2048² 323 / 249 -> 228,
+/// B1 H8 HK2 2048² 174 / 186 -> 167, B2 H8 HK2 1000x1500 118 / 151 -> 113.
+pub fn bwd_causal_kernels() -> (&'static str, &'static str) {
+    ("fmha_bwd_dq_hd128_bf16_causal_lpt", "fmha_bwd_dkdv_hd128_bf16_causal_lpt")
 }
 
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
@@ -204,9 +205,8 @@ mod tests {
     }
 
     #[test]
-    fn bwd_dkdv_pair_rule() {
-        assert!(super::bwd_dkdv_pair(1, 16, 4096, 256));
-        assert!(!super::bwd_dkdv_pair(1, 8, 2048, 256));
-        assert!(!super::bwd_dkdv_pair(4, 8, 1024, 256));
+    fn bwd_causal_lpt_registered() {
+        let (q, k) = super::bwd_causal_kernels();
+        assert!(crate::registry::kernel_by_name(q).is_some() && crate::registry::kernel_by_name(k).is_some());
     }
 }

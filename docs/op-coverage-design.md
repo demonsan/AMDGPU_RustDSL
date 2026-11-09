@@ -940,11 +940,20 @@ blockscale 128×128（`fp8bs`）的规则：
 | B1H16 4096² causal | 672.5 µs | 335.8 µs | 0.50× |
 | B4H8 1024² causal | 123.9 µs | 116.6 µs | 0.94× |
 
-- **causal dkdv 的 key tile 配对**：`fmha_bwd_dkdv_hd128_bf16_causal_pair`，由 `dispatch::bwd_dkdv_pair` 选择。
-  - 每个 CTA 处理第 x 个和第 nkt−1−x 个 key tile，网格减半，两个 pass 之间对 LDS ring 做一次 barrier。
-  - 选择规则：未配对时的网格 ≥ 2×CU 时才配对。
-  - B1H16 4096² causal：dkdv 从 460 µs 降到 276，总时间从 670 降到 487（厂商 330，比值从 0.50× 升到 0.68×）。
-  - 小网格时配对反而变慢：B1H8 2048² 为 119 → 132，B4H8 1024² 为 72 → 81，因此保持不配对。
+- **causal 的最长优先发射顺序**（sched：`fmha_bwd_dq_hd128_bf16_causal_lpt` / `fmha_bwd_dkdv_hd128_bf16_causal_lpt`，由 `dispatch::bwd_causal_kernels` 选择）：
+  - 网格改为 (H, B, tiles)，tile 维放在最慢的一维，最重的 tile 先发。
+  - 原因：硬件按线性 id 顺序取 workgroup。tile 放在最快维时，每个 XCD 的队列里长短 tile 交替，长 tile 被拖到后面执行。ATT 显示单个 pair 的耗时与负载无关，所以差距不在单个 CTA 的速度上。
+  - 同次运行，对比原顺序 / 配对 dkdv（配对已移除，保留为 tag `archive/bwd-dkdv-pair`）/ lpt，总时间（µs）：
+
+| 形状 | 原顺序 | 配对 | lpt |
+|---|--:|--:|--:|
+| B1H16 4096² | 598 | 450 | 407 |
+| B4H8 2048² | 323 | 249 | 228 |
+| B1H8 HK2 2048² | 174 | 186 | 167 |
+| B2H8 HK2 1000×1500 | 118 | 151 | 113 |
+
+  - lpt 在所有形状上都最快。
+  - 对厂商：4096² causal 为 0.81×，B4 2048² 为 0.88×，causal GQA 2048² 为 0.98×，1000×1500 为 1.18×。
 - **dkdv 的 mask 改写**：每个 tile 先算出可见查询相对 q0 的区间 [dlo, qhi)，每个值只与常量比较一次再做 select。原做法是逐值做整数运算再与 select_i32 组合。
   - dkdv：2048² 从 98.4 µs 降到 93.8，2048² causal GQA 从 119.8 降到 104.1，1000×1500 causal 从 69.5 降到 59.2，4096² causal（配对）从 275 降到 236。
   - 总时间对厂商的比值：2048² 为 0.82×，causal GQA 为 0.91×，4096² causal 为 0.73×。
