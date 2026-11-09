@@ -364,7 +364,7 @@ fn main() -> ExitCode {
                 (Some("gemm_blockscale"), Some(m), Some(n), Some(k)) => {
                     // amdc dispatch gemm_blockscale <M> <N> <K> [--cus N]: the split-K factor of gemm_a8w8_blockscale
                     let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
-                    println!("{{\"splits\":{}}}", amdgpu_kernels::dispatch::blockscale_split_k(m, n, k, cus));
+                    { let (rows, s) = amdgpu_kernels::dispatch::blockscale_config(m, n, k, cus); println!("{{\"rows\":{},\"splits\":{}}}", rows, s); }
                     ExitCode::SUCCESS
                 }
                 (Some("mla"), Some(b), Some(h), _) => {

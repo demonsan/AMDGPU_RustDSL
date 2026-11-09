@@ -66,8 +66,8 @@ pub fn dispatched_names() -> BTreeSet<String> {
     }
     // the GEMM family (blockscale split-K by its rule; the Python tile rule picks the 256 or the _128 kernels)
     for (m, nn, k) in [(256u64, 1024u64, 512u64), (4096, 4096, 4096)] {
-        let s = blockscale_split_k(m, nn, k, 256);
-        n.insert(if s > 1 { "gemm_a8w8_blockscale_splitk".into() } else { "gemm_a8w8_blockscale".into() });
+        let (rows, s) = blockscale_config(m, nn, k, 256);
+        n.insert(match (rows, s > 1) { (128, _) => "gemm_a8w8_blockscale".into(), (_, false) => "gemm_a8w8_blockscale_64".into(), _ => "gemm_a8w8_blockscale_64_splitk".into() });
         if s > 1 {
             n.insert(format!("gemm_splitk_reduce_s{s}"));
         }

@@ -1,19 +1,22 @@
 //! Host-side dispatch rules for the shipped kernel families (measured same-run against the vendor kernels; docs/op-coverage-design.md
 //! §7.4 / §7.5). Pure functions of the problem shape and the CU count: a launcher picks the kernel name and the grid with them.
 
-/// fp8 blockscale GEMM (`gemm_a8w8_blockscale` 128 x 128 CTAs): the split-K factor. Mid-M shapes whose CTA count M N / 128^2 is at most
-/// about two per CU run `gemm_a8w8_blockscale_splitk` with S = 2 (+ `gemm_splitk_reduce_s2`): measured 1024x4096x8192 864 -> 975,
-/// 256x7168x4096 384 -> 516, 512x7168x7168 761 -> 840 TF/s; S = 4 never won; large shapes stay unsplit (4096^3: S = 2 loses).
-pub fn blockscale_split_k(m: u64, n: u64, k: u64, cus: u64) -> u32 {
-    let ctas = m.div_ceil(128) * n.div_ceil(128);
-    // both halves of K must stay whole 128-wide scale groups
-    if ctas <= 2 * cus && k % 256 == 0 {
-        2
-    } else {
-        1
+/// fp8 blockscale GEMM: (CTA rows, split-K S). 128 x 128 (`gemm_a8w8_blockscale`) when that grid is at least two CTAs per CU; else 64 x 128
+/// (`gemm_a8w8_blockscale_64`, `_64_splitk` + `gemm_splitk_reduce_s<S>`) with the smallest S <= 4 (power of two, K whole 128-groups per
+/// part) giving S CTAs >= CUs. Same run (us, ours / best aiter BpreShuffle tile): 1024x4096x8192 68.0 / 62.5 (was 71.4 with 128 S2),
+/// 512x7168x7168 60.3 / 51.3 (64.1), 256x7168x4096 S2 25.3 / 16.9 (29.4), 128x4096x8192 S4 20.9 / 22.3 (27.1), 64x8192^2 S4 22.5 / 23.0
+/// (27.2); 4096^3 and 2048x7168^2 stay 128 x 128 (122.7 / 129.3, 185.2 / 187.2).
+pub fn blockscale_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
+    if m.div_ceil(128) * n.div_ceil(128) >= 2 * cus {
+        return (128, 1);
     }
+    let c = m.div_ceil(64) * n.div_ceil(128);
+    let mut s = 1u64;
+    while s < 4 && c * s < cus && k % (256 * s) == 0 {
+        s *= 2;
+    }
+    (64, s as u32)
 }
-
 /// bf16 prefill (`fmha_fwd_hd128_bf16_v3[_causal]`): the number of key parts S of the `_ks` form (1 = the plain kernel). Small grids (fewer
 /// CTAs than CUs; causal grids are halved by the q-tile pairing) split each q tile's key range: measured B1 H8 4096^2 533 -> 601 TF/s (S = 2),
 /// causal 259 -> 346 (S = 4), causal B2 H8 1000x1300 78 -> 94; S <= 4.
@@ -186,10 +189,11 @@ mod tests {
 
     #[test]
     fn blockscale_rule() {
-        assert_eq!(blockscale_split_k(1024, 4096, 8192, 256), 2);
-        assert_eq!(blockscale_split_k(256, 7168, 4096, 256), 2);
-        assert_eq!(blockscale_split_k(512, 7168, 7168, 256), 2);
-        assert_eq!(blockscale_split_k(4096, 4096, 4096, 256), 1);
+        assert_eq!(blockscale_config(1024, 4096, 8192, 256), (64, 1));
+        assert_eq!(blockscale_config(256, 7168, 4096, 256), (64, 2));
+        assert_eq!(blockscale_config(512, 7168, 7168, 256), (64, 1));
+        assert_eq!(blockscale_config(128, 4096, 8192, 256), (64, 4));
+        assert_eq!(blockscale_config(4096, 4096, 4096, 256), (128, 1));
     }
 
     #[test]
