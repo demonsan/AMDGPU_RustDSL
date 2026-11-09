@@ -50,3 +50,35 @@ for registers / LDS) are non-zero only for the vendor at B64 (2.0e7 / 5.0e6); ou
 7. **Combine launch**: 7.2 µs (25 % of the 28.7 µs at B16) is the second kernel; the fused variant removes it but cannot split K (S = 1), so at B16 the fused kernel needs the efficiency fix of 2 to win.
 
 Levers by evidence: (a) per-wave software pipelining of tile t + 1 (2 K/V slots, 1 CTA per CU); (b) fix the K/V LDS read/write swizzle (bank conflicts) and/or move the K loads to registers like the vendor; (c) hoist / amortise the block-table lookup and descriptor setup out of the per-tile path (SALU 10x), e.g. resolve a whole page-table row into SGPRs once per 4-8 tiles; (d) fused combine for S = 1 at B >= 64 (already there).
+
+
+## Warm ATT timeline: ours (fused, S = 1) vs the vendor, B16
+
+`tools/att_pa.sh` (rocprofv3 thread trace of one SIMD, 5th dispatch = warm; B16, H 64, HK 8, ctx 2048, page 16; ours = `pa_decode16_bf16_hd128_p16_f`, 128 CTAs of 4 waves, the same grid as the vendor's). Wave on CU 1 / SIMD 0 for ours, CU 2 / SIMD 0 for the vendor
+(the CU that hosts a wave of a 128-CTA grid is not predictable). ATT captured 11 loop iterations (tiles of 32 keys) of ours; the vendor wave runs its 512 keys in 31.7 K cycles.
+
+| per wave | ours (11 tiles of 32 keys) | vendor (512 keys) |
+|---|---|---|
+| wave life | 46.9 K cycles (4.3 K / tile of 32 keys, **133 cycles / key**) | 31.7 K cycles (**62 cycles / key**) |
+| instructions | 6556 (**596 / tile = 18.6 / key**) | 3042 (5.9 / key) |
+| VALU | 3922 (357 / tile, 11.2 / key) | 2065 (4.0 / key) |
+| SALU | 1226 (111 / tile, 3.5 / key) | 125 (0.24 / key) |
+| s_nop (hazard padding) | 449 (41 / tile) | 21 |
+| MFMA | 176 | 336 |
+| latency by class | VALU 39.6 %, waitcnt lgkm 13.5 %, waitcnt vm 12.2 %, SALU 11.9 %, **s_nop 9.7 %**, DMA issue 3.5 %, ds_write 3.1 %, MFMA 3.0 %, ds_read 2.9 % | VALU 34.9 %, **global_load issue 28.8 %** (stall on the memory pipe), MFMA 15.1 %, barrier 7.4 %, lgkm wait 4.0 % |
+
+* The vendor wave is **memory-pipe bound**: its largest class is the stall at the `global_load_dwordx4 a[..]` issue (loads go straight into AGPRs, about 240 AGPR dwords = 60 KB per wave in flight) plus barriers. Ours is **issue + latency bound**:
+  596 instructions per tile at 1 wave per SIMD, VALU alone 357 x 4.5 cycles = 1.6 K of the 4.0 K cycles per tile.
+* Even with every wait hidden, ours has an instruction floor of about 2.7 K cycles per 32 keys (VALU 1.6 K + SALU 0.5 K + nops 0.4 K + the rest) against the vendor's **whole** 2.0 K: the per-tile instruction count, not only the exposed latency, is the limit at one wave per SIMD. This is why the
+  three overlap structures did not help: they attack the 1.0 K of waits (`waitcnt vm` 492 + `waitcnt lgkm` 543 cycles per tile), which sits behind a 2.7 K issue floor.
+* MFMA is idle 93 % of its stream span (38.7 K cycles against 2.8 K ideal); the largest blamed sites are the `s_waitcnt vmcnt(8)` that waits for the K DMA (about 2.1 K cycles per tile in the gap view, which includes the whole non-MFMA tile work in the gap), `s_nop` (3.9 K), and the softmax VALU chain.
+* **`s_nop`**: 49 static sites, 41 executed per tile (about 9.7 % of the time): 20 x `s_nop 2` between `v_cmp_lt_i32 vcc` and the `v_cndmask_b32` that reads it - the lowering of `min` / `max` (the key clamp `min(k_hi - 1).max(0).min(maxk)` is 3 selects per DMA, 8 DMAs per tile)
+  as compare + select instead of `v_min_i32` / `v_max_i32` - and 16 x `s_nop 0` after `s_mov m0` before each `buffer_load ... lds` (the M0 hazard, one per DMA).
+
+Levers by evidence, cheapest first:
+1. Lower integer `min` / `max` to `v_min_i32` / `v_max_i32` (backend peephole: `select(a < b, a, b)`): removes about 20 compare + 20 select + 20 `s_nop 2` per tile (about 60 instructions and about 60 stall cycles of the 596 / 4.3 K).
+2. Skip the key clamp on full tiles (it only matters for the last tile of a wave's range): another 24 VALU per tile on the common path.
+3. One M0 write per 4 DMAs (the instruction offset carries the other three; `decode16` branch `sched-pa-lookup`, commit "one M0 write per 4 LDS DMAs"): 12 fewer `s_mov` + 12 fewer `s_nop 0` per tile. It measured no time change on its own at S = 2 (latency-bound there), but it moves the issue floor.
+4. Page-group lookups (done, `fmha::paged`): VALU -11 %, VMEM -24 %. The V swizzle (done): LDS bank conflicts -85..-100 %.
+5. Then the big one: the 357 VALU per tile. Static estimate of what is in it: the DMA row-offset arithmetic (16 DMAs), the softmax (16 S values per lane: max, exp2, sum, P pack), the O rescale (8 blocks x 4 accumulators multiplied by alpha every tile = 32 `v_mul`; skip it when the running max did not change, a uniform branch), the group4 permlane reductions. The rescale-skip and the clamp-skip are scheduler-level wins that do not need new hardware features.
+6. Only after the instruction count is near the vendor's (about 200 per tile) does deeper prefetch (K to registers 2-3 tiles ahead) pay: with 1 wave per SIMD it is the latency of one wave's chain that the prefetch hides, and that chain is currently 60 % instruction issue.
