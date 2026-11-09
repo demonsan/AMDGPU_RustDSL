@@ -22,7 +22,7 @@ fn reads_sgpr(l: &str, s: &str) -> bool {
     // the SGPR as an operand (not the destination): any comma-separated operand after the first
     let t = l.trim();
     let Some((_, ops)) = t.split_once(' ') else { return false };
-    ops.split(',').skip(1).any(|o| o.trim() == s)
+    ops.split(',').skip(1).any(|o| o.trim().split_whitespace().next() == Some(s))
 }
 
 #[test]
