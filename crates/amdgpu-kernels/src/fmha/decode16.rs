@@ -49,12 +49,6 @@ pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_all(name, page, kt, 0, false, true)
 }
 
-/// `_pf` / `_fpf` (prefetch): two K / V slots per wave (32 KB, one CTA per CU) - tile t + 1's lookups and DMAs are issued before tile t's
-/// compute (the vendor's deep-buffered structure; small grids).
-pub fn pa_decode16_pf(name: &str, page: i32, fused: bool) -> Function {
-    pa_decode16_gen(name, page, 32, 0, false, fused, true)
-}
-
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -73,11 +67,6 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 }
 
 fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
-    pa_decode16_gen(name, page, kt, kvm, mtp, fused, false)
-}
-
-fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool, pf: bool) -> Function {
-    assert!(!pf || (kvm == 0 && !mtp && kt == 32), "decode16 prefetch: bf16, qlen 1, 32-key tiles");
     assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
@@ -251,9 +240,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     // fp8: the staged fp8 V rows (converted into the bf16 V tile)
     let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
-    // prefetch: the second K / V slot
-    let kreg1 = pf.then(|| lds.private("K1", (KT * krow) as i64, 4, &[]));
-    let vreg1 = pf.then(|| lds.private("V1", (KT * ROW) as i64, 4, &[]));
     // fused: wave w's normalized partial O [16 cols][128] f32 over its own K region (8 KB w) and its LSE [16] at the start of its own V
     // region (32 KB + 8 KB w): a wave writes only its own dead storage, before the barrier
     const EPI_L: i32 = 32768;
@@ -296,151 +282,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
-    let (m_v, l_v, ov) = if pf {
-        let me1 = kreg1.as_ref().unwrap().mine(wv);
-        let mev1 = vreg1.as_ref().unwrap().mine(wv);
-        // the DMAs of the tile at key_t into slot (mk, mv), version gen
-        let issue = |b: &mut FnBuilder, key_t: ValueId, gen: Opnd, mk: &amdgpu_tile::shared::PrivRef<'_>, mv: &amdgpu_tile::shared::PrivRef<'_>| {
-            let rows: Vec<(ValueId, ValueId)> = (0..KT / 4)
-                .map(|i| {
-                    let key = b.bind_i32(ev(key_t) + kk_of(i));
-                    let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-                    let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-                    (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(kc, pv)| {
-                    let pg = b.bitcast_i32(pv);
-                    let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-                    (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW))
-                })
-                .collect();
-            let kbase = mk.base();
-            let vbase = mv.base();
-            mk.write(b, gen, |b| {
-                for (i, &(kc, rowoff)) in rows.iter().enumerate() {
-                    let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
-                    let m0k = b.bind_i32(kbase.clone() + ((i as i32) << 10));
-                    b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
-                }
-            });
-            mv.write(b, gen, |b| {
-                for (i, &(_, rowoff)) in rows.iter().enumerate() {
-                    let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-                    let m0v = b.bind_i32(vbase.clone() + ((i as i32) << 10));
-                    b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
-                }
-            });
-        };
-        // QK, softmax, PV of the tile at key_t from slot (mk, mv) (its DMAs complete)
-        let compute = |b: &mut FnBuilder, key_t: ValueId, gen: Opnd, mk: &amdgpu_tile::shared::PrivRef<'_>, mv: &amdgpu_tile::shared::PrivRef<'_>, m_v: VarId, l_v: VarId, ov: &[VarId], sv_: &[VarId]| {
-            let kb = b.bind_i32(mk.base());
-            mk.read_back(b, gen, |b| {
-                for c in 0..4usize {
-                    for blk in 0..NKB as i32 {
-                        let a = b.bind_i32(ev(kr[c]) + ev(kb) + blk * 16 * ROW);
-                        let kf = b.load_lds_b128(a);
-                        b.var_mfma(sv_[blk as usize], kind, kf, qf[c], c == 0);
-                    }
-                }
-            });
-            let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
-            let mut s: Vec<ValueId> = Vec::with_capacity(16);
-            for blk in 0..NKB {
-                for r in 0..4u8 {
-                    let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
-                    let x = b.bitcast_f32(x);
-                    let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
-                    s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
-                }
-            }
-            let mut mx = s[0];
-            for pair in s[1..].chunks(2) {
-                mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
-            }
-            let mt = group4(b, mx, true);
-            let mt = b.mul_f32(mt, csc);
-            let thr = b.c_f32(8.0);
-            let mlim = b.add_f32(Opnd::Var(m_v), thr);
-            let grow = b.cmp_lt_f32(mlim, mt);
-            let grow = b.any_lane(grow);
-            b.begin_if(Opnd::Val(grow));
-            {
-                let mn = b.max_f32(Opnd::Var(m_v), mt);
-                let dm = b.sub_f32(Opnd::Var(m_v), mn);
-                let alpha = b.exp2_f32(dm);
-                for v in ov {
-                    for r in 0..4u8 {
-                        let x = b.frag4_lane(Opnd::Var(*v), r);
-                        let x = b.bitcast_f32(x);
-                        let y = b.mul_f32(x, alpha);
-                        b.var_set_lane(*v, r, y);
-                    }
-                }
-                let l2 = b.mul_f32(Opnd::Var(l_v), alpha);
-                b.set_var(l_v, l2);
-                b.set_var(m_v, mn);
-            }
-            b.end_if();
-            let zf = b.c_f32(0.0);
-            let nm = b.sub_f32(zf, Opnd::Var(m_v));
-            let p: Vec<ValueId> = s.iter().map(|x| { let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(csc), Opnd::Val(nm))); b.exp2_f32(t) }).collect();
-            let mut ps = p[0];
-            for x in &p[1..] {
-                ps = b.add_f32(ps, *x);
-            }
-            let l_new = b.add_f32(Opnd::Var(l_v), ps);
-            b.set_var(l_v, l_new);
-            let vb = b.bind_i32(mv.base() + ev(vr));
-            mv.read_back(b, gen, |b| {
-                for t in 0..NKB / 2 {
-                    let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
-                    let pf4 = b.pack4(w[0], w[1], w[2], w[3]);
-                    for db in 0..8i32 {
-                        let a0 = b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db);
-                        let a1 = b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db);
-                        let vf = b.load_lds_tr_b16x2(a0, a1);
-                        b.var_mfma(ov[db as usize], kind, vf, pf4, false);
-                    }
-                }
-            });
-        };
-        // prologue: tile 0 into slot A
-        let gen0 = b.c_i32(0);
-        issue(&mut b, k_lo, Opnd::Val(gen0), &me, &mev);
-        let vars = b.begin_loop(&inits);
-        let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
-        let ov: Vec<VarId> = vars[3..11].to_vec();
-        let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
-        let itx = amdgpu_dsl::varx(it);
-        let key_a = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
-        let key_b = { let v = b.bind_i32(ev(key_a) + KT); b.read_first_lane(v) };
-        let key_c = { let v = b.bind_i32(ev(key_a) + 2 * KT); b.read_first_lane(v) };
-        let gen_b = b.bind_i32(itx.clone() + 1);
-        let gen_c = b.bind_i32(itx.clone() + 2);
-        // slot B <- tile it + 1 (beyond the range: clamped keys, never computed), then compute slot A
-        issue(&mut b, key_b, Opnd::Val(gen_b), &me1, &mev1);
-        b.wait_vm(16);
-        compute(&mut b, key_a, Opnd::Var(it), &me, &mev, m_v, l_v, &ov, &sv_);
-        let it1 = b.bind_i32(itx.clone() + 1);
-        let d1 = b.bind_cond(ev(it1).ge(ev(ntile)));
-        b.break_if(d1);
-        // slot A <- tile it + 2 (after slot A's reads), then compute slot B
-        b.wait_lds(0);
-        issue(&mut b, key_c, Opnd::Val(gen_c), &me, &mev);
-        b.wait_vm(16);
-        compute(&mut b, key_b, Opnd::Val(gen_b), &me1, &mev1, m_v, l_v, &ov, &sv_);
-        let it2 = b.bind_i32(itx.clone() + 2);
-        b.set_var(it, it2);
-        let d2 = b.bind_cond(ev(it2).ge(ev(ntile)));
-        b.break_if(d2);
-        b.end_loop();
-        // the prefetch past the range lands before anything reuses the slots
-        b.wait_vm(0);
-        b.wait_lds(0);
-        (m_v, l_v, ov)
-    } else {
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..11].to_vec();
@@ -698,9 +539,6 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
     b.break_if(done);
     b.end_loop();
-    (m_v, l_v, ov)
-    };
-    let zf = b.c_f32(0.0);
     // ---- the split's partial: O / l (fp32, 4 consecutive d per lane and block) and LSE ----
     let lv = l_v_val(&mut b, l_v);
     let l_tot = group4(&mut b, lv, false);
