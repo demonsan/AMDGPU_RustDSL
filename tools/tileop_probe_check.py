@@ -1131,7 +1131,7 @@ def check_i8_epi(planes, out):
                 d = at(l, r)
                 if f32(out[obase + l * n + r]) != d * 0.5:
                     bad[0] += 1
-                if f32(out[obase + (LANES + l) * n + r]) != float(d & 0x7FFFFFFF):
+                if f32(out[obase + (LANES + l) * n + r]) != struct.unpack("<f", struct.pack("<f", float(d & 0x7FFFFFFF)))[0]:  # f32 rounding of the large (masked negative) values
                     bad[1] += 1
             for e in range(n // 2):
                 w = out[obase + 2 * LANES * n + l * (n // 2) + e]
