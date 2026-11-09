@@ -787,12 +787,16 @@ impl<'a> An<'a> {
         let mut digits: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
         let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
+        if dbg {
+            eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
+        }
         if caps_all.len() == ss.len() {
             let mut used: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); ss.len()];
             for (ci, cap0) in caps_all[0].iter().enumerate() {
                 let ((latoms, _), bound, clamp) = cap0;
                 if latoms.is_empty() || !latoms.keys().all(|k| atoms.contains_key(k)) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 1"); } continue; }
                 }
                 // the matching cap of every store (same atoms, bound and kind)
                 let mut picks: Vec<usize> = vec![ci];
@@ -803,7 +807,7 @@ impl<'a> An<'a> {
                     }
                 }
                 if picks.len() != ss.len() {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 2"); } continue; }
                 }
                 // k = offset coefficient / x coefficient, the same for every atom of x (x coefficients positive constants)
                 let mut kf: Option<Poly> = None;
@@ -829,7 +833,7 @@ impl<'a> An<'a> {
                 }
                 let Some(kf) = kf else { continue };
                 if !ok || !cx.nonneg(&kf) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 3"); } continue; }
                 }
                 // x injective: its atoms sorted by coefficient form a radix with unit size
                 let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
@@ -844,7 +848,7 @@ impl<'a> An<'a> {
                     acc = acc.add(&m.scale(*c));
                 }
                 if !inj {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 4"); } continue; }
                 }
                 // a clamp loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every x >= bound - 1 has u
                 // at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
@@ -860,7 +864,7 @@ impl<'a> An<'a> {
                         _ => false,
                     };
                     if !ok_clamp {
-                        continue;
+                        { if dbg { eprintln!("gw:   cap {ci} rejected at 5"); } continue; }
                     }
                 }
                 // x's minimum over the stores (their own constants) and the per-store constant correction
@@ -885,7 +889,7 @@ impl<'a> An<'a> {
                 let Some(xmin) = xmin else { continue };
                 let span = bound.sub(&Poly::int(1)).sub(&xmin);
                 if !ok || !cx.nonneg(&span) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 6"); } continue; }
                 }
                 let mut fixed = Vec::with_capacity(ss.len());
                 for (si, p) in picks.iter().enumerate() {
@@ -896,7 +900,7 @@ impl<'a> An<'a> {
                     fixed.push(consts[si].sub(&kd));
                 }
                 if !ok || picks.iter().enumerate().any(|(si, p)| used[si].contains(p)) {
-                    continue;
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 7"); } continue; }
                 }
                 for (si, p) in picks.iter().enumerate() {
                     used[si].insert(*p);
