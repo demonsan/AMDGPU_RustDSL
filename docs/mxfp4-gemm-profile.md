@@ -43,3 +43,14 @@ ds_read 5.6 K vs 5.4 K; SALU 5.4 K vs 4.6 K; waitcnt(vm) 5.0 K vs ~0; VALU 4.8 K
 3. **A 256-byte K tile does not reduce the DMA issue count** (16 B per lane per instruction either way): it would halve barrier / wait / nop overheads per MFMA (barrier 2.4 K + waitcnt 5.0 K + nop 9.4 K = 16.8 K per wave of the 56 K gap), not the DMA stall. Expect at most the 28 % that those three classes make of the gap.
 4. **LDS bank conflicts** (9.96e6 vs 0): the A / B `ds_read_b128` pattern conflicts; `SQ_LDS_IDX_ACTIVE` is 1.5x the vendor's although the LDS instruction count is lower. The ds_read class itself is small (5.6 K), but it lengthens MFMA operand waits (28.7 K vs 19.6 K per wave).
 5. **s_nop**: 578 per wave against 193: the hazard padding between dependent MFMA accumulator chains and the M0 writes before each DMA (one `s_mov m0` + nop per DMA); grouping four DMAs per M0 value with the instruction offset removes three of four.
+
+## Rerun on `opcov-moe` 003fc5ea (scale loads once per tile pair)
+
+Same-run unprofiled: ours 262.6 - 263.4 us, vendor 229.9 - 230.9 us (0.875x; was 0.82x). Counters (ours / vendor): SQ_INSTS 3.81e7 / 3.58e7 (+6 %, was +16 %); SALU 4.77e6 / 4.76e6 (parity); VALU parity; VMEM 3.34e6 / 2.88e6 (+16 %, was +53 %);
+TA_ADDR_FIFO_FULL 5.4e6 / 5.4e5 (10x, was 16x); TA_CMD_FIFO_FULL 8.2e6 / 5.8e5 (14x, was 25x); SQ_LDS_BANK_CONFLICT 9.96e6 / 0 (unchanged); TA_BUFFER_READ_LDS_WAVEFRONTS 2.16e6 / 1.39e6 (1.55x, unchanged); SQ_WAIT_INST_ANY 4.0e7 / 1.8e7 (2.3x, was 2.9x).
+
+ATT, one wave: life 118.9 K cycles (3.72 K per tile, **29.0 cycles per MFMA**; was 137.2 K / 33.4; vendor 81.4 K / 19.9). MFMA stream excess over ideal 46.8 K (45 %; vendor 9.1 K), blamed: DMA / load issue 38.7 %, s_nop 22.9 %, MFMA gaps 20.4 %, wait vmcnt 15.3 %, barrier 1.7 %.
+Per-wave class cycles (ours vs vendor): MFMA 58.0 K vs 52.4 K; **DMA issue 22.8 K vs 3.3 K** (was 36.9 K); s_nop 9.9 K vs 1.2 K; ds_read 4.9 K vs 5.4 K; waitcnt(vm) 4.8 K vs ~0; SALU 4.7 K vs 4.6 K; VALU 3.8 K vs 2.8 K; barrier 1.3 K vs 1.2 K.
+Remaining gap 37.5 K per wave: DMA issue +19.5 K (52 %), s_nop +8.7 K (23 %), waitcnt(vm) +4.8 K (13 %), MFMA operand waits +5.6 K, VALU +1.0 K, barrier ~0. The B-operand DMA sites (`buffer_load_dwordx4 v16 / v14 ... s27 lds`) carry most of the issue stall.
+Reading: the DMA issue stall is still the largest item and tracks the LDS-DMA wavefront count (1.55x the vendor's), so removing the B tile's DMA-to-LDS (B direct to registers) targets it; a 256-byte K tile can only halve the
+s_nop + waitcnt(vm) + barrier share (16 K of the 37.5 K).
