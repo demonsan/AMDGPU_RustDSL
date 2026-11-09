@@ -1678,7 +1678,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let mut lds = LdsPlan::new();
     let slots = 2;
     // fp4: the swizzled A image (pitch 1024, chunk ^ row % 8) instead of the padded one (conflict-free 16-row fragment reads)
-    let a_swz = cfg.elem == Elem::Fp4 && cfg.moe.is_none() && cfg.conv.is_none();
+    let a_swz = cfg.elem == Elem::Fp4 && cfg.moe.is_none() && cfg.conv.is_none() && std::env::var("TEMP_NOSWZ").is_err();
     let a_bytes = cta_m / 8 * if a_swz { 1024 } else { 1056 };
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
     let nimg = cfg.elem.a_images() as i64;
