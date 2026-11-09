@@ -859,7 +859,23 @@ impl<'a> An<'a> {
                         (a.n * b.d).cmp(&(b.n * a.d))
                     });
                     let ok_clamp = match (wgs.as_slice(), top) {
-                        ([w], Some((tk, tc))) if *w == tk => cx.le(&ranges[tk].1.scale(tc.as_const().unwrap()), &bound.sub(&Poly::int(1))),
+                        ([w], Some((tk, tc))) if *w == tk => {
+                            let c = tc.as_const().unwrap();
+                            cx.le(&ranges[tk].1.scale(c), &bound.sub(&Poly::int(1))) || {
+                                // a workgroup axis with grid = ceil(bound / c): c (grid - 1) <= bound - 1 always
+                                !tk.0 && tk.1 >= u64::MAX - 2 && c.d == 1 && {
+                                    let ax = (u64::MAX - tk.1) as u8;
+                                    self.f.contract.grid_defs.iter().any(|(a2, e)| {
+                                        *a2 == ax
+                                            && matches!(e, Ext::CeilDiv(inner, kk) if *kk as i128 == c.n && match inner.as_ref() {
+                                                Ext::Ka(off) => *bound == Poly::sym(Sym::Ka(*off)),
+                                                Ext::Sym(n) => *bound == Poly::sym(Sym::Named(n.clone())),
+                                                _ => false,
+                                            })
+                                    })
+                                }
+                            }
+                        }
                         ([], _) => true,
                         _ => false,
                     };
