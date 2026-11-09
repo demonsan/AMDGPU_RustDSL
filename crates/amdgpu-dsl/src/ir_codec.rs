@@ -177,6 +177,7 @@ impl FromIr for Op {
             "FragCat" => { v.expect_struct("FragCat")?; Ok(Op::FragCat { parts: FromIr::from_ir(v.field("parts")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "AtomicLds" => { v.expect_struct("AtomicLds")?; Ok(Op::AtomicLds { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "AtomicGlobal" => { v.expect_struct("AtomicGlobal")?; Ok(Op::AtomicGlobal { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
+            "BufferAtomicRet" => { v.expect_struct("BufferAtomicRet")?; Ok(Op::BufferAtomicRet { op: FromIr::from_ir(v.field("op")?)?, rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "ReadLane" => { v.expect_struct("ReadLane")?; Ok(Op::ReadLane { x: FromIr::from_ir(v.field("x")?)?, lane: FromIr::from_ir(v.field("lane")?)? }) }
             "WriteLane" => { v.expect_struct("WriteLane")?; Ok(Op::WriteLane { x: FromIr::from_ir(v.field("x")?)?, lane: FromIr::from_ir(v.field("lane")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
             "Ballot" => { v.expect_struct("Ballot")?; Ok(Op::Ballot { cond: FromIr::from_ir(v.field("cond")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
@@ -296,6 +297,7 @@ impl IrIds for Op {
             Op::FragCat { parts, dwords } => { IrIds::ids(&mut (*parts), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Op::AtomicLds { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Op::AtomicGlobal { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Op::BufferAtomicRet { op, rsrc, voff, soff, imm, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Op::ReadLane { x, lane } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*lane), fv, fr); }
             Op::WriteLane { x, lane, old } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*lane), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
             Op::Ballot { cond, hi } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }

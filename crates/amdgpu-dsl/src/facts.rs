@@ -223,7 +223,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
             e.lds_write = true;
             ResClass::LdsRead
         }
-        Op::AtomicGlobal { .. } => {
+        Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } => {
             e.global_read = true;
             e.global_write = true;
             ResClass::VmemLoad

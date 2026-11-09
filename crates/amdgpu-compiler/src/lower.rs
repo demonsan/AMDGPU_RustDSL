@@ -2546,6 +2546,17 @@ impl Lowerer {
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::BufferAtomicRet { rsrc, voff, soff, imm, value, .. } => {
+                let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                // the returning form writes the old value into its data register: a fresh copy of the value, tied
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, v)?;
+                self.push(MInst::new(MOp::BufferAtomicAddU32Ret).def(d).srcreg(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::AtomicGlobal { op, base, byte_off, value } => {
                 let rb = self.as_v2(*base)?;
                 let v = self.as_v1(*value)?;

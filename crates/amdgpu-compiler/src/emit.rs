@@ -950,6 +950,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::GlobalAtomicIncU32Rtn => vec![format!("global_atomic_inc {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
         MOp::GlobalAtomicAddF32 => vec![format!("global_atomic_add_f32 {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
         MOp::GlobalAtomicAddF32Rtn => vec![format!("global_atomic_add_f32 {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::BufferAtomicAddU32Ret => vec![format!("buffer_atomic_add {}, {} sc0", vr(a, inst.dst.expect("dst")), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
         MOp::BufferAtomicAddU32 => vec![format!("buffer_atomic_add {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
         MOp::BufferAtomicAddF32 => vec![format!("buffer_atomic_add_f32 {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
         MOp::BufferAtomicPkAddBf16 => vec![format!("buffer_atomic_pk_add_bf16 {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
