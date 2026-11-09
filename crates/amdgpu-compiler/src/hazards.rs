@@ -987,3 +987,121 @@ pub fn classify_nops(m: &MFunction) -> Vec<NopSite> {
     }
     out
 }
+
+/// Post-RA: a VALU instruction that WRITES an SGPR (`v_readfirstlane` / `v_readlane`, a VOP3 compare into an SGPR pair) and a later reader of
+/// that physical SGPR (LLVM GCNHazardRecognizer, gfx950 = GFX9 with the gfx940 instructions):
+///   * a VMEM instruction reading it (soffset, resource, saddr): 5 wait states (`checkVMEMHazards`, hasVMEMReadSGPRVALUDefHazard). LLVM counts
+///     from the VALU write even when an SALU rewrote the register in between, so this pass does too.
+///   * a VALU instruction reading it as an explicit operand (incl. a v_cndmask lane mask): 2 wait states (`checkVALUHazards`,
+///     hasVDecCoExecHazard, "VALUWriteSGPRVALURead").
+/// Writes still pending at a block end are carried into the successors (to a fixpoint). Returns the wait states added.
+/// `AMDC_NO_VALU_SGPR=1`: off (A/B).
+pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
+    use crate::sched::model::Pipe;
+    if std::env::var("AMDC_NO_VALU_SGPR").map_or(false, |v| v == "1") {
+        return 0;
+    }
+    const VMEM_WAIT: usize = 5;
+    const VALU_WAIT: usize = 2;
+    let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;
+    let is_valu = |op: MOp| matches!(pipe(op), Pipe::Valu | Pipe::Trans | Pipe::Mfma);
+    let srange = |m: &MFunction, r: VReg| -> Option<(u32, u32)> {
+        let c = m.vreg_class(r);
+        c.is_scalar().then(|| (a.phys[r as usize], a.phys[r as usize] + c.dwords()))
+    };
+    let states = |i: &MInst| if i.op == MOp::SNop { i.imm.max(0) as usize + 1 } else { 1 };
+    // the VALU-written SGPR ranges still inside the longest window when a block ends: (lo, hi, wait states elapsed at the end)
+    let succs = crate::sched::liveness::successors(m);
+    let nb = m.blocks.len();
+    let mut entry: Vec<Vec<(u32, u32, usize)>> = vec![Vec::new(); nb];
+    let block_exit = |m: &MFunction, bi: usize, ent: &[(u32, u32, usize)]| -> Vec<(u32, u32, usize)> {
+        // pending: (lo, hi, states since the write)
+        let mut pend: Vec<(u32, u32, usize)> = ent.to_vec();
+        for inst in &m.blocks[bi].insts {
+            let s = states(inst);
+            for p in pend.iter_mut() {
+                p.2 += s;
+            }
+            if is_valu(inst.op) {
+                if let Some(d) = inst.dst {
+                    if let Some((lo, hi)) = srange(m, d) {
+                        pend.push((lo, hi, 0));
+                    }
+                }
+            }
+            pend.retain(|p| p.2 < VMEM_WAIT);
+        }
+        pend
+    };
+    for _ in 0..8 {
+        let mut changed = false;
+        for bi in 0..nb {
+            let ex = block_exit(m, bi, &entry[bi]);
+            for &s in &succs[bi] {
+                for e in &ex {
+                    match entry[s].iter_mut().find(|x| x.0 == e.0 && x.1 == e.1) {
+                        Some(x) if x.2 <= e.2 => {}
+                        Some(x) => {
+                            x.2 = e.2;
+                            changed = true;
+                        }
+                        None => {
+                            entry[s].push(*e);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut added = 0usize;
+    for bi in 0..nb {
+        let insts = std::mem::take(&mut m.blocks[bi].insts);
+        let mut out: Vec<MInst> = Vec::with_capacity(insts.len() + 4);
+        // (lo, hi, states elapsed since the write, counted up to the CURRENT instruction's issue)
+        let mut pend: Vec<(u32, u32, usize)> = entry[bi].clone();
+        for inst in insts {
+            let p = pipe(inst.op);
+            let need_win = if p == Pipe::Vmem { VMEM_WAIT } else if is_valu(inst.op) { VALU_WAIT } else { 0 };
+            if need_win > 0 {
+                let mut need = 0usize;
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some((lo, hi)) = srange(m, *r) {
+                            for w in &pend {
+                                if w.0 < hi && lo < w.1 && w.2 < need_win {
+                                    need = need.max(need_win - w.2);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut n = need;
+                while n > 0 {
+                    let k = n.min(8);
+                    out.push(MInst::new(MOp::SNop).imm(k as i64 - 1));
+                    for w in pend.iter_mut() {
+                        w.2 += k;
+                    }
+                    n -= k;
+                    added += k;
+                }
+            }
+            let s = states(&inst);
+            let def = if is_valu(inst.op) { inst.dst.and_then(|d| srange(m, d)) } else { None };
+            out.push(inst);
+            for w in pend.iter_mut() {
+                w.2 += s;
+            }
+            if let Some((lo, hi)) = def {
+                pend.push((lo, hi, 0));
+            }
+            pend.retain(|w| w.2 < VMEM_WAIT);
+        }
+        m.blocks[bi].insts = out;
+    }
+    added
+}

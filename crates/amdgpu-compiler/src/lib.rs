@@ -226,6 +226,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 hazards::pad_physical_war(&mut m, &a);
                 hz(&mut m, &a, true);
                 sched::m0::pad(&mut m);
+                hazards::pad_valu_sgpr(&mut m, &a);
                 Ok(a)
             })();
             match attempt {
@@ -261,6 +262,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     hazards::pad_physical_war(&mut m, &alloc);
     hz(&mut m, &alloc, false);
     sched::m0::pad(&mut m);
+    hazards::pad_valu_sgpr(&mut m, &alloc);
     Ok((m, alloc))
 }
 
