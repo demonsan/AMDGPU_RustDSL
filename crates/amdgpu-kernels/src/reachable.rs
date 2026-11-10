@@ -113,10 +113,32 @@ pub fn python_op_names() -> BTreeSet<String> {
     n
 }
 
-/// Every name of the golden manifest: `amdc list` + the dispatch-reachable instantiations + the Python-op instantiations.
+/// Every fixed name `kernel_by_name` matches literally (the `"name" =>` / `"name" |` arms of `registry.rs`) that builds a kernel: the shipped
+/// kernels and the non-parameterized families (`amdc list` holds only the probes).
+pub fn registered_literal_names() -> BTreeSet<String> {
+    let src = include_str!("registry.rs");
+    let mut n = BTreeSet::new();
+    let b = src.as_bytes();
+    let mut i = 0;
+    while let Some(q) = src[i..].find('"').map(|q| q + i) {
+        let Some(e) = src[q + 1..].find('"').map(|e| e + q + 1) else { break };
+        let name = &src[q + 1..e];
+        let rest = src[e + 1..].trim_start();
+        let ident = !name.is_empty() && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') && b[q + 1].is_ascii_lowercase();
+        if ident && (rest.starts_with("=>") || rest.starts_with('|')) && crate::kernel_by_name(name).is_some() {
+            n.insert(name.to_string());
+        }
+        i = e + 1;
+    }
+    n
+}
+
+/// Every name of the golden manifest: the registry's literal names, `amdc list`, the dispatch-reachable instantiations and the Python-op
+/// instantiations.
 pub fn manifest_names() -> BTreeSet<String> {
     let mut n = dispatched_names();
     n.extend(python_op_names());
     n.extend(crate::kernel_names().iter().map(|s| s.to_string()));
+    n.extend(registered_literal_names());
     n
 }
