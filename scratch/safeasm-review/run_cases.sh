@@ -18,7 +18,7 @@ bash tools/container/cargo.sh build -q -p amdgpu-safeasm 2>&1 | tail -3
 
 deps="$TARGET/debug/deps"
 newest() { ls -1t "$deps"/lib$1-*.rlib 2>/dev/null | head -1; }
-SAFEASM="$(newest amdgpu_safeasm)"; COMPILER="$(newest amdgpu_compiler)"; DSL="$(newest amdgpu_dsl)"
+SAFEASM="$(newest amdgpu_safeasm)"; COMPILER="$(newest amdgpu_codegen)"; DSL="$(newest amdgpu_dsl)"
 echo "[review] rlibs: $SAFEASM $COMPILER $DSL"
 [ -n "$SAFEASM" ] || { echo "no safeasm rlib"; exit 1; }
 
@@ -33,8 +33,8 @@ crustc() {
 compile_case() { # $1 = file, $2 = output binary
   local extra=(--edition 2021 --crate-type bin --crate-name uicase -L "dependency=/target/debug/deps"
                --extern "amdgpu_safeasm=/target/debug/deps/$(basename "$SAFEASM")")
-  if grep -q "amdgpu_compiler" "$1"; then
-    extra+=(--extern "amdgpu_compiler=/target/debug/deps/$(basename "$COMPILER")")
+  if grep -q "amdgpu_codegen" "$1"; then
+    extra+=(--extern "amdgpu_codegen=/target/debug/deps/$(basename "$COMPILER")")
   fi
   if grep -q "amdgpu_dsl" "$1"; then
     extra+=(--extern "amdgpu_dsl=/target/debug/deps/$(basename "$DSL")")

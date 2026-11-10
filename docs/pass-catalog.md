@@ -3,9 +3,9 @@
 Survey of the backend as it exists on branch `sched-refactor` (based on origin/Main a5fc452d), written for phase **P1** of
 [refactor-4layer-plan.md](refactor-4layer-plan.md): "named L4 passes and a pass manager with one pipeline per target, each pass carrying its
 evidence (test / probe / LLVM oracle)", plus `amdc passes --target gfx950`. Nothing here changes code. Line numbers refer to this checkout;
-they are anchors for the refactor, not a stable API. Crate shorthands: `compiler` = `crates/amdgpu-compiler/src`, `dsl` = `crates/amdgpu-dsl/src`,
+they are anchors for the refactor, not a stable API. Crate shorthands: `compiler` = `crates/amdgpu-codegen/src`, `dsl` = `crates/amdgpu-dsl/src`,
 `tile` = `crates/amdgpu-tile/src`, `amdc` = `crates/amdc/src/main.rs`, `k-tests` = `crates/amdgpu-kernels/tests`, `c-tests` =
-`crates/amdgpu-compiler/tests`.
+`crates/amdgpu-codegen/tests`.
 
 Evidence vocabulary: **test** (cargo test file or unit test), **probe** (hardware probe: `crates/amdgpu-kernels/src/probes/*.rs`, `tools/*probe*.sh`),
 **oracle** (compared against the pinned LLVM `llc` / assembler: `tools/hazard_oracle.sh`, `tools/llvm_compare.sh`, `tools/llvm_conformance.sh`,
@@ -383,7 +383,7 @@ $ amdc passes --target gfx950 --kernel fmha_fwd_hd128_mxfp8_v3_t128 --evidence
   lower-mir        tokens: dce cmpfold scalarize retarget2 imm sgpr zeroinit addrfold saddrlds edgepad salubr
   sched-list       limit=248 xbar  (preset T128)
   ...
-  hazard-value     tests: crates/amdgpu-compiler/tests/hazard_classes.rs, hazard_oracle.rs, smfmac_hazards.rs
+  hazard-value     tests: crates/amdgpu-codegen/tests/hazard_classes.rs, hazard_oracle.rs, smfmac_hazards.rs
                    oracle: tools/hazard_oracle.sh   probe: tools/mfma_dep.sh
 $ amdc passes --target gfx950 --json     # machine-readable (name, stage, target_dep, gate, evidence[])
 $ amdc passes --check                    # fails when a pass has no evidence entry (see §7, none found list)
@@ -412,7 +412,7 @@ Additions the output should support: `--json`; `--check` (every pass must list >
 
 ## 8. As built (branch `pass-mgr`)
 
-- `crates/amdgpu-compiler/src/pass/mod.rs`: `PassInfo` (name, stage, target dependence, gate, evidence), runnable MIR passes `Pass { info, run }`,
+- `crates/amdgpu-codegen/src/pass/mod.rs`: `PassInfo` (name, stage, target dependence, gate, evidence), runnable MIR passes `Pass { info, run }`,
   the gfx950 bodies `SCHEDULED` / `UNSCHEDULED` (the same pass objects, `Path` selects `hazard-value` / `hz-fill` strictness), the descriptions
   `FRONT` (source + lowering + `assign-agpr`) and `BACK` (final checks, tail), the ladders `OUTER_LADDER` / `inner_ladder` and `retryable`;
   `lower_and_allocate` runs them. A unit test requires an evidence entry for every pass.

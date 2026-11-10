@@ -3,12 +3,12 @@
 
 mod common;
 
-use amdgpu_compiler::agpr::{self, AGPR_ANY};
-use amdgpu_compiler::backend::LlvmTools;
-use amdgpu_compiler::hazards;
-use amdgpu_compiler::mir::*;
-use amdgpu_compiler::regalloc::{self, Alloc};
-use amdgpu_compiler::{compile};
+use amdgpu_codegen::agpr::{self, AGPR_ANY};
+use amdgpu_codegen::backend::LlvmTools;
+use amdgpu_codegen::hazards;
+use amdgpu_codegen::mir::*;
+use amdgpu_codegen::regalloc::{self, Alloc};
+use amdgpu_codegen::{compile};
 use amdgpu_kernels::{kernel_by_name};
 use common::func;
 
@@ -29,7 +29,7 @@ fn assemble_ok(asm: &str, tag: &str) -> Result<(), String> {
     let s = dir.join("k.s");
     std::fs::write(&s, asm).unwrap();
     let out = std::process::Command::new(&clang)
-        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(amdgpu_codegen::target::T.llvm.asm_args)
         .args(["-c", "-o"])
         .arg(dir.join("k.o"))
         .arg(&s)

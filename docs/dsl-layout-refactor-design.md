@@ -28,7 +28,7 @@
 | `ctm-rs` | 类型化指令层 + ABI + launch contract + typestate（mbarrier、TmemGuard） | `amdgpu-isa`（由 `amdgpu-safeasm` 扩展） | atom 描述（指令 + 操作数 TV 布局 + 立即数范围）、寄存器 token、等待/DMA/MFMA typestate |
 | `cute-layout` | 布局代数 + 编译期证明 | **`amdgpu-layout`（新）** | 纯 Rust，零依赖，主机单测；证明在"kernel 构建期"执行 |
 | `cute-rs` | Tensor、zipped_divide、slice、local_tile、cooperative/tiled copy、生产者/消费者流水、tiled MMA | **`amdgpu-tile`（由 `amdgpu-tile/src/` 拆出）** | FlyDSL 命名的 TiledCopy/TiledMma + 我们的 LdsPlan/Pipeline 协议 |
-| 闭世界导入器 + 全模块验证器 | rustc MIR → 方言；whole-module verifier | `amdgpu-compiler`（lower / sched / regalloc / hazards / `gpu_verify` / emit） | 不变；`gpu_verify` 本来就是全函数验证器 |
+| 闭世界导入器 + 全模块验证器 | rustc MIR → 方言；whole-module verifier | `amdgpu-codegen`（lower / sched / regalloc / hazards / `gpu_verify` / emit） | 不变；`gpu_verify` 本来就是全函数验证器 |
 | `cuda-host` / `cuda-core` / `cuda-bindings` | 类型化启动、RAII、FFI | `amdgpu-host`（+ 可选 `amdgpu-host-sys`） | 见 §5，需用户决策 |
 
 依赖方向（无环）：
@@ -42,7 +42,7 @@ amdgpu-isa     (atom 描述、typestate；依赖 layout)        amdgpu-dsl (IR +
                               ↑
               amdgpu-kernels (fmha/ gemm/ mlp/ probes/ verifier_cases/ + 注册表)
                               ↑
-              amdgpu-compiler (lower/RA/sched/gpu_verify/emit)   amdgpu-host (合同 → 主机)
+              amdgpu-codegen (lower/RA/sched/gpu_verify/emit)   amdgpu-host (合同 → 主机)
                               ↑
                             amdc
 ```
@@ -442,7 +442,7 @@ fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, p: &Fragment /* P 的 B 布局�
 | `TensorDecl` 自动合同 | `contract::compact_tensor` / `same_strides`：合同从 `Layout` 推出（分配 = cosize，紧致关系 = 内层外延乘积），`fmha.rs:397` |
 | 不涉及布局的部分 | 仍复用 `amdgpu_tile`：`LdsPlan`/标记、`Pipeline`/`Roles`、softmax、combine、`_t128` 的 VGPR K-scale 暂存、ones/Q 常量写入 |
 
-crate 依赖：`amdgpu-layout`（零依赖）← `amdgpu-isa` ← `amdgpu-tile`（再依赖 `amdgpu-dsl`）← `amdgpu-compiler`（注册 kernel）。全部 `#![forbid(unsafe_code)]`，`rust_safety` 测试覆盖。
+crate 依赖：`amdgpu-layout`（零依赖）← `amdgpu-isa` ← `amdgpu-tile`（再依赖 `amdgpu-dsl`）← `amdgpu-codegen`（注册 kernel）。全部 `#![forbid(unsafe_code)]`，`rust_safety` 测试覆盖。
 
 ### 9.3 决定（与 §8 的对照）
 

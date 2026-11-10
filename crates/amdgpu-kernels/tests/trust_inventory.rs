@@ -1,11 +1,11 @@
 //! The trust surface of the GPU-semantics verifier made explicit (docs/trust-inventory.md): every escape is either an error, a counted
 //! ledger entry, or a counted "bounds-checked, not race-checked" access - never silent. Each test pins one entry of the inventory.
 
-use amdgpu_compiler::gpu_verify::{verify_ir, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, Severity};
 use amdgpu_dsl::{CmpPred, CmpTy, DType, Ext, FnBuilder, Function, Op, Opnd};
 use amdgpu_kernels::kernel_by_name;
 
-fn no_errors(r: &amdgpu_compiler::gpu_verify::Report) -> bool {
+fn no_errors(r: &amdgpu_codegen::gpu_verify::Report) -> bool {
     r.findings.iter().all(|f| f.severity != Severity::Error)
 }
 

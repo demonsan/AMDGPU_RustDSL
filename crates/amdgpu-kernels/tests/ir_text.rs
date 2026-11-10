@@ -99,8 +99,8 @@ fn round_tripped_kernels_emit_identical_assembly() {
     for k in all_kernels() {
         let f = amdgpu_kernels::kernel_by_name(&k).unwrap();
         let g = parse(&print(&f)).unwrap();
-        let a = amdgpu_compiler::compile_with(&f, &amdgpu_compiler::backend::OwnTail).map(|c| c.asm);
-        let b = amdgpu_compiler::compile_with(&g, &amdgpu_compiler::backend::OwnTail).map(|c| c.asm);
+        let a = amdgpu_codegen::compile_with(&f, &amdgpu_codegen::backend::OwnTail).map(|c| c.asm);
+        let b = amdgpu_codegen::compile_with(&g, &amdgpu_codegen::backend::OwnTail).map(|c| c.asm);
         assert_eq!(a, b, "{k}: assembly differs after the round trip");
     }
 }

@@ -1,7 +1,7 @@
 //! Tile library layers 5-6: a complete one-group attention kernel written ONLY with library components (tensors, LDS plan, DMA copies, pipeline, QK/PV
 //! tiles, online softmax with rollback, fp8 P conversion with and without the LUT correction, smfmac row sums, bf16 / KV-split partial epilogues), and
 //! the KV-split combine rewritten with `combine_splits`. Every kernel: gpu_verify 0 errors, compiles, and has the FMHA instruction signature.
-use amdgpu_compiler::gpu_verify::{analyse, Severity};
+use amdgpu_codegen::gpu_verify::{analyse, Severity};
 use amdgpu_tile::epilogue::*;
 use amdgpu_tile::frag::*;
 use amdgpu_tile::reduce::KeyMask;
@@ -152,7 +152,7 @@ fn check(f: &Function) -> String {
     let r = analyse(f).expect("analyse");
     let e: Vec<String> = r.findings.iter().filter(|x| x.severity == Severity::Error).map(|x| format!("[{}] {}", x.code, x.msg)).collect();
     assert!(e.is_empty(), "{}: {}", f.name, e.join("\n"));
-    amdgpu_compiler::compile(f).expect("compile").asm
+    amdgpu_codegen::compile(f).expect("compile").asm
 }
 
 fn n(asm: &str, m: &str) -> usize {
@@ -208,7 +208,7 @@ fn combine8h_lib() -> Function {
 #[test]
 fn combine8h_rewritten_with_the_library_matches_the_shipped_instruction_mix() {
     let mine = check(&combine8h_lib());
-    let shipped = amdgpu_compiler::compile(&amdgpu_kernels::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h").unwrap()).unwrap().asm;
+    let shipped = amdgpu_codegen::compile(&amdgpu_kernels::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h").unwrap()).unwrap().asm;
     for m in ["global_load_dwordx4", "global_load_dword ", "global_store_dwordx4", "v_exp_f32", "v_cvt_f32_f16", "v_cvt_pk_bf16_f32", "v_rcp_f32", "v_max_f32", "s_cbranch"] {
         assert_eq!(n(&mine, m), n(&shipped, m), "{m}\n--- library:\n{mine}\n--- shipped:\n{shipped}");
     }

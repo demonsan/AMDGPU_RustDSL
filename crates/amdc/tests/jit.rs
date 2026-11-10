@@ -46,7 +46,7 @@ fn specialized_kernels_verify_strictly_and_shrink() {
     ] {
         let f = amdgpu_kernels::kernel_by_name(k).unwrap();
         let s = specialize(&f, &b(spec)).unwrap();
-        let r = amdgpu_compiler::gpu_verify::analyse(&s).unwrap();
+        let r = amdgpu_codegen::gpu_verify::analyse(&s).unwrap();
         assert!(r.errors().is_empty(), "{k}: {:?}", r.errors());
         assert!(s.stmts().len() <= f.stmts().len(), "{k}");
     }

@@ -1,7 +1,7 @@
 ﻿// (NEW, safe path) End-to-end: embed the const-drop block (real matrix result read too early) in a DSL kernel, compile,
 // print the asm; the job assembles it and runs it on GPU (expected stale 0 instead of 64).
 use amdgpu_dsl::{DType, FnBuilder, Op};
-use amdgpu_compiler::asm::block_to_asm;
+use amdgpu_codegen::asm::block_to_asm;
 use amdgpu_safeasm::*;
 fn build() -> AsmBlock {
     let mut s = Seq::new();
@@ -53,7 +53,7 @@ fn main() {
     let of = f.bitcast_f32(out);
     f.store_f32(o, 0, of);
     let func = f.finish();
-    match amdgpu_compiler::compile(&func) {
+    match amdgpu_codegen::compile(&func) {
         Ok(r) => {
             println!("=== KERNEL_ASM ===");
             println!("{}", r.asm);

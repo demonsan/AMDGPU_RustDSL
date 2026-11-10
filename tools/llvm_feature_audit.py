@@ -10,7 +10,7 @@ Per test (every *.ll and *.mir under the directory) the tool extracts
                     encoding suffixes stripped); split by target class
   (d) features    : IR / ABI features (calls, alloca/stack, atomics, intrinsics, debug info, exceptions, varargs, calling conventions, attributes, kernarg,
                     workgroup id, LDS, barriers/waitcnt, spills, subtarget -mattr, address spaces, types)
-and classifies each test against OUR opcode universe (derived from crates/amdgpu-compiler/src/target/gfx950/emit.rs and llvm/llvm{20,24}.tbl):
+and classifies each test against OUR opcode universe (derived from crates/amdgpu-codegen/src/target/gfx950/emit.rs and llvm/llvm{20,24}.tbl):
   COVERED       gfx950-class codegen test, every required opcode exists in our compiler, no unsupported IR feature
   PARTIAL       gfx950-class codegen test, no hard-unsupported feature, but opcodes / features are missing (listed)
   OUT-OF-SCOPE  pass-level or non-codegen test, non-gfx950-class subtarget, or an IR feature the kernel DSL does not model (calls, stack, exceptions, debug info, ...)
@@ -426,7 +426,7 @@ TOK_RE = re.compile(r"\b((?:v|s|buffer|global|ds|flat|scratch)_[a-z0-9_]*[a-z0-9
 
 
 def our_universe(repo):
-    emit = os.path.join(repo, "crates", "amdgpu-compiler", "src", "emit.rs")
+    emit = os.path.join(repo, "crates", "amdgpu-codegen", "src", "emit.rs")
     src = open(emit, errors="replace").read()
     arms = list(re.finditer(r"((?:MOp::\w+\s*\|\s*)*MOp::\w+)\s*(?:if\b[^=]*?)?=>", src))
     by_mop = {}
@@ -443,7 +443,7 @@ def our_universe(repo):
     # table-derived MIR opcode names (both dialects)
     tbl_ops = {}
     for tbl in ("llvm20.tbl", "llvm24.tbl"):
-        p = os.path.join(repo, "crates", "amdgpu-compiler", "src", "target", "gfx950", "llvm", tbl)
+        p = os.path.join(repo, "crates", "amdgpu-codegen", "src", "target", "gfx950", "llvm", tbl)
         rows = set()
         for ln in open(p, errors="replace"):
             if ln.startswith("#") or "|" not in ln:
@@ -466,7 +466,7 @@ def our_universe(repo):
     # control-flow / terminator mnemonics are emitted by render_term / terminators, not in match arms
     for extra in ("s_branch", "s_cbranch_vccnz", "s_cbranch_vccz", "s_cbranch_scc0", "s_cbranch_scc1", "s_endpgm", "s_nop", "s_barrier", "s_waitcnt", "s_setprio"):
         mnemonics.add(extra)
-    enum_src = open(os.path.join(repo, "crates", "amdgpu-compiler", "src", "mir.rs"), errors="replace").read()
+    enum_src = open(os.path.join(repo, "crates", "amdgpu-codegen", "src", "mir.rs"), errors="replace").read()
     em = re.search(r"pub enum MOp \{(.*?)\n\}", enum_src, re.S)
     n_enum = len(re.findall(r"^\s{4}([A-Z]\w*)\s*(?:,|\(|\{|=)", em.group(1), re.M)) if em else -1
     mops = sorted(set(by_mop) | set(k for k in tbl_ops if not k.startswith("__rows_")))

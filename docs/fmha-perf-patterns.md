@@ -6,8 +6,8 @@
 > 实测影响、分类、库需要暴露/保证的抽象。
 >
 > 缩写：`K` = [`crates/amdgpu-kernels/src/probes/mod.rs`](../crates/amdgpu-kernels/src/probes/mod.rs)（22.5k 行），
-> `C` = [`crates/amdgpu-compiler/src/lib.rs`](../crates/amdgpu-compiler/src/lib.rs)，
-> `H` = [`crates/amdgpu-compiler/src/hazards.rs`](../crates/amdgpu-compiler/src/hazards.rs)，
+> `C` = [`crates/amdgpu-codegen/src/lib.rs`](../crates/amdgpu-codegen/src/lib.rs)，
+> `H` = [`crates/amdgpu-codegen/src/hazards.rs`](../crates/amdgpu-codegen/src/hazards.rs)，
 > `S.rN` = [`docs/archive/status.md`](archive/status.md) 第 N 轮，`CS` = [`docs/current-status.md`](current-status.md)，
 > `VS` = [`docs/vendor-spec.md`](vendor-spec.md)，`KR` = [`docs/archive/kvsplit-results.md`](archive/kvsplit-results.md)。
 > 行号均在分支 `fmha-port`（HEAD `071f9c5`）上核对过。性能数字默认是 B1H8S2048、own 后端、`_vs128` 强制 64 blocks（per-CU 视角），

@@ -179,7 +179,7 @@ pub fn info_json_src(f: &Function, spec: &[(String, u32, SpecValue)], derived: &
 \"block\":[{},1,1],\"lds_bytes\":{},\"vgpr\":{},\"agpr\":{},\"sgpr\":{},\"scratch_bytes\":{},\"kernarg_size\":{},\"kernarg_align\":8,\"args\":[{}],\
 \"contract\":{{\"grid\":[{}],\"ka_is\":[{}],\"ka_range\":[{}],\"ka_set\":[{}],\"tensors\":[{}],\"syms\":[{}]}}}}",
         esc(source),
-        amdgpu_compiler::target::T.name,
+        amdgpu_codegen::target::T.name,
         esc(VERSION),
         esc(GIT),
         compiler_hash(backend),

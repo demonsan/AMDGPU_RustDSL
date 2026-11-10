@@ -74,7 +74,7 @@ The vendor kernel and legacy/dsl/env-override kernels keep the historical hand p
 
 ## Verification evidence
 
-- `cargo test -p amdgpu-compiler --test contract_host_truth`: 3/3 pass, including
+- `cargo test -p amdgpu-codegen --test contract_host_truth`: 3/3 pass, including
   `generated_host_abi_matches_the_hand_offsets_and_sizes` (generated `Args` offsets/sizes/static
   asserts + JSON vs the hand 656/648/36-byte ABI facts for all four shipped v3 kernels).
 - `g++ -std=c++17 -D__HIP_PLATFORM_AMD__ -Itests/gpu -I$ROCM/include` compiles `ref_host.cpp` and the

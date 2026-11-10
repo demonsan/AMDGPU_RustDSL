@@ -1,6 +1,6 @@
 ﻿// POC part 2: the same phase written with the existing DSL -> lower -> regalloc -> emit path, with stores of
 // both results so the two variants can be compared on hardware as data (the safe Seq has no store ops).
-use amdgpu_compiler::lower;
+use amdgpu_codegen::lower;
 use amdgpu_dsl::{DType, FnBuilder, Op};
 fn main() {
     let mut b = FnBuilder::new("pv_phase_dsl", 64);
@@ -30,7 +30,7 @@ fn main() {
     b.store_f32(o, 0, l_new);
     b.store_f32(o, 4, of);
     let m = lower::lower(&b.finish()).unwrap();
-    let alloc = amdgpu_compiler::regalloc::allocate(&m).unwrap();
+    let alloc = amdgpu_codegen::regalloc::allocate(&m).unwrap();
     println!("=== KERNEL_PATH ===");
-    println!("{}", amdgpu_compiler::emit::emit(&m, &alloc));
+    println!("{}", amdgpu_codegen::emit::emit(&m, &alloc));
 }

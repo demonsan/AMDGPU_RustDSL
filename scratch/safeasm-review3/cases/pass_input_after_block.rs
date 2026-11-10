@@ -1,6 +1,6 @@
 ﻿// (F8 positive) Reading an input port is fine and must not clobber the caller's value: kernel stores v (7.0) before and
 // after embedding a block that reads v as an input. Hardware check in the job (expect 7.0 both).
-use amdgpu_compiler::compile;
+use amdgpu_codegen::compile;
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
 use amdgpu_safeasm::*;
 fn reader_block() -> AsmBlock {

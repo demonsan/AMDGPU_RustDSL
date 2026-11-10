@@ -1,6 +1,6 @@
 //! `hzfill` (post-RA hazard-window filling): on the shipped kernels it only removes wait states, keeps the MIR valid and every value's
 //! physical register reaching its readers (the allocator's reaching-writer check), and leaves the hazard model with nothing to add.
-use amdgpu_compiler::{compile_mir_alloc, hzfill, mir, regalloc};
+use amdgpu_codegen::{compile_mir_alloc, hzfill, mir, regalloc};
 
 #[test]
 fn hzfill_keeps_the_kernels_valid() {
@@ -14,8 +14,8 @@ fn hzfill_keeps_the_kernels_valid() {
         assert!(mir::verify(&m).is_empty(), "{k}: {:?}", mir::verify(&m));
         assert!(regalloc::check_reaching(&m, &a).is_empty(), "{k}: {:?}", regalloc::check_reaching(&m, &a));
         let mut c = m.clone();
-        amdgpu_compiler::hazards::fix_value_hazards_opts(&mut c, true);
-        amdgpu_compiler::hazards::pad_physical_war(&mut c, &a);
+        amdgpu_codegen::hazards::fix_value_hazards_opts(&mut c, true);
+        amdgpu_codegen::hazards::pad_physical_war(&mut c, &a);
         let n = |x: &mir::MFunction| x.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
         assert_eq!(n(&c), n(&m), "{k}: the hazard passes would still pad");
     }
@@ -33,8 +33,8 @@ fn hzfill_is_a_region_option() {
     };
     assert!(all > 0);
     // no region has hzfill enabled: nothing moves
-    let mut o = amdgpu_compiler::sched::Options::default();
-    o.regions = vec![amdgpu_compiler::sched::region::RegionSpec { name: "r".into(), authored: true, tokens: String::new() }];
+    let mut o = amdgpu_codegen::sched::Options::default();
+    o.regions = vec![amdgpu_codegen::sched::region::RegionSpec { name: "r".into(), authored: true, tokens: String::new() }];
     let mut m = m0.clone();
     let none = hzfill::fill_with(&mut m, &a0, true, Some(&o)).moved;
     assert_eq!(none, 0, "region 0 and region 1 both lack hzfill");

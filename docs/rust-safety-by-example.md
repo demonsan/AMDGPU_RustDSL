@@ -25,7 +25,7 @@
 ```rust
 // crates/amdgpu-dsl/src/lib.rs:15
 #![forbid(unsafe_code)]
-// crates/amdgpu-compiler/src/lib.rs:3
+// crates/amdgpu-codegen/src/lib.rs:3
 #![forbid(unsafe_code)]
 // crates/amdgpu-safeasm/src/lib.rs  (safe-asm 同样)
 #![forbid(unsafe_code)]
@@ -34,10 +34,10 @@
 ```
 
 **保证**：编译期。`forbid` 让后续任何 `unsafe {}` / `unsafe fn` / `unsafe impl` 直接编译失败，不依赖 review。
-依赖只有 path 依赖（`amdgpu-dsl → amdgpu-safeasm`、`amdgpu-compiler → dsl+safeasm`、`amdc → dsl+compiler`），
+依赖只有 path 依赖（`amdgpu-dsl → amdgpu-safeasm`、`amdgpu-codegen → dsl+safeasm`、`amdc → dsl+compiler`），
 没有 crates.io 包，因此不存在"第三方 `unsafe` 无法审计"的问题。
 
-**违反时**：编译失败。机器检查：`crates/amdgpu-compiler/tests/rust_safety.rs`
+**违反时**：编译失败。机器检查：`crates/amdgpu-codegen/tests/rust_safety.rs`
 （`every_crate_forbids_unsafe_code`、`no_third_party_dependencies`）。
 
 ---
@@ -95,7 +95,7 @@ const OK: () = assert!(I < N, "view index out of range for this register tuple")
 **真实写法**：
 
 ```rust
-// crates/amdgpu-compiler/src/lib.rs:23
+// crates/amdgpu-codegen/src/lib.rs:23
 pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> { … }
 
 // crates/amdc/src/main.rs：CLI 只返回 ExitCode
@@ -114,16 +114,16 @@ Err(e) => { eprintln!("{e}"); ExitCode::from(1) }
 | 门 | 位置 | 检查什么 | 失败 |
 |---|---|---|---|
 | IR verifier | `crates/amdgpu-dsl`（`Function`/`Op` 校验） | dtype、作用域、循环变量单赋值、算子合法性 | `Err` |
-| lowering | `crates/amdgpu-compiler/src/lower.rs` | 操作数类别（`as_v4`/`as_v2`）、常量范围、frag 宽度 | `Err` |
-| MIR verifier | `crates/amdgpu-compiler/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
-| `pin_check` | `crates/amdgpu-compiler/src/pin_check.rs:14` | **pinned 段**的显式 padding 是否弱于编译器规则（重跑 value-hazard + wait pass 于副本） | `Vec<String>` |
-| `asm_check` | `crates/amdgpu-compiler/src/asm_check.rs:12` | last-arriver lite 契约：共享访问必须 `sc1`、ticket `sc0`、barrier 前排空 | `Result<(), Vec<String>>` |
-| hazard pass | `crates/amdgpu-compiler/src/hazards.rs:134,414` | 值级、物理 WAR/WAW、宽存储数据 WAR、`vmcnt`/`lgkmcnt` | 插入等待或报错 |
+| lowering | `crates/amdgpu-codegen/src/lower.rs` | 操作数类别（`as_v4`/`as_v2`）、常量范围、frag 宽度 | `Err` |
+| MIR verifier | `crates/amdgpu-codegen/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
+| `pin_check` | `crates/amdgpu-codegen/src/pin_check.rs:14` | **pinned 段**的显式 padding 是否弱于编译器规则（重跑 value-hazard + wait pass 于副本） | `Vec<String>` |
+| `asm_check` | `crates/amdgpu-codegen/src/asm_check.rs:12` | last-arriver lite 契约：共享访问必须 `sc1`、ticket `sc0`、barrier 前排空 | `Result<(), Vec<String>>` |
+| hazard pass | `crates/amdgpu-codegen/src/hazards.rs:134,414` | 值级、物理 WAR/WAW、宽存储数据 WAR、`vmcnt`/`lgkmcnt` | 插入等待或报错 |
 
 **真实写法**（`pin_check` 的语义：pinned 序列不许比编译器自己更"随意"）：
 
 ```rust
-// crates/amdgpu-compiler/src/pin_check.rs:14
+// crates/amdgpu-codegen/src/pin_check.rs:14
 pub fn check(m: &MFunction) -> Vec<String> {
     // 在副本上重跑 value-hazard pass 与 wait pass；若它们要在 pinned 指令前插入 nop/wait，即报错
 }
@@ -149,7 +149,7 @@ pub fn check(m: &MFunction) -> Vec<String> {
 **机器检查**（逐行扫描全部 `src/**/*.rs`，跳过注释）：
 
 ```rust
-// crates/amdgpu-compiler/tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line
+// crates/amdgpu-codegen/tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line
 const FORBIDDEN: &[&str] = &["unsafe", "transmute", "static mut", "as *const", …];
 ```
 
@@ -166,7 +166,7 @@ const FORBIDDEN: &[&str] = &["unsafe", "transmute", "static mut", "as *const", �
 | crate | `.unwrap()` | `.expect(…)` | `panic!/unreachable!` |
 |---|---:|---:|---:|
 | `amdgpu-dsl` | 22 | 21 | 1 |
-| `amdgpu-compiler` | 35 | 25 | 6 |
+| `amdgpu-codegen` | 35 | 25 | 6 |
 | `amdgpu-safeasm` | 0 | 13 | 0 |
 | `amdc` | 0 | 0 | 0 |
 
@@ -351,7 +351,7 @@ pub fn finish_loop_body(mut self) -> Result<AsmBlock, String>
 ```rust
 s.pin();                    // 该序列被调度器视作屏障：不重排、不跨入跨出
 // 编译后：
-// crates/amdgpu-compiler/src/pin_check.rs:14
+// crates/amdgpu-codegen/src/pin_check.rs:14
 //   check(m: &MFunction) -> Vec<String>
 // 在副本上重跑 value-hazard pass 与 wait pass；若它们要在 pinned 指令前插入 nop/wait，则报错
 ```
@@ -379,7 +379,7 @@ b.var_asm_n(&vars, AsmBlock, &inputs)   // 或 Op::Asm（单值形式）
 
 ```rust
 // forge_for_tests 仅 `cfg(test)` / `test-support` feature
-// cargo test -p amdgpu-compiler --features amdgpu-safeasm/test-support
+// cargo test -p amdgpu-codegen --features amdgpu-safeasm/test-support
 ```
 
 生产构建中无法构造"绕过验证器"的序列；测试里伪造的序列必须被 `verify_block` 拒绝（`tests/ui/fail_*` 的机制）。
@@ -436,9 +436,9 @@ fail_wrong_fragment_width                   pass_sequence（通过对照）
 ## C4. 复现命令
 
 ```bash
-bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面
+bash tools/container/cargo.sh test -p amdgpu-codegen --test rust_safety -- --nocapture   # 4 项 + panic 面
 bash tools/container/cargo.sh test -p amdgpu-kernels --test safeasm | grep forbids      # safe-asm 无 unsafe
-bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
+bash tools/container/cargo.sh test -p amdgpu-codegen --test compile_fail                # 29 个 ui 用例
 bash tools/container/cargo.sh test                                                       # 82 targets / 362 tests
 ```
 

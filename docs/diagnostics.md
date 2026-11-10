@@ -1,7 +1,7 @@
 # Structured diagnostics
 
 Agents (and humans) read compiler results as JSON instead of parsing asm or prose. The implementation is in
-[diag.rs](../crates/amdgpu-compiler/src/diag.rs) and the tests in [diagnostics.rs](../crates/amdgpu-kernels/tests/diagnostics.rs).
+[diag.rs](../crates/amdgpu-codegen/src/diag.rs) and the tests in [diagnostics.rs](../crates/amdgpu-kernels/tests/diagnostics.rs).
 
 ## Commands
 

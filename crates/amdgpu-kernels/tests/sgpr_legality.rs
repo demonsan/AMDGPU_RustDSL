@@ -1,8 +1,8 @@
 //! gfx9 VALU operand legality for the `sgpr` option: a VALU instruction reads at most one distinct SGPR (constant bus limit 1)
 //! and an e32 VOP2/VOPC form takes it only as src0. Scans the emitted asm of the kernels that use `scalarize,sgpr`.
 
-use amdgpu_compiler::lower::with_opts;
-use amdgpu_compiler::{compile};
+use amdgpu_codegen::lower::with_opts;
+use amdgpu_codegen::{compile};
 use amdgpu_kernels::{kernel_by_name};
 
 fn sgpr_operands(ops: &[&str]) -> Vec<String> {

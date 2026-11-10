@@ -145,7 +145,7 @@ amdc print-ir fmha_fwd_hd128_mxfp8_v3_vs128 --stage dsl --out vs128.ir
 amdc emit --from-ir vs128.ir --out vs128.s        # 不改 Rust，直接拿编辑过的 IR 做实验
 ```
 
-**编译器**（`amdgpu-compiler`）：
+**编译器**（`amdgpu-codegen`）：
 - **lowering**：由 profile 选择选项。
 - **调度**：profile 预设 + kernel 的 `sched_opts` + 按区域的策略（见 [`weaver-sched.md`](weaver-sched.md)、[`lgkm-lookahead.md`](lgkm-lookahead.md)）。
 - **寄存器分配**：VGPR / AGPR，可用 pin / reg_cap，见 [`weaver-regs.md`](weaver-regs.md)。

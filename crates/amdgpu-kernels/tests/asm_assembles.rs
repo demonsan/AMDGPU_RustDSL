@@ -1,9 +1,9 @@
 //! Every emitted kernel must be accepted by the real assembler (catches operand-legality bugs such as the constant-bus
 //! violation of an SGPR source in `v_cndmask_b32_e32` that no unit-level parser noticed).
 
-use amdgpu_compiler::backend::LlvmTools;
-use amdgpu_compiler::lower::with_opts;
-use amdgpu_compiler::{compile};
+use amdgpu_codegen::backend::LlvmTools;
+use amdgpu_codegen::lower::with_opts;
+use amdgpu_codegen::{compile};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 
 fn assemble(clang: &std::path::Path, asm: &str, tag: &str) -> Result<(), String> {
@@ -12,7 +12,7 @@ fn assemble(clang: &std::path::Path, asm: &str, tag: &str) -> Result<(), String>
     let s = dir.join("k.s");
     std::fs::write(&s, asm).unwrap();
     let out = std::process::Command::new(clang)
-        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(amdgpu_codegen::target::T.llvm.asm_args)
         .args(["-c", "-o"])
         .arg(dir.join("k.o"))
         .arg(&s)

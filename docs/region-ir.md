@@ -70,6 +70,6 @@ The lowering guarantees this: a variable has ONE register for the whole loop, `s
 retargeted into it, which is refused when anything reads the variable between the producer and the `set_var`), every read reads it, and
 an instruction the lowering re-issues later (`cmpfold`) is re-issued only when none of its source registers is redefined in between, and copy
 coalescing only folds a copy into the instruction right before it; the scheduler and the wait
-pass track the register like any other. `crates/amdgpu-compiler/tests/var_semantics.rs` pins the read-after-`if` case on the allocated MIR
+pass track the register like any other. `crates/amdgpu-codegen/tests/var_semantics.rs` pins the read-after-`if` case on the allocated MIR
 under the FMHA and GEMM profiles. (Until 2026-11 such reads were reported by a conservative lint as "not defined by the contract"; the
 lowering paths that could return the iteration-start value — software pipelining and tail duplication — are gone.)

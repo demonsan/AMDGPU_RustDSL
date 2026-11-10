@@ -1,4 +1,4 @@
-# Instruction scheduling (crates/amdgpu-compiler/src/sched/)
+# Instruction scheduling (crates/amdgpu-codegen/src/sched/)
 
 ## Status (final; merged into Main, numbers as in `docs/current-status.md`)
 

@@ -31,7 +31,7 @@ fn main() {
     let func = f.finish();
     let errs = amdgpu_dsl::verify(&func);
     println!("  DSL verify errors: {errs:?}");
-    match amdgpu_compiler::compile(&func) {
+    match amdgpu_codegen::compile(&func) {
         Ok(r) => {
             println!("  compiled OK; lines touching the input register (look for a write to the register that later stores v):");
             for l in r.asm.lines().filter(|l| l.contains("v_add_f32") || l.contains("v_add_u32") || l.contains("global_store") || l.contains("v_mov")) {

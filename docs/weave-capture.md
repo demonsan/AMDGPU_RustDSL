@@ -102,6 +102,6 @@ certificate). Since 2026-11-08:
   aliases. No shipped kernel has a stale view (asm md5 unchanged for all kernels).
 - **Facts model the alias**: `FnBuilder::facts` adds the viewed variables (tracked transitively by the builder, `view_vars`) to
   `var_reads` of every user, so `must_order` keeps view uses before the variable's next write and a weaver does not create copies.
-- Tests: `crates/amdgpu-compiler/tests/var_views.rs` (alias kept when used before the write; snapshot when used after it, also through a
+- Tests: `crates/amdgpu-codegen/tests/var_views.rs` (alias kept when used before the write; snapshot when used after it, also through a
   nested loop; facts). GPU repro (sched's `AMDC_WEAVE_AUTO_STMT=window AMDC_WEAVE_AUTO_PREFIX=52` on `_t128`, B2H8S2048, 128 rows per
   block): bad 24 before, 0 after.

@@ -4,7 +4,7 @@
 
 use amdc::hostgen;
 
-use amdgpu_compiler::backend::{self, probe, LlvmTail, LlvmTools, TailBackend};
+use amdgpu_codegen::backend::{self, probe, LlvmTail, LlvmTools, TailBackend};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -119,7 +119,7 @@ fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Spe
 
 /// The strict certificate of a specialized kernel (stderr); Err when it does not verify.
 fn certify_specialized(f: &amdgpu_dsl::Function) -> Result<(), ExitCode> {
-    match amdgpu_compiler::gpu_verify::analyse(f) {
+    match amdgpu_codegen::gpu_verify::analyse(f) {
         Ok(r) => {
             let l = r.ledger();
             let c = &f.contract;
@@ -219,14 +219,14 @@ fn mir_roundtrip_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    use amdgpu_compiler::backend::mir_roundtrip::Level;
+    use amdgpu_codegen::backend::mir_roundtrip::Level;
     let lv = match args.get(3).map(|s| s.as_str()) {
         Some("--level=flags") => Level::Flags,
         Some("--level=reflag") => Level::Reflag,
         Some("--level=all") => Level::All,
         _ => Level::Identity,
     };
-    let (out, st) = amdgpu_compiler::backend::mir_roundtrip::roundtrip_text_level(&text, lv);
+    let (out, st) = amdgpu_codegen::backend::mir_roundtrip::roundtrip_text_level(&text, lv);
     if let Err(e) = fs::write(o, out) {
         eprintln!("{o}: {e}");
         return ExitCode::from(1);
@@ -247,8 +247,8 @@ fn mir_table_report_cmd(args: &[String]) -> ExitCode {
             Err(e) => eprintln!("{f}: {e}"),
         }
     }
-    let t = amdgpu_compiler::backend::llvm20::Table::load();
-    let r = amdgpu_compiler::backend::mir_roundtrip::table_report(&files, &t);
+    let t = amdgpu_codegen::backend::llvm20::Table::load();
+    let r = amdgpu_codegen::backend::mir_roundtrip::table_report(&files, &t);
     println!("instructions={} matched_exact={} implicit_operands_differ={} explicit_shape_mismatch={} unknown_opcode={}", r.total, r.matched, r.implicit_differs, r.shape_mismatch, r.unknown_opcode);
     println!("matched opcodes: {}", r.matched_by_opcode.len());
     println!("-- explicit operand shape differs from the table row (opcode: example)");
@@ -421,17 +421,17 @@ fn main() -> ExitCode {
                         Ok(x) => x,
                         Err(c) => return c,
                     };
-                    let ds = match amdgpu_compiler::gpu_verify::analyse(&f) {
+                    let ds = match amdgpu_codegen::gpu_verify::analyse(&f) {
                         Ok(r) => {
                             bad |= !r.errors().is_empty();
-                            amdgpu_compiler::diag::from_report(&f, &r)
+                            amdgpu_codegen::diag::from_report(&f, &r)
                         }
                         Err(e) => {
                             bad = true;
-                            amdgpu_compiler::diag::from_compile_error(&f, &e)
+                            amdgpu_codegen::diag::from_compile_error(&f, &e)
                         }
                     };
-                    objs.push(format!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&ds)));
+                    objs.push(format!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&ds)));
                 }
                 println!("[{}]", objs.join(","));
                 return if strict && bad { ExitCode::from(1) } else { ExitCode::SUCCESS };
@@ -441,12 +441,12 @@ fn main() -> ExitCode {
                     Ok(x) => x,
                     Err(c) => return c,
                 };
-                match amdgpu_compiler::gpu_verify::analyse(&f) {
+                match amdgpu_codegen::gpu_verify::analyse(&f) {
                     Ok(r) => {
                         let errs = r.errors().len();
                         println!("== {}: {} finding(s), {errs} error(s); proven {:?}", f.name, r.findings.len(), r.proven);
                         for fd in &r.findings {
-                            if args.iter().any(|a| a == "-v") || fd.severity != amdgpu_compiler::gpu_verify::Severity::Info {
+                            if args.iter().any(|a| a == "-v") || fd.severity != amdgpu_codegen::gpu_verify::Severity::Info {
                                 println!("  [{}{}] {:?}: {}", fd.code, if fd.alias.is_empty() || fd.alias == fd.code { String::new() } else { format!("|{}", fd.alias) }, fd.severity, fd.msg);
                             }
                         }
@@ -487,21 +487,21 @@ fn main() -> ExitCode {
                 Err(c) => return c,
             };
             let only = args.windows(2).find(|w| w[0] == "--line").and_then(|w| w[1].parse::<usize>().ok());
-            match amdgpu_compiler::diag::asm_map_json(&f, only) {
+            match amdgpu_codegen::diag::asm_map_json(&f, only) {
                 Ok(j) => {
                     println!("{j}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&amdgpu_codegen::diag::from_compile_error(&f, &e)));
                     ExitCode::from(1)
                 }
             }
         }
         "passes" => {
             // amdc passes [--target T] [--evidence]: the compile pipeline of a target (named passes, stage, target dependence, gate, evidence; the retry ladders)
-            let target = args.windows(2).find(|w| w[0] == "--target").map(|w| w[1].clone()).unwrap_or_else(|| amdgpu_compiler::target::T.name.to_string());
-            match amdgpu_compiler::pass::describe(&target, args.iter().any(|a| a == "--evidence")) {
+            let target = args.windows(2).find(|w| w[0] == "--target").map(|w| w[1].clone()).unwrap_or_else(|| amdgpu_codegen::target::T.name.to_string());
+            match amdgpu_codegen::pass::describe(&target, args.iter().any(|a| a == "--evidence")) {
                 Ok(s) => {
                     print!("{s}");
                     ExitCode::SUCCESS
@@ -705,9 +705,9 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            match amdgpu_compiler::compile_mir_alloc(&f) {
+            match amdgpu_codegen::compile_mir_alloc(&f) {
                 Ok((m, _)) => {
-                    let sites = amdgpu_compiler::hazards::classify_nops(&m);
+                    let sites = amdgpu_codegen::hazards::classify_nops(&m);
                     let mut agg: std::collections::BTreeMap<(String, String, String), (usize, usize)> = std::collections::BTreeMap::new();
                     for s in &sites {
                         let e = agg.entry((s.rule.to_string(), s.producer.map_or("-".into(), |x| format!("{x:?}")), s.consumer.map_or("-".into(), |x| format!("{x:?}")))).or_insert((0, 0));
@@ -746,13 +746,13 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            match amdgpu_compiler::diag::summary_json(&f) {
+            match amdgpu_codegen::diag::summary_json(&f) {
                 Ok(j) => {
                     println!("{j}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&amdgpu_codegen::diag::from_compile_error(&f, &e)));
                     ExitCode::from(1)
                 }
             }
@@ -767,7 +767,7 @@ fn main() -> ExitCode {
                 eprintln!("unknown kernel: {name}");
                 return ExitCode::from(2);
             };
-            match amdgpu_compiler::compile_mir(&f) {
+            match amdgpu_codegen::compile_mir(&f) {
                 Ok(m) => {
                     let mut set = std::collections::BTreeSet::new();
                     for b in &m.blocks {
@@ -802,9 +802,9 @@ fn main() -> ExitCode {
             if args.iter().any(|a| a == "--sched") {
                 env::set_var("AMDC_SCHED", "1");
             }
-            match amdgpu_compiler::compile_mir(&f) {
+            match amdgpu_codegen::compile_mir(&f) {
                 Ok(m) => {
-                    for r in amdgpu_compiler::sched::sim::report(&m, &[1, 2]) {
+                    for r in amdgpu_codegen::sched::sim::report(&m, &[1, 2]) {
                         println!("SIM {} loop@{} blocks={} insts={} {}", name, r.header_label, r.blocks, r.insts,
                             r.cycles_per_iter.iter().map(|(w, c)| format!("waves{}={:.1}", w, c)).collect::<Vec<_>>().join(" "));
                     }
@@ -822,13 +822,13 @@ fn main() -> ExitCode {
             let stage = args.windows(2).find(|w| w[0] == "--stage").map(|w| w[1].as_str()).unwrap_or("dsl");
             let f = match load_kernel(&name, &args) { Ok(f) => f, Err(c) => return c };
             let text = match stage {
-                "dsl" => amdgpu_compiler::ir_print::print_dsl(&f),
-                "mir" => match amdgpu_compiler::lower::lower(&f) {
-                    Ok(m) => amdgpu_compiler::ir_print::print_mir(&m, None),
+                "dsl" => amdgpu_codegen::ir_print::print_dsl(&f),
+                "mir" => match amdgpu_codegen::lower::lower(&f) {
+                    Ok(m) => amdgpu_codegen::ir_print::print_mir(&m, None),
                     Err(e) => { eprintln!("lower failed: {e}"); return ExitCode::from(1) }
                 },
-                "mir-ra" => match amdgpu_compiler::compile_mir_alloc(&f) {
-                    Ok((m, a)) => amdgpu_compiler::ir_print::print_mir(&m, Some(&a)),
+                "mir-ra" => match amdgpu_codegen::compile_mir_alloc(&f) {
+                    Ok((m, a)) => amdgpu_codegen::ir_print::print_mir(&m, Some(&a)),
                     Err(e) => { eprintln!("compile failed: {e}"); return ExitCode::from(1) }
                 },
                 _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); return ExitCode::from(2) }
@@ -868,8 +868,8 @@ fn main() -> ExitCode {
                 Ok(f) => f,
                 Err(e) => {
                     if json {
-                        let d = amdgpu_compiler::diag::Diag { code: "IR-PARSE".into(), severity: "error".into(), message: format!("{path}: {e}"), ..Default::default() };
-                        println!("{{\"file\":\"{path}\",\"ok\":false,\"diagnostics\":{}}}", amdgpu_compiler::diag::to_json(&[d]));
+                        let d = amdgpu_codegen::diag::Diag { code: "IR-PARSE".into(), severity: "error".into(), message: format!("{path}: {e}"), ..Default::default() };
+                        println!("{{\"file\":\"{path}\",\"ok\":false,\"diagnostics\":{}}}", amdgpu_codegen::diag::to_json(&[d]));
                     } else {
                         eprintln!("{path}: {e}");
                     }
@@ -878,18 +878,18 @@ fn main() -> ExitCode {
             };
             if json {
                 // structured: the IR verifier's findings (statement-localized) and the strict certificate's when --verify
-                let mut ds: Vec<amdgpu_compiler::diag::Diag> = amdgpu_dsl::verify(&f)
+                let mut ds: Vec<amdgpu_codegen::diag::Diag> = amdgpu_dsl::verify(&f)
                     .into_iter()
-                    .map(|m| amdgpu_compiler::diag::localize(&f, amdgpu_compiler::diag::Diag { code: if m.contains("not provably wave-uniform") { "IR-UNIFORM-BRANCH".into() } else { "IR-VERIFY".into() }, severity: "error".into(), message: m, ..Default::default() }))
+                    .map(|m| amdgpu_codegen::diag::localize(&f, amdgpu_codegen::diag::Diag { code: if m.contains("not provably wave-uniform") { "IR-UNIFORM-BRANCH".into() } else { "IR-VERIFY".into() }, severity: "error".into(), message: m, ..Default::default() }))
                     .collect();
                 if args.iter().any(|a| a == "--verify") {
-                    match amdgpu_compiler::gpu_verify::analyse(&f) {
-                        Ok(r) => ds.extend(amdgpu_compiler::diag::from_report(&f, &r)),
-                        Err(e) => ds.extend(amdgpu_compiler::diag::from_compile_error(&f, &e)),
+                    match amdgpu_codegen::gpu_verify::analyse(&f) {
+                        Ok(r) => ds.extend(amdgpu_codegen::diag::from_report(&f, &r)),
+                        Err(e) => ds.extend(amdgpu_codegen::diag::from_compile_error(&f, &e)),
                     }
                 }
                 let ok = !ds.iter().any(|d| d.severity == "error");
-                println!("{{\"file\":\"{path}\",\"kernel\":\"{}\",\"ok\":{ok},\"statements\":{},\"values\":{},\"diagnostics\":{}}}", f.name, f.stmts().len(), f.value_tys.len(), amdgpu_compiler::diag::to_json(&ds));
+                println!("{{\"file\":\"{path}\",\"kernel\":\"{}\",\"ok\":{ok},\"statements\":{},\"values\":{},\"diagnostics\":{}}}", f.name, f.stmts().len(), f.value_tys.len(), amdgpu_codegen::diag::to_json(&ds));
                 return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
             }
             let again = amdgpu_dsl::ir_text::print(&f);
@@ -926,7 +926,7 @@ fn main() -> ExitCode {
                 Err(c) => return c,
             };
             let json = args.iter().any(|a| a == "--json");
-            match amdgpu_compiler::compile_mir_alloc(&f) {
+            match amdgpu_codegen::compile_mir_alloc(&f) {
                 Ok((m, a)) if json => {
                     // virtual register -> the IR value whose lowering defined it -> the builder call (diagnostics origin)
                     let mut origin: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
@@ -944,7 +944,7 @@ fn main() -> ExitCode {
                             None => String::new(),
                         }
                     };
-                    let regs: Vec<String> = amdgpu_compiler::regplan::region_report(&m, &a)
+                    let regs: Vec<String> = amdgpu_codegen::regplan::region_report(&m, &a)
                         .iter()
                         .map(|p| {
                             format!(
@@ -960,16 +960,16 @@ fn main() -> ExitCode {
                             )
                         })
                         .collect();
-                    println!("{{\"kernel\":\"{}\",\"vgpr\":{},\"agpr\":{},\"regions\":[{}]}}", f.name, a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a), regs.join(","));
+                    println!("{{\"kernel\":\"{}\",\"vgpr\":{},\"agpr\":{},\"regions\":[{}]}}", f.name, a.max_v, amdgpu_codegen::regalloc::agpr_count(&m, &a), regs.join(","));
                     ExitCode::SUCCESS
                 }
                 Err(e) if json => {
-                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&amdgpu_codegen::diag::from_compile_error(&f, &e)));
                     ExitCode::from(1)
                 }
                 Ok((m, a)) => {
-                    println!("{}: arch VGPRs {} AGPRs {}", f.name, a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a));
-                    for p in amdgpu_compiler::regplan::region_report(&m, &a) {
+                    println!("{}: arch VGPRs {} AGPRs {}", f.name, a.max_v, amdgpu_codegen::regalloc::agpr_count(&m, &a));
+                    for p in amdgpu_codegen::regplan::region_report(&m, &a) {
                         println!(
                             "region {:<28} insts {:>5}  vgpr footprint {:>3}  live dwords {:>3}  agpr footprint {:>3}  peak at b{} i{}: {}",
                             p.name,
@@ -982,7 +982,7 @@ fn main() -> ExitCode {
                             p.live_at_peak.iter().take(12).cloned().collect::<Vec<_>>().join(" ")
                         );
                     }
-                    for l in amdgpu_compiler::regplan::report(&m, &a) {
+                    for l in amdgpu_codegen::regplan::report(&m, &a) {
                         println!("plan: {l}");
                     }
                     ExitCode::SUCCESS
@@ -1008,12 +1008,12 @@ fn main() -> ExitCode {
                 }
             }
             let req = args.windows(2).find(|w| w[0] == "--backend").map(|w| w[1].clone()).or_else(|| args.iter().find_map(|a| a.strip_prefix("--backend=").map(|s| s.to_string()))).unwrap_or_else(|| "auto".to_string());
-            let (resolved, _) = amdgpu_compiler::resolve_backend(&req, &f);
+            let (resolved, _) = amdgpu_codegen::resolve_backend(&req, &f);
             let Some(tail) = backend::backend_by_name(&resolved) else {
                 eprintln!("unknown backend: {resolved} (own | llvm-tail | auto)");
                 return ExitCode::from(2);
             };
-            match amdgpu_compiler::compile_with(&f, tail.as_ref()) {
+            match amdgpu_codegen::compile_with(&f, tail.as_ref()) {
                 Ok(c) => {
                     let source = match from_ir_path(&args).and_then(|p| fs::read_to_string(p).ok()) {
                         Some(t) => format!("ir:{}", amdc::jit::fnv_hex(&t)),
@@ -1072,7 +1072,7 @@ fn main() -> ExitCode {
                 }
             }
             if let Some(p) = mir_out {
-                return match amdgpu_compiler::export_mir(&f, &LlvmTail::new()) {
+                return match amdgpu_codegen::export_mir(&f, &LlvmTail::new()) {
                     Ok(mir) => match fs::write(&p, mir) {
                         Ok(()) => {
                             eprintln!("wrote {p}");
@@ -1089,7 +1089,7 @@ fn main() -> ExitCode {
                     }
                 };
             }
-            let (resolved, note) = amdgpu_compiler::resolve_backend(&backend_name, &f);
+            let (resolved, note) = amdgpu_codegen::resolve_backend(&backend_name, &f);
             if let Some(n) = note {
                 eprintln!("note: {n}");
             }
@@ -1100,7 +1100,7 @@ fn main() -> ExitCode {
             };
             let tail: &dyn TailBackend = tail.as_ref();
             let json = args.iter().any(|a| a == "--json");
-            match amdgpu_compiler::compile_with(&f, tail) {
+            match amdgpu_codegen::compile_with(&f, tail) {
                 Ok(c) if json => {
                     if let Some(p) = &out_path {
                         if let Err(e) = fs::write(p, &c.asm) {
@@ -1112,7 +1112,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) if json => {
-                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&amdgpu_codegen::diag::from_compile_error(&f, &e)));
                     ExitCode::from(1)
                 }
                 Ok(c) => {

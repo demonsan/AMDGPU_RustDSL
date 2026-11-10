@@ -10,9 +10,9 @@
 //! Run with AMDC_SCHED=1 / auto / AMDC_SCHED_OPTS=swp to cover the scheduler paths too.
 //! Needs the pinned llc (skips loudly without).
 
-use amdgpu_compiler::backend::{LlvmTail, LlvmTools, OwnTail};
-use amdgpu_compiler::mir::MOp;
-use amdgpu_compiler::{compile_with, export_mir};
+use amdgpu_codegen::backend::{LlvmTail, LlvmTools, OwnTail};
+use amdgpu_codegen::mir::MOp;
+use amdgpu_codegen::{compile_with, export_mir};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 
 fn llc_available() -> bool {
@@ -189,7 +189,7 @@ fn llvm_tail_changes_only_waits_nops_and_descriptor() {
 /// Kernels that use own-backend-only MOps (the LDS-DMA loads) cannot go through the LLVM tail (llc aborts on them).
 fn llvm_tail_supported(name: &str) -> bool {
     let Some(f) = amdgpu_kernels::kernel_by_name(name) else { return true };
-    match amdgpu_compiler::compile_mir(&f) {
+    match amdgpu_codegen::compile_mir(&f) {
         Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds | MOp::VMovDpp | MOp::VMovDppX | MOp::VAddF32Dpp | MOp::VSubF32Dpp | MOp::VMulF32Dpp | MOp::VMaxF32Dpp | MOp::VMinF32Dpp | MOp::VAddU32Dpp | MOp::VMaxI32Dpp | MOp::VMinI32Dpp | MOp::VMaxU32Dpp | MOp::VMinU32Dpp | MOp::VAndB32Dpp | MOp::VOrB32Dpp | MOp::VXorB32Dpp))),
         Err(_) => true,
     }

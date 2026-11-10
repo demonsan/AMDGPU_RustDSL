@@ -1,5 +1,5 @@
 //! gpu_verify v1.1: LDS tile lifetime / versioning. A two-role (producer wave / consumer wave) ring protocol, one positive case and one negative case per rule.
-use amdgpu_compiler::gpu_verify::{verify_ir, Report, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, Report, Severity};
 use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 #[derive(Clone, Copy)]

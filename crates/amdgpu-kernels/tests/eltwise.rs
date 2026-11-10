@@ -1,5 +1,5 @@
 //! Batch 2 streaming elementwise kernels (docs/op-coverage-membound.md): the name grammar, strict GPU-semantics verification (buffer accesses hardware-guarded, no errors) and assembly.
-use amdgpu_compiler::gpu_verify::analyse;
+use amdgpu_codegen::gpu_verify::analyse;
 use amdgpu_kernels::kernel_by_name;
 
 const KERNELS: &[&str] = &["silu_mul_bf16_d4096", "silu_mul_bf16_d1024", "silu_mul_bf16_d24", "silu_mul_bf16_d14336", "gelu_tanh_mul_bf16_d4096", "gelu_tanh_mul_bf16_d11008", "add_bf16"];
@@ -10,7 +10,7 @@ fn the_eltwise_kernels_verify_strict_and_compile() {
         let f = kernel_by_name(k).unwrap_or_else(|| panic!("{k} is registered"));
         let r = analyse(&f).unwrap();
         assert!(r.errors().is_empty(), "{k}: {}", r.render());
-        let c = amdgpu_compiler::compile(&f).unwrap_or_else(|e| panic!("{k}: {e}"));
+        let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(c.vgpr <= 64, "{k}: a streaming kernel stays small (occupancy): {} VGPR", c.vgpr);
         assert!(c.asm.contains("buffer_load_dwordx4") && c.asm.contains("buffer_store_dwordx4"), "{k}: one b128 per lane");
     }

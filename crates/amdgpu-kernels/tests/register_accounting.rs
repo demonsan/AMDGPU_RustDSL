@@ -34,8 +34,8 @@
 
 use std::collections::HashSet;
 
-use amdgpu_compiler::backend::{LlvmTail, LlvmTools};
-use amdgpu_compiler::{compile, compile_with};
+use amdgpu_codegen::backend::{LlvmTail, LlvmTools};
+use amdgpu_codegen::{compile, compile_with};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 
 /// A physical register reference parsed out of an operand: `v12`, `v[4:7]`, `s8`, `s[0:1]`, `a[0:15]`.
@@ -174,7 +174,7 @@ fn is_load(m: &str) -> bool {
 }
 
 /// Register reads/writes of one instruction, as defined by the emitter's own operand formats
-/// (`crates/amdgpu-compiler/src/target/gfx950/emit.rs`).
+/// (`crates/amdgpu-codegen/src/target/gfx950/emit.rs`).
 fn read_write(m: &str, ops: &[String]) -> (Vec<Reg>, Vec<Reg>) {
     if is_control(m) {
         return (Vec::new(), Vec::new());
@@ -518,7 +518,7 @@ const DMA_PROBES: &[&str] = &["probe_dma", "probe_dma_tile", "probe_dma_seq", "p
 
 fn allocates(name: &str) -> bool {
     match kernel_by_name(name) {
-        Some(f) => match amdgpu_compiler::compile_mir(&f) {
+        Some(f) => match amdgpu_codegen::compile_mir(&f) {
             Err(e) => !e.contains("out of VGPRs"),
             Ok(_) => true,
         },
@@ -603,8 +603,8 @@ fn llvm_tail_register_accounting() {
     for name in kernel_names() {
         let f = kernel_by_name(name).unwrap();
         // own-backend-only DMA kernels (e.g. probe_dma) cannot go through the LLVM tail
-        if let Ok(m) = amdgpu_compiler::compile_mir(&f) {
-            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32 | amdgpu_compiler::mir::MOp::BufferLoadDwordX4Lds | amdgpu_compiler::mir::MOp::BufferLoadDwordX1Lds | amdgpu_compiler::mir::MOp::VMovDpp | amdgpu_compiler::mir::MOp::VMovDppX | amdgpu_compiler::mir::MOp::VAddF32Dpp | amdgpu_compiler::mir::MOp::VSubF32Dpp | amdgpu_compiler::mir::MOp::VMulF32Dpp | amdgpu_compiler::mir::MOp::VMaxF32Dpp | amdgpu_compiler::mir::MOp::VMinF32Dpp | amdgpu_compiler::mir::MOp::VAddU32Dpp | amdgpu_compiler::mir::MOp::VMaxI32Dpp | amdgpu_compiler::mir::MOp::VMinI32Dpp | amdgpu_compiler::mir::MOp::VMaxU32Dpp | amdgpu_compiler::mir::MOp::VMinU32Dpp | amdgpu_compiler::mir::MOp::VAndB32Dpp | amdgpu_compiler::mir::MOp::VOrB32Dpp | amdgpu_compiler::mir::MOp::VXorB32Dpp))) {
+        if let Ok(m) = amdgpu_codegen::compile_mir(&f) {
+            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_codegen::mir::MOp::GlobalLoadLdsB128 | amdgpu_codegen::mir::MOp::GlobalLoadLdsB32 | amdgpu_codegen::mir::MOp::BufferLoadDwordX4Lds | amdgpu_codegen::mir::MOp::BufferLoadDwordX1Lds | amdgpu_codegen::mir::MOp::VMovDpp | amdgpu_codegen::mir::MOp::VMovDppX | amdgpu_codegen::mir::MOp::VAddF32Dpp | amdgpu_codegen::mir::MOp::VSubF32Dpp | amdgpu_codegen::mir::MOp::VMulF32Dpp | amdgpu_codegen::mir::MOp::VMaxF32Dpp | amdgpu_codegen::mir::MOp::VMinF32Dpp | amdgpu_codegen::mir::MOp::VAddU32Dpp | amdgpu_codegen::mir::MOp::VMaxI32Dpp | amdgpu_codegen::mir::MOp::VMinI32Dpp | amdgpu_codegen::mir::MOp::VMaxU32Dpp | amdgpu_codegen::mir::MOp::VMinU32Dpp | amdgpu_codegen::mir::MOp::VAndB32Dpp | amdgpu_codegen::mir::MOp::VOrB32Dpp | amdgpu_codegen::mir::MOp::VXorB32Dpp))) {
                 continue;
             }
         }

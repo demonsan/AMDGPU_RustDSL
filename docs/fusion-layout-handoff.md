@@ -222,7 +222,7 @@ P0..P3: consumer tables), with the next block's X prefetch between them.
 - **Verifier:** `gpu-verify --strict` reports `stage-handoff: 4` proven, 0 errors, 0 warnings.
 - **Transparency:** the assembly is byte-identical to the pre-stage build.
 
-**Tests.** `crates/amdgpu-compiler/tests/stage_ir.rs` covers:
+**Tests.** `crates/amdgpu-codegen/tests/stage_ir.rs` covers:
 - tree / flat round trip;
 - a layout mismatch, an undeclared cross-stage read and a wrong barrier phase, each reported;
 - a stage inside a tile region panicking.

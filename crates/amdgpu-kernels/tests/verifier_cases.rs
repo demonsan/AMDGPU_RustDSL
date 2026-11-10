@@ -1,6 +1,6 @@
 //! The verifier attack / audit kernels (`crates/amdgpu-kernels/src/verifier_cases/`): every ATTACK must be REJECTED with its specific
 //! finding, and every trust escape must be EXPOSED in the certificate's ledger (never silently certified).
-use amdgpu_compiler::gpu_verify::analyse;
+use amdgpu_codegen::gpu_verify::analyse;
 use amdgpu_kernels::kernel_by_name;
 
 fn codes(k: &str) -> Vec<String> {

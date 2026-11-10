@@ -6,7 +6,7 @@
 #   (a) `amdc mops <kernel>`                 - the distinct machine opcodes (MOp variants) of its final MIR,
 #   (b) `amdc emit <kernel> --backend own`   - emit,
 #   (c) `clang -x assembler -mcpu=gfx950`    - assemble,
-# then maps every MOp variant of crates/amdgpu-compiler/src/mir.rs to the kernels that exercise it.
+# then maps every MOp variant of crates/amdgpu-codegen/src/mir.rs to the kernels that exercise it.
 #
 # Usage:  bash tools/llvm_opcode_sweep.sh [out_dir]      (default build/llvm_sweep; run it where tools/container/cargo.sh works)
 # Output: out_dir/kernels.tsv      label  mops_ok  emit_ok  asm_ok  n_mops
@@ -21,14 +21,14 @@ CLANG="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 $CARGO build -q --bin amdc 2>&1 | grep -E "^error" -A8 | head -20
 
 # 1) every MOp variant (the `pub enum MOp` of mir.rs) and the keys of the LLVM table
-awk '/^pub enum MOp/{f=1;next} f&&/^}/{exit} f&&/^    [A-Z][A-Za-z0-9]*,/{gsub(/[ ,]/,"");print}' crates/amdgpu-compiler/src/mir.rs | sort -u > "$OUT/all_mops.txt"
+awk '/^pub enum MOp/{f=1;next} f&&/^}/{exit} f&&/^    [A-Z][A-Za-z0-9]*,/{gsub(/[ ,]/,"");print}' crates/amdgpu-codegen/src/mir.rs | sort -u > "$OUT/all_mops.txt"
 NALL=$(wc -l < "$OUT/all_mops.txt")
-awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); print k}' crates/amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl | sort -u > "$OUT/tbl_keys.txt"
+awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); print k}' crates/amdgpu-codegen/src/target/gfx950/llvm/llvm24.tbl | sort -u > "$OUT/tbl_keys.txt"
 
 # 2) the run list: label|kernel|ENV   (ENV = space separated VAR=VAL, may be empty)
 {
   # all names accepted by kernel_by_name
-  awk '/pub fn kernel_by_name/{f=1} f' crates/amdgpu-compiler/src/lib.rs | grep -oE '"[a-z0-9_]+"[[:space:]]*=>[[:space:]]*Some' | sed -E 's/"([a-z0-9_]+)".*/\1/' | sort -u | while read -r K; do echo "$K|$K|"; done
+  awk '/pub fn kernel_by_name/{f=1} f' crates/amdgpu-codegen/src/lib.rs | grep -oE '"[a-z0-9_]+"[[:space:]]*=>[[:space:]]*Some' | sed -E 's/"([a-z0-9_]+)".*/\1/' | sort -u | while read -r K; do echo "$K|$K|"; done
   # option combinations that select other instruction forms
   V=fmha_fwd_hd128_mxfp8_v3_vs128; T=fmha_fwd_hd128_mxfp8_v3_t128
   echo "vs128+lower-sgpr|$V|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"

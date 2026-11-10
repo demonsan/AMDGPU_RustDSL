@@ -1041,7 +1041,7 @@ pub struct LastArriver {
     pub splits: Ext,
 }
 
-/// The kernel's GPU-semantics contract, checked by `amdgpu_compiler::gpu_verify`.
+/// The kernel's GPU-semantics contract, checked by `amdgpu_codegen::gpu_verify`.
 #[derive(Clone, Debug, Default)]
 pub struct Contract {
     pub extents: Vec<ArgExtent>,
@@ -1621,7 +1621,7 @@ pub struct RegionDecl {
     pub tokens: String,
 }
 
-/// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
+/// Compile policy of a kernel (see `amdgpu-codegen/src/lib.rs`): which lowering options and which scheduler preset it gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompileProfile {
     /// The policy of `fmha_fwd_hd128_mxfp8_vs128` (scalarize/retarget2/imm/sgpr/zeroinit lowering, full reordering list scheduler).

@@ -1,6 +1,6 @@
 ﻿// (F11) Constant-cache folding must be refused when it would shorten a wait distance: the round-2 "19 dropped splats"
 // block must no longer pass finish() with an under-padded matrix read (or the folded stream must verify).
-use amdgpu_compiler::asm::block_to_asm;
+use amdgpu_codegen::asm::block_to_asm;
 use amdgpu_safeasm::*;
 fn main() {
     let mut s = Seq::new();

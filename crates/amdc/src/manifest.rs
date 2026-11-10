@@ -4,8 +4,8 @@
 //!
 //! Format: one line per kernel, `name<TAB>md5` (or `name<TAB>ERROR` when the kernel does not compile), sorted by name; `#` lines are comments.
 
-use amdgpu_compiler::backend::OwnTail;
-use amdgpu_compiler::compile_with;
+use amdgpu_codegen::backend::OwnTail;
+use amdgpu_codegen::compile_with;
 
 /// The `AMDC_*` environment variables that are set (non-empty): they change the compiler's output (scheduler, lowering options, backend
 /// switches), so the manifest is computed and checked only in a scrubbed environment.

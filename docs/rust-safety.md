@@ -1,6 +1,6 @@
 # Rust 安全性：这个 DSL + 编译器设计如何保证
 
-> 对应代码：`crates/amdgpu-{dsl,compiler,safeasm}`、`crates/amdc`；机器化证据：`crates/amdgpu-compiler/tests/rust_safety.rs`。
+> 对应代码：`crates/amdgpu-{dsl,compiler,safeasm}`、`crates/amdc`；机器化证据：`crates/amdgpu-codegen/tests/rust_safety.rs`。
 > 本文件回答一个问题：**在这套 "Rust DSL + 自研编译器" 里，Rust 的 safe 是怎么保证的、保证到什么程度、边界在哪。**
 
 ---
@@ -35,18 +35,18 @@
 | `amdgpu-sym` / `amdgpu-layout` / `amdgpu-isa` | `crates/amdgpu-{sym,layout,isa}/src/lib.rs` |
 | `amdgpu-dsl` | `crates/amdgpu-dsl/src/lib.rs` |
 | `amdgpu-tile` / `amdgpu-kernels` | `crates/amdgpu-{tile,kernels}/src/lib.rs` |
-| `amdgpu-compiler` | `crates/amdgpu-compiler/src/lib.rs` |
+| `amdgpu-codegen` | `crates/amdgpu-codegen/src/lib.rs` |
 | `amdgpu-safeasm` | `crates/amdgpu-safeasm/src/lib.rs` |
 | `amdc` | `crates/amdc/src/lib.rs` 与 `crates/amdc/src/main.rs` |
 
 `forbid` 是**编译期硬约束**：任何后续出现的 `unsafe {}`、`unsafe fn`、`unsafe impl`、`unsafe trait` 都会直接编译失败，
-而不是靠 code review 拦住。`crates/amdgpu-compiler/tests/rust_safety.rs::every_crate_forbids_unsafe_code`
-会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 9 个 crate（`amdgpu-sym`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-dsl`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 9 个。
+而不是靠 code review 拦住。`crates/amdgpu-codegen/tests/rust_safety.rs::every_crate_forbids_unsafe_code`
+会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 9 个 crate（`amdgpu-sym`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-dsl`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-codegen`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 9 个。
 
 ### 1.2 零第三方依赖
 
 所有 crate 的 `[dependencies]` 只有互为 `path` 依赖（`amdgpu-sym`、`amdgpu-safeasm` 无依赖；`amdgpu-layout` → sym；`amdgpu-isa` → layout；`amdgpu-dsl` → sym + safeasm + layout；
-`amdgpu-tile` → dsl + layout + isa；`amdgpu-kernels` → dsl + tile + layout + isa + safeasm；`amdgpu-compiler` → sym + dsl + safeasm（不依赖 kernels / tile）；
+`amdgpu-tile` → dsl + layout + isa；`amdgpu-kernels` → dsl + tile + layout + isa + safeasm；`amdgpu-codegen` → sym + dsl + safeasm（不依赖 kernels / tile）；
 `amdc` → dsl + compiler + kernels + tile）。**没有任何 crates.io 依赖**，因此不存在 "外部 crate 里的 `unsafe` 我们无法审计" 的问题
 （`tests/rust_safety.rs::no_third_party_dependencies` 强制）。
 
@@ -134,14 +134,14 @@ DS 偏移是 const generic（`ds_read_b128::<OFF>`），构建期断言：
 ### 2.6 DSL IR 层的类型化
 
 - 纯值 SSA（`ValueId`）+ 显式循环变量（`VarId`），作用域检查（loop/if 内定义的值不能外泄）。
-- 循环变量的**顺序语义**（读到本迭代路径上最后一次 `set_var`；由 lowering 的单寄存器实现保证，`crates/amdgpu-compiler/tests/var_semantics.rs` 固定）。
+- 循环变量的**顺序语义**（读到本迭代路径上最后一次 `set_var`；由 lowering 的单寄存器实现保证，`crates/amdgpu-codegen/tests/var_semantics.rs` 固定）。
 - 内存/MTBUF/MFMA 等算子都带 dtype/宽度/描述符类型，lowering 与 MIR verifier 双重检查。
 
 ### 2.7 证据：29 个 ui 编译失败用例
 
 `crates/amdgpu-safeasm/tests/ui/` 下有 29 个用例（28 个必须编译失败 + 1 个通过对照），覆盖：
 读未等的 `Pending`、重复等待、双写半 dword、非法对齐/偏移、悬垂 `Ready`、token 重复使用、`finish()` 未兑现、
-裸 op 白名单外的操作、`dst` 非 owned 等。`cargo test -p amdgpu-compiler --test compile_fail`（`compile_fail.rs` 驱动）。
+裸 op 白名单外的操作、`dst` 非 owned 等。`cargo test -p amdgpu-codegen --test compile_fail`（`compile_fail.rs` 驱动）。
 
 ---
 
@@ -157,12 +157,12 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 | `AsmBlock::from_parts` | safe-asm（IR 文本解析器专用） | 从 irv1 文本重建块时绕过 `Seq::finish` 的验证；编译器在 lowering 前对每个块照常复核（`pin_check` / hazard pass） | 复核失败 → `Err` |
 | irv1 解析与校验 | `crates/amdgpu-dsl/src/ir_text.rs` | 手改 IR 文本：语法/解码（带行号）、单次定义、`Let` 类型、id 范围、IR 验证器；`--from-ir` 编译默认再跑严格 `gpu_verify` | `Err` |
 | IR verifier | `crates/amdgpu-dsl` / compiler `lower.rs` | 类型/作用域/循环变量/算子合法性 | `Err` |
-| MIR verifier | `crates/amdgpu-compiler/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
+| MIR verifier | `crates/amdgpu-codegen/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
 | `asm_check::check_lite_contract` | compiler | last-arriver 的 lite 契约（全部访问 sc1、ticket sc0、barrier 前排空） | `Err` |
 | `pin_check` | compiler | pinned 段的显式 padding 弱于编译器规则 → 拒绝 | `Err` |
 | hazard/wait pass | compiler | 值级 hazard、物理 WAR/WAW、宽存储数据 WAR、vmcnt/lgkmcnt、在途 load 的物理 WAW、转换目的选择等待态 | 插入等待或报错 |
 | `gpu_verify` / 协议引擎 | compiler | 越界（含 64 位移动描述符、屏蔽哨兵回绕 GV-BUF-WRAP）、wave 一致分支、LDS tile 生命周期与存储复用（GV-TILE-ALIAS-RACE）、启动寄存器预算 | `Err`（严格模式）+ 证书计数 |
-| 结构化诊断 | `crates/amdgpu-compiler/src/diag.rs` | 把上面所有失败转成 JSON（code、语句、区域、Rust 源码位置、值、修复建议）；手写 JSON，零依赖 | 只读 |
+| 结构化诊断 | `crates/amdgpu-codegen/src/diag.rs` | 把上面所有失败转成 JSON（code、语句、区域、Rust 源码位置、值、修复建议）；手写 JSON，零依赖 | 只读 |
 
 **所有验证失败都是 `Result::Err`，不会 UB、不会生成"看起来对"的汇编。**
 
@@ -186,7 +186,7 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 | crate | `.unwrap()` | `.expect(…)` | `panic!/unreachable!/todo!` |
 |---|---:|---:|---:|
 | `amdgpu-dsl` | 22 | 21 | 1 |
-| `amdgpu-compiler` | 35 | 25 | 6 |
+| `amdgpu-codegen` | 35 | 25 | 6 |
 | `amdgpu-safeasm` | 0 | 13 | 0 |
 | `amdc` | 0 | 0 | 0 |
 | **合计** | 57 | 59 | 7 |
@@ -244,8 +244,8 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 复现：
 
 ```bash
-bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面数字
+bash tools/container/cargo.sh test -p amdgpu-codegen --test rust_safety -- --nocapture   # 4 项 + panic 面数字
 bash tools/container/cargo.sh test -p amdgpu-kernels --test safeasm | grep forbids      # safe-asm 无 unsafe
-bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
+bash tools/container/cargo.sh test -p amdgpu-codegen --test compile_fail                # 29 个 ui 用例
 bash tools/container/cargo.sh test                                                       # 82 targets / 362 tests
 ```

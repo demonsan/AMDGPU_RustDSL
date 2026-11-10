@@ -48,7 +48,7 @@ text is a debugging format (not parsed back).
 
 ## Structural equality / hash
 
-`amdgpu_dsl::print` (re-exported by `amdgpu_compiler::ir_print`):
+`amdgpu_dsl::print` (re-exported by `amdgpu_codegen::ir_print`):
 
 - `dsl_structural_eq(a, b)` / `dsl_structural_hash(f)`: full structural identity including args, contract, tiles/LDS plan, AGPR marks,
   register plan, region strategies and tuning fields; alpha-equivalent over `ValueId` / `VarId`. The function **name is not part** of the identity.

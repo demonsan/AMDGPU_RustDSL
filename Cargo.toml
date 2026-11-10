@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/amdgpu-dsl",
-    "crates/amdgpu-compiler",
+    "crates/amdgpu-codegen",
     "crates/amdc",
     "crates/amdgpu-safeasm",
     "crates/amdgpu-layout",

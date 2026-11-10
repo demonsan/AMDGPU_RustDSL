@@ -1,9 +1,9 @@
 //! Safe-asm sequences through the compiler: standalone assembly, hazard padding, equality with the DSL-built path, embedding via `Op::Asm`
 //! and the DS/VMEM scoreboard (`Pending` tokens).
 
-use amdgpu_compiler::asm::{block_insts, block_to_asm, block_to_mfunction};
-use amdgpu_compiler::mir::{MFunction, MInst, MOp, Src, VReg};
-use amdgpu_compiler::{compile, lower};
+use amdgpu_codegen::asm::{block_insts, block_to_asm, block_to_mfunction};
+use amdgpu_codegen::mir::{MFunction, MInst, MOp, Src, VReg};
+use amdgpu_codegen::{compile, lower};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
 use amdgpu_safeasm::examples::{pv_rowsum_phase, rowsum_chain_block};
 use amdgpu_safeasm::*;
@@ -32,7 +32,7 @@ fn safeasm_crate_forbids_unsafe_and_contains_none() {
 }
 
 fn assembles(asm: &str) {
-    let t = amdgpu_compiler::backend::LlvmTools::locate();
+    let t = amdgpu_codegen::backend::LlvmTools::locate();
     let clang = t.tool("clang");
     if !std::process::Command::new(&clang).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         eprintln!("SKIPPED: clang not runnable");
@@ -42,7 +42,7 @@ fn assembles(asm: &str) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("k.s"), asm).unwrap();
     let out = std::process::Command::new(&clang)
-        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(amdgpu_codegen::target::T.llvm.asm_args)
         .args(["-c", "-o"])
         .arg(dir.join("k.o"))
         .arg(dir.join("k.s"))
@@ -419,7 +419,7 @@ fn writing_an_input_port_is_refused() {
 #[test]
 fn coverage_matrix() {
     use amdgpu_safeasm::{HAND_WRITTEN_OPS, TYPED_OPS};
-    let tbl_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl");
+    let tbl_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-codegen/src/target/gfx950/llvm/llvm24.tbl");
     assert!(std::path::Path::new(tbl_path).exists(), "{tbl_path} not found (the LLVM MIR tables moved? update this path)");
     let tbl = std::fs::read_to_string(tbl_path).unwrap();
     let keys: Vec<String> = tbl
@@ -676,8 +676,8 @@ fn var_asm_n_binds_inout_ports_in_declaration_order() {
         b.store_f32(o, 0, xf);
         b.finish()
     };
-    let fa = amdgpu_compiler::lower::lower(&build(true)).unwrap();
-    let fd = amdgpu_compiler::lower::lower(&build(false)).unwrap();
+    let fa = amdgpu_codegen::lower::lower(&build(true)).unwrap();
+    let fd = amdgpu_codegen::lower::lower(&build(false)).unwrap();
     let smf = |m: &MFunction| m.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| i.op == MOp::VSmfmac16x16x128Fp8).count();
     assert_eq!(smf(&fa), 2);
     assert_eq!(smf(&fa), smf(&fd));
@@ -686,10 +686,10 @@ fn var_asm_n_binds_inout_ports_in_declaration_order() {
 /// chain instructions as the DSL path of the same phase (the DSL path adds its own address `v_add` and copies; the chain ops and their order match).
 #[test]
 fn cvt_chain_instruction_sequence_matches_the_dsl_path() {
-    use amdgpu_compiler::backend::OwnTail;
+    use amdgpu_codegen::backend::OwnTail;
     let chain = |name: &str| -> Vec<String> {
         let f = amdgpu_kernels::kernel_by_name(name).unwrap();
-        let asm = amdgpu_compiler::compile_with(&f, &OwnTail).unwrap().asm;
+        let asm = amdgpu_codegen::compile_with(&f, &OwnTail).unwrap().asm;
         asm.lines()
             .map(|l| l.trim().split_whitespace().next().unwrap_or("").to_string())
             .filter(|m| {
@@ -819,7 +819,7 @@ fn dsl_var_mfma_scale_c_lowers_with_distinct_dst_and_c() {
     let l = b.frag16_lane(Opnd::Var(vars[0]), 0);
     let lf = b.bitcast_f32(l);
     b.store_f32(o, 0, lf);
-    let m = amdgpu_compiler::lower::lower(&b.finish()).unwrap();
+    let m = amdgpu_codegen::lower::lower(&b.finish()).unwrap();
     let mf = m.blocks.iter().flat_map(|bl| bl.insts.iter()).find(|i| i.op == MOp::VMfmaScale32x32x64Fp8).unwrap();
     let d = mf.dst.unwrap();
     let c = if let Src::Reg(r) = mf.srcs[2] { r } else { panic!() };
@@ -851,8 +851,8 @@ fn unscaled_fp8_mfma_chain_zero_and_c_forms() {
 
 #[test]
 fn own_tail_chains_unscaled_mfma_without_nops_from_the_zero_form_on() {
-    use amdgpu_compiler::hazards::fix_value_hazards_opts;
-    use amdgpu_compiler::mir::{Block, MFunction, RClass};
+    use amdgpu_codegen::hazards::fix_value_hazards_opts;
+    use amdgpu_codegen::mir::{Block, MFunction, RClass};
     let mk = |insts: Vec<MInst>| {
         let mut b = Block::new(0);
         b.insts = insts;

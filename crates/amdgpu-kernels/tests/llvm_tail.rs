@@ -1,11 +1,11 @@
 //! Tests for the LLVM-tail backend. Tests that need the pinned llc skip (loudly) when it cannot
 //! be run; set ROCM_LLVM_BIN to the llvm/bin directory to force them.
 
-use amdgpu_compiler::backend::llvm20::{self, SigClass, Table};
-use amdgpu_compiler::backend::{probe, LlvmTail, LlvmTools, TailBackend, ALL_MOPS};
-use amdgpu_compiler::mir::*;
-use amdgpu_compiler::regalloc::Alloc;
-use amdgpu_compiler::{compile, compile_mir_alloc, compile_with};
+use amdgpu_codegen::backend::llvm20::{self, SigClass, Table};
+use amdgpu_codegen::backend::{probe, LlvmTail, LlvmTools, TailBackend, ALL_MOPS};
+use amdgpu_codegen::mir::*;
+use amdgpu_codegen::regalloc::Alloc;
+use amdgpu_codegen::{compile, compile_mir_alloc, compile_with};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 use std::collections::HashMap;
 
@@ -33,7 +33,7 @@ fn own_tail_is_the_default_and_unchanged() {
     for k in ["fmha_fwd_hd128_mxfp8_v3_t128", "probe_mfma_scale"] {
         let f = kernel_by_name(k).unwrap();
         let a = compile(&f).unwrap().asm;
-        let b = compile_with(&f, &amdgpu_compiler::backend::OwnTail).unwrap().asm;
+        let b = compile_with(&f, &amdgpu_codegen::backend::OwnTail).unwrap().asm;
         assert_eq!(a, b, "{k}");
     }
 }
@@ -46,7 +46,7 @@ fn every_kernel_exports_mir() {
             continue;
         }
         let f = kernel_by_name(k).unwrap();
-        let mir = amdgpu_compiler::export_mir(&f, &tail).unwrap_or_else(|e| panic!("{k}: {e}"));
+        let mir = amdgpu_codegen::export_mir(&f, &tail).unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(mir.contains("body:"), "{k}");
         assert!(mir.contains("S_ENDPGM"), "{k}");
         assert!(!mir.contains('{') || !mir.contains("{d}"), "{k}: unexpanded token");
@@ -200,11 +200,11 @@ fn drop_auto_waits_removes_only_auto_waits() {
     let mut total_dropped = 0usize;
     for k in ["probe_lds_self2", "probe_roles_loop", "probe_mfma_scale"] {
         let f = kernel_by_name(k).unwrap();
-        let mut m = amdgpu_compiler::lower::lower(&f).unwrap();
-        amdgpu_compiler::hazards::fix_value_hazards(&mut m);
-        let a = amdgpu_compiler::regalloc::allocate(&m).unwrap();
-        let keep = amdgpu_compiler::backend::llvm_mir::export_opts(&m, &a, false, false).unwrap().mir;
-        let drop = amdgpu_compiler::backend::llvm_mir::export_opts(&m, &a, false, true).unwrap().mir;
+        let mut m = amdgpu_codegen::lower::lower(&f).unwrap();
+        amdgpu_codegen::hazards::fix_value_hazards(&mut m);
+        let a = amdgpu_codegen::regalloc::allocate(&m).unwrap();
+        let keep = amdgpu_codegen::backend::llvm_mir::export_opts(&m, &a, false, false).unwrap().mir;
+        let drop = amdgpu_codegen::backend::llvm_mir::export_opts(&m, &a, false, true).unwrap().mir;
         let n = |s: &str| s.lines().filter(|l| l.trim_start().starts_with("S_WAITCNT")).count();
         let explicit = m
             .blocks
@@ -239,7 +239,7 @@ fn exported_flags_pass_the_machine_verifier() {
             }
         }
         let f = kernel_by_name(k).unwrap();
-        let (m, a) = match amdgpu_compiler::compile_mir_alloc(&f) {
+        let (m, a) = match amdgpu_codegen::compile_mir_alloc(&f) {
             Ok(x) => x,
             Err(e) => {
                 bad.push(format!("{k}: {e}"));
@@ -271,7 +271,7 @@ fn metadata_args_match_the_dsl_args_without_padding() {
         }
         let f = kernel_by_name(k).unwrap();
         let (m, _) = compile_mir_alloc(&f).unwrap();
-        let asm = match amdgpu_compiler::compile_with(&f, &tail) {
+        let asm = match amdgpu_codegen::compile_with(&f, &tail) {
             Ok(c) => c.asm,
             Err(e) => {
                 bad.push(format!("{k}: {e}"));
@@ -346,7 +346,7 @@ fn metadata_args_match_the_dsl_args_without_padding() {
 /// Kernels that use own-backend-only MOps (the LDS-DMA loads) cannot go through the LLVM tail (llc aborts on them).
 fn llvm_tail_supported(name: &str) -> bool {
     let Some(f) = amdgpu_kernels::kernel_by_name(name) else { return true };
-    match amdgpu_compiler::compile_mir(&f) {
+    match amdgpu_codegen::compile_mir(&f) {
         Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds | MOp::VMovDpp | MOp::VMovDppX | MOp::VAddF32Dpp | MOp::VSubF32Dpp | MOp::VMulF32Dpp | MOp::VMaxF32Dpp | MOp::VMinF32Dpp | MOp::VAddU32Dpp | MOp::VMaxI32Dpp | MOp::VMinI32Dpp | MOp::VMaxU32Dpp | MOp::VMinU32Dpp | MOp::VAndB32Dpp | MOp::VOrB32Dpp | MOp::VXorB32Dpp))),
         Err(_) => true,
     }

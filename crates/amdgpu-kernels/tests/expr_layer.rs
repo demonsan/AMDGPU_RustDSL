@@ -1,7 +1,7 @@
 //! The operator expression layer (`amdgpu_dsl::expr`) lowers to EXACTLY the ops of the manual API: the demo kernels written with operators compile to the same assembly
 //! (instruction by instruction, the kernel name aside) and the same post-RA MIR as their hand-written twins, and the documented decompositions of the operators the IR has no
 //! single op for are semantically right.
-use amdgpu_compiler::{compile, compile_mir_alloc};
+use amdgpu_codegen::{compile, compile_mir_alloc};
 use amdgpu_kernels::{kernel_by_name};
 use amdgpu_dsl::{DType, FnBuilder, Op, I32};
 
@@ -36,7 +36,7 @@ fn the_demo_kernels_are_registered_and_verify_strict() {
     for k in ["probe_expr_ids", "probe_expr_kernarg"] {
         assert!(amdgpu_kernels::kernel_names().contains(&k), "{k} registered");
         let f = kernel_by_name(k).unwrap();
-        let r = amdgpu_compiler::gpu_verify::analyse(&f).unwrap();
+        let r = amdgpu_codegen::gpu_verify::analyse(&f).unwrap();
         assert!(r.errors().is_empty(), "{k}: {}", r.render());
     }
 }

@@ -11,11 +11,11 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg-$USER}"
 export AMD_ROCM_MOUNT="${AMD_ROCM_MOUNT:-/shared/apps/ubuntu/opt/rocm-10.1.0 /shared/amdgpu/home/blyu_qle/llvm-tools}"
 export AMD_LLVM_BIN="${AMD_LLVM_BIN:-/shared/apps/ubuntu/opt/rocm-10.1.0}"
 mkdir -p "$XDG_RUNTIME_DIR" "$TARGET" "$D/out"
-echo "[review2] cargo build -p amdgpu-safeasm -p amdgpu-compiler -p amdgpu-dsl"
-bash tools/container/cargo.sh build -q -p amdgpu-safeasm -p amdgpu-compiler -p amdgpu-dsl 2>&1 | tail -3
+echo "[review2] cargo build -p amdgpu-safeasm -p amdgpu-codegen -p amdgpu-dsl"
+bash tools/container/cargo.sh build -q -p amdgpu-safeasm -p amdgpu-codegen -p amdgpu-dsl 2>&1 | tail -3
 deps="$TARGET/debug/deps"
 newest() { ls -1t "$deps"/lib$1-*.rlib 2>/dev/null | head -1; }
-SAFEASM="$(newest amdgpu_safeasm)"; COMPILER="$(newest amdgpu_compiler)"; DSL="$(newest amdgpu_dsl)"
+SAFEASM="$(newest amdgpu_safeasm)"; COMPILER="$(newest amdgpu_codegen)"; DSL="$(newest amdgpu_dsl)"
 echo "[review2] rlibs: $(basename "$SAFEASM") $(basename "$COMPILER") $(basename "$DSL")"
 crustc() {
   podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host \
@@ -26,7 +26,7 @@ crustc() {
 compile_case() {
   local extra=(--edition 2021 --crate-type bin --crate-name uicase -L dependency=/target/debug/deps
                --extern "amdgpu_safeasm=/target/debug/deps/$(basename "$SAFEASM")")
-  grep -q "amdgpu_compiler" "$1" && extra+=(--extern "amdgpu_compiler=/target/debug/deps/$(basename "$COMPILER")")
+  grep -q "amdgpu_codegen" "$1" && extra+=(--extern "amdgpu_codegen=/target/debug/deps/$(basename "$COMPILER")")
   grep -q "amdgpu_dsl" "$1" && extra+=(--extern "amdgpu_dsl=/target/debug/deps/$(basename "$DSL")")
   crustc "${extra[@]}" -o "/target/uicase-$2" "scratch/safeasm-review2/cases/$(basename "$1")" 2>&1
 }

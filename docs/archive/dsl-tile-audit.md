@@ -75,7 +75,7 @@ they are the abstraction implementation, not kernel code.
 
 ## 3. Safety: generated contracts/markers vs hand, and attacks
 
-`crates/amdgpu-compiler/tests/dsl_tile_audit.rs` (3/3 pass):
+`crates/amdgpu-codegen/tests/dsl_tile_audit.rs` (3/3 pass):
 
 | DSL kernel | DSL: errors / ledger / contracts | hand: errors / ledger / contracts | tile proof |
 |---|---|---|---|

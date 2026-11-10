@@ -6,7 +6,7 @@
 //! `exp2(x * log2 e)`, and transcendental results must be protected by wait
 //! states.
 
-use amdgpu_compiler::{compile};
+use amdgpu_codegen::{compile};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 
 // The descriptor/register-accounting invariants live in `register_accounting.rs`, which parses the

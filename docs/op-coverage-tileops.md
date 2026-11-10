@@ -23,7 +23,7 @@ TIRx 只有两个 tile 操作（[Tile Operations](https://tvm.apache.org/tirx/pr
 | `apply`（拷贝 / MMA） | `TiledCopy` / `TiledMma`、`partition_{lds,dma,buffer_dma,global}`：按 TV 布局把 atom 重复到视图上，构建期证明覆盖 / 连续 / 对齐 / bank / 操作数匹配 | `crates/amdgpu-tile/src/{copy,mma}.rs` |
 | `apply`（算术，选定指令） | 直接调 DSL op（`Op::PkMulF32` …）或 safe-asm（指定指令形式与等待态） | `crates/amdgpu-dsl`、`crates/amdgpu-safeasm` |
 | `ewise` | 表达式层（`I32/F32` 运算符）在片段 lane 上的手写循环；stage 库通用原语 E（逐元素）/ R（归约）/ Q（量化） | `crates/amdgpu-dsl/src/expr.rs`、`crates/amdgpu-tile/src/prims.rs` |
-| 同步由调用者负责 | 同；但 `s_waitcnt` 由编译器插入，协议由 `gpu_verify` 证明 | `crates/amdgpu-compiler` |
+| 同步由调用者负责 | 同；但 `s_waitcnt` 由编译器插入，协议由 `gpu_verify` 证明 | `crates/amdgpu-codegen` |
 
 **差距**：没有一个统一的 `apply(atom, view…)` 入口——拷贝与 MMA 有，**VALU / 转换 / 跨 lane（DPP、permlane、bpermute）没有 atom 化**；`ewise`
 没有统一形式（各组件手写 lane 循环），也不会自动把成对元素选成 packed 指令。

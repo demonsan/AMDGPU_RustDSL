@@ -1,6 +1,6 @@
 //! Tile library layers 1-3 (docs/dsl-tile-abstractions.md): tensor views generate the FMHA host contract, the LDS plan reproduces `fmha_vs_tiles`,
 //! and a two-role DMA ring pipeline written with the library is accepted by `gpu_verify` with zero errors (and is rejected when the protocol is broken).
-use amdgpu_compiler::gpu_verify::{analyse, Severity};
+use amdgpu_codegen::gpu_verify::{analyse, Severity};
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, VarId, I32};
 
@@ -218,7 +218,7 @@ fn library_ring_pipeline_verifies_strict_clean_and_compiles() {
     let f = demo(0);
     let e = errs(&f);
     assert!(e.is_empty(), "{}", e.join("\n"));
-    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let c = amdgpu_codegen::compile(&f).expect("compile");
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     // A: K tile 4 + K scale 1 per stage, B: V tile 4; each role stages in the prologue and once per loop iteration
     assert_eq!(n("global_load_lds_dwordx4"), 16, "{}", c.asm);
@@ -331,7 +331,7 @@ fn one_window_three_slot_ring_verifies() {
     let e: Vec<String> = r.findings.iter().filter(|x| x.severity != Severity::Info).map(|x| format!("[{}] {:?} {}", x.code, x.severity, x.msg)).collect();
     eprintln!("ring3 findings:\n{}\nproven {:?}", e.join("\n"), r.proven);
     assert!(errs(&f).is_empty(), "{}", e.join("\n"));
-    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let c = amdgpu_codegen::compile(&f).expect("compile");
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     assert_eq!(n("s_barrier"), 2, "P0 + one per steady tile (the tail has none)");
 }
@@ -425,7 +425,7 @@ fn t128_style_staging_verifies() {
     let f = b.finish();
     let e = errs(&f);
     assert!(e.is_empty(), "{}", e.join("\n"));
-    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let c = amdgpu_codegen::compile(&f).expect("compile");
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     assert_eq!(n("global_load_lds_dwordx4"), 3 * 8, "K + V per stage, 3 stages (2 prologue + loop)");
     assert_eq!(n("ds_write_b32"), 3, "the K-scale dword of each stage");

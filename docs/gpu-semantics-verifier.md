@@ -1,6 +1,6 @@
 # GPU 语义验证器（gpu_verify v1）：全局内存 / LDS / VGPR / SGPR 的越界与生命周期证明
 
-> 实现：`crates/amdgpu-compiler/src/gpu_verify.rs`；DSL 合同 API：`crates/amdgpu-dsl/src/lib.rs`（`Ext`、`arg_tensor`、`arg_tensor_slack`、`ka_range`、`ka_is`、`grid_is`、`sym_range`、`assume`）；测试：`crates/amdgpu-kernels/tests/gpu_semantics.rs`；命令行：`amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]`。
+> 实现：`crates/amdgpu-codegen/src/gpu_verify.rs`；DSL 合同 API：`crates/amdgpu-dsl/src/lib.rs`（`Ext`、`arg_tensor`、`arg_tensor_slack`、`ka_range`、`ka_is`、`grid_is`、`sym_range`、`assume`）；测试：`crates/amdgpu-kernels/tests/gpu_semantics.rs`；命令行：`amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]`。
 > 本文是**语义模型与边界**。它说明 v1 证明了什么、依赖什么假设、哪些**没有**被证明（第 8 节），避免“编译器保证安全”被过度解读。
 
 ## 0. 一句话
@@ -92,7 +92,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 **协议模拟**：对 kernel 的控制骨架按**波角色**（工作项 id 相关的 `if` 的 then/else 两侧）分别**具体执行**，每个循环展开 1..=4 次（`BreakIf` 条件已知为真则提前退出），以**动态 barrier 序号**（phase）给每个事件编号；slot/version 表达式按循环变量的具体值求值。
 
 * **发布**：一次 `tile_produce` 在其写**完成**（DMA 须 `wait_vm(0)`，DS 写须 `wait_lds(0)`；部分计数不视为完成）之后的**第一个 barrier** 处对其他 wave 发布（可见相位 = 该 barrier 序号 + 1）；同一 wave 自己读则只需完成。
-* **读**（`tile_consume`）必须：(1) 看到**已发布的**最新版本，且版本号 **恰为期望值**（否则 `GV-TILE-STALE`，消息给出看到的版本、生产者角色/语句、发布相位）；(2) 同版本的所有协作生产者（多 wave 各写一部分）都已发布；(3) 读必须有**收尾等待**（之后第一个 `wait_lds(0)`；带计数的 `wait_lds(n>0)` 不算，因为调度器可重排独立的 DS 读）。读可以**跨 barrier 在途**（厂商的 V 预读：mid barrier 前发出、之后才收尾），其生命周期是 `[发出相位, 收尾等待所在相位]`；只有根本没有收尾等待、后面又有 barrier 时才报 `GV-TILE-PENDING`（Warn）；(4) 其他 wave（含本角色）对同一槽写**别的版本**的窗口 `[发出相位, 发布相位)` 不得与读的生命周期 `[读相位, 收尾相位]` 重叠——在 barrier 之后、收尾等待之前写同一槽即 `GV-TILE-RACE`（攻击测试 `crates/amdgpu-compiler/tests/gpu_tile_inflight.rs`）（否则 `GV-TILE-RACE`：例如单缓冲被下一轮覆盖、读旧版本时下一版本已落地）。
+* **读**（`tile_consume`）必须：(1) 看到**已发布的**最新版本，且版本号 **恰为期望值**（否则 `GV-TILE-STALE`，消息给出看到的版本、生产者角色/语句、发布相位）；(2) 同版本的所有协作生产者（多 wave 各写一部分）都已发布；(3) 读必须有**收尾等待**（之后第一个 `wait_lds(0)`；带计数的 `wait_lds(n>0)` 不算，因为调度器可重排独立的 DS 读）。读可以**跨 barrier 在途**（厂商的 V 预读：mid barrier 前发出、之后才收尾），其生命周期是 `[发出相位, 收尾等待所在相位]`；只有根本没有收尾等待、后面又有 barrier 时才报 `GV-TILE-PENDING`（Warn）；(4) 其他 wave（含本角色）对同一槽写**别的版本**的窗口 `[发出相位, 发布相位)` 不得与读的生命周期 `[读相位, 收尾相位]` 重叠——在 barrier 之后、收尾等待之前写同一槽即 `GV-TILE-RACE`（攻击测试 `crates/amdgpu-codegen/tests/gpu_tile_inflight.rs`）（否则 `GV-TILE-RACE`：例如单缓冲被下一轮覆盖、读旧版本时下一版本已落地）。
 * **写写**：不同 wave 并发写同一槽**不同版本** → `GV-TILE-RACE`；同一版本（协作填充）允许。
 * **每条 producer→consumer 边在所有角色上都跨 barrier**：由“发布相位 ≤ 读相位”与两侧动态 barrier 计数相等（v1 的 `GV-BAR`）共同保证。
 

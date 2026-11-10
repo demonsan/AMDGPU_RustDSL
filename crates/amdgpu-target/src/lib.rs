@@ -1,6 +1,6 @@
-//! Target descriptions (docs/target-design.md): plain data, no dependencies. The passes of `amdgpu-compiler` read every
+//! Target descriptions (docs/target-design.md): plain data, no dependencies. The passes of `amdgpu-codegen` read every
 //! architecture fact from a `Target` instead of a constant of their own; the per-instruction tables that name `MOp` live in
-//! `amdgpu-compiler/src/target/<name>/`.
+//! `amdgpu-codegen/src/target/<name>/`.
 #![forbid(unsafe_code)]
 
 pub mod gfx950;

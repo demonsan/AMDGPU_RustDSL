@@ -2,8 +2,8 @@
 //! hardware: in the asm of probe_valu_sgpr every SGPR written by `v_readfirstlane` is read by a VMEM instruction only after >= 5 wait states
 //! and by a VALU instruction only after >= 2 (the hardware read a stale buffer soffset without them).
 
-use amdgpu_compiler::backend::OwnTail;
-use amdgpu_compiler::compile_with;
+use amdgpu_codegen::backend::OwnTail;
+use amdgpu_codegen::compile_with;
 use amdgpu_kernels::kernel_by_name;
 
 /// wait states of an asm line: `s_nop k` = k + 1, any other instruction 1, labels / directives / blank 0
@@ -73,6 +73,6 @@ fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
 #[test]
 fn the_check_bites_without_the_hazard_pass() {
     let f = kernel_by_name("probe_valu_sgpr").expect("registered");
-    let asm = amdgpu_compiler::hazards::testing::without_valu_sgpr(|| compile_with(&f, &OwnTail).expect("compiles").asm);
+    let asm = amdgpu_codegen::hazards::testing::without_valu_sgpr(|| compile_with(&f, &OwnTail).expect("compiles").asm);
     assert!(check(&asm).is_err(), "the regression check did not detect the missing VALU-writes-SGPR padding");
 }

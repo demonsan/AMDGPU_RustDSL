@@ -64,7 +64,7 @@ The detail and the exact citations for each row are in the subsection named in t
 
 ## 2. gfx950 ↔ gfx1250 differences and the L4 passes (own analysis)
 
-How each L4 component of today's backend (`crates/amdgpu-compiler`) relates to a gfx1250 target. The gfx1250 column states only facts
+How each L4 component of today's backend (`crates/amdgpu-codegen`) relates to a gfx1250 target. The gfx1250 column states only facts
 cited in §3–§7. Classes:
 - **generic**: algorithm and numbers unchanged;
 - **re-parameterized**: same algorithm, numbers or tables from `Target`;

@@ -1,7 +1,7 @@
 //! gpu_verify v4 protocol model: the four axes (arrival / completion / visibility / generation) and the four obligations (O1 complete-before-publish, O2 publish-before-read,
 //! O3 read-before-overwrite, O4 generation-consistency) on LDS (legacy GV-TILE-* names with GV-PROTO-* aliases) and on GLOBAL regions (GV-PROTO-* names), the opt-in fused
 //! KV-split combine (last-arriver) pattern, and the counted trust ledger. See docs/gpu-semantic-protocol.md.
-use amdgpu_compiler::gpu_verify::{verify_ir, Ledger, Report, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, Ledger, Report, Severity};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, Stmt};
 
 fn has(r: &Report, code: &str) -> bool {

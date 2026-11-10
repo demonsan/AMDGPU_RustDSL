@@ -1,7 +1,7 @@
 //! Tile library layer 4: fragments with layouts and tile-level MFMA. A one-group pipeline (4 waves stage K, K scales and V; QK(0) in the prologue, PV(t) +
 //! QK(t+1) in the matrix phase) written with the library: gpu_verify 0 errors, and the emitted instruction mix is the FMHA one (8 scaled MFMAs + 4 f16 bias
 //! MFMAs per QK tile, 8 per PV tile, 2 x ds_read_b128 per K fragment pair, 4 x ds_read_b64_tr_b8 per V fragment).
-use amdgpu_compiler::gpu_verify::{analyse, Severity};
+use amdgpu_codegen::gpu_verify::{analyse, Severity};
 use amdgpu_tile::frag::*;
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
@@ -117,7 +117,7 @@ fn qk_pv_tiles_verify_and_emit_the_fmha_instruction_mix() {
     let r = analyse(&f).expect("analyse");
     let e: Vec<String> = r.findings.iter().filter(|x| x.severity == Severity::Error).map(|x| format!("[{}] {}", x.code, x.msg)).collect();
     assert!(e.is_empty(), "{}", e.join("\n"));
-    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let c = amdgpu_codegen::compile(&f).expect("compile");
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     // QK: prologue + loop = 2 x (8 scaled + 4 f16); PV: loop + 2 tail copies = 3 x 8 scaled
     assert_eq!(n("v_mfma_scale_f32_32x32x64_f8f6f4"), 2 * 8 + 3 * 8, "{}", c.asm);

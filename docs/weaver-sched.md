@@ -1,6 +1,6 @@
 # 按编织区域（weave region）选择调度策略
 
-状态：已实现并在 Main 上（`crates/amdgpu-compiler/src/sched/region.rs`）。**没有声明区域时一切不变**（所有 kernel 的 asm md5 逐个相同）。
+状态：已实现并在 Main 上（`crates/amdgpu-codegen/src/sched/region.rs`）。**没有声明区域时一切不变**（所有 kernel 的 asm md5 逐个相同）。
 
 ## 区域从哪来
 
@@ -17,7 +17,7 @@ b.declare_region("m_phase", /*authored*/ true, /*tokens*/ "ldsink=1");
 - `authored = false`：区域的 token（`AMDC_SCHED_OPTS` 词汇，新增 `reorder` = 打开 list 调度）叠加在 kernel 的选项之上，只作用于该区域的指令。
 - 没有声明的区域继承它所嵌套的区域的策略（最外层 = kernel 默认）。
 
-`Options::regions[k-1]` 是第 k 个声明，`Options::region_of[id]` 把 lowering 的区域号映射到策略号（`amdgpu-compiler/src/lib.rs` 的 `region_strategies`）。
+`Options::regions[k-1]` 是第 k 个声明，`Options::region_of[id]` 把 lowering 的区域号映射到策略号（`amdgpu-codegen/src/lib.rs` 的 `region_strategies`）。
 
 ## 调度器怎么用
 
@@ -43,4 +43,4 @@ b.declare_region("m_phase", /*authored*/ true, /*tokens*/ "ldsink=1");
 也就是说：Weaver 的声明顺序做 m_phase 时比 list 调度器差 3–10 %（list 调度器在该区域里确实有用），`v_phase`（decide + convert）authored 对 per-CU 有 +3 % 但对大形状略负。
 `pexact` / `search` / `ovl` 等只在 1-wave 原型上有微弱收益，已淘汰且代码已删除（结果见 [`lgkm-lookahead.md`](lgkm-lookahead.md)）。区域可用的策略 token：`rewait`、`reorder`、`ldshoist` / `hoist=N`、`slotfill`、`ldsink=D`、`ldahead32=D`、`wsink`、`hzfill`（authored 区域里 `reorder` / `slotfill` / `ldshoist` 不会生效）。
 
-测试：`crates/amdgpu-compiler/tests/sched_regions.rs`（run 划分、authored / free、token 只在区域内生效、后处理不跨边界、authored 不能被 token 解锁、策略号映射）、`tests/sched_regions_lower.rs`（按名字声明、嵌套继承、两个实例同一策略）、`crates/amdgpu-kernels/tests/hzfill.rs`（`hzfill` 作为区域选项）。
+测试：`crates/amdgpu-codegen/tests/sched_regions.rs`（run 划分、authored / free、token 只在区域内生效、后处理不跨边界、authored 不能被 token 解锁、策略号映射）、`tests/sched_regions_lower.rs`（按名字声明、嵌套继承、两个实例同一策略）、`crates/amdgpu-kernels/tests/hzfill.rs`（`hzfill` 作为区域选项）。

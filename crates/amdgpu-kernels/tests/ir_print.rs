@@ -1,5 +1,5 @@
 //! Item D: readable IR printing + alpha-equivalent structural equality.
-use amdgpu_compiler::ir_print::{canonical_dsl_body, dsl_body_structural_eq, dsl_body_structural_hash, dsl_structural_eq, dsl_structural_hash, print_dsl, print_mir};
+use amdgpu_codegen::ir_print::{canonical_dsl_body, dsl_body_structural_eq, dsl_body_structural_hash, dsl_structural_eq, dsl_structural_hash, print_dsl, print_mir};
 use amdgpu_kernels::kernel_by_name;
 
 #[test]
@@ -63,12 +63,12 @@ fn dsl_printer_is_structured_and_shows_types_operands_and_markers() {
 #[test]
 fn mir_printer_shows_blocks_ops_and_registers() {
     let f = kernel_by_name("probe_expr_kernarg").unwrap();
-    let m = amdgpu_compiler::lower::lower(&f).unwrap();
+    let m = amdgpu_codegen::lower::lower(&f).unwrap();
     let text = print_mir(&m, None);
     assert!(text.starts_with("mir @probe_expr_kernarg"), "header");
     assert!(text.contains("  b0:"), "block 0");
     assert!(text.contains(":V"), "virtual register class");
-    let (ma, a) = amdgpu_compiler::compile_mir_alloc(&f).unwrap();
+    let (ma, a) = amdgpu_codegen::compile_mir_alloc(&f).unwrap();
     let ra = print_mir(&ma, Some(&a));
     assert!(ra.contains(":V") && (ra.contains(" v") || ra.contains(" s")), "physical registers");
 }

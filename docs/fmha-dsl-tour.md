@@ -44,7 +44,7 @@ amdgpu-tile     部件：TiledCopy / TiledMma / partition_*、DMA 分区、Onlin
                 opgraph/：算子图、切分、骨架生成器
 amdgpu-kernels  fmha/：graph.rs（算子图）→ skeleton_*.rs（生成的骨架）→ mod.rs（slot 实现、stage 实例、部件组装）
         ↓  amdgpu-dsl 的 Function（结构化 IR；Node::Stage 区域 + weave 区域标记，均不产生代码）
-amdgpu-compiler 下降、调度（按区域的策略）、寄存器分配、GPU 语义验证器（含 GV-STAGE）、gfx950 汇编
+amdgpu-codegen 下降、调度（按区域的策略）、寄存器分配、GPU 语义验证器（含 GV-STAGE）、gfx950 汇编
 ```
 
 FMHA 计算 `O = softmax(Q K^T) V`：

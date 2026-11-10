@@ -37,7 +37,7 @@ cadence's declared compute order; the actual generated IR was separately verifie
 and the GEMM gate. The test is a proof of the layout compositions, not a replacement for the
 runtime CPU reference.
 
-## E2 — online-softmax rebase/rollback recurrence (`amdgpu-compiler/tests/functional_proofs.rs`)
+## E2 — online-softmax rebase/rollback recurrence (`amdgpu-codegen/tests/functional_proofs.rs`)
 
 For one row with arbitrary length, real arithmetic. Streaming state after a prefix:
 
@@ -71,7 +71,7 @@ Run:
 
 ```bash
 cargo test -p amdgpu-kernels --test functional_gemm -- --nocapture
-cargo test -p amdgpu-compiler --test functional_proofs -- --nocapture
+cargo test -p amdgpu-codegen --test functional_proofs -- --nocapture
 ```
 
 ## Relationship to the design doc

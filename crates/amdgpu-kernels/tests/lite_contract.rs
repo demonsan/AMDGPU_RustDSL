@@ -1,7 +1,7 @@
 //! The lite fused-combine contract, checked statically on emitted assembly (own backend and LLVM tail).
-use amdgpu_compiler::asm_check::check_lite_contract;
-use amdgpu_compiler::backend::{LlvmTail, OwnTail};
-use amdgpu_compiler::{compile_with};
+use amdgpu_codegen::asm_check::check_lite_contract;
+use amdgpu_codegen::backend::{LlvmTail, OwnTail};
+use amdgpu_codegen::{compile_with};
 use amdgpu_kernels::{kernel_by_name};
 
 fn asm_of(name: &str, backend: &str) -> String {

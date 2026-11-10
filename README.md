@@ -108,7 +108,7 @@ crates/amdgpu-isa       gfx950 atom 表：copy atom 与 MMA/smfmac atom（A/B/C 
 crates/amdgpu-dsl       类型化 kernel IR（区域树：Loop/If/Region/Stage + 编织区域、寄存器规划、区域策略）+ FnBuilder + 表达式层 + 形状特化 + irv1 文本打印/解析 + α 结构相等
 crates/amdgpu-tile      全部 tile 抽象：TiledCopy/TiledMma/partition_*、行拷贝、pipeline、softmax、reduce、epilogue、DMA/bufdma、handoff；stage 库与通用原语、weaver、算子图/骨架生成
 crates/amdgpu-kernels   全部 kernel（算子图 → 骨架 → slot + stage 实例）：fmha/（v3 出厂四件 + auto、bf16 prefill / decode / MLA / 反向）、gemm/（MXFP8 v4 与 GEMM 族、MoE、卷积）、mlp/、norm/、rows/ eltwise/ dequant/ rope/ cache/ moe/ topk/ sampling/（访存受限算子）、probes/、verifier_cases/ + 按名注册表与 dispatch；IR 功能证明执行器
-crates/amdgpu-compiler  编译器 + 验证器：MIR（算子属性表）、lowering、调度器（list/slotfill、按区域策略）、线性扫描 RA（含 AGPR、寄存器规划）、hazard/wait、hzfill、asm 发射、LLVM MIR 桥、gpu_verify/协议引擎/功能证明；不依赖 kernels/tile
+crates/amdgpu-codegen  编译器 + 验证器：MIR（算子属性表）、lowering、调度器（list/slotfill、按区域策略）、线性扫描 RA（含 AGPR、寄存器规划）、hazard/wait、hzfill、asm 发射、LLVM MIR 桥、gpu_verify/协议引擎/功能证明；不依赖 kernels/tile
 crates/amdgpu-safeasm   手写热点窗口用的 safe Rust asm DSL（typed 寄存器 + 所有权 token + 验证器 + pin）
 crates/amdc             CLI（list / emit / print-ir / ir-check / regplan / summary / srcmap / jit-info / gpu-verify / gen-host / opgraph / skeleton / backend / simmodel / mops / mir-roundtrip；`--json`）+ hostgen、jit 库
 tests/gpu/              端到端：ref_host（我们 vs 厂商 vs CPU）、run_ref、determinism、split 压力、gemm_ref_host、mlp_host、探针 host、生成的主机 ABI（generated/）
@@ -171,7 +171,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 - 基于 `gfx950`；`gfx1250` 只在架构层面预留（未验证）。
 - `llvm20` 方言的表行是 `llvm24` 的拷贝，仅 pinned `llvm24` 的 `llc` 做过机器验证。
 - DMA / LDS 直达 / `buffer_load … lds` 等为 own-only；使用它们的 kernel 自动选 own 后端。
-- 编译策略按 kernel profile 固定（`crates/amdgpu-compiler/src/lib.rs`）；实验开关、别名 kernel 与负结果变体已在 2026-11 整理中删除（结论在 `docs/archive/`，实验分支归档为 `archive/*` tag）。
+- 编译策略按 kernel profile 固定（`crates/amdgpu-codegen/src/lib.rs`）；实验开关、别名 kernel 与负结果变体已在 2026-11 整理中删除（结论在 `docs/archive/`，实验分支归档为 `archive/*` tag）。
 
 ## 许可
 

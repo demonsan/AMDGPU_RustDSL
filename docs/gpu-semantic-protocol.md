@@ -1,6 +1,6 @@
 # GPU 语义协议模型（v4）：到达 / 完成 / 可见 / 代际 四件事分开建模
 
-> 实现：`crates/amdgpu-compiler/src/gpu_protocol.rs`（由原 tile 模拟器重构而来的通用协议引擎）；DSL 标记：`lds_tile/lds_ring/lds_private/lds_alias`、`tile_produce/tile_consume/tile_end`（LDS 实例）与 `buf_region/buf_produce/buf_consume/buf_last_arriver/buf_trust`（全局内存实例）；测试：`tests/gpu_tiles.rs`、`tests/gpu_protocol.rs`。
+> 实现：`crates/amdgpu-codegen/src/gpu_protocol.rs`（由原 tile 模拟器重构而来的通用协议引擎）；DSL 标记：`lds_tile/lds_ring/lds_private/lds_alias`、`tile_produce/tile_consume/tile_end`（LDS 实例）与 `buf_region/buf_produce/buf_consume/buf_last_arriver/buf_trust`（全局内存实例）；测试：`tests/gpu_tiles.rs`、`tests/gpu_protocol.rs`。
 > 本文是**形式模型**。`docs/gpu-semantics-verifier.md` 讲边界/地址/寄存器；本文讲“多个生产者、多个消费者之间的同步协议”到底在证明什么。风格不变：**声明式标记，没有新的类型/struct API**。
 
 ## 1. 为什么要把四件事分开

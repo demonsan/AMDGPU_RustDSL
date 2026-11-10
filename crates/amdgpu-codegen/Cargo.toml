@@ -1,0 +1,16 @@
+[package]
+name = "amdgpu-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Backend: lowering, register allocation and gfx950 assembly emission"
+
+[dependencies]
+amdgpu-sym = { path = "../amdgpu-sym" }
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-safeasm = { path = "../amdgpu-safeasm" }
+amdgpu-target = { path = "../amdgpu-target" }
+
+[dev-dependencies]
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-safeasm = { path = "../amdgpu-safeasm", features = ["test-support"] }

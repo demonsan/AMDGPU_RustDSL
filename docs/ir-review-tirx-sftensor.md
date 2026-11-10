@@ -14,7 +14,7 @@
 |---|---|---|
 | DSL IR | 封闭枚举 `Op`（值，SSA `ValueId`）+ `Stmt`（副作用语句）；**扁平语句列表**，结构靠成对标记：`BeginLoop/EndLoop`、`BeginIf/Else/EndIf`、`TileProduce…TileEnd` | `crates/amdgpu-dsl/src/lib.rs`（`enum Op` L129，`enum Stmt` L561） |
 | 上层库 | `expr.rs`（纯数据表达式树）、`amdgpu-layout`（`Ix`/`Layout`/`Swizzle`/证明）、`amdgpu-tile`（TiledCopy/TiledMma/Pipeline） | 生成上面的 `Op/Stmt` |
-| MIR | 封闭枚举 `MOp`（约 125 个）→ 调度 → RA → hazard/wait → emit / LLVM tail | `crates/amdgpu-compiler/src/` |
+| MIR | 封闭枚举 `MOp`（约 125 个）→ 调度 → RA → hazard/wait → emit / LLVM tail | `crates/amdgpu-codegen/src/` |
 | 验证 | `gpu_verify`（区间 + possible-bits + box 规则、合同 `Ext`）+ 协议引擎（角色路径 / 相位 / 代际） | `gpu_verify.rs`、`gpu_protocol.rs` |
 
 三个已经反复付出代价的结构性问题：

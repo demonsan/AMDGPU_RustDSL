@@ -1,8 +1,8 @@
 //! GPU-semantics verifier (`gpu_verify`): positive cases (shipped kernels, annotated toy kernels) and one NEGATIVE case per error class.
 //! The error taxonomy and the model are documented in docs/gpu-semantics-verifier.md.
-use amdgpu_compiler::gpu_verify::{analyse, verify_ir, verify_mir, Report, Severity};
-use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, Pred, RClass, Term};
-use amdgpu_compiler::regalloc::Alloc;
+use amdgpu_codegen::gpu_verify::{analyse, verify_ir, verify_mir, Report, Severity};
+use amdgpu_codegen::mir::{Block, MFunction, MInst, MOp, Pred, RClass, Term};
+use amdgpu_codegen::regalloc::Alloc;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd};
 
 fn has(rep: &Report, code: &str) -> bool {
@@ -428,7 +428,7 @@ fn shipped_kernels_pass_the_enforced_mir_level_checks() {
         let mir_errors: Vec<_> = rep.errors().into_iter().filter(|e| e.code.starts_with("GV-REG") || e.code == "GV-WAIT").collect();
         assert!(mir_errors.is_empty(), "{name}: {mir_errors:?}");
         // and the default-mode compile (which enforces them) succeeds
-        amdgpu_compiler::compile(&f).unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
+        amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
     }
 }
 // ---------------------------------------------------------------------------------------------------------------------------------------------

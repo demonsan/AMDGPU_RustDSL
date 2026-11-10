@@ -14,6 +14,6 @@ amdgpu-graph = { path = "../amdgpu-graph" }
 amdgpu-safeasm = { path = "../amdgpu-safeasm" }
 
 [dev-dependencies]
-amdgpu-compiler = { path = "../amdgpu-compiler" }
+amdgpu-codegen = { path = "../amdgpu-codegen" }
 amdgpu-sym = { path = "../amdgpu-sym" }
 amdgpu-safeasm = { path = "../amdgpu-safeasm", features = ["test-support"] }

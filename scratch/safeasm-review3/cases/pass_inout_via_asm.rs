@@ -1,6 +1,6 @@
 ﻿// (F8 via the bridge) An in/out block (rowsum_var_block has a mutable leading port) must not be embeddable through `Op::Asm`;
 // only `Stmt::VarAsm` may bind a mutable port. Check both DSL verify and lowering.
-use amdgpu_compiler::compile;
+use amdgpu_codegen::compile;
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
 use amdgpu_safeasm::examples::rowsum_var_block;
 use amdgpu_safeasm::*;

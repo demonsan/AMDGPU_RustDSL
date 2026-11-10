@@ -3,7 +3,7 @@
 // unused splats between an MFMA and its retire: Seq/verifier believe 19 states already separate the write from the reader and
 // pad only 1, while the emitted stream contains *no* instruction there -> the matrix result is read 1 state after the MFMA
 // (hardware needs 20). This case prints the emitted stream; `pass_const_drop_kernel.rs` runs it on hardware.
-use amdgpu_compiler::asm::block_to_asm;
+use amdgpu_codegen::asm::block_to_asm;
 use amdgpu_safeasm::*;
 fn build() -> AsmBlock {
     let mut s = Seq::new();

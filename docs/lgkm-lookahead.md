@@ -1,6 +1,6 @@
 # LDS 读与 lgkm 等待的调度策略（`ldsink` / `ldahead32` / `wsink`）与已淘汰的实验
 
-实现：`crates/amdgpu-compiler/src/sched/ldahead.rs`（调度后处理，作用于每个基本块的最终顺序，之后照常重算等待；依赖 / 冒险 / 栅栏走 `depgraph`，结果用 `verify::check_perm` 复核，区域边界不跨越，见 [`weaver-sched.md`](weaver-sched.md)）。
+实现：`crates/amdgpu-codegen/src/sched/ldahead.rs`（调度后处理，作用于每个基本块的最终顺序，之后照常重算等待；依赖 / 冒险 / 栅栏走 `depgraph`，结果用 `verify::check_perm` 复核，区域边界不跨越，见 [`weaver-sched.md`](weaver-sched.md)）。
 
 | token | 作用 | 状态 |
 |---|---|---|
@@ -28,7 +28,7 @@
 
 ## 预设必须叠加而不是替换
 
-`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 compile profile 的预设（GEMM profile：记分板等待 + `ldshoist`；`T128` profile：ALU 跨栅栏 + 压力上限 248），**再**把 `Function::sched_opts` 的 token 叠在其上。曾经 `_t128` 带 `sched_opts = "ldsink=1"` 后绕过了预设，丢了 +2.2…+2.9 %（layout 中位数）；回归测试 `crates/amdgpu-kernels/tests/sched_preset.rs`。
+`scheduler_options`（`crates/amdgpu-codegen/src/lib.rs`）先取 compile profile 的预设（GEMM profile：记分板等待 + `ldshoist`；`T128` profile：ALU 跨栅栏 + 压力上限 248），**再**把 `Function::sched_opts` 的 token 叠在其上。曾经 `_t128` 带 `sched_opts = "ldsink=1"` 后绕过了预设，丢了 +2.2…+2.9 %（layout 中位数）；回归测试 `crates/amdgpu-kernels/tests/sched_preset.rs`。
 
 ## 实验过但已淘汰（代码已删除；实验分支已归档为 `archive/*` tag）
 

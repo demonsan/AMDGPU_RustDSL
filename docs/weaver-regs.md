@@ -2,7 +2,7 @@
 
 Stage / Weaver 架构里，weaver 决定"哪些值同时活着、谁复用谁的寄存器、每个编织区域最多用多少寄存器"。本层把这些决定写成
 **DSL 级注解**（`Function::reg_plan: Vec<RegMark>`），lowering 把它们解析到 vreg（`MFunction::reg_hints`），分配器
-（`crates/amdgpu-compiler/src/regalloc.rs` 的 `Plan`）遵守，分配后由 `crates/amdgpu-compiler/src/regplan.rs` 检查并报告。
+（`crates/amdgpu-codegen/src/regalloc.rs` 的 `Plan`）遵守，分配后由 `crates/amdgpu-codegen/src/regplan.rs` 检查并报告。
 **没有注解时什么都不变**（49 个 kernel 的 asm md5 逐个相同）。
 
 ## API（`FnBuilder`）
@@ -33,4 +33,4 @@ AGPR 足迹峰值、峰值位置以及峰值处活着的值（DSL 名 `%vN` / `%
 外加计划的执行报告（每个固定放置 honoured / VIOLATED、分离组与缓冲环的实际位置、share 是否共用、无寄存器的目标）。weaver 的单元估计
 （RegProfile）与调度器的压力模型都应以它为准。
 
-测试：`crates/amdgpu-compiler/tests/regplan.rs`（固定放置与冲突、share / separate / ring、区域上限与报告、未闭合区域）。
+测试：`crates/amdgpu-codegen/tests/regplan.rs`（固定放置与冲突、share / separate / ring、区域上限与报告、未闭合区域）。

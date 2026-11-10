@@ -5,8 +5,8 @@
 //! Default run: the dispatch-derived set. `cargo test --release -p amdgpu-kernels --test dispatch_compile -- --ignored`: the full sweep (the
 //! Python-op instantiations and every `amdc list` kernel too), run by python/tests/run_all.sh.
 
-use amdgpu_compiler::backend::OwnTail;
-use amdgpu_compiler::compile_with;
+use amdgpu_codegen::backend::OwnTail;
+use amdgpu_codegen::compile_with;
 use amdgpu_kernels::kernel_by_name;
 use amdgpu_kernels::reachable::{dispatched_names, manifest_names};
 use std::collections::BTreeSet;
@@ -17,7 +17,7 @@ const KNOWN_BROKEN: &[&str] = &[];
 
 /// Assembles `asm` with the real assembler (None when clang is not runnable here: the check is skipped).
 fn assemble(asm: &str, tag: &str) -> Option<Result<(), String>> {
-    let clang = amdgpu_compiler::backend::LlvmTools::locate().tool("clang");
+    let clang = amdgpu_codegen::backend::LlvmTools::locate().tool("clang");
     if !std::process::Command::new(&clang).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         return None;
     }
@@ -29,7 +29,7 @@ fn assemble(asm: &str, tag: &str) -> Option<Result<(), String>> {
     let s = dir.join("k.s");
     std::fs::write(&s, asm).ok()?;
     let out = std::process::Command::new(&clang)
-        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(amdgpu_codegen::target::T.llvm.asm_args)
         .arg("-o")
         .arg(dir.join("k.co"))
         .arg(&s)

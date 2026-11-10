@@ -1,7 +1,7 @@
 //! Independent adversarial audit of the v4 four-axis protocol model (gpu_protocol).
 //! Complements the shipped tests with mutations/axis-separation and multi-producer/consumer cases.
 
-use amdgpu_compiler::gpu_verify::{verify_ir, Ledger, Report, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, Ledger, Report, Severity};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, Stmt};
 
 fn has_alias(r: &Report, code: &str) -> bool {

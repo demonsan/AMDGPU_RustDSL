@@ -1,6 +1,6 @@
 ﻿// (F8 via the bridge, complete binding) Bind ALL ports of an in/out block through `Op::Asm` (the mutable leading port as a Frag4
 // value): what does DSL verify say, and does the lowering reject the mutable port?
-use amdgpu_compiler::compile;
+use amdgpu_codegen::compile;
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
 use amdgpu_safeasm::examples::rowsum_var_block;
 use amdgpu_safeasm::*;

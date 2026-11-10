@@ -10,8 +10,8 @@ phase G).
 | Part | Where | Content |
 |---|---|---|
 | `amdgpu-target` (new crate, no dependencies) | `src/lib.rs` (types), `src/gfx950.rs`, later `src/gfx1250.rs` | Plain data: wave, register files, LDS, counters, hazard rule table (numbers + citations), latency classes, matrix atoms, descriptor / emission format, LLVM tail settings, verifier limits |
-| Per-instruction tables | `amdgpu-compiler/src/target/gfx950/` (moved from `op_attrs.rs`, `emit.rs`, `backend/llvm*.tbl`) | `MOp` → attributes (pipe, cost, counter class, hazard roles, mnemonic / encoding), emit templates, LLVM MIR rows. They name `MOp`, which lives in the codegen crate, so they cannot live in `amdgpu-target` without a cycle |
-| Behaviour (passes) | `amdgpu-compiler` (P1: `amdgpu-codegen`) | Unchanged algorithms (scheduler, RA, hazard / wait insertion, verifier) that read their numbers from the `Target` instead of constants |
+| Per-instruction tables | `amdgpu-codegen/src/target/gfx950/` (moved from `op_attrs.rs`, `emit.rs`, `backend/llvm*.tbl`) | `MOp` → attributes (pipe, cost, counter class, hazard roles, mnemonic / encoding), emit templates, LLVM MIR rows. They name `MOp`, which lives in the codegen crate, so they cannot live in `amdgpu-target` without a cycle |
+| Behaviour (passes) | `amdgpu-codegen` (P1: `amdgpu-codegen`) | Unchanged algorithms (scheduler, RA, hazard / wait insertion, verifier) that read their numbers from the `Target` instead of constants |
 
 A compilation carries `&'static Target` (from `Function::target`, default `gfx950`); every pass gets it from the `MFunction` /
 compile context. There is no global "current target".
@@ -94,10 +94,10 @@ Each row is one move commit: behaviour-neutral, md5 manifest identical, certific
   (classes, per-class order, wait form), `hazards` (named rules: count + unit + scope + source), `latency` (branch / barrier costs, slotfill slot
   and DMA numbers, the weave planner's machine), `emit` (descriptor rounding and caps), `llvm` (llc / assembler arguments), `verify`; data in
   `gfx950.rs`.
-- `amdgpu-compiler/src/target/mod.rs`: `T` = gfx950, the one place a second target changes. `regalloc`, `emit`, `gpu_verify`, `hazards`,
+- `amdgpu-codegen/src/target/mod.rs`: `T` = gfx950, the one place a second target changes. `regalloc`, `emit`, `gpu_verify`, `hazards`,
   `sched::{waits, model, slotfill, m0}`, `backend::llvm20` and `amdc::jit` read their numbers from `T`; `amdgpu-tile`'s weave model reads
   `latency.weave`.
-- Per-instruction tables moved to `amdgpu-compiler/src/target/gfx950/` (`op_attrs.rs`, `emit.rs`, `llvm/llvm{20,24}{.tbl,_header.txt}`); the
+- Per-instruction tables moved to `amdgpu-codegen/src/target/gfx950/` (`op_attrs.rs`, `emit.rs`, `llvm/llvm{20,24}{.tbl,_header.txt}`); the
   atoms to `amdgpu_isa::gfx950` (re-exported at the root).
 - Every step: `amdc md5-manifest --check tests/golden/md5_manifest.tsv` 0 differences (234 kernels), certificates unchanged.
 

@@ -1,7 +1,7 @@
 ﻿// (NEW, safe path) `Seq` counts a materialised constant (`splat`, `VMovB32 imm`) as one wait state when computing `Ready`
 // padding, but the compiler's asm lowering DROPS such constant moves (const cache), so the emitted instruction stream can be
 // one state shorter than the verifier's model. Build exactly that: VALU write -> splat -> ready(matrix idx operand).
-use amdgpu_compiler::asm::block_to_asm;
+use amdgpu_codegen::asm::block_to_asm;
 use amdgpu_safeasm::*;
 fn main() {
     let mut s = Seq::new();

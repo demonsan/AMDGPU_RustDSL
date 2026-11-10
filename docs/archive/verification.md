@@ -21,7 +21,7 @@ temp dir); the hardware conclusions are unchanged, and the one open red flag fro
 
 ## 2. The bug, located independently (Verified)
 
-`crates/amdgpu-compiler/src/regalloc.rs::allocate_with` tracks the highest allocated slot in `max_s` while scanning
+`crates/amdgpu-codegen/src/regalloc.rs::allocate_with` tracks the highest allocated slot in `max_s` while scanning
 SGPRs (`max_s = max_s.max(slot + c.dwords())`). After allocation, a second loop **assigned**
 `max_s = i + 1` for the highest slot marked used - but `used_s` is pruned as values die, so this is "highest
 still-live slot at function exit", not the highest slot ever used. `emit.rs` writes
@@ -100,7 +100,7 @@ evidence:
 `probe_store` code object crashed the host at `hipModuleLaunchKernel` (SIGSEGV); the own-backend object printed
 `PROBE_OK`.** Root cause: the LLVM tail listed kernarg *layout padding* as kernel arguments. `probe_store` has a
 20-byte argument area rounded to 24 bytes; the exported IR added a dummy `%pad0` parameter
-(`crates/amdgpu-compiler/src/target/gfx950/llvm/llvm_mir.rs::kernarg_ir`), which llc turned into a fourth HSA argument
+(`crates/amdgpu-codegen/src/target/gfx950/llvm/llvm_mir.rs::kernarg_ir`), which llc turned into a fourth HSA argument
 (`pad0`, offset 20, by_value). HIP's kernel-parameter launch API then read a fourth parameter from a three-entry
 array (out of bounds). The own metadata had only the three real arguments and worked; patching the descriptor
 fields did not change the crash. Scope: any LLVM-tail kernel whose DSL kernarg layout has internal gaps or

@@ -86,7 +86,7 @@ DSL(Rust) ──► typed IR（区域树：Loop / If / Region / Stage + 编织�
 | **指令调度** | **自研** | 块内 list scheduler、LDS 读提升（`ldshoist`）、`slotfill`（GEMM v4）、依赖图 / 效果模型 / 等待模型（[`scheduling.md`](scheduling.md)） |
 | hazard / wait / descriptor | llvm-tail 或 own | 两个后端指令流逐条一致（`tail_invariance` 守护） |
 
-编译策略按 kernel profile 固定（`crates/amdgpu-compiler/src/lib.rs`）：FMHA `_vs128`/`_kvsplit` = `dce,cmpfold,scalarize,retarget2,imm,sgpr,zeroinit`，
+编译策略按 kernel profile 固定（`crates/amdgpu-codegen/src/lib.rs`）：FMHA `_vs128`/`_kvsplit` = `dce,cmpfold,scalarize,retarget2,imm,sgpr,zeroinit`，
 `_t128` 另加 `addrfold,saddrlds,edgepad,salubr`；GEMM = `dce,cmpfold,lgkmn,zeroinit,scalarize,scalarize2,waveuni,edgepad,kabatch,imm` + M0 复用。
 保留的开关：调度 `AMDC_SCHED`（0 / 1 / ld）、`AMDC_SCHED_OPTS`、`AMDC_SCHED_ADD`（在 kernel 预设上追加调度 token，含 `hzfill`）、`AMDC_SCHED_REGION`
 （按区域策略的 A/B）、`AMDC_SCHED_VERBOSE`；分配器 `AMDC_RA_DEBUG_FILE`、`AMDC_RA_LDS_SPILL(_TARGET)`（强制 LDS spill，回归探针用）；后端 `AMDC_BACKEND`、`AMDC_KEEP_MIR`、`AMDC_DIALECT`、`AMDC_LLC_ARGS`、
@@ -120,7 +120,7 @@ amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发�
 | **寄存器生命周期** | 路径敏感 use-before-wait（任一路径、含循环携带在途值） | 默认强制 |
 | **barrier 协议** | 波分歧 if/else 两侧动态 barrier 数相等 | 18 / 8 / 18 |
 
-区间分析的位级规则（`x ^ y`、`x & m` 的可能置位位）与盒子检验都有攻击测试（`crates/amdgpu-compiler/tests/gv_bits.rs`、`sym_branch.rs`）。
+区间分析的位级规则（`x ^ y`、`x & m` 的可能置位位）与盒子检验都有攻击测试（`crates/amdgpu-codegen/tests/gv_bits.rs`、`sym_branch.rs`）。
 
 **信任预算（证书逐条列出）**：`--shipped`（v3 四个）21 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0（逐项清单 [`trust-inventory.md`](trust-inventory.md)）。
 每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
@@ -161,7 +161,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | `amdgpu-dsl` | IR（区域树 + 编织区域标记、寄存器规划 `RegMark`、区域策略 `RegionDecl`）、`FnBuilder`、表达式层、形状特化（`specialize.rs`）、irv1 文本打印/解析（`ir_text.rs` + 生成的 `ir_codec.rs`）与 α 结构相等（`print.rs`） | sym、safeasm、layout |
 | `amdgpu-tile` | 全部 tile 抽象（TiledCopy/TiledMma/partition、LdsPlan、Pipeline、softmax、frag、行 DMA、合同、handoff）、stage 库与通用原语、weaver、算子图 / 骨架生成 | dsl、layout、isa |
 | `amdgpu-kernels` | 全部 kernel：`fmha/`（v3 + FMHA I/O）、`gemm/`、`mlp/`、`norm/`，每个都是"算子图（`graph.rs` + `*.graph.json`）→ 生成的骨架（`skeleton_*.rs`）→ slot 实现 + stage 实例"；`probes/`、`verifier_cases/`、`ir_proof.rs`、注册表 `registry.rs` | dsl、tile、layout、isa、safeasm |
-| `amdgpu-compiler` | lowering、调度（含按区域策略）、RA + 寄存器规划检查与区域报告（`regplan.rs`）、hazard/wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify`/`gpu_protocol`/函数证明、MIR 打印（不依赖 kernels/tile） | sym、dsl、safeasm |
+| `amdgpu-codegen` | lowering、调度（含按区域策略）、RA + 寄存器规划检查与区域报告（`regplan.rs`）、hazard/wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify`/`gpu_protocol`/函数证明、MIR 打印（不依赖 kernels/tile） | sym、dsl、safeasm |
 | `amdc` | CLI（list / emit / print-ir / ir-check / regplan / jit-info / gpu-verify / gen-host / opgraph / skeleton / backend / simmodel / mops / mir-roundtrip；`--from-ir`、`--specialize`）+ 库 `amdc::hostgen` / `amdc::jit` | dsl、compiler、kernels、tile |
 
 需要具体 kernel 的测试在 `crates/amdgpu-kernels/tests/`（主机合同对照在 `crates/amdc/tests/`）；编译器自身的测试只用测试内构造的 kernel。
@@ -202,7 +202,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
   旧的严格准则（bad = 0）仍以 INFO 打印，`ACC_STRICT=1` 可恢复（`tools/port_gate.sh`）。
 - **参考算法（用户决定 2026-11-05，"accept vendor accuracy"）**：`_vs128` 的长序列副本（≥ 9 tile）使用厂商的参考配方（目标 s91 = 0.24799132、
   懒回滚阈值 s92 = 0.26135647、转换比例 0.25、无 LUT 校正、首 tile 播种；`OnlineSoftmax::set_vendor_ref`）；短序列副本保留精确配方 + LUT 校正；
-  `_t128` 与 `_kvsplit`（出厂 split 走短副本）不受影响。递推与朴素求和的一致性：`crates/amdgpu-compiler/tests/functional_proofs.rs`。
+  `_t128` 与 `_kvsplit`（出厂 split 走短副本）不受影响。递推与朴素求和的一致性：`crates/amdgpu-codegen/tests/functional_proofs.rs`。
   采用时的同轮测量（历史记录）：精度与厂商同分布（例如 B4H8S2048 2 / 2.848e-3 vs 厂商 2 / 2.859e-3），速度 B1H8S8192 +5.5%、其余 +0.7..0.9%。
 - 曾测过的"快速参考"变体（`scaleconv`/`hi512`）没有一个既更快又满足厂商对齐，已删除（数据见 [`archive/`](archive/README.md)）。
 - 确定性 5/5 × 3 次；split 形状重复启动（`port_gate` 的 STRESS 段）。
@@ -268,8 +268,8 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 
 | bug | 影响 | 修复 |
 |---|---|---|
-| 物理 WAW（MFMA 在途结果寄存器被 RA 复用） | 非确定输出 | `pad_physical_war` 跟踪在途 MFMA 目标区间；`crates/amdgpu-compiler/tests/phys_waw.rs` |
-| 两阶段 RA reaching-writer 误报 | 持久循环变量编译失败 | path-aware 检查；`crates/amdgpu-compiler/tests/ra_reaching.rs` |
+| 物理 WAW（MFMA 在途结果寄存器被 RA 复用） | 非确定输出 | `pad_physical_war` 跟踪在途 MFMA 目标区间；`crates/amdgpu-codegen/tests/phys_waw.rs` |
+| 两阶段 RA reaching-writer 误报 | 持久循环变量编译失败 | path-aware 检查；`crates/amdgpu-codegen/tests/ra_reaching.rs` |
 | VMEM 宽存储数据 WAR | `global_store_dwordx4` 后数据寄存器被过早覆盖 → split 路径偶发损坏 | `pad_physical_war` 记录宽存储数据区间；STRESS 段回归 |
 | LDS-DMA 操作数等待放置（AGPR 工作中发现） | 静默误编译 | 见 [`agpr.md`](agpr.md) "Wait placement" 一节 |
 
@@ -277,7 +277,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 
 | 守卫 | 防住的错误 | 位置 |
 |---|---|---|
-| 在途读的物理 WAW（`pad_inflight_waw`） | 一条路径上结果已死的 load 仍在途时，RA 把它的寄存器交给别的值，晚到的 load 覆盖之（MLA decode 的 if / else、Vs128 的 `_ks`、死 load） | post-RA，`crates/amdgpu-compiler/tests/inflight_waw.rs` |
+| 在途读的物理 WAW（`pad_inflight_waw`） | 一条路径上结果已死的 load 仍在途时，RA 把它的寄存器交给别的值，晚到的 load 覆盖之（MLA decode 的 if / else、Vs128 的 `_ks`、死 load） | post-RA，`crates/amdgpu-codegen/tests/inflight_waw.rs` |
 | `ds_bpermute` / `ds_permute` / `ds_swizzle` 的 lgkm 等待 | 调度后的等待重算看不到这三类 LDS 返回值，结果未等就被读 | `op_attrs`（按 LDS 读计入 lgkmcnt），`probe_lane_p1` |
 | `any_lane` 极性 | 对逐 lane 条件取反再折叠进分支极性，"没有 lane 为真"被当成"有 lane 为假" | `lower_condition`，`probe_anylane`（9 种极性） |
 | 分支条件必须 wave 一致 | `begin_if` / `break_if` 的条件不一致时，wave 级分支的语义与作者意图不符；有意的"任一 lane"写 `any_lane(c)` | IR 验证器 `check_uniform_branches` |

@@ -10,11 +10,11 @@
 //! 3. `descriptor_declares_every_register`: the own-backend kernel descriptor covers every VGPR/SGPR (and vcc)
 //!    the emitted code touches.
 
-use amdgpu_compiler::lower::with_opts;
-use amdgpu_compiler::mir::*;
-use amdgpu_compiler::sched::effects::{effects, Slot, VCC};
-use amdgpu_compiler::sched::liveness::successors;
-use amdgpu_compiler::{compile_mir_alloc, lower};
+use amdgpu_codegen::lower::with_opts;
+use amdgpu_codegen::mir::*;
+use amdgpu_codegen::sched::effects::{effects, Slot, VCC};
+use amdgpu_codegen::sched::liveness::successors;
+use amdgpu_codegen::{compile_mir_alloc, lower};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -189,13 +189,13 @@ fn merge(into: &mut Writers, from: &Writers) -> bool {
     ch
 }
 
-fn phys_of(m: &MFunction, a: &amdgpu_compiler::regalloc::Alloc, slot: Slot) -> (bool, u32) {
+fn phys_of(m: &MFunction, a: &amdgpu_codegen::regalloc::Alloc, slot: Slot) -> (bool, u32) {
     let t = slot / 16;
     let class = m.vreg_class(t);
     (class.is_vector(), a.phys[t as usize] + (slot - t * 16))
 }
 
-fn clobbers(m: &MFunction, a: &amdgpu_compiler::regalloc::Alloc) -> Vec<String> {
+fn clobbers(m: &MFunction, a: &amdgpu_codegen::regalloc::Alloc) -> Vec<String> {
     let succs = successors(m);
     let nb = m.blocks.len();
     let mut in_st: Vec<Option<Writers>> = vec![None; nb];
@@ -343,7 +343,7 @@ fn descriptor_declares_every_register() {
     let mut bad = Vec::new();
     for k in kernel_names() {
         let f = kernel_by_name(k).unwrap();
-        let asm = match amdgpu_compiler::compile(&f) {
+        let asm = match amdgpu_codegen::compile(&f) {
             Ok(c) => c.asm,
             Err(e) => {
                 bad.push(format!("{k}: {e}"));

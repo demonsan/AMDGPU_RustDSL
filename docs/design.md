@@ -11,7 +11,7 @@
 |---|---|---|
 | Rust 类型系统（DSL、safe-asm） | 构图期非法描述（move-after-use、Pending 当 Ready、写只读端口、跨 token 混用）；`#![forbid(unsafe_code)]` | GPU 异步 hazard 的最终判定、数值正确性 |
 | IR verifier（`amdgpu-dsl`） | 类型/uniformity/循环变量作用域/立即数范围/描述符类型 | 物理寄存器、指令顺序 |
-| MIR 层（`amdgpu-compiler`） | 效应模型、调度、RA、hazard/wait 插入、`pin_check`、`mir::verify` | 指令选择之外的 LLVM 级优化 |
+| MIR 层（`amdgpu-codegen`） | 效应模型、调度、RA、hazard/wait 插入、`pin_check`、`mir::verify` | 指令选择之外的 LLVM 级优化 |
 | 后端（`llvm-tail` / `own`） | post-RA 的 hazard、waitcnt、descriptor、编码；两者指令流逐条一致（`tail_invariance`） | 寄存器与顺序决策 |
 | Runtime / 测试 harness | 模块加载、ABI、同轮厂商对照、确定性压力 | 编译期正确性 |
 
@@ -70,7 +70,7 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 | `amdgpu-dsl` | IR（区域树、编织区域、寄存器规划、区域策略）、`FnBuilder`、表达式层、形状特化、irv1 文本、α 结构相等 |
 | `amdgpu-tile` | `TiledCopy` / `TiledMma` / `partition_{lds,dma,buffer_dma,global}`、布局导出的主机合同、tile 组件（pipeline、softmax、epilogue …）、stage 库与通用原语、weaver、算子图 / 骨架生成 |
 | `amdgpu-kernels` | 全部 kernel（FMHA v3、GEMM v4、MLP、RMSNorm 量化、探针、验证器用例）+ 按名注册表 |
-| `amdgpu-compiler` | lowering、调度、RA + 寄存器规划、hazard / wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify` / 协议 / 功能证明（不依赖 kernels / tile） |
+| `amdgpu-codegen` | lowering、调度、RA + 寄存器规划、hazard / wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify` / 协议 / 功能证明（不依赖 kernels / tile） |
 | `amdc` | CLI 与 `hostgen` / `jit` 库 |
 
 布局层只决定**地址与每次操作发射哪些指令**；指令顺序仍由 kernel 作者与调度器决定，安全仍由 `gpu_verify` 证明。入门：[`layout-tour.md`](layout-tour.md)；实施记录：[`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9。主机侧：`amdc gen-host` 从 kernel 合同生成 C++ 头与 JSON（[`host-gen.md`](host-gen.md)）。

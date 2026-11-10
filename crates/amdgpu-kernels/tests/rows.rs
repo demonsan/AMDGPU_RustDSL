@@ -1,5 +1,5 @@
 //! Batch 2 row and quantization kernels (docs/op-coverage-membound.md): name grammar, strict GPU-semantics verification and assembly (one b128 load per chunk, buffer accesses hardware-guarded).
-use amdgpu_compiler::gpu_verify::analyse;
+use amdgpu_codegen::gpu_verify::analyse;
 use amdgpu_kernels::kernel_by_name;
 
 const KERNELS: &[&str] = &[
@@ -13,7 +13,7 @@ fn the_row_and_quant_kernels_verify_strict_and_compile() {
         let f = kernel_by_name(k).unwrap_or_else(|| panic!("{k} is registered"));
         let r = analyse(&f).unwrap();
         assert!(r.errors().is_empty(), "{k}: {}", r.render());
-        let c = amdgpu_compiler::compile(&f).unwrap_or_else(|e| panic!("{k}: {e}"));
+        let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(c.vgpr <= 200, "{k}: {} VGPR", c.vgpr);
         assert!(c.asm.contains("buffer_load_dwordx4"), "{k}: b128 loads");
     }

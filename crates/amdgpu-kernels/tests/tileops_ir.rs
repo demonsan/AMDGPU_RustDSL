@@ -26,14 +26,14 @@ fn a_constant_non_power_of_two_cvt_scale_is_rejected() {
 #[test]
 fn bf16_pairs_feed_packed_f32_ops_without_moves() {
     let f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
-    let m = amdgpu_compiler::compile_mir(&f).unwrap();
+    let m = amdgpu_codegen::compile_mir(&f).unwrap();
     let moves = m
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
-        .filter(|i| i.op == amdgpu_compiler::mir::MOp::VMovB32 && matches!(i.srcs.first(), Some(amdgpu_compiler::mir::Src::Reg(_))))
+        .filter(|i| i.op == amdgpu_codegen::mir::MOp::VMovB32 && matches!(i.srcs.first(), Some(amdgpu_codegen::mir::Src::Reg(_))))
         .count();
-    let pk = m.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i.op, amdgpu_compiler::mir::MOp::VPkMulF32 | amdgpu_compiler::mir::MOp::VPkAddF32)).count();
+    let pk = m.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i.op, amdgpu_codegen::mir::MOp::VPkMulF32 | amdgpu_codegen::mir::MOp::VPkAddF32)).count();
     assert_eq!(pk, 6);
     // the frag4 of the four loaded words and frag2_dup copy; the unpack -> pair path itself adds none
     assert!(moves <= 6, "{moves} register moves");
@@ -59,9 +59,9 @@ fn a_lane_of_a_slice_view_keeps_the_slice_offset() {
     let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, 1);
     b.break_if(done);
     b.end_loop();
-    let m = amdgpu_compiler::compile_mir(&b.finish()).unwrap();
+    let m = amdgpu_codegen::compile_mir(&b.finish()).unwrap();
     let st = m.blocks.iter().flat_map(|b| &b.insts).find(|i| format!("{:?}", i.op).starts_with("GlobalStore")).expect("store");
-    let r = match st.srcs[1] { amdgpu_compiler::mir::Src::Reg(r) => r, _ => panic!("store value") };
+    let r = match st.srcs[1] { amdgpu_codegen::mir::Src::Reg(r) => r, _ => panic!("store value") };
     let (base, off) = m.alias.get(&r).map(|a| (a.0, a.1)).expect("the stored dword is a view of the variable");
     assert_eq!(m.vreg_class(base).dwords(), 8);
     assert_eq!(off, 6, "slice 1, lane 2 = dword 6");

@@ -1,8 +1,8 @@
 //! Sample-instruction builder shared by the LLVM-tail tests: one tiny instruction per table row.
 #![allow(dead_code)]
 
-use amdgpu_compiler::backend::llvm20::{Row, SigClass};
-use amdgpu_compiler::mir::*;
+use amdgpu_codegen::backend::llvm20::{Row, SigClass};
+use amdgpu_codegen::mir::*;
 
 pub struct Samples {
     pub vregs: Vec<RClass>,
@@ -75,8 +75,8 @@ impl Samples {
         inst
     }
 
-    pub fn alloc(&self) -> amdgpu_compiler::regalloc::Alloc {
-        amdgpu_compiler::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100, scalar: self.vregs.iter().map(|c| c.is_scalar()).collect() }
+    pub fn alloc(&self) -> amdgpu_codegen::regalloc::Alloc {
+        amdgpu_codegen::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100, scalar: self.vregs.iter().map(|c| c.is_scalar()).collect() }
     }
 }
 

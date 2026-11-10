@@ -1,7 +1,7 @@
 //! The MXFP8 blockscale GEMM (`amdgpu-kernels::gemm_mxfp8`): every variant builds (its build-time layout proofs - DMA source = layout of the LDS
 //! destination for sampled threads and issues - run inside the builder and panic on a mismatch), compiles, and the shipped variant passes the strict
 //! GPU-semantics verification with a small trust ledger.
-use amdgpu_compiler::gpu_verify::{analyse, Severity};
+use amdgpu_codegen::gpu_verify::{analyse, Severity};
 
 const VARIANTS: &[&str] = &["gemm_mxfp8_bs_v4"];
 
@@ -9,7 +9,7 @@ const VARIANTS: &[&str] = &["gemm_mxfp8_bs_v4"];
 fn gemm_variants_build_with_their_layout_proofs_and_compile() {
     for name in VARIANTS {
         let f = amdgpu_kernels::kernel_by_name(name).unwrap_or_else(|| panic!("unknown kernel {name}"));
-        amdgpu_compiler::compile(&f).unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
+        amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
     }
 }
 

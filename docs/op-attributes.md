@@ -1,6 +1,6 @@
 # 机器指令属性表（`op_attrs`）
 
-> 代码：`crates/amdgpu-compiler/src/target/gfx950/op_attrs.rs`；测试：`op_attrs.rs` 内的 `tests`（枚举完整性、LLVM 覆盖表）。
+> 代码：`crates/amdgpu-codegen/src/target/gfx950/op_attrs.rs`；测试：`op_attrs.rs` 内的 `tests`（枚举完整性、LLVM 覆盖表）。
 > 设计依据：[`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) 的 A 项（TIRx 的算子属性：`FInferType`、`TCallEffectKind`、
 > `FLowerIntrinsic`、`FLegalize`——pass 查属性，不枚举算子名）。
 

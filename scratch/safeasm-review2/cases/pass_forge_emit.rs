@@ -1,6 +1,6 @@
 ﻿// (4b, fixed) Encoding-illegal but HAZARD-CLEAN forged instructions: the verifier only models hazards, so this should pass
 // verify(); what do the compiler's public block_to_asm / block_to_mfunction do with it?
-use amdgpu_compiler::asm::{block_to_asm, block_to_mfunction};
+use amdgpu_codegen::asm::{block_to_asm, block_to_mfunction};
 use amdgpu_safeasm::*;
 fn base() -> AsmBlock {
     let mut s = Seq::new();

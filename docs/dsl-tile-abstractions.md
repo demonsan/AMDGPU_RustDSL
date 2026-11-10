@@ -65,7 +65,7 @@ kernels.rs 全文约 4,800 处地址算术 builder 调用。抽象缺失的具�
 ```
 
 模块树：`crates/amdgpu-tile/src/{mod.rs, lane.rs, tensor.rs, shared.rs, copy.rs, pipeline.rs, frag.rs, reduce.rs, softmax.rs, epilogue.rs}`；
-测试：`crates/amdgpu-compiler/tests/tile_*.rs`。
+测试：`crates/amdgpu-codegen/tests/tile_*.rs`。
 
 ---
 
@@ -423,7 +423,7 @@ impl Vs128Body<'_> {
 
 ## 11. 需要 lead/用户决策的点
 
-* **D1 编译策略按名字选择**：`amdgpu-compiler/src/lib.rs:74-127` 用名字前缀/后缀决定 lowering 选项（scalarize/retarget2/imm/sgpr/addrfold）与调度器预设（reorder / alu_across_barrier / max_vgprs 248）。新 kernel 若叫 `..._vs128_tile` 会落到错误的预设（`ends_with("_vs128")` 失败 → `reorder=false`）。建议：在 `Function` 上加一个可选字段 `compile_profile: Option<&'static str>`（`"vs128" | "t128" | "kvsplit" | "combine"`），编译器优先用它，名字匹配作为回退；或新 kernel 名用 `fmha_fwd_hd128_mxfp8_vs_<x>_vs128` 这种同时满足前缀/后缀的形式（不推荐）。需要 lead 拍板（改 Function 结构属于共享代码）。
+* **D1 编译策略按名字选择**：`amdgpu-codegen/src/lib.rs:74-127` 用名字前缀/后缀决定 lowering 选项（scalarize/retarget2/imm/sgpr/addrfold）与调度器预设（reorder / alu_across_barrier / max_vgprs 248）。新 kernel 若叫 `..._vs128_tile` 会落到错误的预设（`ends_with("_vs128")` 失败 → `reorder=false`）。建议：在 `Function` 上加一个可选字段 `compile_profile: Option<&'static str>`（`"vs128" | "t128" | "kvsplit" | "combine"`），编译器优先用它，名字匹配作为回退；或新 kernel 名用 `fmha_fwd_hd128_mxfp8_vs_<x>_vs128` 这种同时满足前缀/后缀的形式（不推荐）。需要 lead 拍板（改 Function 结构属于共享代码）。
 * **D2 `_t128` 目前没有 tile 标记**（不在 `fmha_vs_tiles` 列表里），库会自动加标记——验证器对 3 槽 select 索引的环可能需要 `tile_trust_periodic`（进账本，+1 trusted）。这是安全**增强**，但证书计数会变。
 * **D3 实验分支不移植**（当时的 `FMHA_OPT` 开关已全部删除）：新 kernel 只实现出厂默认配方（`kddma`、`smfv`、`q0reg/q1reg`、vsx 双副本、`dwordx2` 输出、fp16 partial）。实验开关如需保留，作为库组件的配置参数而不是 kernel 里的 `if`。
 * **D4 命名**：新 kernel 暂定 `fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}` 的 `_dsl` 变体并行存在，过门禁后切换出厂映射（md5 不变量在切换前不动）。

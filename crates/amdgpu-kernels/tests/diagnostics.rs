@@ -1,11 +1,11 @@
 //! Structured, localized diagnostics (docs/diagnostics.md): codes, statements, regions and the Rust source location of the builder call.
-use amdgpu_compiler::diag;
+use amdgpu_codegen::diag;
 use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, MemTy, Op, Opnd};
 
 #[test]
 fn a_verifier_finding_points_at_the_kernel_source() {
     let f = amdgpu_kernels::kernel_by_name("gv_attack_buf_wrap").unwrap();
-    let r = amdgpu_compiler::gpu_verify::analyse(&f).unwrap();
+    let r = amdgpu_codegen::gpu_verify::analyse(&f).unwrap();
     let ds = diag::from_report(&f, &r);
     let d = ds.iter().find(|d| d.code == "GV-BUF-WRAP").expect("the wrap finding");
     assert_eq!(d.kernel, "gv_attack_buf_wrap");
@@ -28,7 +28,7 @@ fn a_compile_failure_is_classified_and_localized_to_this_file() {
     b.break_if(done);
     b.end_loop();
     let f = b.finish();
-    let e = amdgpu_compiler::compile_mir(&f).unwrap_err();
+    let e = amdgpu_codegen::compile_mir(&f).unwrap_err();
     let ds = diag::from_compile_error(&f, &e);
     let d = &ds[0];
     assert_eq!(d.code, "IR-UNIFORM-BRANCH");
@@ -61,7 +61,7 @@ fn running_out_of_registers_names_the_live_values_and_their_builder_calls() {
     }
     b.store_f32(q, 0, acc);
     let f = b.finish();
-    match amdgpu_compiler::compile_with(&f, &amdgpu_compiler::backend::OwnTail) {
+    match amdgpu_codegen::compile_with(&f, &amdgpu_codegen::backend::OwnTail) {
         Ok(_) => {} // the allocator found a way (spilling): nothing to check
         Err(e) => {
             let ds = diag::from_compile_error(&f, &e);
@@ -85,10 +85,10 @@ fn the_summary_is_compact_json() {
 #[test]
 fn source_locations_do_not_change_the_code() {
     // the side table is not part of the IR: the same kernel built twice (different call sites) compiles to the same asm
-    let a = amdgpu_compiler::compile(&amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap()).unwrap().asm;
+    let a = amdgpu_codegen::compile(&amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap()).unwrap().asm;
     let mut f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
     f.src_locs = Default::default();
-    let b = amdgpu_compiler::compile(&f).unwrap().asm;
+    let b = amdgpu_codegen::compile(&f).unwrap().asm;
     assert_eq!(a, b);
 }
 
@@ -97,7 +97,7 @@ fn the_asm_source_map_points_instructions_at_their_builder_calls() {
     let f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
     let (asm, map) = diag::asm_map(&f).unwrap();
     // the map is built on the same code the compiler ships
-    assert_eq!(asm, amdgpu_compiler::compile(&f).unwrap().asm);
+    assert_eq!(asm, amdgpu_codegen::compile(&f).unwrap().asm);
     let lines: Vec<&str> = asm.lines().collect();
     let pk: Vec<_> = map.iter().filter(|e| lines[e.line - 1].contains("v_pk_mul_f32")).collect();
     assert_eq!(pk.len(), 4);

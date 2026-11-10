@@ -11,8 +11,8 @@
 | 目标目录 | 实际 | 状态 |
 |---|---|---|
 | `crates/dsl/` | `crates/amdgpu-dsl`（类型化 SSA + 循环变量 + fragment 类型 + 所有指令族；FMHA kernel 家族在 `kernels.rs`） | 完成 |
-| `crates/ir/`（Semantic / Resource / Async IR） | 合并进 `amdgpu-dsl` / `amdgpu-compiler` 的 SSA 与 MIR；完整 Resource / Async IR 未做 | 采纳（简化实现） |
-| `crates/compiler/` | `crates/amdgpu-compiler`（lowering、tuple-aware RA、hazards、`sched/` 调度器与模型、emit、LLVM tail 后端表 `llvm20.tbl` / `llvm24.tbl`） | 完成 |
+| `crates/ir/`（Semantic / Resource / Async IR） | 合并进 `amdgpu-dsl` / `amdgpu-codegen` 的 SSA 与 MIR；完整 Resource / Async IR 未做 | 采纳（简化实现） |
+| `crates/compiler/` | `crates/amdgpu-codegen`（lowering、tuple-aware RA、hazards、`sched/` 调度器与模型、emit、LLVM tail 后端表 `llvm20.tbl` / `llvm24.tbl`） | 完成 |
 | `llvm-bridge/`（项目自有 C++/C ABI） | 未做 C++ bridge；改为 **MIR 导出 + 复用 LLVM 后 RA tail pass**（不修改 LLVM），见 `docs/llvm-tail-integration.md` | 采纳（不同实现） |
 | —（计划外） | `crates/amdgpu-safeasm`：安全 Rust 手写汇编序列（`Ready` / `Pending` 证明、`pin()`、`pin_check`、部分 `lgkmcnt` 令牌），经 `Stmt::VarAsm[N]` 嵌入 | 完成（计划外增项），见 `docs/safe-asm-design.md` |
 | `examples/` | FMHA frontend 即 `kernels.rs` 中的 `fmha_*` 构造器与 `tests/gpu/`、`tools/` 脚本 | 完成 |
@@ -24,12 +24,12 @@
 | 项 | 原计划 | 状态 | 记录 |
 |---|---|---|---|
 | M0 Cargo workspace、out-of-tree pass driver | 建立 workspace；不修改 LLVM | **完成**：workspace + `amdc` 命令行；LLVM 未修改（tail 走外部 `llc` / 汇编器） | `README.md`、`docs/llvm-tail-integration.md` |
-| M0 target capability 数据来源与版本记录 | 固化 | **完成**：厂商 `.co` 反汇编事实与 ISA 硬件验证在 `vendor-spec.md`；LLVM 行表按方言版本（20 / 24）固定 | `docs/vendor-spec.md`、`crates/amdgpu-compiler/src/backend/` |
+| M0 target capability 数据来源与版本记录 | 固化 | **完成**：厂商 `.co` 反汇编事实与 ISA 硬件验证在 `vendor-spec.md`；LLVM 行表按方言版本（20 / 24）固定 | `docs/vendor-spec.md`、`crates/amdgpu-codegen/src/backend/` |
 | M0 出口：空 kernel 走通管线生成可加载 `.co` | 是 | **完成**（`tests/gpu/run.sh`、probe kernels） | `docs/archive/status.md` 前 12 轮 |
 | M1 `Tile` / `Accumulator` / `OnlineState` / `Slot` / `PendingReadBatch` / `ReadCompleteLease`；structured `loop_by_move` / `if_wave_by_move` | 仿射资源 API | **采纳（简化）**：类型化 SSA 值 + 循环携带变量（"读一次、写一次"契约）+ `begin_if`；资源与 lease 只在 safe-asm 序列里以 `Ready` / `Pending` / 独占借用的形式实现 | `docs/design.md`、`docs/safe-asm-design.md` |
 | M1 Semantic SSA + Resource SSA + Async Event IR | 完整三层 IR | **未做**（只有 LDS 区域与"待完成加载"的 wait 跟踪） | `docs/archive/final-report.md` §8 |
 | M1 compile-fail 负例与 IR verifier | 全部拒绝 move-after-use 等 | **部分**：DSL / MIR 验证器、RA 后检查、safe-asm 的类型级拒绝（`tests/safeasm.rs`）；完整 compile-fail 套件未做 | `cargo test` |
-| M2 Recipe expansion、MachineDAG | 展开 | **采纳（改用 lowering）**：`Op` / `Stmt` 直接 lowering 为 MIR | `crates/amdgpu-compiler/src/lower.rs` |
+| M2 Recipe expansion、MachineDAG | 展开 | **采纳（改用 lowering）**：`Op` / `Stmt` 直接 lowering 为 MIR | `crates/amdgpu-codegen/src/lower.rs` |
 | M2 tuple-aware RA、pressure-aware scheduling | 内部实现 | **完成**：tuple-aware RA（紧凑 / 窄操作数回退 / 两阶段 / remat / LDS spill 重试）、列表调度器（`AMDC_SCHED`）；两阶段 RA 的 reaching-writer 缺陷已修 | `docs/scheduling.md`、`docs/archive/status.md` |
 | M2 hard pin / `named_reg` / Strict | 支持 | **完成**（safe-asm `pin()`；`pin_check` 对最终 MIR 复核补空档） | `docs/safe-asm-design.md` |
 | M2 post-RA dependency 与 encoding 验证 | 支持 | **完成**，含三类真实 hazard 修复：物理 WAW、两阶段 RA reaching-writer、VMEM 宽存储数据 WAR | `docs/archive/final-report.md` §5，`docs/vendor-spec.md` §7.11 |

@@ -10,7 +10,7 @@
 | Rust toolchain only inside a container | `tools/container/Containerfile` (ubuntu 22.04 + rustup 1.83.0), built with rootless podman; host and shared home untouched |
 | Workspace builds and tests | `tools/container/cargo.sh build` clean, `cargo test` → 8 backend tests pass |
 | Typed IR + verifier | `amdgpu-dsl`: SSA values, loop variables, scope and type checking |
-| Lowering + own register allocation | `amdgpu-compiler`: MIR, linear-scan RA, copy coalescing, wait-state insertion |
+| Lowering + own register allocation | `amdgpu-codegen`: MIR, linear-scan RA, copy coalescing, wait-state insertion |
 | Assembly emission | `amdc emit attention_fwd` → gfx950 asm accepted by the ROCm assembler |
 | Code object loads and dispatches | HIP module load + launch from `tests/gpu/attn_host.cpp` |
 | ABI + memory path | `probe_store` kernel: `o[tid] = q[tid]` plus a kernarg scalar, `PROBE_OK` |

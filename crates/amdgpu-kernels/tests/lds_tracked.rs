@@ -1,6 +1,6 @@
 //! The LDS accesses of the sampling / top-k / MoE-sorting / MXFP4-norm kernels are all inside declared tile markers (docs/trust-inventory.md: `lds-untracked`): the protocol engine checks their cross-wave order
 //! and visibility, not only their bounds. A new unmarked LDS access in these families fails here.
-use amdgpu_compiler::gpu_verify::{verify_ir, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, Severity};
 use amdgpu_kernels::kernel_by_name;
 
 #[test]
