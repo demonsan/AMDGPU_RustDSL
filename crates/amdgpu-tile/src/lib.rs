@@ -37,6 +37,7 @@ pub mod opgraph;
 pub mod stage;
 pub mod prims;
 pub mod tileop;
+pub mod templates;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, make_tiled_copy_bcast, LdsPart, LdsPrivPart, LdsSlotPart, TiledCopy};
 pub use global::GlobalPart;

@@ -11,6 +11,7 @@
 //! causal = bottom-right (key k visible to query q iff k <= q + SK - SQ).
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 const D: i32 = 128;
@@ -234,29 +235,22 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     let dqv: Vec<VarId> = vars[1..5].to_vec();
     let sv_vars: Vec<VarId> = vars[5..7].to_vec();
     let dp_vars: Vec<VarId> = vars[7..9].to_vec();
-    let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot);
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        let last = b.bind_i32((ev(npair) << 1) - 1);
-        let nxt = b.bind_i32((ev(tile) + 1).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
+    // the 2-slot K / V ring over key-tile pairs (L2 template T1, `PairRing`)
+    let ring = PairRing { npair, first: None, stage_region: None, next_first: false };
+    ring.run(&mut b, it, &stage, |b, slot, tile| {
         let kbase = ks.base as i32 + slot * KT * ROW;
         let vbase = vs.base as i32 + slot * KT * ROW;
         let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S^T = K Q^T, dP^T = V dO^T (2 blocks of 32 keys)
         for c in 0..8usize {
-            kslot.read(&mut b, |b| {
+            kslot.read(b, |b| {
                 for sb in 0..2usize {
                     let ad = b.bind_i32(ev(kr[c]) + kbase + sb as i32 * 32 * ROW);
                     let kf = b.load_lds_b128(ad);
                     b.var_mfma(sv_vars[sb], kind, kf, qf[c], c == 0);
                 }
             });
-            vslot.read(&mut b, |b| {
+            vslot.read(b, |b| {
                 for sb in 0..2usize {
                     let ad = b.bind_i32(ev(kr[c]) + vbase + sb as i32 * 32 * ROW);
                     let vf = b.load_lds_b128(ad);
@@ -294,7 +288,7 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
             }
         }
         // dQ^T += K^T dS^T: 4 steps of 16 keys x 4 blocks of 32 d
-        kslot.read(&mut b, |b| {
+        kslot.read(b, |b| {
             for t in 0..4usize {
                 let (sb, tt) = (t / 2, t % 2);
                 let i0 = 16 * sb + 8 * tt;
@@ -308,11 +302,7 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 }
             }
         });
-    }
-    let it1 = b.bind_i32(itx.clone() + 1);
-    b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
-    b.break_if(done);
+    });
     b.end_loop();
     // dQ = scale dQ^T^T (bf16, 4 consecutive d per 8-byte store)
     let live = b.bind_cond(ev(row).lt(ev(a.sq)));
@@ -491,18 +481,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     for v in dkv.iter().chain(dvv.iter()) {
         b.pin_agpr(*v);
     }
-    let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot + ev(qt0));
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        b.weave_region_begin("dkdv_stage");
-        let last = b.bind_i32((ev(npair) << 1) - 1 + ev(qt0));
-        let nxt = b.bind_i32((ev(tile) + 1).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
-        b.weave_region_end();
+    // the 2-slot Q / dO / LSE-Dot ring over query-tile pairs (L2 template T1, `PairRing`)
+    let ring = PairRing { npair, first: Some(qt0), stage_region: Some("dkdv_stage"), next_first: false };
+    ring.run(&mut b, it, &stage, |b, slot, tile| {
         let qbase = qs.base as i32 + slot * KT * ROW;
         let dbase = ds_.base as i32 + slot * KT * ROW;
         let (qsl, dsl) = (qs.at(&SlotIdx::new(slot, Opnd::Var(it))), ds_.at(&SlotIdx::new(slot, Opnd::Var(it))));
@@ -510,14 +491,14 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         // S and dP interleaved: 4 independent accumulator chains (c outer)
         b.weave_region_begin("dkdv_sdp_mma");
         for c in 0..8usize {
-            qsl.read(&mut b, |b| {
+            qsl.read(b, |b| {
                 for sb in 0..2usize {
                     let ad = b.bind_i32(ev(rr[c]) + qbase + sb as i32 * 32 * ROW);
                     let x = b.load_lds_b128(ad);
                     b.var_mfma(s_vars[sb], kind, x, kf[c], c == 0);
                 }
             });
-            dsl.read(&mut b, |b| {
+            dsl.read(b, |b| {
                 for sb in 0..2usize {
                     let ad = b.bind_i32(ev(rr[c]) + dbase + sb as i32 * 32 * ROW);
                     let x = b.load_lds_b128(ad);
@@ -558,7 +539,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         // the LSE / Dot of the lane's queries from this wave's staged copy (16-byte LDS reads: queries 32 sb + 8 g + 4 h .. + 3)
         let ld_rd: Vec<(ValueId, ValueId)> = {
             let ldb = b.bind_i32((lane.wave() << 9) + (ev(half) << 4) + (lds_ld.base as i32 + slot * 4 * 2 * KT * 4));
-            lds_ld.at(&SlotIdx::new(slot, Opnd::Var(it))).read(&mut b, |b| {
+            lds_ld.at(&SlotIdx::new(slot, Opnd::Var(it))).read(b, |b| {
                 (0..8i32)
                     .map(|i| {
                         let (sb, g) = (i / 4, i % 4);
@@ -607,7 +588,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         // dV^T += dO^T P, dK^T += Q^T dS: 4 steps of 16 queries x 4 blocks of 32 d (A by tr_b16 from the dO / Q tiles)
         b.weave_region_begin("dkdv_dv_dk_mma");
         for (sl, base, src, acc) in [(&dsl, dbase, &p, &dvv), (&qsl, qbase, &dsv, &dkv)] {
-            sl.read(&mut b, |b| {
+            sl.read(b, |b| {
                 for t in 0..4usize {
                     let (sb, tt) = (t / 2, t % 2);
                     let w0 = 8 * sb + 4 * tt;
@@ -622,11 +603,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
             });
         }
         b.weave_region_end();
-    }
-    let it1 = b.bind_i32(itx.clone() + 1);
-    b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
-    b.break_if(done);
+    });
     b.end_loop();
     // dK = scale dK^T^T, dV (bf16; lane = key, 4 consecutive d per 8-byte store)
     for (acc, r_out, sc) in [(&dkv, r_dk, Some(a.scale)), (&dvv, r_dv, None)] {

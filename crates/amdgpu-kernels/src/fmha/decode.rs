@@ -15,6 +15,7 @@
 use super::bf16::{tile_math, Tm};
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::{ev, LdsPlan, Lane};
+use amdgpu_tile::templates::split::{lse_combine, LseCombine};
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;
@@ -260,111 +261,5 @@ pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
 /// `sink` (`attn_combine_bf16_sink_hd128`, gpt-oss attention sinks): a per-head logit sink[h] (f32 [H], ptr @80) joins the softmax
 /// denominator only: O = sum_s e^(lse_s - M) po_s / (sum_s e^(lse_s - M) + e^(sink_h - M)), M = max(max_s lse_s, sink_h).
 pub fn attn_combine_bf16_xs(name: &str, dd: i32, split_major: bool, sink: bool) -> Function {
-    let (dv, rowb) = (dd, 2 * dd);
-    let mut b = FnBuilder::new(name, dd as u32);
-    b.compile_profile(CompileProfile::Gemm);
-    for (n, i) in [("ptr_o", 0u32), ("ptr_po", 1), ("ptr_plse", 2)] {
-        b.arg(n, DType::Ptr, 16 * i, 8);
-    }
-    b.arg("H", DType::I32, 48, 4);
-    b.arg("NS", DType::I32, 64, 4);
-    if sink {
-        b.arg("ptr_sink", DType::Ptr, 80, 8);
-    }
-    let (hh, ns) = (Ext::ka(48), Ext::ka(64));
-    b.sym_range("B", 1, 1 << 16);
-    b.ka_range(48, 1, 1 << 12);
-    b.ka_range(64, 1, 256);
-    b.grid_is(0, hh.clone());
-    b.grid_is(1, Ext::sym("B"));
-    b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(rowb as i64));
-    b.arg_tensor("ptr_po", Ext::sym("B") * hh.clone() * ns.clone() * Ext::c(4 * dv as i64));
-    if sink {
-        b.arg_tensor("ptr_sink", hh.clone() * Ext::c(4));
-    }
-    b.arg_tensor("ptr_plse", Ext::sym("B") * hh * ns * Ext::c(4));
-    let (p_o, p_po, p_l) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 32 }));
-    let hq = b.let_(Op::KernargI32 { offset: 48 });
-    let nsv = b.let_(Op::KernargI32 { offset: 64 });
-    let h = b.let_(Op::WorkgroupIdX);
-    let bat = b.let_(Op::WorkgroupIdY);
-    let tid = b.let_(Op::WorkitemId);
-    let row = { let v = b.bind_i32(ev(bat) * ev(hq) + ev(h)); b.read_first_lane(v) };
-    // partial (split s) of this (b, h): index base + s step
-    let (pbase, pstep) = if split_major {
-        (b.bind_i32(ev(bat) * ev(nsv) * ev(hq) + ev(h)), b.bind_i32(ev(hq)))
-    } else {
-        (b.bind_i32(ev(row) * ev(nsv)), b.c_i32(1))
-    };
-    let (pbase, pstep) = (b.read_first_lane(pbase), b.read_first_lane(pstep));
-    let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsv) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
-    let r_po = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsv) * (4 * dv)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    let r_o = { let n = b.bind_i32((ev(row) + 1) * rowb); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_o, n) };
-    let l_so = { let v = b.bind_i32(ev(pbase) << 2); b.read_first_lane(v) };
-    let c0 = b.c_i32(0);
-    let neg_inf = b.c_f32(f32::NEG_INFINITY);
-    // pass 1: M
-    let v1 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(neg_inf))]);
-    let s1 = amdgpu_dsl::varx(v1[0]);
-    let off = b.bind_i32((s1.clone() * ev(pstep)) << 2);
-    let x = b.buffer_load_f32(r_l, off, l_so, 0);
-    let mx = b.max_f32(Opnd::Var(v1[1]), x);
-    b.set_var(v1[1], mx);
-    let n1 = b.bind_i32(s1 + 1);
-    b.set_var(v1[0], n1);
-    let d1 = b.bind_cond(ev(n1).ge(ev(nsv)));
-    b.break_if(d1);
-    b.end_loop();
-    // sinks: the head's sink logit joins the max (and the denominator below)
-    let snk = sink.then(|| {
-        let p = b.let_(Op::KernargPtr { offset: 80 });
-        let n = { let v = b.bind_i32(ev(hq) << 2); b.read_first_lane(v) };
-        let r = b.buffer_desc_dyn(p, n);
-        let so = { let v = b.bind_i32(ev(h) << 2); b.read_first_lane(v) };
-        b.buffer_load_f32(r, c0, so, 0)
-    });
-    let m = match snk { Some(s) => Opnd::Val(b.max_f32(Opnd::Var(v1[1]), s)), None => Opnd::Var(v1[1]) };
-    // all empty -> M = -inf: use 0 (the weights exp(-inf - 0) = 0, O = 0 / max(sum, tiny))
-    let mbits = b.bitcast_i32(m);
-    let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
-    let zf = b.c_f32(0.0);
-    let mm = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(fin), a: m, b: Opnd::Val(zf) });
-    // pass 2: sums
-    let v2 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(zf)), (DType::F32, Opnd::Val(zf))]);
-    let s2 = amdgpu_dsl::varx(v2[0]);
-    let off = b.bind_i32((s2.clone() * ev(pstep)) << 2);
-    let x = b.buffer_load_f32(r_l, off, l_so, 0);
-    let dx = b.sub_f32(x, mm);
-    let l2e = b.c_f32(std::f32::consts::LOG2_E);
-    let t = b.mul_f32(dx, l2e);
-    let w = b.exp2_f32(t);
-    let po_vo = b.bind_i32(((ev(pbase) + s2.clone() * ev(pstep)) * dv + ev(tid)) << 2);
-    let o = b.buffer_load_f32(r_po, po_vo, c0, 0);
-    let acc = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(o), Opnd::Var(v2[1])));
-    b.set_var(v2[1], acc);
-    let sw = b.add_f32(Opnd::Var(v2[2]), w);
-    b.set_var(v2[2], sw);
-    let n2 = b.bind_i32(s2 + 1);
-    b.set_var(v2[0], n2);
-    let d2 = b.bind_cond(ev(n2).ge(ev(nsv)));
-    b.break_if(d2);
-    b.end_loop();
-    let tiny = b.c_f32(1e-30);
-    let den = match snk {
-        Some(s) => {
-            let ds = b.sub_f32(s, mm);
-            let l2e = b.c_f32(std::f32::consts::LOG2_E);
-            let ts = b.mul_f32(ds, l2e);
-            let ws = b.exp2_f32(ts);
-            Opnd::Val(b.add_f32(Opnd::Var(v2[2]), ws))
-        }
-        None => Opnd::Var(v2[2]),
-    };
-    let den = b.max_f32(den, tiny);
-    let inv = b.rcp_f32(den);
-    let y = b.mul_f32(Opnd::Var(v2[1]), inv);
-    let yb = b.cvt_pk_bf16_f32(y, y);
-    let o_vo = b.bind_i32((ev(row) * dv + ev(tid)) << 1);
-    b.buffer_store_n(r_o, Some(Opnd::Val(o_vo)), c0, 0, yb, amdgpu_dsl::MemTy::U16, false);
-    b.finish()
+    lse_combine(name, &LseCombine { dd, split_major, sink })
 }

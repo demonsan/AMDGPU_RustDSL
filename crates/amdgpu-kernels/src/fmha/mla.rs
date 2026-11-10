@@ -8,6 +8,7 @@
 //! * the DMA writes the tile linearly (chunk c = 72 key + position); the row base of key k comes from lane k (one block-table load per lane
 //!   and tile, `ds_bpermute` per issue).
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 const DK: i32 = 576;
@@ -452,19 +453,12 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + DB].to_vec();
     let sv_: Vec<VarId> = vars[3 + DB..5 + DB].to_vec();
-    let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot);
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        let last = b.bind_i32((ev(npair) << 1) - 1);
-        let nxt = b.bind_i32((ev(tile) + 1).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
+    // the 2-slot KV ring over tile pairs (L2 template T1, `PairRing`)
+    let ring = PairRing { npair, first: None, stage_region: None, next_first: false };
+    ring.run(&mut b, it, &stage, |b, slot, tile| {
         let kbase = kvs.base as i32 + slot * KT * ROW;
         let sl = kvs.at(&SlotIdx::new(slot, Opnd::Var(it)));
-        sl.read(&mut b, |b| {
+        sl.read(b, |b| {
             for c in 0..QC {
                 for blk in 0..2i32 {
                     let a = b.bind_i32(ev(kr[c]) + kbase + blk * 16 * ROW);
@@ -488,7 +482,7 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
         for pair in s[1..].chunks(2) {
             mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
         }
-        let mt = group4(&mut b, mx, true);
+        let mt = group4(b, mx, true);
         let mt = b.mul_f32(mt, csc);
         let thr = b.c_f32(8.0);
         let mlim = b.add_f32(Opnd::Var(m_v), thr);
@@ -530,7 +524,7 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
         let w: Vec<ValueId> = [(0usize, 0usize), (0, 2), (1, 0), (1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
         let pf = b.pack4(w[0], w[1], w[2], w[3]);
         let vbase: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(ev(*v) + kbase)).collect();
-        sl.read(&mut b, |b| {
+        sl.read(b, |b| {
             for db in 0..DB as i32 {
                 let q = (db % 4) as usize;
                 let hi = ((2 * db) & !7) << 4;
@@ -540,11 +534,7 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
             }
         });
-    }
-    let it1 = b.bind_i32(itx.clone() + 1);
-    b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
-    b.break_if(done);
+    });
     b.end_loop();
     // ---- the part's partial (as mla_decode_bf16, NS = S) ----
     let zf = b.c_f32(0.0);

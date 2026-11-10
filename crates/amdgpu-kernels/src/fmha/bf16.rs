@@ -14,6 +14,7 @@
 //!   each 16-key step, and the V^T reads use the same key order.
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::components::gqa_kv_head;
+use amdgpu_tile::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 /// keys per tile
@@ -292,19 +293,10 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
             b.pin_agpr(*v);
         }
     }
-    let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot + ev(kt0));
-        // top of tile: this tile's DMA done and visible; the other slot free (every wave is past tile - 1)
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        // the next tile into the other slot (the last pass stages a tile past the end: rows past the sequence, masked; clamped to the pair count)
-        let nxt = b.bind_i32(ev(tile) + 1);
-        let last = b.bind_i32((ev(npair) << 1) - 1 + ev(kt0));
-        let nxt = b.bind_i32(ev(nxt).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
+    // the 2-slot K / V ring over key-tile pairs (L2 template T1, `PairRing`): at the top of a tile its DMA is done and visible and the
+    // other slot is free; the last pass stages a clamped tile again (rows past the sequence are masked)
+    let ring = PairRing { npair, first: Some(kt0), stage_region: None, next_first: true };
+    ring.run(&mut b, it, &stage, |b, slot, tile| {
         let kbase = I32::c(ks.base as i32 + slot * KT * ROW);
         let vbase = I32::c(vs.base as i32 + slot * KT * ROW);
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
@@ -321,11 +313,8 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
             None => (ev(t_lo) + (KT - 1)).le(ev(lim_min)).select_i32(1, 0),
         };
         let partial = b.bind_cond(full_c.eq(0));
-        tile_math(&mut b, &tm, kbase, vbase, Some((Some(partial), &keep)), m_v, l_v, &s_vars, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
-    }    let it1 = b.bind_i32(itx.clone() + 1);
-    b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
-    b.break_if(done);
+        tile_math(b, &tm, kbase, vbase, Some((Some(partial), &keep)), m_v, l_v, &s_vars, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
+    });
     b.end_loop();
 
     // ---- epilogue: O = O^T / l (both lane halves' row sums), bf16, 4 consecutive d per 8-byte store; LSE = (m + log2 l) ln 2 ----
