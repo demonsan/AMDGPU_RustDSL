@@ -11,11 +11,9 @@
 
 #![forbid(unsafe_code)]
 
-pub mod components;
 pub mod epilogue;
 pub mod frag;
 pub mod lane;
-pub mod pipeline;
 pub mod reduce;
 pub mod rows;
 pub mod shared;
@@ -23,7 +21,6 @@ pub mod softmax;
 pub mod tensor;
 pub mod bufdma;
 pub mod contract;
-pub mod contract_stage;
 pub mod copy;
 pub mod dma;
 pub mod global;
@@ -31,10 +28,8 @@ pub mod handoff;
 pub mod orient;
 pub mod rowsum;
 pub mod mma;
-pub mod stage;
 pub mod prims;
 pub mod tileop;
-pub mod templates;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, make_tiled_copy_bcast, LdsPart, LdsPrivPart, LdsSlotPart, TiledCopy};
 pub use global::GlobalPart;
@@ -250,7 +245,6 @@ impl Ctx {
 // the tile components formerly in `amdgpu_dsl::tile`
 pub use rows::{issue_rows_shared, DwordRowsCopy, DwordRowsVgpr, RowSource, RowsCopy};
 pub use lane::{versioned, Lane, Role, Roles, TileIt};
-pub use pipeline::{Cadence, PipeBody, Pipeline};
 pub use shared::{fmha_swz, LdsPlan, Layout, PrivRef, Shared, SlotIdx, SlotRef, Swz};
 pub use tensor::{Clamp, Dim, KArgs, Stride, Tensor, TensorDecl, TileView};
 

@@ -36,12 +36,12 @@ Template parameters come in four kinds:
 
 | Piece | File:line | Role today | Fate in P1 |
 |---|---|---|---|
-| `Pipeline`, `Cadence`, `TileIt`, `PipeBody` | `crates/amdgpu-tile/src/pipeline.rs:51 / 120 / 68 / 93` | tile pipeline driver: `TwoPhaseOffset`, `OneWindow`, `RegStaged` (2 or 3 slots) | becomes the core of `amdgpu-stage::ring` (templates T1, T2, T3); `TileIt` itself moves **down** into `amdgpu-tile::lane` first, because `reduce.rs:5` (L3) already uses it (`crate-split.md` P2) |
+| `Pipeline`, `Cadence`, `TileIt`, `PipeBody` | `crates/amdgpu-stage/src/pipeline.rs:51 / 120 / 68 / 93` | tile pipeline driver: `TwoPhaseOffset`, `OneWindow`, `RegStaged` (2 or 3 slots) | becomes the core of `amdgpu-stage::ring` (templates T1, T2, T3); `TileIt` itself moves **down** into `amdgpu-tile::lane` first, because `reduce.rs:5` (L3) already uses it (`crate-split.md` P2) |
 | `Roles` (`split`, `single`, `each`), `Role` | `crates/amdgpu-tile/src/lane.rs:54` (+ `Roles` in the same crate) | two-group dispatch with compile-time role tags | `amdgpu-stage::roles` |
-| `StageInst`, `compose`, `merge`, `Prim` | `crates/amdgpu-tile/src/stage.rs:15 / 38 / 112 / 125` | stage composition with weave handover (fusion stage library) | stays, moves to `amdgpu-stage` |
-| `check_boundary`, `StageBoundary`, `LiveFrag` | `crates/amdgpu-tile/src/contract_stage.rs:50 / 71` | producer / consumer fragment-layout contract check | moves to `amdgpu-stage` |
+| `StageInst`, `compose`, `merge`, `Prim` | `crates/amdgpu-stage/src/stage.rs:15 / 38 / 112 / 125` | stage composition with weave handover (fusion stage library) | stays, moves to `amdgpu-stage` |
+| `check_boundary`, `StageBoundary`, `LiveFrag` | `crates/amdgpu-stage/src/contract_stage.rs:50 / 71` | producer / consumer fragment-layout contract check | moves to `amdgpu-stage` |
 | `ConvPlan` handoff | `crates/amdgpu-tile/src/handoff.rs:15 / 115` | layout conversion between fused GEMM stages (`mlp`) | stays in `amdgpu-tile` (L3, decision D2 of `crate-split.md`: it is function-level code over `PrivRef` / `ConvPlan`); the L2 template only calls it |
-| `kv_split_decode`, `kv_split_range(_var)`, `gqa_kv_head` | `crates/amdgpu-tile/src/components.rs:20 / 35 / 58 / 8` | KV-split index maths shared by decode / prefill | template T5 helper |
+| `kv_split_decode`, `kv_split_range(_var)`, `gqa_kv_head` | `crates/amdgpu-stage/src/components.rs:20 / 35 / 58 / 8` | KV-split index maths shared by decode / prefill | template T5 helper |
 | `kvsplit_partial_f16`, `combine_splits` | `crates/amdgpu-tile/src/epilogue.rs:34 / 89` | partial-store and combine epilogues | template T5 |
 | op graph + skeleton generator | `crates/amdgpu-graph/src/opgraph/{mod,skeleton,json}.rs`; generated `fmha/skeleton_{vs128,t128,kvsplit}.rs` | graph → `build_<kernel><S: Slots>` skeleton with slots filled by the kernel | L1 (graph) → L2 (skeleton) boundary; see §3.14 |
 | `RowsCopy`, `issue_rows_shared`, `DwordRowsCopy` | `crates/amdgpu-tile/src/rows.rs:45 / 110 / 164` | DMA / dword row staging helpers | L3 (copy), used by T1 / T3 / T7 |
@@ -78,7 +78,7 @@ in flight.
 
 **Code today.**
 
-- Extracted driver: `crates/amdgpu-tile/src/pipeline.rs` — `Cadence` (`:51`), `TileIt` (`:68`), `PipeBody` (`:93`), `Pipeline::run` (`:162`). Parameters that are already
+- Extracted driver: `crates/amdgpu-stage/src/pipeline.rs` — `Cadence` (`:51`), `TileIt` (`:68`), `PipeBody` (`:93`), `Pipeline::run` (`:162`). Parameters that are already
   template parameters: `tile_rows`, `nkv_bound`, `prebind` (slot-offset values bound at the top of each iteration), `vm_inflight` (`OneWindow`: counted wait at the end
   of a window), `late_tile1_vm` (`RegStaged`: DMAs of tile 1 allowed in flight at the prologue barrier), `rs_depth` (`RegStaged`: **2 or 3 slots**, three tiles per loop
   pass with static slots 0 / 1 / 2, tile t + 3 staged while t + 2 is still in flight under `vmcnt(late_tile1_vm)`), `scalar_exit`, `key_unclamped`.
@@ -501,7 +501,7 @@ No environment knobs in templates (repository rule): fixed choices plus archive 
 ## 6. Extraction status (kernel-opt, 2026-11-10)
 
 All steps below are md5-neutral: `amdc md5-manifest --check tests/golden/md5_manifest.tsv` reports 234 kernels, 0 differences. The template code
-is in `crates/amdgpu-tile/src/templates/` so that M7 (`amdgpu-stage`) can move the directory as a unit.
+is in `crates/amdgpu-stage/src/templates/` so that M7 (`amdgpu-stage`) can move the directory as a unit.
 
 | Template | Done | Users ported | Notes |
 |---|---|---|---|

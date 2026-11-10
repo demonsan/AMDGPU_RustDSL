@@ -8,6 +8,7 @@ use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::*;
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
+use amdgpu_stage::{Cadence, PipeBody, Pipeline};
 
 struct Body {
     ks: Shared,

@@ -148,8 +148,8 @@ fn a_weave_group_is_one_slot_with_a_default_composition_and_member_constructors(
     g.validate().unwrap();
     let text = generate(&g, "attn", &["sm", "pv", "qk"], "attn.graph.json").unwrap();
     assert!(text.contains("fn m_phase(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {"), "{text}");
-    assert!(text.contains("amdgpu_tile::stage::compose(\"m_phase\", vec![self.pv_stage(&*cx), self.qk_stage(&*cx)])"), "{text}");
-    assert!(text.contains("fn qk_stage<'a>(&'a self, cx: &'a Self::Cx) -> amdgpu_tile::stage::StageInst<'a>;"), "{text}");
+    assert!(text.contains("amdgpu_stage::stage::compose(\"m_phase\", vec![self.pv_stage(&*cx), self.qk_stage(&*cx)])"), "{text}");
+    assert!(text.contains("fn qk_stage<'a>(&'a self, cx: &'a Self::Cx) -> amdgpu_stage::stage::StageInst<'a>;"), "{text}");
     assert!(!text.contains("fn qk(&mut self") && !text.contains("fn pv(&mut self"), "grouped nodes have no slots of their own");
     assert!(text.find("slots.sm(b, &mut cx);").unwrap() < text.find("slots.m_phase(b, &mut cx);").unwrap(), "{text}");
     assert_eq!(text, generate(&g, "attn", &["sm", "pv", "qk"], "attn.graph.json").unwrap(), "deterministic");

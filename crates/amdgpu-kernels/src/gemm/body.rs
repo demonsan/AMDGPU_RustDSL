@@ -1,13 +1,14 @@
 //! The GEMM main-loop body (`PipeBody` of the register-staged cadence): scale panel, MXFP4 shuffled scales, operand reads and MMAs.
 
 use amdgpu_dsl::{DType, FnBuilder, I32, Opnd, ValueId, VarId};
-use amdgpu_tile::{ev, ox, PipeBody, Role, Shared, SlotIdx, TileIt};
+use amdgpu_tile::{ev, ox, Role, Shared, SlotIdx, TileIt};
 use amdgpu_tile::copy::LdsPart;
 use amdgpu_tile::mma::TiledMma;
 use super::dma::Dma;
 use super::Elem;
 use super::mma::{bs_fma, mma_blocks, mma_var};
 use super::Scales;
+use amdgpu_stage::{PipeBody};
 
 /// The configuration numbers the body reads (instead of the whole `GemmConfig`): operand format, scale form, wave tile and the MMA
 /// counts placed around the top-of-tile sync. Built by `GemmConfig::body_params` (docs/l2-family-bodies.md §2.3).
@@ -359,7 +360,7 @@ impl Body {
     /// Stage `mma.blockscale_tile`: the MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last
     /// use (first half of the B fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is
     /// reloaded); the scales of t+1 are read before the MMAs and installed at the end (partial lgkm waits). Captured units.
-    fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_tile::stage::StageInst<'static> {
+    fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_stage::stage::StageInst<'static> {
         use amdgpu_codegen::weave::Units;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (self.n_a(), bv.len());
@@ -461,7 +462,7 @@ impl Body {
             });
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles, ..Default::default() };
-        amdgpu_tile::stage::StageInst::new("mma.blockscale_tile", amdgpu_tile::stage::Prim::A, "gemm.tile", contract, u)
+        amdgpu_stage::stage::StageInst::new("mma.blockscale_tile", amdgpu_stage::stage::Prim::A, "gemm.tile", contract, u)
             .param("atom", "mfma_scale_16x16x128_f8")
             .param("wave_tile", format!("{}x{}", 16 * nm, 16 * nn))
             .param("staged", t.staged)
@@ -475,7 +476,7 @@ impl Body {
     }
     /// Stage `move.ab_stage`: the DMA of one tile (A issues, then B issues); soffset = the wave-uniform tile origin, M0 = the first 1 KB block of
     /// each group of 4 issues; one captured unit per DMA instruction (each under the slot's write marker).
-    fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> amdgpu_tile::stage::StageInst<'static> {
+    fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> amdgpu_stage::stage::StageInst<'static> {
         let mut u = amdgpu_codegen::weave::Units::new();
         let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
@@ -548,7 +549,7 @@ impl Body {
             u.capture(b, "ab.SC.b", |b| sc.at(slot).write(b, |b| b.load_buffer_lds(self.rsrc_sfb, *vb, so, m0b, 0, 1)));
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
-        amdgpu_tile::stage::StageInst::new("move.ab_stage", amdgpu_tile::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
+        amdgpu_stage::stage::StageInst::new("move.ab_stage", amdgpu_stage::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
     }}
 
 impl PipeBody for Body {

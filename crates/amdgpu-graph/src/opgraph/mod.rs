@@ -1,7 +1,7 @@
 //! The lightweight OP GRAPH of the stage library (docs/fusion-stage-library-design.md section 3): plain Rust data, JSON-serialisable, NOT an IR. It is the input of the skeleton
 //! generator (`skeleton.rs`) and never enters the compiler.
 //!
-//! * nodes = stage instances: a primitive (M / A / E / R / O / Q / S / P), the registry key of the stage (`amdgpu_tile::stage`), its parameters, a resource estimate and the wave roles;
+//! * nodes = stage instances: a primitive (M / A / E / R / O / Q / S / P), the registry key of the stage (`amdgpu_stage::stage`), its parameters, a resource estimate and the wave roles;
 //! * edges = tensors: dtype / shape, the producer's and the consumer's layout as element tables (when both are known the boundary cost class is COMPUTED with the layout algebra), the largest
 //!   on-chip scope the tensor may stay in, its storage, and the boundary cost class C0..C4 (`Edge::class`);
 //! * a CUT partitions the nodes into kernels; an edge between two kernels is C4 (HBM); the budgets of a kernel (registers, LDS) and the scope requirements are checked per kernel.
@@ -209,7 +209,7 @@ pub struct Node {
     /// unique instance name (also the stage / region label)
     pub id: String,
     pub prim: Prim,
-    /// registry key of the stage (`amdgpu_tile::stage::registry()`)
+    /// registry key of the stage (`amdgpu_stage::stage::registry()`)
     pub stage: String,
     pub params: Vec<(String, Val)>,
     pub resources: Resources,

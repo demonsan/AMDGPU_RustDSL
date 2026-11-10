@@ -8,8 +8,8 @@
 //! * the DMA writes the tile linearly (chunk c = 72 key + position); the row base of key k comes from lane k (one block-table load per lane
 //!   and tile, `ds_bpermute` per issue).
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
-use amdgpu_tile::templates::grid;
-use amdgpu_tile::templates::pair_ring::PairRing;
+use amdgpu_stage::templates::grid;
+use amdgpu_stage::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 const DK: i32 = 576;

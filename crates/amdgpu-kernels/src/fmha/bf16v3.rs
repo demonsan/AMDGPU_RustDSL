@@ -6,10 +6,10 @@
 //! reference (moves when a tile max passes it by 8, wave-level branch), the key mask only on the tiles that need it (uniform branch in the
 //! VALU phase).
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
-use amdgpu_tile::components::gqa_kv_head;
-use amdgpu_tile::templates::split::lse_combine_rows16_hd128;
-use amdgpu_tile::templates::grid;
-use amdgpu_tile::pipeline::{Cadence, PipeBody, Pipeline, TileIt};
+use amdgpu_stage::components::gqa_kv_head;
+use amdgpu_stage::templates::split::lse_combine_rows16_hd128;
+use amdgpu_stage::templates::grid;
+use amdgpu_stage::pipeline::{Cadence, PipeBody, Pipeline, TileIt};
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, Role, Roles, Shared, SlotIdx};
 
 const D: i32 = 128;

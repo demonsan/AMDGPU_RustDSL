@@ -10,6 +10,7 @@ amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-layout = { path = "../amdgpu-layout" }
 amdgpu-isa = { path = "../amdgpu-isa" }
 amdgpu-tile = { path = "../amdgpu-tile" }
+amdgpu-stage = { path = "../amdgpu-stage" }
 amdgpu-graph = { path = "../amdgpu-graph" }
 amdgpu-codegen = { path = "../amdgpu-codegen" }
 amdgpu-safeasm = { path = "../amdgpu-safeasm" }

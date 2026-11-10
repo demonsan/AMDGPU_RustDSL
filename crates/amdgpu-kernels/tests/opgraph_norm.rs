@@ -39,7 +39,7 @@ fn every_hand_over_stays_in_registers() {
 
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
-    let reg = amdgpu_tile::stage::registry();
+    let reg = amdgpu_stage::stage::registry();
     for n in &graph().nodes {
         let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("node {}: stage key {} is not in the registry", n.id, n.stage));
         assert_eq!(n.prim.code(), format!("{:?}", d.prim), "node {}", n.id);

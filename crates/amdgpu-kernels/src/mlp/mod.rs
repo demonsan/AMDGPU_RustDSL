@@ -13,7 +13,7 @@
 use amdgpu_tile::{ev, Lane};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_isa::MmaAtom;
-use amdgpu_tile::contract_stage::{check_boundary, LiveFrag, StageBoundary, Storage};
+use amdgpu_stage::contract_stage::{check_boundary, LiveFrag, StageBoundary, Storage};
 use amdgpu_tile::orient::{consumer_pairs, POperand};
 use amdgpu_layout::Movement;
 
@@ -453,7 +453,7 @@ struct GemmCtx<'r> {
 /// Stage `gemm1_act` (keys `mma.rows_x_lds` + `map.relu_pack_fp8`): `H^T = W1 X^T`, `fp8(relu(alpha H))` packed in accumulator order (fused: the
 /// zero-cost B-operand words of GEMM 2; G1: stored to HBM; G1q: the generic epilogue chain). Captured units; returns the stage and the P words.
 #[allow(clippy::too_many_arguments)]
-fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: &[Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> (amdgpu_tile::stage::StageInst<'static>, Vec<Opnd>) {
+fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: &[Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> (amdgpu_stage::stage::StageInst<'static>, Vec<Opnd>) {
     let mut u = amdgpu_codegen::weave::Units::new();
     let (_, zero) = u.capture(b, "gemm1.setup", |b| b.frag_zero(DType::Frag16));
     let mut acc = vec![zero; (N1 / 32) as usize];
@@ -541,7 +541,7 @@ fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: 
     };
     let contract = amdgpu_dsl::StageContract { barrier_phase: 1, roles: roles.to_vec(), ..Default::default() };
     let p = out.clone();
-    let inst = amdgpu_tile::stage::StageInst::new("mma.rows_x_lds", amdgpu_tile::stage::Prim::A, "gemm1_act", contract, u)
+    let inst = amdgpu_stage::stage::StageInst::new("mma.rows_x_lds", amdgpu_stage::stage::Prim::A, "gemm1_act", contract, u)
         .param("atom", "mfma_scale_32x32x64_f8")
         .param("n", N1)
         .param("k", K1)
@@ -556,7 +556,7 @@ fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: 
 
 /// Stage `gemm2` (keys `mma.rows_x_lds` + `map.store_bf16`): `Y^T = W2 H^T` from the P words, bf16 stores. Captured units.
 #[allow(clippy::too_many_arguments)]
-fn gemm2_stage(b: &mut FnBuilder, g: GemmCtx, w2: &amdgpu_tile::Shared, p_words: &[Opnd], r_out: ValueId, row: ValueId, lane: &Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_tile::stage::StageInst<'static> {
+fn gemm2_stage(b: &mut FnBuilder, g: GemmCtx, w2: &amdgpu_tile::Shared, p_words: &[Opnd], r_out: ValueId, row: ValueId, lane: &Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_stage::stage::StageInst<'static> {
     let mut u = amdgpu_codegen::weave::Units::new();
     let (_, zero) = u.capture(b, "gemm2.setup", |b| b.frag_zero(DType::Frag16));
     let mut acc = vec![zero; (N2 / 32) as usize];
@@ -583,7 +583,7 @@ fn gemm2_stage(b: &mut FnBuilder, g: GemmCtx, w2: &amdgpu_tile::Shared, p_words:
             }
         });
     }
-    amdgpu_tile::stage::StageInst::new("mma.rows_x_lds", amdgpu_tile::stage::Prim::A, "gemm2", contract, u)
+    amdgpu_stage::stage::StageInst::new("mma.rows_x_lds", amdgpu_stage::stage::Prim::A, "gemm2", contract, u)
         .param("atom", "mfma_scale_32x32x64_f8")
         .param("n", N2)
         .param("k", N1)

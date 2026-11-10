@@ -4,7 +4,7 @@
 //! (g = l / 16); the softmax statistics are combined over the 4 lane groups (permlane16 + permlane32 swaps). P^T feeds the 32-key PV step in the
 //! key order {4 g + 0..3 of block 2 t, 16 + 4 g + 0..3 of block 2 t + 1}; V^T by ds_read_b64_tr_b16 with rows 16 r + 4 g + s / 4.
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
-use amdgpu_tile::templates::grid;
+use amdgpu_stage::templates::grid;
 use amdgpu_tile::{ev, LdsPlan, Lane};
 
 const D: i32 = 128;

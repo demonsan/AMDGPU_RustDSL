@@ -10,7 +10,7 @@
 //! `clamp_bin` (the bin index of the idle threads is clamped to 0 so the read stays inside the declared tile: `sampling`) and `norm_hit` (an extra, redundant 0/1 normalisation of the hit flag that
 //! `sampling` carries: kept so that the move is md5-neutral; flip it with a re-baselined manifest to drop the redundant select).
 
-use crate::{ev, Shared, SlotIdx};
+use amdgpu_tile::{ev, Shared, SlotIdx};
 use amdgpu_dsl::{CmpPred, CmpTy, Dpp, DppAluOp, DppCtrl, DType, FnBuilder, MemTy, Op, Opnd, ValueId};
 use std::cell::Cell;
 

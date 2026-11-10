@@ -14,9 +14,9 @@
 //! 12 ptr_plse.
 use super::bf16::{tile_math, Tm};
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
-use amdgpu_tile::templates::grid;
+use amdgpu_stage::templates::grid;
 use amdgpu_tile::{ev, LdsPlan, Lane};
-use amdgpu_tile::templates::split::{lse_combine, LseCombine};
+use amdgpu_stage::templates::split::{lse_combine, LseCombine};
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;

@@ -29,6 +29,7 @@ use io::{combine_kernel, FmhaBlock, FmhaIo};
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, I32};
 use amdgpu_layout::{tup, Ix};
+use amdgpu_stage::{Cadence, Pipeline};
 
 /// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V / K-scale staging, the vendor's
 /// priority ping-pong, two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe with the lazy reference

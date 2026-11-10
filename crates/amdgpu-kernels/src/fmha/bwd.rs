@@ -9,10 +9,10 @@
 //! 9 scale (f32), 10 SQ, 11 SK, 12 H, 13 HK, 14 o (the dot kernel). Q / dO / O / dQ [B, SQ, H, 128], K / V [B, SK, HK, 128], dK / dV per Q head
 //! [B, SK, H, 128] (dense),
 //! causal = bottom-right (key k visible to query q iff k <= q + SK - SQ).
-use amdgpu_tile::components::gqa_kv_head;
+use amdgpu_stage::components::gqa_kv_head;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
-use amdgpu_tile::templates::grid;
-use amdgpu_tile::templates::pair_ring::PairRing;
+use amdgpu_stage::templates::grid;
+use amdgpu_stage::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 const D: i32 = 128;

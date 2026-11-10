@@ -95,7 +95,7 @@ fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
 
 ### 1.4 stage 实例与契约（`AttnBody3` 的 `PipeBody` 相位）
 
-`Pipeline::run` 生成 wait、barrier、槽与代、剥离的末 tile。在每个 hook 里，`AttnBody3` 构造 `amdgpu_tile::stage::StageInst`，即 registry key + `StageContract` + 发射单元：
+`Pipeline::run` 生成 wait、barrier、槽与代、剥离的末 tile。在每个 hook 里，`AttnBody3` 构造 `amdgpu_stage::stage::StageInst`，即 registry key + `StageContract` + 发射单元：
 
 | hook | 实例 | 契约里的交接（GV-STAGE 检查） |
 |---|---|---|

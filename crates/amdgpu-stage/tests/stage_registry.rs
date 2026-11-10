@@ -2,7 +2,7 @@
 
 #[test]
 fn registry_keys_unique_and_cover_instances() {
-    let r = amdgpu_tile::stage::registry();
+    let r = amdgpu_stage::stage::registry();
     let mut keys: Vec<&str> = r.iter().map(|d| d.key).collect();
     keys.sort();
     let n = keys.len();
