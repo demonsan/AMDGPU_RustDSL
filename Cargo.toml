@@ -10,6 +10,7 @@ members = [
     "crates/amdgpu-tile",
     "crates/amdgpu-kernels",
     "crates/amdgpu-sym",
+    "crates/amdgpu-target",
 ]
 
 [workspace.package]
