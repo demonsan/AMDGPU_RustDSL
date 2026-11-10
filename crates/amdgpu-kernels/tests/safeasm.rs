@@ -42,7 +42,8 @@ fn assembles(asm: &str) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("k.s"), asm).unwrap();
     let out = std::process::Command::new(&clang)
-        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-c", "-o"])
+        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(["-c", "-o"])
         .arg(dir.join("k.o"))
         .arg(dir.join("k.s"))
         .output()
@@ -418,7 +419,9 @@ fn writing_an_input_port_is_refused() {
 #[test]
 fn coverage_matrix() {
     use amdgpu_safeasm::{HAND_WRITTEN_OPS, TYPED_OPS};
-    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl")).unwrap();
+    let tbl_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl");
+    assert!(std::path::Path::new(tbl_path).exists(), "{tbl_path} not found (the LLVM MIR tables moved? update this path)");
+    let tbl = std::fs::read_to_string(tbl_path).unwrap();
     let keys: Vec<String> = tbl
         .lines()
         .filter(|l| !l.starts_with('#') && l.contains('|'))

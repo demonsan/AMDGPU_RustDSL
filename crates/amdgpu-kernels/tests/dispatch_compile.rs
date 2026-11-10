@@ -29,7 +29,8 @@ fn assemble(asm: &str, tag: &str) -> Option<Result<(), String>> {
     let s = dir.join("k.s");
     std::fs::write(&s, asm).ok()?;
     let out = std::process::Command::new(&clang)
-        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-o"])
+        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .arg("-o")
         .arg(dir.join("k.co"))
         .arg(&s)
         .output()

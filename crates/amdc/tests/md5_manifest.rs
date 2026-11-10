@@ -6,7 +6,7 @@ fn the_asm_of_every_reachable_kernel_matches_the_golden_manifest() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/md5_manifest.tsv");
     let golden = amdc::manifest::parse(&std::fs::read_to_string(&path).expect("tests/golden/md5_manifest.tsv"));
     let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let now = amdc::manifest::compute(jobs);
+    let now = amdc::manifest::compute(jobs).expect("scrubbed environment");
     let d = amdc::manifest::diff(&golden, &now);
     assert!(
         d.is_empty(),

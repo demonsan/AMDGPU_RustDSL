@@ -42,7 +42,7 @@ pub fn current() -> &'static Dialect {
 }
 /// Pass the tail starts at; first one that exists in the pipeline is used.
 pub const START_PASS_PREFERENCE: &[&str] = &["gcn-create-vopd", "si-memory-legalizer"];
-pub const LLC_ARGS: &[&str] = &["-mtriple=amdgcn-amd-amdhsa", "-mcpu=gfx950", "-O2"];
+pub const LLC_ARGS: &[&str] = crate::target::T.llvm.llc_args;
 
 /// Operand class named in a table signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

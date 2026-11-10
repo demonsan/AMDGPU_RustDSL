@@ -7,8 +7,24 @@
 use amdgpu_compiler::backend::OwnTail;
 use amdgpu_compiler::compile_with;
 
-/// (name, md5 or "ERROR" / "MISSING") for every manifest kernel, compiled on `jobs` threads.
-pub fn compute(jobs: usize) -> Vec<(String, String)> {
+/// The `AMDC_*` environment variables that are set (non-empty): they change the compiler's output (scheduler, lowering options, backend
+/// switches), so the manifest is computed and checked only in a scrubbed environment.
+pub fn env_overrides() -> Vec<String> {
+    let mut v: Vec<String> = std::env::vars().filter(|(k, val)| k.starts_with("AMDC_") && !val.is_empty()).map(|(k, val)| format!("{k}={val}")).collect();
+    v.sort();
+    v
+}
+
+/// (name, md5 or "ERROR" / "MISSING") for every manifest kernel, compiled on `jobs` threads; refused when an `AMDC_*` variable is set.
+pub fn compute(jobs: usize) -> Result<Vec<(String, String)>, String> {
+    let ov = env_overrides();
+    if !ov.is_empty() {
+        return Err(format!("the manifest needs a scrubbed environment; unset: {}", ov.join(" ")));
+    }
+    Ok(compute_unchecked(jobs))
+}
+
+fn compute_unchecked(jobs: usize) -> Vec<(String, String)> {
     let names: Vec<String> = amdgpu_kernels::reachable::manifest_names().into_iter().collect();
     let jobs = jobs.max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);

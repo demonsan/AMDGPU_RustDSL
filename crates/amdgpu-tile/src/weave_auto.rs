@@ -66,7 +66,26 @@ pub struct Model {
 
 impl Model {
     pub fn gfx950() -> Model {
-        Model { issue_gap: 4, mfma_cycles: 64, mfma16_cycles: 32, mfma_latency: 84, mfma16_latency: 48, valu_latency: 8, ds_b128_latency: 144, ds_tr_latency: 125, ds_b32_latency: 64, lds_queue_depth: 8, lds_queue_penalty: 200, dma_issue: 24, branch_cost: 24, reg_slack: 16, passes: 24, window: 40 }
+        // the machine numbers are the target's (amdgpu_target::gfx950 `latency.weave`); reg_slack / passes / window are the search's own
+        let w = &amdgpu_target::gfx950::GFX950.latency.weave;
+        Model {
+            issue_gap: w.issue_gap,
+            mfma_cycles: w.mfma_cycles,
+            mfma16_cycles: w.mfma16_cycles,
+            mfma_latency: w.mfma_latency,
+            mfma16_latency: w.mfma16_latency,
+            valu_latency: w.valu_latency,
+            ds_b128_latency: w.ds_b128_latency,
+            ds_tr_latency: w.ds_tr_latency,
+            ds_b32_latency: w.ds_b32_latency,
+            lds_queue_depth: w.lds_queue_depth,
+            lds_queue_penalty: w.lds_queue_penalty,
+            dma_issue: w.dma_issue,
+            branch_cost: w.branch_cost,
+            reg_slack: 16,
+            passes: 24,
+            window: 40,
+        }
     }
 }
 /// One schedulable item of the planner: a weave unit or a captured statement (or a group of statements that must not be split).

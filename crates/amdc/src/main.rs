@@ -500,7 +500,13 @@ fn main() -> ExitCode {
             // amdc md5-manifest [--out FILE] [--check FILE] [--jobs N]: the own-backend asm md5 of every reachable kernel (the refactor's golden oracle)
             let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
             let jobs = opt("--jobs").and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-            let now = amdc::manifest::compute(jobs);
+            let now = match amdc::manifest::compute(jobs) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
             if let Some(p) = opt("--check") {
                 let golden = match fs::read_to_string(&p) {
                     Ok(s) => amdc::manifest::parse(&s),

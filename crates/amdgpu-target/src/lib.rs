@@ -16,8 +16,58 @@ pub struct Target {
     pub counters: Counters,
     /// the hazard rules whose distances are target facts (the per-instruction writer delays are in the instruction tables)
     pub hazards: &'static [HazardRule],
+    pub latency: LatencyModel,
     pub emit: Emission,
+    pub llvm: LlvmTail,
     pub verify: VerifyLimits,
+}
+
+/// The machine model of the schedulers (the per-instruction issue / latency costs are in the instruction tables).
+#[derive(Debug)]
+pub struct LatencyModel {
+    /// taken branch, unconditional branch, not-taken branch, VALU compare -> branch on vcc, `s_barrier` (cycles)
+    pub branch_taken: u32,
+    pub branch_uncond: u32,
+    pub branch_not_taken: u32,
+    pub vcc_to_branch: u32,
+    pub barrier: u32,
+    /// whether `v_exp` / `v_rcp` issue on their own pipe next to the VALU
+    pub trans_separate_pipe: bool,
+    /// slotfill: cycles of one MFMA issue slot, the instruction cycles that fit into it, a global -> LDS DMA's latency
+    pub slot_cycles: u32,
+    pub slot_budget: u32,
+    pub dma_latency_cycles: u32,
+    /// the weave planner's coarse model (one wave per SIMD)
+    pub weave: WeaveMachine,
+}
+
+/// The weave planner's machine numbers (cycles).
+#[derive(Debug)]
+pub struct WeaveMachine {
+    pub issue_gap: i64,
+    pub mfma_cycles: i64,
+    pub mfma16_cycles: i64,
+    pub mfma_latency: i64,
+    pub mfma16_latency: i64,
+    pub valu_latency: i64,
+    pub ds_b128_latency: i64,
+    pub ds_tr_latency: i64,
+    pub ds_b32_latency: i64,
+    /// LDS ops outstanding at issue from which the return slows down, and by how much
+    pub lds_queue_depth: usize,
+    pub lds_queue_penalty: i64,
+    pub dma_issue: i64,
+    pub branch_cost: i64,
+}
+
+/// The LLVM tools' settings for this target.
+#[derive(Debug)]
+pub struct LlvmTail {
+    pub triple: &'static str,
+    /// `llc` arguments of the post-RA tail (`-mtriple`, `-mcpu`, optimisation level)
+    pub llc_args: &'static [&'static str],
+    /// clang's assembler arguments before `-o` (the code object of this target)
+    pub asm_args: &'static [&'static str],
 }
 
 #[derive(Debug)]
