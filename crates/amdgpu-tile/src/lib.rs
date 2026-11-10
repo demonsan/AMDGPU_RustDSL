@@ -251,8 +251,8 @@ impl Ctx {
 
 // the tile components formerly in `amdgpu_dsl::tile`
 pub use rows::{issue_rows_shared, DwordRowsCopy, DwordRowsVgpr, RowSource, RowsCopy};
-pub use lane::{versioned, Lane, Role, Roles};
-pub use pipeline::{Cadence, PipeBody, Pipeline, TileIt};
+pub use lane::{versioned, Lane, Role, Roles, TileIt};
+pub use pipeline::{Cadence, PipeBody, Pipeline};
 pub use shared::{fmha_swz, LdsPlan, Layout, PrivRef, Shared, SlotIdx, SlotRef, Swz};
 pub use tensor::{Clamp, Dim, KArgs, Stride, Tensor, TensorDecl, TileView};
 

@@ -2,7 +2,7 @@
 //! (`v_max3_f32` chain + partner exchange), the fp8 P conversion (pknorm + scalef32, optionally with the LUT correction) and the smfmac row sums.
 
 use crate::frag::{AccTile, C32x32F32};
-use crate::pipeline::TileIt;
+use crate::lane::TileIt;
 use amdgpu_dsl::{ev};
 use crate::{Lane};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, VarId};
