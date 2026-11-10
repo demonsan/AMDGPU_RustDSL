@@ -31,7 +31,10 @@ fn is_special(op: MOp) -> bool {
         )
 }
 
+// 167k pairs through every hazard pass: ~1.5 min in release, tens of minutes in debug. Debug `cargo test` skips it; the node gate runs it in release
+// (python/tests/run_all.sh: `cargo test --release -p amdgpu-codegen --test hazard_oracle -- --include-ignored`).
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release only: cargo test --release -p amdgpu-codegen --test hazard_oracle (run by python/tests/run_all.sh)")]
 fn hazard_matrix() {
     let tools = LlvmTools::locate();
     if !std::process::Command::new(tools.tool("llc")).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
