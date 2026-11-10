@@ -1,7 +1,7 @@
 //! Repo policy: kernels do not read the environment. A non-default behaviour is a fixed choice in the kernel (and an archive tag for a removed experiment), never an env switch that can reach Main
 //! (a TEMP_BWD_POL / TEMP_BWD_TOK knob did once). This test scans `amdgpu-kernels/src` and `amdgpu-tile/src` for `env::var` / `env::var_os` / `env::vars` / `option_env!` and fails on any use that is not in
 //! the allowlist below, which lists the documented opt-in toolboxes only:
-//!   * `amdgpu-tile/src/weave_auto.rs`: the auto-weave experiment tool (AMDC_WEAVE_AUTO_*), opt-in, never changes a shipped kernel;
+//!   (`weave_auto.rs`, the opt-in auto-weave tool with its AMDC_WEAVE_AUTO_* variables, moved to `amdgpu-codegen` (L4) with the Weaver and is outside the scanned crates; it never changes a shipped kernel)
 //!   * `gemm/body.rs`: `GEMM_PROOF_DROP_KB` (proof negative test) and `gemm/mod.rs`: `GEMM_STAMP` (timestamp instrumentation), both off by default;
 //!   * `probes/mod.rs`: the hardware probe kernels (`PD_*`, `SCHED_WG`), not shipped kernels.
 //! Adding an entry here needs a reason in the commit message; the registry and every shipped kernel module stay env-free.
@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 /// (path suffix, allowed variable-name prefixes; "*" = any, including a dynamic name)
 const ALLOW: &[(&str, &[&str])] = &[
-    ("amdgpu-tile/src/weave_auto.rs", &["*"]),
     ("amdgpu-kernels/src/gemm/mod.rs", &["GEMM_STAMP"]),
     ("amdgpu-kernels/src/gemm/body.rs", &["GEMM_PROOF_DROP_KB"]),
     ("amdgpu-kernels/src/probes/mod.rs", &["PD_", "SCHED_WG"]),
