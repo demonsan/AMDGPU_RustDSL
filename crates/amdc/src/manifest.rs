@@ -9,8 +9,11 @@ use amdgpu_compiler::compile_with;
 
 /// The `AMDC_*` environment variables that are set (non-empty): they change the compiler's output (scheduler, lowering options, backend
 /// switches), so the manifest is computed and checked only in a scrubbed environment.
+/// Variables that do not affect the generated code (build provenance).
+const NEUTRAL: &[&str] = &["AMDC_GIT_DESCRIBE"];
+
 pub fn env_overrides() -> Vec<String> {
-    let mut v: Vec<String> = std::env::vars().filter(|(k, val)| k.starts_with("AMDC_") && !val.is_empty()).map(|(k, val)| format!("{k}={val}")).collect();
+    let mut v: Vec<String> = std::env::vars().filter(|(k, val)| k.starts_with("AMDC_") && !val.is_empty() && !NEUTRAL.contains(&k.as_str())).map(|(k, val)| format!("{k}={val}")).collect();
     v.sort();
     v
 }
