@@ -2,4 +2,5 @@
 //! (mdgpu-stage, docs/crate-split.md M7) can move it as a unit.
 
 pub mod pair_ring;
+pub mod select;
 pub mod split;

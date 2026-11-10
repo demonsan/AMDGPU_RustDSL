@@ -10,6 +10,7 @@
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
 use crate::lds_decl::{private_at, ring_at, tile_at};
+use amdgpu_tile::templates::select::{DescScan, ScanThreads, SelectVer};
 use amdgpu_tile::{ev, Shared, SlotIdx};
 
 const T: i32 = 1024;
@@ -251,8 +252,7 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
             let tcl4 = b.bind_i32(ev(tcl) << 2);
             let zero_i = b.c_i32(0);
             // protocol versions (compile-time counters): a fresh HIST version per histogram build, a fresh RB / WT version per scan_find
-            let hv = std::cell::Cell::new(0i32);
-            let rv = std::cell::Cell::new(0i32);
+            let ver = SelectVer::new();   // the histogram / scan-result versions (clear and scan_find bump them; the template L2 select)
             // the key of an f32 that holds a bf16 value: raw bits, flipped so that integer order = value order
             let key_of = |b: &mut FnBuilder, xf: ValueId| -> ValueId {
                 let bits = b.bitcast_i32(xf);
@@ -301,9 +301,9 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                                 let t = b.sub_f32(xs, m);
                                 let u = b.mul_f32(t, l2e);
                                 let e = b.exp2_f32(u);
-                                tl.hist.at(&SlotIdx::new(0, hv.get())).write(b, |b| b.atomic_lds(AtomicOp::AddF32, addr, e, false));
+                                tl.hist.at(&SlotIdx::new(0, ver.hist())).write(b, |b| b.atomic_lds(AtomicOp::AddF32, addr, e, false));
                             } else {
-                                tl.hist.at(&SlotIdx::new(0, hv.get())).write(b, |b| b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false));
+                                tl.hist.at(&SlotIdx::new(0, ver.hist())).write(b, |b| b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false));
                             }
                         }
                     }
@@ -311,105 +311,13 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                     b.set_var(vit, nx);
                 });
             };
-            // zero the 257 bins, barrier
-            let clear = |b: &mut FnBuilder| {
-                hv.set(hv.get() + 1);
-                let a = b.bind_i32(ev(tcl4) + hist);
-                tl.hist.at(&SlotIdx::new(0, hv.get())).write(b, |b| b.store_lds(a, zero_i, MemTy::B32, false));
-                b.wait_lds(0);
-                b.barrier();
-            };
-            // descending cumulative scan over the 256 bins; returns (bin, cumulative before the bin) of the bin where the cumulative reaches `tgt` (bin 0 / 0 when it never does); `float`: the bins hold f32 sums.
-            // Thread t < 256 owns bin 255 - t: a DPP inclusive scan inside each wave (row_shr 1 / 2 / 4 / 8, then row_bcast 15 / 31), the four wave totals through LDS, one barrier.
+            // the histogram clear and the descending cumulative scan (L2 template `select`, docs/l2-templates.md T9). `clamp_bin`: threads >= 256 own no bin, their index clamps to 0 so the read stays inside the HIST
+            // tile; `norm_hit`: the redundant 0/1 normalisation of the hit flag this kernel always carried (kept: md5-neutral)
             let wt = resl + 32;                                     // 16 dwords: the wave totals
-            let scan_find = |b: &mut FnBuilder, tgt: ValueId, float: bool| -> (ValueId, ValueId) {
-                rv.set(rv.get() + 1);
-                let rs = SlotIdx::new(0, rv.get());
-                // (threads >= 256 own no bin: their bin index clamps to 0 - the value is masked below - so that the read stays inside the HIST tile, provably)
-                let rb = b.bind_i32((255 - ev(tcl)).max(0));
-                let a_h = b.bind_i32((ev(rb) << 2) + hist);
-                let v0 = tl.hist.at(&SlotIdx::new(0, hv.get())).read(b, |b| b.load_lds(a_h, MemTy::B32));
-                b.wait_lds(0);
-                let in256 = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 256);
-                let v0z = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(v0), b: Opnd::I32(0) });
-                let vty = if float { b.bitcast_f32(v0z) } else { v0z };
-                let aop = if float { DppAluOp::AddF32 } else { DppAluOp::AddU32 };
-                let mut v = vty;
-                for c in [DppCtrl::RowShr(1), DppCtrl::RowShr(2), DppCtrl::RowShr(4), DppCtrl::RowShr(8)] {
-                    v = b.dpp_alu(aop, Dpp { ctrl: c, row_mask: 0xf, bank_mask: 0xf, bound_zero: true }, v, v, v);
-                }
-                v = b.dpp_alu(aop, Dpp { ctrl: DppCtrl::RowBcast15, row_mask: 0xa, bank_mask: 0xf, bound_zero: false }, v, v, v);
-                v = b.dpp_alu(aop, Dpp { ctrl: DppCtrl::RowBcast31, row_mask: 0xc, bank_mask: 0xf, bound_zero: false }, v, v, v);
-                // the wave total (lane 63) -> LDS; defaults of the result slots (thread 0)
-                let tot = b.read_lane(v, 63);
-                let a_wt = b.bind_i32((ev(wave) << 2) + wt);
-                tl.wt.at(&rs).write(b, |b| b.store_lds(a_wt, tot, MemTy::B32, false));
-                let is0 = b.cmp(CmpPred::Eq, CmpTy::I32, tid, 0);
-                let dflt_a = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(resl), b: Opnd::I32(resl + 8) });
-                tl.rb.at(&rs).write(b, |b| b.store_lds(dflt_a, zero_i, MemTy::B32, false));
-                let dflt_b = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(resl + 4), b: Opnd::I32(resl + 8) });
-                tl.rb.at(&rs).write(b, |b| b.store_lds(dflt_b, zero_i, MemTy::B32, false));
-                b.wait_lds(0);
-                b.barrier();
-                let mut tots = Vec::new();
-                for w in 0..3i32 {
-                    let a = b.c_i32(wt + 4 * w);
-                    tots.push(tl.wt.at(&rs).read(b, |b| b.load_lds(a, MemTy::B32)));
-                }
-                b.wait_lds(0);
-                // this wave's offset = the sum of the totals of the lower waves (waves >= 4 are idle; their value is unused)
-                let incl = if float {
-                    let mut pre = b.c_f32(0.0);
-                    for (w, t) in tots.iter().enumerate() {
-                        let tf = b.bitcast_f32(*t);
-                        let sum = b.add_f32(pre, tf);
-                        let is_hi = b.cmp(CmpPred::Gt, CmpTy::I32, wave, w as i32);
-                        pre = sel_f32(b, is_hi, sum, pre);
-                    }
-                    b.add_f32(v, pre)
-                } else {
-                    let mut pre = b.c_i32(0);
-                    for (w, t) in tots.iter().enumerate() {
-                        let sum = b.add_i32(pre, *t);
-                        let is_hi = b.cmp(CmpPred::Gt, CmpTy::I32, wave, w as i32);
-                        pre = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is_hi), a: Opnd::Val(sum), b: Opnd::Val(pre) });
-                    }
-                    b.add_i32(v, pre)
-                };
-                // exclusive = inclusive - own value; the owner is the thread with exclusive < tgt <= inclusive
-                let (hit, before) = if float {
-                    let vf = b.bitcast_f32(v0z);
-                    let exf = b.sub_f32(incl, vf);
-                    let g1 = b.cmp(CmpPred::Lt, CmpTy::F32, exf, tgt);
-                    let g2 = b.cmp(CmpPred::Ge, CmpTy::F32, incl, tgt);
-                    let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g1), a: Opnd::I32(1), b: Opnd::I32(0) });
-                    let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(g12), b: Opnd::I32(0) });
-                    (b.cmp(CmpPred::Ne, CmpTy::I32, g12, 0), b.bitcast_i32(exf))
-                } else {
-                    let ex = b.bind_i32(ev(incl) - ev(v0z));
-                    let g1 = b.cmp(CmpPred::Lt, CmpTy::I32, ex, tgt);
-                    let g2 = b.cmp(CmpPred::Ge, CmpTy::I32, incl, tgt);
-                    let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g1), a: Opnd::I32(1), b: Opnd::I32(0) });
-                    let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(g12), b: Opnd::I32(0) });
-                    (b.cmp(CmpPred::Ne, CmpTy::I32, g12, 0), ex)
-                };
-                let go = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hit), a: Opnd::I32(1), b: Opnd::I32(0) });
-                let go = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(go), b: Opnd::I32(0) });
-                let wr = b.cmp(CmpPred::Ne, CmpTy::I32, go, 0);
-                let addr_bin = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::I32(resl), b: Opnd::I32(resl + 8) });
-                tl.rb.at(&rs).write(b, |b| b.store_lds(addr_bin, rb, MemTy::B32, false));
-                let addr_bef = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::I32(resl + 4), b: Opnd::I32(resl + 8) });
-                tl.rb.at(&rs).write(b, |b| b.store_lds(addr_bef, before, MemTy::B32, false));
-                b.wait_lds(0);
-                b.barrier();
-                let r_bin_a = b.c_i32(resl);
-                let r_bef_a = b.c_i32(resl + 4);
-                let bin = tl.rb.at(&rs).read(b, |b| b.load_lds(r_bin_a, MemTy::B32));
-                let bef = tl.rb.at(&rs).read(b, |b| b.load_lds(r_bef_a, MemTy::B32));
-                b.wait_lds(0);
-                b.barrier();
-                (bin, bef)
-            };
+            let th = ScanThreads { tid, tcl, tcl4, wave, zero: zero_i };
+            let desc = DescScan { hist: &tl.hist, wt: &tl.wt, rb: &tl.rb, hist_base: hist, wt_base: wt, res_base: resl, clamp_bin: true, norm_hit: true };
+            let clear = |b: &mut FnBuilder| desc.clear(b, &th, &ver);
+            let scan_find = |b: &mut FnBuilder, tgt: ValueId, float: bool| -> (ValueId, ValueId) { desc.scan_find(b, &th, &ver, tgt, float) };
             // the radix select: the largest key T (>= kmin) with weight(key >= T) >= tgt
             let select = |b: &mut FnBuilder, tgt: ValueId, float: bool, kmin: ValueId| -> ValueId {
                 clear(b);
