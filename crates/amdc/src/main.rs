@@ -496,6 +496,20 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "passes" => {
+            // amdc passes [--target T] [--evidence]: the compile pipeline of a target (named passes, stage, target dependence, gate, evidence; the retry ladders)
+            let target = args.windows(2).find(|w| w[0] == "--target").map(|w| w[1].clone()).unwrap_or_else(|| amdgpu_compiler::target::T.name.to_string());
+            match amdgpu_compiler::pass::describe(&target, args.iter().any(|a| a == "--evidence")) {
+                Ok(s) => {
+                    print!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         "md5-manifest" => {
             // amdc md5-manifest [--out FILE] [--check FILE] [--jobs N]: the own-backend asm md5 of every reachable kernel (the refactor's golden oracle)
             let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());

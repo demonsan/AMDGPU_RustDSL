@@ -16,6 +16,7 @@ pub mod ir_print;
 pub mod diag;
 pub mod hazards;
 pub mod hzfill;
+pub mod pass;
 pub mod target;
 pub mod lower;
 pub mod mir;
@@ -75,7 +76,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
     // and try again. A kernel that allocates at the first attempt is unaffected.
     let mut last = String::new();
-    for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..], &["imm", "ldsspill8"][..], &["imm", "ldsspill16"][..], &["imm", "ldsspill24"][..], &["imm", "ldsspill32"][..], &["imm", "ldsspill48"][..], &["imm", "ldsspill64"][..]] {
+    for extra in pass::OUTER_LADDER {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => {
                 if r.0.lds_bytes > 160 * 1024 {
@@ -83,7 +84,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
                 }
                 return Ok(r);
             }
-            Err(e) if e.contains("out of VGPRs") => last = e,
+            Err(e) if pass::retryable(&e) => last = e,
             Err(e) => return Err(e),
         }
     }
@@ -143,100 +144,30 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         || std::env::var("AMDC_SCHED_ADD").ok().map_or(false, |spec| {
             spec.split(';').filter_map(|e| e.split_once(':')).any(|(pat, toks)| (pat == "*" || pname.contains(pat) || f.name.contains(pat)) && toks.split(',').any(|t| t.trim() == "hzfill"))
         });
-    let hz = |m: &mut mir::MFunction, a: &regalloc::Alloc, strict: bool| {
-        if hzfill {
-            let s = hzfill::fill_with(m, a, strict, hz_opts.as_ref());
-            if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
-                eprintln!("hzfill {}: s_nop wait states {} -> {} ({} moves, {} rejected)", f.name, s.states_before, s.states_after, s.moved, s.rejected);
-            }
-        }
-    };
+    let m0_reuse = m0_reuse_on(f);
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
-        // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
-        // the register file), then the pressure limit, and only then give up the scheduler.
-        let mut attempts: Vec<(u32, Option<usize>)> = vec![(0, None)];
-        if opts.ldshoist {
-            attempts.extend([(0, Some(24)), (0, Some(8)), (0, Some(0))]);
-        }
-        if opts.reorder {
-            attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]); // the pressure limit only matters for the reordering scheduler
-            // a big workgroup: the schedule must also fit the launch budget (ceil(waves / 4) waves per SIMD share 512 registers); a schedule that
-            // hoists later loads above earlier work can blow it. Retry against that budget before giving up the scheduler.
-            let launch = sched::launch_vgpr_budget(base.workgroup_size);
-            if launch < opts.max_vgprs {
-                let c = opts.max_vgprs - launch;
-                attempts.extend([(c, Some(0)), (c + 16, Some(0)), (c + 32, Some(0))]);
-            }
-        }
-        for (cut, hoist) in attempts {
+        for (cut, hoist) in pass::inner_ladder(&opts, base.workgroup_size) {
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
             if let Some(h) = hoist {
                 o.hoist_dist = h;
                 o.ldshoist = h > 0 && opts.ldshoist;
             }
-            let mut m = base.clone();
-            let attempt = (|| -> Result<regalloc::Alloc, String> {
-                sched::run(&mut m, &o)?;
-                if m0_reuse_on(f) {
-                    sched::m0::reuse(&mut m);
-                }
-                sched::m0::explicit(&mut m);
-                let pe = pin_check::check(&m);
-                if !pe.is_empty() {
-                    return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
-                }
-                hazards::fix_value_hazards_opts(&mut m, true);
-                let errs = mir::verify(&m);
-                if !errs.is_empty() {
-                    return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
-                }
-                let a = regalloc::allocate(&m)?;
-                // over the workgroup's launch budget: like running out of VGPRs (try the next, tighter attempt)
-                regalloc::check_workgroup_budget(&m, &a).map_err(|e| format!("out of VGPRs for the launch: {e}"))?;
-                hazards::pad_inflight_waw(&mut m, &a);
-                hazards::pad_physical_war(&mut m, &a);
-                hz(&mut m, &a, true);
-                sched::m0::pad(&mut m);
-                hazards::pad_valu_sgpr(&mut m, &a);
-                Ok(a)
-            })();
-            match attempt {
-                Ok(a) => return Ok((m, a)),
-                Err(e) if e.contains("out of VGPRs") => last_err = e,
+            let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
+            let mut s = pass::MirState { m: base.clone(), alloc: None };
+            match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
+                Ok(()) => return Ok((s.m, s.alloc.expect("allocated"))),
+                Err(e) if pass::retryable(&e) => last_err = e,
                 Err(e) => return Err(e),
             }
         }
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
-    let mut m = base;
-    sched::phase::strip(&mut m); // scheduler directives are meaningless without the scheduler
-    if m0_reuse_on(f) {
-        sched::m0::reuse(&mut m);
-    }
-    sched::m0::explicit(&mut m);
-    let pe = pin_check::check(&m);
-    if !pe.is_empty() {
-        return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
-    }
-    hazards::fix_value_hazards(&mut m);
-    let errs = mir::verify(&m);
-    if !errs.is_empty() {
-        return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
-    }
-    // the unscheduled path trusted its lowering-time waits; passes after lowering (LDS spill, ...) can invalidate them: re-check on every path
-    sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
-    let alloc = regalloc::allocate(&m)?;
-    // a register handed to another value while a load into it is still in flight (a path where the load's result is not used)
-    hazards::pad_inflight_waw(&mut m, &alloc);
-    // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
-    // pad the physical write-after-read hazard on every path, not only for scheduled code.
-    hazards::pad_physical_war(&mut m, &alloc);
-    hz(&mut m, &alloc, false);
-    sched::m0::pad(&mut m);
-    hazards::pad_valu_sgpr(&mut m, &alloc);
-    Ok((m, alloc))
+    let cx = pass::PassCtx { f, path: pass::Path::Unscheduled, sched: None, hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
+    let mut s = pass::MirState { m: base, alloc: None };
+    pass::run_body(pass::UNSCHEDULED, &mut s, &cx)?;
+    Ok((s.m, s.alloc.expect("allocated")))
 }
 
 /// Lower, schedule and allocate, then export post-RA MIR (no llc involved).
