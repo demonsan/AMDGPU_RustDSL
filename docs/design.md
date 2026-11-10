@@ -67,10 +67,13 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 |---|---|
 | `amdgpu-layout` | 布局代数：`Ix`、`IntTuple`、`Layout`、GF(2) `Swizzle`、TV 布局、`IssuePlan` / `layout_to_offsets`、构建期证明（零依赖） |
 | `amdgpu-isa` | gfx950 copy / MMA atom 表（宽度、立即数域、计数器、LDS-direct 形式；A/B/C 的 TV 布局与 provenance） |
-| `amdgpu-dsl` | IR（区域树、编织区域、寄存器规划、区域策略）、`FnBuilder`、表达式层、形状特化、irv1 文本、α 结构相等 |
-| `amdgpu-tile` | `TiledCopy` / `TiledMma` / `partition_{lds,dma,buffer_dma,global}`、布局导出的主机合同、tile 组件（pipeline、softmax、epilogue …）、stage 库与通用原语、weaver、算子图 / 骨架生成 |
-| `amdgpu-kernels` | 全部 kernel（FMHA v3、GEMM v4、MLP、RMSNorm 量化、探针、验证器用例）+ 按名注册表 |
-| `amdgpu-codegen` | lowering、调度、RA + 寄存器规划、hazard / wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify` / 协议 / 功能证明（不依赖 kernels / tile） |
+| `amdgpu-target` | 目标描述（纯数据）：`gfx950` 的波宽、寄存器堆、LDS、计数器、hazard / 延迟 / 调度模型常量 |
+| `amdgpu-dsl` | **L4 IR**（区域树、编织区域、寄存器规划、区域策略、`CompilePolicy`）、`FnBuilder`、表达式层、形状特化、irv1 文本、α 结构相等 |
+| `amdgpu-codegen` | **L4 后端 + Weaver**：lowering、调度、RA + 寄存器规划、hazard / wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify` / 协议 / 功能证明、编织器、pass 管理器（不依赖 kernels / tile） |
+| `amdgpu-tile` | **L3**：`TiledCopy` / `TiledMma` / `partition_{lds,dma,buffer_dma,global}`、布局导出的主机合同、tile 组件（softmax、epilogue、规约、行 DMA、GEMM DMA 计划 …）、`TileIt` / `Roles` |
+| `amdgpu-stage` | **L2**：stage 库与组合、stage 合同、pipeline 驱动（`Cadence`）、流水线模板（ring 对、split、grid、select、scan）、attention / GEMM 家族 body |
+| `amdgpu-graph` | **L1**：算子图 / 骨架生成、dispatch 规则 |
+| `amdgpu-kernels` | 全部 kernel（FMHA v3、GEMM v4、MLP、RMSNorm 量化、探针、验证器用例）+ 按名注册表；只保留每个家族的组合与按形状的编排 |
 | `amdc` | CLI 与 `hostgen` / `jit` 库 |
 
 布局层只决定**地址与每次操作发射哪些指令**；指令顺序仍由 kernel 作者与调度器决定，安全仍由 `gpu_verify` 证明。入门：[`layout-tour.md`](layout-tour.md)；实施记录：[`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9。主机侧：`amdc gen-host` 从 kernel 合同生成 C++ 头与 JSON（[`host-gen.md`](host-gen.md)）。

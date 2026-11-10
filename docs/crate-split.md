@@ -206,3 +206,23 @@ Sizes in total: about 130 files touched by M5 (mechanical), about 20 files by ea
 7. Q7: D2 / D3: confirm `contract.rs`, `handoff.rs` stay L3 and `components.rs` goes L2.
 8. Q8: Should the 36 kernel test files that test the compiler (`gpu_protocol*.rs`, `llvm_tail.rs`, `mir_invariants.rs`, `register_accounting.rs`, ...) stay in `amdgpu-kernels` (they need real kernels) or be split into a new integration-test crate so that `amdgpu-kernels` has no dev-dep on `codegen`?
 9. Q9: Python `python/amdgpu_jit/ops*.py` are named "Python plan entry points" for L1; they only call the `amdc` binary. Is a Rust host-plan API (in `amdgpu-graph`) intended, or does L1 stay Rust-side only for graph and dispatch?
+
+## 6. Status (updated after M8)
+
+Landed on Main, each gated by `amdc md5-manifest --check tests/golden/md5_manifest.tsv` (0 differences) and `cargo test`:
+
+| Move | Result |
+|---|---|
+| P0 (backend) | `amdgpu-target` (plain data) + `amdgpu-codegen/src/target/gfx950/`; golden manifest `tests/golden/md5_manifest.tsv` (`amdc md5-manifest`); the llvm tables moved to `amdgpu-codegen/src/target/gfx950/llvm/` with a hard assertion in `safeasm/build.rs` (this was M3) |
+| pass manager (backend) | `amdgpu-codegen/src/pass/`, `amdc passes`, `CompilePolicy` on the `Function` (the kernel-name policy of `lib.rs` became a kernel-side declaration) |
+| M1 | `amdgpu-dsl` no longer declares the unused `amdgpu-layout` dependency |
+| M2 | `TileIt` moved down to `amdgpu_tile::lane` (L3) |
+| M4 | `amdgpu-graph` (L1): `opgraph/` + `dispatch.rs` |
+| M5 | `amdgpu-compiler` renamed to `amdgpu-codegen` |
+| M6 | the Weaver (`weave.rs`, `weave_auto.rs`) moved to `amdgpu-codegen` (L4) |
+| M7a | `amdgpu-stage` (L2): `stage`, `pipeline`, `components`, `contract_stage`, `templates/` |
+| M7b | the family bodies: `amdgpu-stage::attention` (`attn3`, `block3`, `state`) and `amdgpu-stage::gemm` (`body`, `mma`, `formats`); the GEMM DMA plan helpers to `amdgpu-tile::dma_plan` (L3) |
+
+Decisions taken (section 2.5): D2 `contract.rs` / `handoff.rs` stay L3; D4 / D5 the per-`MOp` tables stay in `amdgpu-codegen` (`target/gfx950/`), `amdgpu-target` holds plain data only, the layout-bearing atoms stay in `amdgpu-isa`; D6 the llvm tables live in `amdgpu-codegen/src/target/gfx950/llvm/`. The current crate map is in [`current-status.md`](current-status.md) and [`design.md`](design.md) §3.1.
+
+Still open: moving the stage registry entries (D10) to the kernels, and the L2 templates of `l2-templates.md` T3 / T4 / T6 / T7 / T8 that were assessed but not extracted (row reductions and streaming element-wise have a single user each; see the per-template notes).
