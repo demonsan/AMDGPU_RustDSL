@@ -80,6 +80,14 @@ pub struct PassCtx<'a> {
 pub struct MirState {
     pub m: MFunction,
     pub alloc: Option<Alloc>,
+    /// the scheduler passes' counters (printed with the `stats` token)
+    pub sched_stats: sched::Stats,
+}
+
+impl MirState {
+    pub fn new(m: MFunction) -> MirState {
+        MirState { m, alloc: None, sched_stats: sched::Stats::default() }
+    }
 }
 
 impl MirState {
@@ -124,8 +132,89 @@ pub const FRONT: &[PassInfo] = &[
 
 // ---------------------------------------------------------------------------------------------------------------- MIR passes
 
-fn run_sched(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
-    sched::run(&mut s.m, cx.sched.expect("the scheduled path has options")).map(|_| ())
+// the scheduler, step by step (exactly `sched::run`, which stays as the one-call form for its unit tests)
+fn so<'a>(cx: &'a PassCtx) -> &'a sched::Options {
+    cx.sched.expect("the scheduled path has options")
+}
+fn run_cfg_cleanup(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    if so(cx).cfg_cleanup {
+        sched::cfg::cleanup(&mut s.m);
+    }
+    Ok(())
+}
+fn run_strip_auto(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
+    sched::waits::strip_auto_waits(&mut s.m);
+    Ok(())
+}
+fn run_dead_selects(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
+    sched::cfg::dce_dead_selects(&mut s.m);
+    Ok(())
+}
+fn run_ldshoist(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    let o = so(cx);
+    if o.any_region(|r| r.ldshoist) {
+        let n = sched::hoist::run(&mut s.m, o);
+        if o.stats {
+            eprintln!("ldshoist: {n} loads hoisted");
+        }
+    }
+    Ok(())
+}
+fn run_slotfill(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    let o = so(cx);
+    if o.any_region(|r| r.slotfill) {
+        let n = sched::slotfill::run(&mut s.m, o)?;
+        if o.stats {
+            eprintln!("slotfill: {n} instructions moved");
+        }
+    }
+    Ok(())
+}
+fn run_phase(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    // `sched_group_barrier` phases (blocks with directives; the directives are removed)
+    let o = so(cx);
+    let phased = sched::phase::run(&mut s.m, o)?;
+    if o.stats && phased > 0 {
+        eprintln!("phase: {phased} instructions moved");
+    }
+    Ok(())
+}
+fn run_list(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    sched::schedule_blocks(&mut s.m, so(cx), &mut s.sched_stats)
+}
+fn run_wsink(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    let o = so(cx);
+    if o.any_region(|r| r.waitsink) {
+        let n = sched::ldahead::sink_explicit_waits(&mut s.m, o);
+        if o.stats {
+            eprintln!("wsink: {n} explicit waits moved");
+        }
+    }
+    Ok(())
+}
+fn run_ldahead(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    let o = so(cx);
+    if o.any_region(|r| r.ldahead32 > 0 || r.ldsink > 0) {
+        let n = sched::ldahead::run(&mut s.m, o);
+        if o.stats {
+            eprintln!("ldahead: {n} blocks changed");
+        }
+    }
+    Ok(())
+}
+fn run_insert_waits(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
+    s.sched_stats.waits_inserted = sched::waits::insert_waits(&mut s.m);
+    Ok(())
+}
+fn run_sched_verify_waits(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    let o = so(cx);
+    if o.verify {
+        sched::waits::verify_waits(&s.m).map_err(|e| format!("wait verification failed: {e}"))?;
+    }
+    if o.stats {
+        eprintln!("sched: {:?}", s.sched_stats);
+    }
+    Ok(())
 }
 fn run_phase_strip(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     // scheduler directives are meaningless without the scheduler
@@ -209,16 +298,20 @@ fn run_valu_sgpr(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     Ok(())
 }
 
-const SCHED: Pass = Pass {
-    info: info(
-        "sched",
-        Sched,
-        Param,
-        "scheduler options (preset / sched_opts / regions / AMDC_SCHED); runs sched-cfg-cleanup, waits-strip-auto, sched-dce-dead-selects, sched-ldshoist, sched-slotfill, sched-phase, sched-list, sched-wsink, sched-ldahead, waitcnt-recompute, verify-waits",
-        &[Test("crates/amdgpu-codegen/src/sched/tests.rs"), Test("crates/amdgpu-kernels/tests/sched_kernels.rs"), Test("crates/amdgpu-codegen/tests/slotfill.rs"), Test("crates/amdgpu-codegen/tests/ldahead.rs"), Doc("docs/scheduling.md"), Probe("tools/sched_mb/")],
-    ),
-    run: run_sched,
+const SCHED_CFG: Pass = Pass { info: info("sched-cfg-cleanup", Sched, Generic, "scheduler (not token nocfg)", &[Indirect("sched_kernels.rs: every kernel schedules and verifies")]), run: run_cfg_cleanup };
+const SCHED_STRIP: Pass = Pass { info: info("waits-strip-auto", Sched, Generic, "scheduler", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_strip_auto };
+const SCHED_DSEL: Pass = Pass { info: info("sched-dce-dead-selects", Sched, Generic, "scheduler", &[Indirect("sched_kernels.rs; md5 manifest")]), run: run_dead_selects };
+const SCHED_HOIST: Pass = Pass { info: info("sched-ldshoist", Sched, Param, "token ldshoist (GEMM preset; ladder rungs cap hoist=N)", &[Test("crates/amdgpu-kernels/tests/sched_kernels.rs"), Test("crates/amdgpu-kernels/tests/sched_preset.rs"), Doc("docs/scheduling.md")]), run: run_ldshoist };
+const SCHED_SLOT: Pass = Pass { info: info("sched-slotfill", Sched, Only, "token slotfill", &[Test("crates/amdgpu-codegen/tests/slotfill.rs"), Doc("docs/slotfill.md")]), run: run_slotfill };
+const SCHED_PHASE: Pass = Pass { info: info("sched-phase", Sched, Param, "sched_group_barrier markers (always consumed)", &[Test("crates/amdgpu-codegen/tests/sched_phase.rs")]), run: run_phase };
+const SCHED_LIST: Pass = Pass {
+    info: info("sched-list", Sched, Param, "tokens reorder / rewait / xbar / limit=N (per region)", &[Test("crates/amdgpu-codegen/src/sched/tests.rs"), Test("crates/amdgpu-kernels/tests/sched_kernels.rs"), Test("crates/amdgpu-codegen/tests/sched_regions.rs"), Doc("docs/scheduling.md"), Probe("tools/sched_mb/")]),
+    run: run_list,
 };
+const SCHED_WSINK: Pass = Pass { info: info("sched-wsink", Sched, Only, "token wsink", &[Test("crates/amdgpu-codegen/tests/ldahead.rs"), Doc("docs/lgkm-lookahead.md")]), run: run_wsink };
+const SCHED_LDAHEAD: Pass = Pass { info: info("sched-ldahead", Sched, Only, "tokens ldsink=D / ldahead32=D", &[Test("crates/amdgpu-codegen/tests/ldahead.rs"), Doc("docs/lgkm-lookahead.md")]), run: run_ldahead };
+const SCHED_WAITS: Pass = Pass { info: info("waitcnt-recompute", Sched, Only, "scheduler", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Test("crates/amdgpu-codegen/tests/inflight_waw.rs"), Doc("docs/scheduling.md")]), run: run_insert_waits };
+const SCHED_VERIFY: Pass = Pass { info: info("verify-waits", Verify, Only, "scheduler (not token noverify)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Test("crates/amdgpu-kernels/tests/gpu_semantics.rs")]), run: run_sched_verify_waits };
 const PHASE_STRIP: Pass = Pass { info: info("sched-phase-strip", Mir, Generic, "unscheduled path", &[Test("crates/amdgpu-codegen/tests/sched_phase.rs")]), run: run_phase_strip };
 const M0_REUSE: Pass = Pass { info: info("m0-reuse", Mir, Only, "policy m0_reuse (GEMM profile)", &[Indirect("md5 manifest; dma_hazards.rs mentions M0")]), run: run_m0_reuse };
 const M0_EXPLICIT: Pass = Pass { info: info("m0-explicit", Mir, Only, "always", &[Indirect("md5 manifest; dispatch_compile.rs (M0 dangling-use regression)")]), run: run_m0_explicit };
@@ -228,7 +321,7 @@ const HAZARD_VALUE: Pass = Pass {
     run: run_hazard_value,
 };
 const MIR_VERIFY: Pass = Pass { info: info("verify-mir-structure", Verify, Param, "always", &[Test("crates/amdgpu-kernels/tests/sched_kernels.rs"), Test("crates/amdgpu-codegen/tests/smfmac_hazards.rs")]), run: run_mir_verify };
-const VERIFY_WAITS: Pass = Pass { info: info("verify-waits", Verify, Only, "unscheduled path (the scheduled path verifies inside `sched`)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Test("crates/amdgpu-kernels/tests/gpu_semantics.rs")]), run: run_verify_waits };
+const VERIFY_WAITS: Pass = Pass { info: info("verify-waits", Verify, Only, "unscheduled path (after verify-mir-structure)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Test("crates/amdgpu-kernels/tests/gpu_semantics.rs")]), run: run_verify_waits };
 const REGALLOC: Pass = Pass {
     info: info("regalloc", Ra, Param, "always (scan -> scan-top -> two-phase; regplan-check when the kernel has register marks)", &[Test("crates/amdgpu-codegen/tests/ra_reaching.rs"), Test("crates/amdgpu-kernels/tests/register_accounting.rs"), Test("crates/amdgpu-codegen/tests/regplan.rs")]),
     run: run_regalloc,
@@ -244,7 +337,7 @@ const VALU_SGPR: Pass = Pass {
 };
 
 /// The scheduled body (one inner-ladder rung, on a clone of the post-AGPR MIR).
-pub const SCHEDULED: &[Pass] = &[SCHED, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, REGALLOC, BUDGET_RUNG, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR];
+pub const SCHEDULED: &[Pass] = &[SCHED_CFG, SCHED_STRIP, SCHED_DSEL, SCHED_HOIST, SCHED_SLOT, SCHED_PHASE, SCHED_LIST, SCHED_WSINK, SCHED_LDAHEAD, SCHED_WAITS, SCHED_VERIFY, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, REGALLOC, BUDGET_RUNG, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR];
 
 /// The unscheduled body (no scheduler, or every inner rung failed).
 pub const UNSCHEDULED: &[Pass] = &[PHASE_STRIP, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, VERIFY_WAITS, REGALLOC, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR];
@@ -359,6 +452,22 @@ mod tests {
     fn every_pass_has_evidence() {
         for p in super::FRONT.iter().chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
             assert!(!p.evidence.is_empty(), "{} has no evidence entry", p.name);
+        }
+    }
+
+    #[test]
+    fn evidence_paths_exist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for p in super::FRONT.iter().chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
+            for e in p.evidence {
+                let path = match e {
+                    super::Evidence::Test(x) | super::Evidence::Doc(x) | super::Evidence::Oracle(x) | super::Evidence::Probe(x) => *x,
+                    super::Evidence::Indirect(_) => continue,
+                };
+                if path.contains('/') {
+                    assert!(root.join(path).exists(), "{}: evidence {path} does not exist", p.name);
+                }
+            }
         }
     }
 }

@@ -157,7 +157,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 o.ldshoist = h > 0 && opts.ldshoist;
             }
             let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
-            let mut s = pass::MirState { m: base.clone(), alloc: None };
+            let mut s = pass::MirState::new(base.clone());
             match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
                 Ok(()) => return Ok((s.m, s.alloc.expect("allocated"))),
                 Err(e) if pass::retryable(&e) => last_err = e,
@@ -167,7 +167,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let cx = pass::PassCtx { f, path: pass::Path::Unscheduled, sched: None, hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
-    let mut s = pass::MirState { m: base, alloc: None };
+    let mut s = pass::MirState::new(base);
     pass::run_body(pass::UNSCHEDULED, &mut s, &cx)?;
     Ok((s.m, s.alloc.expect("allocated")))
 }
