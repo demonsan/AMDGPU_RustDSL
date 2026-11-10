@@ -28,7 +28,7 @@ fn the_graph_json_and_the_fused_skeleton_are_up_to_date() {
     g.validate().expect("valid");
     up_to_date("mlp_fp8.graph.json", &g.to_json_string());
     assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g, "the JSON round-trips");
-    up_to_date("skeleton_fused.rs", &generate(&g, "fused", &ids(&g), "mlp_fp8.graph.json").unwrap());
+    up_to_date("skeleton_fused.rs", &generate(&g, "fused", &ids(&g), "mlp_fp8.graph.json", amdgpu_kernels::stage_registry::registry()).unwrap());
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn cutting_h_gives_the_unfused_pair() {
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
     let g = graph();
-    let reg = amdgpu_stage::stage::registry();
+    let reg = amdgpu_kernels::stage_registry::registry();
     for n in &g.nodes {
         let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("node {}: stage key {} is not in the registry", n.id, n.stage));
         assert_eq!(n.prim.code(), format!("{:?}", d.prim), "node {}: primitive differs from the registry's", n.id);
@@ -77,8 +77,8 @@ fn the_unfused_graph_json_and_both_cut_skeletons_are_up_to_date() {
     g.validate().expect("valid");
     up_to_date("mlp_fp8_unfused.graph.json", &g.to_json_string());
     assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g);
-    up_to_date("skeleton_g1.rs", &generate(&g, "g1", G1, "mlp_fp8_unfused.graph.json").unwrap());
-    up_to_date("skeleton_g2.rs", &generate(&g, "g2", G2, "mlp_fp8_unfused.graph.json").unwrap());
+    up_to_date("skeleton_g1.rs", &generate(&g, "g1", G1, "mlp_fp8_unfused.graph.json", amdgpu_kernels::stage_registry::registry()).unwrap());
+    up_to_date("skeleton_g2.rs", &generate(&g, "g2", G2, "mlp_fp8_unfused.graph.json", amdgpu_kernels::stage_registry::registry()).unwrap());
 }
 
 #[test]

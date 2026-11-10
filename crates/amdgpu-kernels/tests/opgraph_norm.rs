@@ -24,7 +24,7 @@ fn the_graph_json_and_the_skeleton_are_up_to_date() {
     up_to_date("rmsnorm.graph.json", &g.to_json_string());
     assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g);
     let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
-    up_to_date("skeleton_rmsnorm.rs", &generate(&g, "rmsnorm", &ids, "rmsnorm.graph.json").unwrap());
+    up_to_date("skeleton_rmsnorm.rs", &generate(&g, "rmsnorm", &ids, "rmsnorm.graph.json", amdgpu_kernels::stage_registry::registry()).unwrap());
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn every_hand_over_stays_in_registers() {
 
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
-    let reg = amdgpu_stage::stage::registry();
+    let reg = amdgpu_kernels::stage_registry::registry();
     for n in &graph().nodes {
         let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("node {}: stage key {} is not in the registry", n.id, n.stage));
         assert_eq!(n.prim.code(), format!("{:?}", d.prim), "node {}", n.id);
