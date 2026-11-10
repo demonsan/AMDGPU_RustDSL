@@ -850,7 +850,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                         f.after += 1;
                     }
                 }
-                let lim = if vm { 63 } else { 15 };
+                let lim = if vm { crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max } else { crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max };
                 // a counter saturates: an entry with that many younger SAME-counter operations has completed
                 st.retain(|f| f.smem || f.vm != vm || f.after < lim);
                 if at.mem.map_or(true, |mm| !mm.write) || at.smem {

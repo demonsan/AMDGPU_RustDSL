@@ -13,6 +13,7 @@ pub struct Target {
     pub wave: Wave,
     pub regs: RegFiles,
     pub lds: Lds,
+    pub counters: Counters,
     pub emit: Emission,
     pub verify: VerifyLimits,
 }
@@ -65,6 +66,71 @@ pub enum Occupancy {
     UnifiedSteps,
     /// a pool of `blocks` blocks of `block_vgprs` VGPRs shared by the waves; SGPRs are fixed (gfx1250)
     BlockPool { block_vgprs: u32, blocks: u32 },
+}
+
+/// The memory classes that bump a dependency counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemClass {
+    VmemLoad,
+    VmemStore,
+    /// a global -> LDS DMA (`buffer_load ... lds`, `global_load_lds`)
+    LdsDma,
+    Lds,
+    Smem,
+    Msg,
+    Export,
+    /// gfx1250: tensor data mover
+    Tensor,
+    /// gfx1250: asynchronous LDS DMA
+    Async,
+}
+
+/// Completion order of one class on its counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// completes in issue order: `wait(n)` waits for all but the n most recent
+    InOrder,
+    /// completes out of order: only `wait(0)` is a completion point for it
+    OutOfOrder,
+}
+
+#[derive(Debug)]
+pub struct Counter {
+    pub name: &'static str,
+    /// the largest encodable count (a counter with this many younger operations queued has completed the older ones)
+    pub max: u32,
+}
+
+/// How the wait instruction names counters.
+#[derive(Debug)]
+pub enum WaitForm {
+    /// one instruction with a field per counter (gfx950 `s_waitcnt vmcnt(n) lgkmcnt(n) expcnt(n)`)
+    Combined { mnemonic: &'static str },
+    /// one instruction per counter (gfx1250 `s_wait_loadcnt` / `s_wait_storecnt` / `s_wait_dscnt` / ...): (counter, mnemonic)
+    PerCounter(&'static [(usize, &'static str)]),
+}
+
+/// The dependency counters (docs/target-design.md section 2).
+#[derive(Debug)]
+pub struct Counters {
+    pub counters: &'static [Counter],
+    /// (class, counter index, order)
+    pub classes: &'static [(MemClass, usize, Order)],
+    pub wait: WaitForm,
+}
+
+impl Counters {
+    /// The counter a memory class bumps.
+    pub const fn of(&self, class: MemClass) -> &Counter {
+        let mut i = 0;
+        while i < self.classes.len() {
+            if self.classes[i].0 as u8 == class as u8 {
+                return &self.counters[self.classes[i].1];
+            }
+            i += 1;
+        }
+        panic!("memory class without a counter")
+    }
 }
 
 #[derive(Debug)]

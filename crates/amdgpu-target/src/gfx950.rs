@@ -15,6 +15,20 @@ pub const GFX950: Target = Target {
         occupancy: Occupancy::UnifiedSteps,
     },
     lds: Lds { bytes_per_workgroup: 160 * 1024 },
+    // vmcnt 6 bits, lgkmcnt 4 bits, expcnt 3 bits; LDS DMA counts on vmcnt; SMEM and messages complete out of order on lgkmcnt
+    counters: Counters {
+        counters: &[Counter { name: "vmcnt", max: 63 }, Counter { name: "lgkmcnt", max: 15 }, Counter { name: "expcnt", max: 7 }],
+        classes: &[
+            (MemClass::VmemLoad, 0, Order::InOrder),
+            (MemClass::VmemStore, 0, Order::InOrder),
+            (MemClass::LdsDma, 0, Order::InOrder),
+            (MemClass::Lds, 1, Order::InOrder),
+            (MemClass::Smem, 1, Order::OutOfOrder),
+            (MemClass::Msg, 1, Order::OutOfOrder),
+            (MemClass::Export, 2, Order::InOrder),
+        ],
+        wait: WaitForm::Combined { mnemonic: "s_waitcnt" },
+    },
     emit: Emission { sgpr_granule: 8, sgpr_cap: 102, sgpr_min: 8, vgpr_min: 4, vgpr_granule: 4, code_object_version: 6 },
     verify: VerifyLimits { vgpr_limit: 256, sgpr_limit: 102, lds_limit: 160 * 1024 },
 };

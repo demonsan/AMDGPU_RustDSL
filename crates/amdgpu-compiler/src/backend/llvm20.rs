@@ -144,8 +144,9 @@ pub fn kinds_of(inst: &MInst) -> String {
 
 /// gfx9 S_WAITCNT immediate: vmcnt [3:0]+[15:14], expcnt [6:4], lgkmcnt [11:8].
 pub fn waitcnt_imm(vm: Option<u32>, lgkm: Option<u32>) -> u32 {
-    let vm = vm.unwrap_or(63).min(63);
-    let lgkm = lgkm.unwrap_or(15).min(15);
+    let (vm_max, lg_max) = (crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max, crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max);
+    let vm = vm.unwrap_or(vm_max).min(vm_max);
+    let lgkm = lgkm.unwrap_or(lg_max).min(lg_max);
     (vm & 0xf) | ((vm >> 4) << 14) | (7 << 4) | (lgkm << 8)
 }
 
