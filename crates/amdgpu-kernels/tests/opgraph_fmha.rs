@@ -49,7 +49,7 @@ fn s_to_p_is_c0_and_the_epilogue_hand_off_is_a_wave_private_transpose() {
 
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
-    let reg = amdgpu_tile::stage::registry();
+    let reg = amdgpu_stage::stage::registry();
     for (k, g) in all() {
         for n in &g.nodes {
             let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("{k}/{}: stage key {} is not in the registry", n.id, n.stage));

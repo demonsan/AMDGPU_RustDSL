@@ -3,7 +3,7 @@
 //! head, KV-split key range, the recipe-copy condition and the output scale) and the KV-split combine kernel body (`combine_kernel`). The kernels in
 //! `mod.rs` build these through `declare_io` / `block3` and compose them with a `PipeBody` (`AttnBody3`).
 
-use amdgpu_tile::components;
+use amdgpu_stage::components;
 use amdgpu_tile::frag::*;
 use amdgpu_tile::*;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Op, ValueId, I32};
@@ -113,7 +113,7 @@ impl FmhaIo {
         let (bidx, kv_len, key_lo, split) = match &self.kvs {
             None => (zz, kv_all, I32::c(0), None),
             Some(kv) => {
-                let (bi, si, lg) = amdgpu_tile::templates::grid::kv_split_decode(b, zz, kv.splits, 0x280, "B");
+                let (bi, si, lg) = amdgpu_stage::templates::grid::kv_split_decode(b, zz, kv.splits, 0x280, "B");
                 let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
                 (bi, kv_eff, ev(key_lo), Some(si))
             }

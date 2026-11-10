@@ -1,7 +1,7 @@
 //! StageBoundary checks: the MLP P hand-off is a zero-cost renaming; mismatches are reported.
 use amdgpu_isa::MmaAtom;
 use amdgpu_layout::Movement;
-use amdgpu_tile::contract_stage::*;
+use amdgpu_stage::contract_stage::*;
 
 fn frag(name: &str, atom_tv: &amdgpu_layout::Layout) -> LiveFrag {
     LiveFrag::from_tv(name, atom_tv, 32, Storage::Vgpr)

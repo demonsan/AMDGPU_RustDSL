@@ -15,9 +15,9 @@
 //! tail:     if partial { window(masked) } else { window }   (no stage, no barrier)
 //! ```
 
-pub use crate::lane::TileIt;
-use crate::lane::Role;
-use crate::shared::SlotIdx;
+pub use amdgpu_tile::lane::TileIt;
+use amdgpu_tile::lane::Role;
+use amdgpu_tile::shared::SlotIdx;
 use amdgpu_codegen::weave::{rotate, Part, RotStage};
 
 /// The `OneWindow` iteration: stage(t+2) | window(t) | complete(t+2) + wait + barrier.

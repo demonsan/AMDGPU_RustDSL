@@ -13,8 +13,8 @@
 //! * P = exp2(S c - m) packed to bf16 straight from the S^T accumulator: the PV k order per lane half h is keys {4h + 0..3, 8 + 4h + 0..3} of
 //!   each 16-key step, and the V^T reads use the same key order.
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
-use amdgpu_tile::components::gqa_kv_head;
-use amdgpu_tile::templates::pair_ring::PairRing;
+use amdgpu_stage::components::gqa_kv_head;
+use amdgpu_stage::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
 /// keys per tile

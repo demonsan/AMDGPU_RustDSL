@@ -164,7 +164,7 @@ fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
 
 ### §3d stage 实例（`AttnBody3` 的 `PipeBody` 相位）
 
-`Pipeline::run` 决定"什么时候做"：wait、barrier、槽与代、剥离的末 tile。`AttnBody3` 在每个 hook 里构造 stage 实例（`amdgpu_tile::stage::StageInst`），每个实例 = registry key + `StageContract` + 发射单元。
+`Pipeline::run` 决定"什么时候做"：wait、barrier、槽与代、剥离的末 tile。`AttnBody3` 在每个 hook 里构造 stage 实例（`amdgpu_stage::stage::StageInst`），每个实例 = registry key + `StageContract` + 发射单元。
 
 | hook | stage 实例 | contract 里的交接 |
 |---|---|---|

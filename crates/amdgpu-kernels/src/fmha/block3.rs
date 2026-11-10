@@ -8,7 +8,7 @@ use amdgpu_tile::{Ctx, ev, Lane, Shared, Tensor};
 use amdgpu_tile::copy::make_tiled_copy;
 use amdgpu_tile::frag::{AccTile, B32x32x64Fp8, C32x32F32, Frag};
 use amdgpu_tile::mma::make_tiled_mma;
-use amdgpu_tile::components;
+use amdgpu_stage::components;
 use amdgpu_tile::frag;
 use super::attn3::attention_orientation;
 use super::io::FmhaBlock;
@@ -62,7 +62,7 @@ pub fn block3_x(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -
 /// `block3_x` with the per-tensor mode.
 pub fn block3_x_mode(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, xcd: bool, pt: Option<PtMode>) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
-        amdgpu_tile::templates::grid::xcd_tile_head(b, io.s_len(), rows_lg, io.abi().h_ka, io.abi().sq_ka)
+        amdgpu_stage::templates::grid::xcd_tile_head(b, io.s_len(), rows_lg, io.abi().h_ka, io.abi().sq_ka)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
     };
@@ -95,7 +95,7 @@ pub fn block3_at(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, qtile: Valu
     let (bidx, kv_len, key_lo, split) = match io.kvs() {
         None => (zz, kv_all, I32::c(0), None),
         Some(kv) => {
-            let (bi, si, lg) = amdgpu_tile::templates::grid::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
+            let (bi, si, lg) = amdgpu_stage::templates::grid::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
             if causal {
                 // the split covers this block's causal key range (kv_end, computed above); a split past it is empty
                 let (key_lo, kv_eff, empty) = components::kv_split_range_var(b, kv_end, si, lg, io.abi().sk_ka);

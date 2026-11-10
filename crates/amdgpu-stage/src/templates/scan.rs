@@ -5,7 +5,7 @@
 //! writes the other tile at version `j + 1` (a different version of a different tile: no race by construction), then completes the store and barriers. The neighbour address is a `max(tid - s, 0)` (provably
 //! inside the tile; the lanes it does not apply to are masked by the compare). The emitted sequence is the one of the three hand-written copies it replaces (the golden md5 manifest is the gate).
 
-use crate::{ev, Shared, SlotIdx};
+use amdgpu_tile::{ev, Shared, SlotIdx};
 use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, MemTy, Op, Opnd, ValueId};
 
 /// The element type of the scan (the combine is an add).

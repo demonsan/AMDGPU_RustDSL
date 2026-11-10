@@ -3,7 +3,7 @@
 //! The generated text contains
 //!  * a review header (the kernel's stages, its on-chip edges with their boundary classes, the HBM tensors, the resource estimate);
 //!  * a trait `<Kernel>Slots` with one method per slot - `prelude` (kernel ABI, grid, LDS plan, descriptors), one per stage instance (named after the node; the kernel constructs the stage
-//!    instance (`amdgpu_tile::stage`) and emits it with ITS orchestration: weave order, `declare_region`, scheduler tokens), and `loop_open` / `loop_close` around the loop-phase stages;
+//!    instance (`amdgpu_stage::stage`) and emits it with ITS orchestration: weave order, `declare_region`, scheduler tokens), and `loop_open` / `loop_close` around the loop-phase stages;
 //!  * `build_<kernel>`: creates the `FnBuilder`, runs the structural checks of the graph (`check_kernel`: the on-chip edges keep the classes the skeleton was generated for) and calls the slots in
 //!    dependence order. Nothing in the generated function touches the IR except through the slots, so filling the slots with an existing orchestration reproduces that kernel exactly.
 //!
@@ -61,7 +61,7 @@ fn suggest(e: &Edge, load: bool) -> Option<&'static str> {
     } else {
         "map.epilogue_chain"
     };
-    amdgpu_tile::stage::registry().iter().any(|d| d.key == key).then_some(key)
+    amdgpu_stage::stage::registry().iter().any(|d| d.key == key).then_some(key)
 }
 
 /// Generates the skeleton source of kernel `kernel` made of `nodes` (ids). `graph_file` is the path (relative to the generated file) of the graph JSON the build function embeds.
@@ -162,10 +162,10 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
             for m in &members {
                 doc.push(format!("  member `{}`: stage `{}` [{}]{}", m.id, m.stage, m.prim.code(), params_text(m)));
                 doc.extend(node_io(m).into_iter().map(|l| format!("  {l}")));
-                extra.push(format!("    /// the stage instance of member `{}` of group `{}` (key `{}`)\n    fn {}_stage<'a>(&'a self, cx: &'a Self::Cx) -> amdgpu_tile::stage::StageInst<'a>;\n", m.id, gr.name, m.stage, m.id));
+                extra.push(format!("    /// the stage instance of member `{}` of group `{}` (key `{}`)\n    fn {}_stage<'a>(&'a self, cx: &'a Self::Cx) -> amdgpu_stage::stage::StageInst<'a>;\n", m.id, gr.name, m.stage, m.id));
                 ctor.push(format!("self.{}_stage(&*cx)", m.id));
             }
-            let body = format!("let (w, _members) = amdgpu_tile::stage::compose({:?}, vec![{}]);\n        w.seq().emit(b);", gr.label, ctor.join(", "));
+            let body = format!("let (w, _members) = amdgpu_stage::stage::compose({:?}, vec![{}]);\n        w.seq().emit(b);", gr.label, ctor.join(", "));
             slots.push(Slot { name: gr.name.clone(), phase: n.phase, doc, body: Some(body), extra });
         }
         // stores of the cut edges these stages produce
@@ -292,7 +292,7 @@ fn with_sep(a: &str) -> String {
     }
 }
 
-/// The skeleton of a PIPELINED kernel (graph attribute `pipeline` = the `Cadence`; the pipeline driver `amdgpu_tile::pipeline::Pipeline` owns the cadence): slots `prelude`, the pre-pipeline stages,
+/// The skeleton of a PIPELINED kernel (graph attribute `pipeline` = the `Cadence`; the pipeline driver `amdgpu_stage::pipeline::Pipeline` owns the cadence): slots `prelude`, the pre-pipeline stages,
 /// `pipeline` (returns the configured `Pipeline`), the `PipeBody` hooks the graph uses (a node's `hook`, plus the graph attribute `hooks`: a list of extra hook names) and the post-pipeline stages. The
 /// generated `<Kernel>Body` forwards the pipeline's callbacks to the slots.
 fn generate_pipelined(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Result<String, String> {
@@ -349,7 +349,7 @@ fn generate_pipelined(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str)
     }
     s.push_str(&format!("//   hbm in : {}\n//   hbm out: {}\n", rep.inputs.join(", "), rep.outputs.join(", ")));
     s.push_str(&format!("//   est: {} VGPR, {} AGPR, {} B LDS, {} barrier(s)\n\n", rep.resources.vgprs, rep.resources.agprs, rep.resources.lds_bytes, rep.resources.barriers));
-    s.push_str("use amdgpu_dsl::{DType, FnBuilder, Function, Opnd, VarId, I32};\nuse amdgpu_tile::lane::Role;\nuse amdgpu_tile::pipeline::{PipeBody, Pipeline, TileIt};\nuse amdgpu_tile::SlotIdx;\n\n");
+    s.push_str("use amdgpu_dsl::{DType, FnBuilder, Function, Opnd, VarId, I32};\nuse amdgpu_tile::lane::Role;\nuse amdgpu_stage::pipeline::{PipeBody, Pipeline, TileIt};\nuse amdgpu_tile::SlotIdx;\n\n");
     s.push_str("/// The orchestration slots of the kernel: the `Pipeline` configuration, the pipeline's per-phase hooks (the work of a phase) and everything around the pipeline.\n");
     s.push_str(&format!("pub trait {tname} {{\n"));
     s.push_str("    /// values shared between the slots (kernarg values, lane ids, LDS tiles, descriptors, the pipeline body's state)\n    type Cx;\n");
@@ -441,7 +441,7 @@ fn generate_dispatched(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str
     }
     s.push_str(&format!("//   hbm in : {}\n//   hbm out: {}\n", rep.inputs.join(", "), rep.outputs.join(", ")));
     s.push_str(&format!("//   est: {} VGPR, {} AGPR, {} B LDS, {} barrier(s)\n\n", rep.resources.vgprs, rep.resources.agprs, rep.resources.lds_bytes, rep.resources.barriers));
-    s.push_str("use amdgpu_dsl::{FnBuilder, Function};\nuse amdgpu_tile::pipeline::Pipeline;\n\n");
+    s.push_str("use amdgpu_dsl::{FnBuilder, Function};\nuse amdgpu_stage::pipeline::Pipeline;\n\n");
     s.push_str("/// The orchestration slots of the kernel: the setup, the `Pipeline` configuration and the dispatch of the pipeline run (its branches, the body of each, the epilogue).\n");
     s.push_str(&format!("pub trait {tname} {{\n"));
     s.push_str("    /// values shared between the slots (kernarg values, block / lane ids, roles, the KV ring, the pipeline's tile-counter values)\n    type Cx;\n");

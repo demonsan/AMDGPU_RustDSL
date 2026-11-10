@@ -5,6 +5,7 @@ use amdgpu_codegen::gpu_verify::{analyse, Severity};
 use amdgpu_tile::frag::*;
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
+use amdgpu_stage::{Cadence, PipeBody, Pipeline};
 
 struct Body {
     ks: Shared,

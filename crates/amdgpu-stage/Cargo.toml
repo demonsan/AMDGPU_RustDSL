@@ -1,0 +1,15 @@
+[package]
+name = "amdgpu-stage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "L2 stage layer: stage composition (fusion stage library), stage contracts, the pipeline templates (ring, ping-pong, split, grid maps, select, scan) over amdgpu-tile (docs/refactor-4layer-plan.md, docs/l2-templates.md)."
+
+[dependencies]
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-layout = { path = "../amdgpu-layout" }
+amdgpu-codegen = { path = "../amdgpu-codegen" }
+amdgpu-tile = { path = "../amdgpu-tile" }
+
+[dev-dependencies]
+amdgpu-isa = { path = "../amdgpu-isa" }

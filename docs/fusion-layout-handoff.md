@@ -86,7 +86,7 @@ FMHA's end-to-end correctness, not by a layout proof.
 
 ### 3.1 `StageBoundary`
 
-`amdgpu_tile::contract_stage` defines the contract model. Each side of a stage boundary is a `StageBoundary` with these fields:
+`amdgpu_stage::contract_stage` defines the contract model. Each side of a stage boundary is a `StageBoundary` with these fields:
 
 | field | content |
 |---|---|
@@ -108,7 +108,7 @@ FMHA's end-to-end correctness, not by a layout proof.
 It returns the `plan_convert` movement and cost of every hand-off. A boundary emits no instruction and is not a scheduling barrier.
 
 **Status before item B.** The checks run as build-time assertions in the kernel builder. When region IR lands, the boundary moves onto
-the Region node and the verifier checks it. Tests: `crates/amdgpu-tile/tests/contract_stage.rs` covers an identity hand-off, a transposed
+the Region node and the verifier checks it. Tests: `crates/amdgpu-stage/tests/contract_stage.rs` covers an identity hand-off, a transposed
 expectation reported as cross-lane, and four error cases.
 
 ### 3.2 Fused GEMM → elementwise → GEMM (`crates/amdgpu-kernels/src/mlp/mod.rs`)

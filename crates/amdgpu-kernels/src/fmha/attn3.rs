@@ -4,7 +4,7 @@
 use amdgpu_dsl::{DType, FnBuilder, I32, Op, Opnd, StageContract, ValueId, VarId};
 use amdgpu_isa::{DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, GLOBAL_LDS_X1, GLOBAL_LDS_X4, MmaAtom};
 use amdgpu_layout::{ComposedLayout, make_layout, Swizzle, tup};
-use amdgpu_tile::{Ctx, ev, Lane, LdsPlan, PipeBody, Role, Roles, Shared, SlotIdx, TileIt};
+use amdgpu_tile::{Ctx, ev, Lane, LdsPlan, Role, Roles, Shared, SlotIdx, TileIt};
 use amdgpu_tile::copy::{LdsPart, LdsSlotPart, make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcast};
 use amdgpu_tile::dma::{DmaPart, issue_rows_shared, partition_dma};
 use amdgpu_tile::frag::{AccTile, B32x32x64Fp8, C32x32F32, Frag, QkOut};
@@ -17,6 +17,7 @@ use amdgpu_tile::frag;
 use amdgpu_tile::Layout;
 use super::block3::Operands;
 use super::io::FmhaBlock;
+use amdgpu_stage::{PipeBody};
 
 /// The derived S -> P orientation (amdgpu_tile::orient::search_attention over the scaled fp8 atoms): the producer / consumer atom, checked to be the one this
 /// file implements (S^T = K Q^T, P = the B operand of O^T = V^T P^T, zero conversion cost).
@@ -178,7 +179,7 @@ impl KvRing3 {
             // the slot offsets are shared with every reader of the slot instance (SlotIdx cache): declared scalar hand-overs
             let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
             let sl = slot.clone();
-            amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
+            amdgpu_stage::stage::StageInst::new("move.kv_stage", amdgpu_stage::stage::Prim::M, "kv.stage", c, u)
                 .param("role", format!("{role:?}"))
                 .handover(move |_b| (Vec::new(), sl.offset_scalars()))
                 .emit(b);
@@ -557,7 +558,7 @@ impl PipeBody for AttnBody3<'_> {
             let nb = if self.blk.pt.is_some() { u.capture(b, "softmax.pt_bias", |b| self.bias_in(b, nb)).1 } else { nb };
             let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
             let pw2 = pw.clone();
-            amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
+            amdgpu_stage::stage::StageInst::new("online.softmax", amdgpu_stage::stage::Prim::O, "v_phase", c, u)
                 .param("recipe", "vendor-lazy")
                 .handover(move |_b| (vec![p_val(pw2)], bias_scalar(nb)))
                 .emit(b);
@@ -597,12 +598,12 @@ impl PipeBody for AttnBody3<'_> {
         if t.staged {
             c.scalars_in.extend(t.next.offset_scalars());
         }
-        let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(b, &t.cur, &w))];
+        let mut insts = vec![amdgpu_stage::stage::StageInst::new("mma.pv", amdgpu_stage::stage::Prim::A, "pv", Default::default(), self.pv_units(b, &t.cur, &w))];
         if t.staged {
-            insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(b, &t.next, s, bias)));
+            insts.push(amdgpu_stage::stage::StageInst::new("mma.qk", amdgpu_stage::stage::Prim::A, "qk", Default::default(), self.qk_units(b, &t.next, s, bias)));
         }
         let (cur, next, staged) = (t.cur.clone(), t.next.clone(), t.staged);
-        amdgpu_tile::stage::merge("m_phase", c, insts)
+        amdgpu_stage::stage::merge("m_phase", c, insts)
             .handover(move |_b| {
                 let mut s = cur.offset_scalars();
                 if staged {
@@ -644,7 +645,7 @@ impl PipeBody for AttnBody3<'_> {
         // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
         let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
         let (nx, staged) = (t.next.clone(), t.staged);
-        amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
+        amdgpu_stage::stage::StageInst::new("online.softmax", amdgpu_stage::stage::Prim::O, "window", c, u)
             .param("with", "mma.qk blocks")
             .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }))
             .emit(b);

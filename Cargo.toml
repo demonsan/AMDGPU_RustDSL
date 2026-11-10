@@ -8,6 +8,7 @@ members = [
     "crates/amdgpu-layout",
     "crates/amdgpu-isa",
     "crates/amdgpu-tile",
+    "crates/amdgpu-stage",
     "crates/amdgpu-graph",
     "crates/amdgpu-kernels",
     "crates/amdgpu-sym",

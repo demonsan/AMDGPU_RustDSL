@@ -13,7 +13,7 @@ pub mod reduce;
 
 use amdgpu_dsl::{AtomicOp, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use crate::lds_decl::tile_at;
-use amdgpu_tile::templates::scan::{HsScan, ScanElem};
+use amdgpu_stage::templates::scan::{HsScan, ScanElem};
 use amdgpu_tile::{ev, SlotIdx};
 
 pub fn by_name(name: &str) -> Option<Function> {

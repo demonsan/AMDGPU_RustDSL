@@ -14,7 +14,7 @@
 
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Dpp, DppAluOp, DppCtrl, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use crate::lds_decl::tile_at;
-use amdgpu_tile::templates::select::{DescScan, ScanThreads, SelectVer};
+use amdgpu_stage::templates::select::{DescScan, ScanThreads, SelectVer};
 use amdgpu_tile::{ev, SlotIdx};
 
 pub fn by_name(name: &str) -> Option<Function> {

@@ -7,7 +7,7 @@
 | 对象 | 内容 |
 |---|---|
 | `Graph` | 名字、属性（`threads`，流水线图还有 `pipeline` / `hooks` / `dispatch`）、节点、边、weave 组 |
-| `Node` | stage 实例：原语（M/A/E/R/O/Q/S/P）、注册表键（`amdgpu_tile::stage::registry()`）、参数、资源估计（VGPR/AGPR/LDS/barrier）、roles、barrier 相位、所在阶段（prologue/loop/epilogue）、流水线 hook |
+| `Node` | stage 实例：原语（M/A/E/R/O/Q/S/P）、注册表键（`amdgpu_stage::stage::registry()`）、参数、资源估计（VGPR/AGPR/LDS/barrier）、roles、barrier 相位、所在阶段（prologue/loop/epilogue）、流水线 hook |
 | `Edge` | 张量：dtype / 形状 / 逻辑布局、生产者与消费者的 fragment 元素表（都有时**由布局代数计算**边界类）、作用域（wave/block/grid/none）、存储（VGPR/AGPR/LDS 区域/global）、声明的类、kernarg ABI、是否跨迭代（`carried`，不参与依赖序） |
 | `Group` | weave 组：一个 weaver 交织的若干节点（名字、weave 相位标签、成员） |
 

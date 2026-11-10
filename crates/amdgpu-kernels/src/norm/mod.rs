@@ -11,7 +11,7 @@
 
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, StageContract, StageScalar, StageVal, ValueId};
 use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
-use amdgpu_tile::stage::{Prim, StageInst};
+use amdgpu_stage::stage::{Prim, StageInst};
 use amdgpu_codegen::weave::Units;
 use amdgpu_tile::{ev, Lane, LdsPlan};
 

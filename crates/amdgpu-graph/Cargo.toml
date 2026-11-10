@@ -8,3 +8,4 @@ description = "L1 graph layer: the op graph (cut, budget, JSON, skeleton generat
 [dependencies]
 amdgpu-layout = { path = "../amdgpu-layout" }
 amdgpu-tile = { path = "../amdgpu-tile" }
+amdgpu-stage = { path = "../amdgpu-stage" }

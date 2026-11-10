@@ -16,7 +16,7 @@
 //   est: 96 VGPR, 128 AGPR, 98304 B LDS, 1 barrier(s)
 
 use amdgpu_dsl::{FnBuilder, Function};
-use amdgpu_tile::pipeline::Pipeline;
+use amdgpu_stage::pipeline::Pipeline;
 
 /// The orchestration slots of the kernel: the setup, the `Pipeline` configuration and the dispatch of the pipeline run (its branches, the body of each, the epilogue).
 pub trait KvsplitSlots {

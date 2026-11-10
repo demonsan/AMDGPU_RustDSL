@@ -10,8 +10,8 @@
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
 use crate::lds_decl::{private_at, ring_at, tile_at};
-use amdgpu_tile::templates::select::{DescScan, ScanThreads, SelectVer};
-use amdgpu_tile::templates::scan::{HsScan, ScanElem};
+use amdgpu_stage::templates::select::{DescScan, ScanThreads, SelectVer};
+use amdgpu_stage::templates::scan::{HsScan, ScanElem};
 use amdgpu_tile::{ev, Shared, SlotIdx};
 
 const T: i32 = 1024;

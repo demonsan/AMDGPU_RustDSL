@@ -9,7 +9,7 @@
 //! voffsets; the scales once per CTA into a transposed panel (VGPR loads + in-register byte transposes); the LDS-staged epilogue; the slot-filling
 //! scheduler places the DMA issues.
 
-use amdgpu_tile::{ev, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, TileIt};
+use amdgpu_tile::{ev, LdsPlan, Lane, Role, Shared, SlotIdx, TileIt};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{layout_to_offsets, make_layout, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Swizzle};
@@ -28,6 +28,7 @@ use body::*;
 pub use body::verify_sfa_transpose;
 use dma::*;
 use epilogue::*;
+use amdgpu_stage::{Cadence, PipeBody, Pipeline};
 
 /// Slots per wave record of the optional timing stamps (`GEMM_STAMP`): 0 kernel start, 1 setup done, 2 prologue done, 3 loop done, 4 epilogue stores issued, 16 + tile = the tile matrix phase.
 const STAMP_SLOTS: usize = 96;
@@ -554,7 +555,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // XCD-aware raster: workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
     let (bx, by) = if cfg.moe.is_some() || cfg.conv.is_some() { (bx0, by0) } else {
-        amdgpu_tile::templates::grid::xcd_raster_16x16(b, bx0, by0, n_v, m_v, (16 * cfg.cta_n) as i32, (16 * cfg.cta_m) as i32)
+        amdgpu_stage::templates::grid::xcd_raster_16x16(b, bx0, by0, n_v, m_v, (16 * cfg.cta_n) as i32, (16 * cfg.cta_m) as i32)
     };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);
     let wm = b.bind_i32(lane.wave() & 1);

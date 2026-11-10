@@ -12,7 +12,7 @@
 
 use amdgpu_dsl::{DType, FnBuilder, Function, Opnd, VarId, I32};
 use amdgpu_tile::lane::Role;
-use amdgpu_tile::pipeline::{PipeBody, Pipeline, TileIt};
+use amdgpu_stage::pipeline::{PipeBody, Pipeline, TileIt};
 use amdgpu_tile::SlotIdx;
 
 /// The orchestration slots of the kernel: the `Pipeline` configuration, the pipeline's per-phase hooks (the work of a phase) and everything around the pipeline.

@@ -11,8 +11,9 @@
 //!   mask on the tiles that reach the diagonal.
 
 use super::*;
-use amdgpu_tile::templates::grid;
+use amdgpu_stage::templates::grid;
 use amdgpu_tile::tensor::{Dim, KArgs, Stride};
+use amdgpu_stage::{Cadence, Pipeline};
 
 /// The 656-byte ABI of the vendor's fp8 fmha_v3 with the per-tensor descales and its host contract. `kvsplit`: our extension behind it
 /// (0x290 fp16 partials Ohat, 0x298 partial log-sum-exp, 0x2A0 splits in {2, 4, 8}, 0x2A4 rows_total = B S H; grid z = B splits) - the

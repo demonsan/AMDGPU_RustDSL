@@ -3,6 +3,7 @@
 use amdgpu_codegen::gpu_verify::{analyse, Severity};
 use amdgpu_tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, VarId, I32};
+use amdgpu_stage::{Cadence, PipeBody, Pipeline};
 
 fn fmha_tensors(b: &mut FnBuilder, ka: &mut KArgs) -> (Tensor, Tensor, Tensor, Tensor) {
     let s = ka.dim(b, "s_seq_len", 0x060, 1, i64::MAX);
@@ -338,7 +339,7 @@ fn one_window_three_slot_ring_verifies() {
 
 #[test]
 fn kv_split_and_gqa_components_verify() {
-    use amdgpu_tile::components::*;
+    use amdgpu_stage::components::*;
     let mut b = FnBuilder::new("tile_demo_kvs", 64);
     let mut ka = KArgs::new();
     let _ = ka.dim(&mut b, "skv", 0x00, 1, i64::MAX);
