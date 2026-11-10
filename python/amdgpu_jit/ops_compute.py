@@ -107,8 +107,9 @@ def gemm(a, b, out, *, kind="bf16", a_scale=None, b_scale=None, M=None, N=None, 
       "fp8_rowcol"     A, B fp8 e4m3; a_scale f32 [M], b_scale f32 [N] (per row / column)
       "fp8_blockscale" A, B fp8; a_scale f32 [M, K/128] (row-major), b_scale f32 [N/128, K/128]; split-K by the dispatch rule (``splits``)
       "mxfp4"          A [M, K/2], B [N, K/2] packed e2m1; scales E8M0 [rows, K/32] in ``shuffle_mx_scales`` order
-    Tiles: 256 x 256 CTAs (blockscale: 128) when M, N are multiples of 256 and the grid has at least ``cus`` / 4 CTAs, else the ``_128``
-    kernels (bf16 / fp8_rowcol). Shapes default to the tensors'. ``kernel`` / ``splits`` / ``reduce``: an explicit launch (the L1 plan's
+    Default: the kernel, split-K and reduce of ``dispatch::gemm_kernels`` (``amdc dispatch gemm``; the family rules: 256 / ``_128`` /
+    ``_64`` / ``_64_splitk`` + ``gemm_splitk_reduce_s<S>[_rc]``). ``tile`` = 256 / 128 or an explicit ``splits`` (blockscale) select the
+    former fixed forms. Shapes default to the tensors'. ``kernel`` / ``splits`` / ``reduce``: an explicit launch (the L1 plan's
     ``dispatch::gemm_kernels`` choice: the 256 / ``_128`` / ``_64`` / ``_64_splitk`` forms and ``gemm_splitk_reduce_s<S>[_rc]``). Returns (kernel, splits)."""
     ra, rb, ro = as_ref(a), as_ref(b), as_ref(out)
     M = M or ro.shape[0]
@@ -116,6 +117,10 @@ def gemm(a, b, out, *, kind="bf16", a_scale=None, b_scale=None, M=None, N=None, 
     base, es, kt_el = _GEMM[kind]
     K = K or (ra.shape[1] * 2 if kind == "mxfp4" else ra.shape[1])
     name = base
+    if kernel is None and tile == "auto" and splits == "auto":
+        # the one rule (``amdc dispatch gemm`` = dispatch::gemm_kernels): tile, split-K and reduce of the family rules
+        d = dispatch("gemm", kind, M, N, K, "--cus", cus)
+        kernel, splits, reduce = d["kernel"], int(d["splits"]), d["reduce"]
     if kernel is not None:
         name = kernel
     elif kind in ("bf16", "fp8_rowcol"):

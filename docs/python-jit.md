@@ -137,7 +137,7 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 | `topk_softmax(gating, weights, indices, renorm=False)` | `topk_softmax[_renorm]_bf16_e<E>_k<K>` | gating [T, E] bf16 → weights f32, indices i32 [T, K] |
 | `moe_sorting(topk_ids, topk_weights, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tile_start, num_experts, block_m)` | `moe_sorting_e<E>_k<K>_b<BM>` | sizes: `moe_sorting_sizes(M, E, K, BM)` |
 | `moe_reduce(x, out, weights=None)` | `moe_reduce_bf16_k<K>_d<D>` / `moe_combine_bf16_k<K>_d<D>` | x [T, K, D] → out [T, D] |
-| `gemm(a, b, out, kind="bf16"\|"fp8_rowcol"\|"fp8_blockscale"\|"mxfp4", a_scale, b_scale, splits="auto", tile="auto")` | `gemm_a16w16_bf16[_128]`, `gemm_a8w8_rowcol_fp8[_128]`, `gemm_a8w8_blockscale[_splitk]` + `gemm_splitk_reduce_s<S>`, `gemm_a4w4_mxfp4` | B preshuffled (`shuffle_weight`); blockscale split-K from `blockscale_split_k`; mxfp4 scales via `shuffle_mx_scales` |
+| `gemm(a, b, out, kind="bf16"\|"fp8_rowcol"\|"fp8_blockscale"\|"mxfp4", a_scale, b_scale, splits="auto", tile="auto", kernel=None, reduce=None)` | `dispatch::gemm_kernels` (`amdc dispatch gemm <kind> M N K`): `gemm_a16w16_bf16[_128\|_64[_splitk]]`, `gemm_a8w8_rowcol_fp8[_128\|_64[_splitk]]`, `gemm_a8w8_blockscale[_64[_splitk]]` + `gemm_splitk_reduce_s<S>[_rc]`, `gemm_a4w4_mxfp4` | B preshuffled (`shuffle_weight`); mxfp4 scales via `shuffle_mx_scales`; `tile=256\|128` / an explicit blockscale `splits` select the former fixed forms; `kernel` / `splits` / `reduce` launch an explicit choice (the L1 plans) |
 | `prefill_bf16(q, k, v, out, causal, lse=None, scale=None)` | `bf16_prefill_kernel` choice: `fmha_fwd_hd128_bf16_v3[_causal][_ks]` / `fmha_fwd_hd128_bf16_causal` (+ `attn_combine_bf16_hd128_q16`) | q, out [B, SQ, H, 128], k, v [B, SK, HK, 128]; lse f32 [B, H, SQ] |
 | `fused_moe(x, w1, w2, topk_ids, topk_weights, out, dtype="bf16"\|"fp8", act, x_scale, w1_scale, w2_scale, num_experts, inter)` | `moe_sorting_*`, `gemm_moe1_<dt>_<act>[_bm64]`, `quant_token_bf16_fp8_n<I>` (fp8), `gemm_moe2_<dt>[_bm64]`, `moe_sum_bf16_k<K>` | W1 via `moe_w1_interleave` + `shuffle_weight`; block_m from `moe_block_m`; E ≥ 8, D % 1024 = 0 |
 
@@ -151,13 +151,47 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 
 Every other registered kernel is reachable through `launch(name, …)` directly (arguments by the names `amdc jit-info <name>` lists).
 
-The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm_blockscale", M, N, K)`,
+The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm", kind, M, N, K)`, `dispatch("gemm_blockscale", M, N, K)`,
 `dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)`, `dispatch("mla", B, H)`, `dispatch("bwd_causal")` (= `amdc dispatch …`, the functions of `crates/amdgpu-graph/src/dispatch.rs`).
 The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term block is summed to about 2^-10 of its term magnitude
 (visible under cancellation — also with unit scales and a single K block, so it is the instruction, not the kernel).
 
 `python3 python/tests/ops_check.py [name …]` (GPU node, stdlib only; GEMM / prefill / MoE checks sample rows and tokens) runs every op on random data against a Python reference that follows the
 C++ host reference of its family (formulas and tolerances of `tests/gpu/{rows,quant,eltwise,rmsnorm_quant,mxnorm,rope,qknorm_rope_kv,cache,cache_blocked,topk,moe_sorting,moe_reduce}_host.cpp`).
+
+### GEMM: one launch rule (2026-11-10)
+
+`gemm()` with the default `tile` / `splits` follows `dispatch::gemm_kernels`, the rule the L1 graph plans use. Before, it had its own rule:
+- bf16 / fp8 row-col: the 256 × 256 kernel when M, N % 256 == 0 and the grid had ≥ CUs / 4 CTAs, else `_128`;
+- blockscale: 128-row tiles with the dispatch split.
+
+Measured with `python3 python/tests/gemm_rule_ab.py`: MI355X, one GPU, both rules in the same run, interleaved rounds, hip events, median of 5 × 50 calls.
+
+| kind | M × N × K | former rule | µs | `gemm_kernels` | µs | new / old |
+|---|---|---|---:|---|---:|---:|
+| bf16 | 4096 × 4096 × 4096 | `gemm_a16w16_bf16` | 84.5 | same | 84.5 | 1.00 |
+| bf16 | 2048 × 4096 × 4096 | `gemm_a16w16_bf16` | 74.7 | `_128` | 55.2 | 0.74 |
+| bf16 | 1024 × 4096 × 8192 | `gemm_a16w16_bf16` | 135.1 | `_128` | 79.0 | 0.59 |
+| bf16 | 512 × 7168 × 4096 | `_128` | 45.0 | `_64` | 36.5 | 0.81 |
+| bf16 | 256 × 7168 × 4096 | `_128` | 42.8 | `_64` | 21.3 | 0.50 |
+| bf16 | 128 × 4096 × 8192 | `_128` | 75.4 | `_64_splitk` S4 | 30.5 | 0.40 |
+| bf16 | 64 × 8192 × 8192 | `_128` | fails (M < 128 rows) | `_64_splitk` S4 | 34.5 | — |
+| fp8 row-col | 4096 × 4096 × 4096 | `gemm_a8w8_rowcol_fp8` | 55.0 | same | 55.0 | 1.00 |
+| fp8 row-col | 2048 × 4096 × 4096 | `gemm_a8w8_rowcol_fp8` | 45.7 | `_128` | 35.2 | 0.77 |
+| fp8 row-col | 1024 × 4096 × 8192 | `gemm_a8w8_rowcol_fp8` | 71.8 | `_128` | 46.0 | 0.64 |
+| fp8 row-col | 512 × 7168 × 4096 | `_128` | 26.4 | `_64` | 23.5 | 0.89 |
+| fp8 row-col | 256 × 7168 × 4096 | `_128` | 24.3 | `_64` | 15.8 | 0.65 |
+| fp8 row-col | 128 × 4096 × 8192 | `_128` | 42.7 | `_64_splitk` S4 | 31.2 | 0.73 |
+| fp8 row-col | 64 × 8192 × 8192 | `_128` | fails (M < 128 rows) | `_64_splitk` S4 | 25.2 | — |
+| fp8 blockscale | 4096 × 4096 × 4096 | `gemm_a8w8_blockscale` | 105.1 | same | 105.1 | 1.00 |
+| fp8 blockscale | 2048 × 4096 × 4096 | `gemm_a8w8_blockscale` | 58.2 | same | 58.2 | 1.00 |
+| fp8 blockscale | 1024 × 4096 × 8192 | `gemm_a8w8_blockscale` | 79.8 | `_64` | 55.8 | 0.70 |
+| fp8 blockscale | 512 × 7168 × 4096 | `gemm_a8w8_blockscale` | 42.8 | `_64` | 28.1 | 0.66 |
+| fp8 blockscale | 256 × 7168 × 4096 | `gemm_a8w8_blockscale` | 38.9 | `_64` | 18.0 | 0.46 |
+| fp8 blockscale | 128 × 4096 × 8192 | `_splitk` S4 | 27.2 | `_64_splitk` S4 | 21.8 | 0.80 |
+| fp8 blockscale | 64 × 8192 × 8192 | `_splitk` S4 | 35.0 | `_64_splitk` S4 | 29.4 | 0.84 |
+
+The new rule is never slower: 1.00 at the shapes where both rules pick the same kernel, and 0.40–0.89 elsewhere, with the largest wins at small M. The former rule could not launch M = 64. In the first, otherwise identical run, bf16 128 × 4096 × 8192 measured 27.2 µs (run-to-run spread). Numerics: `ops_check.py gemm` (8/8, now through the new defaults) and `graph_check.py gemm` (4/4).
 
 ## Launch overhead
 

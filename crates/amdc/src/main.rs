@@ -387,7 +387,23 @@ fn main() -> ExitCode {
                     { let (rows, s) = amdgpu_graph::dispatch::blockscale_config(m, n, k, cus); println!("{{\"rows\":{},\"splits\":{}}}", rows, s); }
                     ExitCode::SUCCESS
                 }
-                (Some("mla"), Some(b), Some(h), _) => {
+                (Some("gemm"), _, _, _) => {
+                    // amdc dispatch gemm <kind> <M> <N> <K> [--cus N]: the dense GEMM launch (dispatch::gemm_kernels: kernel, split-K, reduce) -
+                    // the one rule of the Python gemm() and the L1 graph plans
+                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
+                    let kind = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                    match (num(3), num(4), num(5)) {
+                        (Some(m), Some(n), Some(k)) => match amdgpu_graph::dispatch::gemm_kernels(kind, m, n, k, cus) {
+                            Some((kernel, s, reduce)) => {
+                                let red = reduce.map(|r| format!("\"{r}\"")).unwrap_or_else(|| "null".into());
+                                println!("{{\"kernel\":\"{kernel}\",\"splits\":{s},\"reduce\":{red}}}");
+                                ExitCode::SUCCESS
+                            }
+                            None => { eprintln!("dispatch gemm: unknown kind `{kind}`"); ExitCode::from(2) }
+                        },
+                        _ => { usage(); ExitCode::from(2) }
+                    }
+                }                (Some("mla"), Some(b), Some(h), _) => {
                     // amdc dispatch mla <B> <H>: (head-parallel form?, splits) of the MLA decode
                     let (hp, s) = amdgpu_graph::dispatch::mla_config(b, h);
                     println!("{{\"hp\":{hp},\"splits\":{s}}}");
