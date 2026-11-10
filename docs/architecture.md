@@ -1,7 +1,7 @@
 # Architecture: four layers, as built
 
 The decision record is [refactor-4layer-plan.md](refactor-4layer-plan.md). This page describes what Main has now, and links to the detailed
-documents. Dependencies point **down only**; `crates/amdc/tests/crate_layers.rs` checks every crate's `[dependencies]`.
+documents. Dependencies point **down only**; `crates/amdc/tests/layer_check.rs` checks the crate ranks, manifests, source references and that lower layers hold no kernel-name policy.
 
 ## 1. Layers and crates
 
@@ -78,7 +78,7 @@ From the description's analysis (target-gfx1250.md §2):
 | Invariant | Where |
 |---|---|
 | Asm of every reachable kernel is unchanged by a refactor (234 kernels) | `tests/golden/md5_manifest.tsv`, `crates/amdc/tests/md5_manifest.rs` ([tests/golden/README.md](../tests/golden/README.md)) |
-| Dependencies point down | `crates/amdc/tests/crate_layers.rs` |
+| Dependencies point down; no kernel-name policy below L2 | `crates/amdc/tests/layer_check.rs` |
 | Kernels, tiles and stages read no environment | `crates/amdgpu-kernels/tests/no_env_knobs.rs` |
 | Every pass lists evidence, and the evidence paths exist | unit tests in `amdgpu-codegen/src/pass/mod.rs` |
 | The compile policy is declared data (no kernel-name inspection) | `amdgpu_dsl::CompileProfile::policy` |
