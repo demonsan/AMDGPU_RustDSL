@@ -33,20 +33,6 @@ pub struct Compiled {
     pub sgpr: u32,
 }
 
-/// The name the compile policy (lowering options, scheduler preset) is derived from: the kernel's own name, unless the kernel declares an explicit
-/// [`amdgpu_dsl::CompileProfile`], which maps to the name of the shipped kernel whose policy it requests (so a profile gets EXACTLY that kernel's policy).
-pub fn policy_name(f: &amdgpu_dsl::Function) -> &str {
-    use amdgpu_dsl::CompileProfile as P;
-    match f.compile_profile {
-        None => &f.name,
-        Some(P::Vs128) => "fmha_fwd_hd128_mxfp8_vs128",
-        Some(P::T128) => "fmha_fwd_hd128_mxfp8_t128",
-        Some(P::KvSplit) => "fmha_fwd_hd128_mxfp8_kvsplit",
-        Some(P::Combine) => "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
-        Some(P::Default) | Some(P::Gemm) => "",
-    }
-}
-
 /// Lowers, verifies, allocates and emits a kernel as gfx950 assembly text with our own tail.
 pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
     compile_with(f, &backend::OwnTail)
@@ -99,7 +85,6 @@ fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
-    let pname = policy_name(f);
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
@@ -131,7 +116,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         (Some(spec), Some(mut o)) => {
             for ent in spec.split([';', '|']) {
                 if let Some((pat, toks)) = ent.split_once(':') {
-                    if pat == "*" || pname.contains(pat) || f.name.contains(pat) {
+                    if pat == "*" || f.name.contains(pat) {
                         o.apply_tokens(toks);
                     }
                 }
@@ -144,7 +129,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let hz_opts = sched_opts.clone();
     let hzfill = sched_opts.as_ref().map_or(false, |o| o.any_region(|r| r.hzfill))
         || std::env::var("AMDC_SCHED_ADD").ok().map_or(false, |spec| {
-            spec.split(';').filter_map(|e| e.split_once(':')).any(|(pat, toks)| (pat == "*" || pname.contains(pat) || f.name.contains(pat)) && toks.split(',').any(|t| t.trim() == "hzfill"))
+            spec.split(';').filter_map(|e| e.split_once(':')).any(|(pat, toks)| (pat == "*" || f.name.contains(pat)) && toks.split(',').any(|t| t.trim() == "hzfill"))
         });
     let m0_reuse = m0_reuse_on(f);
     if let Some(opts) = sched_opts {
