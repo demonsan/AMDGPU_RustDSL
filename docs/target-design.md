@@ -87,6 +87,19 @@ pub struct Target {
 
 Each row is one move commit: behaviour-neutral, md5 manifest identical, certificates identical, `cargo test` + `run_all.sh` green.
 
+### 3.1 As built (P0)
+
+- `crates/amdgpu-target`: `Target` with `wave`, `regs` (VGPR / optional AGPR / SGPR files, unified file, occupancy model), `lds`, `counters`
+  (classes, per-class order, wait form), `hazards` (named rules: count + unit + scope + source), `latency` (branch / barrier costs, slotfill slot
+  and DMA numbers, the weave planner's machine), `emit` (descriptor rounding and caps), `llvm` (llc / assembler arguments), `verify`; data in
+  `gfx950.rs`.
+- `amdgpu-compiler/src/target/mod.rs`: `T` = gfx950, the one place a second target changes. `regalloc`, `emit`, `gpu_verify`, `hazards`,
+  `sched::{waits, model, slotfill, m0}`, `backend::llvm20` and `amdc::jit` read their numbers from `T`; `amdgpu-tile`'s weave model reads
+  `latency.weave`.
+- Per-instruction tables moved to `amdgpu-compiler/src/target/gfx950/` (`op_attrs.rs`, `emit.rs`, `llvm/llvm{20,24}{.tbl,_header.txt}`); the
+  atoms to `amdgpu_isa::gfx950` (re-exported at the root).
+- Every step: `amdc md5-manifest --check tests/golden/md5_manifest.tsv` 0 differences (234 kernels), certificates unchanged.
+
 ## 4. How gfx1250 fits (check, not implementation)
 
 - **Wave and registers:** wave32; VGPR allocation granule; fixed SGPRs. These are data in `wave` / `regs`.
