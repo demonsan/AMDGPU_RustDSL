@@ -8,11 +8,10 @@ use amdgpu_tile::{Ctx, ev, Lane, Shared, Tensor};
 use amdgpu_tile::copy::make_tiled_copy;
 use amdgpu_tile::frag::{AccTile, B32x32x64Fp8, C32x32F32, Frag};
 use amdgpu_tile::mma::make_tiled_mma;
-use amdgpu_stage::components;
+use crate::components;
 use amdgpu_tile::frag;
 use super::attn3::attention_orientation;
-use super::io::FmhaBlock;
-use super::io;
+use super::state::{FmhaBlock, KvsArgs, PtScale};
 
 /// The kernarg offsets the generic block launch reads (the ABI stays with the kernel crate's `declare_io`; docs/l2-family-bodies.md §2.2).
 #[derive(Clone, Copy, Debug)]
@@ -41,7 +40,7 @@ pub trait Operands {
     fn heads(&self) -> ValueId;
     fn s_len(&self) -> I32;
     fn kv_len(&self) -> I32;
-    fn kvs(&self) -> Option<&io::KvsArgs>;
+    fn kvs(&self) -> Option<&KvsArgs>;
     fn abi(&self) -> LaunchAbi;
 }
 /// `FmhaIo::block` with the Q fragments loaded through a TiledCopy: the B operand of the scaled 32x32x64 atom over the lane's (clamped) query row, two
@@ -62,7 +61,7 @@ pub fn block3_x(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -
 /// `block3_x` with the per-tensor mode.
 pub fn block3_x_mode(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, xcd: bool, pt: Option<PtMode>) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
-        amdgpu_stage::templates::grid::xcd_tile_head(b, io.s_len(), rows_lg, io.abi().h_ka, io.abi().sq_ka)
+        crate::templates::grid::xcd_tile_head(b, io.s_len(), rows_lg, io.abi().h_ka, io.abi().sq_ka)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
     };
@@ -95,7 +94,7 @@ pub fn block3_at(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, qtile: Valu
     let (bidx, kv_len, key_lo, split) = match io.kvs() {
         None => (zz, kv_all, I32::c(0), None),
         Some(kv) => {
-            let (bi, si, lg) = amdgpu_stage::templates::grid::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
+            let (bi, si, lg) = crate::templates::grid::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
             if causal {
                 // the split covers this block's causal key range (kv_end, computed above); a split past it is empty
                 let (key_lo, kv_eff, empty) = components::kv_split_range_var(b, kv_end, si, lg, io.abi().sk_ka);
@@ -171,7 +170,7 @@ pub fn block3_at(io: &dyn Operands, b: &mut FnBuilder, rows_lg: i32, qtile: Valu
         let inv_m = b.rcp_f32(m);
         let m2 = b.frag2_dup(m);
         let kunit = b.c_i32(0x7F7F_7F7F);
-        (sel, [ex, ex], vd, kvh, Some(io::PtScale { m2, inv_m, kunit }))
+        (sel, [ex, ex], vd, kvh, Some(PtScale { m2, inv_m, kunit }))
     };
     let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(io.abi().sk_ka).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");

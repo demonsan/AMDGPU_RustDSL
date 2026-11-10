@@ -152,7 +152,7 @@ Swizzle { src_lo: 7, src_n: 4, dst_lo: 4, dst_n: 3, rows: vec![0b0101, 0b0010, 0
 ```
 
 CuTe 的 `Swizzle<B, M, S>` 是它的特例（`Swizzle::cute(b, m, s)`）；KV-split 的转置暂存区用 `Swizzle<3,4,3>`
-（`crates/amdgpu-kernels/src/fmha/attn3.rs:18`：块号 ^= 行号低 3 位）。
+（`crates/amdgpu-stage/src/attention/attn3.rs:18`：块号 ^= 行号低 3 位）。
 
 swizzle 与布局复合成 `ComposedLayout { swz, inner }`：`坐标 → inner → 字节 → swz → 实际字节`。测试证明三件事：
 

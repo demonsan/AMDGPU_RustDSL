@@ -8,10 +8,9 @@
 
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
-mod attn3;
-mod block3;
-pub use attn3::*;
-pub use block3::*;
+pub use amdgpu_stage::attention::{attn3, block3};
+pub use amdgpu_stage::attention::attn3::*;
+pub use amdgpu_stage::attention::block3::*;
 pub mod graph;
 pub mod bf16;
 pub mod bf16v3;
