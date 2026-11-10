@@ -11,6 +11,7 @@
 //! causal = bottom-right (key k visible to query q iff k <= q + SK - SQ).
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
@@ -112,24 +113,11 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
-    if causal {
-        b.grid_is(0, Ext::ka(192));
-        b.grid_is(1, Ext::sym("B"));
-        b.grid_is(2, Ext::ka(160).ceil_div(128));
-    } else {
-        b.grid_is(0, Ext::ka(160).ceil_div(128));
-        b.grid_is(1, Ext::ka(192));
-        b.grid_is(2, Ext::sym("B"));
-    }
+    grid::tile_grid(&mut b, causal, Ext::ka(160).ceil_div(128), Ext::ka(192));
     let a = args(&mut b);
-    let (qt, h, bat) = if causal {
-        let nqt = { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) };
-        let qz = b.let_(Op::WorkgroupIdZ);
-        let q = { let v = b.bind_i32(ev(nqt) - 1 - ev(qz)); b.read_first_lane(v) };
-        (q, b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY))
-    } else {
-        (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
-    };
+    // causal: longest first - the highest query tile (it sees the most keys) launches first
+    let nqt = causal.then(|| { let v = b.bind_i32((ev(a.sq) + 127).lshr(7)); b.read_first_lane(v) });
+    let (qt, h, bat) = grid::tile_ids(&mut b, causal, nqt);
     let lane = Lane::new(&mut b);
     // GQA group G = H / HK (power of two): the KV head
     let gqa = {
@@ -342,24 +330,13 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     b.compile_profile(CompileProfile::Vs128);
     abi(&mut b);
     let lpt = causal;   // longest first (see above)
-    if lpt {
-        b.grid_is(0, Ext::ka(192));
-        b.grid_is(1, Ext::sym("B"));
-        b.grid_is(2, Ext::ka(176).ceil_div(128));
-    } else {
-        b.grid_is(0, Ext::ka(176).ceil_div(128));
-        b.grid_is(1, Ext::ka(192));
-        b.grid_is(2, Ext::sym("B"));
-    }
+    grid::tile_grid(&mut b, lpt, Ext::ka(176).ceil_div(128), Ext::ka(192));
     // (sched's per-region strategies - reorder,ldshoist on the MFMA regions, reorder,hzfill on softmax / pack: 139.5 -> 114.4 us on the Gemm profile -
     // measured 102.2 vs 98.0 us on top of the Vs128 profile + tokens below: not declared; the region markers stay)
 
     let a = args(&mut b);
-    let (kt0, h, bat) = if lpt {
-        (b.let_(Op::WorkgroupIdZ), b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY))
-    } else {
-        (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
-    };
+    // causal: longest first - key tile 0 (it sees the most queries) launches first
+    let (kt0, h, bat) = grid::tile_ids(&mut b, lpt, None);
     let lane = Lane::new(&mut b);
     let gqa = {
         let mut q = b.c_i32(1);

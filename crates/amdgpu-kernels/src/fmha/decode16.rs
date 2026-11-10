@@ -4,6 +4,7 @@
 //! (g = l / 16); the softmax statistics are combined over the 4 lane groups (permlane16 + permlane32 swaps). P^T feeds the 32-key PV step in the
 //! key order {4 g + 0..3 of block 2 t, 16 + 4 g + 0..3 of block 2 t + 1}; V^T by ds_read_b64_tr_b16 with rows 16 r + 4 g + s / 4.
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::{ev, LdsPlan, Lane};
 
 const D: i32 = 128;
@@ -207,8 +208,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         (live, hd, bat, None, None)
     };
     // ---- the wave's key split ----
-    let nsplit = b.bind_i32(ev(s_n) << 2);
-    let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
+    let (nsplit, ns) = grid::wave_split_index(&mut b, z, wv, s_n);
     let ncl = { let v = b.bind_i32((ev(bat) + 1) << 2); b.read_first_lane(v) };
     let r_cl = b.buffer_desc_dyn(p_cl, ncl);
     let cl_so = { let v = b.bind_i32(ev(bat) << 2); b.read_first_lane(v) };
@@ -216,18 +216,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let ctx = { let v = b.buffer_load_f32(r_cl, zero, cl_so, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
     b.assume_trusted(ctx, Ext::c(0), Ext::ka(144) * Ext::c(page as i64), "decode: a context length lies in [0, max_pages P] (host contract)");
     // chunk = ceil(tiles / NS) tiles (NS = 4 S, S a power of two <= 16); [k_lo, k_hi) = [ns chunk, min(ctx, (ns + 1) chunk))
-    let lg = {
-        let sv = ev(s_n);
-        let s1 = sv.clone().gt(1).select_i32(1, 0);
-        let s2 = sv.clone().gt(2).select_i32(2, s1);
-        let s3 = sv.clone().gt(4).select_i32(3, s2);
-        let v = b.bind_i32(sv.gt(8).select_i32(4, s3) + 2);
-        b.read_first_lane(v)
-    };
-    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(LKT));
-    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << LKT);
-    let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
-    let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
+    let lg = grid::split_lg(&mut b, s_n, 4);
+    let (k_lo, k_hi) = grid::key_chunk(&mut b, ctx, ns, nsplit, lg, LKT);
     let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(LKT)); b.read_first_lane(v) };
     // the lane's key limit (MTP: query position qpos sees keys < ctx - qlen + 1 + qpos)
     let kmax = match (qpos, qlen) {

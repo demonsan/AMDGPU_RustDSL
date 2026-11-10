@@ -935,46 +935,7 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
 /// `block3_x` with the per-tensor mode.
 pub fn block3_x_mode(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool, pt: Option<PtMode>) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
-        let x0u = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
-        let y0u = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
-        let x0 = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(x0u), amdgpu_dsl::Opnd::I32(0)));
-        let y0 = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(y0u), amdgpu_dsl::Opnd::I32(0)));
-        let hh = b.let_(amdgpu_dsl::Op::KernargI32 { offset: 0x140 });
-        let xq = b.bind_i32((io.s_len.clone() + ((1 << rows_lg) - 1)).lshr(rows_lg));
-        let n = b.bind_i32(ev(xq) * ev(hh));
-        // ok = (N % 8 == 0) && (H <= 32) && (X <= 16 || N % 128 == 0), as 0 / 1
-        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, (ev(n) & 127).eq(0).select_i32(1, 0)), 0), 0));
-        let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
-        // X <= 16: the vendor's stride (XCD x owns the logical range [x N / 8, (x + 1) N / 8)). X > 16 (S > 4096): XCD x takes chunks of 16
-        // consecutive logical blocks, cycling - with the vendor's stride all 32 CUs of an XCD streamed one head in lockstep and the L2 tag /
-        // DRAM-credit stalls grew 8x (B8H8S8192 -6.9 %); chunks of 16 keep half a head per XCD (+0.2 ... +3.3 % at S 8192 / 16384)
-        let k = b.bind_i32(ev(l).lshr(3));
-        let r_v = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(k));
-        let r_c = b.bind_i32((ev(k).lshr(4) << 7) + ((ev(l) & 7) << 4) + (ev(k) & 15));
-        let mut r = b.bind_i32(ev(xq).le(16).select_i32(ev(r_v), ev(r_c)));
-        // head = M / X by binary long division (H <= 32: 5 steps)
-        let mut y = b.c_i32(0);
-        for bit in [16i32, 8, 4, 2, 1] {
-            let xb = b.bind_i32(ev(xq) * bit);
-            let take = b.bind_i32(ev(r).ge(ev(xb)).select_i32(1, 0));
-            y = b.bind_i32(ev(y) + ev(take) * bit);
-            r = b.bind_i32(ev(r) - ev(take) * ev(xb));
-        }
-        // clamps (no-ops for N % 8 == 0, H <= 32) bound the logical ids for the verifier
-        let rc = b.bind_i32(ev(r).max(0).min(ev(xq) - 1));
-        let yc = b.bind_i32(ev(y).max(0).min(ev(hh) - 1));
-        // wave-uniform: back to SGPRs like the workgroup ids (otherwise the address math downstream turns vector)
-        let qt = b.bind_i32(ev(ok).eq(1).select_i32(ev(rc), ev(x0)));
-        let hi = b.bind_i32(ev(ok).eq(1).select_i32(ev(yc), ev(y0)));
-        let qt = b.read_first_lane(qt);
-        let hi = b.read_first_lane(hi);
-        let qt = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(qt), amdgpu_dsl::Opnd::I32(0)));
-        let hi = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(hi), amdgpu_dsl::Opnd::I32(0)));
-        // the remap is a bijection of [0, X) x [0, H) (N % 8 == 0); the interval engine cannot follow the division: trusted contract facts
-        b.assume_trusted(qt, Ext::c(0), Ext::ka(0x060).ceil_div(1 << rows_lg) - Ext::c(1), "XCD block order: the logical query tile M % X of the bijection M = (L % 8) N / 8 + L / 8 over [0, X H) lies in [0, X)");
-        b.assume_trusted(hi, Ext::c(0), Ext::ka(0x140) - Ext::c(1), "XCD block order: the logical head M / X of the bijection over [0, X H) lies in [0, H)");
-        b.wg_bijection(&[qt, hi], &[0, 1], "XCD block order: (query tile, head) is a bijection of the workgroup (x, y) (the identity when the remap is off)");
-        (qt, hi)
+        amdgpu_tile::templates::grid::xcd_tile_head(b, io.s_len.clone(), rows_lg, 0x140, 0x060)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
     };
@@ -1007,7 +968,7 @@ pub fn block3_at(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, qtile: ValueId, h
     let (bidx, kv_len, key_lo, split) = match &io.kvs {
         None => (zz, kv_all, I32::c(0), None),
         Some(kv) => {
-            let (bi, si, lg) = components::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
+            let (bi, si, lg) = amdgpu_tile::templates::grid::kv_split_decode(b, zz, kv.splits, kv.splits_off, "B");
             if causal {
                 // the split covers this block's causal key range (kv_end, computed above); a split past it is empty
                 let (key_lo, kv_eff, empty) = components::kv_split_range_var(b, kv_end, si, lg, 0x110);

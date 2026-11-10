@@ -11,6 +11,7 @@
 //!   mask on the tiles that reach the diagonal.
 
 use super::*;
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::tensor::{Dim, KArgs, Stride};
 
 /// The 656-byte ABI of the vendor's fp8 fmha_v3 with the per-tensor descales and its host contract. `kvsplit`: our extension behind it
@@ -204,8 +205,7 @@ impl skeleton_vs128::Vs128Slots for PtSlots {
         // the paired q tile nt - 1 - x (when it differs from x): the ring is reused - every wave is done with the first pass
         let (x, y) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY));
         let nt = b.bind_i32((io.s_len.clone() + 255).lshr(8));
-        let qb = { let v = b.bind_i32((ev(nt) - 1 - ev(x)).max(0)); rfl(b, v) };
-        let second = b.bind_cond(ev(qb).gt(ev(x)));
+        let (qb, second) = grid::causal_pair(b, x, nt, Ext::ka(0x060).ceil_div(256), grid::PairForm::ClampedI32);
         b.wait_lds(0);
         b.barrier();
         b.begin_if(Opnd::Val(second));

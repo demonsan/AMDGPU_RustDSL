@@ -8,6 +8,7 @@
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_tile::templates::split::lse_combine_rows16_hd128;
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::pipeline::{Cadence, PipeBody, Pipeline, TileIt};
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, Role, Roles, Shared, SlotIdx};
 
@@ -442,10 +443,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let lg_s = split.then(|| b.let_(Op::KernargI32 { offset: 656 }));
     let (bat0, part) = match lg_s {
         Some(l) => {
-            let bt = { let v = b.bind_i32(ev(z0).lshr(ev(l))); b.read_first_lane(v) };
-            let pt = { let v = b.bind_i32(ev(z0) - (ev(bt) << ev(l))); b.read_first_lane(v) };
-            b.assume_trusted(bt, Ext::c(0), Ext::sym("BB") - Ext::c(1), "split: z = batch 2^lg_s + part (grid z = B S, S = 2^lg_s)");
-            b.assume_trusted(pt, Ext::c(0), Ext::sym("SPL") - Ext::c(1), "split: the part index < S");
+            let (bt, pt) = grid::split_pow2_z(&mut b, z0, l);
             (bt, Some(pt))
         }
         None => (z0, None),
@@ -493,9 +491,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     // causal: the vendor's pairing - CTA x takes q tiles x and nt - 1 - x (equal work per CTA; the grid is halved)
     let nt = { let v = b.bind_i32((ev(s_q) + (qr - 1)).lshr(qr_lg)); b.read_first_lane(v) };
     let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
-        let qb = { let v = b.bind_i32(ev(nt) - 1 - ev(qt)); b.read_first_lane(v) };
-        let second = b.bind_cond(ev(qb).gt(ev(qt)));
-        b.wg_union(&[qt, qb], &[0], Ext::c(0), Ext::ka(96).ceil_div(qr as i64) - Ext::c(1), "causal pairing: CTA x takes q tiles x and nt - 1 - x (the second only when nt - 1 - x > x), grid x = ceil(nt / 2): every q tile once");
+        let (qb, second) = grid::causal_pair(&mut b, qt, nt, Ext::ka(96).ceil_div(qr as i64), grid::PairForm::Plain);
         vec![(qt, None), (qb, Some(second))]
     } else {
         vec![(qt, None)]
