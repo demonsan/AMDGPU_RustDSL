@@ -219,6 +219,20 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 | checkInlineAsmHazards | — | 没有 inline asm；safe-asm 块由 `pin_check` 检查其内部等待 | 不适用 / 另行检查 |
 | fixHazards 的 GFX10 / GFX11 / GFX12 项：vcmpx-permlane、VMEM→SALU 写、SMEM→VALU 写、vcmpx-exec WAR、LDS-branch-VMEM WAR、LDS direct、partial forwarding、trans use、WMMA、mask write、export priority、getreg wait idle、scratch base | 不适用（谓词只对这些代为真） | — | 不适用 |
 
+### 5.2 LLVM 冒险预言机（强制）
+
+`crates/amdgpu-codegen/tests/hazard_oracle.rs` 对表中每一对（生产者，消费者，操作数）比较 pinned LLVM tail 插入的等待态与我们最弱路径（非 strict 的值冒险 + 全部 RA 后冒险 pass）提供的等待态。LLVM 更多而又不在 `allowance` 里的对，测试失败。167406 对中 LLVM 更多的有 2357 对，全部归入以下三类，各有证据：
+
+| 类 | 对数 | 结论与证据 |
+|---|---|---|
+| VALU 写 VCC → VALU 读 VCC（`v_cmp` / `v_add_co` / `VPtrAdd` 内部 → `v_addc` / `v_cndmask`），LLVM 2 | 660 | gfx950 硬件转发 VCC：`tools/vcc_hazard_probe.sh` 在 0 / 1 / 2 个等待态下全部正确（3 轮 × 12 种）。LLVM `hasVDecCoExecHazard` 对 VCC 过度保守 |
+| VOP3P 生产者（`v_pk_*`）→ 任意读者，LLVM 1 | 1569 | pinned LLVM 把打包指令的 op_sel_hi 位当作 VOP3 的目的 op_sel（同一位）。上游 `getDstSelForwardingOperand` 已排除 VOP3P |
+| 16x16x128 f8f6f4 的 FP4 / FP6 操作数，LLVM 12，我们 8 | 144 | 硬件：VALU 读者 7 个、VMEM 读者 1 个等待态即正确（`tools/mfma_lat_probe.sh`；FP8 为 11 / 5，我们按 20）。LLVM 对所有格式都按 8 pass 计 |
+
+本轮由预言机发现并修正的两条（manifest 中 12 个 kernel 的 md5 改变，出厂 FMHA / GEMM / MLP 不变；`run_all.sh` 60 / 60 PASS）：
+- **软子句（XNACK 重放）**：`hazards::pad_soft_clause`。连续的 VMEM（或 SMEM）构成子句，子句中任一指令不得读子句中写过的寄存器（D16 load 读自己的目的；一条 load 写回前一条 load 的地址寄存器），子句写过寄存器后的 store 另起子句；用 `s_nop 0` 断开。依据 LLVM `checkSoftClauseHazards`：我们的 code object 是 `xnack any`，开启 XNACK 的进程会重放子句。
+- **高半转换的伙伴例外**：只豁免合并操作数（绑定的目的），把结果当数据读的转换仍等待 1 个等待态。
+
 结论：除本轮补上的 VALU 写 SGPR 两条外，gfx950 适用的 LLVM 规则都已覆盖，且本编译器的等待数不小于 LLVM；唯一有意偏离是 cvt 的 Lo / Hi 配对，有硬件实测支持。
 
 ## 6. 建议（按性价比）
