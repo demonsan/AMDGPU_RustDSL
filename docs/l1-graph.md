@@ -206,3 +206,18 @@ The rule is the place where a future fusion would go. If sorting is folded into 
   - Twelve more golden plans.
 - **GEMM numerics through the plan** (`graph_check.py`): the `_64_splitk` + `gemm_splitk_reduce_s4[_rc]` paths (bf16, fp8 row/col, fp8 blockscale; M 64, N 1024, K 512) and the `_64` form match the `ops_check` reference.
 - **Python `gemm` (direct calls).** It takes `kernel` / `splits` / `reduce` from the plan. Its default tile choice (256 or `_128` only) is unchanged, so direct calls still differ from `dispatch::gemm_kernels`. Switching the default is a behaviour change (performance) left for a gated step.
+- **One rule per Python entry point** (`one-rule-attn`). Every Python entry point that picks a kernel now asks the dispatch rule its plan uses (`amdc dispatch …`):
+
+  | Python entry point | Rule (`amdc dispatch …`) |
+  |---|---|
+  | `gemm` | `gemm_kernels` (`gemm`) |
+  | `fmha_fwd_mxfp8` / `select_path` | `mxfp8_prefill_path` (`mxfp8`). Formerly a Python rule; ported unchanged and checked by `amdgpu-graph/tests/dispatch_rules.rs` |
+  | `prefill_bf16` | `bf16_prefill_kernel` |
+  | `paged_decode_bf16` | `decode16_plan` |
+  | `mla_decode` | `mla_config` |
+  | `fused_moe` | `moe_block_m` |
+  | `attention_bwd_bf16` | `bwd_causal_kernels` |
+
+  - **Kept in the wrapper:** `prefill_bf16`'s `s_opt` kernarg is the vendor ABI's option word. Our kernels declare it but do not read it, so it is not a kernel choice and stays where it is.
+  - **Graph `attention` op** also covers MXFP8 (fp8 q / k / v + scales → `fmha_fwd_mxfp8` with the path's kernels and the KV-split partials as plan workspaces).
+  - **Checks:** `node_check.py` 17/17 (bit-identical FMHA vs the C++ harness through the new path rule); Python unit tests OK.

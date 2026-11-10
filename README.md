@@ -107,12 +107,13 @@ crates/amdgpu-layout    布局代数：Ix / IntTuple / Layout / Swizzle / TV 布
 crates/amdgpu-isa       gfx950 atom 表：copy atom 与 MMA/smfmac atom（A/B/C 的 TV 布局、provenance，含硬件探针得到的映射）
 crates/amdgpu-dsl       类型化 kernel IR（区域树：Loop/If/Region/Stage + 编织区域、寄存器规划、区域策略）+ FnBuilder + 表达式层 + 形状特化 + irv1 文本打印/解析 + α 结构相等
 crates/amdgpu-tile      全部 tile 抽象：TiledCopy/TiledMma/partition_*、行拷贝、pipeline、softmax、reduce、epilogue、DMA/bufdma、handoff；stage 库与通用原语、weaver、算子图/骨架生成
-crates/amdgpu-kernels   全部 kernel（算子图 → 骨架 → slot + stage 实例）：fmha/（v3 出厂四件 + auto、bf16 prefill / decode / MLA / 反向）、gemm/（MXFP8 v4 与 GEMM 族、MoE、卷积）、mlp/、norm/、rows/ eltwise/ dequant/ rope/ cache/ moe/ topk/ sampling/（访存受限算子）、probes/、verifier_cases/ + 按名注册表与 dispatch；IR 功能证明执行器
+crates/amdgpu-graph     L1 图层：模型级算子图 + 融合规则（算子子图 → 已有融合 kernel 名）+ 启动计划（`amdc graph plan`）；dispatch 规则（GEMM / prefill / MXFP8 / decode / MLA / MoE / 反向，按形状选 kernel 与参数，Python 入口与计划共用同一条规则）；kernel 内部的 stage 级算子图与骨架生成
+crates/amdgpu-kernels   全部 kernel（算子图 → 骨架 → slot + stage 实例）：fmha/（v3 出厂四件 + auto、bf16 prefill / decode / MLA / 反向）、gemm/（MXFP8 v4 与 GEMM 族、MoE、卷积）、mlp/、norm/、rows/ eltwise/ dequant/ rope/ cache/ moe/ topk/ sampling/（访存受限算子）、probes/、verifier_cases/ + 按名注册表；IR 功能证明执行器
 crates/amdgpu-codegen  编译器 + 验证器：MIR（算子属性表）、lowering、调度器（list/slotfill、按区域策略）、线性扫描 RA（含 AGPR、寄存器规划）、hazard/wait、hzfill、asm 发射、LLVM MIR 桥、gpu_verify/协议引擎/功能证明；不依赖 kernels/tile
 crates/amdgpu-safeasm   手写热点窗口用的 safe Rust asm DSL（typed 寄存器 + 所有权 token + 验证器 + pin）
-crates/amdc             CLI（list / emit / print-ir / ir-check / regplan / summary / srcmap / jit-info / gpu-verify / gen-host / opgraph / skeleton / backend / simmodel / mops / mir-roundtrip；`--json`）+ hostgen、jit 库
+crates/amdc             CLI（list / emit / print-ir / ir-check / regplan / summary / srcmap / jit-info / gpu-verify / gen-host / opgraph / skeleton / dispatch / graph plan / md5-manifest / backend / simmodel / mops / mir-roundtrip；`--json`）+ hostgen、jit 库
 tests/gpu/              端到端：ref_host（我们 vs 厂商 vs CPU）、run_ref、determinism、split 压力、gemm_ref_host、mlp_host、探针 host、生成的主机 ABI（generated/）
-python/amdgpu_jit/       Python JIT 入口（ctypes + libamdhip64；gemm_mxfp8_blockscale / fmha_fwd_mxfp8；磁盘缓存；kernarg 打包 + 主机合同校验）
+python/amdgpu_jit/       Python JIT 入口（ctypes + libamdhip64；GEMM / FMHA / prefill / decode / MoE 等算子，按 dispatch 规则选 kernel；`graph.plan` / `graph.run` 执行 L1 计划；磁盘缓存；kernarg 打包 + 主机合同校验）
 tools/                  门禁（port_gate / gemm_gate）、性能矩阵、A/B、ATT/计数器/时间戳分析、asm 对比、探针、LLVM 构建、容器 cargo、文档链接检查
 docs/                   当前状态、设计、教程、验证器、厂商 spec；历史文档在 docs/archive/
 ```
@@ -121,6 +122,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/l1-graph.md`](docs/l1-graph.md) | **L1 图层**：算子词表、融合规则（rmsnorm+quant、add+rmsnorm(+quant)、silu_mul+quant、qknorm+rope(+kvcache)…）、多 kernel 计划（attention split→combine、MoE、GEMM split-K）、`amdc graph plan`、golden 计划与数值检查 |
 | [`docs/python-jit.md`](docs/python-jit.md) | **Python JIT 入口**：amdc 子进程编译 + 磁盘缓存 + 形状特化（默认开）、kernarg 打包与主机合同校验、GEMM / FMHA 高层算子（含出厂路径选择） |
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
 | [`docs/op-coverage-design.md`](docs/op-coverage-design.md) / [`docs/op-coverage-membound.md`](docs/op-coverage-membound.md) / [`docs/op-coverage-memtemplates.md`](docs/op-coverage-memtemplates.md) / [`docs/op-coverage-tileops.md`](docs/op-coverage-tileops.md) | **aiter 基础算子覆盖**：迁移设计与批次状态（§7：GEMM / attention / MoE / 反向 / 卷积）/ 访存受限算子实测与 aiter 覆盖表 / 访存模板 T1–T7 / TIRx 式 tile-op 覆盖矩阵 |

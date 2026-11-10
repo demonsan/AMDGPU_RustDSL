@@ -1,0 +1,47 @@
+{
+  "launches": [
+    {
+      "rule": "attention",
+      "covers": ["attn"],
+      "kernels": ["fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"],
+      "py": "fmha_fwd_mxfp8",
+      "bind": {
+        "q": "q",
+        "k": "k",
+        "v": "v",
+        "q_scale": "qs",
+        "k_scale": "ks",
+        "v_scale": "vs",
+        "out": "o"
+      },
+      "params": {
+        "path": "kvsplit",
+        "splits": 4
+      },
+      "workspaces": [
+        {
+          "name": "ohat",
+          "bytes": 33554432
+        },
+        {
+          "name": "lse",
+          "bytes": 262144
+        }
+      ],
+      "steps": [
+        {
+          "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit",
+          "reads": ["q", "k", "v", "qs", "ks", "vs"],
+          "writes": ["ohat", "lse"]
+        },
+        {
+          "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h",
+          "reads": ["ohat", "lse"],
+          "writes": ["o"]
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

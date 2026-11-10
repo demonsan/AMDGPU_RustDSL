@@ -375,3 +375,38 @@ pub fn gemm_kernels(kind: &str, m: u64, n: u64, k: u64, cus: u64) -> Option<(Str
     let reduce = (s > 1).then(|| format!("gemm_splitk_reduce_s{s}{}", if rc { "_rc" } else { "" }));
     Some((name, s, reduce))
 }
+
+/// MXFP8 prefill (`fmha_fwd_hd128_mxfp8_v3_*`, the vendor ABI): (path, splits), the shipped dispatch of `tests/gpu/ref_host.cpp` fitted on
+/// realistic data. With N256 = ceil(S / 256) H B and T = ceil(SK / 128) key tiles:
+/// - the KV split `_kvsplit` (+ `_kvsplit_combine8h`) with 4 parts when T >= 16 and N256 <= 64, or 2 parts when T >= 32 and N256 <= 128,
+///   provided every part keeps a tile ((S - 1) ceil(T / S) < T);
+/// - otherwise `_t128` when N256 <= 64, else `_vs128`.
+///
+/// Formerly a Python-side rule (`amdgpu_jit.select_path`).
+pub fn mxfp8_prefill_path(b: u64, h: u64, s: u64, sk: u64) -> (&'static str, u32) {
+    let blocks256 = s.div_ceil(256) * h * b;
+    let ntiles = sk.div_ceil(128);
+    let sp = if ntiles >= 16 && blocks256 <= 64 {
+        4
+    } else if ntiles >= 32 && blocks256 <= 128 {
+        2
+    } else {
+        0
+    };
+    if sp > 0 {
+        let tps = ntiles.div_ceil(sp);
+        if (sp - 1) * tps < ntiles {
+            return ("kvsplit", sp as u32);
+        }
+    }
+    (if blocks256 <= 64 { "t128" } else { "vs128" }, 0)
+}
+
+/// The kernels of an MXFP8 prefill path (`mxfp8_prefill_path`).
+pub fn mxfp8_prefill_kernels(path: &str) -> Vec<&'static str> {
+    match path {
+        "vs128" => vec!["fmha_fwd_hd128_mxfp8_v3_vs128"],
+        "t128" => vec!["fmha_fwd_hd128_mxfp8_v3_t128"],
+        _ => vec!["fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"],
+    }
+}

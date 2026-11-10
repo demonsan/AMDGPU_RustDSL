@@ -428,6 +428,10 @@ fn moe(g: &ModelGraph, i: usize) -> R<Launch> {
 /// Prefill attention (bf16, hd128, BSHD): the kernel and key splits from `dispatch::bf16_prefill_kernel`; S > 1 adds the combine.
 fn attention(g: &ModelGraph, i: usize) -> R<Launch> {
     let o = &g.ops[i];
+    if g.dtype(&o.ins[0]) == "fp8" {
+        return attention_mxfp8(g, i);
+    }
+    need(o.ins.len() == 3, || "bf16 attention: q, k, v".into())?;
     for t in &o.ins {
         dt(g, t, "bf16")?;
     }
@@ -593,4 +597,27 @@ fn conv(g: &ModelGraph, i: usize) -> R<Launch> {
         if cta == 128 { "_c128" } else { "" }
     );
     Ok(launch("conv", g, &[i], vec![name], "", vec![("x", o.ins[0].clone()), ("w", o.ins[1].clone()), ("y", o.outs[0].clone())], vec![p_int("cta", cta as i64)]))
+}
+
+/// MXFP8 prefill (hd128, the vendor ABI): the path and splits from `dispatch::mxfp8_prefill_path`; the KV-split path adds the combine and
+/// its partial workspaces.
+fn attention_mxfp8(g: &ModelGraph, i: usize) -> R<Launch> {
+    let o = &g.ops[i];
+    need(o.ins.len() == 6, || "MXFP8 attention: q, k, v, q_scale, k_scale, v_scale".into())?;
+    let (q, k) = (g.shape(&o.ins[0])?, g.shape(&o.ins[1])?);
+    need(q.len() == 4 && k.len() == 4 && q[3] == 128 && k[3] == 128, || "MXFP8 attention: q [B, S, H, 128], k / v [B, SK, HK, 128]".into())?;
+    let (b, s, h, sk) = (q[0], q[1], q[2], k[1]);
+    let (path, sp) = dispatch::mxfp8_prefill_path(b as u64, h as u64, s as u64, sk as u64);
+    let kernels: Vec<String> = dispatch::mxfp8_prefill_kernels(path).iter().map(|x| x.to_string()).collect();
+    let names = ["q", "k", "v", "q_scale", "k_scale", "v_scale"];
+    let mut bind: Vec<(&'static str, String)> = names.iter().zip(&o.ins).map(|(n, t)| (*n, t.clone())).collect();
+    bind.push(("out", o.outs[0].clone()));
+    let mut l = launch("attention", g, &[i], kernels, "fmha_fwd_mxfp8", bind, vec![p_str("path", path), p_int("splits", sp as i64)]);
+    if sp > 1 {
+        let rows = b * s * h;
+        l.workspaces = vec![("ohat".into(), sp as i64 * rows * 128 * 4), ("lse".into(), sp as i64 * rows * 4)];
+        let ins: Vec<&str> = o.ins.iter().map(|x| x.as_str()).collect();
+        l.steps = vec![st(&l.kernels[0], &ins, &["ohat", "lse"]), st(&l.kernels[1], &["ohat", "lse"], &[o.outs[0].as_str()])];
+    }
+    Ok(l)
 }

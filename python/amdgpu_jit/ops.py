@@ -59,23 +59,22 @@ def _present(kern, vals):
 
 # ----------------------------------------------------------------------------------------------------------------------------- FMHA
 def select_path(B, H, S, SK, *, cus=256, partial_bytes=2):
-    """The shipped dispatch (tests/gpu/ref_host.cpp, fitted on realistic data): KV split when ntiles >= 16 and N256 <= 64 (4 splits) or
-    ntiles >= 32 and N256 <= 128 (2 splits), with N256 = ceil(S/256) H B and ntiles = ceil(SK/128); otherwise ``t128`` when N256 <= 64, else
-    ``vs128``. Returns (path, splits)."""
-    blocks256 = math.ceil(S / 256) * H * B
-    ntiles = (SK + 127) // 128
-    s = 4 if (ntiles >= 16 and blocks256 <= 64) else 2 if (ntiles >= 32 and blocks256 <= 128) else 0
-    if s:
-        tps = (ntiles + s - 1) // s
-        if (s - 1) * tps < ntiles:
-            return "kvsplit", s
-    return ("t128" if blocks256 <= 64 else "vs128"), 0
+    """The MXFP8 prefill path: ``dispatch::mxfp8_prefill_path`` (``amdc dispatch mxfp8``; the shipped dispatch of tests/gpu/ref_host.cpp:
+    KV split with 4 / 2 parts on small grids with enough key tiles, else ``t128`` (<= 64 256-row blocks) or ``vs128``). Returns (path, splits)."""
+    from .ops_compute import dispatch
+    d = dispatch("mxfp8", B, H, S, SK)
+    return d["path"], int(d["splits"])
+
 
 _workspace = {}
 
 
 def _ws(key, nbytes):
-    """Persistent device workspace (KV-split partials), grown on demand."""
+    """Persistent device workspace (KV-split partials), grown on demand; a plan-owned workspace of the same name (``graph.run``) first."""
+    from .ops_compute import _ws_override
+    o = _ws_override.get(key[0] if isinstance(key, tuple) else key)
+    if o is not None and o[1] >= nbytes:
+        return o[0]
     buf = _workspace.get(key)
     if buf is None or buf[1] < nbytes:
         if buf is not None:

@@ -1,0 +1,5 @@
+{ "tensors": { "q": {"dtype": "fp8", "shape": [1, 2048, 8, 128]}, "k": {"dtype": "fp8", "shape": [1, 2048, 8, 128]}, "v": {"dtype": "fp8", "shape": [1, 2048, 8, 128]},
+    "qs": {"dtype": "u8", "shape": [1, 2048, 8, 4]}, "ks": {"dtype": "u8", "shape": [1, 2048, 8, 4]}, "vs": {"dtype": "f32", "shape": [1024]},
+    "o": {"dtype": "bf16", "shape": [1, 2048, 8, 128]} },
+  "ops": [ {"id": "attn", "op": "attention", "in": ["q", "k", "v", "qs", "ks", "vs"], "out": ["o"]} ],
+  "outputs": ["o"] }

@@ -35,7 +35,8 @@ pub enum OpKind {
     TopkSoftmax,
     /// x, w1, w2, ids, weights -> y: the two-stage MoE (`act`, `dtype`, `experts`, `inter`)
     MoeExperts,
-    /// q, k, v -> o [, lse]: prefill attention, BSHD (`causal`)
+    /// q, k, v [, q_scale, k_scale, v_scale] -> o [, lse]: prefill attention, BSHD: bf16 (`causal`) or MXFP8 (fp8 q / k / v with the E8M0
+    /// scales and the V descale)
     Attention,
     /// q, k_cache, v_cache, block_table, context_lens -> o: paged decode (`max_context`)
     PagedAttention,
@@ -103,7 +104,7 @@ impl OpKind {
             OpKind::KvCacheWrite => (5, 5, 0, 2),
             OpKind::TopkSoftmax => (1, 1, 2, 2),
             OpKind::MoeExperts => (5, 5, 1, 1),
-            OpKind::Attention => (3, 3, 1, 2),
+            OpKind::Attention => (3, 6, 1, 2),
             OpKind::PagedAttention => (5, 5, 1, 1),
             OpKind::MlaAttention => (4, 4, 1, 1),
             OpKind::AttentionBwd => (6, 6, 3, 3),
