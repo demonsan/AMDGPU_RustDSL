@@ -113,11 +113,43 @@ pub fn python_op_names() -> BTreeSet<String> {
     n
 }
 
-/// Every fixed name `kernel_by_name` matches literally (the `"name" =>` / `"name" |` arms of `registry.rs`) that builds a kernel: the shipped
+/// Every fixed name `kernel_by_name` matches literally (the `"name" =>` / `"name" |` arms of `registry.rs` and the modules' `by_name`) that builds a kernel: the shipped
 /// kernels and the non-parameterized families (`amdc list` holds only the probes).
 pub fn registered_literal_names() -> BTreeSet<String> {
-    let src = include_str!("registry.rs");
+    // the registry and every module with a `by_name` (scanned for literal match arms)
+    const SOURCES: &[&str] = &[
+        include_str!("cache/mla.rs"),
+        include_str!("cache/mod.rs"),
+        include_str!("conv/mod.rs"),
+        include_str!("dequant/mod.rs"),
+        include_str!("eltwise/mod.rs"),
+        include_str!("gemm/mod.rs"),
+        include_str!("mlp/mod.rs"),
+        include_str!("moe/mod.rs"),
+        include_str!("moe/multi.rs"),
+        include_str!("moe/reduce.rs"),
+        include_str!("norm/mod.rs"),
+        include_str!("probes/handoff.rs"),
+        include_str!("registry.rs"),
+        include_str!("rope/mod.rs"),
+        include_str!("rows/mod.rs"),
+        include_str!("rows/mxfp6.rs"),
+        include_str!("rows/mxnorm.rs"),
+        include_str!("rows/mxquant.rs"),
+        include_str!("rows/quant.rs"),
+        include_str!("sampling/mod.rs"),
+        include_str!("topk/gate.rs"),
+        include_str!("topk/mod.rs"),
+        include_str!("topk/perrow.rs"),
+    ];
     let mut n = BTreeSet::new();
+    for src in SOURCES {
+        scan(src, &mut n);
+    }
+    n
+}
+
+fn scan(src: &str, n: &mut BTreeSet<String>) {
     let b = src.as_bytes();
     let mut i = 0;
     while let Some(q) = src[i..].find('"').map(|q| q + i) {
@@ -130,7 +162,6 @@ pub fn registered_literal_names() -> BTreeSet<String> {
         }
         i = e + 1;
     }
-    n
 }
 
 /// Every name of the golden manifest: the registry's literal names, `amdc list`, the dispatch-reachable instantiations and the Python-op
