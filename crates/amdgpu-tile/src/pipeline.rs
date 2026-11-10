@@ -15,6 +15,7 @@
 //! tail:     if partial { window(masked) } else { window }   (no stage, no barrier)
 //! ```
 
+pub use crate::lane::TileIt;
 use crate::lane::Role;
 use crate::shared::SlotIdx;
 use crate::weave::{rotate, Part, RotStage};
@@ -61,32 +62,6 @@ pub enum Cadence {
     /// tail:     m_phase (no loads: `staged` = false)
     /// ```
     RegStaged,
-}
-
-/// One iteration of the pipeline as the body sees it.
-#[derive(Clone, Debug)]
-pub struct TileIt {
-    /// tile counter (0 in the prologue, the loop variable inside the loop and in the tail)
-    pub it: Opnd,
-    /// the tile being computed: slot `idx`, generation `it`
-    pub cur: SlotIdx,
-    /// tile t+1: slot / generation (`_vs128`: staged in this iteration; `_t128`: staged in the previous one)
-    pub next: SlotIdx,
-    /// tile t+2 (`OneWindow` only)
-    pub n2: Option<SlotIdx>,
-    /// the masked copy of the last (partial) tile
-    pub masked: bool,
-    /// a tile is staged in this iteration (false in the peeled tail)
-    pub staged: bool,
-    /// rows per tile
-    pub tile_rows: i32,
-}
-
-impl TileIt {
-    /// First row (key) of the current tile: `it * tile_rows`.
-    pub fn key0(&self) -> I32 {
-        amdgpu_dsl::ox(self.it) << (self.tile_rows.trailing_zeros() as i32)
-    }
 }
 
 /// What a kernel supplies to the pipeline. `role` is the compile-time group tag of the branch being emitted.

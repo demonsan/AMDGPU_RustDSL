@@ -1,6 +1,7 @@
 //! Lane identities and wave-group roles.
 
 use amdgpu_dsl::ev;
+use crate::shared::SlotIdx;
 use amdgpu_dsl::{FnBuilder, Op, Opnd, ValueId, I32};
 
 /// The per-lane ids every component derives its addressing from (emitted exactly like `fmha_t_build`: `tid & 63`, `tid >> 6`, `lane & 31`, `lane >> 5`).
@@ -106,4 +107,30 @@ pub fn versioned(b: &mut FnBuilder, cond: ValueId, mut body: impl FnMut(&mut FnB
     b.else_();
     body(b, false);
     b.end_if();
+}
+
+/// One iteration of the pipeline as the body sees it (the generation / slot bookkeeping every pipeline template hands to its body; L3 data, used by the L3 helpers (`reduce`) and the L2 pipeline driver).
+#[derive(Clone, Debug)]
+pub struct TileIt {
+    /// tile counter (0 in the prologue, the loop variable inside the loop and in the tail)
+    pub it: Opnd,
+    /// the tile being computed: slot `idx`, generation `it`
+    pub cur: SlotIdx,
+    /// tile t+1: slot / generation (`_vs128`: staged in this iteration; `_t128`: staged in the previous one)
+    pub next: SlotIdx,
+    /// tile t+2 (`OneWindow` only)
+    pub n2: Option<SlotIdx>,
+    /// the masked copy of the last (partial) tile
+    pub masked: bool,
+    /// a tile is staged in this iteration (false in the peeled tail)
+    pub staged: bool,
+    /// rows per tile
+    pub tile_rows: i32,
+}
+
+impl TileIt {
+    /// First row (key) of the current tile: `it * tile_rows`.
+    pub fn key0(&self) -> I32 {
+        amdgpu_dsl::ox(self.it) << (self.tile_rows.trailing_zeros() as i32)
+    }
 }
