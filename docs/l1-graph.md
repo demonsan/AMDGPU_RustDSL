@@ -196,7 +196,11 @@ The rule is the place where a future fusion would go. If sorting is folded into 
 - **Step 2:**
   - `amdgpu_jit.graph.plan(graph, cus=None, fuse=True)` / `run(plan, tensors)` / `kernels(plan)`. `run` calls the wrappers named by `py`, with the plan's parameters filtered by each wrapper's signature.
   - `python/tests/graph_check.py` (in `run_all.sh`) runs the fused and unfused (`--no-fuse`) plans of rmsnorm → quant fp8 and silu_mul → quant fp8 on the same data, plus add → rmsnorm → quant fp8 fused only. It checks both against the reference and against each other. Passes on gfx950 (1 launch vs 2 per graph).
-- **Found while writing the goldens:** an MLP with intermediate 14336 (Llama 8B) has no fused or single quant kernel. `silu_mul_quant_fp8` and `quant_token_bf16_fp8` are built only for N ≤ 8192 (`rows/quant.rs`), so the plan reports an error for that op.
+- **Found while writing the goldens:** an MLP with intermediate 14336 (Llama 8B) had no fused or single quant kernel (N ≤ 8192). **Closed:**
+  - sched's long-row quant extends `quant_token` fp8 / int8, `silu_mul_quant`, `situv2` and `group128` to N ≤ 32768;
+  - the rules accept that range (`quant_n`); the norm kernels stay at ≤ 8192;
+  - golden `llama_mlp_14336` plans `silu_mul_quant_fp8_d14336`;
+  - `graph_check.py` `act_quant_long` (M 4, D 14336): fused vs unfused vs reference OK.
 - **Step 3** (`l1-graph-step3`):
   - **Derived names.** `reachable::python_op_names` is derived from the rules over `amdgpu_graph::fusion::canonical::graphs()`, about 40 small graphs at the former hand-listed shapes. The md5 manifest is identical, so the derived set equals the old list.
   - **Plan-owned workspaces.** Every multi-kernel launch lists its `steps` (kernel, reads, writes, through the named workspaces). `graph.run` allocates the plan's workspaces and the wrappers use them (`ops_compute._ws_override`, consulted first by `_workspace`). Kernarg packing stays in the wrappers.
