@@ -1117,3 +1117,75 @@ pub mod testing {
         r
     }
 }
+
+/// Post-RA: soft clauses under XNACK replay (LLVM GCNHazardRecognizer::checkSoftClauseHazards; our code objects are `xnack any`, so a process
+/// that runs with XNACK on may replay a clause). Consecutive VMEM (or consecutive SMEM) instructions form a clause; no instruction of a clause
+/// may read a register an instruction of the clause writes (a D16 load reads its own destination), and a store after a clause that wrote
+/// registers starts a new clause. A `s_nop 0` breaks the clause. Returns the wait states added.
+pub fn pad_soft_clause(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
+    use crate::sched::model::Pipe;
+    let n = crate::target::T.hazard("soft-clause-xnack").n() as usize;
+    // per vreg: (file, lo, hi) with file 0 = vector (VGPR / AGPR tagged), 1 = scalar
+    let rng: Vec<(u32, u32, u32)> = (0..m.vregs.len())
+        .map(|r| {
+            let c = m.vreg_class(r as VReg);
+            let p = a.phys.get(r).copied().unwrap_or(u32::MAX);
+            (if c.is_scalar() { 1 } else { 0 }, p, p.saturating_add(c.dwords()))
+        })
+        .collect();
+    let hit = |x: &[(u32, u32, u32)], y: &[(u32, u32, u32)]| x.iter().any(|p| y.iter().any(|q| p.0 == q.0 && p.1 < q.2 && q.1 < p.2));
+    let mut added = 0usize;
+    for b in m.blocks.iter_mut() {
+        let insts = std::mem::take(&mut b.insts);
+        let mut out: Vec<MInst> = Vec::with_capacity(insts.len() + 2);
+        // the clause being formed: kind (0 = VMEM, 1 = SMEM), its defs and uses
+        let mut kind: Option<u8> = None;
+        let (mut defs, mut uses): (Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>) = (Vec::new(), Vec::new());
+        for inst in insts {
+            let at = crate::op_attrs::attrs(inst.op);
+            let k = if at.smem { Some(1u8) } else if at.cost.pipe == Pipe::Vmem { Some(0u8) } else { None };
+            let my_defs: Vec<(u32, u32, u32)> = inst.dst.map(|d| rng[d as usize]).into_iter().collect();
+            let my_uses: Vec<(u32, u32, u32)> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(rng[*r as usize]) } else { None }).collect();
+            match k {
+                Some(k) if kind == Some(k) && !defs.is_empty() => {
+                    let store = at.mem.map_or(false, |mm| mm.write);
+                    let mut nd = defs.clone();
+                    nd.extend_from_slice(&my_defs);
+                    let mut nu = uses.clone();
+                    nu.extend_from_slice(&my_uses);
+                    if store || hit(&nd, &nu) {
+                        let mut left = n;
+                        while left > 0 {
+                            let s = left.min(8);
+                            out.push(MInst::new(MOp::SNop).imm(s as i64 - 1));
+                            left -= s;
+                        }
+                        added += n;
+                        defs = my_defs;
+                        uses = my_uses;
+                    } else {
+                        defs = nd;
+                        uses = nu;
+                    }
+                }
+                Some(k) if kind == Some(k) => {
+                    defs.extend_from_slice(&my_defs);
+                    uses.extend_from_slice(&my_uses);
+                }
+                Some(k) => {
+                    kind = Some(k);
+                    defs = my_defs;
+                    uses = my_uses;
+                }
+                None => {
+                    kind = None;
+                    defs.clear();
+                    uses.clear();
+                }
+            }
+            out.push(inst);
+        }
+        b.insts = out;
+    }
+    added
+}

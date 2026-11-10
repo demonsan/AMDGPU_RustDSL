@@ -47,6 +47,7 @@ pub const GFX950: Target = Target {
         HazardRule { kind: Kind::Software, name: "wide-store-data", count: Count::N(3), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM 12DWordStore (issue distance 3 = 2 wait states)" },
         HazardRule { kind: Kind::Software, name: "valu-sgpr-vmem", count: Count::N(5), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkVMEMHazards; probe_valu_sgpr" },
         HazardRule { kind: Kind::Software, name: "valu-sgpr-valu", count: Count::N(2), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkVALUHazards hasVDecCoExecHazard" },
+        HazardRule { kind: Kind::Software, name: "soft-clause-xnack", count: Count::N(1), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkSoftClauseHazards (xnack any code objects)" },
         HazardRule { kind: Kind::Software, name: "m0-lds-dma", count: Count::N(1), unit: Unit::WaitStates, scope: Scope::Value, source: "LLVM checkReadM0Hazards (LDS DMA)" },
     ],
     emit: Emission { sgpr_granule: 8, sgpr_cap: 102, sgpr_min: 8, vgpr_min: 4, vgpr_granule: 4, code_object_version: 6 },

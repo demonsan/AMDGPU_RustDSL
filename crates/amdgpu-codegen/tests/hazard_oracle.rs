@@ -2,6 +2,10 @@
 //! back-to-back with a data dependency through the pinned llc tail and record the s_nop /
 //! s_waitcnt / s_delay_alu LLVM inserts; compare with the wait states our own hazard pass
 //! provides. Writes a markdown matrix to $AMDC_ORACLE_OUT when set.
+//!
+//! ENFORCING: our model is the weakest production path (value hazards without the scheduled path's `strict` extras) plus every post-RA pass;
+//! a pair where LLVM inserts more wait states than we do fails unless the excess is explained by an entry of `allowance` (each with its
+//! evidence: a hardware probe, or the upstream LLVM rule showing the pinned LLVM is over-conservative on gfx950).
 
 mod common;
 
@@ -83,6 +87,12 @@ fn hazard_matrix() {
                 // own model
                 let mut one = func("own", vec![b.clone()], sm.vregs.clone());
                 hazards::fix_value_hazards(&mut one);
+                // the post-RA passes of both bodies (pass::SCHEDULED / UNSCHEDULED), on this pair's allocation
+                let pa = sm.alloc();
+                hazards::pad_inflight_waw(&mut one, &pa);
+                hazards::pad_physical_war(&mut one, &pa);
+                hazards::pad_valu_sgpr(&mut one, &pa);
+                hazards::pad_soft_clause(&mut one, &pa);
                 let nops: u32 = one.blocks[0]
                     .insts
                     .iter()
@@ -146,6 +156,8 @@ fn hazard_matrix() {
     }
     let mut rows = Vec::new();
     let (mut missing, mut total_llvm) = (0, 0);
+    let mut explained: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut unexplained: Vec<String> = Vec::new();
     for (i, c) in cases.iter().enumerate() {
         let body = &per[i];
         let mut nops = 0u32;
@@ -165,6 +177,16 @@ fn hazard_matrix() {
         }
         let own = own_nops[i];
         let verdict = if nops > own { missing += 1; "LLVM>own" } else if nops < own { "own>LLVM" } else { "=" };
+        if nops > own {
+            let (slack, why) = allowance(&c.producer, &c.consumer);
+            if nops <= own + slack {
+                for w in why {
+                    *explained.entry(w).or_default() += 1;
+                }
+            } else {
+                unexplained.push(format!("{} -> {}{}: LLVM {} own {} (allowance {})", c.producer, c.consumer, c.slot.map(|s| format!(" (src{s})")).unwrap_or_default(), nops, own, slack));
+            }
+        }
         rows.push(format!(
             "| {} | {}{} | {} | {} | {} | {} |",
             c.producer,
@@ -185,5 +207,50 @@ fn hazard_matrix() {
         }
         std::fs::write(p, out).unwrap();
     }
+    for (w, n) in &explained {
+        eprintln!("explained ({n} pairs): {w}");
+    }
     assert!(cases.len() > 100);
+    assert!(unexplained.is_empty(), "{} pair(s) where LLVM inserts more wait states than our hazard passes, not explained by `allowance`:\n{}", unexplained.len(), unexplained.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+fn base(k: &str) -> &str {
+    k.split(|c| c == ':' || c == '@' || c == ' ').next().unwrap()
+}
+
+/// The wait states LLVM may insert beyond ours for a (producer, consumer) row of the table, and why. Every class cites its evidence.
+fn allowance(producer: &str, consumer: &str) -> (u32, Vec<&'static str>) {
+    let (p, c) = (base(producer), base(consumer));
+    let mut slack = 0;
+    let mut why = Vec::new();
+    // VALU writes VCC -> VALU reads VCC (LLVM checkVALUHazards, hasVDecCoExecHazard: 2): on gfx950 the hardware forwards VCC - tools/vcc_hazard_probe.sh
+    // (v_cmp / v_add_co -> v_addc / v_cndmask with 0, 1, 2 wait states: all correct, 3 runs). Our VPtrAdd emits v_add_co + v_addc back to back, so
+    // LLVM's `s_nop 1` inside it counts once per VPtrAdd of the pair; a VCC writer feeding a VCC reader counts once.
+    const VCC_W: &[&str] = &["VCmpEqF32", "VCmpEqI32", "VCmpEqU32", "VCmpGeF32", "VCmpGeI32", "VCmpGeU32", "VCmpGtF32", "VCmpGtI32", "VCmpGtU32", "VCmpLeF32", "VCmpLeI32", "VCmpLeU32", "VCmpLgF32", "VCmpLtF32", "VCmpLtI32", "VCmpLtU32", "VCmpNeF32", "VCmpNeI32", "VCmpOF32", "VCmpUF32", "VAddCoU32", "VAddcCoU32", "VMadU64U32", "VPtrAdd"];
+    const VCC_R: &[&str] = &["VAddcCoU32", "VCndmask", "VPtrAdd"];
+    let vcc_why = "VALU VCC write -> VALU VCC read: interlocked on gfx950 (tools/vcc_hazard_probe.sh); LLVM hasVDecCoExecHazard is over-conservative for VCC";
+    for x in [p, c] {
+        if x == "VPtrAdd" {
+            slack += 2;
+            why.push(vcc_why);
+        }
+    }
+    if VCC_W.contains(&p) && VCC_R.contains(&c) && !(p == "VPtrAdd" || c == "VPtrAdd") {
+        slack += 2;
+        why.push(vcc_why);
+    }
+    // VOP3P producers: the pinned LLVM reads the packed instruction's op_sel_hi bit as the VOP3 destination op_sel (SISrcMods::DST_OP_SEL is the same
+    // bit) and inserts the dst-sel forwarding nop; upstream GCNHazardRecognizer::getDstSelForwardingOperand excludes VOP3P ("VOP3P uses this bit for
+    // source op_sel_hi"). A packed instruction writes the whole dword.
+    if p.starts_with("VPk") {
+        slack += 1;
+        why.push("VOP3P producer: pinned-LLVM dst-sel forwarding false positive (upstream getDstSelForwardingOperand excludes VOP3P)");
+    }
+    // 16x16x128 f8f6f4 with FP4 / FP6 operands: LLVM uses the 8-pass count for every format (12 wait states); the hardware needs 7 before a VALU reader
+    // and 1 before a VMEM reader (tools/mfma_lat_probe.sh, 3 runs); our table uses 8.
+    if (p.starts_with("VMfmaPlain16x16x128A") || p.starts_with("VMfmaScale16x16x128A")) && (p.contains("A4") || p.contains("A6")) {
+        slack += 4;
+        why.push("16x16x128 FP4/FP6 MFMA: 4-pass latency (hardware 7 / 1 wait states, tools/mfma_lat_probe.sh); LLVM counts 8 passes");
+    }
+    (slack, why)
 }
