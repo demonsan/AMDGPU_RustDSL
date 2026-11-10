@@ -441,7 +441,7 @@ impl Vs128Body<'_> {
 
 | 层 | 模块 | 实际 API（与 §3–§8 设计的差异） | 测试 |
 |---|---|---|---|
-| D1 | `amdgpu_dsl::CompileProfile`、`Function.compile_profile`、`b.compile_profile(..)`；编译器 `policy_name(f)` | profile 映射到对应出厂 kernel 的名字，所有按名字选策略的检查（lowering 选项、调度预设、vcc fill、pin_vmwait）看到的就是该 kernel 的策略；`None` = 旧行为 | 出厂 asm md5 不变 |
+| D1 | `amdgpu_dsl::CompileProfile`、`Function.compile_profile`、`b.compile_profile(..)`；编译器 `Function::compile_policy()` | profile 映射到对应出厂 kernel 的名字，所有按名字选策略的检查（lowering 选项、调度预设、vcc fill、pin_vmwait）看到的就是该 kernel 的策略；`None` = 旧行为 | 出厂 asm md5 不变 |
 | L0 | `expr.rs` | 新增循环变量叶子 `b.i32var(VarId)` / `tile::varx`，`b.bind_opnd`（裸变量根返回 `Opnd::Var`） | `expr_layer` |
 | L1 | `tile/tensor.rs` | `KArgs{arg,i32,ptr,dim,tensor}`，`Dim{C,Ka,Sym,Grid}`，`Stride{Unit,Ka(name,off),Derived(expr)}`，`TensorDecl.packed()/same_strides_as()/alloc()/slack()/declare()`；`TileView.clamp(dim,limit,last)/clamp_min` 作用在**相对**索引上，`offset/ptr/row_source`。元素类型用 `elem_bytes` 而不是 `Elem` 枚举 | `tile_l123`：生成的 Q/K/V/O 合同与出厂合同**结构相等** |
 | L2 | `tile/shared.rs` | `LdsPlan{ring_group,ring,tile,private(..,overlays),overlay,at,total,commit}`，`Layout{Linear,Rows{row_bytes,swz}}`、`Layout::FMHA_SWZ`、`fmha_swz`；`SlotIdx{slot,gen}`（带按 stride 的绑定偏移缓存）、`SlotRef{off,off_v,base,read,write}`、`PrivRef{base,write,read_back}` | `tile_l123`：复现 `fmha_vs_tiles`（偏移、102400、7 对别名完全一致）；未声明真实重叠 → panic |
