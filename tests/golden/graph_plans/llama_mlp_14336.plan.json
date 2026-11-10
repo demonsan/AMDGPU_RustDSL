@@ -1,0 +1,20 @@
+{
+  "launches": [
+    {
+      "rule": "act_mul.silu+quant_token.fp8",
+      "covers": ["act", "quant"],
+      "kernels": ["silu_mul_quant_fp8_d14336"],
+      "py": "silu_mul_quant_fp8",
+      "bind": {
+        "x": "u",
+        "q": "q",
+        "scale": "s"
+      },
+      "params": {},
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

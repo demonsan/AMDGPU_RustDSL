@@ -41,9 +41,14 @@ fn st(kernel: &str, reads: &[&str], writes: &[&str]) -> KStep {
 fn quant_to<'a>(g: &'a ModelGraph, op: usize) -> &'a str {
     g.ops[op].attr_str("to").unwrap_or("fp8")
 }
-/// row widths of the row-kernel families (rows/mod.rs, rows/quant.rs: N % 8 == 0, 8 ..= 8192)
+/// row widths of the norm row kernels (rows/mod.rs: N % 8 == 0, 8 ..= 8192)
 fn row_n(n: i64) -> R<()> {
     need(n % 8 == 0 && (8..=8192).contains(&n), || format!("row width {n} outside the built set (multiple of 8, 8 ..= 8192)"))
+}
+/// row widths of the quantization kernels (rows/quant.rs: quant_token fp8 / int8, silu_mul_quant, group128: N % mult == 0, 8 ..= 32768;
+/// rows past 8192 columns take the long-row path)
+fn quant_n(n: i64, mult: i64) -> R<()> {
+    need(n % mult == 0 && (8..=32768).contains(&n), || format!("row width {n} outside the quant kernels (multiple of {mult}, 8 ..= 32768)"))
 }
 fn style(g: &ModelGraph, op: usize) -> R<&'static str> {
     match g.ops[op].attr_str("style").unwrap_or("neox") {
@@ -156,7 +161,7 @@ pub static FUSED: &[Rule] = &[
             need(quant_to(g, m[1]) == "fp8", || format!("quant_token to {} (the fused kernel quantizes to fp8)", quant_to(g, m[1])))?;
             dt(g, &a.ins[0], "bf16")?;
             let d = last(g, &a.ins[0])? / 2;
-            row_n(d)?;
+            quant_n(d, 8)?;
             let bind = vec![("x", a.ins[0].clone()), ("q", q.outs[0].clone()), ("scale", q.outs[1].clone())];
             Ok(launch("act_mul.silu+quant_token.fp8", g, m, vec![format!("silu_mul_quant_fp8_d{d}")], "silu_mul_quant_fp8", bind, Vec::new()))
         },
@@ -200,14 +205,14 @@ pub fn single(g: &ModelGraph, i: usize) -> R<Launch> {
             let to = quant_to(g, i);
             need(to == "fp8" || to == "int8", || format!("quant_token to {to} (fp8 | int8)"))?;
             let n = last(g, &o.ins[0])?;
-            row_n(n)?;
+            quant_n(n, 8)?;
             one("quant_token", format!("quant_token_bf16_{to}_n{n}"), "quant_per_token", vec![("x", o.ins[0].clone()), ("q", o.outs[0].clone()), ("scale", o.outs[1].clone())], vec![p_str("dtype", to)])
         }
         OpKind::QuantGroup => {
             dt(g, &o.ins[0], "bf16")?;
             need(quant_to(g, i) == "fp8" && o.attr_int("group").unwrap_or(128) == 128, || "quant_group: fp8, groups of 128".into())?;
             let n = last(g, &o.ins[0])?;
-            need(n % 128 == 0 && (128..=8192).contains(&n), || format!("row width {n} outside quant_group128 (multiple of 128, <= 8192)"))?;
+            quant_n(n, 128)?;
             one("quant_group", format!("quant_group128_bf16_fp8_n{n}"), "quant_per_group128", vec![("x", o.ins[0].clone()), ("q", o.outs[0].clone()), ("scale", o.outs[1].clone())], Vec::new())
         }
         OpKind::QuantStatic => {

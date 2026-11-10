@@ -1,0 +1,6 @@
+{ "tensors": { "u": {"dtype": "bf16", "shape": ["M", 28672]}, "a": {"dtype": "bf16", "shape": ["M", 14336]},
+    "q": {"dtype": "fp8", "shape": ["M", 14336]}, "s": {"dtype": "f32", "shape": ["M"]} },
+  "dims": {"M": 64},
+  "ops": [ {"id": "act", "op": "act_mul", "in": ["u"], "out": ["a"], "attrs": {"act": "silu"}},
+           {"id": "quant", "op": "quant_token", "in": ["a"], "out": ["q", "s"], "attrs": {"to": "fp8"}} ],
+  "outputs": ["q", "s"] }

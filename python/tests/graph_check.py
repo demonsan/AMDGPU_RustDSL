@@ -166,7 +166,8 @@ def check_gemm_plan(kind, M, N, K, want):
     return r
 
 
-CHECKS = [("norm_quant", check_norm_quant), ("act_quant", check_act_quant), ("add_norm_quant", check_add_norm_quant),
+CHECKS = [("norm_quant", check_norm_quant), ("act_quant", check_act_quant), ("act_quant_long", lambda: check_act_quant(M=4, D=14336)),
+          ("add_norm_quant", check_add_norm_quant),
           ("gemm_bf16_64_splitk", lambda: check_gemm_plan("bf16", 64, 1024, 512, ["gemm_a16w16_bf16_64_splitk", "gemm_splitk_reduce_s4"])),
           ("gemm_fp8_rowcol_64_splitk", lambda: check_gemm_plan("fp8_rowcol", 64, 1024, 512, ["gemm_a8w8_rowcol_fp8_64_splitk", "gemm_splitk_reduce_s4_rc"])),
           ("gemm_fp8_blockscale_64_splitk", lambda: check_gemm_plan("fp8_blockscale", 64, 1024, 512, ["gemm_a8w8_blockscale_64_splitk", "gemm_splitk_reduce_s4"])),
