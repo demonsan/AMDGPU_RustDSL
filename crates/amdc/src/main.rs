@@ -332,7 +332,7 @@ fn main() -> ExitCode {
             let nodes: Vec<String> = match flag("--nodes").as_deref() { None | Some("all") => all, Some(l) => l.split(',').map(|s| s.to_string()).collect() };
             let refs: Vec<&str> = nodes.iter().map(|s| s.as_str()).collect();
             let gf = flag("--graph-file").unwrap_or_else(|| format!("{}.graph.json", g.name));
-            match skeleton::generate(&g, kernel, &refs, &gf) {
+            match skeleton::generate(&g, kernel, &refs, &gf, amdgpu_kernels::stage_registry::registry()) {
                 Ok(src) => match flag("--out") {
                     Some(o) => match fs::write(&o, &src) { Ok(_) => { println!("wrote {o}"); ExitCode::SUCCESS } Err(e) => { eprintln!("{o}: {e}"); ExitCode::from(1) } },
                     None => { print!("{src}"); ExitCode::SUCCESS }

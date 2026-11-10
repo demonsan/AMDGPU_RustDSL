@@ -126,7 +126,19 @@ fn structural_errors() {
 
 // ---------------------------------------------------------------- skeleton generation: weave groups and cut-edge slots
 
-use amdgpu_graph::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::skeleton::generate as generate_with;
+use amdgpu_stage::stage::{Prim as StagePrim, StageDesc};
+
+/// The stage registry the generator consults for its `move.*` suggestions (the shipped one lives in `amdgpu-kernels`; the keys the tests need are listed here).
+fn reg() -> Vec<StageDesc> {
+    [("move.row_frags", StagePrim::M), ("move.lds_image", StagePrim::M), ("map.store_bf16", StagePrim::E), ("map.epilogue_chain", StagePrim::E)]
+        .iter()
+        .map(|&(key, prim)| StageDesc { key, prim, params: &[], doc: "" })
+        .collect()
+}
+fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Result<String, String> {
+    generate_with(g, kernel, nodes, graph_file, &reg())
+}
 
 fn two_stage_graph() -> Graph {
     // the FMHA shape: v_phase = softmax (sm), m_phase = pv + qk woven by one weaver; qk produces the S of the NEXT iteration (loop-carried edge s)

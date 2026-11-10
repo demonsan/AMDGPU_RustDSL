@@ -29,7 +29,7 @@ fn the_graph_jsons_and_the_dispatched_skeletons_are_up_to_date() {
         up_to_date(&json, &g.to_json_string());
         assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g, "{k}");
         let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
-        up_to_date(&format!("skeleton_{k}.rs"), &generate(&g, k, &ids, &json).unwrap());
+        up_to_date(&format!("skeleton_{k}.rs"), &generate(&g, k, &ids, &json, amdgpu_kernels::stage_registry::registry()).unwrap());
     }
 }
 
@@ -49,7 +49,7 @@ fn s_to_p_is_c0_and_the_epilogue_hand_off_is_a_wave_private_transpose() {
 
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
-    let reg = amdgpu_stage::stage::registry();
+    let reg = amdgpu_kernels::stage_registry::registry();
     for (k, g) in all() {
         for n in &g.nodes {
             let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("{k}/{}: stage key {} is not in the registry", n.id, n.stage));

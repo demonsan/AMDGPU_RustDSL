@@ -10,6 +10,7 @@
 //! The text is deterministic: a test regenerates it and compares with the committed file.
 
 use super::*;
+use amdgpu_stage::stage::StageDesc;
 
 fn ident_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !s.chars().next().unwrap().is_ascii_digit()
@@ -50,7 +51,7 @@ struct Slot {
     extra: Vec<String>,
 }
 
-fn suggest(e: &Edge, load: bool) -> Option<&'static str> {
+fn suggest(e: &Edge, load: bool, reg: &[StageDesc]) -> Option<&'static str> {
     let key = if load {
         match &e.store {
             Store::Lds(_) => "move.lds_image",
@@ -61,7 +62,7 @@ fn suggest(e: &Edge, load: bool) -> Option<&'static str> {
     } else {
         "map.epilogue_chain"
     };
-    amdgpu_stage::stage::registry().iter().any(|d| d.key == key).then_some(key)
+    reg.iter().any(|d| d.key == key).then_some(key)
 }
 
 /// Generates the skeleton source of kernel `kernel` made of `nodes` (ids). `graph_file` is the path (relative to the generated file) of the graph JSON the build function embeds.
@@ -69,8 +70,8 @@ fn suggest(e: &Edge, load: bool) -> Option<&'static str> {
 /// Slots, in program order: `prelude`; the prologue stages; `loop_open`, the loop stages, `loop_close`; the epilogue stages. A stage is a slot named after its node; the members of a weave
 /// group are ONE slot named after the group (default body: `stage::compose` of the member stages in declaration order, the members' constructors `<node>_stage` being required trait
 /// methods); an edge cut away from this kernel adds `store_<tensor>` (right after its producer) / `load_<tensor>` (right before its first consumer) slots whose default body is a `todo!` naming the
-/// registry `move.*` stage that matches the tensor.
-pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Result<String, String> {
+/// registry `move.*` stage that matches the tensor (`reg`: the stage registry of the kernel crate, `amdgpu_kernels::stage_registry::registry()`; a suggested key that `reg` does not hold is not named).
+pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str, reg: &[StageDesc]) -> Result<String, String> {
     if g.attr_str("pipeline").is_some() {
         return generate_pipelined(g, kernel, nodes, graph_file);
     }
@@ -142,7 +143,7 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
         for e in &cut_in {
             if !done_load.contains(&e.name.as_str()) && e.to.iter().any(|t| members.iter().any(|m| &m.id == t)) {
                 done_load.push(&e.name);
-                let key = suggest(e, true);
+                let key = suggest(e, true, reg);
                 let mut doc = vec![format!("slot `load_{}`: {} arrives through HBM (cut edge from {}, class C4); issue its loads before `{}`.", e.name, edge_doc(e), e.from.as_deref().unwrap_or("-"), members[0].id)];
                 if let Some(k) = key {
                     doc.push(format!("  suggested stage: `{k}`"));
@@ -171,7 +172,7 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
         // stores of the cut edges these stages produce
         for e in &cut_out {
             if e.from.as_deref().map_or(false, |f| members.iter().any(|m| m.id == f)) {
-                let key = suggest(e, false);
+                let key = suggest(e, false, reg);
                 let mut doc = vec![format!("slot `store_{}`: {} leaves the kernel through HBM (cut edge to {}, class C4).", e.name, edge_doc(e), e.to.join(","))];
                 if let Some(k) = key {
                     doc.push(format!("  suggested stage: `{k}`"));

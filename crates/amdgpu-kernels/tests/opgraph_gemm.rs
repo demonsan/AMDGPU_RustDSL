@@ -24,7 +24,7 @@ fn the_graph_json_and_the_pipelined_skeleton_are_up_to_date() {
     up_to_date("gemm_v4.graph.json", &g.to_json_string());
     assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g);
     let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
-    up_to_date("skeleton_v4.rs", &generate(&g, "v4", &ids, "gemm_v4.graph.json").unwrap());
+    up_to_date("skeleton_v4.rs", &generate(&g, "v4", &ids, "gemm_v4.graph.json", amdgpu_kernels::stage_registry::registry()).unwrap());
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn the_tile_ring_is_a_block_scope_edge_and_the_accumulators_stay_in_registers() 
 
 #[test]
 fn every_node_names_a_registry_stage_of_its_primitive() {
-    let reg = amdgpu_stage::stage::registry();
+    let reg = amdgpu_kernels::stage_registry::registry();
     for n in &graph().nodes {
         let d = reg.iter().find(|d| d.key == n.stage).unwrap_or_else(|| panic!("node {}: stage key {} is not in the registry", n.id, n.stage));
         assert_eq!(n.prim.code(), format!("{:?}", d.prim), "node {}", n.id);
