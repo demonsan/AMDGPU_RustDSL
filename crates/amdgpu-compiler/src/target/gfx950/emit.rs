@@ -49,14 +49,16 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     let agprs = crate::regalloc::agpr_count(m, a);
     // gfx950 unified register file: accum_offset = arch VGPRs (rounded to 4), next_free_vgpr = arch + AGPRs (rounded to 8).
     let (accum_offset, vgpr, _waves) = if agprs == 0 {
-        let v = round_up(a.max_v, 4).max(4);
+        let e = &crate::target::T.emit;
+        let v = round_up(a.max_v, e.vgpr_granule).max(e.vgpr_min);
         (v, v, 0)
     } else {
         crate::regalloc::unified_budget(a.max_v, agprs)
     };
     // the 8-register rounding must not pass the architectural limit: gfx950 accepts next_free_sgpr <= 102 (vcc is separate); the allocator
     // never uses more than 102 (s0..s101), so a kernel with 97..102 SGPRs declares 102 (rounding to 104 made the assembler reject it)
-    let sgpr = round_up(a.max_s, 8).max(8).min(102);
+    let te = &crate::target::T.emit;
+    let sgpr = round_up(a.max_s, te.sgpr_granule).max(te.sgpr_min).min(te.sgpr_cap);
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
     // it to be 64-byte aligned; without this the fields are read shifted and
@@ -93,7 +95,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .kernarg_segment_align: 8\n");
     out.push_str(&format!("    .group_segment_fixed_size: {}\n", m.lds_bytes));
     out.push_str("    .private_segment_fixed_size: 0\n");
-    out.push_str("    .wavefront_size: 64\n");
+    out.push_str(&format!("    .wavefront_size: {}\n", crate::target::T.wave.lanes));
     out.push_str("    .max_flat_workgroup_size: ");
     out.push_str(&m.workgroup_size.to_string());
     out.push('\n');
@@ -124,7 +126,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
             }
         }
     }
-    out.push_str("amdhsa.target: amdgcn-amd-amdhsa--gfx950\n");
+    out.push_str(&format!("amdhsa.target: amdgcn-amd-amdhsa--{}\n", crate::target::T.name));
     out.push_str("amdhsa.version:\n  - 1\n  - 0\n...\n");
     out.push_str(".end_amdgpu_metadata\n");
     out

@@ -4,3 +4,5 @@
 
 pub mod hostgen;
 pub mod jit;
+pub mod manifest;
+pub mod md5;

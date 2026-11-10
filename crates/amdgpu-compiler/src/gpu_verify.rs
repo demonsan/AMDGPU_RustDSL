@@ -2651,9 +2651,9 @@ fn gcd(a: i128, b: i128) -> i128 {
     a
 }
 
-const VGPR_LIMIT: u32 = 256;
-const SGPR_LIMIT: u32 = 102;
-const LDS_LIMIT: u32 = 160 * 1024;
+const VGPR_LIMIT: u32 = crate::target::T.verify.vgpr_limit;
+const SGPR_LIMIT: u32 = crate::target::T.verify.sgpr_limit;
+const LDS_LIMIT: u32 = crate::target::T.verify.lds_limit;
 
 fn is_matrix_op(op: MOp) -> bool {
     // every MFMA except the sparse smfmac (op_attrs)

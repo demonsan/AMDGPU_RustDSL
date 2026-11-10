@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn every_variant_is_listed() {
         // ALL must list every variant of the enum (the attribute match is exhaustive at compile time)
-        let src = include_str!("mir.rs");
+        let src = include_str!("../../mir.rs");
         let body = &src[src.find("pub enum MOp {").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
         let names: Vec<&str> = body.lines().map(|l| l.trim()).filter(|l| l.ends_with(',') && l.chars().next().map_or(false, |c| c.is_ascii_uppercase())).map(|l| l.trim_end_matches(',')).collect();

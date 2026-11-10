@@ -100,7 +100,7 @@ evidence:
 `probe_store` code object crashed the host at `hipModuleLaunchKernel` (SIGSEGV); the own-backend object printed
 `PROBE_OK`.** Root cause: the LLVM tail listed kernarg *layout padding* as kernel arguments. `probe_store` has a
 20-byte argument area rounded to 24 bytes; the exported IR added a dummy `%pad0` parameter
-(`crates/amdgpu-compiler/src/backend/llvm_mir.rs::kernarg_ir`), which llc turned into a fourth HSA argument
+(`crates/amdgpu-compiler/src/target/gfx950/llvm/llvm_mir.rs::kernarg_ir`), which llc turned into a fourth HSA argument
 (`pad0`, offset 20, by_value). HIP's kernel-parameter launch API then read a fourth parameter from a three-entry
 array (out of bounds). The own metadata had only the three real arguments and worked; patching the descriptor
 fields did not change the crash. Scope: any LLVM-tail kernel whose DSL kernarg layout has internal gaps or

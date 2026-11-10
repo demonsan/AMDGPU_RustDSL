@@ -29,14 +29,14 @@ use super::order::set_relax_dma_lds_read;
 use super::{verify, Options};
 use crate::mir::*;
 
-pub const SLOT_CYCLES: u32 = 32;
-pub const SLOT_BUDGET: u32 = 28;
+pub const SLOT_CYCLES: u32 = crate::target::T.latency.slot_cycles;
+pub const SLOT_BUDGET: u32 = crate::target::T.latency.slot_budget;
 /// Register-pressure cap: a floater never moves more than this many slots (MFMAs) above its source position.
 pub const HOIST_SLOTS: usize = 40;
 /// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency: `DMA_LATENCY_CYCLES` / `SLOT_CYCLES`).
 ///
 /// 512 cycles: swept 8..32 slots on GEMM v4 (9 alternating rounds, docs/slotfill.md): flat for 12..24 (3011..3026 TF/s vs hand 3002), 2969 at 32.
-pub const DMA_LATENCY_CYCLES: u32 = 512;
+pub const DMA_LATENCY_CYCLES: u32 = crate::target::T.latency.dma_latency_cycles;
 pub const DMA_SLOTS: usize = (DMA_LATENCY_CYCLES / SLOT_CYCLES) as usize;
 /// Register-pressure budget: the new order may raise the region's peak of live vector dwords (unified VGPR + AGPR) by at most this much over the authored order;
 /// when it would, the hoist cap is halved until it fits.

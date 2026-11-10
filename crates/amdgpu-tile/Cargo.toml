@@ -9,3 +9,4 @@ description = "Tile layer on the layout algebra: TiledCopy / TiledMma / partitio
 amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-layout = { path = "../amdgpu-layout" }
 amdgpu-isa = { path = "../amdgpu-isa" }
+amdgpu-target = { path = "../amdgpu-target" }

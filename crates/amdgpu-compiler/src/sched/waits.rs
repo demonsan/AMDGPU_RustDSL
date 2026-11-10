@@ -21,8 +21,8 @@ use super::liveness::successors;
 use crate::mir::*;
 
 
-const VM_MAX: u32 = 63;
-const LG_MAX: u32 = 15;
+const VM_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max;
+const LG_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Ent {

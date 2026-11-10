@@ -19,8 +19,8 @@ pub struct Dialect {
 }
 
 pub const DIALECTS: &[Dialect] = &[
-    Dialect { name: "llvm20", version_prefix: "AMD LLVM version 20.", table_src: include_str!("llvm20.tbl"), header_src: include_str!("llvm20_header.txt") },
-    Dialect { name: "llvm24", version_prefix: "AMD LLVM version 24.", table_src: include_str!("llvm24.tbl"), header_src: include_str!("llvm24_header.txt") },
+    Dialect { name: "llvm20", version_prefix: "AMD LLVM version 20.", table_src: include_str!("../target/gfx950/llvm/llvm20.tbl"), header_src: include_str!("../target/gfx950/llvm/llvm20_header.txt") },
+    Dialect { name: "llvm24", version_prefix: "AMD LLVM version 24.", table_src: include_str!("../target/gfx950/llvm/llvm24.tbl"), header_src: include_str!("../target/gfx950/llvm/llvm24_header.txt") },
 ];
 
 /// The dialect for the pinned LLVM: $AMDC_DIALECT, else matched against llc --version, else the primary pin (llvm24).
@@ -42,7 +42,7 @@ pub fn current() -> &'static Dialect {
 }
 /// Pass the tail starts at; first one that exists in the pipeline is used.
 pub const START_PASS_PREFERENCE: &[&str] = &["gcn-create-vopd", "si-memory-legalizer"];
-pub const LLC_ARGS: &[&str] = &["-mtriple=amdgcn-amd-amdhsa", "-mcpu=gfx950", "-O2"];
+pub const LLC_ARGS: &[&str] = crate::target::T.llvm.llc_args;
 
 /// Operand class named in a table signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,8 +144,9 @@ pub fn kinds_of(inst: &MInst) -> String {
 
 /// gfx9 S_WAITCNT immediate: vmcnt [3:0]+[15:14], expcnt [6:4], lgkmcnt [11:8].
 pub fn waitcnt_imm(vm: Option<u32>, lgkm: Option<u32>) -> u32 {
-    let vm = vm.unwrap_or(63).min(63);
-    let lgkm = lgkm.unwrap_or(15).min(15);
+    let (vm_max, lg_max) = (crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max, crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max);
+    let vm = vm.unwrap_or(vm_max).min(vm_max);
+    let lgkm = lgkm.unwrap_or(lg_max).min(lg_max);
     (vm & 0xf) | ((vm >> 4) << 14) | (7 << 4) | (lgkm << 8)
 }
 

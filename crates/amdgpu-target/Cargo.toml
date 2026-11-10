@@ -1,0 +1,8 @@
+[package]
+name = "amdgpu-target"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Target descriptions (gfx950; gfx1250 specification): wave, register files, LDS, dependency counters, hazard rules, latency model, emission, LLVM tail settings"
+
+[dependencies]

@@ -23,7 +23,7 @@ $CARGO build -q --bin amdc 2>&1 | grep -E "^error" -A8 | head -20
 # 1) every MOp variant (the `pub enum MOp` of mir.rs) and the keys of the LLVM table
 awk '/^pub enum MOp/{f=1;next} f&&/^}/{exit} f&&/^    [A-Z][A-Za-z0-9]*,/{gsub(/[ ,]/,"");print}' crates/amdgpu-compiler/src/mir.rs | sort -u > "$OUT/all_mops.txt"
 NALL=$(wc -l < "$OUT/all_mops.txt")
-awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); print k}' crates/amdgpu-compiler/src/backend/llvm24.tbl | sort -u > "$OUT/tbl_keys.txt"
+awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); print k}' crates/amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl | sort -u > "$OUT/tbl_keys.txt"
 
 # 2) the run list: label|kernel|ENV   (ENV = space separated VAR=VAL, may be empty)
 {

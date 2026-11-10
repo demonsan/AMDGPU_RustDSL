@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::mir::*;
 
 /// Cycles that must separate a transcendental write from its first reader.
-const TRANS_LATENCY: usize = 5;
+const TRANS_LATENCY: usize = crate::target::T.hazard("trans-result").n() as usize;
 
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
@@ -428,7 +428,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
 }
 /// Wait slots (issue distance) after a VMEM store of more than 8 bytes before a VALU may overwrite its data registers: 2 wait states on gfx940+ (so the
 /// next write may issue 3 slots after the store; an `s_waitcnt` between counts as one).
-const STORE_DATA_WAIT: usize = 3;
+const STORE_DATA_WAIT: usize = crate::target::T.hazard("wide-store-data").n() as usize;
 
 /// Global stores of more than 64 bits of data (`global_store_dwordx3/x4`): the data VGPRs are read over several cycles after issue.
 fn is_wide_vmem_store(op: MOp) -> bool {
@@ -453,11 +453,12 @@ fn is_valu_vgpr_write(m: &MFunction, inst: &MInst) -> bool {
 /// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
 /// VGPR -> VALU write of the same VGPR"), the 32x32x64 scaled and sparse forms 21.
 fn mfma_dst_wait(lat: usize) -> usize {
-    if lat == 20 {
-        21
-    } else {
-        19
-    }
+    crate::target::T.hazard("mfma-dst-write").by_latency(lat as u32) as usize
+}
+
+/// The SrcC write-after-read window of an MFMA with result latency `lat` (target rule `mfma-srcc-war`).
+fn mfma_srcc_war(lat: usize) -> usize {
+    crate::target::T.hazard("mfma-srcc-war").by_latency(lat as u32) as usize
 }
 
 /// Post-register-allocation hazard: a VALU (or other) write to a physical VGPR range that a still
@@ -507,10 +508,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
     // `edgepad`: the SrcC WAR windows of MFMAs still running at a block end are carried into the successors instead of padding every block
     // end, and both those and the in-flight destinations are carried THROUGH short blocks (fixpoint over the CFG: max remaining per key)
     let war_of = |m: &MFunction, inst: &MInst| -> Option<(usize, Vec<(u32, u32)>)> {
-        let need = mfma_latency(inst.op).map(|l| match l {
-            20 => 21,
-            _ => 12,
-        })?;
+        let need = mfma_latency(inst.op).map(mfma_srcc_war)?;
         let mut srcs = Vec::new();
         if inst.op == MOp::VSmfmac16x16x128Fp8 {
             for s in inst.srcs.iter().take(3) {
@@ -683,10 +681,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 out.push(MInst::new(MOp::SNop).imm(n as i64 - 1));
                 cycle += n;
             }
-            if let Some(need) = mfma_latency(inst.op).map(|l| match l {
-                20 => 21,
-                _ => 12,
-            }) {
+            if let Some(need) = mfma_latency(inst.op).map(mfma_srcc_war) {
                 // Only the accumulator (SrcC) is a WAR hazard: the LLVM tail inserts nothing for a VALU
                 // write to SrcA/SrcB/scale registers right after the MFMA (docs/scheduling.md).
                 let mut srcs = Vec::new();
@@ -850,7 +845,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                         f.after += 1;
                     }
                 }
-                let lim = if vm { 63 } else { 15 };
+                let lim = if vm { crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max } else { crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max };
                 // a counter saturates: an entry with that many younger SAME-counter operations has completed
                 st.retain(|f| f.smem || f.vm != vm || f.after < lim);
                 if at.mem.map_or(true, |mm| !mm.write) || at.smem {
@@ -1001,8 +996,8 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     if testing::SKIP_VALU_SGPR.with(|s| s.get()) {
         return 0;
     }
-    const VMEM_WAIT: usize = 5;
-    const VALU_WAIT: usize = 2;
+    const VMEM_WAIT: usize = crate::target::T.hazard("valu-sgpr-vmem").n() as usize;
+    const VALU_WAIT: usize = crate::target::T.hazard("valu-sgpr-valu").n() as usize;
     let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;
     let is_valu = |op: MOp| matches!(pipe(op), Pipe::Valu | Pipe::Trans | Pipe::Mfma);
     let srange = |m: &MFunction, r: VReg| -> Option<(u32, u32)> {

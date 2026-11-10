@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 **/target/
+!crates/amdgpu-compiler/src/target/
 Cargo.lock
 
 # Generated code objects and assembly

@@ -174,7 +174,7 @@ fn is_load(m: &str) -> bool {
 }
 
 /// Register reads/writes of one instruction, as defined by the emitter's own operand formats
-/// (`crates/amdgpu-compiler/src/emit.rs`).
+/// (`crates/amdgpu-compiler/src/target/gfx950/emit.rs`).
 fn read_write(m: &str, ops: &[String]) -> (Vec<Reg>, Vec<Reg>) {
     if is_control(m) {
         return (Vec::new(), Vec::new());

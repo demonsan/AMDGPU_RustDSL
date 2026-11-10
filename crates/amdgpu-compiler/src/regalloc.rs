@@ -17,16 +17,16 @@ pub struct Alloc {
     pub scalar: Vec<bool>,
 }
 
-const VGPR_COUNT: usize = 256;
+const VGPR_COUNT: usize = crate::target::T.regs.vgpr.count as usize;
 /// AGPRs per wave (a0..a255); arch VGPR + AGPR together must fit the unified 512-register file.
-const AGPR_COUNT: usize = 256;
-pub const UNIFIED_FILE: u32 = 512;
+const AGPR_COUNT: usize = crate::target::agpr_count(crate::target::T) as usize;
+pub const UNIFIED_FILE: u32 = crate::target::unified_total(crate::target::T);
 // 102 usable SGPRs (the descriptor's next_free_sgpr must stay <= 102; vcc is separate)
-const SGPR_COUNT: usize = 102;
+const SGPR_COUNT: usize = crate::target::T.regs.sgpr.count as usize;
 
 /// Reserved: v0 holds workitem id; s0:s1 kernarg pointer; s2..s4 workgroup ids.
-const V_RESERVED: usize = 1;
-const S_RESERVED: usize = 8;
+const V_RESERVED: usize = crate::target::T.regs.vgpr.reserved as usize;
+const S_RESERVED: usize = crate::target::T.regs.sgpr.reserved as usize;
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     let a = allocate_any(m)?;
@@ -528,9 +528,14 @@ pub fn agpr_count(m: &MFunction, a: &Alloc) -> u32 {
 /// Unified-file accounting of an allocation: (accum_offset, next_free_vgpr, waves per SIMD). accum_offset is the arch VGPR count rounded to 4
 /// (.amdhsa_accum_offset), next_free_vgpr = accum_offset + AGPRs rounded to 8; waves per SIMD = floor(512 / next_free_vgpr) (at most 8).
 pub fn unified_budget(max_v: u32, agprs: u32) -> (u32, u32, u32) {
-    let accum = ((max_v + 3) / 4 * 4).max(4);
-    let total = if agprs == 0 { accum } else { ((accum + agprs + 7) / 8) * 8 };
-    let waves = (UNIFIED_FILE / total.max(1)).min(8).max(1);
+    let t = crate::target::T;
+    let (ag, tg, maxw) = match &t.regs.unified {
+        Some(u) => (u.accum_granule, u.total_granule, u.max_waves_per_simd),
+        None => (t.emit.vgpr_granule, t.regs.vgpr.alloc_granule, 1),
+    };
+    let accum = ((max_v + ag - 1) / ag * ag).max(t.emit.vgpr_min);
+    let total = if agprs == 0 { accum } else { ((accum + agprs + tg - 1) / tg) * tg };
+    let waves = (UNIFIED_FILE / total.max(1)).min(maxw).max(1);
     (accum, total, waves)
 }
 
@@ -1135,10 +1140,16 @@ impl Plan {
 pub fn check_workgroup_budget(m: &crate::mir::MFunction, a: &Alloc) -> Result<(), String> {
     let n_agpr = agpr_count(m, a);
     let (_, total, _) = unified_budget(a.max_v, n_agpr);
-    let per_wave = (total + 7) / 8 * 8;
-    let waves = (m.workgroup_size + 63) / 64;
-    let per_simd = ((waves + 3) / 4).max(1);
-    let limit = UNIFIED_FILE / per_simd / 8 * 8;
+    let t = crate::target::T;
+    let (g, simds) = match &t.regs.unified {
+        Some(u) => (u.total_granule, u.simds),
+        None => (t.regs.vgpr.alloc_granule, 4),
+    };
+    let lanes = t.wave.lanes;
+    let per_wave = (total + g - 1) / g * g;
+    let waves = (m.workgroup_size + lanes - 1) / lanes;
+    let per_simd = ((waves + simds - 1) / simds).max(1);
+    let limit = UNIFIED_FILE / per_simd / g * g;
     if per_wave > limit {
         return Err(format!(
             "register budget: workgroup_size {} = {waves} waves -> {per_simd} per SIMD, so each wave may use at most {limit} registers (VGPR + AGPR, \

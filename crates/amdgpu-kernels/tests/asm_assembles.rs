@@ -12,7 +12,8 @@ fn assemble(clang: &std::path::Path, asm: &str, tag: &str) -> Result<(), String>
     let s = dir.join("k.s");
     std::fs::write(&s, asm).unwrap();
     let out = std::process::Command::new(clang)
-        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-c", "-o"])
+        .args(amdgpu_compiler::target::T.llvm.asm_args)
+        .args(["-c", "-o"])
         .arg(dir.join("k.o"))
         .arg(&s)
         .output()

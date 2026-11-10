@@ -9,6 +9,7 @@ description = "Backend: lowering, register allocation and gfx950 assembly emissi
 amdgpu-sym = { path = "../amdgpu-sym" }
 amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-safeasm = { path = "../amdgpu-safeasm" }
+amdgpu-target = { path = "../amdgpu-target" }
 
 [dev-dependencies]
 amdgpu-dsl = { path = "../amdgpu-dsl" }
