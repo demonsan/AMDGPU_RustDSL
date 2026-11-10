@@ -9,7 +9,7 @@
 //! N (D) a multiple of 8, 8..=32768; chunks past the row end are masked in the statistics and their stores dropped by the buffer descriptor.
 //!
 //! Rows up to 8192 columns keep the whole row in registers (one pass over the data). Longer rows (`quant_kernel_long`: 8192 < N <= 32768, e.g. the Llama-8B MLP D = 14336) stream the row twice in groups of
-//! `LONG_G` chunks per lane with the next group's loads in flight: pass 1 reduces the amax, pass 2 re-reads (an L2 hit: the row was read microseconds earlier) and quantizes; the group form (`Group128`) is one pass.
+//! `LONG_G` chunks per lane with the next group's loads in flight: pass 1 reduces the amax while the first 32 chunks (12 for the two-input kinds) stay in registers (bf16, packed), pass 2 quantizes from them and re-reads only the rest of the row (the L2 does not keep it: the rows in flight exceed it); the group form (`Group128`) is one pass.
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, TriOp, UnOp, ValueId};
 use amdgpu_tile::prims::{act, abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, wave_reduce, Act, RedOp};
@@ -265,7 +265,10 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
 /// Per-token kinds: pass 1 reduces the row amax (nothing is kept), pass 2 re-reads the row (the first group's loads are issued before the amax reduction) and quantizes; `Group128` is a single pass.
 fn quant_kernel_long(name: &str, n: i64, kind: QuantKind) -> Function {
     let nld = ((n + 511) / 512) as usize;
-    let ngroups = nld.div_ceil(LONG_G);
+    let two_in = matches!(kind, QuantKind::SiluMulToken | QuantKind::SituMulToken);
+    // two-input kinds hold twice the registers per chunk: smaller groups
+    let lg = if two_in { LONG_G / 2 } else { LONG_G };
+    let ngroups = nld.div_ceil(lg);
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -281,7 +284,6 @@ fn quant_kernel_long(name: &str, n: i64, kind: QuantKind) -> Function {
     b.sym_range("MT", 1, 1 << 20);
     b.ka_is(24, mt.clone() * Ext::c(4));
     b.grid_is(0, mt.clone());
-    let two_in = matches!(kind, QuantKind::SiluMulToken | QuantKind::SituMulToken);
     let in_row = if two_in { 4 * n } else { 2 * n };
     let n_scales = if kind == QuantKind::Group128 { n / 128 } else { 1 };
     b.arg_tensor("x", mt.clone() * Ext::c(4 * in_row));
@@ -328,15 +330,15 @@ fn quant_kernel_long(name: &str, n: i64, kind: QuantKind) -> Function {
         let (gm, um) = (b.mul_f32(c, rb), b.mul_f32(c, rl));
         (beta, lbeta, gm, um)
     });
-    // the loads of group `g` (chunks g LONG_G ..): (first chunk, the b128 of each chunk, the second input's)
+    // the loads of group `g` (chunks g lg ..): (first chunk, the b128 of each chunk, the second input's)
     let issue = |b: &mut FnBuilder, g: usize| -> (usize, Vec<ValueId>, Vec<ValueId>) {
-        let (c0, c1) = (g * LONG_G, ((g + 1) * LONG_G).min(nld));
+        let (c0, c1) = (g * lg, ((g + 1) * lg).min(nld));
         let xs: Vec<ValueId> = (c0..c1).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(gx[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect();
         let x2s: Vec<ValueId> = if two_in { (c0..c1).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(g2[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect() } else { Vec::new() };
         (c0, xs, x2s)
     };
     // the loads one group issues (the counted wait of the previous group lets them stay in flight)
-    let nloads = |g: usize| -> u8 { ((((g + 1) * LONG_G).min(nld) - g * LONG_G) * if two_in { 2 } else { 1 }) as u8 };
+    let nloads = |g: usize| -> u8 { ((((g + 1) * lg).min(nld) - g * lg) * if two_in { 2 } else { 1 }) as u8 };
     let ys_of = |b: &mut FnBuilder, grp: &(usize, Vec<ValueId>, Vec<ValueId>)| -> Vec<(usize, [ValueId; 8])> {
         let (c0, xs, x2s) = grp;
         (0..xs.len()).map(|j| (c0 + j, chunk_y(b, situ, xs[j], if two_in { Some(x2s[j]) } else { None }, valid[c0 + j], zero))).collect()
@@ -380,8 +382,8 @@ fn quant_kernel_long(name: &str, n: i64, kind: QuantKind) -> Function {
         }
         _ => {
             // the first `kg` groups stay in registers between the passes (bf16, packed: 4 VGPRs per chunk and input), the rest of the row is streamed twice
-            let keep_chunks = if two_in { 16 } else { 32 };
-            let kg = if nld <= keep_chunks { ngroups } else { keep_chunks / LONG_G };
+            let keep_chunks = if two_in { 12 } else { 32 };
+            let kg = if nld <= keep_chunks { ngroups } else { keep_chunks / lg };
             // pass 1: the row amax. The kept groups' loads are all issued first (every byte of the row in flight), consumed with counted waits
             let mut part: Option<ValueId> = None;
             let kept: Vec<(usize, Vec<ValueId>, Vec<ValueId>)> = (0..kg).map(|g| issue(b, g)).collect();
