@@ -92,7 +92,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm)
+    f.compile_policy().m0_reuse
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
@@ -101,41 +101,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
     let extra: &[&str] = &extra_all;
-    // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
-    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/archive/status.md round 47).
-    let base = if pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || pname.ends_with("_g2") || pname.ends_with("_t128") {
-        // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
-        // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
-        // the vs128/vsm builds the register slack they need (docs/archive/status.md rounds 49-50).
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
-        // `_t128` (4-wave blocks, one wave per SIMD): addrfold frees the DMA address temporaries so the full scheduler fits (416 -> 494 TFLOP/s)
-        if pname.ends_with("_t128") {
-            v.push("addrfold");
-        }
-        // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
-        // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
-        // v3 `_t128`: `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC):
-        // same-run A/B, B2H8S2048 layout median +3.3% together (on `_vs128` / `_kvsplit` -0.7..-1.5%: not used there, docs/dsl-layout-refactor-design.md
-        // §9.4); `saddrlds` (the SADDR DMA form: +1.8..+2.1%; -0.2..-1.4% on _vs128 / _kvsplit)
-        if pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") {
-            v.extend_from_slice(&["saddrlds", "edgepad", "salubr"]);
-        }
-        v.extend_from_slice(extra);
-        lower::with_opts(&v, || lower::lower(f))?
-    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
-        // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
-        // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
-        // + kabatch (kernarg loads batched into s_load_dwordx4) and imm (inline constants / literals as VALU operands instead of v_mov materialisations)
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad", "kabatch", "imm"];
-        v.extend_from_slice(extra);
-        lower::with_opts(&v, || lower::lower(f))?
-    } else if pname.starts_with("fmha_fwd_hd128_mxfp8") {
-        // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/archive/status.md)
-        let mut v: Vec<&str> = vec!["zeroinit"];
-        v.extend_from_slice(extra);
-        lower::lower_with_extra(f, &v)?
-    } else {
-        lower::lower_with_extra(f, extra)?
+    // the kernel's declared compile policy (amdgpu_dsl::CompileProfile::policy): its lowering tokens, then the retry ladder's and the kernel's own
+    let pol = f.compile_policy();
+    let mut v: Vec<&str> = pol.lower.to_vec();
+    v.extend_from_slice(extra);
+    let base = match pol.lower_base {
+        amdgpu_dsl::LowerBase::Replace => lower::with_opts(&v, || lower::lower(f))?,
+        amdgpu_dsl::LowerBase::Inherit => lower::lower_with_extra(f, &v)?,
     };
     // AGPR requests (DSL pin_agpr / gpr): move the vregs to the AGPR file and repair the instructions that cannot touch it
     let base = {
@@ -335,16 +307,16 @@ pub fn region_strategies(f: &amdgpu_dsl::Function, m: &mir::MFunction) -> Vec<u1
 }
 
 fn scheduler_options_base(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
-    use amdgpu_dsl::CompileProfile as P;
+    use amdgpu_dsl::SchedPreset as P;
     if let Some(o) = sched::Options::from_env() {
         return Some(o);
     }
     if std::env::var("AMDC_SCHED").ok().as_deref() == Some("0") {
         return None;
     }
-    let preset = match f.compile_profile {
+    let preset = match f.compile_policy().sched_preset {
         // scoreboard (partial) waits + ds_read hoisting, no instruction reordering (docs/scheduling.md; measured best on the GEMM)
-        Some(P::Gemm) => {
+        P::Gemm => {
             let mut o = sched::Options::default();
             o.reorder = false;
             o.ldshoist = true;
@@ -352,13 +324,13 @@ fn scheduler_options_base(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
         }
         // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256 (measured 489 -> 505 TFLOP/s on B1H8S2048;
         // limit 246 / 248 only, 244 / 250 give the old schedule: a heuristic knob, re-measure on changes)
-        Some(P::T128) => {
+        P::T128 => {
             let mut o = sched::Options::default();
             o.alu_across_barrier = true;
             o.max_vgprs = 248;
             Some(o)
         }
-        _ => None,
+        P::None => None,
     };
     match (preset, &f.sched_opts) {
         (Some(mut o), Some(s)) => {
