@@ -35,14 +35,18 @@ pub struct Target {
 ```
 
 - **`Wave`**: `lanes`, `exec_bits` (the width of an exec / lane-mask SGPR tuple: 2 SGPRs on wave64, 1 on wave32).
-- **`RegFiles`**: one `RegFile { count, alloc_granule, tuple_align: &[(dwords, align)], reserved }` each for VGPR, AGPR and SGPR, plus:
+- **`RegFiles`**: `vgpr: RegFile`, `agpr: Option<RegFile>` (gfx1250 has no AGPR segment), `sgpr: RegFile`; `RegFile { count, alloc_granule, tuple_align: &[(dwords, align)], reserved }`, plus:
   - `unified: Option<Unified { total, accum_granule }>`. gfx950: arch VGPR + AGPR ≤ 512, `accum_offset` rounded to 4, `next_free_vgpr` to 8.
   - the SGPR rules: usable count (102), the special registers outside it (vcc, exec, m0), the user / system SGPR layout (kernarg pointer in s[0:1], workgroup ids).
-  - `occupancy: &[(regs, waves_per_simd)]`.
+  - `occupancy: Occupancy` — a model, not just a table:
+    - `Steps(&[(regs, waves_per_simd)])`: gfx950, waves per SIMD from the VGPR / AGPR (unified) and SGPR counts.
+    - `BlockPool { block_vgprs, blocks }`: gfx1250, a pool of 64 blocks of 16 VGPRs shared by the waves; SGPRs are fixed and not an occupancy term.
 - **`Lds`**: `bytes_per_workgroup` (160 KiB), `banks`, the DMA forms and their M0 rule (`m0_base_plus_imm`).
 - **`Counters`**: a generic counter set.
   - `counters: &[Counter { name, max, in_order }]`.
   - `classes: &[(MemClass, CounterId, OrderKind)]`. `MemClass` = vmem load / vmem store / lds / lds-dma / smem / msg / tensor / async / ….
+    `OrderKind` is per class, not per counter: `InOrder` or `OutOfOrder` (SMEM on both targets, so a wait for it is always 0). On gfx1250 one counter
+    can be in order for one class and out of order for another (XCNT: VMEM vs SMEM translation order).
   - `wait: WaitForm`, one of:
     - `Combined { mnemonic, fields }`: gfx950 `s_waitcnt vmcnt(n) lgkmcnt(n) expcnt(n)`.
     - `PerCounter(&[(CounterId, mnemonic)])`: gfx1250 `s_wait_loadcnt` / `storecnt` / `dscnt` / `kmcnt` / `asynccnt` / `tensorcnt` / `xcnt`.
@@ -51,7 +55,9 @@ pub struct Target {
   The wait verifier and the wait insertion iterate over the set instead of the two named fields.
 - **`HazardRule`**:
   - `{ name, producer: Class, consumer: Class, role: Operand, waits: Waits, scope: Value | Physical, source }`.
-  - `Waits` is a number, a function of the producer (MFMA passes: `passes + 3 + extra`), or `Instr` for a required instruction (gfx1250 `s_wait_*` / v_nop forms).
+  - `Waits { count: Count, unit: Unit }`.
+    - `Count` is a number, a function of the producer (MFMA passes: `passes + 3 + extra`), or `Instr` for a required instruction (gfx1250 `s_wait_*`).
+    - `Unit` is the distance unit: `WaitStates` (`s_nop` / any instruction issued, gfx950) or `IndependentValu` (only independent VALU instructions count, as in the gfx1250 WMMA `v_nop` rule, where co-execution state changes the count).
   - `source` cites the evidence: LLVM `GCNHazardRecognizer` function, probe name, or ISA page.
 
   The gfx950 table is the audit table of [`trust-inventory.md`](trust-inventory.md) §5.1. `hazards.rs` keeps its algorithms (value-level ready map, post-RA physical passes) and reads the numbers per rule.
