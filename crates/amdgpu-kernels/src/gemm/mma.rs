@@ -1,6 +1,9 @@
 //! GEMM MMA helpers: the scaled / unscaled MFMA blocks on loop-carried operands and the deferred block-scale updates.
 
-use super::*;
+use amdgpu_dsl::{FnBuilder, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::ev;
+use amdgpu_tile::mma::TiledMma;
+use super::Elem;
 
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]

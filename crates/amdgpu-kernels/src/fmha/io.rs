@@ -258,3 +258,21 @@ pub fn combine_kernel(b: &mut FnBuilder, per_thread: usize) {
     let (rows_v, splits_v) = (b.bind_i32(rows), b.bind_i32(splits));
     amdgpu_tile::epilogue::combine_splits(b, ohat, lse, out, rows_v, splits_v, t, row, per_thread, Ext::ka(0x20) - Ext::c(1));
 }
+
+impl super::Operands for FmhaIo {
+    fn q(&self) -> &Tensor { &self.q }
+    fn k(&self) -> &Tensor { &self.k }
+    fn v(&self) -> &Tensor { &self.v }
+    fn o(&self) -> &Tensor { &self.o }
+    fn qsc(&self) -> &Tensor { &self.qsc }
+    fn ksc(&self) -> &Tensor { &self.ksc }
+    fn vsc(&self) -> Option<&Tensor> { self.vsc.as_ref() }
+    fn ptr_vd(&self) -> ValueId { self.ptr_vd }
+    fn gqa(&self) -> ValueId { self.gqa }
+    fn heads(&self) -> ValueId { self.heads }
+    fn s_len(&self) -> I32 { self.s_len.clone() }
+    fn kv_len(&self) -> I32 { self.kv_len.clone() }
+    fn kvs(&self) -> Option<&KvsArgs> { self.kvs.as_ref() }
+    /// the 656-byte fmha_v3 ABI: H at 0x140, SQ at 0x060, SK at 0x110, the softmax scale at 0x050
+    fn abi(&self) -> super::LaunchAbi { super::LaunchAbi { h_ka: 0x140, sq_ka: 0x060, sk_ka: 0x110, scale_ka: 0x050 } }
+}

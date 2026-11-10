@@ -117,3 +117,22 @@ Steps 1–2 are kernel-opt work once M5 / M6 have landed. Step 3 is sched's M7.
 - **Where `Elem` / `Scales` live.** They describe operand formats (fp8 / fp4 / i8 / bf16, Block128 / Mx128 / Mx32 / RowCol). L2 is the minimum; if an L3 atom table needs them (`amdgpu-isa` already distinguishes the MFMA formats), they belong one layer lower. Decide in step 1.
 - **`PtScale` / `PtMode` (per-tensor FP8).** They are block state (per-tensor descales folded into the Q / K scale), so they move with `BlockState`. The ABI of the descale pointers stays in `fp8pt.rs`'s `declare_io_pt`.
 - **Verifier facts.** `block3_at`'s trusted ranges reference kernarg symbols through `Ext::ka(offset)`. With `LaunchAbi` the offsets become data, so the facts are built from `abi.*`. This is the same pattern `templates::grid::xcd_tile_head` already uses (`h_ka`, `sq_ka`).
+
+## 6. Status: steps 1 and 2 done (kernel-opt, `narrow-types-ko`)
+
+Both steps are md5-neutral: `amdc md5-manifest --check` reports 234 kernels, 0 differences.
+
+- **Attention.**
+  - `Operands` and `LaunchAbi` are defined in `fmha/block3.rs`; `FmhaIo` implements `Operands` in `fmha/io.rs`.
+  - `KvRing3::{new, new_x, rebuilt}`, `block3*`, `store_out3*` and `store_partial3` take `&dyn Operands`.
+  - The literal kernarg offsets of the block launch now come from `io.abi()`: H `0x140`, SQ `0x060`, SK `0x110`, softmax scale `0x050`.
+  - The final `LaunchAbi` has `scale_ka` where §2.2 sketched `gqa_ka`. GQA is reached through `Operands::gqa()`, so no GQA offset is needed.
+  - `declare_io` (the ABI) moved from `block3.rs` to `fmha/mod.rs`, so `block3.rs` holds no ABI declaration.
+- **GEMM.**
+  - `Body` holds `params: BodyParams` (built by `GemmConfig::body_params`) instead of the configuration.
+  - The convolution row source is the trait `body::ConvSource` (`tile_voffsets`, `zero`), implemented by `ConvRt` in `gemm/mod.rs`. It is named `ConvSource` rather than §2.3's `RowSource` to avoid a clash with `amdgpu_tile::rows::RowSource`.
+  - `PANEL_KB` appears in `body.rs` only in a comment, so `BodyParams` has no `panel_kb`.
+- **Explicit imports.** `fmha/{attn3, block3}.rs` and `gemm/{abi, body, dma, epilogue, mma}.rs` have no `use super::*` and no `amdgpu_tile::*` glob. Imports name the source crates directly.
+- **Family items still imported through `super::`** (they move with the body or stay as configuration, see §2):
+  - fmha: `io::FmhaBlock`, `block3::Operands`, `attn3::attention_orientation`;
+  - gemm: `Elem`, `Scales`, `Cfg`, `MoeCx`, `MoeStage`, `ConvCfg`, `EPI_PITCH`, `PANEL_KB`, `dma::Dma`, `mma::*`.

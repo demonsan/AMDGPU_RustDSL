@@ -1,7 +1,32 @@
 //! The GEMM main-loop body (`PipeBody` of the register-staged cadence): scale panel, MXFP4 shuffled scales, operand reads and MMAs.
 
-use super::*;
+use amdgpu_dsl::{DType, FnBuilder, I32, Opnd, ValueId, VarId};
+use amdgpu_tile::{ev, ox, PipeBody, Role, Shared, SlotIdx, TileIt};
+use amdgpu_tile::copy::LdsPart;
+use amdgpu_tile::mma::TiledMma;
+use super::dma::Dma;
+use super::Elem;
+use super::mma::{bs_fma, mma_blocks, mma_var};
+use super::Scales;
 
+/// The configuration numbers the body reads (instead of the whole `GemmConfig`): operand format, scale form, wave tile and the MMA
+/// counts placed around the top-of-tile sync. Built by `GemmConfig::body_params` (docs/l2-family-bodies.md §2.3).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BodyParams {
+    pub(crate) elem: Elem,
+    pub(crate) scales: Scales,
+    pub(crate) wave_m: i64,
+    pub(crate) wave_n: i64,
+    pub(crate) pre_sync_mmas: usize,
+    pub(crate) mid_sync_mmas: usize,
+}
+
+/// A-operand row source of the implicit-GEMM convolution: per K tile (key offset `key0`), the voffset of every A DMA issue (the input
+/// pixel of the issue's row, or out of range) and the soffset they go with. The conv address maths stays with the op (`ConvRt`).
+pub(crate) trait ConvSource {
+    fn tile_voffsets(&self, b: &mut FnBuilder, key0: &I32) -> Vec<ValueId>;
+    fn zero(&self) -> ValueId;
+}
 /// The scale panel: every K group's scales of the CTA in LDS, written once in the prologue (`prologue_stores`).
 pub(crate) struct Panel {
     pub(crate) sh: Shared,
@@ -73,7 +98,7 @@ pub(crate) fn sfa_transpose_proof() {
 }
 
 pub(crate) struct Body {
-    pub(crate) cfg: Cfg,
+    pub(crate) params: BodyParams,
     /// K tiles of this CTA's loop (K / 128, or KS with split-K)
     pub(crate) kb_v: ValueId,
     /// the E8M0 scale panel (Scales::Mx128)
@@ -112,7 +137,7 @@ pub(crate) struct Body {
     /// `Scales::Block128`: the per-tile fp32 scale loads (voffsets; `shift` unused)
     pub(crate) bs128: Option<Mx32>,
     /// implicit-GEMM convolution: the per-tile A addressing
-    pub(crate) conv: Option<ConvRt>,
+    pub(crate) conv: Option<Box<dyn ConvSource>>,
     /// split-K: this split's first K tile
     pub(crate) zb: Option<ValueId>,
     /// `Elem::Fp8Bs`: the block products of the tile waiting for their scaled accumulation (`bs_fma`)
@@ -162,7 +187,7 @@ impl Body {
                 n += 1;
             }
         }
-        let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks, nma as u32, self.w4_shift);
+        let p = mma_blocks(b, &self.mma, self.params.elem, self.unit.map(|u| u.0), &blocks, nma as u32, self.w4_shift);
         self.pending.borrow_mut().extend(p);
         self.npre_done = n;
     }
@@ -180,7 +205,7 @@ impl Body {
                 (sa, vec![sb])
             });
         }
-        if self.cfg.scales == Scales::RowCol || self.cfg.scales == Scales::None {
+        if self.params.scales == Scales::RowCol || self.params.scales == Scales::None {
             // unit E8M0 scales (127 in every byte): the fp32 row / column scales are applied in the epilogue
             let (u, v) = self.unit.expect("unit scales");
             return (vec![u, u], vec![v]);
@@ -208,7 +233,7 @@ impl Body {
             let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_f32(rs, *v, so, 0)).collect() };
             return (ld(b, self.rsrc_sfa, &mx.voff_a), ld(b, self.rsrc_sfb, &mx.voff_b));
         }
-        if let (Some(mx), Elem::Bf16W4) = (&self.mx32, self.cfg.elem) {
+        if let (Some(mx), Elem::Bf16W4) = (&self.mx32, self.params.elem) {
             // A16W4: no A scales (zeros, unused); B [N][K / 32]: the 8 group bytes of the tile per n block, as two dwords (words 2 j, 2 j + 1)
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
             let sa = (0..mx.voff_a.len()).map(|_| b.c_i32(0)).collect();
@@ -278,7 +303,7 @@ impl Body {
     }
     /// The B scale word of n block j.
     fn sb_sel(&self, j: usize) -> usize {
-        if self.cfg.elem == Elem::Bf16W4 {
+        if self.params.elem == Elem::Bf16W4 {
             2 * j
         } else if self.mx32.is_some() {
             j
@@ -292,7 +317,7 @@ impl Body {
     /// An operand fragment read into AGPRs.
     /// A fragments (m blocks) of the wave (A8W4 keeps lo + hi fragments: the A variables are twice as many)
     fn n_a(&self) -> usize {
-        (self.cfg.wave_m() / 16) as usize
+        (self.params.wave_m / 16) as usize
     }
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
@@ -300,7 +325,7 @@ impl Body {
     }
     /// The whole tile `t` into registers (prologue: tile 0).
     fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
-        let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
+        let (nm, nn) = ((self.params.wave_m / 16) as usize, (self.params.wave_n / 16) as usize);
         let (sa, sb) = self.load_scales(b, ox(t.it), &t.cur);
         let sa: Vec<ValueId> = sa.into_iter().map(|v| self.scale_word(b, v)).collect();
         let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
@@ -355,7 +380,7 @@ impl Body {
         let body = |b: &mut FnBuilder, u: &mut Units| {
             // bf16 (two dependent K-half MFMAs per block): the blocks of a PAIR of rows form one unit (first halves of all, then second
             // halves), so a block's second MFMA issues 8 MFMAs after its first (4 per row left 120 s_nops of MFMA dependency stalls)
-            let rows_per_unit = if self.cfg.elem == Elem::Bf16 && nm % 2 == 0 { 2 } else if self.cfg.elem == Elem::Bf16W4 { nm } else { 1 };
+            let rows_per_unit = if self.params.elem == Elem::Bf16 && nm % 2 == 0 { 2 } else if self.params.elem == Elem::Bf16W4 { nm } else { 1 };
             for (lo, hi) in [(0, half), (half, nn)] {
                 for i0 in (0..nm).step_by(rows_per_unit) {
                     let rows = i0..i0 + rows_per_unit;
@@ -363,9 +388,9 @@ impl Body {
                     for i in rows.clone() {
                         let todo: Vec<usize> = (lo..hi).filter(|&j| !(lo == 0 && i * half + j < self.npre_done)).collect(); // the rest were issued before the barrier
                         let (w, by) = self.sa_sel(i);
-                        if self.cfg.elem == Elem::Fp8 {  // one unit per block
+                        if self.params.elem == Elem::Fp8 {  // one unit per block
                             for &j in &todo {
-                                u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
+                                u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.params.elem, self.unit.map(|u| u.0), self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
                             }
                         } else {
                             blocks.extend(todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by)));
@@ -373,7 +398,7 @@ impl Body {
                     }
                     if !blocks.is_empty() {
                         u.capture(b, format!("mma.i{i0}+{}h{lo}", rows_per_unit), |b| {
-                            let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks, nm as u32, self.w4_shift);
+                            let p = mma_blocks(b, &self.mma, self.params.elem, self.unit.map(|u| u.0), &blocks, nm as u32, self.w4_shift);
                             self.pending.borrow_mut().extend(p);
                         });
                     }
@@ -455,7 +480,7 @@ impl Body {
         let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
             // mixed precision: A advances (images) key0 bytes (128 A bytes per image per 128-byte fp4 B tile)
-            let nimg = self.cfg.elem.a_images();
+            let nimg = self.params.elem.a_images();
             let ka = if nimg > 1 {
                 let v = b.bind_i32((key0.clone() << (nimg.trailing_zeros() as i32)) + ev(self.a_org)); b.read_first_lane(v)
             } else {
@@ -472,46 +497,12 @@ impl Body {
         });
         // implicit-GEMM conv: this tile's channel block and tap (wave uniform), then per A issue the input pixel's voffset (or out of range)
         let conv_vo: Option<Vec<ValueId>> = self.conv.as_ref().map(|cv| {
-            let (_, vo) = u.capture(b, "ab.conv", |b| {
-                let cc = cv.cfg;
-                let trs = cc.t * cc.r * cc.s;
-                let rs = cc.r * cc.s;
-                // t / trs, rs / s by multiply-shift (exact for t < 2^12 = 4096 K tiles, checked)
-                let magic = |d: i32| -> i64 { ((1i64 << 24) + d as i64 - 1) / d as i64 };
-                for d in [trs, rs, cc.s] {
-                    let m = magic(d);
-                    for x in 0..(1i64 << 12) {
-                        assert_eq!((x * m) >> 24, x / d as i64, "conv: multiply-shift by {d}");
-                    }
-                }
-                let t = b.bind_i32(key0.clone().lshr(7));
-                let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(24));
-                let tap = b.bind_i32(ev(t) - ev(cb) * trs);
-                let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(24));
-                let tr = b.bind_i32(ev(tap) - ev(dz) * rs);
-                let rr = b.bind_i32((ev(tr) * magic(cc.s) as i32).lshr(24));
-                let ss = b.bind_i32(ev(tr) - ev(rr) * cc.s);
-                let toff = b.bind_i32((((ev(dz) * cc.dil) * ev(cv.h) + ev(rr) * cc.dil) * ev(cv.w) + ev(ss) * cc.dil) * ev(cv.c) * 2 + (ev(cb) << 7));
-                let big = b.c_i32(0x7fff_fff0);
-                cv.rows
-                    .iter()
-                    .map(|&(base, id0, ih0, iw0)| {
-                        let (zi, yi, xi) = (b.bind_i32(ev(id0) + ev(dz) * cc.dil), b.bind_i32(ev(ih0) + ev(rr) * cc.dil), b.bind_i32(ev(iw0) + ev(ss) * cc.dil));
-                        let ok = b.bind_i32(
-                            ev(zi).ge(0).select_i32(1, 0) & ev(zi).lt(ev(cv.di)).select_i32(1, 0) & ev(yi).ge(0).select_i32(1, 0) & ev(yi).lt(ev(cv.h)).select_i32(1, 0)
-                                & ev(xi).ge(0).select_i32(1, 0) & ev(xi).lt(ev(cv.w)).select_i32(1, 0),
-                        );
-                        let ok = b.bind_cond(ev(ok).eq(1));
-                        let v = b.bind_i32(ev(base) + ev(toff));
-                        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(big) })
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let (_, vo) = u.capture(b, "ab.conv", |b| cv.tile_voffsets(b, &key0));
             vo
         });
         // (A8W4: a third pass, the hi A image: LDS + a_hi, global + 128 bytes)
         let mut passes = vec![(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, 0usize, 0i32), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave, 1, 0)];
-        for k in 1..self.cfg.elem.a_images() {
+        for k in 1..self.params.elem.a_images() {
             passes.push((&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, k + 1, k as i32 * self.a_hi));
         }
         for (bi, (sh, dma, rsrc, wave, oi, lds_off)) in passes.into_iter().enumerate() {
@@ -536,7 +527,7 @@ impl Body {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
                 // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
                 let (g, so) = match (&conv_vo, bi) {
-                    (Some(vo), 0) => (vo[q], self.conv.as_ref().map(|c| c.zero).unwrap()),
+                    (Some(vo), 0) => (vo[q], self.conv.as_ref().map(|c| c.zero()).unwrap()),
                     _ => (g, orgs[oi]),
                 };
                 u.capture(b, format!("ab.{uname}.{q}"), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
@@ -565,7 +556,7 @@ impl PipeBody for Body {
         self.stage_now(b, key0, slot);
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
-        if self.cfg.scales == Scales::Mx128 {
+        if self.params.scales == Scales::Mx128 {
             let p = self.panel.as_ref().expect("scale panel");
             let sj = &p.sfa;
             let pr = p.sh.at(&SlotIdx::new(0, 0));
@@ -605,7 +596,7 @@ impl PipeBody for Body {
         }
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
-        let mut v: Vec<(DType, Opnd)> = (0..(self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)).map(|_| (DType::Frag4, Opnd::Val(self.zero4))).collect();
+        let mut v: Vec<(DType, Opnd)> = (0..(self.params.wave_m / 16) * (self.params.wave_n / 16)).map(|_| (DType::Frag4, Opnd::Val(self.zero4))).collect();
         if let Some((bf, af, sa, sb)) = &self.staged {
             v.extend(bf.iter().chain(af.iter()).map(|x| (DType::Frag8, Opnd::Val(*x))));
             v.extend(sa.iter().map(|x| (DType::I32, Opnd::Val(*x))));
@@ -614,13 +605,13 @@ impl PipeBody for Body {
         v
     }
     fn bind_state(&mut self, vars: &[VarId]) {
-        let na = ((self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)) as usize;
+        let na = ((self.params.wave_m / 16) * (self.params.wave_n / 16)) as usize;
         self.acc = vars[..na].to_vec();
         if let Some((bf, af, sa, sb)) = self.staged.take() {
             let (nb, nf, ns, nsb) = (bf.len(), af.len(), sa.len(), sb.len());
             let r = &vars[na..];
             self.rv = Some((r[..nb].to_vec(), r[nb..nb + nf].to_vec(), r[nb + nf..nb + nf + ns].to_vec(), r[nb + nf + ns..nb + nf + ns + nsb].to_vec()));
-            let nimg = self.cfg.elem.a_images();
+            let nimg = self.params.elem.a_images();
             if nimg > 1 {
                 let av = &r[nb..nb + nf];
                 let nm = nf / nimg;
@@ -631,15 +622,15 @@ impl PipeBody for Body {
     /// The next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them.
     fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
         self.set_parity(b, _t);
-        if self.cfg.mid_sync_mmas > 0 {
+        if self.params.mid_sync_mmas > 0 {
             let from = self.npre_done;
-            self.early_mmas(b, from, from + self.cfg.mid_sync_mmas);
+            self.early_mmas(b, from, from + self.params.mid_sync_mmas);
         }
     }
     /// The first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there).
     fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
         self.set_parity(b, _t);
-        let npre = self.cfg.pre_sync_mmas;
+        let npre = self.params.pre_sync_mmas;
         self.early_mmas(b, 0, npre);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {

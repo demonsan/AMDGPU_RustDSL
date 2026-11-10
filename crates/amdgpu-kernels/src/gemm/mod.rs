@@ -106,6 +106,47 @@ struct ConvRt {
 }
 
 /// q = n / d (both >= 0, n < 2^22) by a float reciprocal and one integer correction step.
+impl body::ConvSource for ConvRt {
+    fn tile_voffsets(&self, b: &mut FnBuilder, key0: &I32) -> Vec<ValueId> {
+        let cc = self.cfg;
+        let trs = cc.t * cc.r * cc.s;
+        let rs = cc.r * cc.s;
+        // t / trs, rs / s by multiply-shift (exact for t < 2^12 = 4096 K tiles, checked)
+        let magic = |d: i32| -> i64 { ((1i64 << 24) + d as i64 - 1) / d as i64 };
+        for d in [trs, rs, cc.s] {
+            let m = magic(d);
+            for x in 0..(1i64 << 12) {
+                assert_eq!((x * m) >> 24, x / d as i64, "conv: multiply-shift by {d}");
+            }
+        }
+        let t = b.bind_i32(key0.clone().lshr(7));
+        let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(24));
+        let tap = b.bind_i32(ev(t) - ev(cb) * trs);
+        let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(24));
+        let tr = b.bind_i32(ev(tap) - ev(dz) * rs);
+        let rr = b.bind_i32((ev(tr) * magic(cc.s) as i32).lshr(24));
+        let ss = b.bind_i32(ev(tr) - ev(rr) * cc.s);
+        let toff = b.bind_i32((((ev(dz) * cc.dil) * ev(self.h) + ev(rr) * cc.dil) * ev(self.w) + ev(ss) * cc.dil) * ev(self.c) * 2 + (ev(cb) << 7));
+        let big = b.c_i32(0x7fff_fff0);
+        self.rows
+            .iter()
+            .map(|&(base, id0, ih0, iw0)| {
+                let (zi, yi, xi) = (b.bind_i32(ev(id0) + ev(dz) * cc.dil), b.bind_i32(ev(ih0) + ev(rr) * cc.dil), b.bind_i32(ev(iw0) + ev(ss) * cc.dil));
+                let ok = b.bind_i32(
+                    ev(zi).ge(0).select_i32(1, 0) & ev(zi).lt(ev(self.di)).select_i32(1, 0) & ev(yi).ge(0).select_i32(1, 0) & ev(yi).lt(ev(self.h)).select_i32(1, 0)
+                        & ev(xi).ge(0).select_i32(1, 0) & ev(xi).lt(ev(self.w)).select_i32(1, 0),
+                );
+                let ok = b.bind_cond(ev(ok).eq(1));
+                let v = b.bind_i32(ev(base) + ev(toff));
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(big) })
+            })
+            .collect::<Vec<_>>()
+    }
+    fn zero(&self) -> ValueId {
+        self.zero
+    }
+}
+
 fn div_rt(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
     // (v_cvt_f32_i32 = CvtF32I32: int -> float; v_cvt_i32_f32 = CvtI32F32: float -> int)
     let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, n);
@@ -262,6 +303,10 @@ const EPI_PITCH: i64 = 272;
 /// Scale panel capacity in K groups of 128 (the vendor `sp64`): K <= 8192.
 const PANEL_KB: i64 = 64;
 impl GemmConfig {
+    /// the numbers the main-loop body reads (ody::BodyParams)
+    fn body_params(&self) -> BodyParams {
+        BodyParams { elem: self.elem, scales: self.scales, wave_m: self.wave_m(), wave_n: self.wave_n(), pre_sync_mmas: self.pre_sync_mmas, mid_sync_mmas: self.mid_sync_mmas }
+    }
     fn wave_m(&self) -> i64 {
         self.cta_m / 2
     }
@@ -890,11 +935,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         (sc_s.clone(), va, vb, wofs, rd)
     });
     let body = Body {
-        cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
+        params: cfg.body_params(), kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
         a_rd_x: (1..nimg).map(|k| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (k * a_bytes) as i32)).collect(); h }).collect(),
         a_hi: a_bytes as i32,
         w4_shift: (cfg.elem == Elem::Bf16W4).then(|| b.bind_i32((lane.lane().lshr(5)) << 3)),
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false), sc_dma,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt.map(|c| Box::new(c) as Box<dyn body::ConvSource>), pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false), sc_dma,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {

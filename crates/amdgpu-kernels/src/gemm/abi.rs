@@ -1,6 +1,10 @@
 //! GEMM kernarg ABI and host contracts (dense, conv, MoE).
 
-use super::*;
+use amdgpu_dsl::{DType, Ext, FnBuilder};
+use super::ConvCfg;
+use super::MoeStage;
+use super::PANEL_KB;
+use super::Scales;
 
 /// The 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950), declared in offset order.
 pub(crate) fn declare_abi(b: &mut FnBuilder) {
