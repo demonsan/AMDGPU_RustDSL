@@ -410,6 +410,18 @@ Additions the output should support: `--json`; `--check` (every pass must list >
 11. **Where the `.co` step lives.** The plan's "from Function to assembly text / .co" has no `.co` code in Rust; if P1 wants a `finalize` pass (`clang`), it is a new capability (Python JIT does it today), not a refactor.
 12. **Size of `lower.rs` (5243 lines) and `gpu_verify.rs` (3046 lines)**: splitting them is the bulk of P1's mechanical work; each split must be a move-only commit with the md5 manifest unchanged (plan rule: no behaviour change mixed into a move).
 
+## 8. As built (branch `pass-mgr`)
+
+- `crates/amdgpu-compiler/src/pass/mod.rs`: `PassInfo` (name, stage, target dependence, gate, evidence), runnable MIR passes `Pass { info, run }`,
+  the gfx950 bodies `SCHEDULED` / `UNSCHEDULED` (the same pass objects, `Path` selects `hazard-value` / `hz-fill` strictness), the descriptions
+  `FRONT` (source + lowering + `assign-agpr`) and `BACK` (final checks, tail), the ladders `OUTER_LADDER` / `inner_ladder` and `retryable`;
+  `lower_and_allocate` runs them. A unit test requires an evidence entry for every pass.
+- `amdc passes [--target gfx950] [--evidence]` prints the pipeline and the ladders (`--target gfx1250`: not implemented, specification only).
+- The compile policy is declared data: `amdgpu_dsl::CompileProfile::policy()` → `CompilePolicy { lower_base, lower, m0_reuse, sched_preset }`
+  (`Function::compile_policy`); the compiler no longer inspects kernel names (the only name-specific extras, `saddrlds,edgepad,salubr` of the v3
+  `_t128`, are declared by that kernel as `lower_opts`). `policy_name` remains only for the `AMDC_SCHED_ADD` experiment matching.
+- Every step: md5 manifest 0 differences (234 kernels), certificates unchanged.
+
 ## Appendix: counts
 
 Catalogued: 7 pre-lowering IR / analysis rows, 7 lowering rows, 1 AGPR row, 13 scheduling rows (+4 scheduler analyses), 3 MIR check / hazard rows,
