@@ -114,7 +114,7 @@ fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
 
 ### 1.5 发射单元与 weaver
 
-stage 返回 `Units`（`amdgpu_tile::weave`），而不是直接发射：
+stage 返回 `Units`（`amdgpu_codegen::weave`），而不是直接发射：
 
 ```
 m_phase：pv.setup  pv.rowsum  pv.read.h0e0 pv.mma.h0e0 …  qk.setup(bias MFMA)  qk.read0 qk.mma0 … qk.end

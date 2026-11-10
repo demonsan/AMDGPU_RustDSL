@@ -31,8 +31,6 @@ pub mod handoff;
 pub mod orient;
 pub mod rowsum;
 pub mod mma;
-pub mod weave;
-pub mod weave_auto;
 pub mod stage;
 pub mod prims;
 pub mod tileop;

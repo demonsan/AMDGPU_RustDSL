@@ -134,10 +134,10 @@ impl DmaPart {
     }
     /// `issue_buffer` as captured emission units: the per-tile setup (soffset, M0) and one unit per DMA instruction (each under the slot's write
     /// marker).
-    pub fn issue_buffer_units(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) -> crate::weave::Units {
+    pub fn issue_buffer_units(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) -> amdgpu_codegen::weave::Units {
         assert_eq!(slot.sh.name, self.sh.name, "DmaPart: slot of another buffer");
         let n = self.row_c.len() as i64;
-        let mut u = crate::weave::Units::new();
+        let mut u = amdgpu_codegen::weave::Units::new();
         let (_, (so, m0)) = u.capture(b, format!("dma.{}.setup", self.sh.name), |b| {
             let so = {
                 let v = b.bind_i32(key0.clone() * &self.src.stride + ev_(bf.base));

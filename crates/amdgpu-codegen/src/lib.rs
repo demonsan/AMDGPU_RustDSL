@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod weave;
+pub mod weave_auto;
 pub mod agpr;
 pub mod asm;
 pub mod asm_check;

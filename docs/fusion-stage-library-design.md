@@ -244,7 +244,7 @@ M{scatter: slot_mapping → 页表位置, 布局 = cache 布局}
 
 ### 7.1 第一层：stage = 编译期按形状实例化 → 发射单元
 
-stage 的参数（形状、dtype、slot、tile 号等）在调用点给定。实例化后得到一组 `Unit`（`crates/amdgpu-tile/src/weave.rs`），每个单元带：
+stage 的参数（形状、dtype、slot、tile 号等）在调用点给定。实例化后得到一组 `Unit`（`crates/amdgpu-codegen/src/weave.rs`），每个单元带：
 
 | 字段 | 含义 |
 |---|---|

@@ -18,7 +18,7 @@
 pub use crate::lane::TileIt;
 use crate::lane::Role;
 use crate::shared::SlotIdx;
-use crate::weave::{rotate, Part, RotStage};
+use amdgpu_codegen::weave::{rotate, Part, RotStage};
 
 /// The `OneWindow` iteration: stage(t+2) | window(t) | complete(t+2) + wait + barrier.
 const ONE_WINDOW_PARTS: [Part; 3] = [

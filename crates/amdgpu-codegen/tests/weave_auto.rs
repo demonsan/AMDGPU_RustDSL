@@ -1,8 +1,8 @@
-//! `weave_auto` (amdgpu_tile::weave_auto): the cost-based weave order over captured units is a topological order, deterministic, better than the declaration order in its own model when reads can be
+//! `weave_auto` (amdgpu_codegen::weave_auto): the cost-based weave order over captured units is a topological order, deterministic, better than the declaration order in its own model when reads can be
 //! hoisted, and keeps barriers and everything ordered by the statement facts where they are.
 use amdgpu_dsl::{DType, FnBuilder, Op, ValueId};
-use amdgpu_tile::weave::{check_order, Units, Weaver};
-use amdgpu_tile::weave_auto::{auto_order, simulate, Model};
+use amdgpu_codegen::weave::{check_order, Units, Weaver};
+use amdgpu_codegen::weave_auto::{auto_order, simulate, Model};
 
 fn base() -> (FnBuilder, ValueId, ValueId) {
     let mut b = FnBuilder::new("auto", 64);

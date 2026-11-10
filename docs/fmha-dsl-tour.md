@@ -181,7 +181,7 @@ fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
 
 `_vs128` / `_kvsplit` 证明了 12 个交接，`_t128` 证明了 4 个。
 
-### §3e 发射单元与 weaver（`amdgpu_tile::weave`）
+### §3e 发射单元与 weaver（`amdgpu_codegen::weave`）
 
 stage 实例返回发射单元（`Units`），而不是直接发射。`m_phase` 的单元如下：
 

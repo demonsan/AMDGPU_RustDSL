@@ -33,7 +33,7 @@ use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
-use amdgpu_tile::weave::Units;
+use amdgpu_codegen::weave::Units;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, StageContract, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};

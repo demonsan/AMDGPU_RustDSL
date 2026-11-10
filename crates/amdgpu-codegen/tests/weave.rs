@@ -1,7 +1,7 @@
 //! The weaver: explicit orders are checked (permutation + topological order) before anything is emitted; `spread` places fillers between skeleton units.
 
 use amdgpu_dsl::{FnBuilder, Op, Opnd};
-use amdgpu_tile::weave::{check_order, Units, Weaver};
+use amdgpu_codegen::weave::{check_order, Units, Weaver};
 
 /// a -> b (b uses a's value) and an independent c
 fn three(b: &mut FnBuilder) -> Units {
