@@ -158,11 +158,16 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | `amdgpu-layout` | 布局代数 | sym |
 | `amdgpu-isa` | gfx950 copy / MMA atom | layout |
 | `amdgpu-safeasm` | safe-asm 窗口（[`safe-asm-design.md`](safe-asm-design.md)） | – |
-| `amdgpu-dsl` | IR（区域树 + 编织区域标记、寄存器规划 `RegMark`、区域策略 `RegionDecl`）、`FnBuilder`、表达式层、形状特化（`specialize.rs`）、irv1 文本打印/解析（`ir_text.rs` + 生成的 `ir_codec.rs`）与 α 结构相等（`print.rs`） | sym、safeasm、layout |
-| `amdgpu-tile` | 全部 tile 抽象（TiledCopy/TiledMma/partition、LdsPlan、Pipeline、softmax、frag、行 DMA、合同、handoff）、stage 库与通用原语、weaver、算子图 / 骨架生成 | dsl、layout、isa |
-| `amdgpu-kernels` | 全部 kernel：`fmha/`（v3 + FMHA I/O）、`gemm/`、`mlp/`、`norm/`，每个都是"算子图（`graph.rs` + `*.graph.json`）→ 生成的骨架（`skeleton_*.rs`）→ slot 实现 + stage 实例"；`probes/`、`verifier_cases/`、`ir_proof.rs`、注册表 `registry.rs` | dsl、tile、layout、isa、safeasm |
-| `amdgpu-codegen` | lowering、调度（含按区域策略）、RA + 寄存器规划检查与区域报告（`regplan.rs`）、hazard/wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify`/`gpu_protocol`/函数证明、MIR 打印（不依赖 kernels/tile） | sym、dsl、safeasm |
-| `amdc` | CLI（list / emit / print-ir / ir-check / regplan / jit-info / gpu-verify / gen-host / opgraph / skeleton / backend / simmodel / mops / mir-roundtrip；`--from-ir`、`--specialize`）+ 库 `amdc::hostgen` / `amdc::jit` | dsl、compiler、kernels、tile |
+| `amdgpu-target` | 目标描述（纯数据，[`target-design.md`](target-design.md)）：`gfx950` 的波宽、寄存器堆、LDS、计数器、hazard / 延迟 / 调度模型常量；逐指令表（按 `MOp`）在 `amdgpu-codegen/src/target/gfx950/` | – |
+| `amdgpu-dsl` | **L4 IR**：区域树 + 编织区域标记、寄存器规划 `RegMark`、区域策略 `RegionDecl`、`CompilePolicy`、`FnBuilder`、表达式层、形状特化（`specialize.rs`）、irv1 文本打印/解析（`ir_text.rs` + 生成的 `ir_codec.rs`）与 α 结构相等（`print.rs`） | sym、safeasm |
+| `amdgpu-codegen` | **L4 后端 + Weaver**：lowering、调度（含按区域策略）、RA + 寄存器规划检查与区域报告（`regplan.rs`）、hazard/wait、`hzfill`、emit、LLVM MIR 桥、`gpu_verify`/`gpu_protocol`/函数证明、MIR 打印、编织器（`weave.rs` / `weave_auto.rs`）、pass 管理器（`pass/`，`amdc passes`）（不依赖 kernels/tile） | sym、dsl、safeasm、target |
+| `amdgpu-tile` | **L3 函数层**：tile 抽象（TiledCopy/TiledMma/partition、LdsPlan、softmax、frag、行 DMA 与 GEMM DMA 计划 `dma_plan.rs`、epilogue、规约原语、`TileIt`/`Roles`）、通用原语、handoff / 主机合同 | dsl、layout、isa、target、codegen |
+| `amdgpu-stage` | **L2 编排层**：stage 库与组合（`stage.rs`）、stage 合同（`contract_stage.rs`）、pipeline 驱动（`pipeline.rs`：`Cadence`）、KV 切分 / 网格组件（`components.rs`）、流水线模板（`templates/`：ring 对、split、grid、select、scan）、家族 body（`attention/`：`KvRing3`、`AttnBody3`、`Operands`；`gemm/`：寄存器暂存 body、`Elem` / `Scales`） | dsl、layout、isa、tile、codegen |
+| `amdgpu-graph` | **L1 图层**：算子图（`opgraph/`：割、预算、JSON、骨架生成器）与 dispatch 规则（`dispatch.rs`，`amdc dispatch`） | layout、tile、stage |
+| `amdgpu-kernels` | 全部 kernel：`fmha/`（v3 + FMHA I/O）、`gemm/`（配置、ABI、epilogue、骨架 slot）、`mlp/`、`norm/` …，每个都是"算子图（`graph.rs` + `*.graph.json`）→ 生成的骨架（`skeleton_*.rs`）→ slot 实现 + stage 实例"；`probes/`、`verifier_cases/`、`ir_proof.rs`、注册表 `registry.rs`、可达名清单 `reachable.rs` | dsl、layout、isa、tile、stage、graph、codegen、safeasm |
+| `amdc` | CLI（list / emit / print-ir / ir-check / regplan / jit-info / gpu-verify / gen-host / opgraph / skeleton / dispatch / passes / md5-manifest / backend / simmodel / mops / mir-roundtrip；`--from-ir`、`--specialize`）+ 库 `amdc::hostgen` / `amdc::jit` | dsl、codegen、kernels、tile、graph |
+
+分层与迁移记录：[`refactor-4layer-plan.md`](refactor-4layer-plan.md)、[`crate-split.md`](crate-split.md)（§6 状态）。
 
 需要具体 kernel 的测试在 `crates/amdgpu-kernels/tests/`（主机合同对照在 `crates/amdc/tests/`）；编译器自身的测试只用测试内构造的 kernel。
 

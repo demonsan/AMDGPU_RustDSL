@@ -33,3 +33,7 @@ abstraction can express it.
 - One owner per moved file at a time; moves land in small merges so branches do not rot.
 - No behaviour change is mixed into a move commit.
 - Per-shape orchestration stays in kernel code (not in L1 / L2 generic rules).
+
+## 4. Status
+
+P0 and P1 landed (see [`crate-split.md`](crate-split.md) §6 for the move list and [`current-status.md`](current-status.md) for the crate map): `amdgpu-graph` (L1), `amdgpu-stage` (L2), `amdgpu-tile` (L3), `amdgpu-dsl` + `amdgpu-codegen` + `amdgpu-target` (L4); the Weaver is in `amdgpu-codegen`; `amdc passes` lists the pipeline. Every move was gated by the golden md5 manifest.

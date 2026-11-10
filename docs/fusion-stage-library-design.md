@@ -75,7 +75,7 @@
 
 ### 2.1 StageContract（在现有结构上扩展）
 
-现有 `StageContract`（`crates/amdgpu-dsl/src/lib.rs`）的字段：`live_in` / `live_out`（`StageVal`：名字、值、元素表、位宽、存储）、`lds_freed`、`lds_reused`、`barrier_phase`、`roles`。GV-STAGE 在 region 边界检查它们。另外 `amdgpu-tile/src/contract_stage.rs` 的 `StageBoundary` 已经带了 pinned 寄存器区间和在途计数容忍度。
+现有 `StageContract`（`crates/amdgpu-dsl/src/lib.rs`）的字段：`live_in` / `live_out`（`StageVal`：名字、值、元素表、位宽、存储）、`lds_freed`、`lds_reused`、`barrier_phase`、`roles`。GV-STAGE 在 region 边界检查它们。另外 `amdgpu-stage/src/contract_stage.rs` 的 `StageBoundary` 已经带了 pinned 寄存器区间和在途计数容忍度。
 
 库化需要的补充只有四项：
 
@@ -98,7 +98,7 @@
 
 FMHA 这一轮的经验（[`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md)、[`fmha-4wave-design.md`](fmha-4wave-design.md)）说明：同样的 stage 组合，编排不同，性能可以差 10–40 %。所以编排必须留在 kernel 里可改，库不应替 kernel 决定它。
 
-现有 `Pipeline`（`amdgpu-tile/src/pipeline.rs`，几种 `Cadence`）的定位：它是**编排的辅助件**，供 kernel 选用，不是库对 stage 的要求。
+现有 `Pipeline`（`amdgpu-stage/src/pipeline.rs`，几种 `Cadence`）的定位：它是**编排的辅助件**，供 kernel 选用，不是库对 stage 的要求。
 
 ### 2.3 组合：boundary 代价类与 orient
 
@@ -309,7 +309,7 @@ Weaver::new(units)            // 一个或多个 stage 的单元（Units::append
 | 阶段 | 内容 | 验证 |
 |---|---|---|
 | P0 | `StageContract` 扩展：<br>• `StageVal.layout`（TV 布局文本）+ `storage` 检查；<br>• `scalars_in/out`（含 owner）；<br>• `outstanding`（vm/lgkm 入口/出口容忍）；<br>• `resources`（barriers 精确检查，寄存器/LDS 为估计）；<br>• `ANY_PHASE`（版本化/角色分支与流水循环内的 stage）。<br>GV-STAGE：池化常量不算跨 stage 读；在任何 stage 之外绑定的值无需生产者。IR 文本 codec 覆盖新字段 | `crates/amdgpu-codegen/tests/stage_ir.rs`、`crates/amdgpu-kernels/tests/ir_text.rs` |
-| P1 | `amdgpu-tile/src/stage.rs`：`Prim`、`StageInst`（units + contract + handover + prebind）、`merge` / `compose`、registry（17 个 key，`tests/stage_registry.rs`）。<br>出厂 kernel 均由 stage 实例构成，并位于 `Node::Stage` 区域内：<br>• MLP：`gemm1_act` / `gemm2`；<br>• GEMM v4：`gemm.ab_stage` / `gemm.tile`；<br>• FMHA：`kv.stage` / `v_phase` / `m_phase`（`mma.pv` + `mma.qk` 合并）/ `window`。<br>交接方式：<br>• FMHA 的共享 slot 偏移以 `SlotIdx::offset_scalars` 声明为标量交接，不预绑定（预绑定会改变 IR 顺序与汇编）；<br>• GEMM 用 `prebind`。 | 汇编逐字节相同；证书 24/100/0；strict 0 错误（`_vs128` / `_kvsplit` stage-handoff 12，`_t128` 4） |
+| P1 | `amdgpu-stage/src/stage.rs`：`Prim`、`StageInst`（units + contract + handover + prebind）、`merge` / `compose`、registry（17 个 key，`tests/stage_registry.rs`）。<br>出厂 kernel 均由 stage 实例构成，并位于 `Node::Stage` 区域内：<br>• MLP：`gemm1_act` / `gemm2`；<br>• GEMM v4：`gemm.ab_stage` / `gemm.tile`；<br>• FMHA：`kv.stage` / `v_phase` / `m_phase`（`mma.pv` + `mma.qk` 合并）/ `window`。<br>交接方式：<br>• FMHA 的共享 slot 偏移以 `SlotIdx::offset_scalars` 声明为标量交接，不预绑定（预绑定会改变 IR 顺序与汇编）；<br>• GEMM 用 `prebind`。 | 汇编逐字节相同；证书 24/100/0；strict 0 错误（`_vs128` / `_kvsplit` stage-handoff 12，`_t128` 4） |
 | P2 | `amdgpu-tile/src/prims.rs`：E（act / affine / bf16 解包）、R（lane + wave 归约）、Q（`fp8_scale` / `fp8_pack`）。<br>新 kernel：<br>• `rmsnorm_quant_fp8_n<N>`（4 个 stage）；<br>• GEMM epilogue 链 `mlp_fp8_ws_g1q_{relu,silu}`。 | 对 CPU 参考 bad=0；数字见 [`current-status.md`](current-status.md) §4.8 |
 | P3 | 算子图、切分、骨架生成（sched，`amdgpu-graph/src/opgraph/`，[`opgraph.md`](opgraph.md)）：出厂 FMHA / GEMM / MLP / RMSNorm 都从图生成骨架，slot 里只放编排 | 骨架 + 原编排 → 汇编逐字节相同 |
 
