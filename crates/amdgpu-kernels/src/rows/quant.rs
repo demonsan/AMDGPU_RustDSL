@@ -379,34 +379,56 @@ fn quant_kernel_long(name: &str, n: i64, kind: QuantKind) -> Function {
             }
         }
         _ => {
-            // pass 1: the row amax
+            // the first `kg` groups stay in registers between the passes (bf16, packed: 4 VGPRs per chunk and input), the rest of the row is streamed twice
+            let keep_chunks = if two_in { 16 } else { 32 };
+            let kg = if nld <= keep_chunks { ngroups } else { keep_chunks / LONG_G };
+            // pass 1: the row amax. The kept groups' loads are all issued first (every byte of the row in flight), consumed with counted waits
             let mut part: Option<ValueId> = None;
-            let mut cur = issue(b, 0);
-            for g in 0..ngroups {
-                let nxt = (g + 1 < ngroups).then(|| issue(b, g + 1));
-                b.wait_vm(if g + 1 < ngroups { nloads(g + 1) } else { 0 });
-                for (_, y) in ys_of(b, &cur) {
+            let kept: Vec<(usize, Vec<ValueId>, Vec<ValueId>)> = (0..kg).map(|g| issue(b, g)).collect();
+            for g in 0..kg {
+                let after: u32 = (g + 1..kg).map(|h| nloads(h) as u32).sum();
+                b.wait_vm(after as u8);
+                for (_, y) in ys_of(b, &kept[g]) {
                     let a = abs8(b, &y);
                     let m = lane_reduce(b, RedOp::Max, &a);
                     part = Some(match part { None => m, Some(p) => b.max_f32(p, m) });
                 }
-                if let Some(nx) = nxt {
-                    cur = nx;
+            }
+            if kg < ngroups {
+                let mut cur = issue(b, kg);
+                for g in kg..ngroups {
+                    let nxt = (g + 1 < ngroups).then(|| issue(b, g + 1));
+                    b.wait_vm(if g + 1 < ngroups { nloads(g + 1) } else { 0 });
+                    for (_, y) in ys_of(b, &cur) {
+                        let a = abs8(b, &y);
+                        let m = lane_reduce(b, RedOp::Max, &a);
+                        part = Some(match part { None => m, Some(p) => b.max_f32(p, m) });
+                    }
+                    if let Some(nx) = nxt {
+                        cur = nx;
+                    }
                 }
             }
-            // pass 2 starts loading before the amax reduction
-            let mut cur = issue(b, 0);
+            // pass 2: the first streamed group's loads start before the amax reduction; the kept groups are quantized from their registers
+            let first_streamed = (kg < ngroups).then(|| issue(b, kg));
             let amax = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, 0, &lane);
             let (s, inv) = if kind == QuantKind::TokenInt8 { int8_scale(b, amax) } else { fp8_scale(b, amax) };
-            for g in 0..ngroups {
-                let nxt = (g + 1 < ngroups).then(|| issue(b, g + 1));
-                // the previous group's stores are younger than this group's loads: they complete first (in-order vmcnt) - the wait is conservative
-                b.wait_vm(if g + 1 < ngroups { nloads(g + 1) } else { 0 });
-                for (i, y) in ys_of(b, &cur) {
+            for g in 0..kg {
+                for (i, y) in ys_of(b, &kept[g]) {
                     store_q(b, i, inv, &y);
                 }
-                if let Some(nx) = nxt {
-                    cur = nx;
+            }
+            if let Some(mut cur) = first_streamed {
+                for g in kg..ngroups {
+                    let nxt = (g + 1 < ngroups).then(|| issue(b, g + 1));
+                    // (in-order vmcnt: the kept groups' stores are older than the next group's loads, so they complete with this group's loads - conservative)
+                    b.wait_vm(if g + 1 < ngroups { nloads(g + 1) } else { 0 });
+                    for (i, y) in ys_of(b, &cur) {
+                        store_q(b, i, inv, &y);
+                    }
+                    if let Some(nx) = nxt {
+                        cur = nx;
+                    }
                 }
             }
             let vs = b.bind_i32(ev(row) << 2);
