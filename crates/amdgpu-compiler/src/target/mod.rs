@@ -4,6 +4,8 @@
 
 pub use amdgpu_target::Target;
 
+pub mod gfx950;
+
 /// The target every compilation uses (P0: gfx950).
 pub const T: &Target = &amdgpu_target::gfx950::GFX950;
 

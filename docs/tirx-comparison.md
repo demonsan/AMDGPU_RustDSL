@@ -44,7 +44,7 @@ kernel 编译器，出货 FMHA / GEMM / MLP / RMSNorm 并与厂商同轮对比�
 | TIRx 思想 | 我们的落地 | 代码 / 文档 |
 |---|---|---|
 | **3.1 布局代数与 TV 布局** | `Layout` / `IntTuple` / GF(2) `Swizzle` / TV 布局 / `IssuePlan` / `BitForm`，`convert_layout` 按代数分档；构建期证明（单射、覆盖、bank、tr_b8 源、操作数匹配）；gfx950 copy 与 MMA atom 表 | `crates/amdgpu-layout`、`crates/amdgpu-isa`；[layout-tour.md](layout-tour.md) |
-| **3.2 算子属性表** | 每个 MOp 的效果、hazard 类、调度代价、AGPR 合法性、后端可表达性在一张穷尽 `match` 表里，各 pass 查表而非枚举算子 | `crates/amdgpu-compiler/src/op_attrs.rs`；[op-attributes.md](op-attributes.md) |
+| **3.2 算子属性表** | 每个 MOp 的效果、hazard 类、调度代价、AGPR 合法性、后端可表达性在一张穷尽 `match` 表里，各 pass 查表而非枚举算子 | `crates/amdgpu-compiler/src/target/gfx950/op_attrs.rs`；[op-attributes.md](op-attributes.md) |
 | **3.3 区域 IR ≈ `RegionStmt`** | kernel 体是 `Loop / If / Region / Stage` 树，线性视图由树派生（配对错误无法表示）；`Node::Stage` 带 `StageContract`（融合边界契约，GV-STAGE）；编织区域 `Stmt::RegionMark` 给寄存器规划与按区域调度用 | `crates/amdgpu-dsl/src/lib.rs`；[region-ir.md](region-ir.md)、[weaver-regs.md](weaver-regs.md)、[weaver-sched.md](weaver-sched.md) |
 | **3.4 结构相等 / 哈希 + α 规范化** | `dsl_structural_eq/hash`：ValueId / VarId 按首次出现结构化重编号（语句、op 操作数、注解），函数名不参与 | `crates/amdgpu-dsl/src/print.rs`、`ir_text::alpha_canonical`；[ir-printing.md](ir-printing.md) |
 | **3.5 IR 文本往返 ≈ TVMScript** | `irv1`：`print-ir --stage dsl` 完整可解析，`ir-check` / `--from-ir`（emit、gpu-verify、jit-info、regplan）、A/B 脚本与 Python JIT 接受 `.ir`；全部 kernel 往返后 `Function` 逐字段相等、双后端 asm 与证书逐字节相同 | `crates/amdgpu-dsl/src/ir_text.rs`；[ir-text.md](ir-text.md) |

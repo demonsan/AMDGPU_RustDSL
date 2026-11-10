@@ -1,5 +1,5 @@
 # Operand-class table for the safe-asm opcode templates (read by build.rs, which also checks every row against the backend table
-# crates/amdgpu-compiler/src/backend/llvm24.tbl: key must exist and the arity must match its signature).
+# crates/amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl: key must exist and the arity must match its signature).
 #
 #   method | MOp key | form
 #

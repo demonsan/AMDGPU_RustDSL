@@ -4,7 +4,7 @@ use std::fmt::Write;
 fn main() {
     println!("cargo:rerun-if-changed=opspec.tbl");
     let spec = std::fs::read_to_string("opspec.tbl").expect("opspec.tbl");
-    let tbl_path = "../amdgpu-compiler/src/backend/llvm24.tbl";
+    let tbl_path = "../amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl";
     println!("cargo:rerun-if-changed={tbl_path}");
     // key -> arity (number of source classes) from the backend table; absent when building outside the workspace
     let mut arity: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

@@ -10,7 +10,7 @@ Per test (every *.ll and *.mir under the directory) the tool extracts
                     encoding suffixes stripped); split by target class
   (d) features    : IR / ABI features (calls, alloca/stack, atomics, intrinsics, debug info, exceptions, varargs, calling conventions, attributes, kernarg,
                     workgroup id, LDS, barriers/waitcnt, spills, subtarget -mattr, address spaces, types)
-and classifies each test against OUR opcode universe (derived from crates/amdgpu-compiler/src/emit.rs and backend/llvm{20,24}.tbl):
+and classifies each test against OUR opcode universe (derived from crates/amdgpu-compiler/src/target/gfx950/emit.rs and llvm/llvm{20,24}.tbl):
   COVERED       gfx950-class codegen test, every required opcode exists in our compiler, no unsupported IR feature
   PARTIAL       gfx950-class codegen test, no hard-unsupported feature, but opcodes / features are missing (listed)
   OUT-OF-SCOPE  pass-level or non-codegen test, non-gfx950-class subtarget, or an IR feature the kernel DSL does not model (calls, stack, exceptions, debug info, ...)
@@ -443,7 +443,7 @@ def our_universe(repo):
     # table-derived MIR opcode names (both dialects)
     tbl_ops = {}
     for tbl in ("llvm20.tbl", "llvm24.tbl"):
-        p = os.path.join(repo, "crates", "amdgpu-compiler", "src", "backend", tbl)
+        p = os.path.join(repo, "crates", "amdgpu-compiler", "src", "target", "gfx950", "llvm", tbl)
         rows = set()
         for ln in open(p, errors="replace"):
             if ln.startswith("#") or "|" not in ln:

@@ -19,8 +19,8 @@ pub struct Dialect {
 }
 
 pub const DIALECTS: &[Dialect] = &[
-    Dialect { name: "llvm20", version_prefix: "AMD LLVM version 20.", table_src: include_str!("llvm20.tbl"), header_src: include_str!("llvm20_header.txt") },
-    Dialect { name: "llvm24", version_prefix: "AMD LLVM version 24.", table_src: include_str!("llvm24.tbl"), header_src: include_str!("llvm24_header.txt") },
+    Dialect { name: "llvm20", version_prefix: "AMD LLVM version 20.", table_src: include_str!("../target/gfx950/llvm/llvm20.tbl"), header_src: include_str!("../target/gfx950/llvm/llvm20_header.txt") },
+    Dialect { name: "llvm24", version_prefix: "AMD LLVM version 24.", table_src: include_str!("../target/gfx950/llvm/llvm24.tbl"), header_src: include_str!("../target/gfx950/llvm/llvm24_header.txt") },
 ];
 
 /// The dialect for the pinned LLVM: $AMDC_DIALECT, else matched against llc --version, else the primary pin (llvm24).

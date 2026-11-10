@@ -2,7 +2,7 @@
 
 Part of the four-layer refactor ([`refactor-4layer-plan.md`](refactor-4layer-plan.md)). P0 moves every gfx950 fact behind one
 description without changing any output: the golden md5 manifest (`tests/golden/md5_manifest.tsv`), the certificates and the tests
-stay identical. gfx1250 (MI450 B0) is described against the same fields as a specification only (`docs/target-gfx1250.md`, branch `gfx1250-spec`,
+stay identical. gfx1250 (MI450 B0) is described against the same fields as a specification only (target-gfx1250.md on branch `gfx1250-spec`,
 phase G).
 
 ## 1. Split: data vs. per-instruction tables

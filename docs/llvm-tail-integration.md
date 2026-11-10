@@ -43,7 +43,7 @@ gfx1250 (Unknown, to be re-checked by `amdc backend check` + the oracle on that 
 
 | Coupling | Where | Guard |
 |---|---|---|
-| (a) MIR text + opcode/operand shapes | `backend/llvm20.tbl` (DATA, one row per MOp/operand-kind), `backend/llvm20_header.txt` (function header), `backend/llvm20.rs` (token renderer, S_WAITCNT encoding) | test `opcode_probe_every_row_assembles`: one tiny MIR per row through the pinned llc with `-verify-machineinstrs`; a version bump shows exactly which rows broke. `table_has_a_row_for_every_mop` |
+| (a) MIR text + opcode/operand shapes | `target/gfx950/llvm/llvm20.tbl` (DATA, one row per MOp/operand-kind), `target/gfx950/llvm/llvm20_header.txt` (function header), `backend/llvm20.rs` (token renderer, S_WAITCNT encoding) | test `opcode_probe_every_row_assembles`: one tiny MIR per row through the pinned llc with `-verify-machineinstrs`; a version bump shows exactly which rows broke. `table_has_a_row_for_every_mop` |
 | (b) pass names / start point | `backend.lock` + `backend/probe.rs` | every LlvmTail emit re-checks `llc --version`; `amdc backend check` compares the whole tail pipeline, requires `si-insert-waitcnts` + `post-RA-hazard-rec`, and FAILS if any of `postmisched, machine-scheduler, post-RA-sched, block-placement, ...` runs after the start |
 | (c) IR shell attributes | header template | descriptor equality is checked by the oracle (user_sgpr_count 2, wg ids xyz, ieee 0, denorm 3 ...) |
 | (d) assembler syntax | `.s` is produced by LLVM itself; our own text is only used by OwnTail | - |

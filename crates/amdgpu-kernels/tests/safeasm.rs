@@ -418,7 +418,7 @@ fn writing_an_input_port_is_refused() {
 #[test]
 fn coverage_matrix() {
     use amdgpu_safeasm::{HAND_WRITTEN_OPS, TYPED_OPS};
-    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/backend/llvm24.tbl")).unwrap();
+    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/target/gfx950/llvm/llvm24.tbl")).unwrap();
     let keys: Vec<String> = tbl
         .lines()
         .filter(|l| !l.starts_with('#') && l.contains('|'))
