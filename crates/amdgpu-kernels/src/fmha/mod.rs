@@ -816,6 +816,10 @@ impl skeleton_t128::T128Slots for T128Slots {
     type Cx = FmhaCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
         b.compile_profile(CompileProfile::T128);
+        // `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC): same-run A/B,
+        // B2H8S2048 layout median +3.3% together; `saddrlds` (the SADDR DMA form: +1.8..+2.1%); all three are -0.2..-1.5% on _vs128 / _kvsplit
+        // (docs/dsl-layout-refactor-design.md section 9.4)
+        b.lower_opts(&["saddrlds", "edgepad", "salubr"]);
         let io = declare_io(b, 128, false);
         let blk = block3_x(&io, b, 7, true);
         let roles = Roles::single(&blk.lane, 4);
