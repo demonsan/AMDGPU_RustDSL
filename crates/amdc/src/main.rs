@@ -387,7 +387,14 @@ fn main() -> ExitCode {
                     { let (rows, s) = amdgpu_graph::dispatch::blockscale_config(m, n, k, cus); println!("{{\"rows\":{},\"splits\":{}}}", rows, s); }
                     ExitCode::SUCCESS
                 }
-                (Some("gemm"), _, _, _) => {
+                (Some("mxfp8"), Some(b), Some(h), Some(s)) => {
+                    // amdc dispatch mxfp8 <B> <H> <S> <SK>: the MXFP8 prefill path and splits (dispatch::mxfp8_prefill_path)
+                    let sk = num(5).unwrap_or(s);
+                    let (path, sp) = amdgpu_graph::dispatch::mxfp8_prefill_path(b, h, s, sk);
+                    let ks: Vec<String> = amdgpu_graph::dispatch::mxfp8_prefill_kernels(path).iter().map(|k| format!("\"{k}\"")).collect();
+                    println!("{{\"path\":\"{path}\",\"splits\":{sp},\"kernels\":[{}]}}", ks.join(","));
+                    ExitCode::SUCCESS
+                }                (Some("gemm"), _, _, _) => {
                     // amdc dispatch gemm <kind> <M> <N> <K> [--cus N]: the dense GEMM launch (dispatch::gemm_kernels: kernel, split-K, reduce) -
                     // the one rule of the Python gemm() and the L1 graph plans
                     let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
