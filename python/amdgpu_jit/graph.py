@@ -52,13 +52,33 @@ def _wrapper(name):
     raise ValueError(f"graph: no wrapper `{name}`")
 
 
+_bufs = {}
+
+
+def _plan_workspace(name, nbytes):
+    """The plan-owned workspace ``name`` (grown on demand, kept across runs)."""
+    from . import _hip
+    buf = _bufs.get(name)
+    if buf is None or buf[1] < nbytes:
+        if buf is not None:
+            from ._generic import invalidate_launch_memos
+            invalidate_launch_memos()
+            _hip.free(buf[0])
+        buf = _bufs[name] = (_hip.malloc(nbytes), nbytes)
+    return buf
+
+
 def run(p, tensors, *, stream=None, check=True):
     """Executes plan ``p`` (from ``plan``) with ``tensors`` (graph tensor name -> buffer). Each launch calls its Python wrapper (``py``) with
-    the bound tensors and the plan's parameters (the ones the wrapper takes). Returns the list of the wrappers' results."""
+    the bound tensors and the plan's parameters (the ones the wrapper takes). The plan's ``workspaces`` are allocated here, and the
+    wrappers use them instead of their own (explicit workspaces, docs/l1-graph.md step 3). Returns the list of the wrappers' results."""
+    from . import ops_compute
     if p.get("errors"):
         raise PlanError("; ".join(f"op {e['op']}: {e['why']}" for e in p["errors"]))
     out = []
     for l in p["launches"]:
+        if not l["py"]:
+            raise PlanError(f"{l['rule']} ({', '.join(l['kernels'])}): no Python wrapper launches it")
         fn = _wrapper(l["py"])
         sig = inspect.signature(fn).parameters
         kw = {}
@@ -73,7 +93,13 @@ def run(p, tensors, *, stream=None, check=True):
             kw["stream"] = stream
         if "check" in sig:
             kw["check"] = check
-        out.append(fn(**kw))
+        ops_compute._ws_override.clear()
+        for w in l.get("workspaces", []):
+            ops_compute._ws_override[w["name"]] = _plan_workspace(w["name"], int(w["bytes"]))
+        try:
+            out.append(fn(**kw))
+        finally:
+            ops_compute._ws_override.clear()
     return out
 
 

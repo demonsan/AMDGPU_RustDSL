@@ -13,7 +13,8 @@
       "params": {
         "renorm": true
       },
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     },
     {
       "rule": "moe_experts",
@@ -63,6 +64,28 @@
         {
           "name": "moe_t",
           "bytes": 33554432
+        }
+      ],
+      "steps": [
+        {
+          "kernel": "moe_sorting_e128_k8_b64",
+          "reads": ["ids", "w"],
+          "writes": ["moe_sid", "moe_sw", "moe_seid", "moe_nv", "moe_ts"]
+        },
+        {
+          "kernel": "gemm_moe1_bf16_silu_bm64",
+          "reads": ["x", "w1", "moe_sid", "moe_seid", "moe_nv", "moe_sw"],
+          "writes": ["moe_y1"]
+        },
+        {
+          "kernel": "gemm_moe2_bf16_bm64",
+          "reads": ["moe_y1", "w2", "moe_sid", "moe_seid", "moe_nv", "moe_sw"],
+          "writes": ["moe_t"]
+        },
+        {
+          "kernel": "moe_sum_bf16_k8",
+          "reads": ["moe_t"],
+          "writes": ["y"]
         }
       ]
     }

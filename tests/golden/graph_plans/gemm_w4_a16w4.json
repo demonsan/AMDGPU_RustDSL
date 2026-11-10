@@ -1,0 +1,4 @@
+{ "tensors": { "a": {"dtype": "bf16", "shape": [64, 4096]}, "b": {"dtype": "u8", "shape": [4096, 2048]}, "sb": {"dtype": "u8", "shape": [4096, 128]},
+    "c": {"dtype": "bf16", "shape": [64, 4096]} },
+  "ops": [ {"id": "mm", "op": "gemm_w4", "in": ["a", "b", "sb"], "out": ["c"], "attrs": {"kind": "a16w4"}} ],
+  "outputs": ["c"] }

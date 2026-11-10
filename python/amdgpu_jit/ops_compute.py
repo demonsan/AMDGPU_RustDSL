@@ -26,9 +26,14 @@ def dispatch(*args):
 
 
 _ws = {}
+# plan-owned workspaces (``graph.run``): name -> (ptr, nbytes), consulted first by ``_workspace``
+_ws_override = {}
 
 
 def _workspace(key, nbytes):
+    o = _ws_override.get(key)
+    if o is not None and o[1] >= nbytes:
+        return o[0]
     buf = _ws.get(key)
     if buf is None or buf[1] < nbytes:
         if buf is not None:
@@ -95,27 +100,32 @@ _GEMM = {"bf16": ("gemm_a16w16_bf16", 2, 64), "fp8_rowcol": ("gemm_a8w8_rowcol_f
          "mxfp4": ("gemm_a4w4_mxfp4", 0, 256)}
 
 
-def gemm(a, b, out, *, kind="bf16", a_scale=None, b_scale=None, M=None, N=None, K=None, splits="auto", tile="auto", cus=256, stream=None,
-         check=True):
+def gemm(a, b, out, *, kind="bf16", a_scale=None, b_scale=None, M=None, N=None, K=None, splits="auto", tile="auto", cus=256, kernel=None,
+         reduce=None, stream=None, check=True):
     """``out[M, N] (bf16) = A[M, K] B[N, K]^T`` with B preshuffled (``shuffle_weight``, 16 x 16). kind:
       "bf16"           A, B bf16
       "fp8_rowcol"     A, B fp8 e4m3; a_scale f32 [M], b_scale f32 [N] (per row / column)
       "fp8_blockscale" A, B fp8; a_scale f32 [M, K/128] (row-major), b_scale f32 [N/128, K/128]; split-K by the dispatch rule (``splits``)
       "mxfp4"          A [M, K/2], B [N, K/2] packed e2m1; scales E8M0 [rows, K/32] in ``shuffle_mx_scales`` order
     Tiles: 256 x 256 CTAs (blockscale: 128) when M, N are multiples of 256 and the grid has at least ``cus`` / 4 CTAs, else the ``_128``
-    kernels (bf16 / fp8_rowcol). Shapes default to the tensors'. Returns (kernel, splits)."""
+    kernels (bf16 / fp8_rowcol). Shapes default to the tensors'. ``kernel`` / ``splits`` / ``reduce``: an explicit launch (the L1 plan's
+    ``dispatch::gemm_kernels`` choice: the 256 / ``_128`` / ``_64`` / ``_64_splitk`` forms and ``gemm_splitk_reduce_s<S>[_rc]``). Returns (kernel, splits)."""
     ra, rb, ro = as_ref(a), as_ref(b), as_ref(out)
     M = M or ro.shape[0]
     N = N or ro.shape[1]
     base, es, kt_el = _GEMM[kind]
     K = K or (ra.shape[1] * 2 if kind == "mxfp4" else ra.shape[1])
     name = base
-    if kind in ("bf16", "fp8_rowcol"):
+    if kernel is not None:
+        name = kernel
+    elif kind in ("bf16", "fp8_rowcol"):
         big = M % 256 == 0 and N % 256 == 0 and (M // 256) * (N // 256) * 4 >= cus
         if tile == 128 or (tile == "auto" and not big):
             name = base + "_128"
     S = 1
-    if kind == "fp8_blockscale":
+    if kernel is not None:
+        S = 1 if splits == "auto" else int(splits)
+    elif kind == "fp8_blockscale":
         S = dispatch("gemm_blockscale", M, N, K, "--cus", cus)["splits"] if splits == "auto" else int(splits)
         if S > 1 and N % 1024:
             S = 1  # the reduce kernel covers N in 1024-column blocks
@@ -126,13 +136,17 @@ def gemm(a, b, out, *, kind="bf16", a_scale=None, b_scale=None, M=None, N=None, 
     if S == 1:
         launch(name, vals, stream=stream, check=check)
         return name, 1
-    # split-K: fp32 partials [S][MP][N] in a workspace, then gemm_splitk_reduce_s<S>
-    MP = -(-M // 128) * 128
+    # split-K: fp32 partials [S][MP][N] in a workspace (MP = M rounded up to the CTA rows), then gemm_splitk_reduce_s<S>[_rc]
+    split = name if kernel is not None else name + "_splitk"
+    rows = 64 if "_64" in split else 128
+    MP = -(-M // rows) * rows
     ws = _Raw(_workspace("gemm_splitk", S * MP * N * 4), S * MP * N * 4)
     vals.update(ptr_c=ws, batch=S, stride_sfa_batch=kt // S, stride_sfb_batch=MP)
-    launch(name + "_splitk", vals, stream=stream, check=check)
-    launch(f"gemm_splitk_reduce_s{S}", ptrs=[ws, ro, 0, 0], scalars=[M, N, S, MP], stream=stream, check=check)
-    return name + "_splitk", S
+    launch(split, vals, stream=stream, check=check)
+    red = reduce or f"gemm_splitk_reduce_s{S}"
+    sc = [a_scale, b_scale] if red.endswith("_rc") else [0, 0]
+    launch(red, ptrs=[ws, ro] + sc, scalars=[M, N, S, MP], stream=stream, check=check)
+    return split, S
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- attention

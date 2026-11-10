@@ -3,6 +3,7 @@
 //! (`crate::dispatch`). The output is a deterministic launch plan (`amdc graph plan`) whose launches name the Python wrapper that executes
 //! them. The layer only chooses kernel names and parameters; it never changes code generation.
 
+pub mod canonical;
 pub mod rules;
 
 use crate::opgraph::json::Json;
@@ -40,6 +41,25 @@ pub enum OpKind {
     PagedAttention,
     /// q, kv_cache, block_table, context_lens -> o: MLA decode
     MlaAttention,
+    /// q, k, v, o, do, lse -> dq, dk, dv: attention backward, hd128 bf16 BSHD (`causal`)
+    AttentionBwd,
+    /// a, b [, a_scale, b_scale] -> c [M, N] bf16 = A B^T, B preshuffled (`kind`: bf16 | fp8_rowcol | i8_rowcol | fp8_blockscale | mxfp4)
+    Gemm,
+    /// a, b, b_scale [, a_scale] -> c: MXFP4-weight GEMM (`kind`: a16w4 | a8w4)
+    GemmW4,
+    /// x, w -> y: implicit-GEMM convolution, bf16 NDHWC (`r`, `s`, `t`, `stride`, `pad`, `dil`, `rows`, `channels_out`)
+    Conv,
+    /// x [, weights] -> y [T, D]: the MoE top-k sum, weighted or plain
+    MoeReduce,
+    /// logits -> ids: greedy
+    Argmax,
+    /// logits, u -> ids: temperature sampling (`temperature`, `top_k`, `top_p`)
+    Sample,
+    /// logits, seq_lens | row_starts, row_ends -> indices: the sparse-attention indexer top-k (`mode`: decode | prefill, `next_n`)
+    TopkPerRow,
+    /// causal conv1d: fwd x, weight, bias, cu_seqlens, cache_indices, has_initial, conv_states -> out; update x, weight, bias, state
+    /// [, state_indices] -> out (`mode`: fwd | update, `silu`, `max_seqlen`)
+    CausalConv1d,
 }
 
 impl OpKind {
@@ -60,6 +80,15 @@ impl OpKind {
             "attention" => OpKind::Attention,
             "paged_attention" => OpKind::PagedAttention,
             "mla_attention" => OpKind::MlaAttention,
+            "attention_bwd" => OpKind::AttentionBwd,
+            "gemm" => OpKind::Gemm,
+            "gemm_w4" => OpKind::GemmW4,
+            "conv" => OpKind::Conv,
+            "moe_reduce" => OpKind::MoeReduce,
+            "argmax" => OpKind::Argmax,
+            "sample" => OpKind::Sample,
+            "topk_per_row" => OpKind::TopkPerRow,
+            "causal_conv1d" => OpKind::CausalConv1d,
             _ => return None,
         })
     }
@@ -77,6 +106,15 @@ impl OpKind {
             OpKind::Attention => (3, 3, 1, 2),
             OpKind::PagedAttention => (5, 5, 1, 1),
             OpKind::MlaAttention => (4, 4, 1, 1),
+            OpKind::AttentionBwd => (6, 6, 3, 3),
+            OpKind::Gemm => (2, 4, 1, 1),
+            OpKind::GemmW4 => (3, 4, 1, 1),
+            OpKind::Conv => (2, 2, 1, 1),
+            OpKind::MoeReduce => (1, 2, 1, 1),
+            OpKind::Argmax => (1, 1, 1, 1),
+            OpKind::Sample => (2, 2, 1, 1),
+            OpKind::TopkPerRow => (2, 3, 1, 1),
+            OpKind::CausalConv1d => (4, 7, 1, 1),
         }
     }
 }
@@ -261,6 +299,16 @@ pub struct Launch {
     pub bind: Vec<(&'static str, String)>,
     pub params: Vec<(String, Json)>,
     pub workspaces: Vec<(String, i64)>,
+    /// multi-kernel launches: each kernel with the tensors / workspaces it reads and writes, in launch order (empty for one kernel)
+    pub steps: Vec<KStep>,
+}
+
+/// One kernel of a multi-kernel launch (docs/l1-graph.md step 3: the per-launch data flow through the plan-owned workspaces).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KStep {
+    pub kernel: String,
+    pub reads: Vec<String>,
+    pub writes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -292,6 +340,18 @@ impl Plan {
                     ("bind".into(), Json::Obj(l.bind.iter().map(|(k, v)| (k.to_string(), Json::Str(v.clone()))).collect())),
                     ("params".into(), Json::Obj(l.params.clone())),
                     ("workspaces".into(), Json::Arr(l.workspaces.iter().map(|(n, b)| Json::Obj(vec![("name".into(), Json::Str(n.clone())), ("bytes".into(), Json::Int(*b))])).collect())),
+                    (
+                        "steps".into(),
+                        Json::Arr(
+                            l.steps
+                                .iter()
+                                .map(|s| {
+                                    let strs = |v: &[String]| Json::Arr(v.iter().map(|x| Json::Str(x.clone())).collect());
+                                    Json::Obj(vec![("kernel".into(), Json::Str(s.kernel.clone())), ("reads".into(), strs(&s.reads)), ("writes".into(), strs(&s.writes))])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ])
             })
             .collect();

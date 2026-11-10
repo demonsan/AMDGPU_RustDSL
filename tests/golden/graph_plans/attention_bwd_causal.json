@@ -1,0 +1,5 @@
+{ "tensors": { "q": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "k": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "v": {"dtype": "bf16", "shape": [1, 2048, 8, 128]},
+    "o": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "do": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "lse": {"dtype": "f32", "shape": [1, 8, 2048]},
+    "dq": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "dk": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "dv": {"dtype": "bf16", "shape": [1, 2048, 8, 128]} },
+  "ops": [ {"id": "bwd", "op": "attention_bwd", "in": ["q", "k", "v", "o", "do", "lse"], "out": ["dq", "dk", "dv"], "attrs": {"causal": true}} ],
+  "outputs": ["dq", "dk", "dv"] }

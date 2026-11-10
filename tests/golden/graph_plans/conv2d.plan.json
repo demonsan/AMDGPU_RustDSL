@@ -1,0 +1,22 @@
+{
+  "launches": [
+    {
+      "rule": "conv",
+      "covers": ["conv"],
+      "kernels": ["conv2d_bf16_r3s3_st1_p1_d1_c128"],
+      "py": "",
+      "bind": {
+        "x": "x",
+        "w": "w",
+        "y": "y"
+      },
+      "params": {
+        "cta": 128
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

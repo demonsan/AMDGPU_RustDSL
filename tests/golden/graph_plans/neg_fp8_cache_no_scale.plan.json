@@ -15,7 +15,8 @@
       "params": {
         "style": "neox"
       },
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [

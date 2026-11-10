@@ -92,25 +92,10 @@ pub fn dispatched_names() -> BTreeSet<String> {
     n
 }
 
-/// The instantiations the Python memory-bound ops pick at common model shapes.
+/// The instantiations the Python memory-bound ops pick at common model shapes: DERIVED from the L1 fusion rules over the canonical op graphs
+/// (`amdgpu_graph::fusion::canonical`, docs/l1-graph.md step 3).
 pub fn python_op_names() -> BTreeSet<String> {
-    let mut n = BTreeSet::new();
-    for d in [4096, 7168] {
-        for k in [format!("rmsnorm_bf16_n{d}"), format!("add_rmsnorm_bf16_n{d}"), format!("add_rmsnorm_fp8_n{d}"), format!("rmsnorm_quant_fp8_n{d}"),
-            format!("rmsnorm_quant_mxfp4_bf16_k{d}"), format!("quant_token_bf16_fp8_n{d}"), format!("quant_token_bf16_int8_n{d}"), format!("quant_group128_bf16_fp8_n{d}"),
-            format!("silu_mul_bf16_d{d}"), format!("gelu_tanh_mul_bf16_d{d}"), format!("silu_mul_quant_fp8_d{d}")]
-        {
-            n.insert(k);
-        }
-    }
-    for k in ["quant_bf16_fp8_static", "rope_neox_bf16_h32_d128", "rope_gptj_bf16_h32_d128", "qknorm_rope_neox_bf16_h32_d128", "qknorm_rope_kvcache_neox_bf16_h8_d128",
-        "qknorm_rope_kvcache_neox_fp8_h8_d128_i64", "reshape_cache_flash_bf16_h8_d128", "reshape_cache_blocked_bf16_h8_d128_b16", "reshape_cache_blocked_fp8_h8_d128_b16_i64",
-        "topk_softmax_bf16_e128_k8", "topk_softmax_renorm_bf16_e256_k8", "moe_reduce_bf16_k8_d4096", "moe_combine_bf16_k8_d4096", "argmax_bf16_v128256", "sample_bf16_v128256",
-        "sample_topkp_bf16_v128256", "topk_per_row_decode_f32_k2048", "topk_per_row_prefill_f32_k2048", "causal_conv1d_fwd_bf16_w4_silu", "causal_conv1d_update_bf16_w4_s3_idx_silu"]
-    {
-        n.insert(k.into());
-    }
-    n
+    amdgpu_graph::fusion::canonical::python_op_names()
 }
 
 /// Every fixed name `kernel_by_name` matches literally (the `"name" =>` / `"name" |` arms of `registry.rs` and the modules' `by_name`) that builds a kernel: the shipped

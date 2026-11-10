@@ -1,0 +1,4 @@
+{ "tensors": { "a": {"dtype": "fp8", "shape": [4096, 4096]}, "b": {"dtype": "fp8", "shape": [4096, 4096]}, "sa": {"dtype": "f32", "shape": [4096]},
+    "sb": {"dtype": "f32", "shape": [4096]}, "c": {"dtype": "bf16", "shape": [4096, 4096]} },
+  "ops": [ {"id": "mm", "op": "gemm", "in": ["a", "b", "sa", "sb"], "out": ["c"], "attrs": {"kind": "fp8_rowcol"}} ],
+  "outputs": ["c"] }

@@ -11,7 +11,8 @@
         "out": "y"
       },
       "params": {},
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     },
     {
       "rule": "quant_token",
@@ -26,7 +27,8 @@
       "params": {
         "dtype": "fp8"
       },
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [

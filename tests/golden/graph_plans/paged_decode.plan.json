@@ -18,7 +18,8 @@
         "splits": 2,
         "max_context": 4096
       },
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [],

@@ -14,7 +14,8 @@
         "scale": "s"
       },
       "params": {},
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     },
     {
       "rule": "act_mul.silu+quant_token.fp8",
@@ -27,7 +28,8 @@
         "scale": "as"
       },
       "params": {},
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [],

@@ -1,0 +1,4 @@
+{ "tensors": { "l": {"dtype": "bf16", "shape": ["B", 128256]}, "u": {"dtype": "f32", "shape": ["B"]}, "ids": {"dtype": "i32", "shape": ["B"]} },
+  "dims": {"B": 32},
+  "ops": [ {"id": "pick", "op": "sample", "in": ["l", "u"], "out": ["ids"], "attrs": {"temperature": "0.7", "top_k": 50, "top_p": "0.9"}} ],
+  "outputs": ["ids"] }

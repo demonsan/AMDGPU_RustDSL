@@ -1,0 +1,24 @@
+{
+  "launches": [
+    {
+      "rule": "sample",
+      "covers": ["pick"],
+      "kernels": ["sample_topkp_bf16_v128256"],
+      "py": "sample",
+      "bind": {
+        "logits": "l",
+        "u": "u",
+        "out": "ids"
+      },
+      "params": {
+        "top_k": 50,
+        "temperature": "0.7",
+        "top_p": "0.9"
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

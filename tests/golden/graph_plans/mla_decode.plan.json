@@ -25,6 +25,18 @@
           "name": "mla_plse",
           "bytes": 32768
         }
+      ],
+      "steps": [
+        {
+          "kernel": "mla_decode_bf16_hp_p16",
+          "reads": ["q", "kv", "bt", "cl"],
+          "writes": ["mla_po", "mla_plse"]
+        },
+        {
+          "kernel": "attn_combine_bf16_hd512",
+          "reads": ["mla_po", "mla_plse"],
+          "writes": ["o"]
+        }
       ]
     }
   ],

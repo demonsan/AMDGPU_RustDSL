@@ -463,7 +463,8 @@ def up_f32(vals, shape):
     return aj.DeviceBuffer(shape, "float32", data=struct.pack(f"<{len(vals)}f", *vals))
 
 
-def check_gemm(kind="bf16", M=256, N=256, K=256, tile="auto", rows=4):
+def check_gemm(kind="bf16", M=256, N=256, K=256, tile="auto", rows=4, run=None):
+    """``run(da, db, do, dsa, dsb, K)`` (default: ``aj.gemm``) launches the GEMM and returns (kernel, S): graph_check.py runs the L1 plan."""
     r = Res(f"gemm {kind} M={M} N={N} K={K} tile={tile}")
     sa = sb = None
     if kind == "bf16":
@@ -491,7 +492,10 @@ def check_gemm(kind="bf16", M=256, N=256, K=256, tile="auto", rows=4):
     elif kind == "bf16":
         dsa = dsb = None
     do = aj.DeviceBuffer((M, N), "bfloat16")
-    name, S = aj.gemm(da, db, do, kind=kind, a_scale=dsa, b_scale=dsb, K=K, tile=tile)
+    if run is None:
+        name, S = aj.gemm(da, db, do, kind=kind, a_scale=dsa, b_scale=dsb, K=K, tile=tile)
+    else:
+        name, S = run(da, db, do, dsa, dsb, K)
     r.name += f" -> {name} S={S}"
     out = down_bf16(do, M * N)
     for ri in range(rows):

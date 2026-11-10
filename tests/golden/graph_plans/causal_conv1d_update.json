@@ -1,0 +1,4 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": [8, 4096]}, "w": {"dtype": "bf16", "shape": [4096, 4]}, "b": {"dtype": "bf16", "shape": [4096]},
+    "st": {"dtype": "bf16", "shape": [16, 4096, 3]}, "si": {"dtype": "i32", "shape": [8]}, "y": {"dtype": "bf16", "shape": [8, 4096]} },
+  "ops": [ {"id": "conv", "op": "causal_conv1d", "in": ["x", "w", "b", "st", "si"], "out": ["y"], "attrs": {"mode": "update", "silu": true}} ],
+  "outputs": ["y"] }

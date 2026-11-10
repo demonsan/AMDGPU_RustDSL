@@ -1,0 +1,25 @@
+{
+  "launches": [
+    {
+      "rule": "causal_conv1d",
+      "covers": ["conv"],
+      "kernels": ["causal_conv1d_update_bf16_w4_s3_idx_silu"],
+      "py": "causal_conv1d_update",
+      "bind": {
+        "x": "x",
+        "weight": "w",
+        "bias": "b",
+        "state": "st",
+        "out": "y",
+        "state_indices": "si"
+      },
+      "params": {
+        "silu": true
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

@@ -14,7 +14,8 @@
         "scale": "s"
       },
       "params": {},
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [],
