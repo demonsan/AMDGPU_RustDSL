@@ -2,7 +2,7 @@
 //! pipeline inside `Roles::each` / `versioned` branches; `_t128` is one group): the graph says which stage runs in which pipeline hook, which stages one weaver interleaves (weave groups) and what the
 //! boundaries cost (S -> P is C0, O -> epilogue a wave-private LDS transpose, C2).
 
-use amdgpu_tile::opgraph::{Class, Edge, Graph, Group, Node, Phase, Prim, Resources, Scope, Store, Val};
+use amdgpu_graph::opgraph::{Class, Edge, Graph, Group, Node, Phase, Prim, Resources, Scope, Store, Val};
 
 fn node(id: &str, prim: Prim, stage: &str, phase: Phase, hook: Option<&str>, params: Vec<(&str, Val)>, res: Resources, roles: &str) -> Node {
     Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: res, roles: vec![roles.into()], barrier_phase: 0, phase, hook: hook.map(|h| h.to_string()) }

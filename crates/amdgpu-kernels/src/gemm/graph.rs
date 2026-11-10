@@ -1,7 +1,7 @@
 //! The op graph of the shipped MXFP8 blockscale GEMM (`gemm_mxfp8_bs_v4`, design section 4.2): the input of the skeleton generator. One pipelined kernel: the A / B tile copies (`move.ab_stage`, the
 //! pipeline's `stage` hook), the register-tile MMAs (`mma.blockscale_tile`, the `m_phase` hook) and the bf16 epilogue after the pipeline.
 
-use amdgpu_tile::opgraph::{Class, Edge, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
+use amdgpu_graph::opgraph::{Class, Edge, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
 
 fn node(id: &str, prim: Prim, stage: &str, phase: Phase, hook: Option<&str>, params: Vec<(&str, Val)>, res: Resources) -> Node {
     Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: res, roles: vec!["4 waves (2 x 2), all the same program".into()], barrier_phase: 0, phase, hook: hook.map(|h| h.to_string()) }

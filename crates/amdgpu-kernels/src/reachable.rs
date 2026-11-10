@@ -2,7 +2,7 @@
 //! ops pick at common model shapes, and the registry list. Shared by `tests/dispatch_compile.rs` (every reachable kernel compiles and
 //! assembles) and `amdc md5-manifest` (the golden asm md5 of every reachable kernel, tests/golden/md5_manifest.tsv).
 
-use crate::dispatch::*;
+use amdgpu_graph::dispatch::*;
 use std::collections::BTreeSet;
 
 /// The kernel names the dispatch rules produce over a grid of launch shapes.

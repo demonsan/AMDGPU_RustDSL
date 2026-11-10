@@ -1,6 +1,6 @@
-//! The op graph (amdgpu_tile::opgraph): JSON round trip, computed boundary classes, cuts (C4 edges, scope / budget checks), the review text.
-use amdgpu_tile::opgraph::json::Json;
-use amdgpu_tile::opgraph::*;
+//! The op graph (amdgpu_graph::opgraph): JSON round trip, computed boundary classes, cuts (C4 edges, scope / budget checks), the review text.
+use amdgpu_graph::opgraph::json::Json;
+use amdgpu_graph::opgraph::*;
 
 fn node(id: &str, prim: Prim, stage: &str, vgprs: u32) -> Node {
     Node { id: id.into(), prim, stage: stage.into(), params: vec![("k".into(), Val::Int(256)), ("act".into(), Val::Str("relu".into()))], resources: Resources { vgprs, agprs: 0, lds_bytes: 1024, barriers: 0 }, roles: vec!["all".into()], barrier_phase: 0, phase: Phase::Loop, hook: None }
@@ -126,7 +126,7 @@ fn structural_errors() {
 
 // ---------------------------------------------------------------- skeleton generation: weave groups and cut-edge slots
 
-use amdgpu_tile::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::skeleton::generate;
 
 fn two_stage_graph() -> Graph {
     // the FMHA shape: v_phase = softmax (sm), m_phase = pv + qk woven by one weaver; qk produces the S of the NEXT iteration (loop-carried edge s)

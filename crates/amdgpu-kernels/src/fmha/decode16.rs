@@ -22,7 +22,7 @@ fn group4(b: &mut FnBuilder, x: ValueId, max: bool) -> ValueId {
 }
 
 /// `kt` keys per tile and wave: 32 (a 16 KB private K / V region: two CTAs of 4 waves per CU; large batches) or 64 (32 KB, one CTA per CU;
-/// small grids: more keys per wave). The launch dispatch (`crate::dispatch::decode16_plan`) runs the fused (`_f`) or last-arriver (`_c`) forms;
+/// small grids: more keys per wave). The launch dispatch (`amdgpu_graph::dispatch::decode16_plan`) runs the fused (`_f`) or last-arriver (`_c`) forms;
 /// these split forms (with the `attn_combine_bf16_hd128` kernel) remain for experiments and the MTP / fp8 variants.
 pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_x(name, page, kt, false)

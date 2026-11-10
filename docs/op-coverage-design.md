@@ -518,7 +518,7 @@
 - 与厂商同条件的 split-K 对比。
 
 **blockscale 中等 M 的分发规则**（2026-11-08，同次运行，对照 aiter 的 BpreShuffle_128x128）：
-- 规则：CTA 数 M·N/128² ≤ 约 2×CU 数时，改用 `gemm_a8w8_blockscale_splitk`，取 S = 2，再加 `gemm_splitk_reduce_s2`。规则写在 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `blockscale_split_k` 中。
+- 规则：CTA 数 M·N/128² ≤ 约 2×CU 数时，改用 `gemm_a8w8_blockscale_splitk`，取 S = 2，再加 `gemm_splitk_reduce_s2`。规则写在 [`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `blockscale_split_k` 中。
 - 实测：
 
   | 形状 | 不切分 | S = 2 | 厂商 | 比（S = 2） |
@@ -863,14 +863,14 @@
     | 4096² B1H8 | 0.94（`_ks` S2） | 0.94（`_ks` S4） |
     | 512² B16H32 | 0.84 | — |
 
-  - 分发规则见 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `bf16_prefill_kernel`：
+  - 分发规则见 [`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `bf16_prefill_kernel`：
     - 极小的 causal 网格（配对后不足 64 个 CTA）仍用 v1 causal。例如 B2H8 1000×1300：v1 123 TF/s，v3 最好 94 TF/s，厂商 115 TF/s。
     - hd64 / hd256、滑窗和 varlen 仍走 v1。
 - **paged decode `pa_decode16_bf16_hd128_p<P>`**，见 [`fmha/decode16.rs`](../crates/amdgpu-kernels/src/fmha/decode16.rs)。
   - 用于 G ≤ 16：每个 wave 改用 16x16x32 MFMA，消除 32 行形式下 3/4 的空算。
   - 速度从 0.51× 提到 0.62×。
   - 敏感性实验：去掉 PV 只快 6%；去掉 DMA 后时间减半。瓶颈是访存延迟没有被隐藏：每 CU 只有 4 个 wave，且每个 wave 内 DMA 与计算串行。
-  - 于是加入 32 key 的 tile（每个 wave 的私有区 16 KB，每 CU 可驻留 2 个 CTA），与 64 key 版（`_k64`）并存，当时由 `decode16_config` 按 B·HK 选择 tile 大小和切分数 S（v9 起由 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `decode16_plan` 取代，见下文 last-arriver 一节）。
+  - 于是加入 32 key 的 tile（每个 wave 的私有区 16 KB，每 CU 可驻留 2 个 CTA），与 64 key 版（`_k64`）并存，当时由 `decode16_config` 按 B·HK 选择 tile 大小和切分数 S（v9 起由 [`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `decode16_plan` 取代，见下文 last-arriver 一节）。
   - 实测：
 
     | 形状（B / H / HK / ctx） | 配置 | ours | 厂商 | 比 |
@@ -881,7 +881,7 @@
   - block-table 查表批量化：0.37× → 0.51×。
   - **last-arriver 合并（`pa_decode16_bf16_hd128_p<P>_c`，v9）**：split 形式的 CTA 用 sc1 写穿存部分结果并 lite release，然后由一个 lane 取 (b, hk) 的 ticket（返回式 `buffer_atomic_add`，其余 lane 的偏移越界、在 L2 之前被丢弃），最后到达的 CTA acquire 后合并 S 份部分结果、直接写 bf16 输出——不需要 combine kernel。
     - 第一版（`archive/decode16-lastc`）慢约 100 µs：ticket 原子由 CTA 的全部 256 个 lane 执行（非 0 lane 加 0，仍是 L2 原子），计数器相邻，B16 时约 3.2 万个同 cache line 原子串行化。改成单 lane 后：B16 ctx 2048 S1 128 → 30.3 µs，S4 353 → 26.3 µs。fence 本身只降为等待，不是瓶颈。
-    - 分发：[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `decode16_plan(B, HK, ctx)`。n = B·HK ≥ 256 时用 fused；更小的网格用 `_c`，S 取使 n·S ≥ 256 的最小 2 的幂，并限制每份至少 512 个 key（S ≤ ctx / 512）。
+    - 分发：[`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `decode16_plan(B, HK, ctx)`。n = B·HK ≥ 256 时用 fused；更小的网格用 `_c`，S 取使 n·S ≥ 256 的最小 2 的幂，并限制每份至少 512 个 key（S ≤ ctx / 512）。
     - 实测（H 64，HK 8，页 16，µs，同一次运行；旧规则 = split + combine kernel，n < 64 用 `_k64`；比 = 厂商 / ours）：
 
       | B | ctx 1024 | ctx 2048 | ctx 8192 |
@@ -906,7 +906,7 @@
   - 后续改动：
     - 把 tile 拆成两个 16 key 的半块，第 0 半块的 QK 与第 1 半块的 DMA 重叠：H16 从 79 降到 76 µs，约为厂商的 0.63×。
     - H ≥ 64 时改用 head 并行形式 `mla_decode_bf16_hp_p<P>`：每 CTA 的 4 个 wave 是 4 组各 16 个 head，共享 2 槽的 36 KB KV 环，每 64 个 head 只读一次 KV。H128 B64 ctx 4096 P16：348 → 232 µs（S=2）。
-    - [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `mla_config` 负责选择形式和切分数 S。
+    - [`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `mla_config` 负责选择形式和切分数 S。
   - 期间发现两个后端 bug：
     - `ds_bpermute` 之后缺少 lgkm 等待，tileops f841f0a2 已修复；
     - if / else 中随机 lane 的存储丢失：根因是 then 路径的 Q 预取 load 在 else 路径上结果已死但仍在途，RA 把其寄存器交给 else 的临时值，晚到的 load 覆盖之；后端已用 post-RA 的在途 load 物理 WAW 守卫（`pad_inflight_waw`）修复（见 [`current-status.md`](current-status.md) §6.1）。新版此前通过去掉该分支绕开。- **MoE stage 2**：
@@ -940,7 +940,7 @@
 - **小网格：KV split（`fmha_fwd_hd128_fp8pt_v3[_causal]_kvsplit`）**：`skeleton_kvsplit` 上的同一个 body（MUBUF staging、优先级 ping-pong、单次 bias MFMA），每个 q tile 的 key 范围切成 S 份（grid z = B·S），fp16 部分结果加 LSE，由出厂的 `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` 合并。
   - ABI 扩展放在 656 字节之后（0x290 Ohat、0x298 LSE、0x2A0 splits、0x2A4 rows_total），因为 0x270 / 0x280 已被 V descale 的步长占用。
   - causal：切的是该 q tile 可见的 key 范围（`components::kv_split_range_var`）；超出范围的 split 夹到最后一个 tile 运行，结果以 LSE = −∞ 丢弃。split 内的 causal mask 以 split 起点为原点。
-  - 分发：[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `fp8pt_prefill_kernel`：未配对网格 U = B·H·⌈SQ/256⌉ < CU 数时用 split，S 取使 U·S ≥ CU 的最小值（≤ 4，每份至少两个 key tile）。
+  - 分发：[`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `fp8pt_prefill_kernel`：未配对网格 U = B·H·⌈SQ/256⌉ < CU 数时用 split，S 取使 U·S ≥ CU 的最小值（≤ 4，每份至少两个 key tile）。
   - 扫描（同次运行，µs，plain / 最佳 split / 厂商）：B1 H8 2048² 37.7 / 24.6（S4）/ 33.2；4096² 71.0 / 55.3（S2）/ 63.7；causal 2048² 50.4 / 25.2（S4）/ 41.1；causal 4096² 90.8 / 51.3（S2）/ 68.2。U = 256 时 split 更慢（B4 H16 1024²：32.3 对 S2 47.6；causal 40.0 对 45.6），所以不切。
   - strict 0 错误；厂商对齐全部 PASS（mean_err 1.02–1.07×）。
 
@@ -1070,7 +1070,7 @@ blockscale 128×128（`fp8bs`）的规则：
   - 性能：M512 D=I=3072 E32 topk4（gpt-oss 尺寸，K 填充到 256 的倍数）+ `_oss`：a16w4 的 stage 1 为 286 µs，a4w4 为 128 µs；M4096 时分别为 1293 µs 与 409 µs。差距来自反量化的 VALU。
   - 限制：K（即 D 与 I）必须是 256 的倍数，gpt-oss 的 2880 要填充到 3072。
   - a8w4 MoE 理论上用同一套机制即可得到（`Elem::Fp8W4` 加不重排的 Mx32），但还没有 host 测试，暂未注册。
-- **block_m 64（已完成）**：`gemm_moe{1,2}_*_bm64` 是 64 行 tile。[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `moe_block_m` 在每专家平均行数 M·topk/E < 128 时选用它。
+- **block_m 64（已完成）**：`gemm_moe{1,2}_*_bm64` 是 64 行 tile。[`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `moe_block_m` 在每专家平均行数 M·topk/E < 128 时选用它。
   - M256 D7168 I2048 E64 topk8，stage 1：fp8 从 420 µs 降到 381 µs（aiter 392，1.03×）；fp8bs 从 530 µs 降到 417 µs（aiter 418，1.0×）。
   - 同一形状的 stage 2 + sum：fp8 251 → 222 µs，fp8bs 262 → 213 µs。
   - M128 E8 topk2 fp8bs：53.8 → 38.0 µs。
@@ -1226,7 +1226,7 @@ blockscale 128×128（`fp8bs`）的规则：
 
 小形状 tile 数少，所以 TF/s 低。
 
-**小形状改进**：网格不足 CU 数一半时改用 `_c128`，即 128×128 CTA，规则见 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `conv_cta`。
+**小形状改进**：网格不足 CU 数一半时改用 `_c128`，即 128×128 CTA，规则见 [`dispatch.rs`](../crates/amdgpu-graph/src/dispatch.rs) 的 `conv_cta`。
 - 1×1 NB2：49 → 94 TF/s；
 - 3×3 s2：44 → 89 TF/s；
 - 3×3 NB2 56²：69 → 135 TF/s；

@@ -129,7 +129,7 @@ on-chip: kv kv_stage→qk,pv C3 (block) | s qk→softmax C0 (loop-carried) | p s
 
 ### §3b 骨架（`fmha/skeleton_vs128.rs`，生成文件，勿手改）
 
-由 `amdgpu_tile::opgraph::skeleton` 从图生成，内容包括：
+由 `amdgpu_graph::opgraph::skeleton` 从图生成，内容包括：
 - trait `Vs128Slots`，三个 slot：`prelude` / `pipeline` / `dispatch`；
 - `build_vs128(name, slots)`：先检查图（节点、代价类），再依次调用三个 slot。
 

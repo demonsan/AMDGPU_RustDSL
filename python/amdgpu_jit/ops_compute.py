@@ -1,7 +1,7 @@
 """Compute-bound ops (docs/op-coverage-design.md §7): the GEMM family (bf16, fp8 row/col scales, fp8 blockscale with the split-K dispatch,
 MXFP4), the bf16 attention prefill (the dispatch rule picks the kernel and the key splits) and the fused MoE (routing sort, stage 1, the
 re-quantization, stage 2, the top-k sum). Thin wrappers over ``_generic.launch``; the dispatch rules are asked from amdc (``amdc dispatch``,
-the single rule in crates/amdgpu-kernels/src/dispatch.rs). Host-side layout helpers (``shuffle_weight``, ``shuffle_mx_scales``,
+the single rule in crates/amdgpu-graph/src/dispatch.rs). Host-side layout helpers (``shuffle_weight``, ``shuffle_mx_scales``,
 ``moe_w1_interleave``) prepare weights from bytes for torch-free callers."""
 import json
 import math

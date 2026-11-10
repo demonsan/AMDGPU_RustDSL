@@ -2,7 +2,7 @@
 //! (`mlp_fp8_ws_g1` / `_g2`) is the cut at the `h` edge (C4: H through HBM).
 
 use super::{p_boundary, ALPHA, K1, N1, N2, W_IMG, W_PITCH};
-use amdgpu_tile::opgraph::{Class, Edge, FragLayout, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
+use amdgpu_graph::opgraph::{Class, Edge, FragLayout, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
 
 fn node(id: &str, prim: Prim, stage: &str, phase: Phase, params: Vec<(&str, Val)>, res: Resources) -> Node {
     Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: res, roles: vec!["all 4 waves: same program".into()], barrier_phase: 0, phase, hook: None }

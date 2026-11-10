@@ -1,7 +1,7 @@
 //! The op graph of RMSNorm + per-token fp8 quantization (design section 4.4): load -> rms (R) -> quant (E + R + Q) -> store. One wave per row, straight-line (no loop): the stages are the
 //! `norm` kernel's `Node::Stage` regions, the edges their hand-overs (all register-resident, C0). `N` is a stage parameter (here 1024); the generated skeleton is the same for every N.
 
-use amdgpu_tile::opgraph::{Class, Edge, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
+use amdgpu_graph::opgraph::{Class, Edge, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
 
 fn node(id: &str, prim: Prim, stage: &str, params: Vec<(&str, Val)>, vgprs: u32) -> Node {
     Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: Resources { vgprs, agprs: 0, lds_bytes: 0, barriers: 0 }, roles: vec!["all 4 waves: one row each".into()], barrier_phase: 0, phase: Phase::Prologue, hook: None }

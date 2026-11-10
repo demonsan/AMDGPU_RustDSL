@@ -1,6 +1,6 @@
 # 算子图与骨架生成器（stage 库 P3）
 
-状态：已实现（`crates/amdgpu-tile/src/opgraph/`）。设计见 [`fusion-stage-library-design.md`](fusion-stage-library-design.md) §3 / §5。算子图**不是新 IR**：它只是骨架生成器的输入，不进入编译器。
+状态：已实现（`crates/amdgpu-graph/src/opgraph/`）。设计见 [`fusion-stage-library-design.md`](fusion-stage-library-design.md) §3 / §5。算子图**不是新 IR**：它只是骨架生成器的输入，不进入编译器。
 
 ## 1. 数据模型（可序列化为 JSON，无 serde）
 

@@ -1,0 +1,10 @@
+[package]
+name = "amdgpu-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "L1 graph layer: the op graph (cut, budget, JSON, skeleton generator) and the host-side dispatch rules of the shipped kernel families (docs/refactor-4layer-plan.md)."
+
+[dependencies]
+amdgpu-layout = { path = "../amdgpu-layout" }
+amdgpu-tile = { path = "../amdgpu-tile" }

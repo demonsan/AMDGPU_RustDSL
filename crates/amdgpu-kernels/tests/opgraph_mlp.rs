@@ -1,8 +1,8 @@
 //! The MLP op graph and its generated skeletons (P3): the committed graph JSON and skeleton sources are what the generator produces now (`UPDATE_SKELETONS=1` rewrites them), and the cuts of the
 //! graph give the fused kernel (one kernel) and the unfused pair (C4 at `h`).
 use amdgpu_kernels::mlp::graph::{graph, graph_unfused};
-use amdgpu_tile::opgraph::skeleton::generate;
-use amdgpu_tile::opgraph::*;
+use amdgpu_graph::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::*;
 
 fn file(rel: &str) -> String {
     format!("{}/src/mlp/{rel}", env!("CARGO_MANIFEST_DIR"))

@@ -21,7 +21,6 @@ pub mod ir_proof;
 pub mod probes;
 pub mod verifier_cases;
 pub mod registry;
-pub mod dispatch;
 pub mod reachable;
 
 pub use registry::{kernel_by_name, kernel_names};
