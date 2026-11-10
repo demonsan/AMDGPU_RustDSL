@@ -14,6 +14,8 @@ pub struct Target {
     pub regs: RegFiles,
     pub lds: Lds,
     pub counters: Counters,
+    /// the hazard rules whose distances are target facts (the per-instruction writer delays are in the instruction tables)
+    pub hazards: &'static [HazardRule],
     pub emit: Emission,
     pub verify: VerifyLimits,
 }
@@ -130,6 +132,93 @@ impl Counters {
             i += 1;
         }
         panic!("memory class without a counter")
+    }
+}
+
+/// The distance unit of a hazard rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    /// wait states: every issued instruction or `s_nop` state counts (gfx950)
+    WaitStates,
+    /// only independent VALU instructions count (gfx1250 WMMA `v_nop` rule; co-execution state changes the count)
+    IndependentValu,
+}
+
+/// The required distance of a rule.
+#[derive(Debug)]
+pub enum Count {
+    N(u32),
+    /// by the producer's MFMA result latency: (latency, distance) pairs, else the default
+    ByMfmaLatency(&'static [(u32, u32)], u32),
+    /// a required instruction rather than a distance (gfx1250 `s_wait_*` forms)
+    Instr(&'static str),
+}
+
+/// Where the rule is checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// on values before register allocation
+    Value,
+    /// on physical registers after allocation
+    Physical,
+}
+
+/// One hazard rule (docs/trust-inventory.md section 5.1 is the gfx950 audit against LLVM GCNHazardRecognizer).
+#[derive(Debug)]
+pub struct HazardRule {
+    pub name: &'static str,
+    pub count: Count,
+    pub unit: Unit,
+    pub scope: Scope,
+    /// the evidence: LLVM function, ISA section, probe
+    pub source: &'static str,
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl Target {
+    /// The hazard rule `name` (panics at compile time in a const context when the target has no such rule).
+    pub const fn hazard(&self, name: &str) -> &HazardRule {
+        let mut i = 0;
+        while i < self.hazards.len() {
+            if str_eq(self.hazards[i].name, name) {
+                return &self.hazards[i];
+            }
+            i += 1;
+        }
+        panic!("hazard rule not described by the target")
+    }
+}
+
+impl HazardRule {
+    /// The fixed distance (panics for other counts).
+    pub const fn n(&self) -> u32 {
+        match self.count {
+            Count::N(n) => n,
+            _ => panic!("not a fixed-distance rule"),
+        }
+    }
+
+    /// The distance for a producer with MFMA result latency `lat`.
+    pub fn by_latency(&self, lat: u32) -> u32 {
+        match &self.count {
+            Count::ByMfmaLatency(t, d) => t.iter().find(|(l, _)| *l == lat).map_or(*d, |x| x.1),
+            Count::N(n) => *n,
+            Count::Instr(_) => 0,
+        }
     }
 }
 

@@ -29,6 +29,15 @@ pub const GFX950: Target = Target {
         ],
         wait: WaitForm::Combined { mnemonic: "s_waitcnt" },
     },
+    hazards: &[
+        HazardRule { name: "trans-result", count: Count::N(5), unit: Unit::WaitStates, scope: Scope::Value, source: "LLVM TransForwardingHazard (1; 5 kept, conservative)" },
+        HazardRule { name: "mfma-dst-write", count: Count::ByMfmaLatency(&[(20, 21)], 19), unit: Unit::WaitStates, scope: Scope::Physical, source: "CDNA4 ISA 7.6 XDL write VGPR -> VALU write; LLVM GFX940_XDL_N_PassWriteVgprVALUWawWaitStates" },
+        HazardRule { name: "mfma-srcc-war", count: Count::ByMfmaLatency(&[(20, 21)], 12), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkMAIVALUHazards SrcC WAR (conservative)" },
+        HazardRule { name: "wide-store-data", count: Count::N(3), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM 12DWordStore (issue distance 3 = 2 wait states)" },
+        HazardRule { name: "valu-sgpr-vmem", count: Count::N(5), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkVMEMHazards; probe_valu_sgpr" },
+        HazardRule { name: "valu-sgpr-valu", count: Count::N(2), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkVALUHazards hasVDecCoExecHazard" },
+        HazardRule { name: "m0-lds-dma", count: Count::N(1), unit: Unit::WaitStates, scope: Scope::Value, source: "LLVM checkReadM0Hazards (LDS DMA)" },
+    ],
     emit: Emission { sgpr_granule: 8, sgpr_cap: 102, sgpr_min: 8, vgpr_min: 4, vgpr_granule: 4, code_object_version: 6 },
     verify: VerifyLimits { vgpr_limit: 256, sgpr_limit: 102, lds_limit: 160 * 1024 },
 };

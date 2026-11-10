@@ -212,7 +212,7 @@ pub fn pad(m: &mut MFunction) -> usize {
         let mut i = 1;
         while i < b.insts.len() {
             if crate::op_attrs::attrs(b.insts[i].op).m0_src.is_some() && b.insts[i].skip_m0 && is_m0_writer(b.insts[i - 1].op) {
-                b.insts.insert(i, MInst::new(MOp::SNop).imm(0));
+                b.insts.insert(i, MInst::new(MOp::SNop).imm(crate::target::T.hazard("m0-lds-dma").n() as i64 - 1));
                 n += 1;
                 i += 1;
             }
