@@ -125,7 +125,7 @@ pub const FRONT: &[PassInfo] = &[
 // ---------------------------------------------------------------------------------------------------------------- MIR passes
 
 fn run_sched(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
-    sched::run(&mut s.m, cx.sched.expect("the scheduled path has options"))
+    sched::run(&mut s.m, cx.sched.expect("the scheduled path has options")).map(|_| ())
 }
 fn run_phase_strip(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     // scheduler directives are meaningless without the scheduler
