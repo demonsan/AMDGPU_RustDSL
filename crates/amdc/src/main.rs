@@ -25,7 +25,9 @@ fn usage() {
     eprintln!("  amdc gen-host <kernel>|--shipped [--out <dir>]   generate C++ ABI/validate/launch header + JSON metadata");
     eprintln!("  amdc opgraph <graph.json> [--cut k1=n1+n2,k2=n3]   review text of an op graph and its cut (kernels, stages, on-chip edges with classes, HBM tensors, estimates)");
     eprintln!("  amdc skeleton <graph.json> <kernel> [--nodes n1,n2|all] [--graph-file <path>] [--out <file.rs>]   generate the Rust skeleton (orchestration slots) of one kernel of the graph");
-    eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
+    eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock
+  amdc passes [--target gfx950] [--evidence]   the compile pipeline: named passes, stage, target dependence, gate, evidence; the retry ladders
+  amdc md5-manifest [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
 }
 
 /// The `--specialize` bindings of the command line (`--specialize a=1,b=2` or `--specialize=a=1`, repeatable).
@@ -493,6 +495,20 @@ fn main() -> ExitCode {
                 Err(e) => {
                     println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
                     ExitCode::from(1)
+                }
+            }
+        }
+        "passes" => {
+            // amdc passes [--target T] [--evidence]: the compile pipeline of a target (named passes, stage, target dependence, gate, evidence; the retry ladders)
+            let target = args.windows(2).find(|w| w[0] == "--target").map(|w| w[1].clone()).unwrap_or_else(|| amdgpu_compiler::target::T.name.to_string());
+            match amdgpu_compiler::pass::describe(&target, args.iter().any(|a| a == "--evidence")) {
+                Ok(s) => {
+                    print!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(2)
                 }
             }
         }

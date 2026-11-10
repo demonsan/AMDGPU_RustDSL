@@ -16,6 +16,7 @@ pub mod ir_print;
 pub mod diag;
 pub mod hazards;
 pub mod hzfill;
+pub mod pass;
 pub mod target;
 pub mod lower;
 pub mod mir;
@@ -75,7 +76,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
     // and try again. A kernel that allocates at the first attempt is unaffected.
     let mut last = String::new();
-    for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..], &["imm", "ldsspill8"][..], &["imm", "ldsspill16"][..], &["imm", "ldsspill24"][..], &["imm", "ldsspill32"][..], &["imm", "ldsspill48"][..], &["imm", "ldsspill64"][..]] {
+    for extra in pass::OUTER_LADDER {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => {
                 if r.0.lds_bytes > 160 * 1024 {
@@ -83,7 +84,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
                 }
                 return Ok(r);
             }
-            Err(e) if e.contains("out of VGPRs") => last = e,
+            Err(e) if pass::retryable(&e) => last = e,
             Err(e) => return Err(e),
         }
     }
@@ -92,7 +93,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm)
+    f.compile_policy().m0_reuse
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
@@ -101,41 +102,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
     let extra: &[&str] = &extra_all;
-    // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
-    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/archive/status.md round 47).
-    let base = if pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || pname.ends_with("_g2") || pname.ends_with("_t128") {
-        // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
-        // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
-        // the vs128/vsm builds the register slack they need (docs/archive/status.md rounds 49-50).
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
-        // `_t128` (4-wave blocks, one wave per SIMD): addrfold frees the DMA address temporaries so the full scheduler fits (416 -> 494 TFLOP/s)
-        if pname.ends_with("_t128") {
-            v.push("addrfold");
-        }
-        // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
-        // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
-        // v3 `_t128`: `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC):
-        // same-run A/B, B2H8S2048 layout median +3.3% together (on `_vs128` / `_kvsplit` -0.7..-1.5%: not used there, docs/dsl-layout-refactor-design.md
-        // §9.4); `saddrlds` (the SADDR DMA form: +1.8..+2.1%; -0.2..-1.4% on _vs128 / _kvsplit)
-        if pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") {
-            v.extend_from_slice(&["saddrlds", "edgepad", "salubr"]);
-        }
-        v.extend_from_slice(extra);
-        lower::with_opts(&v, || lower::lower(f))?
-    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
-        // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
-        // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
-        // + kabatch (kernarg loads batched into s_load_dwordx4) and imm (inline constants / literals as VALU operands instead of v_mov materialisations)
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad", "kabatch", "imm"];
-        v.extend_from_slice(extra);
-        lower::with_opts(&v, || lower::lower(f))?
-    } else if pname.starts_with("fmha_fwd_hd128_mxfp8") {
-        // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/archive/status.md)
-        let mut v: Vec<&str> = vec!["zeroinit"];
-        v.extend_from_slice(extra);
-        lower::lower_with_extra(f, &v)?
-    } else {
-        lower::lower_with_extra(f, extra)?
+    // the kernel's declared compile policy (amdgpu_dsl::CompileProfile::policy): its lowering tokens, then the retry ladder's and the kernel's own
+    let pol = f.compile_policy();
+    let mut v: Vec<&str> = pol.lower.to_vec();
+    v.extend_from_slice(extra);
+    let base = match pol.lower_base {
+        amdgpu_dsl::LowerBase::Replace => lower::with_opts(&v, || lower::lower(f))?,
+        amdgpu_dsl::LowerBase::Inherit => lower::lower_with_extra(f, &v)?,
     };
     // AGPR requests (DSL pin_agpr / gpr): move the vregs to the AGPR file and repair the instructions that cannot touch it
     let base = {
@@ -171,100 +144,30 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         || std::env::var("AMDC_SCHED_ADD").ok().map_or(false, |spec| {
             spec.split(';').filter_map(|e| e.split_once(':')).any(|(pat, toks)| (pat == "*" || pname.contains(pat) || f.name.contains(pat)) && toks.split(',').any(|t| t.trim() == "hzfill"))
         });
-    let hz = |m: &mut mir::MFunction, a: &regalloc::Alloc, strict: bool| {
-        if hzfill {
-            let s = hzfill::fill_with(m, a, strict, hz_opts.as_ref());
-            if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
-                eprintln!("hzfill {}: s_nop wait states {} -> {} ({} moves, {} rejected)", f.name, s.states_before, s.states_after, s.moved, s.rejected);
-            }
-        }
-    };
+    let m0_reuse = m0_reuse_on(f);
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
-        // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
-        // the register file), then the pressure limit, and only then give up the scheduler.
-        let mut attempts: Vec<(u32, Option<usize>)> = vec![(0, None)];
-        if opts.ldshoist {
-            attempts.extend([(0, Some(24)), (0, Some(8)), (0, Some(0))]);
-        }
-        if opts.reorder {
-            attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]); // the pressure limit only matters for the reordering scheduler
-            // a big workgroup: the schedule must also fit the launch budget (ceil(waves / 4) waves per SIMD share 512 registers); a schedule that
-            // hoists later loads above earlier work can blow it. Retry against that budget before giving up the scheduler.
-            let launch = sched::launch_vgpr_budget(base.workgroup_size);
-            if launch < opts.max_vgprs {
-                let c = opts.max_vgprs - launch;
-                attempts.extend([(c, Some(0)), (c + 16, Some(0)), (c + 32, Some(0))]);
-            }
-        }
-        for (cut, hoist) in attempts {
+        for (cut, hoist) in pass::inner_ladder(&opts, base.workgroup_size) {
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
             if let Some(h) = hoist {
                 o.hoist_dist = h;
                 o.ldshoist = h > 0 && opts.ldshoist;
             }
-            let mut m = base.clone();
-            let attempt = (|| -> Result<regalloc::Alloc, String> {
-                sched::run(&mut m, &o)?;
-                if m0_reuse_on(f) {
-                    sched::m0::reuse(&mut m);
-                }
-                sched::m0::explicit(&mut m);
-                let pe = pin_check::check(&m);
-                if !pe.is_empty() {
-                    return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
-                }
-                hazards::fix_value_hazards_opts(&mut m, true);
-                let errs = mir::verify(&m);
-                if !errs.is_empty() {
-                    return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
-                }
-                let a = regalloc::allocate(&m)?;
-                // over the workgroup's launch budget: like running out of VGPRs (try the next, tighter attempt)
-                regalloc::check_workgroup_budget(&m, &a).map_err(|e| format!("out of VGPRs for the launch: {e}"))?;
-                hazards::pad_inflight_waw(&mut m, &a);
-                hazards::pad_physical_war(&mut m, &a);
-                hz(&mut m, &a, true);
-                sched::m0::pad(&mut m);
-                hazards::pad_valu_sgpr(&mut m, &a);
-                Ok(a)
-            })();
-            match attempt {
-                Ok(a) => return Ok((m, a)),
-                Err(e) if e.contains("out of VGPRs") => last_err = e,
+            let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
+            let mut s = pass::MirState { m: base.clone(), alloc: None };
+            match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
+                Ok(()) => return Ok((s.m, s.alloc.expect("allocated"))),
+                Err(e) if pass::retryable(&e) => last_err = e,
                 Err(e) => return Err(e),
             }
         }
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
-    let mut m = base;
-    sched::phase::strip(&mut m); // scheduler directives are meaningless without the scheduler
-    if m0_reuse_on(f) {
-        sched::m0::reuse(&mut m);
-    }
-    sched::m0::explicit(&mut m);
-    let pe = pin_check::check(&m);
-    if !pe.is_empty() {
-        return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
-    }
-    hazards::fix_value_hazards(&mut m);
-    let errs = mir::verify(&m);
-    if !errs.is_empty() {
-        return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
-    }
-    // the unscheduled path trusted its lowering-time waits; passes after lowering (LDS spill, ...) can invalidate them: re-check on every path
-    sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
-    let alloc = regalloc::allocate(&m)?;
-    // a register handed to another value while a load into it is still in flight (a path where the load's result is not used)
-    hazards::pad_inflight_waw(&mut m, &alloc);
-    // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
-    // pad the physical write-after-read hazard on every path, not only for scheduled code.
-    hazards::pad_physical_war(&mut m, &alloc);
-    hz(&mut m, &alloc, false);
-    sched::m0::pad(&mut m);
-    hazards::pad_valu_sgpr(&mut m, &alloc);
-    Ok((m, alloc))
+    let cx = pass::PassCtx { f, path: pass::Path::Unscheduled, sched: None, hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
+    let mut s = pass::MirState { m: base, alloc: None };
+    pass::run_body(pass::UNSCHEDULED, &mut s, &cx)?;
+    Ok((s.m, s.alloc.expect("allocated")))
 }
 
 /// Lower, schedule and allocate, then export post-RA MIR (no llc involved).
@@ -335,16 +238,16 @@ pub fn region_strategies(f: &amdgpu_dsl::Function, m: &mir::MFunction) -> Vec<u1
 }
 
 fn scheduler_options_base(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
-    use amdgpu_dsl::CompileProfile as P;
+    use amdgpu_dsl::SchedPreset as P;
     if let Some(o) = sched::Options::from_env() {
         return Some(o);
     }
     if std::env::var("AMDC_SCHED").ok().as_deref() == Some("0") {
         return None;
     }
-    let preset = match f.compile_profile {
+    let preset = match f.compile_policy().sched_preset {
         // scoreboard (partial) waits + ds_read hoisting, no instruction reordering (docs/scheduling.md; measured best on the GEMM)
-        Some(P::Gemm) => {
+        P::Gemm => {
             let mut o = sched::Options::default();
             o.reorder = false;
             o.ldshoist = true;
@@ -352,13 +255,13 @@ fn scheduler_options_base(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
         }
         // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256 (measured 489 -> 505 TFLOP/s on B1H8S2048;
         // limit 246 / 248 only, 244 / 250 give the old schedule: a heuristic knob, re-measure on changes)
-        Some(P::T128) => {
+        P::T128 => {
             let mut o = sched::Options::default();
             o.alu_across_barrier = true;
             o.max_vgprs = 248;
             Some(o)
         }
-        _ => None,
+        P::None => None,
     };
     match (preset, &f.sched_opts) {
         (Some(mut o), Some(s)) => {

@@ -1569,6 +1569,11 @@ impl std::fmt::Debug for SrcLocs {
 }
 
 impl Function {
+    /// The declared compile policy (`CompileProfile::policy`; the default policy without a profile).
+    pub fn compile_policy(&self) -> CompilePolicy {
+        self.compile_profile.map_or(DEFAULT_POLICY, |p| p.policy())
+    }
+
     /// `file:line:col` of the builder call that created value `v`.
     pub fn value_loc(&self, v: ValueId) -> Option<String> {
         self.src_locs.0.get(v as usize).copied().flatten().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -1633,6 +1638,72 @@ pub enum CompileProfile {
     /// No FMHA-specific policy (plain lowering, scheduler only when requested by the environment).
     Default,
 }
+
+/// How a policy's lowering tokens combine with the lowering options already in effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LowerBase {
+    /// on top of the options in effect (the default `dce,cmpfold`, or a caller's `lower::with_opts` override)
+    Inherit,
+    /// exactly these tokens (plus the retry ladder's and the kernel's own `lower_opts`)
+    Replace,
+}
+
+/// The scheduler preset a policy selects (the kernel's `sched_opts` tokens are applied on top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedPreset {
+    /// no preset: the scheduler runs only for `sched_opts`, declared regions or the environment
+    None,
+    /// scoreboard (partial) waits + ds_read hoisting, no instruction reordering (docs/scheduling.md; measured best on the GEMM)
+    Gemm,
+    /// ALU may cross the single barrier per tile, VGPR pressure limit 248 (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246 / 248 only)
+    T128,
+}
+
+/// The declared compile policy of a kernel: the data the compiler's pipeline reads (it no longer looks at kernel names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompilePolicy {
+    pub lower_base: LowerBase,
+    pub lower: &'static [&'static str],
+    /// M0 reuse for LDS-DMA loads (sched::m0::reuse)
+    pub m0_reuse: bool,
+    pub sched_preset: SchedPreset,
+}
+
+/// The vendor-structure FMHA lowering: `scalarize` (wave-uniform integer chains in SGPRs) for the register savings the svscale / 3-slot swizzled ring
+/// need; measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment lanes), imm and sgpr
+/// cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off (docs/archive/status.md rounds 47-50).
+const VS_LOWER: &[&str] = &["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
+
+impl CompileProfile {
+    /// The policy table.
+    pub const fn policy(self) -> CompilePolicy {
+        match self {
+            CompileProfile::Vs128 | CompileProfile::KvSplit => CompilePolicy { lower_base: LowerBase::Replace, lower: VS_LOWER, m0_reuse: false, sched_preset: SchedPreset::None },
+            // `_t128` (4-wave blocks, one wave per SIMD): addrfold frees the DMA address temporaries so the full scheduler fits (416 -> 494 TFLOP/s)
+            CompileProfile::T128 => CompilePolicy {
+                lower_base: LowerBase::Replace,
+                lower: &["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit", "addrfold"],
+                m0_reuse: false,
+                sched_preset: SchedPreset::T128,
+            },
+            // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/archive/status.md)
+            CompileProfile::Combine => CompilePolicy { lower_base: LowerBase::Inherit, lower: &["zeroinit"], m0_reuse: false, sched_preset: SchedPreset::None },
+            // partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`); scalarize / scalarize2 / waveuni: the wave-uniform DMA address
+            // chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU; kabatch (kernarg loads batched into s_load_dwordx4) and imm
+            // (inline constants / literals as VALU operands instead of v_mov materialisations); M0 reuse for the LDS-DMA loads
+            CompileProfile::Gemm => CompilePolicy {
+                lower_base: LowerBase::Replace,
+                lower: &["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad", "kabatch", "imm"],
+                m0_reuse: true,
+                sched_preset: SchedPreset::Gemm,
+            },
+            CompileProfile::Default => DEFAULT_POLICY,
+        }
+    }
+}
+
+/// The policy of a kernel without a declared profile.
+pub const DEFAULT_POLICY: CompilePolicy = CompilePolicy { lower_base: LowerBase::Inherit, lower: &[], m0_reuse: false, sched_preset: SchedPreset::None };
 
 impl Function {
     /// The structured body (region IR).
