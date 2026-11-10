@@ -64,7 +64,10 @@ fn a_high_half_scalef32_convert_gets_one_wait_state_before_any_consumer_of_its_r
     assert_eq!(after(MOp::VCvtPkFp8Lo, accw()), 0, "the low half stays unpadded");
     assert_eq!(after(MOp::VCvtPkFp8Lo, mov()), 0, "the low half stays unpadded");
     assert_eq!(after(MOp::VAccvgprRead, accw()), 0, "accvgpr_read -> accvgpr_write copies stay unpadded");
-    // the partner conversion reads the dword it merges into: interlocked, no padding (the shipped Lo / Hi pairs)
-    let partner = || MInst::new(MOp::VCvtPkFp8Lo).def(0).srcreg(0).srcreg(2);
-    assert_eq!(after(MOp::VCvtPkFp8Hi, partner()), 0, "the partner half-convert is exempt");
+    // a conversion that merges into the result's dword (the tied destination, srcs[2]) is interlocked: no padding (the shipped pairs merge this way)
+    let merge = || MInst::new(MOp::VCvtPkFp8Hi).def(0).srcreg(1).srcreg(2).srcreg(0);
+    assert_eq!(after(MOp::VCvtPkFp8Hi, merge()), 0, "a conversion merging into the dword is exempt");
+    // a conversion that READS the high-half result as data waits like any consumer (LLVM oracle: dst-sel forwarding, hazard_oracle.rs)
+    let data = || MInst::new(MOp::VCvtPkFp8Lo).def(3).srcreg(0).srcreg(2);
+    assert!(after(MOp::VCvtPkFp8Hi, data()) >= 1, "a conversion reading the result as data needs a wait state");
 }
