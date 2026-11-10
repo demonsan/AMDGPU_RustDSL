@@ -13,6 +13,7 @@ pub mod reduce;
 
 use amdgpu_dsl::{AtomicOp, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use crate::lds_decl::tile_at;
+use amdgpu_tile::templates::scan::{HsScan, ScanElem};
 use amdgpu_tile::{ev, SlotIdx};
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -139,36 +140,11 @@ fn moe_sorting_x(name: &str, e: i64, k: i64, bm: i64, publish_cursors: bool) -> 
     t_s0.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a_s0, padded, MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
-    let mut cur = offs0;
-    let mut s = 1i32;
-    let mut ver = 0i32;   // the version of the tile `cur`
-    while s < 512 {
-        let nxt = if cur == offs0 { offs1 } else { offs0 };
-        let (cur_t, nxt_t) = if cur == offs0 { (&t_s0, &t_s1) } else { (&t_s1, &t_s0) };
-        let a_own = b.bind_i32(ev(tid4) + cur);
-        let own = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_own, MemTy::B32));
-        let prev_i = b.bind_i32(ev(tid) - s);
-        let ok = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
-        // (a max, not a select: the address is provably inside the scan tile; masked by `ok` below)
-        let pi = b.bind_i32(ev(prev_i).max(0));
-        let a_pv = b.bind_i32((ev(pi) << 2) + cur);
-        let pv = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
-        b.wait_lds(0);
-        let add = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(pv), b: Opnd::I32(0) });
-        let sum = b.add_i32(own, add);
-        let a_nx = b.bind_i32(ev(tid4) + nxt);
-        nxt_t.at(&SlotIdx::new(0, ver + 1)).write(b, |b| b.store_lds(a_nx, sum, MemTy::B32, false));
-        b.wait_lds(0);
-        b.barrier();
-        cur = nxt;
-        ver += 1;
-        s *= 2;
-    }
-    let cur_t = if cur == offs0 { &t_s0 } else { &t_s1 };
-    let a_incl = b.bind_i32(ev(tid4) + cur);
-    let incl = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_incl, MemTy::B32));
-    let a_tot = b.c_i32(cur + 4 * (e as i32 - 1));
-    let total = cur_t.at(&SlotIdx::new(0, ver)).read(b, |b| b.load_lds(a_tot, MemTy::B32));
+    // the inclusive scan over the experts (L2 template `scan`, Hillis-Steele ping-pong over the declared tiles S0 / S1; docs/l2-templates.md T9)
+    let hs = HsScan { s0: &t_s0, s1: &t_s1, base0: offs0, base1: offs1, n: 512, elem: ScanElem::U32 };
+    let sc = hs.steps(b, tid, tid4, None);
+    let (cur, ver, cur_t) = (sc.base, sc.ver, sc.tile);
+    let (incl, total) = sc.incl_total(b, tid4, e as i32 - 1);
     b.wait_lds(0);
     let off_e = b.bind_i32(ev(incl) - ev(padded));                                     // this expert's first padded position
     let a_c = b.bind_i32(ev(tid4) + offc);

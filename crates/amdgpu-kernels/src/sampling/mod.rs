@@ -11,6 +11,7 @@ use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, 
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
 use crate::lds_decl::{private_at, ring_at, tile_at};
 use amdgpu_tile::templates::select::{DescScan, ScanThreads, SelectVer};
+use amdgpu_tile::templates::scan::{HsScan, ScanElem};
 use amdgpu_tile::{ev, Shared, SlotIdx};
 
 const T: i32 = 1024;
@@ -457,39 +458,10 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
         tl.sc0.at(&SlotIdx::new(0, 0)).write(b, |b| b.store_lds(a0, sti, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
-        let mut cur = sc0;
-        let mut s = 1i32;
-        let mut step = 0i32;   // the version of the tile `cur` (ping-pong: every step writes the other tile one version up)
-        while s < T {
-            let nxt = if cur == sc0 { sc1 } else { sc0 };
-            let (cur_t, nxt_t) = if cur == sc0 { (&tl.sc0, &tl.sc1) } else { (&tl.sc1, &tl.sc0) };
-            let a_own = b.bind_i32(ev(tid4) + cur);
-            let own = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_own, MemTy::B32));
-            let prev_i = b.bind_i32(ev(tid) - s);
-            let okp = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
-            // the neighbour below (clamped to 0 for the first s threads: masked by `okp` below; a max so that the address is provably inside the scan tile)
-            let pi = b.bind_i32(ev(prev_i).max(0));
-            let a_pv = b.bind_i32((ev(pi) << 2) + cur);
-            let pv = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_pv, MemTy::B32));
-            b.wait_lds(0);
-            let ownf = b.bitcast_f32(own);
-            let pvf = b.bitcast_f32(pv);
-            let addf = sel_f32(b, okp, pvf, zero);
-            let sum = b.add_f32(ownf, addf);
-            let sumi = b.bitcast_i32(sum);
-            let a_nx = b.bind_i32(ev(tid4) + nxt);
-            nxt_t.at(&SlotIdx::new(0, step + 1)).write(b, |b| b.store_lds(a_nx, sumi, MemTy::B32, false));
-            b.wait_lds(0);
-            b.barrier();
-            cur = nxt;
-            step += 1;
-            s *= 2;
-        }
-        let cur_t = if cur == sc0 { &tl.sc0 } else { &tl.sc1 };
-        let a_inc = b.bind_i32(ev(tid4) + cur);
-        let incl_i = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_inc, MemTy::B32));
-        let a_tot = b.c_i32(cur + 4 * (T - 1));
-        let tot_i = cur_t.at(&SlotIdx::new(0, step)).read(b, |b| b.load_lds(a_tot, MemTy::B32));
+        // (L2 template `scan`: Hillis-Steele ping-pong over SC0 / SC1)
+        let hs = HsScan { s0: &tl.sc0, s1: &tl.sc1, base0: sc0, base1: sc1, n: T, elem: ScanElem::F32 };
+        let sc = hs.steps(b, tid, tid4, Some(zero));
+        let (incl_i, tot_i) = sc.incl_total(b, tid4, T - 1);
         b.wait_lds(0);
         let incl = b.bitcast_f32(incl_i);
         let total = b.bitcast_f32(tot_i);

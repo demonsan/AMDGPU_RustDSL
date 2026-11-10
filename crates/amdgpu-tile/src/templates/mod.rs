@@ -4,4 +4,5 @@
 pub mod grid;
 pub mod pair_ring;
 pub mod select;
+pub mod scan;
 pub mod split;
