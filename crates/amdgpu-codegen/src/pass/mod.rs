@@ -105,7 +105,7 @@ pub struct Pass {
     pub run: RunFn,
 }
 
-const fn info(name: &'static str, stage: Stage, dep: TargetDep, gate: &'static str, evidence: &'static [Evidence]) -> PassInfo {
+pub(crate) const fn info(name: &'static str, stage: Stage, dep: TargetDep, gate: &'static str, evidence: &'static [Evidence]) -> PassInfo {
     PassInfo { name, stage, dep, gate, evidence }
 }
 
@@ -121,12 +121,6 @@ pub const FRONT: &[PassInfo] = &[
     info("strip-any-lane", Source, Generic, "when any_lane markers are present", &[Indirect("every kernel using any_lane; probe_anylane")]),
     info("analysis-uniform-values", Source, Param, "lowering token scalarize", &[Test("crates/amdgpu-codegen/tests/uniform_select.rs"), Test("crates/amdgpu-codegen/tests/scalarize2.rs")]),
     info("lower-mir", Lower, Only, "always; tokens = policy + ladder rung + Function::lower_opts", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs"), Test("crates/amdgpu-kernels/tests/tail_invariance.rs"), Oracle("tools/llvm_compare.sh"), Probe("crates/amdgpu-kernels/src/probes/tileops.rs")]),
-    info("lower-select-fold", Lower, Only, "token cmpfold (default)", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs")]),
-    info("lower-dce", Lower, Generic, "loads always; full with token dce (default)", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs")]),
-    info("lower-remat", Lower, Generic, "ladder rungs remat1..4", &[Indirect("outer ladder; register_accounting.rs")]),
-    info("lower-lds-spill", Lower, Param, "ladder rungs ldsspill8..64", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]),
-    info("lower-coalesce", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]),
-    info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]),
     info("assign-agpr", Mir, Only, "always (no-op without AGPR marks)", &[Test("crates/amdgpu-kernels/tests/agpr.rs"), Probe("tools/agpr_probe.sh"), Doc("docs/agpr.md")]),
 ];
 
@@ -429,6 +423,11 @@ pub fn describe(target: &str, evidence: bool) -> Result<String, String> {
     };
     for p in FRONT {
         line(&mut s, "front", p);
+        if p.name == "lower-mir" {
+            for c in crate::lower::CLEANUP {
+                line(&mut s, "front", &c.info);
+            }
+        }
     }
     for p in SCHEDULED {
         line(&mut s, "scheduled", &p.info);
@@ -450,7 +449,7 @@ pub fn describe(target: &str, evidence: bool) -> Result<String, String> {
 mod tests {
     #[test]
     fn every_pass_has_evidence() {
-        for p in super::FRONT.iter().chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
+        for p in super::FRONT.iter().chain(crate::lower::CLEANUP.iter().map(|p| &p.info)).chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
             assert!(!p.evidence.is_empty(), "{} has no evidence entry", p.name);
         }
     }
@@ -458,7 +457,7 @@ mod tests {
     #[test]
     fn evidence_paths_exist() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for p in super::FRONT.iter().chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
+        for p in super::FRONT.iter().chain(crate::lower::CLEANUP.iter().map(|p| &p.info)).chain(super::SCHEDULED.iter().map(|p| &p.info)).chain(super::UNSCHEDULED.iter().map(|p| &p.info)).chain(super::BACK) {
             for e in p.evidence {
                 let path = match e {
                     super::Evidence::Test(x) | super::Evidence::Doc(x) | super::Evidence::Oracle(x) | super::Evidence::Probe(x) => *x,

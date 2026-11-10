@@ -110,11 +110,114 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
     LAST_ORIGINS.with(|o| *o.borrow_mut() = lw.val.iter().map(|(v, r)| (*r, *v)).collect());
     res?;
     let mut m = lw.finish()?;
-    if opt_on("kabatch") {
-        batch_kernarg_loads(&mut m);
+    for p in CLEANUP {
+        (p.run)(&mut m)?;
     }
     Ok(m)
 }
+
+/// One lowering clean-up pass on the fresh MIR (gated by the lowering tokens in effect, `opt_on`).
+pub struct LowerPass {
+    pub info: crate::pass::PassInfo,
+    pub run: fn(&mut MFunction) -> Result<(), String>,
+}
+
+fn run_select_fold(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("cmpfold") {
+        fold_select_cmp(m);
+        // select(a < b, a, b) and friends become v_min / v_max (no vcc, no v_cmp -> v_cndmask hazard), clamp chains v_med3 / min3 / max3
+        select_minmax(m);
+        dce_cmp_pairs(m);
+        fuse_minmax3(m);
+    }
+    Ok(())
+}
+fn run_dce_loads(m: &mut MFunction) -> Result<(), String> {
+    // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
+    // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
+    dce_full(m, true);
+    Ok(())
+}
+fn run_dce_full(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("dce") {
+        dce_full(m, false);
+    }
+    Ok(())
+}
+fn run_remat(m: &mut MFunction) -> Result<(), String> {
+    // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
+    // number of loop blocks using the constant)
+    if opt_on("remat4") {
+        remat_exprs(m);
+    } else {
+        for (name, k) in [("remat1", 1usize), ("remat2", 2), ("remat3", usize::MAX)] {
+            if opt_on(name) {
+                remat_consts(m, k);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+fn run_lds_spill(m: &mut MFunction) -> Result<(), String> {
+    let spill_n: usize = ["ldsspill8", "ldsspill16", "ldsspill24", "ldsspill32", "ldsspill48", "ldsspill64"].iter().find(|n| opt_on(n)).map(|n| n.trim_start_matches("ldsspill").parse().unwrap()).unwrap_or(0);
+    if spill_n > 0 {
+        let (n, bytes) = lds_spill(m, spill_n);
+        if n > 0 {
+            eprintln!("lds-spill: {n} loop-invariant values moved to LDS, {} bytes per value per workgroup, {bytes} bytes total", bytes / (n.max(1) as u32));
+            crate::sched::waits::insert_waits(m);
+        }
+    }
+    Ok(())
+}
+fn run_coalesce(m: &mut MFunction) -> Result<(), String> {
+    let renames = coalesce(m);
+    if m.reg_hints.active() {
+        // a planned value whose producer was coalesced into another register (e.g. a loop variable) is planned as that register
+        let rn = |r: VReg| -> VReg {
+            let mut r = r;
+            while let Some((_, d)) = renames.iter().find(|(s, _)| *s == r) {
+                r = *d;
+            }
+            r
+        };
+        let h = &mut m.reg_hints;
+        for (r, _) in h.pins_v.iter_mut() {
+            *r = rn(*r);
+        }
+        for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)) {
+            for r in g.iter_mut() {
+                *r = rn(*r);
+            }
+        }
+    }
+    Ok(())
+}
+fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
+    dce(m);
+    Ok(())
+}
+fn run_kabatch(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("kabatch") {
+        batch_kernarg_loads(m);
+    }
+    Ok(())
+}
+
+/// The lowering clean-ups in their order (docs/pass-catalog.md section 2.2).
+pub const CLEANUP: &[LowerPass] = {
+    use crate::pass::{info, Evidence::*, Stage::Lower, TargetDep::*};
+    &[
+        LowerPass { info: info("lower-select-fold", Lower, Only, "token cmpfold (default)", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs")]), run: run_select_fold },
+        LowerPass { info: info("lower-dce-loads", Lower, Generic, "always", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs")]), run: run_dce_loads },
+        LowerPass { info: info("lower-dce", Lower, Generic, "token dce (default)", &[Test("crates/amdgpu-kernels/tests/mir_invariants.rs")]), run: run_dce_full },
+        LowerPass { info: info("lower-remat", Lower, Generic, "ladder rungs remat1..4", &[Indirect("outer ladder; register_accounting.rs")]), run: run_remat },
+        LowerPass { info: info("lower-lds-spill", Lower, Param, "ladder rungs ldsspill8..64 (re-inserts waits)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_lds_spill },
+        LowerPass { info: info("lower-coalesce", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_coalesce },
+        LowerPass { info: info("lower-dce-final", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_dce_final },
+        LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },
+    ]
+};
 
 /// `kabatch`: kernarg loads of the entry block that fall into the same 16-byte-aligned window (inside the kernarg segment) become ONE
 /// `s_load_dwordx4` into an SGPR quad; the original destinations become views of it (`m.alias`). Issued at the first load's position (earlier
@@ -398,60 +501,6 @@ impl Lowerer {
             }
         }
         self.resolve_reg_plan();
-        if opt_on("cmpfold") {
-            fold_select_cmp(&mut self.mir);
-            // select(a < b, a, b) and friends become v_min / v_max (no vcc, no v_cmp -> v_cndmask hazard), clamp chains v_med3 / min3 / max3
-            select_minmax(&mut self.mir);
-            dce_cmp_pairs(&mut self.mir);
-            fuse_minmax3(&mut self.mir);
-        }
-        // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
-        // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
-        dce_full(&mut self.mir, true);
-        if opt_on("dce") {
-            dce_full(&mut self.mir, false);
-        }
-        // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
-        // number of loop blocks using the constant)
-        let spill_n: usize = ["ldsspill8", "ldsspill16", "ldsspill24", "ldsspill32", "ldsspill48", "ldsspill64"].iter().find(|n| opt_on(n)).map(|n| n.trim_start_matches("ldsspill").parse().unwrap()).unwrap_or(0);
-        if opt_on("remat4") {
-            remat_exprs(&mut self.mir);
-        } else {
-            for (name, k) in [("remat1", 1usize), ("remat2", 2), ("remat3", usize::MAX)] {
-                if opt_on(name) {
-                    remat_consts(&mut self.mir, k);
-                    break;
-                }
-            }
-        }
-        if spill_n > 0 {
-            let (n, bytes) = lds_spill(&mut self.mir, spill_n);
-            if n > 0 {
-                eprintln!("lds-spill: {n} loop-invariant values moved to LDS, {} bytes per value per workgroup, {bytes} bytes total", bytes / (n.max(1) as u32));
-                crate::sched::waits::insert_waits(&mut self.mir);
-            }
-        }
-        let renames = coalesce(&mut self.mir);
-        if self.mir.reg_hints.active() {
-            // a planned value whose producer was coalesced into another register (e.g. a loop variable) is planned as that register
-            let rn = |r: VReg| -> VReg {
-                let mut r = r;
-                while let Some((_, d)) = renames.iter().find(|(s, _)| *s == r) {
-                    r = *d;
-                }
-                r
-            };
-            let h = &mut self.mir.reg_hints;
-            for (r, _) in h.pins_v.iter_mut() {
-                *r = rn(*r);
-            }
-            for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)) {
-                for r in g.iter_mut() {
-                    *r = rn(*r);
-                }
-            }
-        }
-        dce(&mut self.mir);
         Ok(self.mir)
     }
 
