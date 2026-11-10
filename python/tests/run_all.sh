@@ -2,6 +2,7 @@
 # All Python op checks on a GPU node, with a summary table (docs/python-jit.md):
 #   python/tests/ops_check.py   every amdgpu_jit op against its Python reference (stdlib only)
 #   python/tests/decode_check.py the paged decode (both dispatch forms)
+#   python/tests/graph_check.py  the L1 graph plans: fused vs unfused vs the reference (docs/l1-graph.md)
 #   python/tests/test_unit.py    host-only unit tests
 #   crates/amdgpu-kernels/tests/dispatch_compile.rs (--ignored, release) every reachable kernel compiles
 #   python/tests/node_check.py   (--full) bit identity vs the C++ harnesses, cache behaviour, launch overhead
@@ -23,13 +24,14 @@ bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test dispatc
 python3 -m unittest discover -s python/tests -p 'test_unit.py' > "$OUT/unit.log" 2>&1; unit=$?
 python3 python/tests/ops_check.py "$@" > "$OUT/ops.log" 2>&1; ops=$?
 python3 python/tests/decode_check.py > "$OUT/decode.log" 2>&1; dec=$?
+python3 python/tests/graph_check.py > "$OUT/graph.log" 2>&1; gr=$?
 nc=skipped
 if [ $FULL = 1 ]; then python3 python/tests/node_check.py --skip-perf > "$OUT/node.log" 2>&1 && nc=PASS || nc=FAIL; fi
 python3 - "$OUT" "$unit" "$ops" "$dec" "$nc" "$(( $(date +%s) - t0 ))" "$comp" <<'PY'
 import re, sys
 out, unit, ops, dec, nc, secs, comp = sys.argv[1:]
 rows = []
-for f in ("ops.log", "decode.log"):
+for f in ("ops.log", "decode.log", "graph.log"):
     for line in open(f"{out}/{f}", encoding="utf-8", errors="replace"):
         m = re.match(r"^(ok|FAIL)\s+(.*)$", line.rstrip())
         if m:

@@ -322,7 +322,13 @@ pub struct Rule {
 
 /// Plans the graph: maximal munch over the ops in order (longest rules first), then the single-op rules for the rest.
 pub fn plan(g: &ModelGraph) -> Plan {
-    let mut rs: Vec<&Rule> = rules::FUSED.iter().collect();
+    plan_with(g, true)
+}
+
+/// `plan` with the fused rules switched off (`fuse = false`): every op through its single-op rule (the unfused reference plan of the
+/// numerics check, docs/l1-graph.md §7.3).
+pub fn plan_with(g: &ModelGraph, fuse: bool) -> Plan {
+    let mut rs: Vec<&Rule> = if fuse { rules::FUSED.iter().collect() } else { Vec::new() };
     rs.sort_by_key(|r| std::cmp::Reverse(r.steps.len()));
     let mut covered = vec![false; g.ops.len()];
     let mut out = Plan::default();

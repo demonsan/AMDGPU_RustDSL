@@ -13,7 +13,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dispatch decode16 <B> <HK> <CTX> [--page P]   (the paged-decode launch plan as JSON)");
-    eprintln!("  amdc graph plan <graph.json | -> [--cus N]        (the L1 launch plan of an op graph, docs/l1-graph.md)");
+    eprintln!("  amdc graph plan <graph.json | -> [--cus N] [--no-fuse] (the L1 launch plan of an op graph, docs/l1-graph.md)");
     eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
@@ -341,7 +341,7 @@ fn main() -> ExitCode {
             }
         }
         "graph" => {
-            // amdc graph plan <graph.json | -> [--cus N]: the L1 launch plan of a model-level op graph (docs/l1-graph.md): fused kernels chosen by
+            // amdc graph plan <graph.json | -> [--cus N] [--no-fuse]: the L1 launch plan of a model-level op graph (docs/l1-graph.md): fused kernels chosen by
             // the fusion rules, per-shape parameters from the dispatch rules. Exit 1 when an op has no kernel.
             if args.get(1).map(|s| s.as_str()) != Some("plan") { usage(); return ExitCode::from(2); }
             let Some(path) = args.get(2) else { usage(); return ExitCode::from(2); };
@@ -354,7 +354,7 @@ fn main() -> ExitCode {
             };
             let mut g = match amdgpu_graph::fusion::ModelGraph::from_json_str(&text) { Ok(g) => g, Err(e) => { eprintln!("{path}: {e}"); return ExitCode::from(1); } };
             if let Some(c) = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()) { g.cus = c; }
-            let p = amdgpu_graph::fusion::plan(&g);
+            let p = amdgpu_graph::fusion::plan_with(&g, !args.iter().any(|a| a == "--no-fuse"));
             print!("{}", p.to_json().to_string_pretty());
             if p.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
         }        "dispatch" => {

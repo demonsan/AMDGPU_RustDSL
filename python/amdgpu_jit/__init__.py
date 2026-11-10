@@ -18,10 +18,11 @@ from .ops_mem import (act_mul, add_rmsnorm, add_rmsnorm_quant_fp8, quant_per_gro
                       rmsnorm_quant_fp8, rmsnorm_quant_mxfp4, silu_mul_quant_fp8, rope, qknorm_rope, qknorm_rope_kvcache, reshape_cache,
                       topk_softmax, moe_sorting, moe_sorting_sizes, moe_reduce)
 from . import _hip as hip
+from . import graph
 
 __all__ = ["launch", "mla_decode", "argmax", "sample", "topk_per_row_decode", "topk_per_row_prefill", "causal_conv1d_fwd",
            "causal_conv1d_update", "gemm_w4", "a16w4_permute", "attention_bwd_bf16", "dispatch", "gemm", "prefill_bf16", "fused_moe", "shuffle_weight", "shuffle_mx_scales", "moe_w1_interleave", "rmsnorm", "add_rmsnorm", "add_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "rmsnorm_quant_mxfp4", "quant_per_token",
            "quant_per_group128", "quant_static_fp8", "act_mul", "silu_mul_quant_fp8", "rope", "qknorm_rope", "qknorm_rope_kvcache",
            "reshape_cache", "topk_softmax", "moe_sorting", "moe_sorting_sizes", "moe_reduce", "gemm_mxfp8_blockscale", "fmha_fwd_mxfp8", "select_path", "decode16_plan", "paged_decode_bf16", "get_kernel", "Kernel", "KernelInfo", "ContractError", "CompileError",
-           "DeviceBuffer", "RawPtr", "TensorRef", "as_ref", "cache_dir", "clear_memory_cache", "stats", "hip"]
+           "DeviceBuffer", "RawPtr", "TensorRef", "as_ref", "cache_dir", "clear_memory_cache", "stats", "hip", "graph"]
 __version__ = "0.1.0"

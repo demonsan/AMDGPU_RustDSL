@@ -185,3 +185,15 @@ The rule is the place where a future fusion would go. If sorting is folded into 
 - **Attribute equivalence.** The fused kernels fix some attributes that the unfused ops take freely, e.g. `add_rmsnorm_fp8`'s scale semantics (dynamic per token, max|y| / 448). `accept` must reject a graph whose `quant_token` asks for anything else (static scale, other max). The vocabulary needs those attributes explicit.
 - **Symbolic M.** The plan is per concrete shape. If plan latency matters on the Python side, the rule output can mark the M-dependent parameters (block_m, splits) as "dispatch at launch" instead of re-planning per M.
 - **Graph source.** For now graphs are hand-written JSON or built by Python helpers. Importing from a framework trace (torch.fx, vLLM model code) is out of scope for this layer.
+
+## 10. Status
+
+- **Step 1** (`l1-graph-step1`):
+  - `amdgpu-graph::fusion` with the §5 rules and the single-op rules;
+  - `amdc graph plan <json | -> [--cus N] [--no-fuse]`;
+  - `tests/golden/graph_plans` (12 graphs + 5 negatives) checked by `amdgpu-graph/tests/fusion.rs`;
+  - `amdgpu-kernels/tests/graph_plan_names.rs` (every planned kernel is registered).
+- **Step 2:**
+  - `amdgpu_jit.graph.plan(graph, cus=None, fuse=True)` / `run(plan, tensors)` / `kernels(plan)`. `run` calls the wrappers named by `py`, with the plan's parameters filtered by each wrapper's signature.
+  - `python/tests/graph_check.py` (in `run_all.sh`) runs the fused and unfused (`--no-fuse`) plans of rmsnorm → quant fp8 and silu_mul → quant fp8 on the same data, plus add → rmsnorm → quant fp8 fused only. It checks both against the reference and against each other. Passes on gfx950 (1 launch vs 2 per graph).
+- **Found while writing the goldens:** an MLP with intermediate 14336 (Llama 8B) has no fused or single quant kernel. `silu_mul_quant_fp8` and `quant_token_bf16_fp8` are built only for N ≤ 8192 (`rows/quant.rs`), so the plan reports an error for that op.
