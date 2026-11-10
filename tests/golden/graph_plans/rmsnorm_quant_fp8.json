@@ -1,0 +1,6 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": ["M", 4096]}, "g": {"dtype": "bf16", "shape": [4096]}, "y": {"dtype": "bf16", "shape": ["M", 4096]},
+    "q": {"dtype": "fp8", "shape": ["M", 4096]}, "s": {"dtype": "f32", "shape": ["M"]} },
+  "dims": {"M": 256},
+  "ops": [ {"id": "norm", "op": "rmsnorm", "in": ["x", "g"], "out": ["y"], "attrs": {"eps": "1e-6"}},
+           {"id": "quant", "op": "quant_token", "in": ["y"], "out": ["q", "s"], "attrs": {"to": "fp8"}} ],
+  "outputs": ["q", "s"] }

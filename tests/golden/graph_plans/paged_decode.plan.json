@@ -1,0 +1,26 @@
+{
+  "launches": [
+    {
+      "rule": "paged_attention",
+      "covers": ["attn"],
+      "kernels": ["pa_decode16_bf16_hd128_p16_c"],
+      "py": "paged_decode_bf16",
+      "bind": {
+        "q": "q",
+        "k_cache": "kc",
+        "v_cache": "vc",
+        "block_table": "bt",
+        "context_lens": "cl",
+        "out": "o"
+      },
+      "params": {
+        "form": "lastc",
+        "splits": 2,
+        "max_context": 4096
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

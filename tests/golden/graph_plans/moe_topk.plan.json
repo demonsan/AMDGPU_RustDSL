@@ -1,0 +1,72 @@
+{
+  "launches": [
+    {
+      "rule": "topk_softmax",
+      "covers": ["route"],
+      "kernels": ["topk_softmax_renorm_bf16_e128_k8"],
+      "py": "topk_softmax",
+      "bind": {
+        "gating": "gate",
+        "weights": "w",
+        "indices": "ids"
+      },
+      "params": {
+        "renorm": true
+      },
+      "workspaces": []
+    },
+    {
+      "rule": "moe_experts",
+      "covers": ["experts"],
+      "kernels": ["moe_sorting_e128_k8_b64", "gemm_moe1_bf16_silu_bm64", "gemm_moe2_bf16_bm64", "moe_sum_bf16_k8"],
+      "py": "fused_moe",
+      "bind": {
+        "x": "x",
+        "w1": "w1",
+        "w2": "w2",
+        "topk_ids": "ids",
+        "topk_weights": "w",
+        "out": "y"
+      },
+      "params": {
+        "dtype": "bf16",
+        "act": "silu",
+        "num_experts": 128,
+        "inter": 1024,
+        "block_m": 64
+      },
+      "workspaces": [
+        {
+          "name": "moe_sid",
+          "bytes": 40928
+        },
+        {
+          "name": "moe_sw",
+          "bytes": 40928
+        },
+        {
+          "name": "moe_seid",
+          "bytes": 640
+        },
+        {
+          "name": "moe_nv",
+          "bytes": 8
+        },
+        {
+          "name": "moe_ts",
+          "bytes": 516
+        },
+        {
+          "name": "moe_y1",
+          "bytes": 4194304
+        },
+        {
+          "name": "moe_t",
+          "bytes": 33554432
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

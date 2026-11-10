@@ -1,0 +1,34 @@
+{
+  "launches": [
+    {
+      "rule": "qknorm+rope",
+      "covers": ["kn", "rot"],
+      "kernels": ["qknorm_rope_neox_bf16_h8_d128"],
+      "py": "qknorm_rope",
+      "bind": {
+        "x": "k",
+        "out": "kr",
+        "positions": "pos",
+        "cos_sin": "cs",
+        "gamma": "g"
+      },
+      "params": {
+        "style": "neox"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [
+    {
+      "rule": "qknorm+rope+kvcache",
+      "at": "kn",
+      "why": "an fp8 cache needs the static k_scale / v_scale attributes"
+    }
+  ],
+  "errors": [
+    {
+      "op": "cache",
+      "why": "an fp8 flash cache needs the static `k_scale` attribute"
+    }
+  ]
+}

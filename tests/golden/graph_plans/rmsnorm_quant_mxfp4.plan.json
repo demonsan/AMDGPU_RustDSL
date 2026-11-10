@@ -1,0 +1,20 @@
+{
+  "launches": [
+    {
+      "rule": "rmsnorm+quant_mx.fp4",
+      "covers": ["norm", "quant"],
+      "kernels": ["rmsnorm_quant_mxfp4_bf16_k4096"],
+      "py": "rmsnorm_quant_mxfp4",
+      "bind": {
+        "x": "x",
+        "gamma": "g",
+        "q": "q",
+        "scale": "s"
+      },
+      "params": {},
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

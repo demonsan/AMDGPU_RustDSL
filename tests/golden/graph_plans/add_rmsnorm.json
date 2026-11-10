@@ -1,0 +1,6 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": ["M", 7168]}, "r": {"dtype": "bf16", "shape": ["M", 7168]}, "g": {"dtype": "bf16", "shape": [7168]},
+    "h": {"dtype": "bf16", "shape": ["M", 7168]}, "y": {"dtype": "bf16", "shape": ["M", 7168]} },
+  "dims": {"M": 64},
+  "ops": [ {"id": "res", "op": "add", "in": ["x", "r"], "out": ["h"]},
+           {"id": "norm", "op": "rmsnorm", "in": ["h", "g"], "out": ["y"], "attrs": {"eps": "1e-5"}} ],
+  "outputs": ["h", "y"] }

@@ -6,9 +6,6 @@
 //! * QK / PV = `gemm` of the scaled 32x32x64 atom; the online softmax, row sums, pipeline cadence and epilogues come from amdgpu-tile.
 //! The ABI types, per-block state and the KV-split combine body live in `io.rs`.
 
-use amdgpu_tile::copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcast, LdsPart, LdsSlotPart};
-use amdgpu_tile::dma::{issue_rows_shared, partition_dma, DmaPart};
-use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
 mod attn3;
@@ -29,14 +26,9 @@ mod skeleton_t128;
 mod skeleton_vs128;
 
 use io::{combine_kernel, FmhaBlock, FmhaIo};
-use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
-use amdgpu_tile::reduce::KeyMask;
-use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
-use amdgpu_codegen::weave::Units;
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, StageContract, ValueId, VarId, I32};
-use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
-use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, I32};
+use amdgpu_layout::{tup, Ix};
 
 /// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V / K-scale staging, the vendor's
 /// priority ping-pong, two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe with the lazy reference

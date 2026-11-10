@@ -1,0 +1,22 @@
+{
+  "launches": [
+    {
+      "rule": "rmsnorm+quant_token.fp8",
+      "covers": ["norm", "quant"],
+      "kernels": ["rmsnorm_quant_fp8_n4096"],
+      "py": "rmsnorm_quant_fp8",
+      "bind": {
+        "x": "x",
+        "gamma": "g",
+        "q": "q",
+        "scale": "s"
+      },
+      "params": {
+        "eps": "1e-6"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

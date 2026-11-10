@@ -1,0 +1,23 @@
+{
+  "launches": [
+    {
+      "rule": "add+rmsnorm",
+      "covers": ["res", "norm"],
+      "kernels": ["add_rmsnorm_bf16_n7168"],
+      "py": "add_rmsnorm",
+      "bind": {
+        "x": "x",
+        "res": "r",
+        "gamma": "g",
+        "out": "y",
+        "res_out": "h"
+      },
+      "params": {
+        "eps": "1e-5"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

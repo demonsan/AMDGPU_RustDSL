@@ -1,0 +1,5 @@
+{ "tensors": { "q": {"dtype": "bf16", "shape": ["B", 128, 576]}, "kv": {"dtype": "bf16", "shape": [8192, 16, 576]},
+    "bt": {"dtype": "i32", "shape": ["B", 128]}, "cl": {"dtype": "i32", "shape": ["B"]}, "o": {"dtype": "bf16", "shape": ["B", 128, 512]} },
+  "dims": {"B": 4},
+  "ops": [ {"id": "attn", "op": "mla_attention", "in": ["q", "kv", "bt", "cl"], "out": ["o"]} ],
+  "outputs": ["o"] }

@@ -1,0 +1,4 @@
+{ "tensors": { "q": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "k": {"dtype": "bf16", "shape": [1, 2048, 8, 128]},
+    "v": {"dtype": "bf16", "shape": [1, 2048, 8, 128]}, "o": {"dtype": "bf16", "shape": [1, 2048, 8, 128]} },
+  "ops": [ {"id": "attn", "op": "attention", "in": ["q", "k", "v"], "out": ["o"], "attrs": {"causal": true}} ],
+  "outputs": ["o"] }

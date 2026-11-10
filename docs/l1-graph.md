@@ -151,16 +151,16 @@ The rule is the place where a future fusion would go. If sorting is folded into 
 
 ```json
 { "launches": [
-    { "kernel": "rmsnorm_quant_fp8_n4096", "rule": "rmsnorm+quant_token.fp8", "covers": ["n1", "q1"],
-      "bind": {"x": "x", "gamma": "g", "q": "q", "scale": "s"}, "params": {"eps": 1e-6, "M": 256},
-      "py": "rmsnorm_quant_fp8" } ],
-  "workspaces": [],
-  "rejected": [ {"rule": "add+rmsnorm+quant_token.fp8", "at": "n1", "why": "no add producer"} ] }
+    { "rule": "rmsnorm+quant_token.fp8", "covers": ["n1", "q1"], "kernels": ["rmsnorm_quant_fp8_n4096"], "py": "rmsnorm_quant_fp8",
+      "bind": {"x": "x", "gamma": "g", "q": "q", "scale": "s"}, "params": {"eps": "1e-6"}, "workspaces": [] } ],
+  "rejected": [ {"rule": "...", "at": "n1", "why": "interior tensor `y` is also read by op q2"} ],
+  "errors": [] }
 ```
 
 - **`bind`** maps the kernel's argument roles to graph tensors. The roles are the parameter names of the Python wrapper named in `py`, so the Python side executes a plan by calling its existing, tested wrappers.
 - **Multi-launch plans** (§5.2, §5.3) use `py` = `prefill_bf16` / `fused_moe` at first, i.e. the whole flow, which already allocates its workspaces. Splitting them into per-launch steps with plan-owned workspaces is a later step, once the wrappers accept explicit workspaces.
-- **`rejected`** lists the candidates that failed condition 2 or 3 of §4, with the reason.
+- **`rejected`** lists the candidates that failed condition 2 or 3 of §4, with the reason. **`errors`** lists the ops no rule covers (no standalone kernel, or the shapes are outside every kernel); `amdc graph plan` then exits 1.
+- **Floats.** Float attributes (`eps`, `scale`, `k_scale`) are JSON strings: the reader has integers only. They are passed through to the wrapper unchanged.
 - **Output order.** The printed plan is deterministic (topological, rules in table order), so it can be checked as a golden file.
 
 ## 7. Tests and gates

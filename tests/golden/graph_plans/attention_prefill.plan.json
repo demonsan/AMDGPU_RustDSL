@@ -1,0 +1,33 @@
+{
+  "launches": [
+    {
+      "rule": "attention",
+      "covers": ["attn"],
+      "kernels": ["fmha_fwd_hd128_bf16_v3_causal_ks", "attn_combine_bf16_hd128_q16"],
+      "py": "prefill_bf16",
+      "bind": {
+        "q": "q",
+        "k": "k",
+        "v": "v",
+        "out": "o"
+      },
+      "params": {
+        "causal": true,
+        "splits": 4,
+        "cus": 256
+      },
+      "workspaces": [
+        {
+          "name": "prefill_po",
+          "bytes": 33554432
+        },
+        {
+          "name": "prefill_plse",
+          "bytes": 262144
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

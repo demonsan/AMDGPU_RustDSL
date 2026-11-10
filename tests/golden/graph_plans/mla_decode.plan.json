@@ -1,0 +1,33 @@
+{
+  "launches": [
+    {
+      "rule": "mla_attention",
+      "covers": ["attn"],
+      "kernels": ["mla_decode_bf16_hp_p16", "attn_combine_bf16_hd512"],
+      "py": "mla_decode",
+      "bind": {
+        "q": "q",
+        "kv_cache": "kv",
+        "block_table": "bt",
+        "context_lens": "cl",
+        "out": "o"
+      },
+      "params": {
+        "hp": true,
+        "splits": 16
+      },
+      "workspaces": [
+        {
+          "name": "mla_po",
+          "bytes": 16777216
+        },
+        {
+          "name": "mla_plse",
+          "bytes": 32768
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

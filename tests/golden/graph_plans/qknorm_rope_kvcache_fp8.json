@@ -1,0 +1,9 @@
+{ "tensors": { "k": {"dtype": "bf16", "shape": ["T", 8, 128]}, "g": {"dtype": "bf16", "shape": [128]}, "n": {"dtype": "bf16", "shape": ["T", 8, 128]},
+    "kr": {"dtype": "bf16", "shape": ["T", 8, 128]}, "pos": {"dtype": "i64", "shape": ["T"]}, "cs": {"dtype": "bf16", "shape": [4096, 128]},
+    "v": {"dtype": "bf16", "shape": ["T", 8, 128]}, "slots": {"dtype": "i64", "shape": ["T"]},
+    "kc": {"dtype": "fp8", "shape": [65536, 8, 128]}, "vc": {"dtype": "fp8", "shape": [65536, 8, 128]} },
+  "dims": {"T": 256},
+  "ops": [ {"id": "kn", "op": "qknorm", "in": ["k", "g"], "out": ["n"]},
+           {"id": "rot", "op": "rope", "in": ["n", "pos", "cs"], "out": ["kr"]},
+           {"id": "cache", "op": "kvcache_write", "in": ["kr", "v", "slots", "kc", "vc"], "attrs": {"layout": "flash", "k_scale": "0.5", "v_scale": "0.25"}} ],
+  "outputs": ["kc", "vc"] }

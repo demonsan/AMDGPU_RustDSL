@@ -1,0 +1,40 @@
+{
+  "launches": [
+    {
+      "rule": "rmsnorm",
+      "covers": ["norm"],
+      "kernels": ["rmsnorm_bf16_n4104"],
+      "py": "rmsnorm",
+      "bind": {
+        "x": "x",
+        "gamma": "g",
+        "out": "y"
+      },
+      "params": {},
+      "workspaces": []
+    },
+    {
+      "rule": "quant_token",
+      "covers": ["quant"],
+      "kernels": ["quant_token_bf16_fp8_n4104"],
+      "py": "quant_per_token",
+      "bind": {
+        "x": "y",
+        "q": "q",
+        "scale": "s"
+      },
+      "params": {
+        "dtype": "fp8"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [
+    {
+      "rule": "rmsnorm+quant_token.fp8",
+      "at": "norm",
+      "why": "row width 4104 outside rmsnorm_quant_fp8 (multiple of 512, 512 ..= 8192)"
+    }
+  ],
+  "errors": []
+}

@@ -1,0 +1,10 @@
+{
+  "launches": [],
+  "rejected": [],
+  "errors": [
+    {
+      "op": "res",
+      "why": "no standalone add kernel (fuses as add+rmsnorm)"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": ["T", 32, 128]}, "g": {"dtype": "bf16", "shape": [128]}, "n": {"dtype": "bf16", "shape": ["T", 32, 128]},
+    "y": {"dtype": "bf16", "shape": ["T", 32, 128]}, "pos": {"dtype": "i64", "shape": ["T"]}, "cs": {"dtype": "bf16", "shape": [4096, 128]} },
+  "dims": {"T": 512},
+  "ops": [ {"id": "qn", "op": "qknorm", "in": ["x", "g"], "out": ["n"], "attrs": {"eps": "1e-6"}},
+           {"id": "rot", "op": "rope", "in": ["n", "pos", "cs"], "out": ["y"], "attrs": {"style": "neox"}} ],
+  "outputs": ["y"] }

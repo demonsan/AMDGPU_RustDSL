@@ -1,0 +1,6 @@
+{ "tensors": { "gate": {"dtype": "bf16", "shape": ["M", 128]}, "w": {"dtype": "f32", "shape": ["M", 8]}, "ids": {"dtype": "i32", "shape": ["M", 8]},
+    "x": {"dtype": "bf16", "shape": ["M", 4096]}, "w1": {"dtype": "u8", "shape": [1]}, "w2": {"dtype": "u8", "shape": [1]}, "y": {"dtype": "bf16", "shape": ["M", 4096]} },
+  "dims": {"M": 256},
+  "ops": [ {"id": "route", "op": "topk_softmax", "in": ["gate"], "out": ["w", "ids"], "attrs": {"renorm": true}},
+           {"id": "experts", "op": "moe_experts", "in": ["x", "w1", "w2", "ids", "w"], "out": ["y"], "attrs": {"experts": 128, "inter": 1024, "act": "silu", "dtype": "bf16"}} ],
+  "outputs": ["y"] }

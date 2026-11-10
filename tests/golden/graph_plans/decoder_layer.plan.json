@@ -1,0 +1,35 @@
+{
+  "launches": [
+    {
+      "rule": "add+rmsnorm+quant_token.fp8",
+      "covers": ["res", "norm", "quant"],
+      "kernels": ["add_rmsnorm_fp8_n4096"],
+      "py": "add_rmsnorm_quant_fp8",
+      "bind": {
+        "x": "x",
+        "res": "r",
+        "gamma": "g1",
+        "out": "q",
+        "res_out": "h",
+        "scale": "s"
+      },
+      "params": {},
+      "workspaces": []
+    },
+    {
+      "rule": "act_mul.silu+quant_token.fp8",
+      "covers": ["act", "aquant"],
+      "kernels": ["silu_mul_quant_fp8_d4096"],
+      "py": "silu_mul_quant_fp8",
+      "bind": {
+        "x": "u",
+        "q": "aq",
+        "scale": "as"
+      },
+      "params": {},
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

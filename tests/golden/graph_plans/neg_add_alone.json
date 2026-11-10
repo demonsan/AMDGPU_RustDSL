@@ -1,0 +1,3 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": [64, 4096]}, "r": {"dtype": "bf16", "shape": [64, 4096]}, "h": {"dtype": "bf16", "shape": [64, 4096]} },
+  "ops": [ {"id": "res", "op": "add", "in": ["x", "r"], "out": ["h"]} ],
+  "outputs": ["h"] }

@@ -1,0 +1,24 @@
+{
+  "launches": [
+    {
+      "rule": "qknorm+rope",
+      "covers": ["qn", "rot"],
+      "kernels": ["qknorm_rope_neox_bf16_h32_d128"],
+      "py": "qknorm_rope",
+      "bind": {
+        "x": "x",
+        "out": "y",
+        "positions": "pos",
+        "cos_sin": "cs",
+        "gamma": "g"
+      },
+      "params": {
+        "eps": "1e-6",
+        "style": "neox"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

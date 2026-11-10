@@ -1,0 +1,29 @@
+{
+  "launches": [
+    {
+      "rule": "qknorm+rope+kvcache",
+      "covers": ["kn", "rot", "cache"],
+      "kernels": ["qknorm_rope_kvcache_neox_fp8_h8_d128_i64"],
+      "py": "qknorm_rope_kvcache",
+      "bind": {
+        "k": "k",
+        "out": "kr",
+        "positions": "pos",
+        "cos_sin": "cs",
+        "gamma": "g",
+        "v": "v",
+        "key_cache": "kc",
+        "value_cache": "vc",
+        "slot_mapping": "slots"
+      },
+      "params": {
+        "style": "neox",
+        "k_scale": "0.5",
+        "v_scale": "0.25"
+      },
+      "workspaces": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}
