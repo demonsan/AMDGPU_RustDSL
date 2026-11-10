@@ -1,7 +1,7 @@
 //! The GEMM v4 op graph and its generated pipelined skeleton (P3): the committed graph JSON and skeleton source are what the generator produces now (`UPDATE_SKELETONS=1` rewrites them).
 use amdgpu_kernels::gemm::graph::graph;
-use amdgpu_tile::opgraph::skeleton::generate;
-use amdgpu_tile::opgraph::*;
+use amdgpu_graph::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::*;
 
 fn file(rel: &str) -> String {
     format!("{}/src/gemm/{rel}", env!("CARGO_MANIFEST_DIR"))

@@ -33,7 +33,6 @@ pub mod rowsum;
 pub mod mma;
 pub mod weave;
 pub mod weave_auto;
-pub mod opgraph;
 pub mod stage;
 pub mod prims;
 pub mod tileop;

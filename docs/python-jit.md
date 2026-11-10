@@ -152,7 +152,7 @@ included), so a row count that is not a multiple of a CTA's rows is reported as 
 Every other registered kernel is reachable through `launch(name, …)` directly (arguments by the names `amdc jit-info <name>` lists).
 
 The dispatch rules are asked from amdc: `amdgpu_jit.dispatch("prefill_bf16", B, H, SQ, SK, causal)`, `dispatch("gemm_blockscale", M, N, K)`,
-`dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)`, `dispatch("mla", B, H)`, `dispatch("bwd_causal")` (= `amdc dispatch …`, the functions of `crates/amdgpu-kernels/src/dispatch.rs`).
+`dispatch("moe", M, topk, E)`, `dispatch("decode16", B, HK, ctx)`, `dispatch("mla", B, H)`, `dispatch("bwd_causal")` (= `amdc dispatch …`, the functions of `crates/amdgpu-graph/src/dispatch.rs`).
 The fp8 GEMM checks allow for the f8f6f4 MFMA's internal precision: a 128-term block is summed to about 2^-10 of its term magnitude
 (visible under cancellation — also with unit scales and a single K block, so it is the instruction, not the kernel).
 

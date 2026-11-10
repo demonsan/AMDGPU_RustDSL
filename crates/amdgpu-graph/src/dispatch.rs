@@ -336,13 +336,6 @@ mod tests {
         }
         assert_eq!(decode16_plan(1, 8, 256), P::Fused);
         assert_eq!(decode16_kernel(16, P::LastC(4)), ("pa_decode16_bf16_hd128_p16_c".to_string(), 4));
-        assert!(crate::kernel_by_name("pa_decode16_bf16_hd128_p16_c").is_some());
-    }
-
-    #[test]
-    fn bwd_causal_registered() {
-        let (q, k) = super::bwd_causal_kernels();
-        assert!(crate::registry::kernel_by_name(q).is_some() && crate::registry::kernel_by_name(k).is_some());
     }
 
     #[test]

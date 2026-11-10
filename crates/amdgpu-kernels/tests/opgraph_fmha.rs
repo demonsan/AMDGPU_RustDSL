@@ -1,7 +1,7 @@
 //! The FMHA op graphs and their generated dispatched skeletons (P3): the committed JSON / Rust files are what the generator produces now (`UPDATE_SKELETONS=1` rewrites them).
 use amdgpu_kernels::fmha::graph::{graph_kvsplit, graph_t128, graph_vs128};
-use amdgpu_tile::opgraph::skeleton::generate;
-use amdgpu_tile::opgraph::*;
+use amdgpu_graph::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::*;
 
 fn file(rel: &str) -> String {
     format!("{}/src/fmha/{rel}", env!("CARGO_MANIFEST_DIR"))

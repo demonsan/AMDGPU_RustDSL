@@ -145,7 +145,7 @@ def fmha_fwd_mxfp8(q, k, v, q_scale, k_scale, v_scale, out, *, path="auto", spli
 
 
 def decode16_plan(b, hk, ctx, page=16):
-    """The paged-decode (bf16, hd128, GQA <= 16) launch plan - the single rule ``amdgpu_kernels::dispatch::decode16_plan``, asked from amdc
+    """The paged-decode (bf16, hd128, GQA <= 16) launch plan - the single rule ``amdgpu_graph::dispatch::decode16_plan``, asked from amdc
     (``amdc dispatch decode16``): returns ``(kernel_name, form, splits)`` with form "fused" (S = 1, no combine kernel) or "lastc" (the
     last-arriving CTA merges the S partials, no combine kernel)."""
     import json

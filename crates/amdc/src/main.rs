@@ -311,7 +311,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "opgraph" | "skeleton" => {
-            use amdgpu_tile::opgraph::{skeleton, Budget, Cut, Graph, KernelCut};
+            use amdgpu_graph::opgraph::{skeleton, Budget, Cut, Graph, KernelCut};
             let Some(path) = args.get(1) else { usage(); return ExitCode::from(2); };
             let text = match fs::read_to_string(path) { Ok(t) => t, Err(e) => { eprintln!("{path}: {e}"); return ExitCode::from(1); } };
             let g = match Graph::from_json_str(&text) { Ok(g) => g, Err(e) => { eprintln!("{path}: {e}"); return ExitCode::from(1); } };
@@ -346,11 +346,11 @@ fn main() -> ExitCode {
             match (args.get(1).map(|s| s.as_str()), num(2), num(3), num(4)) {
                 (Some("decode16"), Some(b), Some(hk), Some(ctx)) => {
                     let page = args.windows(2).find(|w| w[0] == "--page").and_then(|w| w[1].parse::<u32>().ok()).unwrap_or(16);
-                    let plan = amdgpu_kernels::dispatch::decode16_plan(b, hk, ctx);
-                    let (kernel, s) = amdgpu_kernels::dispatch::decode16_kernel(page, plan);
+                    let plan = amdgpu_graph::dispatch::decode16_plan(b, hk, ctx);
+                    let (kernel, s) = amdgpu_graph::dispatch::decode16_kernel(page, plan);
                     let form = match plan {
-                        amdgpu_kernels::dispatch::Decode16Plan::Fused => "fused",
-                        amdgpu_kernels::dispatch::Decode16Plan::LastC(_) => "lastc",
+                        amdgpu_graph::dispatch::Decode16Plan::Fused => "fused",
+                        amdgpu_graph::dispatch::Decode16Plan::LastC(_) => "lastc",
                     };
                     println!("{{\"kernel\":\"{kernel}\",\"form\":\"{form}\",\"splits\":{s},\"b\":{b},\"hk\":{hk},\"ctx\":{ctx},\"page\":{page}}}");
                     ExitCode::SUCCESS
@@ -359,31 +359,31 @@ fn main() -> ExitCode {
                     // amdc dispatch prefill_bf16 <B> <H> <SQ> <SK> <causal 0|1> [--cus N]
                     let (sk, causal) = (num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0);
                     let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
-                    let (kernel, s) = amdgpu_kernels::dispatch::bf16_prefill_kernel(b, h, sq, sk, causal, cus);
+                    let (kernel, s) = amdgpu_graph::dispatch::bf16_prefill_kernel(b, h, sq, sk, causal, cus);
                     println!("{{\"kernel\":\"{kernel}\",\"splits\":{s}}}");
                     ExitCode::SUCCESS
                 }
                 (Some("gemm_blockscale"), Some(m), Some(n), Some(k)) => {
                     // amdc dispatch gemm_blockscale <M> <N> <K> [--cus N]: the split-K factor of gemm_a8w8_blockscale
                     let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
-                    { let (rows, s) = amdgpu_kernels::dispatch::blockscale_config(m, n, k, cus); println!("{{\"rows\":{},\"splits\":{}}}", rows, s); }
+                    { let (rows, s) = amdgpu_graph::dispatch::blockscale_config(m, n, k, cus); println!("{{\"rows\":{},\"splits\":{}}}", rows, s); }
                     ExitCode::SUCCESS
                 }
                 (Some("mla"), Some(b), Some(h), _) => {
                     // amdc dispatch mla <B> <H>: (head-parallel form?, splits) of the MLA decode
-                    let (hp, s) = amdgpu_kernels::dispatch::mla_config(b, h);
+                    let (hp, s) = amdgpu_graph::dispatch::mla_config(b, h);
                     println!("{{\"hp\":{hp},\"splits\":{s}}}");
                     ExitCode::SUCCESS
                 }
                 (Some("bwd_causal"), _, _, _) => {
                     // amdc dispatch bwd_causal: the causal attention-backward dq / dkdv kernels (longest-first grids)
-                    let (dq, dkdv) = amdgpu_kernels::dispatch::bwd_causal_kernels();
+                    let (dq, dkdv) = amdgpu_graph::dispatch::bwd_causal_kernels();
                     println!("{{\"dq\":\"{dq}\",\"dkdv\":\"{dkdv}\"}}");
                     ExitCode::SUCCESS
                 }
                 (Some("moe"), Some(m), Some(topk), Some(e)) => {
                     // amdc dispatch moe <M> <TOPK> <E>: block_m of the routing sort and the gemm_moe kernels
-                    println!("{{\"block_m\":{}}}", amdgpu_kernels::dispatch::moe_block_m(m, topk, e));
+                    println!("{{\"block_m\":{}}}", amdgpu_graph::dispatch::moe_block_m(m, topk, e));
                     ExitCode::SUCCESS
                 }
                 _ => {

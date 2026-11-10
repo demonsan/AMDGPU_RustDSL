@@ -118,3 +118,11 @@ fn every_dispatched_kernel_compiles() {
 fn every_reachable_kernel_compiles() {
     compile_all(&manifest_names());
 }
+
+/// The names the dispatch rules produce must be registered kernels (moved here from the unit tests of `dispatch.rs`, which now lives in `amdgpu-graph` and cannot see the registry).
+#[test]
+fn dispatch_names_are_registered() {
+    assert!(amdgpu_kernels::kernel_by_name("pa_decode16_bf16_hd128_p16_c").is_some());
+    let (q, k) = amdgpu_graph::dispatch::bwd_causal_kernels();
+    assert!(amdgpu_kernels::registry::kernel_by_name(q).is_some() && amdgpu_kernels::registry::kernel_by_name(k).is_some());
+}

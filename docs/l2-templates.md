@@ -43,7 +43,7 @@ Template parameters come in four kinds:
 | `ConvPlan` handoff | `crates/amdgpu-tile/src/handoff.rs:15 / 115` | layout conversion between fused GEMM stages (`mlp`) | stays in `amdgpu-tile` (L3, decision D2 of `crate-split.md`: it is function-level code over `PrivRef` / `ConvPlan`); the L2 template only calls it |
 | `kv_split_decode`, `kv_split_range(_var)`, `gqa_kv_head` | `crates/amdgpu-tile/src/components.rs:20 / 35 / 58 / 8` | KV-split index maths shared by decode / prefill | template T5 helper |
 | `kvsplit_partial_f16`, `combine_splits` | `crates/amdgpu-tile/src/epilogue.rs:34 / 89` | partial-store and combine epilogues | template T5 |
-| op graph + skeleton generator | `crates/amdgpu-tile/src/opgraph/{mod,skeleton,json}.rs`; generated `fmha/skeleton_{vs128,t128,kvsplit}.rs` | graph → `build_<kernel><S: Slots>` skeleton with slots filled by the kernel | L1 (graph) → L2 (skeleton) boundary; see §3.14 |
+| op graph + skeleton generator | `crates/amdgpu-graph/src/opgraph/{mod,skeleton,json}.rs`; generated `fmha/skeleton_{vs128,t128,kvsplit}.rs` | graph → `build_<kernel><S: Slots>` skeleton with slots filled by the kernel | L1 (graph) → L2 (skeleton) boundary; see §3.14 |
 | `RowsCopy`, `issue_rows_shared`, `DwordRowsCopy` | `crates/amdgpu-tile/src/rows.rs:45 / 110 / 164` | DMA / dword row staging helpers | L3 (copy), used by T1 / T3 / T7 |
 | `wave_reduce`, `lane_reduce`, `group_reduce_dpp`, `wave_allreduce`, `group_allreduce` | `crates/amdgpu-tile/src/prims.rs:163 / 152 / 240`, `tileop.rs:114 / 162` | reductions | L3; T8 composes them |
 | `OnlineSoftmax` | `crates/amdgpu-tile/src/softmax.rs:31` | FMHA online softmax recipes | L3 |

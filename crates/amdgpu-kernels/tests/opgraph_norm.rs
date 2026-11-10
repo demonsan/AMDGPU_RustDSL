@@ -1,7 +1,7 @@
 //! The RMSNorm + quant op graph and its generated skeleton (P3, design section 4.4).
 use amdgpu_kernels::norm::graph::graph;
-use amdgpu_tile::opgraph::skeleton::generate;
-use amdgpu_tile::opgraph::*;
+use amdgpu_graph::opgraph::skeleton::generate;
+use amdgpu_graph::opgraph::*;
 
 fn file(rel: &str) -> String {
     format!("{}/src/norm/{rel}", env!("CARGO_MANIFEST_DIR"))
