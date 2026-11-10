@@ -10,6 +10,6 @@ amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-layout = { path = "../amdgpu-layout" }
 amdgpu-codegen = { path = "../amdgpu-codegen" }
 amdgpu-tile = { path = "../amdgpu-tile" }
+amdgpu-isa = { path = "../amdgpu-isa" }
 
 [dev-dependencies]
-amdgpu-isa = { path = "../amdgpu-isa" }

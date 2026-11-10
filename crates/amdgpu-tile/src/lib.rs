@@ -23,6 +23,7 @@ pub mod bufdma;
 pub mod contract;
 pub mod copy;
 pub mod dma;
+pub mod dma_plan;
 pub mod global;
 pub mod handoff;
 pub mod orient;

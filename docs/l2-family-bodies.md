@@ -4,7 +4,7 @@ This is a design note for the crate split ([`crate-split.md`](crate-split.md) M7
 It covers how the three family-body modules split out in `thin-families-ko` can become `amdgpu-stage` templates:
 - `crates/amdgpu-kernels/src/fmha/attn3.rs`
 - `crates/amdgpu-kernels/src/fmha/block3.rs`
-- `crates/amdgpu-kernels/src/gemm/body.rs`
+- `crates/amdgpu-stage/src/gemm/body.rs`
 
 The modules must not depend on the kernel-crate family types (`FmhaIo`, `GemmConfig`). The note proposes no code change. Every step it proposes
 is a move or a type narrowing, and must leave `amdc md5-manifest --check` identical.

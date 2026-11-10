@@ -3,11 +3,11 @@
 use amdgpu_dsl::{FnBuilder, Op, Opnd, ValueId, VarId};
 use amdgpu_tile::ev;
 use amdgpu_tile::mma::TiledMma;
-use super::Elem;
+use super::formats::Elem;
 
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
+pub fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
     let p = mma_blocks(b, mma, elem, unit, &[(acc, a, bf, sa, sb, byte_a)], 0, None);
     assert!(p.is_empty(), "mma_var: block-scaled MMAs go through mma_blocks");
 }
@@ -16,7 +16,7 @@ pub(crate) fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Optio
 /// bf16: the 32-byte fragments are two 16-byte bf16 operands (8 elements each, the same K permutation for A and B); the first halves of every
 /// block, then the second halves, so the two MFMAs into one accumulator are not back to back.
 /// `a_hi_off` (A8W4): the hi A fragment of the A variable v is VarId(v + a_hi_off) (the loop state lays the hi fragments right after the lo ones).
-pub(crate) fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)], a_hi_off: u32, w4: Option<ValueId>) -> Vec<(VarId, ValueId, VarId, VarId)> {
+pub fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)], a_hi_off: u32, w4: Option<ValueId>) -> Vec<(VarId, ValueId, VarId, VarId)> {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
     if elem == Elem::Bf16W4 {
         // A16W4: per (A image k, half h) step: every B fragment of the unit dequantized once (dword 2 k + h = 8 fp4 -> 8 bf16 times the
@@ -163,7 +163,7 @@ pub(crate) fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Op
 }
 
 /// The deferred block-scale updates: acc += t (sa sb) lane by lane.
-pub(crate) fn bs_fma(b: &mut FnBuilder, pending: &[(VarId, ValueId, VarId, VarId)]) {
+pub fn bs_fma(b: &mut FnBuilder, pending: &[(VarId, ValueId, VarId, VarId)]) {
     for &(acc, t, sa, sb) in pending {
         let (fa, fb) = (b.bitcast_f32(Opnd::Var(sa)), b.bitcast_f32(Opnd::Var(sb)));
         let s = b.mul_f32(fa, fb);

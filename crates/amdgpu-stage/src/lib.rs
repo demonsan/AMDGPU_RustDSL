@@ -10,6 +10,7 @@
 
 pub mod components;
 pub mod contract_stage;
+pub mod gemm;
 pub mod pipeline;
 pub mod stage;
 pub mod templates;
