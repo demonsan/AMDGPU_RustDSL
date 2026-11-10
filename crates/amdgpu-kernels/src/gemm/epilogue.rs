@@ -1,6 +1,14 @@
 //! GEMM epilogues: the MoE epilogue from the accumulators and the LDS-staged bf16 / row-col scaled epilogue.
 
-use super::*;
+use amdgpu_dsl::{DType, Ext, FnBuilder, Op, Opnd, ValueId, VarId};
+use amdgpu_layout::{ImmRange, IssuePlan, Ix, layout_to_offsets, make_layout, Swizzle, tup};
+use amdgpu_tile::{Ctx, ev, Lane, Shared};
+use amdgpu_tile::mma::TiledMma;
+use super::Cfg;
+use super::EPI_PITCH;
+use super::MoeCx;
+use super::MoeStage;
+use super::Scales;
 
 /// The MoE epilogue straight from the accumulators (lane: row = the c_tv row, 4 consecutive columns): per m block the sorted row's
 /// (token, slot) and routing weight; stage 1: act(gate) up of the interleaved block pairs -> bf16 [M topk, n_out] at row token topk + slot;

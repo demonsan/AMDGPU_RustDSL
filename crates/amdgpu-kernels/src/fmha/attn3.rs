@@ -1,7 +1,22 @@
 //! The MXFP8 / per-tensor FP8 attention body shared by the `_vs128`, `_kvsplit`, `_t128` and `fp8pt` kernels (L2 template candidate,
 //! docs/l2-templates.md T2 / T6): the derived orientation and views, the K / V / K-scale ring (`KvRing3`) and the phase body (`AttnBody3`).
 
-use super::*;
+use amdgpu_dsl::{DType, FnBuilder, I32, Op, Opnd, StageContract, ValueId, VarId};
+use amdgpu_isa::{DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, GLOBAL_LDS_X1, GLOBAL_LDS_X4, MmaAtom};
+use amdgpu_layout::{ComposedLayout, make_layout, Swizzle, tup};
+use amdgpu_tile::{Ctx, ev, Lane, LdsPlan, PipeBody, Role, Roles, Shared, SlotIdx, TileIt};
+use amdgpu_tile::copy::{LdsPart, LdsSlotPart, make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcast};
+use amdgpu_tile::dma::{DmaPart, issue_rows_shared, partition_dma};
+use amdgpu_tile::frag::{AccTile, B32x32x64Fp8, C32x32F32, Frag, QkOut};
+use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
+use amdgpu_tile::reduce::KeyMask;
+use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
+use amdgpu_tile::weave::Units;
+use amdgpu_layout::Layout as LLayout;
+use amdgpu_tile::frag;
+use amdgpu_tile::Layout;
+use super::block3::Operands;
+use super::io::FmhaBlock;
 
 /// The derived S -> P orientation (amdgpu_tile::orient::search_attention over the scaled fp8 atoms): the producer / consumer atom, checked to be the one this
 /// file implements (S^T = K Q^T, P = the B operand of O^T = V^T P^T, zero conversion cost).
@@ -62,11 +77,11 @@ pub struct KvRing3 {
 }
 
 impl KvRing3 {
-    pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+    pub fn new(b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
         Self::new_x(b, io, blk, roles, slots, true)
     }
     /// `kscale = false`: no K-scale staging or reads (per-tensor FP8; the KD ring keeps its place so the LDS plan is the shipped one).
-    pub fn new_x(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool) -> KvRing3 {
+    pub fn new_x(b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
         let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
@@ -80,7 +95,7 @@ impl KvRing3 {
     }
     /// The same ring (LDS regions) with every lane partition and copy rebuilt from `blk` / `roles` (fresh values: a second pass over the ring
     /// does not keep the first pass's address registers live; the paired causal form).
-    pub fn rebuilt(&self, b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+    pub fn rebuilt(&self, b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
         let sh = [self.ks.clone(), self.vs.clone(), self.kd.clone(), self.ones.clone(), self.q1.clone(), self.q0.clone(), self.epi.clone()];
         let mut r = Self::parts(b, io, blk, roles, slots, self.kdpart.is_some(), sh);
         if self.buf.is_some() {
@@ -91,7 +106,7 @@ impl KvRing3 {
         }
         r
     }
-    fn parts(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool, sh: [Shared; 7]) -> KvRing3 {
+    fn parts(b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, slots: u32, kscale: bool, sh: [Shared; 7]) -> KvRing3 {
         let [ks, vs, kd, ones, q1, q0, epi] = sh;
         let lane = &blk.lane;
         let mut ctx = Ctx::new();
@@ -108,8 +123,8 @@ impl KvRing3 {
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
         let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
         let kdpart = kscale.then(|| make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]));
-        let (kt, vt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v));
-        let kdt = kscale.then(|| blk.kv_tile(b, &io.ksc));
+        let (kt, vt) = (blk.kv_tile(b, io.k()), blk.kv_tile(b, io.v()));
+        let kdt = kscale.then(|| blk.kv_tile(b, io.ksc()));
         let (ksrc, vsrc) = (kt.row_source(b, 1), vt.row_source(b, 1));
         let kdsrc = kdt.map(|t| t.row_source(b, 1));
         let wv = ev(roles.wave_in_group);

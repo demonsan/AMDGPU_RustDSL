@@ -211,3 +211,77 @@ impl skeleton_t128::T128Slots for T128Slots {
         });
     }
 }
+
+/// The 656-byte FMHA kernarg ABI (+ the KV-split extension) with the host contract DERIVED from the tensors' layouts (`contract::compact_tensor` /
+/// `same_strides`: allocation = cosize, compactness relations); the kernarg loads and the runtime tensors are those of `FmhaIo::declare`.
+pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> FmhaIo {
+    let ka = &mut KArgs::new();
+    let gqa = ka.i32(b, "s_gqa", 0x0B0);
+    b.ka_range(0x0B0, 1, 16);
+    b.ka_is(0x140, Ext::sym("HK") * Ext::ka(0x0B0));
+    let s = ka.dim(b, "s_seq_len", 0x060, 1, i64::MAX);
+    let skv = ka.dim(b, "s_kv_seq_len", 0x110, 1, i64::MAX);
+    let heads = ka.i32(b, "s_q_head_num", 0x140);
+    let h = Dim::Ka { off: 0x140, val: heads };
+    let (hk, d) = (Dim::sym("HK"), Dim::c(128));
+    let bat = if kvsplit { Dim::sym("B") } else { Dim::grid(2) };
+    let bshd = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
+        ka.tensor(name, off, eb, vec![bat.clone(), n.clone(), hh.clone(), d.clone()], vec![Stride::Ka(st[0].0, st[0].1), Stride::Ka(st[1].0, st[1].1), Stride::Ka(st[2].0, st[2].1), Stride::Unit])
+            .external_contract()
+            .declare(ka, b)
+    };
+    let q = bshd(ka, b, "ptr_q", 0x010, 1, &s, &h, [("s_Bs", 0x0A0), ("s_Seqs", 0x070), ("s_Hs", 0x090)]);
+    let k = bshd(ka, b, "ptr_k", 0x020, 1, &skv, &hk, [("s_k_Bs", 0x0E0), ("s_k_Seqs", 0x0C0), ("s_k_Hs", 0x0D0)]);
+    let v = bshd(ka, b, "ptr_v", 0x030, 1, &skv, &hk, [("s_v_Bs", 0x170), ("s_v_Seqs", 0x150), ("s_v_Hs", 0x160)]);
+    let o = bshd(ka, b, "ptr_o", 0x000, 2, &s, &h, [("s_o_Bs", 0x1A0), ("s_o_Seqs", 0x180), ("s_o_Hs", 0x190)]);
+    let qd_stride = ev(b.bind_i32(q.strides[1].clone().lshr(5)));
+    let kd_stride = ev(b.bind_i32(k.strides[1].clone().lshr(5)));
+    let scale = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, n: &Dim, hh: &Dim, bs: (&'static str, u32), der: I32, hs: (&'static str, u32)| {
+        ka.tensor(name, off, 1, vec![bat.clone(), n.clone(), hh.clone(), Dim::c(4)], vec![Stride::Ka(bs.0, bs.1), Stride::Derived(der), Stride::Ka(hs.0, hs.1), Stride::Unit])
+            .external_contract()
+            .declare(ka, b)
+    };
+    let qsc = scale(ka, b, "ptr_q_descale", 0x200, &s, &h, ("s_descale_q_Bs", 0x230), qd_stride, ("s_descale_q_Hs", 0x240));
+    let ksc = scale(ka, b, "ptr_k_descale", 0x210, &skv, &hk, ("s_descale_k_Bs", 0x250), kd_stride, ("s_descale_k_Hs", 0x260));
+    // the contract, from the layouts (bytes)
+    let mut ctx = Ctx::new();
+    let big = i64::MAX / 4;
+    let cb = if kvsplit { ctx.sym_ext("B", 1, big, None, Ext::sym("B")) } else { ctx.sym_ext("grid_z", 1, big, None, Ext::grid_z()) };
+    let kas = |ctx: &mut Ctx, name: &str, off: u32| ctx.sym_ext(name, 0, big, None, Ext::ka(off));
+    let (cs, cskv, ch) = (kas(&mut ctx, "S", 0x060), kas(&mut ctx, "SK", 0x110), kas(&mut ctx, "H", 0x140));
+    let chk = ctx.sym_ext("HK", 1, big, None, Ext::sym("HK"));
+    let lay = |sh: [&Ix; 4], st: [Ix; 4]| amdgpu_layout::make_layout(tup![sh[0].clone(), sh[1].clone(), sh[2].clone(), sh[3].clone()], tup![st[0].clone(), st[1].clone(), st[2].clone(), st[3].clone()]);
+    let c = |k: i64| Ix::C(k);
+    let ql = lay([&cb, &cs, &ch, &c(128)], [kas(&mut ctx, "s_Bs", 0x0A0), kas(&mut ctx, "s_Seqs", 0x070), c(128), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_q", &ql, &[Some(0x0A0), Some(0x070), Some(0x090), None], None);
+    let kl = lay([&cb, &cskv, &chk, &c(128)], [kas(&mut ctx, "s_k_Bs", 0x0E0), kas(&mut ctx, "s_k_Seqs", 0x0C0), c(128), c(1)]);
+    let k_ka = [Some(0x0E0), Some(0x0C0), Some(0x0D0), None];
+    contract::compact_tensor(b, &ctx, "ptr_k", &kl, &k_ka, None);
+    let vl = lay([&cb, &cskv, &chk, &c(128)], [kas(&mut ctx, "s_v_Bs", 0x170), kas(&mut ctx, "s_v_Seqs", 0x150), c(128), c(1)]);
+    contract::same_strides(b, &ctx, "ptr_v", &vl, &[Some(0x170), Some(0x150), Some(0x160), None], &kl, &k_ka);
+    let ol = lay([&cb, &cs, &ch, &c(128)], [kas(&mut ctx, "s_o_Bs", 0x1A0), kas(&mut ctx, "s_o_Seqs", 0x180), c(256), c(2)]);
+    contract::compact_tensor(b, &ctx, "ptr_o", &ol, &[Some(0x1A0), Some(0x180), Some(0x190), None], None);
+    let qsl = lay([&cb, &cs, &ch, &c(4)], [kas(&mut ctx, "s_descale_q_Bs", 0x230), ch.mul_c(4), c(4), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_q_descale", &qsl, &[Some(0x230), None, Some(0x240), None], Some(Ext::c(512 * 4) * Ext::ka(0x140)));
+    let ksl = lay([&cb, &cskv, &chk, &c(4)], [kas(&mut ctx, "s_descale_k_Bs", 0x250), chk.mul_c(4), c(4), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_k_descale", &ksl, &[Some(0x250), None, Some(0x260), None], Some(Ext::c(640 * 4) * Ext::ka(0x140)));
+    let ptr_vd = ka.ptr(b, "ptr_v_descale", 0x220);
+    b.arg_tensor("ptr_v_descale", Ext::c(4096));
+    b.grid_is(1, Ext::ka(0x140));
+    b.grid_is(0, Ext::ka(0x060).ceil_div(rows_per_block));
+    let kvs = if kvsplit {
+        let splits = ka.dim(b, "kvs_splits", 0x280, 1, i64::MAX).val().expect("splits");
+        let rows_total = ka.dim(b, "kvs_rows_total", 0x284, 1, i64::MAX).val().expect("rows");
+        b.grid_is(2, Ext::sym("B") * Ext::ka(0x280));
+        b.ka_is(0x284, Ext::sym("B") * Ext::ka(0x060) * Ext::ka(0x140));
+        let ohat = ka.ptr(b, "ptr_ohat", 0x270);
+        let lse = ka.ptr(b, "ptr_lse", 0x278);
+        b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
+        b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
+        Some(io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total), splits_off: 0x280 })
+    } else {
+        ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
+        None
+    };
+    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, vsc: None, gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs }
+}

@@ -1,6 +1,9 @@
 //! GEMM operand staging: the K-tile LDS image and the per-issue DMA plans (dense, padded A image, gathered MoE rows).
 
-use super::*;
+use amdgpu_dsl::{FnBuilder, I32, ValueId};
+use amdgpu_layout::{composition, IssuePlan, Ix, make_layout, right_inverse, tup};
+use amdgpu_tile::{Ctx, ev, Lane};
+use amdgpu_layout::Layout;
 
 /// LDS image of a [rows x 128 bytes] K-tile: 16-row x 16-byte interleave (the aiter B preshuffle pattern with K = 128):
 /// (r, k) -> (r / 16) 2048 + (k / 16) 256 + (r % 16) 16 + k % 16. A 16-lane group of every operand read covers 256 consecutive bytes (all banks once).
