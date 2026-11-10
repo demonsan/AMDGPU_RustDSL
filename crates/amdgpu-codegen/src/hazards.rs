@@ -160,9 +160,11 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             }
             // the HIGH-half conversion (`v_cvt_scalef32_pk_fp8_* ... op_sel:[0,0,1]`, a partial-dword write) needs one wait state before ANY consumer of its result (hardware: a dependent
             // adjacent `v_accvgpr_write` and a `v_mov_b32` copy read a stale value; one `s_nop` fixes it) - except the partner conversion of the other half, which merges into the same
-            // dword and is interlocked (the Lo / Hi pairs of the shipped kernels run unpadded)
-            if !matches!(inst.op, MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi) {
-                for s in &inst.srcs {
+            // dword and is interlocked (the Lo / Hi pairs of the shipped kernels run unpadded). The exception covers only the merge (the tied
+            // destination, srcs[2..]): a conversion that READS the high-half result as data (srcs[0] / srcs[1]) waits like any consumer (LLVM oracle)
+            let partner = matches!(inst.op, MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi);
+            {
+                for s in inst.srcs.iter().take(if partner { 2 } else { usize::MAX }) {
                     if let Src::Reg(r) = s {
                         if let Some(rd) = hiw.get(&canon(*r)) {
                             earliest = earliest.max(*rd);

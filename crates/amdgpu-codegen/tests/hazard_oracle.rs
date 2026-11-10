@@ -136,8 +136,13 @@ fn hazard_matrix() {
     let mut per: Vec<Vec<String>> = vec![Vec::new(); cases.len()];
     let mut cur: Option<usize> = None;
     for line in asm.lines() {
+        // the block label comment (`; %bb.N:`) switches the case; a `s_setprio N` inside a case is an instruction under test, not a marker
+        if let Some(n) = line.trim().strip_prefix("; %bb.").and_then(|r| r.strip_suffix(':')) {
+            cur = n.trim().parse::<usize>().ok();
+            continue;
+        }
         let l = line.split(';').next().unwrap().trim();
-        if let Some(n) = l.strip_prefix("s_setprio ") {
+        if let (Some(n), None) = (l.strip_prefix("s_setprio "), cur) {
             let n = n.trim();
             cur = match n.strip_prefix("0x") {
                 Some(h) => usize::from_str_radix(h, 16).ok(),
