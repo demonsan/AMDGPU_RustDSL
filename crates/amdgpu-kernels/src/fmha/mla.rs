@@ -8,6 +8,7 @@
 //! * the DMA writes the tile linearly (chunk c = 72 key + position); the row base of key k comes from lane k (one block-table load per lane
 //!   and tile, `ds_bpermute` per issue).
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::templates::pair_ring::PairRing;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
@@ -83,21 +84,9 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let cl_so = { let v = b.bind_i32(ev(bat) << 2); b.read_first_lane(v) };
     let ctx = { let v = b.buffer_load_f32(r_cl, c0, cl_so, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
     b.assume_trusted(ctx, Ext::c(0), Ext::ka(112) * Ext::c(page as i64), "MLA decode: a context length lies in [0, max_pages P] (host contract)");
-    let lg = {
-        let sv = ev(s_n);
-        let mut acc = amdgpu_dsl::I32::c(0);
-        for (thr, val) in [(1, 1), (2, 2), (4, 3), (8, 4), (16, 5), (32, 6)] {
-            acc = sv.clone().gt(thr).select_i32(val, acc);
-        }
-        let v = b.bind_i32(acc + 2);
-        b.read_first_lane(v)
-    };
-    let nsplit = b.bind_i32(ev(s_n) << 2);
-    let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
-    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(5));
-    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 5);
-    let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
-    let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
+    let lg = grid::split_lg(&mut b, s_n, 6);
+    let (nsplit, ns) = grid::wave_split_index(&mut b, z, wv, s_n);
+    let (k_lo, k_hi) = grid::key_chunk(&mut b, ctx, ns, nsplit, lg, 5);
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };

@@ -1669,21 +1669,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // XCD-aware raster: workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
     let (bx, by) = if cfg.moe.is_some() || cfg.conv.is_some() { (bx0, by0) } else {
-        let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
-        let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
-        let loc = b.bind_i32(ev(id).lshr(3));
-        // block (of 16) = 2 (id % 8) + loc / 16 -> (row, col) = (block / 4, block % 4); inside the block: loc % 16 -> (n4, m4)
-        let blk = b.bind_i32(((ev(id) & 7) << 1) + ev(loc).lshr(4));
-        let (bc, br) = (ev(blk) & 3, ev(blk).lshr(2));
-        let nx = b.bind_i32((bc << 2) + (ev(loc) & 3));
-        let ny = b.bind_i32((br << 2) + (ev(loc).lshr(2) & 3));
-        let s = b.bind_i32(ev(okv).eq(0).select_i32(1, 0));
-        let px = b.bind_i32(ev(bx0) + ev(s) * (ev(nx) - ev(bx0)));
-        let py = b.bind_i32(ev(by0) + ev(s) * (ev(ny) - ev(by0)));
-        b.assume_trusted(px, Ext::c(0), Ext::sym("NT") - Ext::c(1), "XCD raster: (px, py) is a permutation of the 16 x 16 tile grid when the select applies (N = 16 cta_n, M = 16 cta_m: 4 x 4 blocks, 2 per XCD), the identity (workgroup ids) otherwise");
-        b.assume_trusted(py, Ext::c(0), Ext::sym("MT") - Ext::c(1), "XCD raster: see px");
-        b.wg_bijection(&[px, py], &[0, 1], "XCD raster: (px, py) is a permutation of the tile grid (the identity unless N = 16 cta_n, M = 16 cta_m)");
-        (px, py)
+        amdgpu_tile::templates::grid::xcd_raster_16x16(b, bx0, by0, n_v, m_v, (16 * cfg.cta_n) as i32, (16 * cfg.cta_m) as i32)
     };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);
     let wm = b.bind_i32(lane.wave() & 1);

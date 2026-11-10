@@ -14,6 +14,7 @@
 //! 12 ptr_plse.
 use super::bf16::{tile_math, Tm};
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
+use amdgpu_tile::templates::grid;
 use amdgpu_tile::{ev, LdsPlan, Lane};
 use amdgpu_tile::templates::split::{lse_combine, LseCombine};
 
@@ -85,8 +86,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let row_live = b.bind_cond(ev(j).lt(ev(gsz)));
     let head = b.bind_i32(ev(hk) * ev(gsz) + ev(j).min(ev(gsz) - 1));
     // ---- the wave's key split ----
-    let nsplit = b.bind_i32(ev(s_n) << 2);
-    let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
+    let (nsplit, ns) = grid::wave_split_index(&mut b, z, wv, s_n);
     let ncl = { let v = b.bind_i32((ev(bat) + 1) << 2); b.read_first_lane(v) };
     let r_cl = b.buffer_desc_dyn(p_cl, ncl);
     let cl_so = { let v = b.bind_i32(ev(bat) << 2); b.read_first_lane(v) };
@@ -94,18 +94,8 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let ctx = { let v = b.buffer_load_f32(r_cl, zero, cl_so, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
     b.assume_trusted(ctx, Ext::c(0), Ext::ka(144) * Ext::c(page as i64), "decode: a context length lies in [0, max_pages P] (host contract)");
     // chunk = ceil(tiles / NS) tiles (NS = 4 S, S a power of two <= 16); [k_lo, k_hi) = [ns chunk, min(ctx, (ns + 1) chunk))
-    let lg = {
-        let sv = ev(s_n);
-        let s1 = sv.clone().gt(1).select_i32(1, 0);
-        let s2 = sv.clone().gt(2).select_i32(2, s1);
-        let s3 = sv.clone().gt(4).select_i32(3, s2);
-        let v = b.bind_i32(sv.gt(8).select_i32(4, s3) + 2);
-        b.read_first_lane(v)
-    };
-    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(6));
-    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 6);
-    let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
-    let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
+    let lg = grid::split_lg(&mut b, s_n, 4);
+    let (k_lo, k_hi) = grid::key_chunk(&mut b, ctx, ns, nsplit, lg, 6);
     let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(6)); b.read_first_lane(v) };
 
     // ---- descriptors ----
