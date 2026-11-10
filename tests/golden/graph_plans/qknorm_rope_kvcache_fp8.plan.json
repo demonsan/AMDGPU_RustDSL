@@ -21,7 +21,8 @@
         "k_scale": "0.5",
         "v_scale": "0.25"
       },
-      "workspaces": []
+      "workspaces": [],
+      "steps": []
     }
   ],
   "rejected": [],

@@ -197,3 +197,12 @@ The rule is the place where a future fusion would go. If sorting is folded into 
   - `amdgpu_jit.graph.plan(graph, cus=None, fuse=True)` / `run(plan, tensors)` / `kernels(plan)`. `run` calls the wrappers named by `py`, with the plan's parameters filtered by each wrapper's signature.
   - `python/tests/graph_check.py` (in `run_all.sh`) runs the fused and unfused (`--no-fuse`) plans of rmsnorm → quant fp8 and silu_mul → quant fp8 on the same data, plus add → rmsnorm → quant fp8 fused only. It checks both against the reference and against each other. Passes on gfx950 (1 launch vs 2 per graph).
 - **Found while writing the goldens:** an MLP with intermediate 14336 (Llama 8B) has no fused or single quant kernel. `silu_mul_quant_fp8` and `quant_token_bf16_fp8` are built only for N ≤ 8192 (`rows/quant.rs`), so the plan reports an error for that op.
+- **Step 3** (`l1-graph-step3`):
+  - **Derived names.** `reachable::python_op_names` is derived from the rules over `amdgpu_graph::fusion::canonical::graphs()`, about 40 small graphs at the former hand-listed shapes. The md5 manifest is identical, so the derived set equals the old list.
+  - **Plan-owned workspaces.** Every multi-kernel launch lists its `steps` (kernel, reads, writes, through the named workspaces). `graph.run` allocates the plan's workspaces and the wrappers use them (`ops_compute._ws_override`, consulted first by `_workspace`). Kernarg packing stays in the wrappers.
+- **Vocabulary extended:**
+  - `gemm`: bf16 | fp8_rowcol | i8_rowcol | fp8_blockscale | mxfp4. Tile, split-K and reduce come from the new `dispatch::gemm_kernels`, built on the family rules. That function now also owns the "reduce covers N in 1024-column blocks" guard, which the Python wrapper used to apply.
+  - `gemm_w4`, `conv` (implicit GEMM, CTA from `conv_cta`; no Python wrapper, so `py` is empty and `run` refuses it), `attention_bwd`, `moe_reduce`, `argmax`, `sample`, `topk_per_row` (decode / prefill), `causal_conv1d` (fwd / update).
+  - Twelve more golden plans.
+- **GEMM numerics through the plan** (`graph_check.py`): the `_64_splitk` + `gemm_splitk_reduce_s4[_rc]` paths (bf16, fp8 row/col, fp8 blockscale; M 64, N 1024, K 512) and the `_64` form match the `ops_check` reference.
+- **Python `gemm` (direct calls).** It takes `kernel` / `splits` / `reduce` from the plan. Its default tile choice (256 or `_128` only) is unchanged, so direct calls still differ from `dispatch::gemm_kernels`. Switching the default is a behaviour change (performance) left for a gated step.

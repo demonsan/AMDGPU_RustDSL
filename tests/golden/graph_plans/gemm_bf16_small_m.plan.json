@@ -1,0 +1,42 @@
+{
+  "launches": [
+    {
+      "rule": "gemm",
+      "covers": ["mm"],
+      "kernels": ["gemm_a16w16_bf16_64_splitk", "gemm_splitk_reduce_s4"],
+      "py": "gemm",
+      "bind": {
+        "a": "a",
+        "b": "b",
+        "out": "c"
+      },
+      "params": {
+        "kind": "bf16",
+        "kernel": "gemm_a16w16_bf16_64_splitk",
+        "splits": 4,
+        "K": 8192,
+        "reduce": "gemm_splitk_reduce_s4"
+      },
+      "workspaces": [
+        {
+          "name": "gemm_splitk",
+          "bytes": 8388608
+        }
+      ],
+      "steps": [
+        {
+          "kernel": "gemm_a16w16_bf16_64_splitk",
+          "reads": ["a", "b"],
+          "writes": ["gemm_splitk"]
+        },
+        {
+          "kernel": "gemm_splitk_reduce_s4",
+          "reads": ["gemm_splitk"],
+          "writes": ["c"]
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

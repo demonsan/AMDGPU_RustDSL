@@ -1,0 +1,4 @@
+{ "tensors": { "a": {"dtype": "u8", "shape": [256, 2048]}, "b": {"dtype": "u8", "shape": [4096, 2048]}, "sa": {"dtype": "u8", "shape": [256, 128]},
+    "sb": {"dtype": "u8", "shape": [4096, 128]}, "c": {"dtype": "bf16", "shape": [256, 4096]} },
+  "ops": [ {"id": "mm", "op": "gemm", "in": ["a", "b", "sa", "sb"], "out": ["c"], "attrs": {"kind": "mxfp4"}} ],
+  "outputs": ["c"] }

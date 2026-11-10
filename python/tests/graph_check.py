@@ -130,7 +130,47 @@ def check_add_norm_quant(M=32, N=512):
     return r
 
 
-CHECKS = [("norm_quant", check_norm_quant), ("act_quant", check_act_quant), ("add_norm_quant", check_add_norm_quant)]
+def gemm_graph(kind, M, N, K):
+    adt = {"bf16": "bf16", "fp8_rowcol": "fp8", "fp8_blockscale": "fp8"}[kind]
+    ts = {"a": {"dtype": adt, "shape": [M, K]}, "b": {"dtype": adt, "shape": [N, K]}, "c": {"dtype": "bf16", "shape": [M, N]}}
+    ins = ["a", "b"]
+    if kind != "bf16":
+        ts["sa"] = {"dtype": "f32", "shape": [M] if kind == "fp8_rowcol" else [M, K // 128]}
+        ts["sb"] = {"dtype": "f32", "shape": [N] if kind == "fp8_rowcol" else [N // 128, K // 128]}
+        ins += ["sa", "sb"]
+    return {"tensors": ts, "ops": [{"id": "mm", "op": "gemm", "in": ins, "out": ["c"], "attrs": {"kind": kind}}], "outputs": ["c"]}
+
+
+def check_gemm_plan(kind, M, N, K, want):
+    """The GEMM through its L1 plan (``dispatch::gemm_kernels``: tile, split-K, reduce; plan-owned split-K workspace) against the
+    reference of ops_check.check_gemm."""
+    import ops_check
+    plans = []
+
+    def run(da, db, do, dsa, dsb, k):
+        p = G.plan(gemm_graph(kind, M, N, K))
+        plans.append(G.kernels(p))
+        t = {"a": da, "b": db, "c": do}
+        if dsa is not None:
+            t.update(sa=dsa, sb=dsb)
+        G.run(p, t)
+        aj.hip.synchronize()
+        l = p["launches"][0]
+        return l["kernels"][0], l["params"]["splits"]
+
+    r = ops_check.check_gemm(kind, M, N, K, run=run)
+    r.name = "graph " + r.name
+    if plans and plans[0] != want:
+        print(f"    plan {plans[0]} (want {want})")
+        r.bad += 1
+    return r
+
+
+CHECKS = [("norm_quant", check_norm_quant), ("act_quant", check_act_quant), ("add_norm_quant", check_add_norm_quant),
+          ("gemm_bf16_64_splitk", lambda: check_gemm_plan("bf16", 64, 1024, 512, ["gemm_a16w16_bf16_64_splitk", "gemm_splitk_reduce_s4"])),
+          ("gemm_fp8_rowcol_64_splitk", lambda: check_gemm_plan("fp8_rowcol", 64, 1024, 512, ["gemm_a8w8_rowcol_fp8_64_splitk", "gemm_splitk_reduce_s4_rc"])),
+          ("gemm_fp8_blockscale_64_splitk", lambda: check_gemm_plan("fp8_blockscale", 64, 1024, 512, ["gemm_a8w8_blockscale_64_splitk", "gemm_splitk_reduce_s4"])),
+          ("gemm_bf16_64", lambda: check_gemm_plan("bf16", 256, 256, 256, ["gemm_a16w16_bf16_64"]))]
 
 
 def main(filters):

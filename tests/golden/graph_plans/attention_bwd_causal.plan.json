@@ -1,0 +1,50 @@
+{
+  "launches": [
+    {
+      "rule": "attention_bwd",
+      "covers": ["bwd"],
+      "kernels": ["fmha_bwd_dot_hd128_bf16", "fmha_bwd_dq_hd128_bf16_causal", "fmha_bwd_dkdv_hd128_bf16_causal"],
+      "py": "attention_bwd_bf16",
+      "bind": {
+        "q": "q",
+        "k": "k",
+        "v": "v",
+        "o": "o",
+        "do": "do",
+        "lse": "lse",
+        "dq": "dq",
+        "dk": "dk",
+        "dv": "dv"
+      },
+      "params": {
+        "causal": true,
+        "cus": 256
+      },
+      "workspaces": [
+        {
+          "name": "bwd_dot",
+          "bytes": 65536
+        }
+      ],
+      "steps": [
+        {
+          "kernel": "fmha_bwd_dot_hd128_bf16",
+          "reads": ["o", "do"],
+          "writes": ["bwd_dot"]
+        },
+        {
+          "kernel": "fmha_bwd_dq_hd128_bf16_causal",
+          "reads": ["q", "k", "v", "do", "lse", "bwd_dot"],
+          "writes": ["dq"]
+        },
+        {
+          "kernel": "fmha_bwd_dkdv_hd128_bf16_causal",
+          "reads": ["q", "k", "v", "do", "lse", "bwd_dot"],
+          "writes": ["dk", "dv"]
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

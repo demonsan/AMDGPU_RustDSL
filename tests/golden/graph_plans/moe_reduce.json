@@ -1,0 +1,4 @@
+{ "tensors": { "x": {"dtype": "bf16", "shape": ["T", 8, 4096]}, "w": {"dtype": "f32", "shape": ["T", 8]}, "y": {"dtype": "bf16", "shape": ["T", 4096]} },
+  "dims": {"T": 128},
+  "ops": [ {"id": "sum", "op": "moe_reduce", "in": ["x", "w"], "out": ["y"]} ],
+  "outputs": ["y"] }

@@ -3,7 +3,7 @@
 //! mirror (`tests/graph_plan_names.rs`: every name the rules produce over the canonical shapes builds). Per-shape choices (key splits, block_m,
 //! the decode form) come from `crate::dispatch`, never from here.
 
-use super::{Launch, ModelGraph, OpKind, Rule, Step};
+use super::{KStep, Launch, ModelGraph, OpKind, Rule, Step};
 use crate::dispatch;
 use crate::opgraph::json::Json;
 
@@ -33,7 +33,10 @@ fn eps(g: &ModelGraph, op: usize) -> Vec<(String, Json)> {
     g.ops[op].attr("eps").map(|e| vec![("eps".to_string(), e.clone())]).unwrap_or_default()
 }
 fn launch(rule: &'static str, g: &ModelGraph, m: &[usize], kernels: Vec<String>, py: &'static str, bind: Vec<(&'static str, String)>, params: Vec<(String, Json)>) -> Launch {
-    Launch { rule, covers: m.iter().map(|&i| g.ops[i].id.clone()).collect(), kernels, py, bind, params, workspaces: Vec::new() }
+    Launch { rule, covers: m.iter().map(|&i| g.ops[i].id.clone()).collect(), kernels, py, bind, params, workspaces: Vec::new(), steps: Vec::new() }
+}
+fn st(kernel: &str, reads: &[&str], writes: &[&str]) -> KStep {
+    KStep { kernel: kernel.into(), reads: reads.iter().map(|s| s.to_string()).collect(), writes: writes.iter().map(|s| s.to_string()).collect() }
 }
 fn quant_to<'a>(g: &'a ModelGraph, op: usize) -> &'a str {
     g.ops[op].attr_str("to").unwrap_or("fp8")
@@ -281,6 +284,90 @@ pub fn single(g: &ModelGraph, i: usize) -> R<Launch> {
         OpKind::Attention => attention(g, i),
         OpKind::PagedAttention => paged(g, i),
         OpKind::MlaAttention => mla(g, i),
+        OpKind::AttentionBwd => attention_bwd(g, i),
+        OpKind::Gemm => gemm(g, i),
+        OpKind::GemmW4 => gemm_w4(g, i),
+        OpKind::Conv => conv(g, i),
+        OpKind::MoeReduce => {
+            let s = g.shape(&o.ins[0])?;
+            need(s.len() == 3, || "moe_reduce: x [T, K, D]".into())?;
+            let (k, d) = (s[1], s[2]);
+            let mut bind = vec![("x", o.ins[0].clone()), ("out", o.outs[0].clone())];
+            let name = if let Some(w) = o.ins.get(1) {
+                bind.push(("weights", w.clone()));
+                format!("moe_reduce_bf16_k{k}_d{d}")
+            } else {
+                format!("moe_combine_bf16_k{k}_d{d}")
+            };
+            one("moe_reduce", name, "moe_reduce", bind, Vec::new())
+        }
+        OpKind::Argmax => {
+            dt(g, &o.ins[0], "bf16")?;
+            let v = last(g, &o.ins[0])?;
+            one("argmax", format!("argmax_bf16_v{v}"), "argmax", vec![("logits", o.ins[0].clone()), ("out", o.outs[0].clone())], Vec::new())
+        }
+        OpKind::Sample => {
+            dt(g, &o.ins[0], "bf16")?;
+            let v = last(g, &o.ins[0])?;
+            let top_k = o.attr_int("top_k").unwrap_or(0);
+            let top_p: f64 = match o.attr("top_p") {
+                None => 1.0,
+                Some(j) => j.str().and_then(|s| s.parse().ok()).or_else(|| j.int().map(|i| i as f64)).ok_or("sample: top_p is a number (string)")?,
+            };
+            let filtered = top_k > 0 || top_p < 1.0;
+            let mut params = vec![p_int("top_k", top_k)];
+            for k in ["temperature", "top_p"] {
+                if let Some(x) = o.attr(k) {
+                    params.push((k.into(), x.clone()));
+                }
+            }
+            let name = format!("sample_{}bf16_v{v}", if filtered { "topkp_" } else { "" });
+            one("sample", name, "sample", vec![("logits", o.ins[0].clone()), ("u", o.ins[1].clone()), ("out", o.outs[0].clone())], params)
+        }
+        OpKind::TopkPerRow => {
+            dt(g, &o.ins[0], "f32")?;
+            let k = last(g, &o.outs[0])?;
+            match o.attr_str("mode").unwrap_or("decode") {
+                "decode" => {
+                    let next_n = o.attr_int("next_n").unwrap_or(1);
+                    let bind = vec![("logits", o.ins[0].clone()), ("seq_lens", o.ins[1].clone()), ("indices", o.outs[0].clone())];
+                    one("topk_per_row", format!("topk_per_row_decode_f32_k{k}"), "topk_per_row_decode", bind, vec![p_int("next_n", next_n)])
+                }
+                "prefill" => {
+                    need(o.ins.len() == 3, || "topk_per_row prefill: logits, row_starts, row_ends".into())?;
+                    let bind = vec![("logits", o.ins[0].clone()), ("row_starts", o.ins[1].clone()), ("row_ends", o.ins[2].clone()), ("indices", o.outs[0].clone())];
+                    one("topk_per_row", format!("topk_per_row_prefill_f32_k{k}"), "topk_per_row_prefill", bind, Vec::new())
+                }
+                m => Err(format!("topk_per_row mode `{m}` (decode | prefill)")),
+            }
+        }
+        OpKind::CausalConv1d => {
+            dt(g, &o.ins[0], "bf16")?;
+            let w = last(g, &o.ins[1])?;
+            let silu = o.attr_bool("silu").unwrap_or(true);
+            let sfx = if silu { "_silu" } else { "" };
+            match o.attr_str("mode").unwrap_or("fwd") {
+                "fwd" => {
+                    need(o.ins.len() == 7, || "causal_conv1d fwd: x, weight, bias, cu_seqlens, cache_indices, has_initial, conv_states".into())?;
+                    let ms = o.attr_int("max_seqlen").ok_or("causal_conv1d fwd: the `max_seqlen` attribute")?;
+                    let names = ["x", "weight", "bias", "cu_seqlens", "cache_indices", "has_initial", "conv_states"];
+                    let mut bind: Vec<(&'static str, String)> = names.iter().zip(&o.ins).map(|(n, t)| (*n, t.clone())).collect();
+                    bind.push(("out", o.outs[0].clone()));
+                    one("causal_conv1d", format!("causal_conv1d_fwd_bf16_w{w}{sfx}"), "causal_conv1d_fwd", bind, vec![p_int("max_seqlen", ms), ("silu".into(), Json::Bool(silu))])
+                }
+                "update" => {
+                    need(o.ins.len() == 4 || o.ins.len() == 5, || "causal_conv1d update: x, weight, bias, state [, state_indices]".into())?;
+                    let sl = last(g, &o.ins[3])?;
+                    let idx = o.ins.len() == 5;
+                    let mut bind = vec![("x", o.ins[0].clone()), ("weight", o.ins[1].clone()), ("bias", o.ins[2].clone()), ("state", o.ins[3].clone()), ("out", o.outs[0].clone())];
+                    if idx {
+                        bind.push(("state_indices", o.ins[4].clone()));
+                    }
+                    one("causal_conv1d", format!("causal_conv1d_update_bf16_w{w}_s{sl}{}{sfx}", if idx { "_idx" } else { "" }), "causal_conv1d_update", bind, vec![("silu".into(), Json::Bool(silu))])
+                }
+                m => Err(format!("causal_conv1d mode `{m}` (fwd | update)")),
+            }
+        }
     }
 }
 
@@ -320,8 +407,21 @@ fn moe(g: &ModelGraph, i: usize) -> R<Launch> {
     ws.push(("moe_t".into(), m * k * d * 4));
     let bind = vec![("x", o.ins[0].clone()), ("w1", o.ins[1].clone()), ("w2", o.ins[2].clone()), ("topk_ids", o.ins[3].clone()), ("topk_weights", o.ins[4].clone()), ("out", o.outs[0].clone())];
     let params = vec![p_str("dtype", dt_s), p_str("act", act), p_int("num_experts", e), p_int("inter", inter), p_int("block_m", bm)];
+    let (x, ids, w, y) = (o.ins[0].as_str(), o.ins[3].as_str(), o.ins[4].as_str(), o.outs[0].as_str());
+    let route = ["moe_sid", "moe_seid", "moe_nv", "moe_sw"];
+    let mut steps = vec![st(&kernels[0], &[ids, w], &["moe_sid", "moe_sw", "moe_seid", "moe_nv", "moe_ts"])];
+    let r1: Vec<&str> = [x, o.ins[1].as_str()].into_iter().chain(route).collect();
+    steps.push(st(&kernels[1], &r1, &["moe_y1"]));
+    let a2: &[&str] = if fp8 { &["moe_y1q", "moe_y1s"] } else { &["moe_y1"] };
+    if fp8 {
+        steps.push(st(&kernels[2], &["moe_y1"], a2));
+    }
+    let r2: Vec<&str> = a2.iter().copied().chain([o.ins[2].as_str()]).chain(route).collect();
+    steps.push(st(&kernels[kernels.len() - 2], &r2, &["moe_t"]));
+    steps.push(st(&kernels[kernels.len() - 1], &["moe_t"], &[y]));
     let mut l = launch("moe_experts", g, &[i], kernels, "fused_moe", bind, params);
     l.workspaces = ws;
+    l.steps = steps;
     Ok(l)
 }
 
@@ -348,8 +448,15 @@ fn attention(g: &ModelGraph, i: usize) -> R<Launch> {
     if let Some(l) = o.outs.get(1) {
         bind.push(("lse", l.clone()));
     }
+    let steps = if s > 1 {
+        let (q, k, v, o_) = (o.ins[0].as_str(), o.ins[1].as_str(), o.ins[2].as_str(), o.outs[0].as_str());
+        vec![st(&kernels[0], &[q, k, v], &["prefill_po", "prefill_plse"]), st(&kernels[1], &["prefill_po", "prefill_plse"], &[o_])]
+    } else {
+        Vec::new()
+    };
     let mut l = launch("attention", g, &[i], kernels, "prefill_bf16", bind, vec![("causal".into(), Json::Bool(causal)), p_int("splits", s as i64), p_int("cus", g.cus as i64)]);
     l.workspaces = ws;
+    l.steps = steps;
     Ok(l)
 }
 
@@ -383,5 +490,107 @@ fn mla(g: &ModelGraph, i: usize) -> R<Launch> {
     let bind = vec![("q", o.ins[0].clone()), ("kv_cache", o.ins[1].clone()), ("block_table", o.ins[2].clone()), ("context_lens", o.ins[3].clone()), ("out", o.outs[0].clone())];
     let mut l = launch("mla_attention", g, &[i], vec![format!("mla_decode_bf16_{}p{p}", if hp { "hp_" } else { "" }), "attn_combine_bf16_hd512".into()], "mla_decode", bind, vec![("hp".into(), Json::Bool(hp)), p_int("splits", s as i64)]);
     l.workspaces = vec![("mla_po".into(), b * h * parts * 512 * 4), ("mla_plse".into(), b * h * parts * 4)];
+    let (q_, kv_, bt, cl, out) = (o.ins[0].as_str(), o.ins[1].as_str(), o.ins[2].as_str(), o.ins[3].as_str(), o.outs[0].as_str());
+    l.steps = vec![st(&l.kernels[0], &[q_, kv_, bt, cl], &["mla_po", "mla_plse"]), st(&l.kernels[1], &["mla_po", "mla_plse"], &[out])];
     Ok(l)
+}
+
+/// Attention backward (hd128 bf16): `fmha_bwd_dot` (Dot = rowsum(dO O) into a workspace), then dq and dkdv; causal: the kernels of
+/// `dispatch::bwd_causal_kernels` (longest-first grids).
+fn attention_bwd(g: &ModelGraph, i: usize) -> R<Launch> {
+    let o = &g.ops[i];
+    let q = g.shape(&o.ins[0])?;
+    need(q.len() == 4 && q[3] == 128, || "attention_bwd: q [B, SQ, H, 128]".into())?;
+    let causal = o.attr_bool("causal").unwrap_or(false);
+    let (dqk, dkdv) = if causal { dispatch::bwd_causal_kernels() } else { ("fmha_bwd_dq_hd128_bf16", "fmha_bwd_dkdv_hd128_bf16") };
+    let names = ["q", "k", "v", "o", "do", "lse"];
+    let mut bind: Vec<(&'static str, String)> = names.iter().zip(&o.ins).map(|(n, t)| (*n, t.clone())).collect();
+    bind.extend([("dq", o.outs[0].clone()), ("dk", o.outs[1].clone()), ("dv", o.outs[2].clone())]);
+    let mut l = launch("attention_bwd", g, &[i], vec!["fmha_bwd_dot_hd128_bf16".into(), dqk.into(), dkdv.into()], "attention_bwd_bf16", bind, vec![("causal".into(), Json::Bool(causal)), p_int("cus", g.cus as i64)]);
+    l.workspaces = vec![("bwd_dot".into(), q[0] * q[2] * q[1] * 4)];
+    let n = |j: usize| o.ins[j].as_str();
+    l.steps = vec![
+        st(&l.kernels[0], &[n(3), n(4)], &["bwd_dot"]),
+        st(&l.kernels[1], &[n(0), n(1), n(2), n(4), n(5), "bwd_dot"], &[o.outs[0].as_str()]),
+        st(&l.kernels[2], &[n(0), n(1), n(2), n(4), n(5), "bwd_dot"], &[o.outs[1].as_str(), o.outs[2].as_str()]),
+    ];
+    Ok(l)
+}
+
+/// Dense GEMM: the kernel, split-K and reduce from `dispatch::gemm_kernels` (the family tile / split rules).
+fn gemm(g: &ModelGraph, i: usize) -> R<Launch> {
+    let o = &g.ops[i];
+    let kind = o.attr_str("kind").unwrap_or("bf16");
+    let c = g.shape(&o.outs[0])?;
+    need(c.len() == 2, || "gemm: c [M, N]".into())?;
+    let (m, n) = (c[0], c[1]);
+    let k = if kind == "mxfp4" { last(g, &o.ins[0])? * 2 } else { last(g, &o.ins[0])? };
+    let (name, s, reduce) = dispatch::gemm_kernels(kind, m as u64, n as u64, k as u64, g.cus).ok_or(format!("gemm kind `{kind}` (bf16 | fp8_rowcol | i8_rowcol | fp8_blockscale | mxfp4)"))?;
+    need(kind == "bf16" || o.ins.len() == 4, || format!("gemm {kind}: a, b, a_scale, b_scale"))?;
+    let mut bind = vec![("a", o.ins[0].clone()), ("b", o.ins[1].clone()), ("out", o.outs[0].clone())];
+    if o.ins.len() == 4 {
+        bind.push(("a_scale", o.ins[2].clone()));
+        bind.push(("b_scale", o.ins[3].clone()));
+    }
+    let mut kernels = vec![name.clone()];
+    let mut params = vec![p_str("kind", kind), p_str("kernel", &name), p_int("splits", s as i64), p_int("K", k)];
+    let mut ws = Vec::new();
+    if let Some(r) = reduce {
+        kernels.push(r.clone());
+        params.push(p_str("reduce", &r));
+        ws.push(("gemm_splitk".to_string(), s as i64 * ((m + 127) / 128 * 128) * n * 4));
+    }
+    let steps = if kernels.len() > 1 {
+        let ins: Vec<&str> = o.ins.iter().map(|s| s.as_str()).collect();
+        let red_in: Vec<&str> = std::iter::once("gemm_splitk").chain(if kernels[1].ends_with("_rc") { ins[2..].to_vec() } else { Vec::new() }).collect();
+        vec![st(&kernels[0], &ins, &["gemm_splitk"]), st(&kernels[1], &red_in, &[o.outs[0].as_str()])]
+    } else {
+        Vec::new()
+    };
+    let mut l = launch("gemm", g, &[i], kernels, "gemm", bind, params);
+    l.workspaces = ws;
+    l.steps = steps;
+    Ok(l)
+}
+
+/// MXFP4-weight GEMMs (`gemm_a16w4_mxfp4`, `gemm_a8w4_mxfp_128`).
+fn gemm_w4(g: &ModelGraph, i: usize) -> R<Launch> {
+    let o = &g.ops[i];
+    let kind = o.attr_str("kind").unwrap_or("a16w4");
+    let name = match kind {
+        "a16w4" => "gemm_a16w4_mxfp4",
+        "a8w4" => "gemm_a8w4_mxfp_128",
+        k => return Err(format!("gemm_w4 kind `{k}` (a16w4 | a8w4)")),
+    };
+    need(kind == "a16w4" || o.ins.len() == 4, || "gemm_w4 a8w4: a, b, b_scale, a_scale".into())?;
+    let mut bind = vec![("a", o.ins[0].clone()), ("b", o.ins[1].clone()), ("b_scale", o.ins[2].clone()), ("out", o.outs[0].clone())];
+    if let Some(sa) = o.ins.get(3) {
+        bind.push(("a_scale", sa.clone()));
+    }
+    Ok(launch("gemm_w4", g, &[i], vec![name.into()], "gemm_w4", bind, vec![p_str("kind", kind)]))
+}
+
+/// Implicit-GEMM convolution (bf16, channels last): `conv{2,3}d_bf16_[t<T>]r<R>s<S>_st<st>_p<pad>_d<dil>[_c128]`, the CTA from
+/// `dispatch::conv_cta`. No Python wrapper launches it yet (`py` empty).
+fn conv(g: &ModelGraph, i: usize) -> R<Launch> {
+    let o = &g.ops[i];
+    dt(g, &o.ins[0], "bf16")?;
+    let y = g.shape(&o.outs[0])?;
+    need(y.len() == 4 || y.len() == 5, || "conv: y [NB, (OD,) OH, OW, K]".into())?;
+    let rows: i64 = y[..y.len() - 1].iter().product();
+    let n = y[y.len() - 1];
+    let a = |k: &str, d: i64| o.attr_int(k).unwrap_or(d);
+    let (r, s, t) = (a("r", 3), a("s", 3), a("t", 1));
+    let three = y.len() == 5;
+    let cta = dispatch::conv_cta(rows as u64, n as u64, g.cus);
+    let name = format!(
+        "conv{}d_bf16_{}r{r}s{s}_st{}_p{}_d{}{}",
+        if three { 3 } else { 2 },
+        if three { format!("t{t}") } else { String::new() },
+        a("stride", 1),
+        a("pad", 0),
+        a("dil", 1),
+        if cta == 128 { "_c128" } else { "" }
+    );
+    Ok(launch("conv", g, &[i], vec![name], "", vec![("x", o.ins[0].clone()), ("w", o.ins[1].clone()), ("y", o.outs[0].clone())], vec![p_int("cta", cta as i64)]))
 }

@@ -1,0 +1,3 @@
+{ "tensors": { "l": {"dtype": "f32", "shape": [16, 65536]}, "sl": {"dtype": "i32", "shape": [8]}, "ix": {"dtype": "i32", "shape": [16, 2048]} },
+  "ops": [ {"id": "topk", "op": "topk_per_row", "in": ["l", "sl"], "out": ["ix"], "attrs": {"mode": "decode", "next_n": 2}} ],
+  "outputs": ["ix"] }

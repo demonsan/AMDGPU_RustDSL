@@ -347,3 +347,31 @@ mod tests {
         assert_eq!(super::i8_gemm_config(64, 8192, 256), (64, 4));
     }
 }
+
+/// The dense GEMM launch of `out[M, N] = A B^T` for an operand kind: (main kernel, split-K S, the split-K reduce kernel when S > 1). The tile and
+/// split come from the family rules (`bf16_gemm_config`, `i8_gemm_config`, `blockscale_config`):
+/// - 256 rows: the base kernel; 128: `_128`; 64: `_64`; 64 with S > 1: `_64_splitk` + `gemm_splitk_reduce_s<S>`;
+/// - the per-token x per-channel kinds (`fp8_rowcol`, `i8_rowcol`) reduce with the scales (`_rc`).
+///
+/// The reduce covers N in 1024-column blocks, so N % 1024 != 0 runs unsplit. `mxfp4` has one kernel (`gemm_a4w4_mxfp4`). None: unknown kind.
+pub fn gemm_kernels(kind: &str, m: u64, n: u64, k: u64, cus: u64) -> Option<(String, u32, Option<String>)> {
+    let (base, rc) = match kind {
+        "bf16" => ("gemm_a16w16_bf16", false),
+        "fp8_rowcol" => ("gemm_a8w8_rowcol_fp8", true),
+        "i8_rowcol" => ("gemm_a8w8_i8", true),
+        "fp8_blockscale" => ("gemm_a8w8_blockscale", false),
+        "mxfp4" => return Some(("gemm_a4w4_mxfp4".into(), 1, None)),
+        _ => return None,
+    };
+    let (rows, s) = if kind == "fp8_blockscale" { blockscale_config(m, n, k, cus) } else { i8_gemm_config(m, n, cus) };
+    let s = if s > 1 && n % 1024 != 0 { 1 } else { s };
+    let name = match (rows, s > 1) {
+        (256, _) => base.to_string(),
+        (128, _) if kind == "fp8_blockscale" => base.to_string(),
+        (128, _) => format!("{base}_128"),
+        (_, false) => format!("{base}_64"),
+        (_, true) => format!("{base}_64_splitk"),
+    };
+    let reduce = (s > 1).then(|| format!("gemm_splitk_reduce_s{s}{}", if rc { "_rc" } else { "" }));
+    Some((name, s, reduce))
+}

@@ -1,0 +1,22 @@
+{
+  "launches": [
+    {
+      "rule": "topk_per_row",
+      "covers": ["topk"],
+      "kernels": ["topk_per_row_decode_f32_k2048"],
+      "py": "topk_per_row_decode",
+      "bind": {
+        "logits": "l",
+        "seq_lens": "sl",
+        "indices": "ix"
+      },
+      "params": {
+        "next_n": 2
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

@@ -1,0 +1,20 @@
+{
+  "launches": [
+    {
+      "rule": "moe_reduce",
+      "covers": ["sum"],
+      "kernels": ["moe_reduce_bf16_k8_d4096"],
+      "py": "moe_reduce",
+      "bind": {
+        "x": "x",
+        "out": "y",
+        "weights": "w"
+      },
+      "params": {},
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

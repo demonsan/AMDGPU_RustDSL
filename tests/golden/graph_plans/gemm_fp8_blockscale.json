@@ -1,0 +1,4 @@
+{ "tensors": { "a": {"dtype": "fp8", "shape": [128, 8192]}, "b": {"dtype": "fp8", "shape": [4096, 8192]}, "sa": {"dtype": "f32", "shape": [128, 64]},
+    "sb": {"dtype": "f32", "shape": [32, 64]}, "c": {"dtype": "bf16", "shape": [128, 4096]} },
+  "ops": [ {"id": "mm", "op": "gemm", "in": ["a", "b", "sa", "sb"], "out": ["c"], "attrs": {"kind": "fp8_blockscale"}} ],
+  "outputs": ["c"] }

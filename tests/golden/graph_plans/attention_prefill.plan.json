@@ -25,6 +25,18 @@
           "name": "prefill_plse",
           "bytes": 262144
         }
+      ],
+      "steps": [
+        {
+          "kernel": "fmha_fwd_hd128_bf16_v3_causal_ks",
+          "reads": ["q", "k", "v"],
+          "writes": ["prefill_po", "prefill_plse"]
+        },
+        {
+          "kernel": "attn_combine_bf16_hd128_q16",
+          "reads": ["prefill_po", "prefill_plse"],
+          "writes": ["o"]
+        }
       ]
     }
   ],

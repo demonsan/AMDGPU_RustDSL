@@ -1,0 +1,44 @@
+{
+  "launches": [
+    {
+      "rule": "gemm",
+      "covers": ["mm"],
+      "kernels": ["gemm_a8w8_blockscale_64_splitk", "gemm_splitk_reduce_s4"],
+      "py": "gemm",
+      "bind": {
+        "a": "a",
+        "b": "b",
+        "out": "c",
+        "a_scale": "sa",
+        "b_scale": "sb"
+      },
+      "params": {
+        "kind": "fp8_blockscale",
+        "kernel": "gemm_a8w8_blockscale_64_splitk",
+        "splits": 4,
+        "K": 8192,
+        "reduce": "gemm_splitk_reduce_s4"
+      },
+      "workspaces": [
+        {
+          "name": "gemm_splitk",
+          "bytes": 8388608
+        }
+      ],
+      "steps": [
+        {
+          "kernel": "gemm_a8w8_blockscale_64_splitk",
+          "reads": ["a", "b", "sa", "sb"],
+          "writes": ["gemm_splitk"]
+        },
+        {
+          "kernel": "gemm_splitk_reduce_s4",
+          "reads": ["gemm_splitk"],
+          "writes": ["c"]
+        }
+      ]
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

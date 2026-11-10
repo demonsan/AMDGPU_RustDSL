@@ -1,0 +1,27 @@
+{
+  "launches": [
+    {
+      "rule": "gemm",
+      "covers": ["mm"],
+      "kernels": ["gemm_a8w8_i8_64"],
+      "py": "gemm",
+      "bind": {
+        "a": "a",
+        "b": "b",
+        "out": "c",
+        "a_scale": "sa",
+        "b_scale": "sb"
+      },
+      "params": {
+        "kind": "i8_rowcol",
+        "kernel": "gemm_a8w8_i8_64",
+        "splits": 1,
+        "K": 4096
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}

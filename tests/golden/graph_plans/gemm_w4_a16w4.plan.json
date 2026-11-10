@@ -1,0 +1,23 @@
+{
+  "launches": [
+    {
+      "rule": "gemm_w4",
+      "covers": ["mm"],
+      "kernels": ["gemm_a16w4_mxfp4"],
+      "py": "gemm_w4",
+      "bind": {
+        "a": "a",
+        "b": "b",
+        "b_scale": "sb",
+        "out": "c"
+      },
+      "params": {
+        "kind": "a16w4"
+      },
+      "workspaces": [],
+      "steps": []
+    }
+  ],
+  "rejected": [],
+  "errors": []
+}
