@@ -72,7 +72,7 @@ pub struct LlvmTail {
 
 #[derive(Debug)]
 pub struct Wave {
-    /// lanes per wave (64; gfx1250 32)
+    /// lanes per wave (64; wave32 targets 32)
     pub lanes: u32,
 }
 
@@ -90,7 +90,7 @@ pub struct RegFile {
 #[derive(Debug)]
 pub struct RegFiles {
     pub vgpr: RegFile,
-    /// the accumulation registers (None: no AGPR segment, gfx1250)
+    /// the accumulation registers (None: a target without an AGPR segment)
     pub agpr: Option<RegFile>,
     pub sgpr: RegFile,
     /// arch VGPRs + AGPRs share one file of this many registers per lane (gfx950: 512)
@@ -116,7 +116,7 @@ pub struct Unified {
 pub enum Occupancy {
     /// waves per SIMD = unified total / registers per wave (gfx950)
     UnifiedSteps,
-    /// a pool of `blocks` blocks of `block_vgprs` VGPRs shared by the waves; SGPRs are fixed (gfx1250)
+    /// a pool of `blocks` blocks of `block_vgprs` VGPRs shared by the waves; SGPRs are not an occupancy term
     BlockPool { block_vgprs: u32, blocks: u32 },
 }
 
@@ -131,9 +131,9 @@ pub enum MemClass {
     Smem,
     Msg,
     Export,
-    /// gfx1250: tensor data mover
+    /// a tensor data mover operation
     Tensor,
-    /// gfx1250: asynchronous LDS DMA
+    /// an asynchronous LDS DMA
     Async,
 }
 
@@ -158,7 +158,7 @@ pub struct Counter {
 pub enum WaitForm {
     /// one instruction with a field per counter (gfx950 `s_waitcnt vmcnt(n) lgkmcnt(n) expcnt(n)`)
     Combined { mnemonic: &'static str },
-    /// one instruction per counter (gfx1250 `s_wait_loadcnt` / `s_wait_storecnt` / `s_wait_dscnt` / ...): (counter, mnemonic)
+    /// one instruction per counter (gfx12 in upstream LLVM: `s_wait_loadcnt` / `s_wait_storecnt` / `s_wait_dscnt` / ...): (counter, mnemonic)
     PerCounter(&'static [(usize, &'static str)]),
 }
 
@@ -190,7 +190,7 @@ impl Counters {
 pub enum Unit {
     /// wait states: every issued instruction or `s_nop` state counts (gfx950)
     WaitStates,
-    /// only independent VALU instructions count (gfx1250 WMMA `v_nop` rule; co-execution state changes the count)
+    /// only independent VALU instructions count (upstream LLVM `GCNHazardRecognizer::fixWMMAHazards`)
     IndependentValu,
 }
 
@@ -200,7 +200,7 @@ pub enum Count {
     N(u32),
     /// by the producer's MFMA result latency: (latency, distance) pairs, else the default
     ByMfmaLatency(&'static [(u32, u32)], u32),
-    /// a required instruction rather than a distance (gfx1250 `s_wait_*` forms)
+    /// a required instruction rather than a distance
     Instr(&'static str),
 }
 

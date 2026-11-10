@@ -2,7 +2,7 @@
 
 Part of the four-layer refactor ([`refactor-4layer-plan.md`](refactor-4layer-plan.md)). P0 moves every gfx950 fact behind one
 description without changing any output: the golden md5 manifest (`tests/golden/md5_manifest.tsv`), the certificates and the tests
-stay identical. gfx1250 (MI450 B0) is described against the same fields as a specification only (target-gfx1250.md on branch `gfx1250-spec`,
+stay identical. gfx1250 is described against the same fields as a specification only, from public sources (AMD ISA documents, upstream LLVM) (target-gfx1250.md, phase G,
 phase G).
 
 ## 1. Split: data vs. per-instruction tables
@@ -21,7 +21,7 @@ compile context. There is no global "current target".
 ```rust
 pub struct Target {
     pub name: &'static str,                 // "gfx950"
-    pub wave: Wave,                         // lanes: 64 (gfx1250: 32)
+    pub wave: Wave,                         // lanes: 64 (wave32 targets: 32)
     pub regs: RegFiles,
     pub lds: Lds,
     pub counters: Counters,
@@ -35,29 +35,30 @@ pub struct Target {
 ```
 
 - **`Wave`**: `lanes`, `exec_bits` (the width of an exec / lane-mask SGPR tuple: 2 SGPRs on wave64, 1 on wave32).
-- **`RegFiles`**: `vgpr: RegFile`, `agpr: Option<RegFile>` (gfx1250 has no AGPR segment), `sgpr: RegFile`; `RegFile { count, alloc_granule, tuple_align: &[(dwords, align)], reserved }`, plus:
+- **`RegFiles`**: `vgpr: RegFile`, `agpr: Option<RegFile>` (None for a target without an AGPR segment), `sgpr: RegFile`; `RegFile { count, alloc_granule, tuple_align: &[(dwords, align)], reserved }`, plus:
   - `unified: Option<Unified { total, accum_granule }>`. gfx950: arch VGPR + AGPR ≤ 512, `accum_offset` rounded to 4, `next_free_vgpr` to 8.
   - the SGPR rules: usable count (102), the special registers outside it (vcc, exec, m0), the user / system SGPR layout (kernarg pointer in s[0:1], workgroup ids).
   - `occupancy: Occupancy` — a model, not just a table:
     - `Steps(&[(regs, waves_per_simd)])`: gfx950, waves per SIMD from the VGPR / AGPR (unified) and SGPR counts.
-    - `BlockPool { block_vgprs, blocks }`: gfx1250, a pool of 64 blocks of 16 VGPRs shared by the waves; SGPRs are fixed and not an occupancy term.
+    - `BlockPool { block_vgprs, blocks }`: a target whose VGPRs are allocated to waves in fixed-size blocks from a shared pool, with SGPRs not an occupancy term (the numbers come from the phase-G description and its public sources).
 - **`Lds`**: `bytes_per_workgroup` (160 KiB), `banks`, the DMA forms and their M0 rule (`m0_base_plus_imm`).
 - **`Counters`**: a generic counter set.
   - `counters: &[Counter { name, max, in_order }]`.
   - `classes: &[(MemClass, CounterId, OrderKind)]`. `MemClass` = vmem load / vmem store / lds / lds-dma / smem / msg / tensor / async / ….
-    `OrderKind` is per class, not per counter: `InOrder` or `OutOfOrder` (SMEM on both targets, so a wait for it is always 0). On gfx1250 one counter
-    can be in order for one class and out of order for another (XCNT: VMEM vs SMEM translation order).
+    `OrderKind` is per class, not per counter: `InOrder` or `OutOfOrder` (SMEM on gfx950, so a wait for it is always 0). One counter can be in order for one
+    class and out of order for another, so the order belongs to the (class, counter) pair; a wait on a counter with classes of different order pending is
+    treated as out of order.
   - `wait: WaitForm`, one of:
     - `Combined { mnemonic, fields }`: gfx950 `s_waitcnt vmcnt(n) lgkmcnt(n) expcnt(n)`.
-    - `PerCounter(&[(CounterId, mnemonic)])`: gfx1250 `s_wait_loadcnt` / `storecnt` / `dscnt` / `kmcnt` / `asynccnt` / `tensorcnt` / `xcnt`.
+    - `PerCounter(&[(CounterId, mnemonic)])`: one wait instruction per counter, as for gfx12 in upstream LLVM (`SIInsertWaitcnts`: `s_wait_loadcnt`, `s_wait_storecnt`, `s_wait_dscnt`, `s_wait_kmcnt`, ...).
 
   gfx950: `vmcnt` (63; loads and stores, in issue order), `lgkmcnt` (15; LDS in order, SMEM out of order, so an SMEM wait is always 0), `expcnt`.
   The wait verifier and the wait insertion iterate over the set instead of the two named fields.
 - **`HazardRule`**:
   - `{ name, producer: Class, consumer: Class, role: Operand, waits: Waits, scope: Value | Physical, source }`.
   - `Waits { count: Count, unit: Unit }`.
-    - `Count` is a number, a function of the producer (MFMA passes: `passes + 3 + extra`), or `Instr` for a required instruction (gfx1250 `s_wait_*`).
-    - `Unit` is the distance unit: `WaitStates` (`s_nop` / any instruction issued, gfx950) or `IndependentValu` (only independent VALU instructions count, as in the gfx1250 WMMA `v_nop` rule, where co-execution state changes the count).
+    - `Count` is a number, a function of the producer (MFMA passes: `passes + 3 + extra`), or `Instr` for a required instruction instead of a distance.
+    - `Unit` is the distance unit: `WaitStates` (`s_nop` / any instruction issued, gfx950) or `IndependentValu` (only independent VALU instructions count toward the distance, as in upstream LLVM's WMMA hazard handling, `GCNHazardRecognizer::fixWMMAHazards`).
   - `source` cites the evidence: LLVM `GCNHazardRecognizer` function, probe name, or ISA page.
 
   The gfx950 table is the audit table of [`trust-inventory.md`](trust-inventory.md) §5.1. `hazards.rs` keeps its algorithms (value-level ready map, post-RA physical passes) and reads the numbers per rule.
@@ -102,8 +103,10 @@ Each row is one move commit: behaviour-neutral, md5 manifest identical, certific
 
 ## 4. How gfx1250 fits (check, not implementation)
 
-- **Wave and registers:** wave32; VGPR allocation granule; fixed SGPRs. These are data in `wave` / `regs`.
-- **Split counters:** `PerCounter` wait form. Classes: TDM → TENSOR, async LDS DMA → ASYNC, scalar memory → KM.
-- **Hazards:** WMMA / SWMMAC software hazards and VALU dependency distances are `HazardRule` rows. Rows that need an instruction rather than wait states use `Waits::Instr`.
+Only facts from public AMD ISA documents and upstream LLVM may be recorded (phase G cites them per fact).
+
+- **Wave and registers:** the wave size, the VGPR allocation granule and the SGPR rules are data in `wave` / `regs`.
+- **Split counters:** the `PerCounter` wait form with a (class, counter, order) row per memory class.
+- **Hazards:** WMMA hazards and VALU dependency distances are `HazardRule` rows; rows that need an instruction rather than a distance use `Count::Instr`. A `kind: Software | Interlock` field (a distance the software must provide vs. one the hardware interlocks and only costs time) is the expected first extension.
 - **Matrix atoms:** WMMA lane layouts go in `atoms`.
-- **Not described:** VOPD pairing and clusters are not described by P0 fields. They become `Target` extensions when a gfx1250 backend exists. Phase G records them in prose.
+- **Not described by P0 fields:** VOPD pairing, clusters, extended VGPR addressing, LDS DMA forms without an M0 rule, the `s_wait_alu` fields. They become `Target` extensions when a gfx1250 backend exists; phase G records them in prose.
