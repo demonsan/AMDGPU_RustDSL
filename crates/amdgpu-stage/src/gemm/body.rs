@@ -4,55 +4,55 @@ use amdgpu_dsl::{DType, FnBuilder, I32, Opnd, ValueId, VarId};
 use amdgpu_tile::{ev, ox, Role, Shared, SlotIdx, TileIt};
 use amdgpu_tile::copy::LdsPart;
 use amdgpu_tile::mma::TiledMma;
-use super::dma::Dma;
-use super::Elem;
+use amdgpu_tile::dma_plan::Dma;
+use super::formats::Elem;
 use super::mma::{bs_fma, mma_blocks, mma_var};
-use super::Scales;
-use amdgpu_stage::{PipeBody};
+use super::formats::Scales;
+use crate::PipeBody;
 
 /// The configuration numbers the body reads (instead of the whole `GemmConfig`): operand format, scale form, wave tile and the MMA
 /// counts placed around the top-of-tile sync. Built by `GemmConfig::body_params` (docs/l2-family-bodies.md §2.3).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BodyParams {
-    pub(crate) elem: Elem,
-    pub(crate) scales: Scales,
-    pub(crate) wave_m: i64,
-    pub(crate) wave_n: i64,
-    pub(crate) pre_sync_mmas: usize,
-    pub(crate) mid_sync_mmas: usize,
+pub struct BodyParams {
+    pub elem: Elem,
+    pub scales: Scales,
+    pub wave_m: i64,
+    pub wave_n: i64,
+    pub pre_sync_mmas: usize,
+    pub mid_sync_mmas: usize,
 }
 
 /// A-operand row source of the implicit-GEMM convolution: per K tile (key offset `key0`), the voffset of every A DMA issue (the input
 /// pixel of the issue's row, or out of range) and the soffset they go with. The conv address maths stays with the op (`ConvRt`).
-pub(crate) trait ConvSource {
+pub trait ConvSource {
     fn tile_voffsets(&self, b: &mut FnBuilder, key0: &I32) -> Vec<ValueId>;
     fn zero(&self) -> ValueId;
 }
 /// The scale panel: every K group's scales of the CTA in LDS, written once in the prologue (`prologue_stores`).
-pub(crate) struct Panel {
-    pub(crate) sh: Shared,
+pub struct Panel {
+    pub sh: Shared,
     /// LDS offset of the B part inside the panel
-    pub(crate) b_base: i64,
+    pub b_base: i64,
     /// A part transposed: [kb][wm][lane % 16][m block i] (8 bytes per lane: 2 dwords, MFMA byte selects); this lane's offset
-    pub(crate) tr: ValueId,
+    pub tr: ValueId,
     /// B part expanded to dwords [wn][PANEL_KB] (byte 0 = the scale): this wave's dword offset (wn 4 PANEL_KB)
-    pub(crate) b_dw: ValueId,
+    pub b_dw: ValueId,
     /// the VGPR scale path emitted in `prologue_stores`
-    pub(crate) sfa: SfaJob,
+    pub sfa: SfaJob,
 }
 
 /// The VGPR scale path: A scales by 4 passes of buffer_load_dwordx4 (lane = 16 M rows of one K group), a 4x4 byte transpose per dword across each
 /// lane quad (dpp quad_perm [1,0,3,2] + v_perm, dpp quad_perm [2,3,0,1] + v_perm) straight into the transposed panel layout, one ds_write per dword;
 /// B scales by one dword load per thread. Layout proof: `sfa_transpose_proof`.
-pub(crate) struct SfaJob {
-    pub(crate) voff: ValueId,
-    pub(crate) pso: Vec<ValueId>,
-    pub(crate) sel1: ValueId,
-    pub(crate) sel2: ValueId,
-    pub(crate) dst: ValueId,
-    pub(crate) bvo: ValueId,
-    pub(crate) bsh: ValueId,
-    pub(crate) bdst: ValueId,
+pub struct SfaJob {
+    pub voff: ValueId,
+    pub pso: Vec<ValueId>,
+    pub sel1: ValueId,
+    pub sel2: ValueId,
+    pub dst: ValueId,
+    pub bvo: ValueId,
+    pub bsh: ValueId,
+    pub bdst: ValueId,
 }
 
 /// Build-time proof of the VGPR scale path: simulates every lane of every pass byte by byte (the global load, both dpp/perm steps) and checks that
@@ -61,7 +61,7 @@ pub(crate) struct SfaJob {
 /// calls it build-time through `sfa_transpose_proof`).
 pub fn verify_sfa_transpose() { sfa_transpose_proof() }
 
-pub(crate) fn sfa_transpose_proof() {
+pub fn sfa_transpose_proof() {
     // a byte is identified by (kb, m)
     let perm = |s0: [(i64, i64); 4], s1: [(i64, i64); 4], sel: u32| -> [(i64, i64); 4] {
         let mut o = [(0, 0); 4];
@@ -98,73 +98,73 @@ pub(crate) fn sfa_transpose_proof() {
     assert_eq!(seen.len(), 64 * 256, "sfa transpose: every panel byte written once");
 }
 
-pub(crate) struct Body {
-    pub(crate) params: BodyParams,
+pub struct Body {
+    pub params: BodyParams,
     /// K tiles of this CTA's loop (K / 128, or KS with split-K)
-    pub(crate) kb_v: ValueId,
+    pub kb_v: ValueId,
     /// the E8M0 scale panel (Scales::Mx128)
-    pub(crate) panel: Option<Panel>,
-    pub(crate) mma: TiledMma,
-    pub(crate) a_s: Shared,
-    pub(crate) b_s: Shared,
-    pub(crate) a_dma: Dma,
-    pub(crate) b_dma: Dma,
-    pub(crate) a_org: ValueId,
-    pub(crate) b_org: ValueId,
-    pub(crate) a_wave: ValueId,
-    pub(crate) b_wave: ValueId,
-    pub(crate) rsrc_a: ValueId,
-    pub(crate) rsrc_b: ValueId,
-    pub(crate) rsrc_sfa: ValueId,
-    pub(crate) rsrc_sfb: ValueId,
-    pub(crate) a_rd: LdsPart,
-    pub(crate) b_rd: LdsPart,
+    pub panel: Option<Panel>,
+    pub mma: TiledMma,
+    pub a_s: Shared,
+    pub b_s: Shared,
+    pub a_dma: Dma,
+    pub b_dma: Dma,
+    pub a_org: ValueId,
+    pub b_org: ValueId,
+    pub a_wave: ValueId,
+    pub b_wave: ValueId,
+    pub rsrc_a: ValueId,
+    pub rsrc_b: ValueId,
+    pub rsrc_sfa: ValueId,
+    pub rsrc_sfb: ValueId,
+    pub a_rd: LdsPart,
+    pub b_rd: LdsPart,
     /// mixed precision: the A images 1.. (the image-0 partition moved by k `a_hi`) and the image stride in the slot
-    pub(crate) a_rd_x: Vec<LdsPart>,
-    pub(crate) a_hi: i32,
+    pub a_rd_x: Vec<LdsPart>,
+    pub a_hi: i32,
     /// A16W4: the lane's B-scale byte shift (8 (g / 2), g = lane / 16)
-    pub(crate) w4_shift: Option<ValueId>,
-    pub(crate) zero4: ValueId,
-    pub(crate) acc: Vec<VarId>,
+    pub w4_shift: Option<ValueId>,
+    pub zero4: ValueId,
+    pub acc: Vec<VarId>,
     /// MMAs of the register tile already issued by `pre_sync` / `post_wait`
-    pub(crate) npre_done: usize,
+    pub npre_done: usize,
     /// timing stamps (GEMM_STAMP=ends|tiles): debug buffer, this wave's record offset, per-tile stamps
-    pub(crate) stamp: Option<(ValueId, ValueId, bool)>,
+    pub stamp: Option<(ValueId, ValueId, bool)>,
     /// `Scales::RowCol`: the unit E8M0 scale words as VGPR values (lane / 64 = 0 keeps them vector: a wave-uniform constant would be held in an
     /// SGPR and copied to a VGPR before every scaled MFMA, with a VALU -> MFMA wait)
-    pub(crate) unit: Option<(ValueId, ValueId)>,
+    pub unit: Option<(ValueId, ValueId)>,
     /// `Scales::Mx32`: the per-tile scale loads
-    pub(crate) mx32: Option<Mx32>,
+    pub mx32: Option<Mx32>,
     /// `Scales::Block128`: the per-tile fp32 scale loads (voffsets; `shift` unused)
-    pub(crate) bs128: Option<Mx32>,
+    pub bs128: Option<Mx32>,
     /// implicit-GEMM convolution: the per-tile A addressing
-    pub(crate) conv: Option<Box<dyn ConvSource>>,
+    pub conv: Option<Box<dyn ConvSource>>,
     /// split-K: this split's first K tile
-    pub(crate) zb: Option<ValueId>,
+    pub zb: Option<ValueId>,
     /// `Elem::Fp8Bs`: the block products of the tile waiting for their scaled accumulation (`bs_fma`)
-    pub(crate) pending: std::cell::RefCell<Vec<(VarId, ValueId, VarId, VarId)>>,
+    pub pending: std::cell::RefCell<Vec<(VarId, ValueId, VarId, VarId)>>,
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
-    pub(crate) staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, Vec<ValueId>)>,
-    pub(crate) rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
+    pub staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, Vec<ValueId>)>,
+    pub rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
     /// shuffled 1 x 32 scales: the MFMA scale-byte offset of the tile being computed (0 even tile, 2 odd tile of a pair: the pair's dword is
     /// loaded once, for the even tile, and kept)
-    pub(crate) odd_by: std::cell::Cell<u8>,
+    pub odd_by: std::cell::Cell<u8>,
     /// the tail's one-time shift of the pair dwords has been emitted (per tail branch: reset by `iter` hooks below)
-    pub(crate) tail_shifted: std::cell::Cell<bool>,
+    pub tail_shifted: std::cell::Cell<bool>,
     /// depth3 + Block128: the per-tile fp32 scales go through the DMA stage into the SC ring (two dword DMAs per wave: A rows of the CTA,
     /// B block; only wave 0's are real, the others land in their own 512-byte part of the slot): (ring, A voffset, B voffset)
-    pub(crate) sc_dma: Option<(Shared, ValueId, ValueId, ValueId, ValueId)>,
+    pub sc_dma: Option<(Shared, ValueId, ValueId, ValueId, ValueId)>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
 /// and the per-lane v_perm selector (`shift`) that picks the bytes of K groups g and 4 + g (g = lane / 16).
-pub(crate) struct Mx32 {
-    pub(crate) voff_a: Vec<ValueId>,
-    pub(crate) voff_b: Vec<ValueId>,
-    pub(crate) shift: ValueId,
+pub struct Mx32 {
+    pub voff_a: Vec<ValueId>,
+    pub voff_b: Vec<ValueId>,
+    pub shift: ValueId,
     /// `scale_shuf`: [rows / 16][KT / 2][lane][4 bytes] with lane 16 g + r holding the bytes of K groups g, 4 + g of the even
     /// tile, then of the odd tile (one coalesced dword per lane, block and tile pair); the bit shift of the last `load_scales` (0 / 16)
-    pub(crate) shuf: Option<std::cell::RefCell<Option<ValueId>>>,
+    pub shuf: Option<std::cell::RefCell<Option<ValueId>>>,
 }
 
 impl Body {
@@ -360,7 +360,7 @@ impl Body {
     /// Stage `mma.blockscale_tile`: the MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last
     /// use (first half of the B fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is
     /// reloaded); the scales of t+1 are read before the MMAs and installed at the end (partial lgkm waits). Captured units.
-    fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_stage::stage::StageInst<'static> {
+    fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> crate::stage::StageInst<'static> {
         use amdgpu_codegen::weave::Units;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (self.n_a(), bv.len());
@@ -462,7 +462,7 @@ impl Body {
             });
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles, ..Default::default() };
-        amdgpu_stage::stage::StageInst::new("mma.blockscale_tile", amdgpu_stage::stage::Prim::A, "gemm.tile", contract, u)
+        crate::stage::StageInst::new("mma.blockscale_tile", crate::stage::Prim::A, "gemm.tile", contract, u)
             .param("atom", "mfma_scale_16x16x128_f8")
             .param("wave_tile", format!("{}x{}", 16 * nm, 16 * nn))
             .param("staged", t.staged)
@@ -476,7 +476,7 @@ impl Body {
     }
     /// Stage `move.ab_stage`: the DMA of one tile (A issues, then B issues); soffset = the wave-uniform tile origin, M0 = the first 1 KB block of
     /// each group of 4 issues; one captured unit per DMA instruction (each under the slot's write marker).
-    fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> amdgpu_stage::stage::StageInst<'static> {
+    fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> crate::stage::StageInst<'static> {
         let mut u = amdgpu_codegen::weave::Units::new();
         let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
@@ -549,7 +549,7 @@ impl Body {
             u.capture(b, "ab.SC.b", |b| sc.at(slot).write(b, |b| b.load_buffer_lds(self.rsrc_sfb, *vb, so, m0b, 0, 1)));
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
-        amdgpu_stage::stage::StageInst::new("move.ab_stage", amdgpu_stage::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
+        crate::stage::StageInst::new("move.ab_stage", crate::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
     }}
 
 impl PipeBody for Body {

@@ -2,45 +2,45 @@
 
 use amdgpu_dsl::{FnBuilder, I32, ValueId};
 use amdgpu_layout::{composition, IssuePlan, Ix, make_layout, right_inverse, tup};
-use amdgpu_tile::{Ctx, ev, Lane};
+use crate::{Ctx, ev, Lane};
 use amdgpu_layout::Layout;
 
 /// LDS image of a [rows x 128 bytes] K-tile: 16-row x 16-byte interleave (the aiter B preshuffle pattern with K = 128):
 /// (r, k) -> (r / 16) 2048 + (k / 16) 256 + (r % 16) 16 + k % 16. A 16-lane group of every operand read covers 256 consecutive bytes (all banks once).
-pub(crate) fn smem_tile(rows: i64) -> Layout {
+pub fn smem_tile(rows: i64) -> Layout {
     make_layout(tup![tup![16, rows / 16], tup![16, 8]], tup![tup![16, 2048], tup![1, 256]])
 }
 /// The same image restricted to one 16-row MMA operand block (element index r + 16 k, 16 x 128).
-pub(crate) fn smem_block() -> Layout {
+pub fn smem_block() -> Layout {
     make_layout(tup![16, tup![16, 8]], tup![16, tup![1, 256]])
 }
 
 /// One DMA stage of a [rows x 128 B] tile: per issue the lane's voffset (bound once, loop invariant) and the LDS offset of its 1 KB block.
-pub(crate) struct Dma {
-    pub(crate) issues: Vec<(ValueId, i32)>,
+pub struct Dma {
+    pub issues: Vec<(ValueId, i32)>,
     /// per-lane gathered rows (MoE): every issue its own M0, no instruction offset (the voffset is the exact source offset)
-    pub(crate) gather: bool,
+    pub gather: bool,
     /// LDS bytes per 1 KB issue block (1024, or 1056 for the padded A image); the issue LDS offsets above are in 1 KB units (`act`)
-    pub(crate) pitch: i32,
+    pub pitch: i32,
 }
 
 impl Dma {
     /// (M0 offset of the issue's group of 4, instruction offset) for the virtual 1 KB offset `lds`
-    pub(crate) fn act(&self, lds: i32) -> (i32, u32) {
+    pub fn act(&self, lds: i32) -> (i32, u32) {
         if self.gather {
             return (lds / 1024 * self.pitch, 0);
         }
         ((lds - lds % 4096) / 1024 * self.pitch, ((lds % 4096) / 1024 * self.pitch) as u32)
     }
     /// the M0 group of an issue
-    pub(crate) fn group(&self, lds: i32) -> i32 {
+    pub fn group(&self, lds: i32) -> i32 {
         if self.gather { lds } else { lds - lds % 4096 }
     }
 }
 
 /// Turns the per-issue source offsets (minus the instruction offset `pitch (q % 4)`) into voffsets, lowered through the GF(2) bit-form normal form
 /// (amdgpu_layout::BitForm: shift groups, CSE across plans by Ctx::bind).
-pub(crate) fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, gofs: Vec<Ix>, pitch: i32) -> Dma {
+pub fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, gofs: Vec<Ix>, pitch: i32) -> Dma {
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-(pitch as i64) * (q as i64 % 4))).collect();
     ctx.set_bitfield(true);
     let issues = adj.iter().enumerate().map(|(q, g)| { let e = ctx.bind(b, g); (b.bind_i32(e), 1024 * q as i32) }).collect();
@@ -49,7 +49,7 @@ pub(crate) fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, gofs: Vec<Ix>, pitch: i
 }
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
 /// proved here for sampled threads against a direct search of the LDS layout.
-pub(crate) fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
+pub fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
     let issues = rows * 128 / 1024 / waves;
     let sm = smem_tile(rows);
     let tv = make_layout(tup![tup![64, waves], tup![16, issues]], tup![tup![16, 1024 * issues], tup![1, 1024]]);
@@ -74,7 +74,7 @@ pub(crate) fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob
 
 /// The A DMA of the padded image with GATHERED rows (MoE): the same lane -> (tile row lane / 8 + 8 block, bytes 16 (lane % 8)) map as
 /// `dma_plan_rows_pad`; the source row of tile row r is `row_src(r)` (per lane, loop invariant); exact voffsets, no instruction offset.
-pub(crate) fn dma_plan_gather(b: &mut FnBuilder, lane: &Lane, rows: i64, waves: i64, k_v: ValueId, row_src: &dyn Fn(&mut FnBuilder, I32) -> ValueId) -> Dma {
+pub fn dma_plan_gather(b: &mut FnBuilder, lane: &Lane, rows: i64, waves: i64, k_v: ValueId, row_src: &dyn Fn(&mut FnBuilder, I32) -> ValueId) -> Dma {
     let issues = rows * 128 / 1024 / waves;
     let mut out = Vec::new();
     for q in 0..issues {
@@ -91,7 +91,7 @@ pub(crate) fn dma_plan_gather(b: &mut FnBuilder, lane: &Lane, rows: i64, waves: 
 /// A-tile DMA for the PADDED row-major LDS image (the vendor form): 1 KB blocks of 8 whole 128-byte rows at a pitch of 1056 bytes (32 bytes of
 /// padding per block spread the banks of the fragment reads), lanes linear in the source (lane -> row lane / 8, bytes 16 (lane % 8)): fully
 /// monotone 128-byte segments, no source-side permutation. LDS image: (r, k) -> 1056 (r / 8) + 128 (r % 8) + k.
-pub(crate) fn dma_plan_rows_pad(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
+pub fn dma_plan_rows_pad(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
     let issues = rows * 128 / 1024 / waves;
     let d = &ctx.dyns;
     let tid_id = match s_tid {

@@ -11,7 +11,7 @@
 >
 > | 本文的层 | 路线 B 中的替代 |
 > |---|---|
-> | L1 张量 `TensorDecl` 自动合同 | 合同从 `amdgpu_layout::Layout` 推出：`amdgpu_tile::contract::compact_tensor` / `same_strides`（`crates/amdgpu-kernels/src/fmha/block3.rs:8-81` 的 `declare_io`） |
+> | L1 张量 `TensorDecl` 自动合同 | 合同从 `amdgpu_layout::Layout` 推出：`amdgpu_tile::contract::compact_tensor` / `same_strides`（`crates/amdgpu-stage/src/attention/block3.rs:8-81` 的 `declare_io`） |
 > | L3 copy（`RowsCopy`、`DwordRowsCopy`、`RowFrags::load`） | `partition_dma`、`partition_buffer_dma`、`partition_global`（`crates/amdgpu-tile/src/{dma,bufdma,global}.rs`） |
 > | L4 片段读（`RowsReader`、`TrReader`、`RowScaleReader`） | `make_tiled_copy_a/_b/_bcast` + `partition_lds`（`crates/amdgpu-tile/src/copy.rs`），atom 来自 `amdgpu-isa` |
 > | L4 MMA（`qk_tile`/`pv_tile` 中的 MFMA） | `TiledMma` + `gemm`（`crates/amdgpu-tile/src/mma.rs`；支持 `swap_ab`） |
