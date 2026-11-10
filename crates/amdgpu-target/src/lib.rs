@@ -3,6 +3,7 @@
 //! `amdgpu-codegen/src/target/<name>/`.
 #![forbid(unsafe_code)]
 
+pub mod gfx1250;
 pub mod gfx950;
 
 /// One target.
@@ -20,6 +21,8 @@ pub struct Target {
     pub emit: Emission,
     pub llvm: LlvmTail,
     pub verify: VerifyLimits,
+    pub mem: Mem,
+    pub sync: Sync,
 }
 
 /// The machine model of the schedulers (the per-instruction issue / latency costs are in the instruction tables).
@@ -85,6 +88,20 @@ pub struct RegFile {
     pub reserved: u32,
     /// granule of the descriptor's register count
     pub alloc_granule: u32,
+    /// registers above an instruction's directly encodable range (None: every register is directly encodable)
+    pub window: Option<RegWindow>,
+}
+
+/// A register file larger than the instruction fields can address: the high address bits come from a mode the code sets
+/// (docs/target-gfx1250.md section 3.2.1).
+#[derive(Debug)]
+pub struct RegWindow {
+    /// registers reachable without the mode (0..direct)
+    pub direct: u32,
+    /// the instruction that sets the high bits
+    pub setter: &'static str,
+    /// operands that ignore the high bits (must stay below `direct`)
+    pub low_only: &'static [&'static str],
 }
 
 #[derive(Debug)]
@@ -125,6 +142,20 @@ pub enum Occupancy {
 pub enum MemClass {
     VmemLoad,
     VmemStore,
+    /// cache invalidate / write-back instructions (counted with loads / stores where the target says so)
+    CacheInv,
+    CacheWb,
+    /// the LDS half of a FLAT instruction
+    FlatLds,
+    /// a multicast cluster load into VGPRs
+    ClusterLoad,
+    /// a barrier-state query or SCC-writing barrier instruction
+    BarrierQuery,
+    /// the address-translation side of a VMEM / SMEM issue (gfx1250 XCNT)
+    VmemXlate,
+    SmemXlate,
+    /// an asynchronous LDS DMA in the store direction (`Async` is the load direction)
+    AsyncStore,
     /// a global -> LDS DMA (`buffer_load ... lds`, `global_load_lds`)
     LdsDma,
     Lds,
@@ -169,6 +200,21 @@ pub struct Counters {
     /// (class, counter index, order)
     pub classes: &'static [(MemClass, usize, Order)],
     pub wait: WaitForm,
+    /// A counter with classes of different completion order (or several classes) pending can only be waited to 0: partial waits are valid
+    /// only while one in-order class is pending (gfx950: lgkmcnt with SMEM queued; gfx1250: LLVM `SIInsertWaitcnts` counterOutOfOrder).
+    pub mixed_waits_zero: bool,
+    /// A counter every wait on another counter also bounds (gfx1250: a wait for N on a memory counter implies XCNT <= N): (counter, except
+    /// the counters whose waits do not imply it)
+    pub implied: Option<(usize, &'static [usize])>,
+    /// The ALU dependency wait instruction and its fields, for `Count::Instr` rows (None: the target has none)
+    pub alu_wait: Option<AluWait>,
+}
+
+/// An ALU dependency wait instruction (gfx1250 `s_wait_alu`): the immediate's fields as (name, low bit, width).
+#[derive(Debug)]
+pub struct AluWait {
+    pub mnemonic: &'static str,
+    pub fields: &'static [(&'static str, u8, u8)],
 }
 
 impl Counters {
@@ -214,9 +260,19 @@ pub enum Scope {
 }
 
 /// One hazard rule (docs/trust-inventory.md section 5.1 is the gfx950 audit against LLVM GCNHazardRecognizer).
+/// Who enforces a hazard rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// the software must provide the distance (otherwise wrong results)
+    Software,
+    /// the hardware interlocks; the distance only costs time (a scheduling fact, not a correctness rule)
+    Interlock,
+}
+
 #[derive(Debug)]
 pub struct HazardRule {
     pub name: &'static str,
+    pub kind: Kind,
     pub count: Count,
     pub unit: Unit,
     pub scope: Scope,
@@ -272,10 +328,31 @@ impl HazardRule {
     }
 }
 
+/// Where a global <-> LDS DMA takes its LDS address from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LdsAddr {
+    /// M0 holds the LDS base; the instruction adds its immediate and lane * size (gfx950 `buffer_load ... lds`, `global_load_lds`)
+    M0BasePlusImm,
+    /// a per-lane VGPR holds the LDS byte address (gfx1250 async loads / stores)
+    VgprPerLane,
+    /// a descriptor field holds it (gfx1250 tensor DMA)
+    Descriptor,
+}
+
+/// One global <-> LDS DMA form.
+#[derive(Debug)]
+pub struct LdsDma {
+    pub form: &'static str,
+    pub lds_addr: LdsAddr,
+    /// the counter its completion is tracked on (index into `Counters::counters`)
+    pub counter: usize,
+}
+
 #[derive(Debug)]
 pub struct Lds {
     /// bytes per workgroup
     pub bytes_per_workgroup: u32,
+    pub dma: &'static [LdsDma],
 }
 
 /// The kernel descriptor (`.amdhsa_*`) and code-object facts.
@@ -290,6 +367,26 @@ pub struct Emission {
     /// granule of the arch VGPR count without AGPRs
     pub vgpr_granule: u32,
     pub code_object_version: u32,
+}
+
+/// Memory-instruction facts.
+#[derive(Debug)]
+pub struct Mem {
+    /// bits of a buffer descriptor's `num_records`
+    pub num_records_bits: u32,
+    /// the cache-policy bits / fields of the memory instructions
+    pub cache_policy: &'static [&'static str],
+}
+
+/// Synchronization facts.
+#[derive(Debug)]
+pub struct Sync {
+    /// the barrier is split into signal and wait instructions
+    pub split_barrier: bool,
+    /// named barriers besides the workgroup barrier
+    pub named_barriers: u32,
+    /// the largest workgroup cluster (0: no clusters)
+    pub max_cluster_workgroups: u32,
 }
 
 /// Limits the GPU-semantics verifier checks the final allocation against.

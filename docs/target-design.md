@@ -101,6 +101,23 @@ Each row is one move commit: behaviour-neutral, md5 manifest identical, certific
   atoms to `amdgpu_isa::gfx950` (re-exported at the root).
 - Every step: `amdc md5-manifest --check tests/golden/md5_manifest.tsv` 0 differences (234 kernels), certificates unchanged.
 
+### 3.2 Extension fields (after phase G)
+
+From the public gfx1250 description ([target-gfx1250.md](target-gfx1250.md) section 2), data only (no pass reads them; gfx950 values keep
+today's behaviour):
+
+| Field | gfx950 | gfx1250 (`amdgpu_target::gfx1250`) |
+|---|---|---|
+| `RegFile::window: Option<RegWindow { direct, setter, low_only }>` | None | VGPR: direct 256, `s_set_vgpr_msb`, the v0-v255-only operands |
+| `Counters::mixed_waits_zero` | true (lgkmcnt with SMEM queued) | true (LLVM `SIInsertWaitcnts`) |
+| `Counters::implied: Option<(counter, except)>` | None | XCNT, except the tensor waits |
+| `Counters::alu_wait: Option<AluWait { mnemonic, fields }>` | None | `s_wait_alu` fields (LLVM AMDGPUAsmUtils.cpp) |
+| `Lds::dma: [LdsDma { form, lds_addr: M0BasePlusImm / VgprPerLane / Descriptor, counter }]` | buffer / global LDS DMA, M0 base | async (VGPR address), cluster, tensor (descriptor) |
+| `Mem { num_records_bits, cache_policy }` | 32; sc0 / sc1 / nt | 45; scope / th / nv / scale_offset |
+| `Sync { split_barrier, named_barriers, max_cluster_workgroups }` | false, 0, 0 | true, 16, 16 |
+| `HazardRule::kind: Software / Interlock` | all Software | e.g. `WMMA_COEXEC` (Software, unit IndependentValu) |
+| `MemClass` | + CacheInv, CacheWb, FlatLds, ClusterLoad, BarrierQuery, VmemXlate, SmemXlate, AsyncStore | the gfx1250 class rows |
+
 ## 4. How gfx1250 fits (check, not implementation)
 
 Only facts from public AMD ISA documents and upstream LLVM may be recorded (phase G cites them per fact).
