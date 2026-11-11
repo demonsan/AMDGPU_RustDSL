@@ -2336,6 +2336,7 @@ impl FnBuilder {
         let tree = std::mem::take(&mut self.tree);
         let body = tree.finish().unwrap_or_else(|e| panic!("kernel `{}`: {e}", self.f.name));
         self.f.set_body(body);
+        plan_derive::derive(&mut self.f);
         self.f
     }
 
@@ -4621,6 +4622,7 @@ pub fn verify(f: &Function) -> Vec<String> {
 pub mod expr;
 pub mod print;
 pub mod facts;
+pub mod plan_derive;
 pub mod units;
 pub use facts::Captured;
 pub mod ir_text;
