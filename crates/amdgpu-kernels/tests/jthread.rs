@@ -4,7 +4,7 @@
 use amdgpu_dsl::{ev, CmpPred, CmpTy, DType, Ext, FnBuilder, Function, Op, Opnd};
 
 /// out[tid] = 1.0 when the loop left after an even tile (idx = 1 on that exit), 2.0 after an odd one; the loop walks n tiles two at a time.
-/// A rarely taken branch (`begin_if_unlikely`, it == 2) writes 3.0 to out[64 + tid] (n >= 3); otherwise that word stays untouched.
+/// A rarely taken branch (`begin_if_unlikely`, it >= 2) writes 3.0 to out[64 + tid] (n >= 3); otherwise that word stays untouched.
 pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     let mut b = FnBuilder::new("probe_two_exit", 64);
     // kernarg layout of tests/gpu/tileop_probe_host.cpp: in (unused), out, PROBE_I32
@@ -22,7 +22,7 @@ pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))]);
     let (it, idx) = (vars[0], vars[1]);
     let two = b.c_i32(2);
-    let rare = b.cmp(CmpPred::Eq, CmpTy::I32, Opnd::Var(it), two);
+    let rare = b.cmp(CmpPred::Ge, CmpTy::I32, Opnd::Var(it), two);
     b.begin_if_unlikely(rare);
     let off2 = b.bind_i32((ev(tid) << 2) + 256);
     let q2 = b.ptr_add(po, off2);
@@ -127,7 +127,8 @@ fn the_unlikely_branch_is_laid_out_after_the_hot_code() {
     let asm = |tok: &[&str]| amdgpu_codegen::compile(&two_exit_kernel(tok)).unwrap().asm;
     let base = asm(&[]);
     let cold = asm(&["coldlayout"]);
-    let three = "0x40400000";
+    let base_has = |s: &str| base.contains(s);
+    let three = if base_has("0x40400000") { "0x40400000" } else { "1077936128" };
     let pos = |a: &str, s: &str| a.find(s).unwrap_or_else(|| panic!("{s} not found:\n{a}"));
     assert!(pos(&base, three) < pos(&base, "s_endpgm"), "without the token the branch stays in place:\n{base}");
     assert!(pos(&cold, three) > pos(&cold, "s_endpgm"), "with it the branch follows the hot code:\n{cold}");
