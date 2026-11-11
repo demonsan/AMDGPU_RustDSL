@@ -285,6 +285,9 @@ fn run_m0_pad(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     sched::m0::pad(&mut s.m);
     Ok(())
 }
+fn run_bweave_order(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
+    crate::bweave::order(&mut s.m, crate::bweave::OrderPolicy::Identity).map(|_| ())
+}
 fn run_soft_clause(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     let a = s.alloc.take().expect("allocated");
     hazards::pad_soft_clause(&mut s.m, &a);
@@ -331,6 +334,10 @@ const INFLIGHT_WAW: Pass = Pass { info: info("hazard-inflight-waw", Post, Only, 
 const PHYS_WAR: Pass = Pass { info: info("hazard-phys-war", Post, Only, "always", &[Test("crates/amdgpu-codegen/tests/phys_waw.rs"), Test("crates/amdgpu-kernels/tests/agpr.rs")]), run: run_phys_war };
 const HZFILL: Pass = Pass { info: info("hz-fill", Post, Only, "scheduler token hzfill (strict on the scheduled path)", &[Test("crates/amdgpu-kernels/tests/hzfill.rs")]), run: run_hzfill };
 const M0_PAD: Pass = Pass { info: info("m0-pad", Post, Only, "always", &[Indirect("md5 manifest")]), run: run_m0_pad };
+const BWEAVE_ORDER: Pass = Pass {
+    info: info("bweave-order", Mir, Generic, "always (B3: every phase in today's order)", &[Test("crates/amdgpu-codegen/src/bweave.rs"), Indirect("md5 manifest")]),
+    run: run_bweave_order,
+};
 const SOFT_CLAUSE: Pass = Pass {
     info: info("hazard-soft-clause", Post, Only, "always (xnack any code objects)", &[Test("crates/amdgpu-codegen/tests/hazard_oracle.rs"), Oracle("tools/hazard_oracle.sh")]),
     run: run_soft_clause,
@@ -341,10 +348,10 @@ const VALU_SGPR: Pass = Pass {
 };
 
 /// The scheduled body (one inner-ladder rung, on a clone of the post-AGPR MIR).
-pub const SCHEDULED: &[Pass] = &[SCHED_CFG, SCHED_STRIP, SCHED_DSEL, SCHED_HOIST, SCHED_SLOT, SCHED_PHASE, SCHED_LIST, SCHED_WSINK, SCHED_LDAHEAD, SCHED_WAITS, SCHED_VERIFY, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, REGALLOC, BUDGET_RUNG, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
+pub const SCHEDULED: &[Pass] = &[BWEAVE_ORDER, SCHED_CFG, SCHED_STRIP, SCHED_DSEL, SCHED_HOIST, SCHED_SLOT, SCHED_PHASE, SCHED_LIST, SCHED_WSINK, SCHED_LDAHEAD, SCHED_WAITS, SCHED_VERIFY, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, REGALLOC, BUDGET_RUNG, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
 
 /// The unscheduled body (no scheduler, or every inner rung failed).
-pub const UNSCHEDULED: &[Pass] = &[PHASE_STRIP, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, VERIFY_WAITS, REGALLOC, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
+pub const UNSCHEDULED: &[Pass] = &[BWEAVE_ORDER, PHASE_STRIP, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, VERIFY_WAITS, REGALLOC, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
 
 /// The final checks and the tail (compile_with).
 pub const BACK: &[PassInfo] = &[
