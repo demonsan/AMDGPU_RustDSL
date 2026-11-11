@@ -332,34 +332,64 @@ pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (us
                 continue;
             }
             let per = in_fill.len().div_ceil(mfma.len());
-            // the new order: every instruction outside the two sets keeps its place relative to the skeleton's first instruction;
-            // the skeleton is emitted with the fillers spread after its MFMAs
+            let g = crate::sched::depgraph::build(m, &b.insts, &b.term, false);
+            // the new order: every instruction outside the two sets keeps its place relative to the first of them; the skeleton is
+            // emitted in order, each skeleton instruction preceded by the fillers it depends on (transitively, in their order) and each
+            // MFMA followed by up to `per` fillers whose predecessors are all placed
             let first = in_skel[0].min(in_fill[0]);
             let mut ord: Vec<usize> = Vec::with_capacity(b.insts.len());
             let moved: std::collections::HashSet<usize> = in_skel.iter().chain(in_fill.iter()).copied().collect();
+            let is_fill: std::collections::HashSet<usize> = in_fill.iter().copied().collect();
+            let mut done = vec![false; b.insts.len()];
+            // filler ancestors of instruction x (within the filler set), oldest first
+            fn fill_ancestors(x: usize, g: &crate::sched::depgraph::Graph, is_fill: &std::collections::HashSet<usize>, done: &[bool], out: &mut Vec<usize>) {
+                for &(p, _) in &g.preds[x] {
+                    if is_fill.contains(&p) && !done[p] && !out.contains(&p) {
+                        fill_ancestors(p, g, is_fill, done, out);
+                        out.push(p);
+                    }
+                }
+            }
             let mut placed = false;
-            let mut fi = in_fill.iter().copied().peekable();
             for i in 0..b.insts.len() {
                 if moved.contains(&i) {
                     if !placed && i == first {
                         placed = true;
                         for &s in &in_skel {
+                            let mut need = Vec::new();
+                            fill_ancestors(s, &g, &is_fill, &done, &mut need);
+                            need.sort_unstable();
+                            for f in need {
+                                done[f] = true;
+                                ord.push(f);
+                            }
+                            done[s] = true;
                             ord.push(s);
                             if crate::op_attrs::attrs(b.insts[s].op).cost.pipe == Pipe::Mfma {
-                                for _ in 0..per {
-                                    if let Some(f) = fi.next() {
+                                let mut k = 0;
+                                for &f in &in_fill {
+                                    if k == per {
+                                        break;
+                                    }
+                                    if !done[f] && g.preds[f].iter().all(|&(p, _)| done[p] || !moved.contains(&p)) {
+                                        done[f] = true;
                                         ord.push(f);
+                                        k += 1;
                                     }
                                 }
                             }
                         }
-                        ord.extend(fi.by_ref());
+                        for &f in &in_fill {
+                            if !done[f] {
+                                done[f] = true;
+                                ord.push(f);
+                            }
+                        }
                     }
                     continue;
                 }
                 ord.push(i);
             }
-            let g = crate::sched::depgraph::build(m, &b.insts, &b.term, false);
             let mut pos = vec![0usize; ord.len()];
             for (k, &i) in ord.iter().enumerate() {
                 pos[i] = k;
@@ -535,18 +565,25 @@ mod interleave_tests {
     }
 
     #[test]
-    fn a_dependence_blocks_the_merge() {
+    fn a_filler_an_mfma_needs_is_pulled_ahead_of_it() {
         let mut b = block();
-        // the first MFMA now reads a filler's result: the filler may not move after it
-        b.insts[4] = {
-            let mut i = MInst::new(MOp::VMfma16x16x32Bf16Z).def(0).srcreg(1).srcreg(1);
-            i.unit = 2;
-            i.srcs[0] = Src::Reg(4);
-            i
-        };
+        // the first MFMA reads filler 0's result (the PV step needs its packed P words)
+        b.insts[4].srcs[0] = Src::Reg(4);
         let mut m = mf(vec![b], 8);
         m.vregs[4] = RClass::V4;
-        let (merged, fell) = interleave(&mut m, &plan(OrderSpec::Free));
-        assert_eq!((merged, fell), (0, 1));
+        assert_eq!(interleave(&mut m, &plan(OrderSpec::Free)), (1, 0));
+        let defs: Vec<Option<u32>> = m.blocks[0].insts.iter().map(|i| i.dst).collect();
+        assert_eq!(defs, vec![Some(4), Some(0), Some(5), Some(6), Some(2), Some(7)]);
+    }
+
+    #[test]
+    fn an_unmoved_instruction_in_between_blocks_the_merge() {
+        let mut b = block();
+        // a glue instruction (no unit) between the fillers and the skeleton defines what the first MFMA reads
+        b.insts.insert(4, MInst::new(MOp::VMovB32).def(1).imm(9));
+        let mut m = mf(vec![b], 8);
+        let before: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert_eq!(interleave(&mut m, &plan(OrderSpec::Free)), (0, 1));
+        assert_eq!(m.blocks[0].insts.iter().map(|i| i.op).collect::<Vec<_>>(), before);
     }
 }
