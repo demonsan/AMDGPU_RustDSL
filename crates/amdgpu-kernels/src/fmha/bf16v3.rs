@@ -404,7 +404,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let pair = dqk == 192 && !split && !name.contains("_np");
     // `_q128`: the 128-row / 64-key-tile form (mid-size causal grids, `dispatch`)
     let small = name.ends_with("_q128");
-    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small, pv_early: false, single: false })
+    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small, pv_early: false, single: !small && !pair })
 }
 
 /// Build options of `fmha_fwd_bf16_v3_d` (A/B variants).
