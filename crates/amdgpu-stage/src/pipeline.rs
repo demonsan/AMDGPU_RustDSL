@@ -301,7 +301,8 @@ impl Pipeline {
             // the last tile: it + idx, in slot idx. One drain per exit with its STATIC slot (the vendor's drain1 / drain0): `if (idx == 1)
             // {drain in slot 1} else {drain in slot 0}`; the back-end Weaver threads each exit edge (known `idx`) straight to its drain
             let last_barrier = role != Role::B;
-            let which = b.bind_cond(varx(idx).eq(1));
+            // `0 < idx` (idx is 0 / 1): a less-than compare, which the back-end jump threading folds per edge (`jthread`)
+            let which = b.bind_cond(I32::c(0).lt(varx(idx)));
             b.begin_if(which);
             for k in [1, 0] {
                 let it_t = b.bind_i32(varx(it) + k);

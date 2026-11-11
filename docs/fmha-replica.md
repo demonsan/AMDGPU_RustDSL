@@ -245,3 +245,45 @@ The replica therefore keeps `pin_roles` **off** (its asm is step 2's). The two a
 | pins allocated after free values | back-end allocator — fixed (pins first) |
 | a pinned role subset degrades our schedule; Q's registers taken by our prelude | **back-end Weaver**: schedule-aware RA around a complete register plan |
 | K / V / P / scale-word registers (transient values, the vendor's rotation `v[20:51]`, P in S) | **DSL**: a register plan for transient fragments (`reg_share` exists; a rotation / ring plan for read results does not) |
+
+### 4.5 Step 4a: the vendor's instruction forms (back-end lowering tokens)
+
+**Change.**
+- The replica turns on two of backend-llvm-tail's lowering tokens (Main `dfc305fc`):
+  - `cmpneg`: the lazy rollback test written as `!(thr >= max)` (`OnlineSoftmax::nan_rollback`) becomes the vendor's NaN-taking `v_cmp_nge_f32` (12 sites);
+  - `movb64`: fragment / accumulator zeroing as `v_mov_b64 v[..], 0` (136 sites).
+- The drain selector is written `0 < idx`, a less-than compare that the jump-threading pass (`jthread`, next) folds per edge.
+
+**Class:** expressible now. The forms were missing MIR operations (§3.1), and are now opt-in lowering patterns.
+
+**Gates** (`port_gate`, the replica as `_vs128`, STRESS skipped): **OVERALL PASS**.
+
+**Performance, same session (normal data, ratio to the same-run vendor):**
+
+| shape | `_vs128` | replica step 4a |
+|---|---:|---:|
+| per-CU 64 blocks | 0.958× (690.1 TF/s) | **0.969×** (701.0) |
+| B4H8S2048 | 0.943× | **0.949×** |
+| B1H8S8192 | 0.980× | **0.991×** (2515.3) |
+| B2H8S2048 | 0.962× | **0.981×** (1278.2) |
+
+## 5. Findings so far, per difference class (the deliverable)
+
+| Difference from the vendor kernel | Class | State |
+|---|---|---|
+| Unscaled PV MFMA (8 + 8 per tile) | expressible now (DSL `var_mfma_fp8_32x32x64`) | in the replica (step 1) |
+| Two tiles per loop pass, static ring slots, one drain per exit | expressible now (`Pipeline::unroll2`, `break_if` with a `which` variable) | in the replica (step 2) |
+| Each exit edge jumping straight to its drain | back-end Weaver: jump threading on a per-edge constant | pass `jthread` (backend-llvm-tail), to apply |
+| Rollback blocks out of line (after the hot code, hot path falls through) | back-end Weaver: cold-block layout + a DSL hint (`begin_if_unlikely`) | agreed design (backend-llvm-tail) |
+| `v_cmp_nge_f32`, `v_mov_b64`, `v_mfma_f32_32x32x8_bf16` | missing MIR ops → opt-in lowering patterns | the first two in the replica (step 4a); the bf16 helper is next |
+| Scalar forms (`s_sub_u32`, `s_cmp_*_u32`, `s_addk_i32`, `s_or_b32`), `v_mul_i32_i24` | missing MIR ops / lowering patterns | low priority |
+| Wave-uniform values as SGPR operands of VALU (12.8 % of the vendor's instructions) | back-end Weaver / lowering (constant-bus aware operand choice) | W3 B2 |
+| Exec masking in the epilogue | DSL feature (lane subset) or a counted safe-asm window | not planned |
+| Vendor nop after a VALU VCC write before a VCC read (1 state; we demanded 2) | safety rule: over-conservative | lowered to 1 (backend-llvm-tail, `vcc-rule`) |
+| MFMA tuples at even, not width-aligned, bases (`v[52:67]`) | safety rule: wrong | fixed (even alignment, §4.4) |
+| Pinned registers allocated after free values | back-end allocator | fixed (pins first, §4.4) |
+| The vendor's register numbers (roles) | back-end Weaver: schedule-aware RA around a full plan; DSL: register plans for transient fragments | pins cost −4 … −12 % on our schedule; off (§4.4) |
+| M0 written per LDS-DMA issue | back-end Weaver: M0 planning | W3 B2 |
+| Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
+| The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
+| gpu_verify on lifted vendor code | proofs only for what the DSL expresses; lifted asm is opaque | — |
