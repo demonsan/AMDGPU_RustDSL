@@ -121,6 +121,45 @@ What the table shows:
 - **The rebase:** ours is our lazy recipe's rollback branch, laid out *inline* in the loop body (an `if`), whereas the vendor's rollback blocks are out of line. That is the block-layout item of §3.6, not an algorithm difference.
 - **The real algorithm differences:**
   - PV through the scaled MFMA (the vendor: unscaled);
-  - 96 VALU per tile of `v_perm` / `v_pk_sub_u16` / `v_and` that the vendor does not have. Which stage emits them (P packing or scale-word preparation) is the first thing R3 traces;
+  - 96 VALU per tile of `v_perm` / `v_pk_sub_u16` / `v_and` that the vendor does not have (traced in §4.2: the LUT copy, not the long-sequence loop);
   - one tile per pass, against the vendor's two-tile unrolled pass with two exits.
 - **Exact operand equality is 1.8 %:** registers are allocated differently, the gap §4 step 3 addresses.
+
+### 4.2 Step 1: unscaled PV; where the 96 extra VALU come from
+
+**Trace.** `_vs128` has two versions of each group's loop:
+- the **LUT copy** (`FmhaBlock::lut_copy`: sequences of fewer than 4 key tiles keep the LUT-corrected fp8 conversion, `reduce.rs`: `perm` → `pk_sub_u16`), loops `BB7` / `BB26`;
+- the **vendor-recipe copy** (`set_vendor_ref`, lazy rebase), loops `BB48` / `BB67`.
+
+The 96 VALU are the LUT correction and live only in the short-sequence copy. The vendor has no such copy (it accepts the larger error on short sequences; our port gate measured 1.31× the vendor's mean error without it at S = 300, SK = 129). The comparison below uses the vendor-recipe loop.
+
+**Change.**
+- `AttnBody3::pv_unscaled`: PV through `v_mfma_f32_32x32x64_f8f6f4`, i.e. the DSL's `var_mfma_fp8_32x32x64`, as the vendor does;
+- the row sum without its 1/16 (`OnlineSoftmax::l_total_unit`), so O / l is unchanged (powers of two).
+
+Kernel `fmha_fwd_hd128_mxfp8_v3_replica` (registered, not dispatched; the md5 manifest gains this one entry). **Class: expressible now** — no new DSL or backend feature was needed.
+
+| | `_vs128` (vendor-recipe loop) | replica step 1 | vendor (per tile) |
+|---|---:|---:|---:|
+| instructions / tile without fillers (incl. the inline rollback branch) | 337 | 335 | 220 (+ out-of-line rollback) |
+| scaled / unscaled MFMA per tile | 16 / 0 | 8 / 8 | 8 / 8 |
+| opcode alignment with the vendor loop | 36.8 % | 39.1 % | — |
+| registers identical up to renaming | — | 3.8 % | — |
+
+**Gates.**
+- `gpu-verify --strict`: 0 errors.
+- `port_gate` (replica as `_vs128`, STRESS skipped): BUILD, VERIFY, ACC16 15/15, ACC64 vendor parity on all paths (15/15, 15/15, 15/15, 13/13) and DET 5/5 all PASS.
+
+**Performance, same run (normal data, TF/s, ratio to the vendor in the same run):**
+
+| shape | `_vs128` | replica step 1 | change |
+|---|---|---|---:|
+| per-CU 64 blocks | 688.3 (0.941×) | 670.6 (0.925×) | −2.6 % |
+| B4H8S2048 | 1883.9 (0.973×) | 1829.2 (0.948×) | −2.9 % |
+| B1H8S8192 | 2484.0 (0.977×) | 2427.9 (0.957×) | −2.3 % |
+| B2H8S2048 | 1247.5 (0.953×) | 1228.5 (0.952×) | −1.5 % |
+
+**Reading.**
+- The vendor's MFMA mix costs us 2–3 % with our schedule: the static counts are equal and the nops / waits nearly so (12 / 23 vs 13 / 20), so the difference is dynamic.
+- Unscaled PV is kept in the replica (it is the vendor's form) but **not** for `_vs128`.
+- Open: why the unscaled form runs slower in our order. Candidates are its source-C read timing / dependency rules in our hazard model and the scheduler's latency table; an ATT trace would settle it.

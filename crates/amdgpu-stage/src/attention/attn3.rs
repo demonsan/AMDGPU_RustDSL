@@ -269,6 +269,9 @@ pub struct AttnBody3<'a> {
     p_staged: bool,
     /// causal key mask (per-tensor FP8 `_causal`)
     pub causal: Option<CausalMask>,
+    /// PV through the UNSCALED fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`, the vendor's form): O accumulates 16x the scaled form's value, so
+    /// the row sum drops its 1/16 (`OnlineSoftmax::l_total_unit`); the quotient O / l is unchanged (powers of two)
+    pub pv_unscaled: bool,
 }
 
 /// The causal mask of a block: key k of this lane's query row is visible when `k < min(row + qoff1, kv_len)` (computed in the masking branch); the
@@ -300,7 +303,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -444,7 +447,12 @@ impl<'a> AttnBody3<'a> {
         for hh in 0..2usize {
             for e in 0..4usize {
                 let (_, vf) = u.capture(b, format!("pv.read.h{hh}e{e}"), |b| v.read(b, hh + 2 * e));
-                u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0));
+                if self.pv_unscaled {
+                    let (x, y) = if r.mma.swap_ab { (p[hh], vf) } else { (vf, p[hh]) };
+                    u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| b.var_mfma_fp8_32x32x64(o.accs[e].var, x, y));
+                } else {
+                    u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0));
+                }
             }
         }
         u
@@ -490,7 +498,7 @@ impl<'a> AttnBody3<'a> {
         self.pv_units(b, slot, w).emit_all(b);
     }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
-        let l = self.sm.l_total(b);
+        let l = if self.pv_unscaled { self.sm.l_total_unit(b) } else { self.sm.l_total(b) };
         self.blk.out_scale(b, l)
     }
 }

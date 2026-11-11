@@ -35,7 +35,7 @@ use amdgpu_stage::{Cadence, Pipeline};
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots);
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: false });
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
@@ -44,6 +44,13 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     f
 }
 
+/// W5 / R3 (docs/fmha-replica.md §4): the `_vs128` structure moved step by step onto the vendor kernel's algorithm and schedule. Step 1: PV
+/// through the unscaled fp8 MFMA (the vendor's form). Experimental, not dispatched.
+pub fn fmha_fwd_hd128_mxfp8_v3_replica() -> Function {
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
+}
 /// Values shared between the slots of the FMHA kernels (what the generated skeletons' `Cx` carries).
 pub(crate) struct FmhaCx {
     io: FmhaIo,
@@ -55,7 +62,10 @@ pub(crate) struct FmhaCx {
 }
 
 /// The slots of `_vs128` (`skeleton_vs128.rs`, generated from `graph::graph_vs128()`).
-pub(crate) struct Vs128Slots;
+pub(crate) struct Vs128Slots {
+    /// the W5 replica steps (`fmha_fwd_hd128_mxfp8_v3_replica`)
+    pub(crate) replica: bool,
+}
 
 impl skeleton_vs128::Vs128Slots for Vs128Slots {
     type Cx = FmhaCx;
@@ -91,6 +101,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 }
                 body.setprio = true;
                 body.biasonce = true;
+                body.pv_unscaled = self.replica;
                 pipe.run(b, role, &mut body);
                 let fin = body.out_scale(b);
                 store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin);
