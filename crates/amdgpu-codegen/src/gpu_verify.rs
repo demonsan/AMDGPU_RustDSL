@@ -1534,12 +1534,13 @@ impl<'a> An<'a> {
         if depth == 0 {
             return self.int_of(o);
         }
-        let Opnd::Val(v) = o else { return self.int_of(o) };
+        // the refined operand of a select may be a loop variable (a select-cycled ring slot: `idx < 2 ? idx + 1 : 0`)
         if let Some((t, i)) = &self.ovr {
             if t == o {
                 return i.clone();
             }
         }
+        let Opnd::Val(v) = o else { return self.int_of(o) };
         if self.assumed_vals.contains(v) {
             return self.int_of(o);
         }
@@ -1548,11 +1549,19 @@ impl<'a> An<'a> {
             return self.int_of(o);
         }
         let mut saved: Vec<(ValueId, Option<AV>)> = Vec::new();
+        let mut saved_vars: Vec<(VarId, Option<Itv>)> = Vec::new();
         for ch in op.operands() {
             if let Opnd::Val(c) = ch {
                 if self.defs.get(&c).map_or(false, |d| is_int_ty(d.result_ty())) {
                     let ci = self.recompute(&ch, depth - 1);
                     saved.push((c, self.env.insert(c, AV::Int(ci))));
+                }
+            }
+            if let Opnd::Var(x) = ch {
+                if let Some((t, i)) = self.ovr.clone() {
+                    if t == ch {
+                        saved_vars.push((x, self.vars.insert(x, i)));
+                    }
                 }
             }
         }
@@ -1567,6 +1576,16 @@ impl<'a> An<'a> {
                 }
                 None => {
                     self.env.remove(&c);
+                }
+            }
+        }
+        for (x, old) in saved_vars.into_iter().rev() {
+            match old {
+                Some(a) => {
+                    self.vars.insert(x, a);
+                }
+                None => {
+                    self.vars.remove(&x);
                 }
             }
         }
