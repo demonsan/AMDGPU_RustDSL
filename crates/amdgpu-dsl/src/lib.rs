@@ -1556,6 +1556,9 @@ pub struct Function {
     /// Scheduler strategies of weave regions, keyed by region NAME (the labels of `weave_region_begin` / the Weaver / stage names): `declare_region(name, authored, tokens)`. A region without a
     /// declaration inherits its enclosing region's strategy (the kernel default at the top). Empty for every kernel that does not ask for per-region strategies (nothing changes then).
     pub regions: Vec<RegionDecl>,
+    /// The kernel plan of the front-end Weaver (docs/two-weavers.md): constraints and hints for the back end. None for every kernel without one
+    /// (nothing changes then).
+    pub plan: Option<plan::KernelPlan>,
 }
 
 /// Builder call sites of the values of a function (see `Function::src_locs`).
@@ -1734,7 +1737,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None };
         f.set_body(body);
         f
     }
@@ -1817,6 +1820,7 @@ impl FnBuilder {
             sched_opts: None,
             regions: Vec::new(),
             reg_plan: Vec::new(),
+            plan: None,
             },
             expr_consts: Default::default(),
             captures: Vec::new(),
@@ -3698,6 +3702,9 @@ pub fn verify(f: &Function) -> Vec<String> {
     check_var_slices(f, &mut errs);
     check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
+    if let Some(p) = &f.plan {
+        errs.extend(plan::verify(p));
+    }
 
     // Region stack: values visible in the current scope.
     let mut scopes: Vec<HashSet<ValueId>> = vec![HashSet::new()];
@@ -4576,6 +4583,7 @@ pub mod print;
 pub mod facts;
 pub use facts::Captured;
 pub mod ir_text;
+pub mod plan;
 mod ir_codec;
 pub mod specialize;
 pub use expr::{ev, ox, varx};
