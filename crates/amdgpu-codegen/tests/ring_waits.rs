@@ -13,12 +13,12 @@ use common::func;
 
 /// One phase (Free), a ring of `slots` slots produced and consumed in it: unit 0 = the DMA of iteration `d`, unit 1 = the reads of the
 /// current iteration.
-fn plan(slots: u32, d: u32) -> KernelPlan {
+fn plan(slots: u32, d: i32) -> KernelPlan {
     let u = |id, name: &str, class, iter| UnitDecl { id, name: name.into(), phase: 0, class, anchor: false, iter, latency: 0, roles: 0 };
     KernelPlan {
         phases: vec![Phase { id: 0, name: "qk".into(), parent: None, kind: PhaseKind::Straight, order: OrderSpec::Free, budget: Budget::default() }],
         rings: vec![RingDecl { id: 0, name: "k".into(), slots, bytes_per_slot: 16384, cadence: Cadence::TwoPhaseOffset, producer_phase: 0, consumer_phase: 0, owner: RingOwner::Cta }],
-        units: vec![u(0, "dma", UnitClass::Dma, d), u(1, "read", UnitClass::Lds, 0)],
+        units: vec![u(0, "dma", UnitClass::Dma, d), u(1, "read", UnitClass::LdsRead, 0)],
         ..Default::default()
     }
 }
