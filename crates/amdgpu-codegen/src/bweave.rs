@@ -610,6 +610,44 @@ mod interleave_tests {
         assert_eq!(defs, vec![Some(4), Some(0), Some(5), Some(6), Some(2), Some(7)]);
     }
 
+    /// The replica's B5 shape: the QK skeleton reads K (ring slot t), the fillers are the DMAs of tile t + 2 (iteration offset 2). With a
+    /// 3-slot ring they touch another slot, so the DMAs may move between the QK reads and MFMAs (the LDS-DMA fence orders memory only).
+    #[test]
+    fn ring_dmas_of_another_slot_merge_into_the_qk_window() {
+        let mk = |slots: u32| {
+            let u = |id, name: &str, class, iter| UnitDecl { id, name: name.into(), phase: 0, class, anchor: false, iter, latency: 0, roles: 0 };
+            KernelPlan {
+                phases: vec![Phase { id: 0, name: "m".into(), parent: None, kind: PhaseKind::Straight, order: OrderSpec::Free, budget: Budget::default() }],
+                rings: vec![RingDecl { id: 0, name: "k".into(), slots, bytes_per_slot: 8192, cadence: Cadence::OneWindow, producer_phase: 0, consumer_phase: 0, owner: RingOwner::Cta }],
+                units: vec![u(0, "dma", UnitClass::Dma, 2), u(1, "qk", UnitClass::Mfma, 0)],
+                hints: Hints { interleave: vec![(1, vec![0])], ..Default::default() },
+                ..Default::default()
+            }
+        };
+        let tag = |mut i: MInst, u: u32| {
+            i.unit = u;
+            i
+        };
+        let mut b = Block::new(0);
+        // QK: read K (into v1), MFMA, read K (into v3), MFMA; then two DMAs of tile t + 2
+        b.insts.push(tag(MInst::new(MOp::LdsReadB128).def(1).srcreg(4).imm(0), 2));
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(0).srcreg(1).srcreg(1), 2));
+        b.insts.push(tag(MInst::new(MOp::LdsReadB128).def(3).srcreg(4).imm(64), 2));
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(2).srcreg(3).srcreg(3), 2));
+        for _ in 0..2 {
+            b.insts.push(tag(MInst::new(MOp::BufferLoadDwordX4Lds).srcreg(5).srcreg(4).srcreg(6).imm(0), 1));
+        }
+        let mut m = mf(vec![b.clone()], 8);
+        m.vregs[5] = RClass::S4;
+        m.vregs[6] = RClass::S1;
+        let mut m2 = m.clone();
+        assert_eq!(interleave(&mut m, &mk(3)), (1, 0), "3 slots: the DMAs write another slot");
+        let ops: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert_eq!(ops[2], MOp::BufferLoadDwordX4Lds, "a DMA right after the first MFMA: {ops:?}");
+        // 2 slots, distance 2: the DMAs overwrite the slot QK reads: they stay behind the reads
+        assert_eq!(interleave(&mut m2, &mk(2)), (0, 1));
+    }
+
     #[test]
     fn an_unmoved_instruction_in_between_blocks_the_merge() {
         let mut b = block();
