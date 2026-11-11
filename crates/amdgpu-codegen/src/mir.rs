@@ -606,6 +606,8 @@ pub struct MInst {
     pub skip_m0: bool,
     /// The weave / stage region the instruction was lowered in (`MFunction::reg_hints.regions`, 1-based; 0 = none). No codegen effect.
     pub region: u16,
+    /// the plan unit the instruction was lowered from (`Stmt::UnitMark` id + 1; 0 = none): the back-end Weaver's unit graph
+    pub unit: u32,
     /// Cache policy of a global / buffer access, LLVM CPol bits on gfx950: 1 = sc0, 2 = nt, 16 = sc1 (0 = default).
     pub cpol: u8,
     /// Diagnostics: the IR value (`ValueId`) whose lowering emitted this instruction (the last value-defining statement for the others);
@@ -615,7 +617,7 @@ pub struct MInst {
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, cpol: 0, origin: u32::MAX }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

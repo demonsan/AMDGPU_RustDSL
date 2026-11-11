@@ -639,6 +639,7 @@ impl FromIr for Stmt {
             "StoreLds2" => { v.expect_struct("StoreLds2")?; Ok(Stmt::StoreLds2 { addr: FromIr::from_ir(v.field("addr")?)?, v0: FromIr::from_ir(v.field("v0")?)?, v1: FromIr::from_ir(v.field("v1")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
             "RegionMark" => { v.expect_struct("RegionMark")?; Ok(Stmt::RegionMark { name: FromIr::from_ir(v.field("name")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
+            "UnitMark" => { v.expect_struct("UnitMark")?; Ok(Stmt::UnitMark { id: FromIr::from_ir(v.field("id")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
             "TileProduce" => { v.expect_struct("TileProduce")?; Ok(Stmt::TileProduce { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
             "TileConsume" => { v.expect_struct("TileConsume")?; Ok(Stmt::TileConsume { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
             "TileEnd" => { v.expect_unit("TileEnd")?; Ok(Stmt::TileEnd) }
@@ -703,6 +704,7 @@ impl IrIds for Stmt {
             Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*v0), fv, fr); IrIds::ids(&mut (*v1), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
             Stmt::RegionMark { name, begin } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
+            Stmt::UnitMark { id, begin } => { IrIds::ids(&mut (*id), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
             Stmt::TileProduce { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileConsume { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileEnd => {}

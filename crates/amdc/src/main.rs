@@ -27,6 +27,7 @@ fn usage() {
     eprintln!("  amdc opgraph <graph.json> [--cut k1=n1+n2,k2=n3]   review text of an op graph and its cut (kernels, stages, on-chip edges with classes, HBM tensors, estimates)");
     eprintln!("  amdc skeleton <graph.json> <kernel> [--nodes n1,n2|all] [--graph-file <path>] [--out <file.rs>]   generate the Rust skeleton (orchestration slots) of one kernel of the graph");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock
+  amdc weave-report <kernel>|--from-ir <file>   the back-end Weaver unit graph of the final MIR (docs/two-weavers.md)
   amdc passes [--target gfx950] [--evidence]   the compile pipeline: named passes, stage, target dependence, gate, evidence; the retry ladders
   amdc md5-manifest [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
 }
@@ -535,6 +536,28 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_codegen::diag::to_json(&amdgpu_codegen::diag::from_compile_error(&f, &e)));
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "weave-report" => {
+            // amdc weave-report <kernel>|--from-ir <file>: the back-end Weaver's unit graph of the final MIR (docs/two-weavers.md, step B1)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            match amdgpu_codegen::compile_mir(&f) {
+                Ok(m) => {
+                    let g = amdgpu_codegen::bweave::build(&m);
+                    print!("{}", amdgpu_codegen::bweave::report(&m, &g, f.plan.as_ref()));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
                     ExitCode::from(1)
                 }
             }
