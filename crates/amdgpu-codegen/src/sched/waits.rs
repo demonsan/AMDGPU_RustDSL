@@ -66,6 +66,16 @@ impl RingModel {
                 }
             }
         }
+        // a moved DMA unit no ring names as its producer (the ring's producer phase is another copy of the body): it is taken as a
+        // producer of every ring its own phase consumes (conservative: more slot tokens, never fewer)
+        for u in &plan.units {
+            if u.class == UnitClass::Dma && u.iter != 0 && !m.producers.contains_key(&(u.id + 1)) {
+                let rings: Vec<usize> = plan.rings.iter().enumerate().filter(|(_, r)| r.consumer_phase == u.phase).map(|(i, _)| i).collect();
+                for ri in rings {
+                    m.producers.entry(u.id + 1).or_default().push((ri, plan.rings[ri].slots.max(1), u.iter as i64));
+                }
+            }
+        }
         m.body_iters = max_c + 1;
         Some(m)
     }
