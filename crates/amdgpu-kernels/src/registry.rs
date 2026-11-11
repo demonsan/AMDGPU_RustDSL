@@ -117,7 +117,12 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
         "attn_combine_bf16_sink_hd128" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd128", 128, false, true)),
         "attn_combine_bf16_sink_hd64" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd64", 64, false, true)),
-        "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
+        "attn_combine_bf16_hd512" => Some({
+            // W6 (docs/w6-laggards.md §6): the MLA combine with the list scheduler (reordering)
+            let mut f = crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512);
+            f.sched_opts = Some("reorder".to_string());
+            f
+        }),
         "attn_combine_bf16_hd512_sm" => Some(crate::fmha::decode::attn_combine_bf16_x("attn_combine_bf16_hd512_sm", 512, true)),
         n if n.starts_with("mla_decode_bf16_hp_p") => n["mla_decode_bf16_hp_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16_hp(n, p)),
         n if n.starts_with("mla_decode_bf16_p") => n["mla_decode_bf16_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16(n, p)),

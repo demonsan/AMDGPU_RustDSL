@@ -156,3 +156,19 @@ We would measure both with perf_ab on `fmha_hd192` / `fmha_bf16`.
 - Waits per tile 83 → about 10, nops 59 → under 10. The vendor's numbers are 5 / 3.5.
 - The VALU phase (423–575 instructions per tile) mostly hidden behind the 80 MFMAs per tile.
 - This is the gap to the vendor on the small grids: 0.77–0.82×.
+
+## 6. Scheduler policy on MLA and decode16 (adopted)
+
+The list scheduler with reordering is now applied per kernel through `sched_opts = "reorder"`:
+- the MLA kernels (`mla_decode_bf16_p*`, `_hp_p*`) and their combine (`attn_combine_bf16_hd512`);
+- the last-arriver form of decode16 (`pa_decode16_*_c`).
+
+It relies on backend-llvm-tail's SCC fix (`origin/sccfix`): the descriptor pseudos wrote SCC without declaring it, so the scheduler could separate an `s_cmp` from its `s_cselect` (the earlier MLA miscompile). perf_ab, release `amdc`, 7 reps, same session:
+
+| family | change | geomean new / old | cases |
+|---|---|--:|---|
+| mla | scheduler on (kernels + combine) | **1.138** | B1H128C8192 1.069, B32H16C2048 **1.193**, B4H16C16384 **1.227**, B8H128C4096 1.071 (all IMPROVED) |
+| decode | scheduler on the `_c` form only | **1.015** | `_c`: B1H32HK4C32768 1.029 / B4H16HK1C16384 1.043 IMPROVED, B1H64HK8C8192 1.017, B8H64HK8C4096 0.992; `_f`: 1.004 / 1.003 |
+| decode | scheduler on every form (rejected) | 1.009 | the fused `_f` form lost 0.4–1.6 % |
+
+The correctness markers of the harness hosts (`MLA_OK`, `PA_OK`) held in every run.

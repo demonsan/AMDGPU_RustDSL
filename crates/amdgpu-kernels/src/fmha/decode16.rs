@@ -920,7 +920,13 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let r_o = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * (2 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
         b.buffer_store_b128(r_o, o_vo, c0, 0, f4);
     }
-    b.finish()
+    let mut f = b.finish();
+    if lastc {
+        // W6 (docs/w6-laggards.md §6): the list scheduler with reordering on the last-arriver form (the split shapes: +1.6 .. +3.9 %); the fused
+        // form stays unscheduled (-0.4 .. -1.6 %)
+        f.sched_opts = Some("reorder".to_string());
+    }
+    f
 }
 
 /// The f32 value of a loop variable (after the loop).
