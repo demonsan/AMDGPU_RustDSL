@@ -387,6 +387,18 @@ The gain needs the combination. The two-tile pass alone is neutral, and unscaled
 
 After the fixes all 54 removals are detected; `cargo test` 548 / 0.
 
+### 4.11 The W3 B2 tokens on the shipped configuration: `m0reuse`, `sgpr`, `sgpr2` — neutral
+
+`lower_opts` of `_vs128` / `_replica` + `m0reuse` (one M0 write per group of DMAs with the same LDS base) + `sgpr` + `sgpr2` (uniform SGPR operands of VALU).
+
+**port_gate:** all PASS.
+- ACC16 / ACC64 / DET pass; strict verify reports 0 errors.
+- Per-CU 700.9 TF/s (0.973× vendor), B4H8S2048 0.971×, B1H8S8192 0.992×, layout median 0.973×.
+
+**perf_ab `fmha_mxfp8`** (old = Main `4f1e5a02`, 7 reps): geomean **1.004**. Per case: 0.994 / 0.999 / 1.007 / 1.014.
+
+**Not adopted.** On this kernel, the M0 writes and the uniform-operand forms were not on the critical path.
+
 ## 5. Findings so far, per difference class (the deliverable)
 
 | Difference from the vendor kernel | Class | State |
@@ -397,15 +409,15 @@ After the fixes all 54 removals are detected; `cargo test` 548 / 0.
 | Rollback blocks out of line (after the hot code, hot path falls through) | back-end Weaver: cold-block layout + a DSL hint (`begin_if_unlikely`) | in the replica (`coldlayout`, step 4b); VGPRs unchanged |
 | `v_cmp_nge_f32`, `v_mov_b64`, `v_mfma_f32_32x32x8_bf16` | missing MIR ops → opt-in lowering patterns | the first two in the replica (step 4a); the bf16 helper is next |
 | Scalar forms (`s_sub_u32`, `s_cmp_*_u32`, `s_addk_i32`, `s_or_b32`), `v_mul_i32_i24` | missing MIR ops / lowering patterns | low priority |
-| Wave-uniform values as SGPR operands of VALU (12.8 % of the vendor's instructions) | back-end Weaver / lowering (constant-bus aware operand choice) | W3 B2 |
+| Wave-uniform values as SGPR operands of VALU (12.8 % of the vendor's instructions) | back-end Weaver / lowering (constant-bus aware operand choice) | available as opt-in `sgpr` + `sgpr2` (W3 B2); on the replica configuration with `m0reuse`: correct, perf neutral (perf_ab 1.004), not adopted (§4.11) |
 | Exec masking in the epilogue | DSL feature (lane subset) or a counted safe-asm window | not planned |
 | Vendor nop after a VALU VCC write before a VCC read (1 state; we demanded 2) | safety rule: over-conservative | lowered to 1 (backend-llvm-tail, `vcc-rule`) |
 | MFMA tuples at even, not width-aligned, bases (`v[52:67]`) | safety rule: wrong | fixed (even alignment, §4.4) |
 | Pinned registers allocated after free values | back-end allocator | fixed (pins first, §4.4) |
 | The vendor's register numbers (roles) | back-end Weaver: schedule-aware RA around a full plan; DSL: register plans for transient fragments | pins cost −4 … −12 % on our schedule; off (§4.4) |
-| M0 written per LDS-DMA issue | back-end Weaver: M0 planning | W3 B2 |
+| M0 written per LDS-DMA issue | back-end Weaver: M0 planning | available as opt-in `m0reuse` (54 → 18 M0 writes); neutral on the replica (§4.11), not adopted |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
-| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension | analysed (§4.7); **blocked on W3 B4+** |
+| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension + back-end Weaver B5 | ring built (`_ring2`, K 2 / V 4 slots, §4.10): correct, −9 … −11 % with the copies at the matrix-phase start; the B5 merge into the QK MFMAs not yet firing (with backend) |
 | PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % on our registers / waits (§4.8): **blocked on W3 B4+** (schedule-aware RA), with the V prefetch |
 | V-fragment prefetch before the barrier | expressible (weave order) | **blocked on W3 B4+** (pays only with the authored order + schedule-aware RA) |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
