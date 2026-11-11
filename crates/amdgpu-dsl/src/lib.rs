@@ -4616,6 +4616,7 @@ pub fn verify(f: &Function) -> Vec<String> {
 pub mod expr;
 pub mod print;
 pub mod facts;
+pub mod units;
 pub use facts::Captured;
 pub mod ir_text;
 pub mod plan;

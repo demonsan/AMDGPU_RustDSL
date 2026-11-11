@@ -11,7 +11,7 @@ use amdgpu_tile::frag::{AccTile, B32x32x64Fp8, C32x32F32, Frag, QkOut};
 use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
-use amdgpu_codegen::weave::Units;
+use crate::weave::Units;
 use amdgpu_layout::Layout as LLayout;
 use amdgpu_tile::frag;
 use amdgpu_tile::Layout;

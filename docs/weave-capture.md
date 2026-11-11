@@ -51,7 +51,7 @@ cannot be silently missed.
 Anything not ordered by these rules may be interleaved; the result still goes through the IR verifier, lowering, the scheduler and
 `gpu_verify --strict` like any other kernel.
 
-## The tile layer on top (`amdgpu_codegen::weave`, weave2)
+## The tile layer on top (`amdgpu_stage::weave`, weave2)
 
 | API | What it does |
 |---|---|

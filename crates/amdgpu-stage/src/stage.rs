@@ -7,7 +7,7 @@
 //! The registry ([`registry`]) lists the stage kinds the kernels in this crate family instantiate (key, primitive, parameters): the op graph and the
 //! skeleton generator (`opgraph`, P3) refer to stages by key.
 
-use amdgpu_codegen::weave::{Units, Weaver};
+use crate::weave::{Units, Weaver};
 use amdgpu_dsl::{FnBuilder, StageContract, StageScalar, StageVal};
 
 /// The library primitives (docs/fusion-stage-library-design.md §1.1; `X`, the cross-device exchange, is out of scope).

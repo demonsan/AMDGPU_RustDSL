@@ -1,6 +1,6 @@
 # 基于代价模型的自动编织策略（`weave_auto`）
 
-状态：**可选策略，未采用为默认**（分支 `weave2-auto`；代码 `crates/amdgpu-codegen/src/weave_auto.rs`，测试 `crates/amdgpu-codegen/tests/weave_auto.rs`）。默认行为不变（所有 kernel 的 asm md5 与 Main 相同）；全部开关都是环境变量，只在编织的 `emit` / `plan` 里读取。
+状态：**可选策略，未采用为默认**（分支 `weave2-auto`；代码 `crates/amdgpu-stage/src/weave_auto.rs`，测试 `crates/amdgpu-stage/tests/weave_auto.rs`）。默认行为不变（所有 kernel 的 asm md5 与 Main 相同）；全部开关都是环境变量，只在编织的 `emit` / `plan` 里读取。
 
 ## 做了什么
 

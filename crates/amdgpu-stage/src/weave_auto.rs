@@ -8,7 +8,7 @@
 //! later behind a deep queue, LDS-DMA issue 24. It is NOT a performance oracle below ~3800 simulated cycles per iteration (the hardware is LDS-bandwidth bound there); the strategy is
 //! therefore reported with measured numbers, not adopted by default.
 
-use crate::weave::{Hint, Units};
+use amdgpu_dsl::units::{Hint, Units};
 use amdgpu_dsl::facts::{Facts, ResClass};
 use std::collections::HashMap;
 

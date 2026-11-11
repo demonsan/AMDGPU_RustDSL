@@ -454,7 +454,7 @@ struct GemmCtx<'r> {
 /// zero-cost B-operand words of GEMM 2; G1: stored to HBM; G1q: the generic epilogue chain). Captured units; returns the stage and the P words.
 #[allow(clippy::too_many_arguments)]
 fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: &[Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> (amdgpu_stage::stage::StageInst<'static>, Vec<Opnd>) {
-    let mut u = amdgpu_codegen::weave::Units::new();
+    let mut u = amdgpu_stage::weave::Units::new();
     let (_, zero) = u.capture(b, "gemm1.setup", |b| b.frag_zero(DType::Frag16));
     let mut acc = vec![zero; (N1 / 32) as usize];
     for kb in 0..K1 / 64 {
@@ -557,7 +557,7 @@ fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: 
 /// Stage `gemm2` (keys `mma.rows_x_lds` + `map.store_bf16`): `Y^T = W2 H^T` from the P words, bf16 stores. Captured units.
 #[allow(clippy::too_many_arguments)]
 fn gemm2_stage(b: &mut FnBuilder, g: GemmCtx, w2: &amdgpu_tile::Shared, p_words: &[Opnd], r_out: ValueId, row: ValueId, lane: &Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_stage::stage::StageInst<'static> {
-    let mut u = amdgpu_codegen::weave::Units::new();
+    let mut u = amdgpu_stage::weave::Units::new();
     let (_, zero) = u.capture(b, "gemm2.setup", |b| b.frag_zero(DType::Frag16));
     let mut acc = vec![zero; (N2 / 32) as usize];
     for (jb, pf) in p_words.iter().enumerate() {
