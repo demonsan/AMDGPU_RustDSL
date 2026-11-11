@@ -55,6 +55,7 @@ impl RingModel {
         }
         let mut m = RingModel { slots: plan.rings.iter().map(|r| r.slots.max(1)).collect(), ..Default::default() };
         let mut max_c = 0i64;
+        let min_p = plan.units.iter().filter(|u| u.class == UnitClass::Dma && u.iter != 0).map(|u| u.iter).min().unwrap_or(i32::MAX);
         for (ri, r) in plan.rings.iter().enumerate() {
             for u in &plan.units {
                 let e = (ri, r.slots.max(1), u.iter as i64);
@@ -62,7 +63,10 @@ impl RingModel {
                     m.producers.entry(u.id + 1).or_default().push(e);
                 } else if u.phase == r.consumer_phase {
                     m.consumers.entry(u.id + 1).or_default().push(e);
-                    max_c = max_c.max(u.iter as i64);
+                    // the iterations a trip covers: the reading units' offsets (a DMA's setup units carry the DMA's offset)
+                    if u.iter < min_p {
+                        max_c = max_c.max(u.iter as i64);
+                    }
                 }
             }
         }
