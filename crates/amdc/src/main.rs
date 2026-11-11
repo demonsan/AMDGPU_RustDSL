@@ -382,6 +382,14 @@ fn main() -> ExitCode {
                     println!("{{\"kernel\":\"{kernel}\",\"splits\":{s}}}");
                     ExitCode::SUCCESS
                 }
+                (Some(fam @ ("fp8pt" | "hd192")), Some(b), Some(h), Some(sq)) => {
+                    // amdc dispatch fp8pt|hd192 <B> <H> <SQ> <SK> <causal 0|1> [--cus N]: the per-tensor FP8 / hd192 (MLA prefill) kernel and key splits
+                    let (sk, causal) = (num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0);
+                    let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
+                    let (kernel, s) = if fam == "fp8pt" { amdgpu_graph::dispatch::fp8pt_prefill_kernel(b, h, sq, sk, causal, cus) } else { amdgpu_graph::dispatch::hd192_prefill_kernel(b, h, sq, sk, causal, cus) };
+                    println!("{{\"kernel\":\"{kernel}\",\"splits\":{s}}}");
+                    ExitCode::SUCCESS
+                }
                 (Some("gemm_blockscale"), Some(m), Some(n), Some(k)) => {
                     // amdc dispatch gemm_blockscale <M> <N> <K> [--cus N]: the split-K factor of gemm_a8w8_blockscale
                     let cus = args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256);
@@ -429,7 +437,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 _ => {
-                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E> | mla <B> <H> | bwd_causal");
+                    eprintln!("usage: amdc dispatch decode16 <B> <HK> <CTX> [--page P] | prefill_bf16|fp8pt|hd192 <B> <H> <SQ> <SK> <causal> [--cus N] | gemm_blockscale <M> <N> <K> [--cus N] | moe <M> <TOPK> <E> | mla <B> <H> | bwd_causal");
                     ExitCode::from(2)
                 }
             }
