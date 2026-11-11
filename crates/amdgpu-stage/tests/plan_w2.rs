@@ -1,8 +1,8 @@
 //! The kernel plan the front end derives (docs/two-weavers.md 6.1): phases / units / dependences / interleave hints from the Weaver, order / tokens / budgets / loop kinds / CTA shape
 //! from the declarations at `finish`.
 
-use amdgpu_dsl::plan::{verify, DepKind, OrderSpec, PhaseKind};
-use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+use amdgpu_dsl::plan::{verify, DepKind, OrderSpec, PhaseKind, RegConstraint};
+use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, RegRef};
 use amdgpu_stage::weave::{Units, Weaver};
 
 /// a -> b (b uses a's value) and an independent c
@@ -20,6 +20,11 @@ fn the_weaver_and_finish_derive_a_consistent_plan() {
     fb.declare_region("hot", false, "ldsink=1");
     fb.reg_cap("hot", 96);
     let u = three(&mut fb);
+    // register marks: a pin, a separate group, a register ring of two buffers
+    let (p, q) = (fb.c_i32(1), fb.c_i32(2));
+    fb.pin_vgpr_at(RegRef::Val(p), 8);
+    fb.reg_separate(&[RegRef::Val(p), RegRef::Val(q)]);
+    fb.reg_ring("R", &[RegRef::Val(p), RegRef::Val(q)]);
     Weaver::new(u).phase("hot").seq().emit(&mut fb);
     // a woven loop body with a spread (skeleton a, fillers c b)
     let _v = fb.begin_loop(&[(DType::I32, Opnd::I32(0))]);
@@ -43,6 +48,11 @@ fn the_weaver_and_finish_derive_a_consistent_plan() {
     let body = p.phases.iter().find(|x| x.name == "body").unwrap();
     assert!(matches!(body.kind, PhaseKind::LoopBody { .. }), "{:?}", body.kind);
     assert_eq!(body.order, OrderSpec::Authored);
+
+    // the register marks became value-level constraints
+    assert!(p.reg_constraints.iter().any(|c| matches!(c, RegConstraint::Pin { base: 8, .. })));
+    assert!(p.reg_constraints.iter().any(|c| matches!(c, RegConstraint::Separate(v) if v.len() == 2)));
+    assert!(p.reg_constraints.iter().any(|c| matches!(c, RegConstraint::RegRing { name, bufs } if name == "R" && bufs.len() == 2)));
 
     // units in emission order with the derived dependence a -> b (a value flows)
     let hot_units: Vec<_> = p.units.iter().filter(|u| u.phase == hot.id).collect();
