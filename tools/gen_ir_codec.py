@@ -19,7 +19,7 @@ OUT = os.path.join(ROOT, "crates/amdgpu-dsl/src/ir_codec.rs")
 TYPES = ["VarId", "DType", "Opnd", "Op", "Ext", "ArgExtent", "TileDecl", "BufRegion", "LastArriver", "WgMap", "WgWinner", "Contract", "StageVal", "StageScalar", "StageOutstanding", "StageResources", "StageContract",
          "Stmt", "Arg", "AgprTarget", "AgprMark", "RegRef", "RegMark", "RegionKind", "RegionDecl", "CompileProfile", "UnOp", "BinOp", "TriOp", "CmpPred", "CmpTy", "MemTy", "D16Ty", "MmaShape", "MmaTy", "MmaKind", "MmaScale", "CachePolicy", "CvtOp", "DppCtrl", "Dpp", "DppAluOp", "AtomicOp",
          # the kernel plan (plan.rs, docs/two-weavers.md)
-         "KernelPlan", "Phase", "PhaseKind", "OrderSpec", "Budget", "M0Use", "UnitClass", "UnitDecl", "DepKind", "Dep", "RegFileKind", "Via", "HandOff", "SyncRule", "Hints"]
+         "KernelPlan", "CtaShape", "RoleDecl", "Cadence", "RingOwner", "RingDecl", "CrossCtaProtocol", "MemOrder", "RegConstraint", "Phase", "PhaseKind", "OrderSpec", "Budget", "M0Use", "UnitClass", "UnitDecl", "DepKind", "Dep", "RegFileKind", "Via", "HandOff", "SyncRule", "Hints"]
 
 
 def strip_comments(s):
