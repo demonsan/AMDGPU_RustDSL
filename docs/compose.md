@@ -58,3 +58,10 @@ The search found rule defects, and the rules in `dispatch.rs` now follow the mea
 
 Gate (`perf_ab.py --families gemm`, old = the tree before the rule change): **PASS**, 79 cases, family geometric mean **1.042**, 19 cases IMPROVED (1.04 - 1.33x), none failing. The hold-out shapes (K = 6144, N = 8192, other M; not
 used by the fits) are among the improved ones (1792x8192x4096 +23 - 26 %, 160x4096x8192 +9 - 13 %, 320x8192x6144 bf16 +6 %) and the rest are unchanged.
+
+## Attention families (decode16 splits, bf16 prefill key splits)
+
+`compose_search.py search|check-decode16|check-prefill` run the same pipeline on the attention hosts (`pa_host`, `attn_host`; the decode16 candidates are the fused form and the last-arriver form with S = 2 / 4 / 8 / 16, the prefill ones the
+plain / paired / `_q128` / `_ks` forms with the combine kernel). [`compose-attention-evidence.md`](compose-attention-evidence.md) (node 53, GPU 1): **all 15 decode16 shapes** (B 4 .. 64 x ctx 1024 .. 8192, HK 8, page 16) and **7 of the 8
+prefill shapes** confirm the recorded rules within 3 % (decode16 B16 ctx8192: S4 is 2.2 % faster than the rule's S2; the 8th prefill shape, 2x8x1000x1300 non-causal, did not launch on the host: no measurement). No attention rule change is
+indicated by the evidence.
