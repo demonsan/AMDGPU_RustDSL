@@ -43,6 +43,11 @@ pub struct RingModel {
     pub slots: Vec<u32>,
     /// iterations one trip of the loop body advances (the token shift at a back edge)
     pub body_iters: i64,
+    /// unit tag -> the LDS tiles the unit's tile markers produce / consume (from the kernel's `region Produce / Consume tile`)
+    pub tiles_prod: std::collections::HashMap<u32, Vec<String>>,
+    pub tiles_cons: std::collections::HashMap<u32, Vec<String>>,
+    /// declared tile aliases (`lds_alias`): such tiles share bytes
+    pub aliases: Vec<(String, String)>,
 }
 
 impl RingModel {
@@ -82,6 +87,67 @@ impl RingModel {
         }
         m.body_iters = max_c + 1;
         Some(m)
+    }
+}
+
+impl RingModel {
+    /// The model of a function: the plan's rings, with each unit's ring membership taken from the tile markers inside it (exact per unit;
+    /// the plan's producer / consumer phases cannot name every copy of a body). Falls back to the plan-only rules for rings no marker names.
+    pub fn of_function(f: &amdgpu_dsl::Function) -> Option<RingModel> {
+        use amdgpu_dsl::plan::UnitClass;
+        use amdgpu_dsl::Stmt;
+        let plan = f.plan.as_ref()?;
+        let mut m = RingModel::of(plan)?;
+        let mut stack: Vec<u32> = Vec::new();
+        for s in f.stmts() {
+            match s {
+                Stmt::UnitMark { id, begin: true } => stack.push(*id + 1),
+                Stmt::UnitMark { begin: false, .. } => {
+                    stack.pop();
+                }
+                Stmt::TileProduce { tile, .. } | Stmt::TileConsume { tile, .. } => {
+                    if let Some(&u) = stack.last() {
+                        let map = if matches!(s, Stmt::TileProduce { .. }) { &mut m.tiles_prod } else { &mut m.tiles_cons };
+                        let e = map.entry(u).or_default();
+                        if !e.contains(tile) {
+                            e.push(tile.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        m.aliases = f.contract.tile_aliases.clone();
+        let iter_of = |tag: u32| plan.units.iter().find(|u| u.id + 1 == tag).map(|u| u.iter as i64).unwrap_or(0);
+        let is_dma = |tag: u32| plan.units.iter().find(|u| u.id + 1 == tag).map_or(false, |u| u.class == UnitClass::Dma);
+        for (ri, r) in plan.rings.iter().enumerate() {
+            let s = r.slots.max(1);
+            let prods: Vec<u32> = m.tiles_prod.iter().filter(|(t, v)| is_dma(**t) && v.contains(&r.name)).map(|(t, _)| *t).collect();
+            let cons: Vec<u32> = m.tiles_cons.iter().filter(|(_, v)| v.contains(&r.name)).map(|(t, _)| *t).collect();
+            if prods.is_empty() && cons.is_empty() {
+                continue;
+            }
+            // the markers name this ring: they replace the phase-derived membership
+            for v in m.producers.values_mut() {
+                v.retain(|e| e.0 != ri);
+            }
+            for v in m.consumers.values_mut() {
+                v.retain(|e| e.0 != ri);
+            }
+            for t in prods {
+                m.producers.entry(t).or_default().push((ri, s, iter_of(t)));
+            }
+            for t in cons {
+                m.consumers.entry(t).or_default().push((ri, s, iter_of(t)));
+            }
+        }
+        m.producers.retain(|_, v| !v.is_empty());
+        m.consumers.retain(|_, v| !v.is_empty());
+        Some(m)
+    }
+
+    fn tiles_meet(&self, a: &[String], b: &[String]) -> bool {
+        a.iter().any(|x| b.iter().any(|y| x == y || self.aliases.iter().any(|(p, q)| (p == x && q == y) || (p == y && q == x))))
     }
 }
 
@@ -126,6 +192,18 @@ fn ring_tokens(e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
 /// allocations and the slot tokens say which slot each access touches, so the two need no order (the wait pass keeps the
 /// completion dependences of the slots that do meet). False whenever either access is not a ring access.
 pub fn ring_independent(rm: &RingModel, ea: &Effects, a: &MInst, eb: &Effects, b: &MInst) -> bool {
+    // a DMA of one tile and an LDS read of other tiles (the units' markers name both sides; declared tiles are disjoint unless aliased)
+    let is_dma = |e: &Effects| e.fence == Fence::Barrier && e.mem.is_some();
+    let is_read = |e: &Effects| e.fence == Fence::None && matches!(&e.mem, Some(m) if m.space == Space::Lds && !m.write);
+    for (d, de, r, re) in [(a, ea, b, eb), (b, eb, a, ea)] {
+        if is_dma(de) && is_read(re) {
+            if let (Some(p), Some(c)) = (rm.tiles_prod.get(&d.unit), rm.tiles_cons.get(&r.unit)) {
+                if !p.is_empty() && !c.is_empty() && !rm.tiles_meet(p, c) {
+                    return true;
+                }
+            }
+        }
+    }
     let (ra, la, ia) = ring_tokens_of(rm, ea, a);
     let (rb, lb, ib) = ring_tokens_of(rm, eb, b);
     // (DMA, read): the DMA issues kind-0 tokens, the read needs kind-0 tokens (raw); (read, DMA): the read issues kind-1, the DMA needs kind-1 (war)

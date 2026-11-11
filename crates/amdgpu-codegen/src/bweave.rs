@@ -310,12 +310,16 @@ pub fn apply_order(b: &mut Block, segs: &[Seg], ord: &[usize]) {
 /// ceil(fillers / MFMAs) filler instructions. The merged block order is applied only when it keeps every edge of the instruction
 /// dependence graph (`sched::depgraph`); otherwise the block keeps its order. Returns (blocks merged, hints that fell back).
 pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (usize, usize) {
+    interleave_with(m, plan, crate::sched::waits::RingModel::of(plan))
+}
+
+/// `interleave` with the ring model of the function (tile-marker membership, `RingModel::of_function`).
+pub fn interleave_with(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan, rings: Option<crate::sched::waits::RingModel>) -> (usize, usize) {
     use amdgpu_dsl::plan::OrderSpec;
     let free_unit = |id: u32| -> bool {
         plan.units.iter().find(|u| u.id == id).and_then(|u| plan.phases.iter().find(|p| p.id == u.phase)).map_or(false, |p| !matches!(p.order, OrderSpec::Authored))
     };
     let (mut merged, mut fell_back) = (0usize, 0usize);
-    let rings = crate::sched::waits::RingModel::of(plan);
     for bi in 0..m.blocks.len() {
         for (skel, fills) in &plan.hints.interleave {
             if !free_unit(*skel) || fills.iter().any(|f| !free_unit(*f)) {

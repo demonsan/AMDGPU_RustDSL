@@ -197,7 +197,7 @@ fn run_ldahead(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     Ok(())
 }
 fn ring_model(cx: &PassCtx) -> Option<sched::waits::RingModel> {
-    cx.f.plan.as_ref().and_then(sched::waits::RingModel::of)
+    sched::waits::RingModel::of_function(cx.f)
 }
 
 fn run_insert_waits(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
@@ -293,7 +293,7 @@ fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     crate::bweave::order(&mut s.m, crate::bweave::OrderPolicy::Identity)?;
     // B4: the plan's interleave hints inside Free phases (no Free phase in a plan: nothing changes)
     if let Some(p) = &cx.f.plan {
-        let (_, fell_back) = crate::bweave::interleave(&mut s.m, p);
+        let (_, fell_back) = crate::bweave::interleave_with(&mut s.m, p, crate::sched::waits::RingModel::of_function(cx.f));
         if fell_back > 0 && std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
             eprintln!("bweave {}: {fell_back} interleave hint(s) kept their order (a dependence forbids the merge)", cx.f.name);
         }

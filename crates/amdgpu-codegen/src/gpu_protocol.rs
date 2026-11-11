@@ -1229,7 +1229,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
 /// barrier interval, the plan lies and the reordered code could race: GV-PLAN-RING.
 fn check_plan_rings(f: &Function, tr: &Trace, diags: &mut Vec<(&'static str, Severity, usize, String)>) {
     let Some(plan) = &f.plan else { return };
-    let Some(rm) = crate::sched::waits::RingModel::of(plan) else { return };
+    let Some(rm) = crate::sched::waits::RingModel::of_function(f) else { return };
     let units = unit_of_stmt(f);
     let tile_of_ring: Vec<Option<usize>> = plan.rings.iter().map(|r| f.contract.tiles.iter().position(|t| t.name == r.name)).collect();
     for v in plan_ring_violations(&rm, &units, &tile_of_ring, &tr.evs) {
