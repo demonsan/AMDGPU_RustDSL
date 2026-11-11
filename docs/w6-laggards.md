@@ -121,3 +121,38 @@ These are the next measurable steps:
 - `unroll2` on the bf16 v3 pipeline;
 - the mask arithmetic;
 - then, with W3's interleaving, the in-wave softmax / MFMA weave.
+
+**Step 3: two tiles per pass on bf16 v3 (`Pipeline::unroll2` + `jthread`) — neutral, not adopted.** `perf_ab --families fmha_hd192,fmha_bf16`, 7 reps:
+- hd192 geomean 0.998;
+- bf16 full 0.992 (OK).
+
+The **bf16 causal cases did not run**: the paired-causal kernel with `unroll2` produced no result. The cause was not investigated, since the form gives nothing on the shapes that ran. In the W5 replica the two-tile pass only paid together with the other changes. Here the stall is the per-phase drain (83 waits per tile), which unrolling does not remove.
+
+### 5.1 Request to the back-end Weaver (W3 B4): in-wave softmax / MFMA interleave for bf16 v3
+
+**Target.** `fmha_fwd_bf16_v3_d` (hd192 and hd128), group A's loop. The plan units already exist:
+- `bf16v3.v_phase`: `v.mask`, `v.max`, `v.rescale`, `v.exp`;
+- `bf16v3.m_phase`: `m.pv`, `m.qk`.
+
+**What the vendor does** (§5, step 2): the softmax of tile t (`v.exp`: 64 `v_exp_f32` + 64 `v_fma_f32` + the row sum) runs **between** the MFMAs that do not depend on it. The loop opens with 63 `v_exp` woven into 45 MFMAs and 32 V reads. Result: 5 `s_waitcnt` and 3.5 `s_nop` per tile, against our 83 and 59.
+
+**Dependences that allow it.**
+- `m.qk` of tile t + 1 (S(t+1) = Q K(t+1)ᵀ) does not depend on `v.exp(t)`, so the two can interleave.
+- `m.pv(t)` needs P(t), i.e. the end of `v.exp(t)` + the bf16 packing.
+- `v.max(t)` / `v.rescale(t)` need S(t), complete after `m.qk(t)`.
+
+**Asks.**
+1. A **Free phase** spanning `v.exp(t)` and `m.qk(t+1)` within one wave, so the back end may order across today's phase boundary. That boundary is a front-end choice (`v_phase` / `m_phase` regions + the ping-pong barrier).
+2. An **interleave hint**: spread `v.exp(t)` over `m.qk(t+1)`'s MFMAs, about 4 VALU per MFMA. That keeps the VALU latency (trans ops: `v_exp` 4 passes) under the MFMA issue (16 passes each).
+3. Waits placed per unit dependence (counted `lgkmcnt` for the K reads of `m.qk`), not a drain at the region end.
+
+**Front-end part (ours, after B4 lands).** The plan must allow it. Either:
+- **(a)** keep the two-group ping-pong but move `m.qk(t+1)` into the softmax phase of the same group; or
+- **(b)** a single-group in-wave pipeline, as the vendor runs (no `s_setprio`, 4 barriers per tile).
+
+We would measure both with perf_ab on `fmha_hd192` / `fmha_bf16`.
+
+**Expected.**
+- Waits per tile 83 → about 10, nops 59 → under 10. The vendor's numbers are 5 / 3.5.
+- The VALU phase (423–575 instructions per tile) mostly hidden behind the 80 MFMAs per tile.
+- This is the gap to the vendor on the small grids: 0.77–0.82×.
