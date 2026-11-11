@@ -358,7 +358,58 @@ fn main() -> ExitCode {
             let p = amdgpu_graph::fusion::plan_with(&g, !args.iter().any(|a| a == "--no-fuse"));
             print!("{}", p.to_json().to_string_pretty());
             if p.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
-        }        "dispatch" => {
+        }        "compose-facts" => {
+            // amdc compose-facts [--out FILE]: the generated `amdgpu_graph::compose_facts` source (the CTA shape and rings of every kernel that declares a plan)
+            let src = amdgpu_kernels::compose_facts_gen::source();
+            match args.windows(2).find(|w| w[0] == "--out") {
+                Some(w) => match std::fs::write(&w[1], src) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("compose-facts: {}: {e}", w[1]);
+                        ExitCode::from(1)
+                    }
+                },
+                None => {
+                    print!("{src}");
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+        "compose" => {
+            // amdc compose <family> <shape>: the composition of a launch (docs/compose.md): kernels, splits, tile and the plan facts (CTA shape, rings) of the main kernel, as JSON
+            use amdgpu_graph::compose as cp;
+            let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
+            let opt = |name: &str, d: u64| args.windows(2).find(|w| w[0] == name).and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(d);
+            let c = match (args.get(1).map(|s| s.as_str()), num(2), num(3), num(4)) {
+                (Some("decode16"), Some(b), Some(hk), Some(ctx)) => Some(cp::decode16(b, hk, ctx, opt("--page", 16) as u32)),
+                (Some("prefill_bf16"), Some(b), Some(h), Some(sq)) => Some(cp::prefill_bf16(b, h, sq, num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0, opt("--cus", 256))),
+                (Some("fp8pt"), Some(b), Some(h), Some(sq)) => Some(cp::fp8pt(b, h, sq, num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0, opt("--cus", 256))),
+                (Some("hd192"), Some(b), Some(h), Some(sq)) => Some(cp::hd192(b, h, sq, num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0, opt("--cus", 256))),
+                (Some("mxfp8"), Some(b), Some(h), Some(sq)) => Some(cp::mxfp8(b, h, sq, num(5).unwrap_or(sq))),
+                (Some("mla"), Some(b), Some(h), _) => Some(cp::mla(b, h, opt("--page", 64) as u32)),
+                (Some("bwd_causal"), _, _, _) => Some(cp::bwd_causal()),
+                (Some("gemm"), _, _, _) => match (args.get(2), num(3), num(4), num(5)) {
+                    (Some(kind), Some(m), Some(n), Some(k)) => cp::gemm(kind, m, n, k, opt("--cus", 256)),
+                    _ => None,
+                },
+                (Some("moe"), _, _, _) => match (args.get(2), num(3), num(4), num(5)) {
+                    (Some(dt), Some(m), Some(topk), Some(e)) => Some(cp::moe(dt, m, topk, e)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match c {
+                Some(c) => {
+                    println!("{}", c.to_json());
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("usage: amdc compose decode16 <B> <HK> <CTX> [--page P] | prefill_bf16|fp8pt|hd192 <B> <H> <SQ> <SK> <causal> [--cus N] | mxfp8 <B> <H> <S> [SK] | gemm <kind> <M> <N> <K> [--cus N] | mla <B> <H> [--page P] | moe <bf16|fp8|fp4> <M> <TOPK> <E> | bwd_causal");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "dispatch" => {
             // amdc dispatch decode16 <B> <HK> <CTX> [--page P]: the launch plan of the paged decode (dispatch::decode16_plan) as JSON - the single
             // rule the hosts (tools/pa_auto.sh, python amdgpu_jit.decode16_plan) follow
             let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());

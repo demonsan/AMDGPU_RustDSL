@@ -22,6 +22,7 @@ pub mod probes;
 pub mod verifier_cases;
 pub mod registry;
 pub mod stage_registry;
+pub mod compose_facts_gen;
 pub mod reachable;
 
 pub use registry::{kernel_by_name, kernel_names};
