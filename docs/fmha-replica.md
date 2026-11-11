@@ -99,3 +99,28 @@ Plan: a new kernel (`fmha_fwd_hd128_mxfp8_v3_replica`) built on the existing sta
 3. **Registers:** the vendor's VGPR roles pinned (O v116–179, S v52–115, K / V v20–51, Q v4–19, P reusing S) through the DSL's register plan (`pin_vgpr_at`, shares).
 4. **Order:** per phase, the vendor's instruction order through weave regions / authored order. Counted safe-asm windows only where the DSL cannot state the order.
 5. **Two-exit loop / cold blocks:** as far as the DSL allows; the rest is listed against §3.6.
+
+### 4.1 Starting point: the steady loops side by side
+
+`isa_diff.py ours.s vendor.dis --range-a BB7:BB8 --range-b label_block_A_loop:label_block_A_drain1` compares group A's loop. Ours runs one tile per pass, the vendor two:
+
+| per tile | ours | vendor (pass / 2) |
+|---|---:|---:|
+| instructions without fillers | 463 | 220 |
+| VALU | 361 | 113 |
+| scaled QK MFMA / unscaled PV MFMA | 16 / 0 (PV scaled) | 8 / 8 |
+| `ds_read_b64_tr_b8` / `ds_read_b128` | 32 / 16 | 32 / 16 |
+| LDS-DMA issues | 5 | 5 |
+| `v_pk_add_f32` + `v_pk_mul_f32` (rebase) | 32 + 32 | 0 (out-of-line rollback blocks) |
+| `v_perm_b32` + `v_pk_sub_u16` + `v_and_b32` (our P / scale path) | 32 + 32 + 32 | 0 |
+| `v_max3_f32`, `v_cvt_pknorm_u16_f32`, `v_cvt_scalef32_pk_fp8_bf16` | 31, 32, 32 | 32, 32, 32 |
+| `s_waitcnt` / `s_nop` | 20 / 11 | 16 / 1 |
+
+What the table shows:
+- **Same counts:** the reads, the copies and the softmax core are already the same per tile.
+- **The rebase:** ours is our lazy recipe's rollback branch, laid out *inline* in the loop body (an `if`), whereas the vendor's rollback blocks are out of line. That is the block-layout item of §3.6, not an algorithm difference.
+- **The real algorithm differences:**
+  - PV through the scaled MFMA (the vendor: unscaled);
+  - 96 VALU per tile of `v_perm` / `v_pk_sub_u16` / `v_and` that the vendor does not have. Which stage emits them (P packing or scale-word preparation) is the first thing R3 traces;
+  - one tile per pass, against the vendor's two-tile unrolled pass with two exits.
+- **Exact operand equality is 1.8 %:** registers are allocated differently, the gap §4 step 3 addresses.
