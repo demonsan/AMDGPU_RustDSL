@@ -46,8 +46,10 @@ fn check(name: &str, m: &MFunction, a: &Alloc, errs: &mut Vec<String>) {
                 sw |= writes_scc(mn);
                 sr |= reads_scc(mn);
                 let (w, r) = vcc_effects(l);
+                // a read of the vcc an earlier line of the same expansion wrote is internal (VPtrAdd's carry)
+                vr |= r && !vw;
                 vw |= w;
-                vr |= r;
+                sr &= !(sw && !reads_scc(mn) && false);
             }
             let mut miss = Vec::new();
             if sw && !at.scc_write {
