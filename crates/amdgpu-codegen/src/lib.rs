@@ -81,7 +81,8 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    f.compile_policy().m0_reuse
+    // the GEMM profile's policy, or the lowering token `m0reuse` on any kernel (W3 B2: one M0 write per group of LDS-DMA issues)
+    f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse")
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {

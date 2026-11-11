@@ -49,6 +49,10 @@ amdgpu-kernels ─┼─► amdgpu-graph (L1) ─► amdgpu-stage (L2) ─► am
   `hazard-phys-war`, `hz-fill`, `m0-pad`, `hazard-valu-sgpr`;
 - unscheduled body (fallback): the same objects without the scheduler, `hazard-value` non-strict, `verify-waits` before `regalloc`;
 - back: `check-workgroup-budget`, `verify-gpu`, `emit-own | emit-llvm-tail`;
+- the two Weavers: the front-end Weaver (`amdgpu_stage::weave`) emits the units and records the kernel plan (`Function::plan`, completed at
+  `FnBuilder::finish` by `amdgpu-dsl/src/plan_derive.rs`); the back-end Weaver (`amdgpu-codegen/src/bweave.rs`) heads both bodies with
+  `bweave-order` (today's order, plus the interleave of Free phases) and feeds the wait pass the plan's rings. Status, opt-in tokens and gates:
+  [two-weavers.md](two-weavers.md) section 7;
 - retry ladders as data: the outer one adds lowering tokens (`remat1..4`, `ldsspill8..64`), the inner one cuts pressure / hoisting; both retry on
   `out of VGPRs`.
 
@@ -84,3 +88,5 @@ From the description's analysis (target-gfx1250.md §2):
 | The compile policy is declared data (no kernel-name inspection) | `amdgpu_dsl::CompileProfile::policy` |
 | Strict certificates (shipped 21 / 100 / 0) and the trust ledger | `amdc gpu-verify --shipped --strict`, [trust-inventory.md](trust-inventory.md) |
 | Every reachable kernel compiles, passes the descriptor limits and assembles | `crates/amdgpu-kernels/tests/dispatch_compile.rs`, `python/tests/run_all.sh` |
+| Every emitted instruction expansion declares its implicit SCC / VCC effects in the instruction table | `crates/amdgpu-kernels/tests/emit_effects.rs` |
+| A behaviour change keeps every kernel family within noise | `tools/perf_ab.sh` ([perf-ab.md](perf-ab.md)), `tools/port_gate.sh` |

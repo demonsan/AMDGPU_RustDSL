@@ -235,4 +235,34 @@ W2c completes the plan at `FnBuilder::finish` (`amdgpu-dsl/src/plan_derive.rs`, 
 - stage contracts -> `HandOff` (a `live_out` value of an earlier stage that a later stage takes as `live_in`: registers, an LDS tile or global; the recorded fragment layout);
 - the contract's multi-slot LDS tiles -> `RingDecl` (producer / consumer phases from the units that contain the tile's produce / consume regions; private tiles `owner: Wave`; the cadence is inferred from the slot count: 3 slots one window, else the two-phase offset);
 - `CtaShape` from the workgroup size.
-Not derived yet: `RegMark::PinV` / `RegMark::Ring` / last-arriver `CrossCta` (waiting for the plan-ext2 forms), `Counted` / `Barrier` rules (the Order dependences carry them until B4), wave roles, the loop trip counts.
+W2d derives `RegMark::PinV` -> `RegConstraint::Pin` and `RegMark::Ring` -> `RegConstraint::RegRing`. Not derived yet: the last-arriver `CrossCta`
+(the plan form `LastArriver { counter: FlagRef, partials, splits }` exists), `Counted` / `Barrier` rules (the Order dependences carry them), wave roles,
+the loop trip counts.
+
+## 7. As built (status)
+
+What is live on Main, what is opt-in, and how each part is gated. "Opt-in" means a lowering token or a plan entry that no shipped kernel sets
+yet; such a part is md5-identical by construction and is enabled per kernel with a W4 gate.
+
+| Part | Where | State | Gate |
+|---|---|---|---|
+| plan types, irv1 codec, `plan::verify` | `amdgpu-dsl/src/plan.rs`, `ir_codec.rs` | live; every weaved kernel carries a plan (W2b-W2d) | md5; `tests/plan_ir.rs`; `compose_facts` |
+| unit marks, `MInst::unit`, unit graph, `amdc weave-report` | `lower.rs`, `bweave.rs` | live (analysis) | md5; `bweave` unit tests |
+| B2 per-unit lowering caches | lowering token `unitlocal` | opt-in | `tests/unit_local.rs` |
+| B2 uniform SGPR operands | tokens `sgpr` (binary ops, compares), `sgpr2` (commutative VOP2 ops, `v_sub` minuend) | opt-in | `tests/b2_operands.rs`, `tools/sgpr2_probe.sh` (hardware) |
+| B2 M0 grouping of LDS-DMA issues | policy `m0_reuse` (GEMM) or token `m0reuse` (any kernel; the replica: 54 -> 18 M0 writes) | live for GEMM, opt-in elsewhere | md5; port_gate when a kernel adopts it |
+| B2 waits on the unscheduled path | - | not started (md5-changing, a W4-gated step) | - |
+| B3 ordering pass `bweave-order` (identity) | head of both pass bodies | live | md5 |
+| B4 instruction-level interleave in Free phases | `bweave::interleave` (plan `Hints::interleave`, dependency-aware merge, checked against `sched::depgraph`) | live, acts only on Free phases (none shipped yet) | md5; unit tests; perf_ab + port_gate per kernel |
+| B5 ring-slot dependences in the wait pass | `sched/waits.rs` `RingModel` (RAW DMA -> read, WAR read -> DMA, ageing at back edges) | active only for a plan with a cross-iteration DMA in a Free phase | `tests/ring_waits.rs` (mutation tests) |
+| B6a phase budgets as scheduler limits | `scheduler_options` (Free phases) | live, Free phases only | md5; `tests/budget_sched.rs` |
+| B6b register rotation | `RegMark::Ring` / `RegConstraint::RegRing` (disjoint buffers, `regplan`) | live (existing allocator constraint) | `regplan` verification |
+| B6c per-phase fallback | the rung before the unscheduled fallback | live, Free phases only | `tests/budget_sched.rs` |
+| CFG: jump threading, cold-block layout | tokens `jthread`, `coldlayout` (`cfg_thread.rs`, `begin_if_unlikely`) | opt-in (the replica uses them) | `tests/jthread.rs`, `tools/jthread_probe.sh` |
+| W5 instruction forms | tokens `cmpneg`, `movb64`, `salu32`; `BinOp::MulI32I24`; bf16 32x32x8 MFMA | opt-in | `tests/mops_w5.rs`, `tools/salu32_probe.sh` |
+| implicit SCC / VCC effects of every expansion | `tests/emit_effects.rs` | live check | cargo test |
+| B7 removal of tokens / switches / ladders | - | not started | - |
+
+Gates for every step: md5 manifest (or, for a behaviour change, `tools/perf_ab.sh --quick` PASS against Main plus `tools/port_gate.sh` for the
+shipped FMHA set), certificates unchanged, `cargo test`, `python/tests/run_all.sh` (incl. the hazard oracle). Design of B5 / B6:
+[w3-b5-b6.md](w3-b5-b6.md).
