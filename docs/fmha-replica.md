@@ -361,6 +361,32 @@ Our list scheduler, given our registers and waits, finds a faster order than the
 
 **Method note.** An environment toggle does not reach `amdc` inside `port_gate`, because the gate emits through the container. Same-session A/Bs therefore need two kernel names. The pin A/B numbers in §4.4 come from separate builds, not toggles.
 
+### 4.9 Spin-off: the replica configuration as the shipped `_vs128`
+
+Two A/Bs with `tools/perf_ab.sh` (`--families fmha_mxfp8 --release`, old = Main `e48ec5c8`, same session):
+
+| new `_vs128` | geomean new / old | per case (1×8×2048 / 1×8×8192 / 2×32×8192 / 4×8×2048) | verdict |
+|---|---:|---|---|
+| `unroll2` + `jthread` only (scaled PV, inline rollback) | 0.996 | 0.980 / 0.998 / 1.001 / 1.004 | OK, no gain: not adopted |
+| the full replica configuration (step 4b) | **1.017** (7 reps) | **1.021 (IMPROVED)** / 1.008 / 1.008 / 1.032 | OK, adopted |
+
+The gain needs the combination. The two-tile pass alone is neutral, and unscaled PV alone loses 2–3 % (§4.2). Together, plus the out-of-line rollback, they win.
+
+**port_gate of the shipped set with the new `_vs128`: OVERALL PASS** — BUILD, VERIFY, ACC16, ACC64 vendor parity on all paths, DET, STRESS (300 + 100 launches), PERF:
+- per-CU 0.971× vendor (recorded 0.959×);
+- B4H8S2048 0.983×;
+- B1H8S8192 0.991× (2511 TF/s, recorded 2416);
+- B2H8S2048 0.973×;
+- layout median 0.972× (recorded 0.948×).
+
+`_vs128` is now built with `Vs128Slots { replica: true }`; the md5 manifest changes for `_vs128` only.
+
+**Verifier coverage, found by adopting the replica configuration.** The barrier mutation test (`gpu_tiles.rs`: remove each barrier of `_vs128` in turn; the verifier must notice at least 70 % of the removals) failed: 18 of 54 removals went unnoticed. Two gaps, both fixed (`gpu_verify` / `gpu_protocol`, md5 unchanged, every kernel still verifies with 0 errors):
+1. The role barrier balance (`GV-BAR`) summed only the then-arm of each nested if. A barrier missing from an else arm (one of the per-exit drains, the full-tile arm of a tail test) was invisible. The two roles are now also compared on each nested if's barrier delta (else − then; ifs whose arms run the same barriers are ignored).
+2. The tile-protocol simulation never took a runtime `break_if`, so the code after a mid-loop exit (the drain of a two-tile pass) was never simulated. In the last simulated iteration each runtime exit is now a decision, keyed by its ordinal so that the roles leave at the same exit.
+
+After the fixes all 54 removals are detected; `cargo test` 548 / 0.
+
 ## 5. Findings so far, per difference class (the deliverable)
 
 | Difference from the vendor kernel | Class | State |
@@ -379,8 +405,11 @@ Our list scheduler, given our registers and waits, finds a faster order than the
 | The vendor's register numbers (roles) | back-end Weaver: schedule-aware RA around a full plan; DSL: register plans for transient fragments | pins cost −4 … −12 % on our schedule; off (§4.4) |
 | M0 written per LDS-DMA issue | back-end Weaver: M0 planning | W3 B2 |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
-| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension | analysed (§4.7), next |
-| PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % on our registers / waits (§4.8): needs the V prefetch and schedule-aware RA |
-| V-fragment prefetch before the barrier | expressible (weave order) | next |
+| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension | analysed (§4.7); **blocked on W3 B4+** |
+| PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % on our registers / waits (§4.8): **blocked on W3 B4+** (schedule-aware RA), with the V prefetch |
+| V-fragment prefetch before the barrier | expressible (weave order) | **blocked on W3 B4+** (pays only with the authored order + schedule-aware RA) |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
+| Verifier blind spots for multi-exit loops (else-arm barriers, mid-loop exits) | verification: incomplete | fixed (§4.9) |
 | gpu_verify on lifted vendor code | proofs only for what the DSL expresses; lifted asm is opaque | — |
+
+**Shipped result of W5:** the replica configuration (steps 1, 2, 4a, 4b) is the shipped `_vs128` (§4.9): perf_ab +1.7 % geomean, per-CU 0.971× the vendor.

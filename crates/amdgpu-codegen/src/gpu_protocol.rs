@@ -237,6 +237,9 @@ struct Sim<'a> {
     outer: i64,
     in_role: bool,
     unsupported: &'a mut Vec<(usize, String)>,
+    /// runtime `break_if`s met in the current iteration of the outermost loop (their ordinal keys the exit decision, so that the two roles' loops,
+    /// built alike, pair exit for exit)
+    brk_ord: usize,
 }
 
 impl<'a> Sim<'a> {
@@ -421,6 +424,7 @@ impl<'a> Sim<'a> {
                     for it in 0..self.n {
                         if self.loop_depth == 1 {
                             self.outer = it as i64;
+                            self.brk_ord = 0;
                         }
                         self.exec_loop_body(i + 1, close);
                         if self.break_taken {
@@ -437,11 +441,25 @@ impl<'a> Sim<'a> {
                     continue;
                 }
                 Stmt::BreakIf { cond } => {
-                    if let CV::K(c) = self.cv(cond) {
-                        if c != 0 {
-                            self.break_taken = true;
-                            return;
+                    match self.cv(cond) {
+                        CV::K(c) => {
+                            if c != 0 {
+                                self.break_taken = true;
+                                return;
+                            }
                         }
+                        // a runtime exit of the outermost loop: in its LAST simulated iteration each exit point is a decision (taken / not taken), so the
+                        // code after every exit (e.g. a per-exit drain of a loop unrolled by two) is simulated too; keyed by the exit's ordinal in the
+                        // iteration (workgroup-uniform: both roles leave at the same exit)
+                        CV::U if self.loop_depth == 1 && self.outer == self.n as i64 - 1 => {
+                            let key = usize::MAX - self.brk_ord;
+                            self.brk_ord += 1;
+                            if self.choose(key, true) {
+                                self.break_taken = true;
+                                return;
+                            }
+                        }
+                        CV::U => {}
                     }
                 }
                 Stmt::BeginIf { cond } => {
@@ -942,7 +960,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 64 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0 };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));

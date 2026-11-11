@@ -2463,7 +2463,10 @@ fn flat_len(nodes: &[Node]) -> usize {
 
 /// Dynamic barrier count of a statement range as a polynomial in the loop trip counts: index d = coefficient of the product of the trip counts of d nested loops
 /// (all loops at the same nesting depth are assumed to run the same number of iterations in both roles, which is how the role kernels are built).
-fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool) -> Vec<i64> {
+/// `deltas` collects, per nested if in order, the barrier difference (else arm - then arm; an if without else counts as an empty else arm): the
+/// totals follow the then-sides only and would not see a barrier missing from an else arm (a per-exit drain, the full-tile arm of a tail test). Two
+/// roles built alike must have equal totals AND equal deltas, i.e. the same barrier count on every combination of (uniform) branch outcomes.
+fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, deltas: &mut Vec<Vec<i64>>) -> Vec<i64> {
     let mut out: Vec<i64> = vec![0];
     while *pos < stmts.len() {
         if until(&stmts[*pos]) {
@@ -2476,7 +2479,7 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool) ->
             }
             Stmt::BeginLoop { .. } => {
                 *pos += 1;
-                let inner = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndLoop));
+                let inner = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndLoop), deltas);
                 *pos += 1;
                 if out.len() < inner.len() + 1 {
                     out.resize(inner.len() + 1, 0);
@@ -2487,11 +2490,14 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool) ->
             }
             Stmt::BeginIf { .. } => {
                 *pos += 1;
-                let t = bar_counts(stmts, pos, &|s| matches!(s, Stmt::Else | Stmt::EndIf));
+                let t = bar_counts(stmts, pos, &|s| matches!(s, Stmt::Else | Stmt::EndIf), deltas);
+                let mut e = vec![0];
                 if matches!(stmts.get(*pos), Some(Stmt::Else)) {
                     *pos += 1;
-                    let _ = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndIf));
+                    e = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndIf), deltas);
                 }
+                let n = t.len().max(e.len());
+                deltas.push(trim((0..n).map(|d| e.get(d).copied().unwrap_or(0) - t.get(d).copied().unwrap_or(0)).collect()));
                 *pos += 1;
                 // a nested if contributes its then-side (nested divergent ifs are checked on their own)
                 if out.len() < t.len() {
@@ -2558,13 +2564,23 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
         if let Stmt::BeginIf { cond } = &f.stmts()[pos] {
             let divergent = tainted(cond, &tv, &tvars);
             let mut p = pos + 1;
-            let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf)));
+            let (mut te, mut ee) = (Vec::new(), Vec::new());
+            let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf), &mut te));
             let mut e = vec![0];
             if matches!(f.stmts().get(p), Some(Stmt::Else)) {
                 p += 1;
-                e = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf)));
+                e = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf), &mut ee));
             }
-            if divergent && t != e {
+            // nested ifs whose arms run the same barriers change nothing (and the two sides need not have the same nesting for them)
+            te.retain(|d| d.iter().any(|&x| x != 0));
+            ee.retain(|d| d.iter().any(|&x| x != 0));
+            if divergent && t == e && te != ee {
+                rep.add(
+                    "GV-BAR",
+                    Severity::Error,
+                    format!("stmt {pos}: wave-divergent if/else (condition depends on the workitem id): a nested if changes the barrier count differently in the two sides (else - then per nested if: then side {te:?} vs else side {ee:?}), so some combination of branch outcomes runs different numbers of barriers - waves that run fewer barriers deadlock the workgroup"),
+                );
+            } else if divergent && t != e {
                 rep.add(
                     "GV-BAR",
                     Severity::Error,
