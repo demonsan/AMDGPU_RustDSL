@@ -229,4 +229,10 @@ To be agreed before B0:
   flows from the producer to the consumer, otherwise `Order`; `distance` 0);
 - `Hints::interleave` from `Weaver::spread` (skeleton unit -> the fillers placed in its shadow);
 - each unit's statements are bracketed by `Stmt::UnitMark` with the unit's plan id, so `MInst::unit` ties the lowered instructions to it (`amdc weave-report` shows `N plan units`).
-Not yet derived (W2c): `RegionDecl` / `RegMark::Cap` into `Phase::order` / `Phase::budget` / `Hints::tokens`, `LoopBody` kinds and trip counts, CTA shape, roles, rings (pipeline templates), hand-offs and sync rules (stage contracts).
+W2c completes the plan at `FnBuilder::finish` (`amdgpu-dsl/src/plan_derive.rs`, derived from the function's own declarations; nothing changes in the emitted code):
+- `RegionDecl { authored, tokens }` -> `Phase::order` (`Authored` / `Free`) and `Hints::tokens`; `RegMark::Cap` -> `Phase::budget`; `RegMark::Share` / `Separate` -> `reg_constraints`;
+- phases whose units sit inside a loop -> `PhaseKind::LoopBody` (`rotate.steady`: peel = (prologue present, epilogue present); `trip` stays None: the IR has no induction variable);
+- stage contracts -> `HandOff` (a `live_out` value of an earlier stage that a later stage takes as `live_in`: registers, an LDS tile or global; the recorded fragment layout);
+- the contract's multi-slot LDS tiles -> `RingDecl` (producer / consumer phases from the units that contain the tile's produce / consume regions; private tiles `owner: Wave`; the cadence is inferred from the slot count: 3 slots one window, else the two-phase offset);
+- `CtaShape` from the workgroup size.
+Not derived yet: `RegMark::PinV` / `RegMark::Ring` / last-arriver `CrossCta` (waiting for the plan-ext2 forms), `Counted` / `Barrier` rules (the Order dependences carry them until B4), wave roles, the loop trip counts.
