@@ -78,3 +78,54 @@ fn movb64_zeroes_tuple_pairs_with_v_mov_b64() {
     assert_eq!(a.matches("v_mov_b64").count(), 2, "a Frag4 is two pairs:\n{a}");
     strict_ok(&f);
 }
+
+/// A loop over a kernarg count with uniform arithmetic: `it + 3` (addk), `n - it` and `it | 1` (s_sub / s_or), an unsigned loop exit
+/// `it >= n` (s_cmp_ge_u32) and `v_mul_i32_i24` on small per-lane values.
+fn salu_kernel(tokens: &[&str]) -> Function {
+    use amdgpu_dsl::{varx, BinOp, Opnd};
+    let mut b = FnBuilder::new("probe_salu32", 256);
+    b.arg("x", DType::Ptr, 0x00, 8);
+    b.arg("o", DType::Ptr, 0x08, 8);
+    b.arg("n", DType::I32, 0x10, 4);
+    b.arg("pad", DType::I32, 0x14, 4);
+    b.arg_tensor("x", Ext::c(256 * 4));
+    b.arg_tensor("o", Ext::c(256 * 4));
+    b.ka_range(0x10, 1, 64);
+    b.lower_opts(&[&["scalarize"][..], tokens].concat());
+    let po = b.let_(Op::KernargPtr { offset: 0x08 });
+    let n = b.let_(Op::KernargI32 { offset: 0x10 });
+    let tid = b.let_(Op::WorkitemId);
+    let v = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))]);
+    let (it, acc) = (v[0], v[1]);
+    let left = b.let_(Op::Bin(BinOp::SubU32, n.into(), Opnd::Var(it)));
+    let odd = b.let_(Op::Bin(BinOp::OrB32, Opnd::Var(it), Opnd::I32(1)));
+    let s = b.bind_i32(varx(acc) + left + odd);
+    b.set_var(acc, s);
+    let nx = b.bind_i32(varx(it) + 3);
+    b.set_var(it, nx);
+    let done = b.cmp(CmpPred::Ge, CmpTy::U32, Opnd::Var(it), n);
+    b.break_if(done);
+    b.end_loop();
+    let small = b.bind_i32(ev(tid) & 255);
+    let prod = b.let_(Op::Bin(BinOp::MulI32I24, small.into(), Opnd::Var(acc)));
+    let off = b.bind_i32(ev(tid) << 2);
+    let q = b.ptr_add(po, off);
+    let f = b.let_(Op::BitcastF32(prod.into()));
+    b.store_f32(q, 0, f);
+    b.finish()
+}
+
+#[test]
+fn salu32_selects_the_scalar_forms() {
+    let base = asm(&salu_kernel(&[]));
+    for m in ["s_sub_u32", "s_or_b32", "s_addk_i32", "s_cmp_ge_u32"] {
+        assert!(!base.contains(m), "{m} without the token:\n{base}");
+    }
+    assert!(base.contains("v_mul_i32_i24"), "the explicit op always lowers to v_mul_i32_i24:\n{base}");
+    let f = salu_kernel(&["salu32"]);
+    let a = asm(&f);
+    for m in ["s_sub_u32", "s_or_b32", "s_addk_i32", "s_cmp_ge_u32"] {
+        assert!(a.contains(m), "{m} missing:\n{a}");
+    }
+    strict_ok(&f);
+}

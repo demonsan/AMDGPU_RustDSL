@@ -483,6 +483,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VMinU32 => bin(a, inst, "v_min_u32_e32"),
         MOp::VSubU32 => bin(a, inst, "v_sub_u32_e32"),
         MOp::VMulU32U24 => bin(a, inst, "v_mul_u32_u24_e32"),
+        MOp::VMulI32I24 => bin(a, inst, "v_mul_i32_i24_e32"),
         MOp::VAshrI32 => bin(a, inst, "v_ashrrev_i32_e32"),
         MOp::VMulHiU32 => bin(a, inst, "v_mul_hi_u32"),
         MOp::VMulHiI32 => bin(a, inst, "v_mul_hi_i32"),
@@ -1059,6 +1060,20 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SLshrB32 => vec![format!("s_lshr_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SAndB32 => vec![format!("s_and_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SXorB32 => vec![format!("s_xor_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SSubU32 => vec![format!("s_sub_u32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SOrB32 => vec![format!("s_or_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SAddkI32 => {
+            let d = d_s(a, inst);
+            let s = src1_s(a, inst.srcs[0]);
+            if d == s {
+                vec![format!("s_addk_i32 {d}, {}", inst.imm)]
+            } else {
+                vec![format!("s_mov_b32 {d}, {s}"), format!("s_addk_i32 {d}, {}", inst.imm)]
+            }
+        }
+        MOp::SCmpEqU32 => vec![format!("s_cmp_eq_u32 {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SCmpGeU32 => vec![format!("s_cmp_ge_u32 {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SCmpLeU32 => vec![format!("s_cmp_le_u32 {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SMinI32 => vec![format!("s_min_i32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SCselectB64 | MOp::SCselectB128 => {
             let (d, x, y) = (a.phys[inst.dst.expect("dst") as usize], a.phys[reg_of(&inst.srcs[0]) as usize], a.phys[reg_of(&inst.srcs[1]) as usize]);

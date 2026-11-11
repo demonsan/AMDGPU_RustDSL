@@ -86,6 +86,9 @@ fn eval(m: &MFunction, insts: &[MInst], env: &mut HashMap<VReg, K>, gc: &HashMap
             MOp::VCmpLtU32 => (Some(VCC), cmp(env, &|a, b| a < b, true)),
             MOp::VCmpGeU32 => (Some(VCC), cmp(env, &|a, b| a >= b, true)),
             MOp::SCmpLtI32 => (Some(SCC), cmp(env, &|a, b| a < b, false)),
+            MOp::SCmpEqU32 => (Some(SCC), cmp(env, &|a, b| a == b, true)),
+            MOp::SCmpGeU32 => (Some(SCC), cmp(env, &|a, b| a >= b, true)),
+            MOp::SCmpLeU32 => (Some(SCC), cmp(env, &|a, b| a <= b, true)),
             MOp::VCndmask => {
                 // srcs[0] when vcc is false, srcs[1] when true
                 let o = match env.get(&VCC) {
