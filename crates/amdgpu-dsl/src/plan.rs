@@ -223,8 +223,8 @@ pub enum FlagRef {
 /// The split / merge variants of a cross-CTA reduction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CrossCtaProtocol {
-    /// the last CTA to arrive (atomic `counter`) merges the `partials`
-    LastArriver { counter: RegRef, partials: Vec<RegRef> },
+    /// the last CTA to arrive (atomic `counter`) merges the `partials` (global regions by name; `splits` = the number of arrivers)
+    LastArriver { counter: FlagRef, partials: Vec<String>, splits: Option<Ext> },
     /// a separate merge kernel
     SeparateKernel,
     /// the merge happens inside the CTA through LDS

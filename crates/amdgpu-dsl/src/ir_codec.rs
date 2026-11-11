@@ -1631,7 +1631,7 @@ impl IrIds for FlagRef {
 impl FromIr for CrossCtaProtocol {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
-            "LastArriver" => { v.expect_struct("LastArriver")?; Ok(CrossCtaProtocol::LastArriver { counter: FromIr::from_ir(v.field("counter")?)?, partials: FromIr::from_ir(v.field("partials")?)? }) }
+            "LastArriver" => { v.expect_struct("LastArriver")?; Ok(CrossCtaProtocol::LastArriver { counter: FromIr::from_ir(v.field("counter")?)?, partials: FromIr::from_ir(v.field("partials")?)?, splits: FromIr::from_ir(v.field("splits")?)? }) }
             "SeparateKernel" => { v.expect_unit("SeparateKernel")?; Ok(CrossCtaProtocol::SeparateKernel) }
             "InCtaLds" => { v.expect_unit("InCtaLds")?; Ok(CrossCtaProtocol::InCtaLds) }
             other => Err(v.err(format!("unknown CrossCtaProtocol variant `{other}`"))),
@@ -1641,7 +1641,7 @@ impl FromIr for CrossCtaProtocol {
 impl IrIds for CrossCtaProtocol {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            CrossCtaProtocol::LastArriver { counter, partials } => { IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*partials), fv, fr); }
+            CrossCtaProtocol::LastArriver { counter, partials, splits } => { IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*partials), fv, fr); IrIds::ids(&mut (*splits), fv, fr); }
             CrossCtaProtocol::SeparateKernel => {}
             CrossCtaProtocol::InCtaLds => {}
         }
