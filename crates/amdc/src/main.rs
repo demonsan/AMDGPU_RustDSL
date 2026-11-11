@@ -391,8 +391,27 @@ fn main() -> ExitCode {
                     println!("{{\"kind\":\"{kind}\",\"m\":{m},\"n\":{n},\"k\":{k},\"cus\":{cus},\"rule\":{rule},\"candidates\":[{}]}}", rows.join(","));
                     ExitCode::SUCCESS
                 }
+                (Some(fam @ ("decode16" | "prefill_bf16")), _, _, _, _) => {
+                    // amdc compose-search decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal 0|1>
+                    let cus = opt("--cus", 256.0) as u64;
+                    let a = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let (cands, rule, shape) = if fam == "decode16" {
+                        let (b, hk, ctx, page) = (a(2), a(3), a(4), opt("--page", 16.0) as u32);
+                        let (rk, rs) = amdgpu_graph::dispatch::decode16_kernel(page, amdgpu_graph::dispatch::decode16_plan(b, hk, ctx));
+                        (cs::decode16_candidates(b, hk, ctx, page, cus), format!("{{\"kernel\":\"{rk}\",\"splits\":{rs},\"reduce\":null}}"), format!("\"b\":{b},\"hk\":{hk},\"ctx\":{ctx},\"page\":{page}"))
+                    } else {
+                        let (b, h, sq, sk, c) = (a(2), a(3), a(4), a(5), a(6) != 0);
+                        let (rk, rs) = amdgpu_graph::dispatch::bf16_prefill_kernel(b, h, sq, sk, c, cus);
+                        let red = if rs > 1 { "\"attn_combine_bf16_hd128_q16\"" } else { "null" };
+                        (cs::prefill_bf16_candidates(b, h, sq, sk, c, cus), format!("{{\"kernel\":\"{rk}\",\"splits\":{rs},\"reduce\":{red}}}"), format!("\"b\":{b},\"h\":{h},\"sq\":{sq},\"sk\":{sk},\"causal\":{c}"))
+                    };
+                    let kept = cs::prune(&cands, opt("--margin", 1.5));
+                    let rows: Vec<String> = cands.iter().zip(&kept).map(|(c, k)| c.to_json(*k)).collect();
+                    println!("{{\"kind\":\"{fam}\",{shape},\"cus\":{cus},\"rule\":{rule},\"candidates\":[{}]}}", rows.join(","));
+                    ExitCode::SUCCESS
+                }
                 _ => {
-                    eprintln!("usage: amdc compose-search gemm <bf16|i8_rowcol|fp8_rowcol|fp8_blockscale> <M> <N> <K> [--cus N] [--margin X]");
+                    eprintln!("usage: amdc compose-search gemm <bf16|i8_rowcol|fp8_rowcol|fp8_blockscale> <M> <N> <K> [--cus N] [--margin X] | decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal>");
                     ExitCode::from(2)
                 }
             }
