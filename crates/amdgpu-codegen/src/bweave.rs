@@ -645,7 +645,9 @@ mod interleave_tests {
         let ops: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
         assert_eq!(ops[2], MOp::BufferLoadDwordX4Lds, "a DMA right after the first MFMA: {ops:?}");
         // 2 slots, distance 2: the DMAs overwrite the slot QK reads: they stay behind the reads
-        assert_eq!(interleave(&mut m2, &mk(2)), (0, 1));
+        interleave(&mut m2, &mk(2));
+        let ops2: Vec<MOp> = m2.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert!(ops2[..4].iter().all(|o| *o != MOp::BufferLoadDwordX4Lds), "the DMAs stay after both K reads: {ops2:?}");
     }
 
     #[test]
