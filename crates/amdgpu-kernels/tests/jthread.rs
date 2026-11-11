@@ -80,10 +80,11 @@ fn each_exit_goes_straight_to_its_drain() {
     let cmp_branch = |m: &amdgpu_codegen::mir::MFunction| {
         m.blocks.iter().filter(|b| b.insts.iter().any(|i| i.op == amdgpu_codegen::mir::MOp::VCmpEqI32) && matches!(b.term, amdgpu_codegen::mir::Term::CondGoto { .. })).count()
     };
-    assert_eq!(cmp_branch(&base), 0, "the flag compare feeds a cndmask; the branch is on the 0/1 value:\n{}", dump(&base));
+    assert_eq!(cmp_branch(&base), 1, "one exit block compares the flag and branches:\n{}", dump(&base));
     let ne_branch = |m: &amdgpu_codegen::mir::MFunction| m.blocks.iter().filter(|b| b.insts.iter().any(|i| i.op == amdgpu_codegen::mir::MOp::VCmpEqI32) && matches!(b.term, amdgpu_codegen::mir::Term::Goto(_))).count();
     assert_eq!(ne_branch(&base), 0);
     let t = lowered(&["jthread"]);
+    assert_eq!(cmp_branch(&t), 0, "no block branches on the flag:\n{}", dump(&t));
     assert_eq!(ne_branch(&t), 2, "two copies of the exit block, each ending in a jump:\n{}", dump(&t));
     // the two copies go to different drains
     let targets: Vec<u32> = t
