@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # MFMA result latency per operand format (tools/mfma_lat_probe.py).  Usage: HIP_VISIBLE_DEVICES=0 bash tools/mfma_lat_probe.sh
 set -uo pipefail
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-2}"; case ",$HIP_VISIBLE_DEVICES," in *,[4-7],*) echo "GPUs 4-7 are not to be used (user rule): HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"; exit 2;; esac
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/mlat
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 [ -x build/tileop_probe_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/tileop_probe_host.cpp -o build/tileop_probe_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
