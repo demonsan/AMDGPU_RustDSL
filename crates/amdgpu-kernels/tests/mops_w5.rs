@@ -99,7 +99,7 @@ fn salu_kernel(tokens: &[&str]) -> Function {
     let (it, acc) = (v[0], v[1]);
     let left = b.let_(Op::Bin(BinOp::SubU32, n.into(), Opnd::Var(it)));
     let odd = b.let_(Op::Bin(BinOp::OrB32, Opnd::Var(it), Opnd::I32(1)));
-    let s = b.bind_i32(varx(acc) + left + odd);
+    let s = b.bind_i32(varx(acc) + ev(left) + ev(odd));
     b.set_var(acc, s);
     let nx = b.bind_i32(varx(it) + 3);
     b.set_var(it, nx);
