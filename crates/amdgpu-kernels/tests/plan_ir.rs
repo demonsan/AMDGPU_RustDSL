@@ -36,9 +36,13 @@ fn a_plan() -> KernelPlan {
         sync: vec![
             SyncRule::Counted { producer: 0, consumer: 1, counter: "vmcnt".into(), slack: 2 },
             SyncRule::Barrier { after: 0, before: 1 },
-            SyncRule::CrossCta { flag: RegRef::Var(amdgpu_dsl::VarId(0)), scope: "agent".into(), protocol: CrossCtaProtocol::SeparateKernel, order: MemOrder::AcqRel },
+            SyncRule::CrossCta { flag: FlagRef::Kernarg { arg: "counter".into(), region: Some("merge".into()) }, scope: "agent".into(), protocol: CrossCtaProtocol::SeparateKernel, order: MemOrder::AcqRel },
         ],
-        reg_constraints: vec![RegConstraint::Separate(vec![RegRef::Var(amdgpu_dsl::VarId(0))])],
+        reg_constraints: vec![
+            RegConstraint::Separate(vec![RegRef::Var(amdgpu_dsl::VarId(0))]),
+            RegConstraint::Pin { value: RegRef::Var(amdgpu_dsl::VarId(0)), base: 64 },
+            RegConstraint::RegRing { name: "kfrag".into(), bufs: vec![RegRef::Var(amdgpu_dsl::VarId(0))] },
+        ],
         hints: Hints { interleave: vec![(1, vec![0])], priority: vec![(1, 2)], prefetch_depth: vec![(1, 2)], tokens: vec![(1, "ldsink=1".into())] },
     }
 }

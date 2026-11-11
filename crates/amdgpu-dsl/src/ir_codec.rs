@@ -1610,6 +1610,24 @@ impl IrIds for RingDecl {
     }
 }
 
+impl FromIr for FlagRef {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Value" => { v.expect_tuple("Value", 1)?; Ok(FlagRef::Value(FromIr::from_ir(v.item(0)?)?)) }
+            "Kernarg" => { v.expect_struct("Kernarg")?; Ok(FlagRef::Kernarg { arg: FromIr::from_ir(v.field("arg")?)?, region: FromIr::from_ir(v.field("region")?)? }) }
+            other => Err(v.err(format!("unknown FlagRef variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for FlagRef {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            FlagRef::Value(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            FlagRef::Kernarg { arg, region } => { IrIds::ids(&mut (*arg), fv, fr); IrIds::ids(&mut (*region), fv, fr); }
+        }
+    }
+}
+
 impl FromIr for CrossCtaProtocol {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
@@ -1657,6 +1675,8 @@ impl FromIr for RegConstraint {
         match v.name()? {
             "Share" => { v.expect_tuple("Share", 1)?; Ok(RegConstraint::Share(FromIr::from_ir(v.item(0)?)?)) }
             "Separate" => { v.expect_tuple("Separate", 1)?; Ok(RegConstraint::Separate(FromIr::from_ir(v.item(0)?)?)) }
+            "Pin" => { v.expect_struct("Pin")?; Ok(RegConstraint::Pin { value: FromIr::from_ir(v.field("value")?)?, base: FromIr::from_ir(v.field("base")?)? }) }
+            "RegRing" => { v.expect_struct("RegRing")?; Ok(RegConstraint::RegRing { name: FromIr::from_ir(v.field("name")?)?, bufs: FromIr::from_ir(v.field("bufs")?)? }) }
             other => Err(v.err(format!("unknown RegConstraint variant `{other}`"))),
         }
     }
@@ -1666,6 +1686,8 @@ impl IrIds for RegConstraint {
         match self {
             RegConstraint::Share(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             RegConstraint::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            RegConstraint::Pin { value, base } => { IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*base), fv, fr); }
+            RegConstraint::RegRing { name, bufs } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); }
         }
     }
 }
