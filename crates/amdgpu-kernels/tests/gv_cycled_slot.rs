@@ -15,7 +15,7 @@ fn cycled(prev: bool) -> Function {
     let (it, idx) = (v[0], v[1]);
     let stop = b.cmp(amdgpu_dsl::CmpPred::Ge, amdgpu_dsl::CmpTy::I32, Opnd::Var(it), n);
     b.break_if(stop);
-    let slot = if prev { b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2)) } else { b.bind_i32(varx(idx)) };
+    let slot = if prev { b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2)) } else { b.bind_i32(varx(idx) + 0) };
     let addr = b.bind_i32(ev(slot) * 1024 + (ev(tid) << 4));
     let z = b.c_i32(0);
     let f4 = b.frag4(z, z, z, z);
