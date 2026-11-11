@@ -329,10 +329,12 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let ov: Vec<VarId> = vars[3..11].to_vec();
     let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
     let itx = amdgpu_dsl::varx(it);
+    let mut units = amdgpu_dsl::units::Units::new();
+    let (_, (key_t, kvsc, nv)) = units.capture(&mut b, "decode16.issue", |b| {
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
     // grouped pages (bf16 flash): one load per page group, the raw value shared by the group's DMAs
-    let gpages: Vec<ValueId> = if grp_path { (0..ngrp).map(|g| group_page(&mut b, ev(key_t), g)).collect() } else { Vec::new() };
+    let gpages: Vec<ValueId> = if grp_path { (0..ngrp).map(|g| group_page(b, ev(key_t), g)).collect() } else { Vec::new() };
     let lookups: Vec<(ValueId, ValueId)> = if grp_path {
         (0..KT / 4)
             .map(|i| {
@@ -398,7 +400,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         })
         .collect();
     let l8 = b.bind_i32(lane.lane() & 7);
-    me.write(&mut b, Opnd::Var(it), |b| {
+    me.write(b, Opnd::Var(it), |b| {
         for (i, &(kc, rowoff)) in rows.iter().enumerate() {
             // (fp8: chunk ^ key % 8 within the 8-chunk row)
             let kvo = if blocked {
@@ -451,7 +453,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                 .collect();
             let hsel = b.bind_cond((lane.lane() & 1).eq(1));
             let pgl = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hsel), a: Opnd::Val(pgs[1]), b: Opnd::Val(pgs[0]) });
-            ms.write(&mut b, Opnd::Var(it), |b| {
+            ms.write(b, Opnd::Var(it), |b| {
                 for i in 0..4i32 {
                     // chunk c = 64 i + l: d = c / 2 = 32 i + l / 2
                     let vvo = b.bind_i32(ev(pgl) + ((lane.lane().lshr(1)) + 32 * i) * page);
@@ -462,7 +464,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         }
         Some(ms) => {
             let sb = ms.base();
-            ms.write(&mut b, Opnd::Var(it), |b| {
+            ms.write(b, Opnd::Var(it), |b| {
                 for (i, &(_, rowoff)) in rows.iter().enumerate() {
                     let vvo = b.bind_i32(ev(rowoff) + (ev(l8) << 4));
                     let m0v = b.bind_i32(sb.clone() + ((i as i32) << 10));
@@ -470,7 +472,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                 }
             });
         }
-        None => mev.write(&mut b, Opnd::Var(it), |b| {
+        None => mev.write(b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
                 // V tile swizzle: the 32-byte granule G of tile row r is stored at granule G ^ (r % 8) (the DMA lands lane-linear, so the swizzle is applied to the SOURCE chunk: l16 ^ 2 (r % 8))
                 let vvo = if grp_path { goff[i].1 } else { let vsw = b.bind_i32((kk_of(i as i32) & 7) << 1); b.bind_i32(ev(rowoff) + ((ev(l16) ^ ev(vsw)) << 4)) };
@@ -479,10 +481,13 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }),
     }
-    b.wait_vm(nv);
+    (key_t, kvsc, nv)
+    });
+    units.anchor(&mut b, "decode16.wait_k", |b| b.wait_vm(nv));
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
+    units.capture(&mut b, "decode16.qk", |b| {
     let kb = b.bind_i32(mbase.clone());
-    me.read_back(&mut b, Opnd::Var(it), |b| {
+    me.read_back(b, Opnd::Var(it), |b| {
         for c in 0..4usize {
             for blk in 0..NKB as i32 {
                 let kf = if fp8 {
@@ -507,7 +512,9 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }
     });
+    });
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
+    let (_, (p, zf)) = units.capture(&mut b, "decode16.softmax", |b| {
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(16);
     // grouped path: the key mask only on the tile that needs it (uniform branch, VALU only, in place)
@@ -543,7 +550,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     for pair in s[1..].chunks(2) {
         mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
     }
-    let mt = group4(&mut b, mx, true);
+    let mt = group4(b, mx, true);
     let mt = b.mul_f32(mt, csc);
     let thr = b.c_f32(8.0);
     let mlim = b.add_f32(Opnd::Var(m_v), thr);
@@ -582,7 +589,10 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     }
     let l_new = b.add_f32(Opnd::Var(l_v), ps);
     b.set_var(l_v, l_new);
-    b.wait_vm(0);
+    (p, zf)
+    });
+    units.anchor(&mut b, "decode16.wait_v", |b| b.wait_vm(0));
+    units.capture(&mut b, "decode16.vconv", |b| {
     if let Some(ms) = &mvs {
         // fp8: the staged V rows -> the bf16 V tile (lane: key l / 2, d half l % 2: 64 fp8 -> 64 bf16); blocked: the staged V^T chunks
         // 4 l .. 4 l + 3 (d 2 l + q / 2, keys 16 (q % 2) ..) -> the bf16 V^T tile [128 d][32 keys] (rows of 64 bytes)
@@ -590,11 +600,11 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let key = b.bind_i32(lane.lane().lshr(1));
         let hf = b.bind_i32(lane.lane() & 1);
         let src = if blocked { b.bind_i32(sb.clone() + (lane.lane() << 6)) } else { b.bind_i32(sb.clone() + ev(key) * D + (ev(hf) << 6)) };
-        let raw: Vec<ValueId> = ms.read_back(&mut b, Opnd::Var(it), |b| (0..4i32).map(|q| { let a = b.bind_i32(ev(src) + 16 * q); b.load_lds_b128(a) }).collect());
+        let raw: Vec<ValueId> = ms.read_back(b, Opnd::Var(it), |b| (0..4i32).map(|q| { let a = b.bind_i32(ev(src) + 16 * q); b.load_lds_b128(a) }).collect());
         let one = b.c_f32(1.0);
         // (blocked: chunk q of the lane -> d 2 l + q / 2 row (64 bytes), 32 bytes at 32 (q % 2); the per-q offset 64 (q / 2) + 32 (q % 2) = 32 q)
         let dst = if blocked { b.bind_i32(vbase0.clone() + (lane.lane() << 7)) } else { b.bind_i32(vbase0.clone() + ev(key) * ROW + (ev(hf) << 7)) };
-        mev.write(&mut b, Opnd::Var(it), |b| {
+        mev.write(b, Opnd::Var(it), |b| {
             for (q, f) in raw.iter().enumerate() {
                 let ws: Vec<ValueId> = (0..4u8)
                     .flat_map(|dw| [(dw, 0u8), (dw, 1u8)])
@@ -612,8 +622,10 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         });
         b.wait_lds(0);
     }
+    });
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     // blocked: P times the per-key V scales (the row sum l is unscaled)
+    units.capture(&mut b, "decode16.pv", |b| {
     let p: Vec<ValueId> = match &kvsc { Some((_, vs)) => p.iter().zip(vs).map(|(x, s)| b.mul_f32(*x, *s)).collect(), None => p };
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
     // the swizzled granule offsets of the 8 d blocks (hoisted): (db ^ (r0 % 8)) * 32, r0 = 4 grp + l16 / 4
@@ -622,7 +634,7 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     let vgran: Vec<ValueId> = if vswz { (0..8i32).map(|db| { let g = b.bind_i32((ev(r0m) ^ db) << 5); b.bind_i32(ev(vb) + ev(g)) }).collect() } else { Vec::new() };
     // blocked: the V^T row (d 16 db + l % 16) bytes of keys 4 g .. 4 g + 3 and 16 + 4 g ..
     let vtb = blocked.then(|| b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3)));
-    mev.read_back(&mut b, Opnd::Var(it), |b| {
+    mev.read_back(b, Opnd::Var(it), |b| {
         for t in 0..NKB / 2 {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
@@ -647,6 +659,9 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             }
         }
     });
+    });
+    // the loop body as Weaver units in the authored order (docs/w6-laggards.md): plan units for the back-end Weaver, no code change
+    amdgpu_stage::weave::Weaver::new(units).plan_label("decode16.loop").seq().emit(&mut b);
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));

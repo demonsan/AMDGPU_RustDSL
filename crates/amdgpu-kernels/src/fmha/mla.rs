@@ -144,6 +144,8 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let ov: Vec<VarId> = vars[3..3 + DB].to_vec();
     let sv_: Vec<VarId> = vars[3 + DB..5 + DB].to_vec();
     let itx = amdgpu_dsl::varx(it);
+    let mut units = amdgpu_dsl::units::Units::new();
+    let (_, key_t) = units.capture(&mut b, "mla.issue", |b| {
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 5)); b.read_first_lane(v) };
     b.wait_lds(0);
     // the row base of key l % 32 of the tile (one block-table load per lane), shared by ds_bpermute
@@ -156,7 +158,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     // per half: 18 issues of 1 KB (chunk c = 72 key + position, key < 16), row bases by ds_bpermute from lane 16 h + key
     for (h, me) in mes.iter().enumerate() {
         let mb = mbases[h].clone();
-        me.write(&mut b, Opnd::Var(it), |b| {
+        me.write(b, Opnd::Var(it), |b| {
             for g0 in (0..18i32).step_by(9) {
                 let parts: Vec<(ValueId, ValueId)> = (g0..g0 + 9)
                     .map(|i| {
@@ -178,19 +180,24 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
             }
         });
     }
+    key_t
+    });
     // ---- S^T: block (half) 0 after its 18 DMAs complete (half 1 in flight), then block 1 ----
     for blk in 0..2usize {
-        b.wait_vm(if blk == 0 { 18 } else { 0 });
+        units.anchor(&mut b, format!("mla.wait{blk}"), |b| b.wait_vm(if blk == 0 { 18 } else { 0 }));
+        units.capture(&mut b, format!("mla.qk{blk}"), |b| {
         let kb = b.bind_i32(mbases[blk].clone());
-        mes[blk].read_back(&mut b, Opnd::Var(it), |b| {
+        mes[blk].read_back(b, Opnd::Var(it), |b| {
             for c in 0..QC {
                 let a = b.bind_i32(ev(kr[c]) + ev(kb));
                 let kf = b.load_lds_b128(a);
                 b.var_mfma(sv_[blk], kind, kf, qf[c], c == 0);
             }
         });
+        });
     }
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
+    let (_, (p, zf)) = units.capture(&mut b, "mla.softmax", |b| {
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(8);
     for blk in 0..2usize {
@@ -205,7 +212,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     for pair in s[1..].chunks(2) {
         mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
     }
-    let mt = group4(&mut b, mx, true);
+    let mt = group4(b, mx, true);
     let mt = b.mul_f32(mt, csc);
     let thr = b.c_f32(8.0);
     let mlim = b.add_f32(Opnd::Var(m_v), thr);
@@ -244,7 +251,10 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     }
     let l_new = b.add_f32(Opnd::Var(l_v), ps);
     b.set_var(l_v, l_new);
+    (p, zf)
+    });
     // ---- O^T += V^T P^T: one 32-key step x 32 blocks of 16 d ----
+    units.capture(&mut b, "mla.pv", |b| {
     let w: Vec<ValueId> = [(0usize, 0usize), (0, 2), (1, 0), (1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
     let pf = b.pack4(w[0], w[1], w[2], w[3]);
     let vb0: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbases[0].clone() + ev(*v))).collect();
@@ -253,11 +263,14 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     for db in 0..DB as i32 {
         let q = (db % 4) as usize;
         let hi = ((2 * db) & !7) << 4;
-        let x0 = mes[0].read_back(&mut b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb0[q]) + hi); b.load_lds_tr_b16(a) });
-        let x1 = mes[1].read_back(&mut b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb1[q]) + hi); b.load_lds_tr_b16(a) });
+        let x0 = mes[0].read_back(b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb0[q]) + hi); b.load_lds_tr_b16(a) });
+        let x1 = mes[1].read_back(b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb1[q]) + hi); b.load_lds_tr_b16(a) });
         let vf = b.cat_frag4(x0, x1);
         b.var_mfma(ov[db as usize], kind, vf, pf, false);
     }
+    });
+    // the loop body as Weaver units in the authored order (docs/w6-laggards.md): plan units for the back-end Weaver, no code change
+    amdgpu_stage::weave::Weaver::new(units).plan_label("mla.loop").seq().emit(&mut b);
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(nloop)));
@@ -447,6 +460,8 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
     ring.run(&mut b, it, &stage, |b, slot, tile| {
         let kbase = kvs.base as i32 + slot * KT * ROW;
         let sl = kvs.at(&SlotIdx::new(slot, Opnd::Var(it)));
+        let mut units = amdgpu_dsl::units::Units::new();
+        units.capture(b, "mla_hp.qk", |b| {
         sl.read(b, |b| {
             for c in 0..QC {
                 for blk in 0..2i32 {
@@ -456,6 +471,8 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
                 }
             }
         });
+        });
+        let (_, p) = units.capture(b, "mla_hp.softmax", |b| {
         let key_t = b.bind_i32(ev(k_lo) + (ev(tile) << 5));
         let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
         let mut s: Vec<ValueId> = Vec::with_capacity(8);
@@ -510,6 +527,9 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
         }
         let l_new = b.add_f32(Opnd::Var(l_v), ps);
         b.set_var(l_v, l_new);
+        p
+        });
+        units.capture(b, "mla_hp.pv", |b| {
         let w: Vec<ValueId> = [(0usize, 0usize), (0, 2), (1, 0), (1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
         let pf = b.pack4(w[0], w[1], w[2], w[3]);
         let vbase: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(ev(*v) + kbase)).collect();
@@ -523,6 +543,8 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
             }
         });
+        });
+        amdgpu_stage::weave::Weaver::new(units).plan_label("mla_hp.tile").seq().emit(b);
     });
     b.end_loop();
     // ---- the part's partial (as mla_decode_bf16, NS = S) ----
