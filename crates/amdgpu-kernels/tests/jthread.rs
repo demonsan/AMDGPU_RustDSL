@@ -59,8 +59,6 @@ fn dump(m: &amdgpu_codegen::mir::MFunction) -> String {
 fn dump_two_exit_mir() {
     let f = two_exit_kernel(&[]);
     let m = amdgpu_codegen::compile_mir(&f).unwrap_or_else(|e| panic!("{e}"));
-    if std::env::var("JTHREAD_DUMP").is_ok() {
-        println!("{}", dump(&m));
-    }
+    println!("{}", dump(&m));
     assert!(!m.blocks.is_empty());
 }
