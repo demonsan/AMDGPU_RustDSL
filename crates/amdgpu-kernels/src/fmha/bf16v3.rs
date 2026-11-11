@@ -169,6 +169,12 @@ impl Body<'_> {
 }
 impl PipeBody for Body<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        if role == Role::All {
+            // the single-group form: every wave stages its share of K (and the rope part) and of V
+            self.stage(b, Role::A, key0, slot);
+            self.stage(b, Role::B, key0, slot);
+            return;
+        }
         // (weave region markers: no code, the scheduler strategies of AMDC_SCHED_REGION / `declare_region` attach to these names, as in the MXFP8 kernels)
         b.weave_region_begin("kv_stage");
         // the stage as Weaver units in the authored order (docs/w6-laggards.md): plan units, no code change
@@ -210,6 +216,12 @@ impl PipeBody for Body<'_> {
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.s_init = self.qk(b, &t0.cur, None);
     }
+    /// The single-group form (`V3Opts::single`, `Cadence::OneWindow`): the softmax of tile t, then one Free plan phase {exp(t), QK(t + 1),
+    /// PV(t)} with the exps interleaved into the QK MFMAs (K(t + 1) is complete and published at the window start: staged two windows ahead
+    /// and drained by the previous window's `wait_vm(0)`); every wave runs the same schedule, no phase offset, no priority ping-pong
+    fn window(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
+        self.v_phase_x(b, role, t, true);
+    }
     fn loop_state(&mut self, b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let m0 = b.c_f32(-1.0e30);
         let l0 = b.c_f32(0.0);
@@ -224,7 +236,29 @@ impl PipeBody for Body<'_> {
         self.o = vars[2..6].to_vec();
         self.s = vars[6..6 + self.nb].to_vec();
     }
-    fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+    fn v_phase(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
+        self.v_phase_x(b, role, t, false);
+    }
+    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if self.prio {
+            b.set_prio(1);
+        }
+        b.weave_region_begin("m_phase");
+        let mut units = amdgpu_dsl::units::Units::new();
+        if !self.pv_early {
+            units.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+        }
+        if t.staged {
+            let s = self.s.clone();
+            units.capture(b, "m.qk", |b| self.qk(b, &t.next, Some(&s)));
+        }
+        amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.m_phase").seq().emit(b);
+        b.weave_region_end();
+    }
+}
+
+impl Body<'_> {
+    fn v_phase_x(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt, qk_in_free: bool) {
         if self.prio {
             b.set_prio(0);
         }
@@ -318,7 +352,7 @@ impl PipeBody for Body<'_> {
             .collect();
         pw
         });
-        if !self.pv_early {
+        if !self.pv_early && !qk_in_free {
             amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.v_phase").seq().emit(b);
             self.p = pw;
             b.weave_region_end();
@@ -332,26 +366,24 @@ impl PipeBody for Body<'_> {
         let mut fu = amdgpu_dsl::units::Units::new();
         fu.v.push(exp_unit);
         self.p = pw;
-        let (pv_id, _) = fu.capture(b, "m.pv", |b| self.pv(b, &t.cur));
-        amdgpu_stage::weave::Weaver::new(fu).plan_label("bf16v3.v_pv").seq().free().interleave(pv_id, vec![0]).emit(b);
+        if qk_in_free {
+            // single group: QK(t + 1) into the S variables (their tile-t values were taken by v.max), the exps interleaved into its MFMAs; then PV(t)
+            let qk_id = if t.staged {
+                let s = self.s.clone();
+                Some(fu.capture(b, "m.qk", |b| self.qk(b, &t.next, Some(&s))).0)
+            } else {
+                None
+            };
+            let (pv_id, _) = fu.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+            let skel = qk_id.unwrap_or(pv_id);
+            amdgpu_stage::weave::Weaver::new(fu).plan_label("bf16v3.window").seq().free().interleave(skel, vec![0]).emit(b);
+        } else {
+            let (pv_id, _) = fu.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+            amdgpu_stage::weave::Weaver::new(fu).plan_label("bf16v3.v_pv").seq().free().interleave(pv_id, vec![0]).emit(b);
+        }
         b.weave_region_end();
     }
-    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
-        if self.prio {
-            b.set_prio(1);
-        }
-        b.weave_region_begin("m_phase");
-        let mut units = amdgpu_dsl::units::Units::new();
-        if !self.pv_early {
-            units.capture(b, "m.pv", |b| self.pv(b, &t.cur));
-        }
-        if t.staged {
-            let s = self.s.clone();
-            units.capture(b, "m.qk", |b| self.qk(b, &t.next, Some(&s)));
-        }
-        amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.m_phase").seq().emit(b);
-        b.weave_region_end();
-    }
+
 }
 
 pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
@@ -372,7 +404,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let pair = dqk == 192 && !split && !name.contains("_np");
     // `_q128`: the 128-row / 64-key-tile form (mid-size causal grids, `dispatch`)
     let small = name.ends_with("_q128");
-    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small, pv_early: false })
+    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small, pv_early: false, single: false })
 }
 
 /// Build options of `fmha_fwd_bf16_v3_d` (A/B variants).
@@ -386,6 +418,8 @@ pub struct V3Opts {
     pub small: bool,
     /// PV(t) in the softmax phase as one Free phase with the exps (`Body::pv_early`)
     pub pv_early: bool,
+    /// one group of 8 waves (`Cadence::OneWindow`, 64-key tiles, 3-slot rings): softmax(t) + {exp(t), QK(t + 1), PV(t)} per window (`Body::window`)
+    pub single: bool,
 }
 
 /// `fmha_fwd_bf16_v3_d` with build options.
@@ -396,9 +430,11 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let QROW = 2 * dqk;
     // geometry: 256 query rows (two groups of 4 waves) x 128-key tiles, or (`opts.small`) 128 rows (two groups of 2 waves) x 64-key tiles:
     // half the LDS (two workgroups per CU) and twice the q tiles, for grids that leave CUs idle
-    let (qr, kt, wpg) = if opts.small { (128i32, 64i32, 2i32) } else { (QR, KT, 4) };
+    // (`opts.single`: 256 rows, all 8 waves one group (they stage K and V together), 64-key tiles in 3-slot rings)
+    let (qr, kt, wpg) = if opts.small { (128i32, 64i32, 2i32) } else if opts.single { (QR, 64, 8) } else { (QR, KT, 4) };
     let (qr_lg, kt_lg) = (qr.trailing_zeros() as i32, kt.trailing_zeros() as i32);
-    let mut b = FnBuilder::new(name, (2 * wpg * 64) as u32);
+    let nthreads = if opts.single { 512 } else { 2 * wpg * 64 };
+    let mut b = FnBuilder::new(name, nthreads as u32);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
     // (causal, also the causal key-split form: the Gemm profile measured faster (955 vs 915 TF/s at 8192², 350 vs 328 _ks S=2 at 4096²);
@@ -496,7 +532,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     // (XCD order of the (q tile, head) grid measured no gain: not used)
     let (qt, h, bat) = (qt0, h0, bat0);
     let lane = Lane::new(&mut b);
-    let roles = Roles::split(&mut b, &lane, wpg as u32);
+    let roles = Roles::split(&mut b, &lane, if opts.single { 4 } else { wpg } as u32);
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
     let half = b.bind_i32(lane.half());
@@ -510,17 +546,18 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
 
     // ---- LDS: the K / V rings (2 slots x 32 KB each) ----
     let mut lds = LdsPlan::new();
-    let ks = lds.ring("K", (kt * ROW) as i64, 2, TLayout::Linear);
-    let vs = lds.ring("V", (kt * ROW) as i64, 2, TLayout::Linear);
+    let nslots = if opts.single { 3 } else { 2 };
+    let ks = lds.ring("K", (kt * ROW) as i64, nslots, TLayout::Linear);
+    let vs = lds.ring("V", (kt * ROW) as i64, nslots, TLayout::Linear);
     // hd192: the K rope ring (128 keys x 128 bytes per slot)
-    let kbs = hd192.then(|| lds.ring("KR", (kt * 128) as i64, 2, TLayout::Linear));
+    let kbs = hd192.then(|| lds.ring("KR", (kt * 128) as i64, nslots, TLayout::Linear));
     lds.commit(&mut b);
     // DMA (per group, 4 waves): block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; K source chunk ^ (key % 16)
-    let wig = roles.wave_in_group;
+    let wig = if opts.single { b.bind_i32(lane.wave()) } else { roles.wave_in_group };
     let l16 = b.bind_i32(lane.lane() & 15);
     let k_so0 = { let v = b.bind_i32(ev(bat) * ev(k_bs) + ev(hkv) * ev(k_hs)); b.read_first_lane(v) };
     let v_so0 = { let v = b.bind_i32(ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs)); b.read_first_lane(v) };
-    let parts1 = lane_parts(&mut b, &lane, wig, wpg, l16, half, k_seqs, v_seqs, hd192);
+    let parts1 = lane_parts(&mut b, &lane, wig, wpg, kt, l16, half, k_seqs, v_seqs, hd192);
     // the second pass of the paired causal form rebinds them (`fresh2`): reusing the first pass's values keeps them live through its last tile
     let fresh2 = pair && opts.fresh2;
     let (ks, vs) = (&ks, &vs);
@@ -592,22 +629,22 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     let fresh = (fresh2 && guard.is_some()).then(|| {
         let half2 = b.bind_i32(lane.half());
         let l16b = b.bind_i32(lane.lane() & 15);
-        (half2, lane_parts(&mut b, &lane, wig, wpg, l16b, half2, k_seqs, v_seqs, hd192))
+        (half2, lane_parts(&mut b, &lane, wig, wpg, kt, l16b, half2, k_seqs, v_seqs, hd192))
     });
     let (half, lp) = match &fresh {
         Some((h, p)) => (*h, p),
         None => (half, &parts1),
     };
     let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: lp.k_vo.clone(), v_vo: lp.v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: lp.kb_vo.clone(), v_seqs: hd192.then_some(v_seqs), wpg };
-    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, kt, Ext::ka(272).ceil_div(kt as i64));
+    let mut pipe = Pipeline::new(if opts.single { Cadence::OneWindow } else { Cadence::TwoPhaseOffset }, nkv, kv_len, kt, Ext::ka(272).ceil_div(kt as i64));
     pipe.key_unclamped = true;
 
     let any = b.bind_cond(ev(nkv).gt(0));
     b.begin_if(Opnd::Val(any));
-    roles.each(&mut b, |b, role| {
+    let mut per_role = |b: &mut FnBuilder, role: Role| {
         let mut body = Body {
             ring: &ring, kind, qf: &qf, kr: &lp.kr, kr2: &lp.kr2, vr: lp.vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true, kt, nb: (kt / 32) as usize, pv_early: opts.pv_early,
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: !opts.single, kt, nb: (kt / 32) as usize, pv_early: opts.pv_early,
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
@@ -687,7 +724,12 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
             b.buffer_store_f32(r_l, vo, so, 0, lse);
         }
         b.end_if();
-    });
+    };
+    if opts.single {
+        per_role(&mut b, Role::All);
+    } else {
+        roles.each(&mut b, per_role);
+    }
     if let (Some(_), Some(pt)) = (lg_s, part) {
         // an empty part (no tile): O = 0, LSE = -inf (the combine weights it 0)
         b.else_();
@@ -748,14 +790,16 @@ struct LaneParts {
 /// DMA voffsets (per group, 4 waves: block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; source chunk ^ (key % 16)),
 /// the hd192 rope-part voffsets and the K / K-rope / V^T read offsets of the lane.
 #[allow(clippy::too_many_arguments)]
-fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, wpg: i32, l16: ValueId, half: ValueId, k_seqs: ValueId, v_seqs: ValueId, hd192: bool) -> LaneParts {
-    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + wpg * i) << 2) + lane.lane().lshr(4))).collect();
+fn lane_parts(b: &mut FnBuilder, lane: &Lane, wig: ValueId, wpg: i32, kt: i32, l16: ValueId, half: ValueId, k_seqs: ValueId, v_seqs: ValueId, hd192: bool) -> LaneParts {
+    // issues of 1 KB per wave: the tile's kt x 256-byte rows over the waves that stage it (8 for 128 keys x 4 waves)
+    let n_iss = kt * ROW / 1024 / wpg;
+    let keys: Vec<ValueId> = (0..n_iss).map(|i| b.bind_i32(((ev(wig) + wpg * i) << 2) + lane.lane().lshr(4))).collect();
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
     let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // hd192 rope part: 1 KB block bi = w + 4 i (i < 4) = keys 8 bi + lane / 8, chunk lane % 8 (source dims 128 + 8 chunk ..: byte 256 +), ^ key % 8
     let kb_vo: Vec<ValueId> = if hd192 {
-        (0..4)
+        (0..kt * 128 / 1024 / wpg)
             .map(|i| {
                 let k = b.bind_i32(((ev(wig) + wpg * i) << 3) + lane.lane().lshr(3));
                 b.bind_i32(ev(k) * ev(k_seqs) + 256 + (((lane.lane() & 7) ^ (ev(k) & 7)) << 4))

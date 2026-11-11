@@ -194,3 +194,29 @@ The B4 merge did weave the exps between the PV MFMAs in the emitted loop, and st
 **Not adopted.**
 
 **Cause.** In our two-group ping-pong, moving PV into the softmax phase takes the 32 PV MFMAs out of the matrix phase. The group in its softmax phase then competes for the matrix pipe with the other group's matrix phase, which now holds only QK. The phases also stop alternating cleanly: one is long and mixed, the other short. The vendor's in-wave overlap belongs to a different composition (no priority ping-pong, 4 barriers per tile, two tiles per pass). Reproducing it is a front-end composition change: a single-group or re-balanced phase plan, a W2 / front-end Weaver decision, not a B4 placement. Until such a plan exists, the B4 merge has no profitable Free phase in this kernel.
+
+### 5.3 Composition experiment: a single-group in-wave pipeline (time-boxed prototype) — negative
+
+**Plan** (`V3Opts::single`, option kept, default off).
+- **Composition:** all 8 waves form one group. There is no phase offset and no priority ping-pong, and every wave stages its share of K and V. The cadence is `Cadence::OneWindow`: tiles are staged two windows ahead in 3-slot rings, and the previous window's `wait_vm(0)` drains them, so tile t+1 is published when window t starts.
+- **Tiles:** 64 keys, so the three slots fit (96 KiB of LDS for hd128).
+- **Per window t:** the softmax head (mask, max, rescale) runs authored. Then one Free plan phase `{exp(t), QK(t + 1), PV(t)}` with the exps interleaved into the QK MFMAs (`Body::window`).
+
+**perf_ab** (old = `bf16-b4` `f80c2ef2`, 5 reps; correctness markers held):
+- **fmha_bf16:** geomean 0.911. hd128 non-causal 0.85–0.90; causal 0.89–1.02.
+- **fmha_hd192:** geomean 0.950, but only the unpaired causal form uses the prototype: causal 1×16×16×4096² 0.80, 1×8×8 0.90. The other hd192 forms are unchanged.
+
+**Not adopted.**
+
+**Strict verify:** 2–4 `GV-LDS-OOB` errors. The interval analysis cannot bound the LDS-DMA base of a select-cycled 3-slot ring slot. This is a proof gap, not a measured fault: the hosts' result checks pass.
+
+**Cause** (as far as one prototype shows).
+- The ping-pong hides each group's softmax behind the other group's matrix phase.
+- In one group, only the exps can overlap the MFMAs. The softmax head (masking, row max with its cross-lane swap, the lazy rescale branch) stays serial.
+- The 64-key tile halves the matrix work per window, while the barrier and the drain per window stay.
+
+The vendor's in-wave kernel overlaps more of the head (two tiles per pass, 128-key tiles in a 2-slot K / 3-slot V ring). Getting there needs:
+- the B5 ring (K2 / V3, distance 2) with 128-key tiles, which LDS allows at hd128 (2 × 32 + 3 × 32 = 160 KiB, at the limit), not the 3 × 3 slots used here;
+- a head that overlaps: the row max of tile t+1 woven into PV(t).
+
+This is the replica's step 2 territory. The composition choice is recorded as a measured negative at 64-key tiles.
