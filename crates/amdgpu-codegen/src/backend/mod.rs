@@ -319,7 +319,6 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::VCmpLtF32,
     MOp::VCndmask,
     MOp::VWriteSub,
-    MOp::VZeroSub2,
     MOp::VReadSub,
     MOp::VMfma16x16x16F16,
     MOp::VMfma32x32x8F16,
