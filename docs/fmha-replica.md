@@ -304,6 +304,32 @@ The loop now has the vendor's size and instruction mix. What is left:
 
 ¹ The vendor measured low in that run (1808.7 vs 1933.2 TF/s); the absolute TF/s favour the replica by 4.9 %.
 
+### 4.7 Per-phase order: where the two hot loops differ (analysis)
+
+The class timeline of one tile of group A's hot loop, written as runs (`v` VALU, `s` SALU, `t` `ds_read_b64_tr_b8`, `r` `ds_read_b128/b32`, `D` LDS-DMA issue, `Q` scaled QK MFMA, `P` unscaled PV MFMA, `R` smfmac row sum, `H` helper MFMA, `w` wait, `n` nop, `B` barrier, `p` setprio, `j` branch):
+
+```
+vendor   p v35 n j v64 s t8 w s p B | j w R2 P t4 w P t4 w P t4 w P t4 w P t4 w P t4 s4 v w P r2 s4 w v3 P r6 H w v6
+         Q s2 v2 s2 v2 r2 Q s4 D s r2 w Q s D r2 w Q s D r2 w Q s D r2 w Q s D r2 w Q w Q p B
+replica  s v3 j s v s v s v6 s n2 D s v6 s n2 D s n D s n D s n D p v33 n v3 n v3 j v50 w v15 w B |
+         p H r R t4 w v R t4 r w P t4 w v r P t4 w v P r2 w P r3 w Q r2 w v Q r2 w Q t4 w Q t4 w P t4 w P t4 w P r2 w P r2
+         w Q r2 w Q r2 w Q w Q w B
+```
+
+| Order difference | Vendor | Replica | Class |
+|---|---|---|---|
+| **Copy issue point** | the 5 LDS-DMA issues of the tile *two* ahead sit inside the QK window, one between consecutive QK MFMAs; completion at the end of the next VALU phase | the 5 issues of the *next* tile at the start of the VALU phase, each behind its own M0 write + nop; completion before the mid barrier | **DSL / pipeline**: a deeper copy ring (K 2 slots, V 3 slots, distance 2) and a stage issued from inside the matrix phase. Pipeline cadence and stage interleave exist (`rotate`, weave regions); the distance-2 ring for one buffer and DMA units woven between QK MFMAs do not |
+| **V-fragment prefetch** | 8 `ds_read_b64_tr_b8` of the next PV at the end of the VALU phase, before the barrier | the V reads inside the M phase, 4 before each PV pair | expressible: the PV read units moved into the softmax stage's tail (a weave-order change) |
+| **PV / QK order in the M phase** | row sums, the 8 PV MFMAs back to back (4 reads each), then the helper MFMA, then the 8 QK MFMAs | helper first, PV and QK interleaved in pairs (the weave's declaration order) | expressible: weave order of the merged `mma.pv` / `mma.qk` stage |
+| **M0 per DMA issue** | one M0 per group, offsets in the instruction | `s_mov m0` + `s_nop` per issue | back-end Weaver (M0 planning, W3 B2) |
+| **Scalar address arithmetic** | 46 SALU per pass | 24 SALU, more VALU | back-end Weaver / lowering (uniform values in SGPRs, W3 B2) |
+
+The copy issue point is the largest structural difference. It is also the one the earlier copy-stream prototypes measured negative on `_vs128` ([`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) §4–§6). The replica now has the vendor's tile pair, static slots and out-of-line rollback, so it is the right place to re-test it.
+
+Next steps:
+1. The two expressible weave-order changes (V prefetch, PV block before QK).
+2. The distance-2 copy ring with in-window issue. This is a pipeline extension.
+
 ## 5. Findings so far, per difference class (the deliverable)
 
 | Difference from the vendor kernel | Class | State |
@@ -322,5 +348,7 @@ The loop now has the vendor's size and instruction mix. What is left:
 | The vendor's register numbers (roles) | back-end Weaver: schedule-aware RA around a full plan; DSL: register plans for transient fragments | pins cost −4 … −12 % on our schedule; off (§4.4) |
 | M0 written per LDS-DMA issue | back-end Weaver: M0 planning | W3 B2 |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
+| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension | analysed (§4.7), next |
+| V-fragment prefetch before the barrier; PV block before QK | expressible (weave order) | analysed (§4.7), next |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
 | gpu_verify on lifted vendor code | proofs only for what the DSL expresses; lifted asm is opaque | — |
