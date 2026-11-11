@@ -8,6 +8,7 @@
 
 pub mod compose;
 pub mod compose_facts;
+pub mod compose_search;
 pub mod dispatch;
 pub mod fusion;
 pub mod opgraph;

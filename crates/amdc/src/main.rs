@@ -375,6 +375,28 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "compose-search" => {
+            // amdc compose-search gemm <kind> <M> <N> <K> [--cus N] [--margin X]: the feasible candidates of a GEMM launch with the coarse model's time, the conservative pruning, and the recorded rule's choice, as JSON
+            // (docs/compose.md; the measured top-k is `tools/compose_search.py`)
+            use amdgpu_graph::compose_search as cs;
+            let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
+            let opt = |name: &str, d: f64| args.windows(2).find(|w| w[0] == name).and_then(|w| w[1].parse::<f64>().ok()).unwrap_or(d);
+            match (args.get(1).map(|s| s.as_str()), args.get(2), num(3), num(4), num(5)) {
+                (Some("gemm"), Some(kind), Some(m), Some(n), Some(k)) => {
+                    let cus = opt("--cus", 256.0) as u64;
+                    let cands = cs::gemm_candidates(kind, m, n, k, cus);
+                    let kept = cs::prune(&cands, opt("--margin", 1.5));
+                    let rule = amdgpu_graph::dispatch::gemm_kernels(kind, m, n, k, cus).map(|(kn, s, red)| format!("{{\"kernel\":\"{kn}\",\"splits\":{s},\"reduce\":{}}}", red.map(|r| format!("\"{r}\"")).unwrap_or_else(|| "null".into()))).unwrap_or_else(|| "null".into());
+                    let rows: Vec<String> = cands.iter().zip(&kept).map(|(c, k)| c.to_json(*k)).collect();
+                    println!("{{\"kind\":\"{kind}\",\"m\":{m},\"n\":{n},\"k\":{k},\"cus\":{cus},\"rule\":{rule},\"candidates\":[{}]}}", rows.join(","));
+                    ExitCode::SUCCESS
+                }
+                _ => {
+                    eprintln!("usage: amdc compose-search gemm <bf16|i8_rowcol|fp8_rowcol|fp8_blockscale> <M> <N> <K> [--cus N] [--margin X]");
+                    ExitCode::from(2)
+                }
+            }
+        }
         "compose" => {
             // amdc compose <family> <shape>: the composition of a launch (docs/compose.md): kernels, splits, tile and the plan facts (CTA shape, rings) of the main kernel, as JSON
             use amdgpu_graph::compose as cp;

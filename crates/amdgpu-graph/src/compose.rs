@@ -26,6 +26,8 @@ pub struct KernelFacts {
     pub waves: u32,
     pub phases: u32,
     pub units: u32,
+    /// the LDS bytes the kernel declares (`Function::lds_bytes`; the rings may overlay each other)
+    pub lds_bytes: u32,
     pub rings: &'static [RingFact],
 }
 
@@ -153,7 +155,7 @@ impl Composition {
                     .iter()
                     .map(|r| format!("{{\"name\":\"{}\",\"slots\":{},\"bytes_per_slot\":{},\"owner\":\"{}\"}}", r.name, r.slots, r.bytes_per_slot, if r.wave_private { "wave" } else { "cta" }))
                     .collect();
-                format!("{{\"threads\":{},\"waves\":{},\"phases\":{},\"units\":{},\"rings\":[{}]}}", f.threads, f.waves, f.phases, f.units, rings.join(","))
+                format!("{{\"threads\":{},\"waves\":{},\"phases\":{},\"units\":{},\"lds_bytes\":{},\"rings\":[{}]}}", f.threads, f.waves, f.phases, f.units, f.lds_bytes, rings.join(","))
             }
         };
         format!("{{\"family\":\"{}\",\"kernels\":[{}],\"splits\":{},\"tile\":{},\"rule\":\"{}\",\"plan\":{}}}", self.family, ks.join(","), self.splits, tile, self.rule, facts)
