@@ -33,6 +33,8 @@ pub enum RegFx {
     Plain,
     /// writes only the dword `imm` of the destination (fragment lane write)
     SubWrite,
+    /// writes only the dwords `imm`, `imm + 1` of the destination (`v_mov_b64` pair write)
+    SubWrite2,
     /// reads only the dword `imm` of source 0 (fragment lane read)
     SubRead,
     /// 16-bit half writer: the other half survives, so the destination is also read
@@ -401,6 +403,7 @@ pub const ALL: &[MOp] = &[
     MOp::VCmpLeF32,
     MOp::VCmpGtF32,
     MOp::VCmpGeF32,
+    MOp::VCmpNgeF32,
     MOp::VCmpEqF32,
     MOp::VCmpNeF32,
     MOp::VCmpLgF32,
@@ -427,10 +430,13 @@ pub const ALL: &[MOp] = &[
     MOp::VCmpLtF32,
     MOp::VCndmask,
     MOp::VWriteSub,
+    MOp::VZeroSub2,
     MOp::VReadSub,
     MOp::VMfma16x16x16F16,
     MOp::VMfma32x32x8F16,
     MOp::VMfma32x32x8F16Z,
+    MOp::VMfma32x32x8Bf16,
+    MOp::VMfma32x32x8Bf16Z,
     MOp::VMfma16x16x32Fp8,
     MOp::VMfma32x32x16Fp8,
     MOp::VMfmaScale32x32x64Fp8,
@@ -848,6 +854,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VCmpLeF32 => a("v_cmp_le_f32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpGtF32 => a("v_cmp_gt_f32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpGeF32 => a("v_cmp_ge_f32", valu).vcc(false, true).def_vcc().dce(Pure),
+        // !(a >= b), true on NaN (lowering token `cmpneg`)
+        VCmpNgeF32 => a("v_cmp_nge_f32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpEqF32 => a("v_cmp_eq_f32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpNeF32 => a("v_cmp_neq_f32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpLgF32 => a("v_cmp_lg_f32", valu).vcc(false, true).def_vcc().dce(Pure),
@@ -875,10 +883,15 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VCndmask => a("v_cndmask_b32", valu).vcc(true, false).use_vcc().wdelay(2).dce(Pure),
         // ---- fragments / matrix cores
         VWriteSub => a("v_mov_b32", valu).regfx(RegFx::SubWrite).wdelay(2),
+        // zero two dwords of a tuple with one `v_mov_b64` (lowering token `movb64`); no LLVM row (own tail)
+        VZeroSub2 => a("v_mov_b64", valu).regfx(RegFx::SubWrite2).wdelay(2).backend(Backend::OwnOnly),
         VReadSub => a("v_mov_b32", valu).regfx(RegFx::SubRead).wdelay(2),
         VMfma16x16x16F16 => a("v_mfma_f32_16x16x16_f16", mfma16).mfma(12, false, false, false, false).agpr(true, 0b111),
         VMfma32x32x8F16 => a("v_mfma_f32_32x32x8_f16", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
         VMfma32x32x8F16Z => a("v_mfma_f32_32x32x8_f16", mfma32).mfma(12, false, false, true, false).agpr(true, 0b11),
+        // bf16 32x32x8 (the 1k form): same pipeline as the f16 form
+        VMfma32x32x8Bf16 => a("v_mfma_f32_32x32x8_bf16", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
+        VMfma32x32x8Bf16Z => a("v_mfma_f32_32x32x8_bf16", mfma32).mfma(12, false, false, true, false).agpr(true, 0b11),
         VMfma16x16x32Fp8 => a("v_mfma_f32_16x16x32_fp8_fp8", mfma16).mfma(12, false, false, false, false).agpr(true, 0b111),
         VMfma32x32x16Fp8 => a("v_mfma_f32_32x32x16_fp8_fp8", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
         VMfmaScale32x32x64Fp8 => a("v_mfma_scale_f32_32x32x64_f8f6f4", mfma64).mfma(20, true, true, false, false).agpr(true, 0b111),

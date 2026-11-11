@@ -612,6 +612,12 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                         wr.push((base, base + 1));
                     }
                 }
+                MOp::VZeroSub2 => {
+                    if let Some(d) = inst.dst {
+                        let base = a.phys[d as usize] + inst.imm as u32;
+                        wr.push((base, base + 2));
+                    }
+                }
                 MOp::VPermlane32Swap | MOp::VPermlane16Swap => {
                     for s in inst.srcs.iter().take(2) {
                         if let Src::Reg(r) = s {

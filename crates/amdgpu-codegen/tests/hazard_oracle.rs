@@ -243,7 +243,7 @@ fn allowance(producer: &str, consumer: &str) -> (u32, Vec<&'static str>) {
             why.push(vcc_why);
         }
     }
-    if VCC_W.contains(&p) && VCC_R.contains(&c) && !(p == "VPtrAdd" || c == "VPtrAdd") {
+    if (VCC_W.contains(&p) || p.starts_with("VCmp")) && VCC_R.contains(&c) && !(p == "VPtrAdd" || c == "VPtrAdd") {
         slack += 2;
         why.push(vcc_why);
     }
