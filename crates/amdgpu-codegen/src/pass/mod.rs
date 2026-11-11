@@ -196,14 +196,18 @@ fn run_ldahead(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     }
     Ok(())
 }
-fn run_insert_waits(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
-    s.sched_stats.waits_inserted = sched::waits::insert_waits(&mut s.m);
+fn ring_model(cx: &PassCtx) -> Option<sched::waits::RingModel> {
+    cx.f.plan.as_ref().and_then(sched::waits::RingModel::of)
+}
+
+fn run_insert_waits(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    s.sched_stats.waits_inserted = sched::waits::with_ring_model(ring_model(cx), || sched::waits::insert_waits(&mut s.m));
     Ok(())
 }
 fn run_sched_verify_waits(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     let o = so(cx);
     if o.verify {
-        sched::waits::verify_waits(&s.m).map_err(|e| format!("wait verification failed: {e}"))?;
+        sched::waits::with_ring_model(ring_model(cx), || sched::waits::verify_waits(&s.m)).map_err(|e| format!("wait verification failed: {e}"))?;
     }
     if o.stats {
         eprintln!("sched: {:?}", s.sched_stats);

@@ -21,6 +21,147 @@ use super::liveness::successors;
 use crate::mir::*;
 
 
+// ------------------------------------------------------------------------------------------------ W3 B5: ring slots as memory tokens
+//
+// An LDS-DMA writes LDS, not a register, so neither of its two dependences is visible to the register scoreboard:
+//   RAW  the DMA of a ring slot must complete (vmcnt) before the first LDS read of that slot;
+//   WAR  every LDS read of a slot must complete (lgkmcnt) before a DMA that overwrites the slot is issued.
+// Today's kernels state both with explicit waits in program order. Once B5 moves a DMA across iterations (a producer unit with
+// `iter != 0` in a Free phase), the plan's rings carry them instead: a producer unit of ring R with iteration offset d writes the
+// slot (t + d) mod S, a consumer unit with offset c reads (t + c) mod S, so the two touch the same slot iff d = c (mod S). The
+// scoreboard tracks one token per (ring, relative slot); at a loop back edge the tokens shift by the iterations one trip advances.
+// Active only while a plan with such a phase is installed (`with_ring_model`), so every other kernel keeps its waits.
+
+/// The rings of a plan as seen by the wait pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RingModel {
+    /// unit tag (`MInst::unit`) -> (ring, slots, iteration offset) for the DMA producers of a ring
+    pub producers: std::collections::HashMap<u32, Vec<(usize, u32, i64)>>,
+    /// unit tag -> (ring, slots, iteration offset) for the units reading a ring's slots
+    pub consumers: std::collections::HashMap<u32, Vec<(usize, u32, i64)>>,
+    /// slots of each ring
+    pub slots: Vec<u32>,
+    /// iterations one trip of the loop body advances (the token shift at a back edge)
+    pub body_iters: i64,
+}
+
+impl RingModel {
+    /// The model of `plan`, when it has a non-authored phase holding a DMA unit with a non-zero iteration offset (B5 active).
+    pub fn of(plan: &amdgpu_dsl::plan::KernelPlan) -> Option<RingModel> {
+        use amdgpu_dsl::plan::{OrderSpec, UnitClass};
+        let free = |ph: u32| plan.phases.iter().any(|p| p.id == ph && !matches!(p.order, OrderSpec::Authored));
+        if !plan.units.iter().any(|u| u.class == UnitClass::Dma && u.iter != 0 && free(u.phase)) || plan.rings.is_empty() {
+            return None;
+        }
+        let mut m = RingModel { slots: plan.rings.iter().map(|r| r.slots.max(1)).collect(), ..Default::default() };
+        let mut max_c = 0i64;
+        for (ri, r) in plan.rings.iter().enumerate() {
+            for u in &plan.units {
+                let e = (ri, r.slots.max(1), u.iter as i64);
+                if u.class == UnitClass::Dma && u.phase == r.producer_phase {
+                    m.producers.entry(u.id + 1).or_default().push(e);
+                } else if u.phase == r.consumer_phase {
+                    m.consumers.entry(u.id + 1).or_default().push(e);
+                    max_c = max_c.max(u.iter as i64);
+                }
+            }
+        }
+        m.body_iters = max_c + 1;
+        Some(m)
+    }
+}
+
+thread_local! {
+    static RINGS: std::cell::RefCell<Option<RingModel>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `model` installed for the wait pass and its verifier on this thread.
+pub fn with_ring_model<R>(model: Option<RingModel>, f: impl FnOnce() -> R) -> R {
+    let old = RINGS.with(|c| c.replace(model));
+    let r = f();
+    RINGS.with(|c| *c.borrow_mut() = old);
+    r
+}
+
+const TOK_BASE: u32 = u32::MAX - 8192;
+
+/// kind 0 = a DMA write of the slot, 1 = an LDS read of the slot
+fn tok(kind: u32, ring: usize, rel: i64, slots: u32) -> Slot {
+    TOK_BASE + kind * 4096 + ring as u32 * 64 + rel.rem_euclid(slots as i64) as u32
+}
+
+fn tok_parts(s: Slot) -> Option<(u32, usize, u32)> {
+    if (TOK_BASE..TOK_BASE + 8192).contains(&s) {
+        let x = s - TOK_BASE;
+        Some((x / 4096, ((x % 4096) / 64) as usize, x % 64))
+    } else {
+        None
+    }
+}
+
+/// (tokens whose vm entries must complete first, tokens whose lg entries must complete first, tokens this instruction issues)
+fn ring_tokens(e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
+    RINGS.with(|c| {
+        let c = c.borrow();
+        let Some(rm) = c.as_ref() else { return (vec![], vec![], vec![]) };
+        let dma = e.fence == Fence::Barrier && e.mem.is_some();
+        let lds_read = e.fence == Fence::None && matches!(&e.mem, Some(a) if a.space == Space::Lds && !a.write);
+        if dma {
+            if let Some(ps) = rm.producers.get(&inst.unit) {
+                let war = ps.iter().map(|&(r, s, d)| tok(1, r, d, s)).collect();
+                let iss = ps.iter().map(|&(r, s, d)| tok(0, r, d, s)).collect();
+                return (vec![], war, iss);
+            }
+        } else if lds_read {
+            if let Some(cs) = rm.consumers.get(&inst.unit) {
+                let raw = cs.iter().map(|&(r, s, d)| tok(0, r, d, s)).collect();
+                let iss = cs.iter().map(|&(r, s, d)| tok(1, r, d, s)).collect();
+                return (raw, vec![], iss);
+            }
+        }
+        (vec![], vec![], vec![])
+    })
+}
+
+/// The state carried over a loop back edge: ring tokens move back by the iterations one trip advanced.
+fn shift_tokens(st: &State) -> State {
+    RINGS.with(|c| {
+        let c = c.borrow();
+        let Some(rm) = c.as_ref() else { return st.clone() };
+        let mut out = st.clone();
+        for q in [&mut out.vm, &mut out.lg] {
+            let old = std::mem::take(&mut q.e);
+            for (key, mut v) in old {
+                let mut rel_key = None;
+                for s in v.slots.iter_mut() {
+                    if let Some((k, r, rel)) = tok_parts(*s) {
+                        let n = rm.slots.get(r).copied().unwrap_or(1);
+                        *s = tok(k, r, rel as i64 - rm.body_iters, n);
+                        rel_key = tok_parts(*s).map(|x| x.2);
+                    }
+                }
+                // an access issued on an earlier trip is a different entry from the same instruction's next issue: key it by its age
+                let key = match rel_key {
+                    Some(rel) => ring_key(key, rel),
+                    None => key,
+                };
+                q.e.insert(key, v);
+            }
+        }
+        out
+    })
+}
+
+/// Queue key of a ring access: the instruction id plus its current relative slot (top bits).
+fn ring_key(id: u64, rel: u32) -> u64 {
+    (id & ((1u64 << 48) - 1)) | (1u64 << 63) | ((rel as u64) << 48)
+}
+
+fn is_back_edge(m: &MFunction, from: usize, to: usize) -> bool {
+    let (fl, tl) = (m.blocks[from].label, m.blocks[to].label);
+    m.loops.iter().any(|&(h, l)| h == tl && l == fl)
+}
+
 const VM_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max;
 const LG_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max;
 
@@ -87,6 +228,49 @@ struct State {
 
 fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mut Vec<MInst>>) -> usize {
     let mut inserted = 0;
+    let (ring_vm, ring_lg, ring_issue) = ring_tokens(e, inst);
+    if !ring_vm.is_empty() || !ring_lg.is_empty() || !ring_issue.is_empty() {
+        if let Some(n) = st.vm.need(&ring_vm) {
+            if let Some(o) = out {
+                o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
+            }
+            st.vm.complete(n);
+            inserted += 1;
+        }
+        if let Some(n) = st.lg.need(&ring_lg) {
+            let n = if st.lg.e.values().any(|v| v.smem) { 0 } else { n };
+            if let Some(o) = out {
+                o.push(MInst::new(MOp::SWaitLgkm).imm(n as i64).auto());
+            }
+            st.lg.complete(n);
+            inserted += 1;
+        }
+        if e.fence == Fence::Barrier {
+            // a ring DMA: operand waits as usual, then it enters the vm queue with its slot token
+            let touched: Vec<Slot> = e.reads.clone();
+            if let Some(n) = st.vm.need(&touched) {
+                if let Some(o) = out {
+                    o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
+                }
+                st.vm.complete(n);
+                inserted += 1;
+            }
+            if let Some(n) = st.lg.need(&touched) {
+                let n = if st.lg.e.values().any(|v| v.smem) { 0 } else { n };
+                if let Some(o) = out {
+                    o.push(MInst::new(MOp::SWaitLgkm).imm(n as i64).auto());
+                }
+                st.lg.complete(n);
+                inserted += 1;
+            }
+            let key = ring_issue.first().and_then(|s| tok_parts(*s)).map_or(id, |x| ring_key(id, x.2));
+            st.vm.issue(key, ring_issue, false, VM_MAX);
+            if let Some(o) = out {
+                o.push(inst.clone());
+            }
+            return inserted;
+        }
+    }
     match e.fence {
         Fence::WaitVm(n) => {
             st.vm.complete(n.max(0) as u32);
@@ -152,9 +336,12 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         return inserted;
     }
     if let Some(a) = &e.mem {
+        let key = ring_issue.first().and_then(|s| tok_parts(*s)).map_or(id, |x| ring_key(id, x.2));
+        let mut slots = e.writes.clone();
+        slots.extend(ring_issue);
         match a.space {
-            Space::Global => st.vm.issue(id, e.writes.clone(), false, VM_MAX),
-            Space::Lds => st.lg.issue(id, e.writes.clone(), false, LG_MAX),
+            Space::Global => st.vm.issue(key, slots, false, VM_MAX),
+            Space::Lds => st.lg.issue(key, slots, false, LG_MAX),
         }
     } else if e.smem {
         st.lg.issue(id, e.writes.clone(), true, LG_MAX);
@@ -192,9 +379,10 @@ pub fn insert_waits(m: &mut MFunction) -> usize {
             let mut st = s;
             run_block(m, b, &mut st, None);
             for &t in &succs[b] {
+                let st = if is_back_edge(m, b, t) { shift_tokens(&st) } else { st.clone() };
                 match &mut in_st[t] {
                     None => {
-                        in_st[t] = Some(st.clone());
+                        in_st[t] = Some(st);
                         changed = true;
                     }
                     Some(x) => {
@@ -256,13 +444,21 @@ pub fn verify_waits(m: &MFunction) -> Result<(), String> {
                     if st.vm.need(&touched).is_some() || st.lg.need(&touched).is_some() {
                         return Err(format!("block {b} inst {ii} ({:?}) touches a register with a load in flight", inst.op));
                     }
+                    let (rv, rl, _) = ring_tokens(&e, inst);
+                    if st.vm.need(&rv).is_some() {
+                        return Err(format!("block {b} inst {ii} ({:?}) reads a ring slot whose DMA is still in flight", inst.op));
+                    }
+                    if st.lg.need(&rl).is_some() {
+                        return Err(format!("block {b} inst {ii} ({:?}) overwrites a ring slot whose LDS reads are still in flight", inst.op));
+                    }
                 }
                 step(&mut st, &e, inst, ((b as u64) << 32) | ii as u64, &mut None);
             }
             for &t in &succs[b] {
+                let st = if is_back_edge(m, b, t) { shift_tokens(&st) } else { st.clone() };
                 match &mut in_st[t] {
                     None => {
-                        in_st[t] = Some(st.clone());
+                        in_st[t] = Some(st);
                         changed = true;
                     }
                     Some(x) => {
