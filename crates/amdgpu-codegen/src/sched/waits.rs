@@ -104,6 +104,30 @@ fn ring_tokens(e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
     RINGS.with(|c| {
         let c = c.borrow();
         let Some(rm) = c.as_ref() else { return (vec![], vec![], vec![]) };
+        ring_tokens_of(rm, e, inst)
+    })
+}
+
+/// A ring DMA and an LDS read of a ring that touch different slots (or different rings): the plan's rings are disjoint LDS
+/// allocations and the slot tokens say which slot each access touches, so the two need no order (the wait pass keeps the
+/// completion dependences of the slots that do meet). False whenever either access is not a ring access.
+pub fn ring_independent(rm: &RingModel, ea: &Effects, a: &MInst, eb: &Effects, b: &MInst) -> bool {
+    let (ra, la, ia) = ring_tokens_of(rm, ea, a);
+    let (rb, lb, ib) = ring_tokens_of(rm, eb, b);
+    // (DMA, read): the DMA issues kind-0 tokens, the read needs kind-0 tokens (raw); (read, DMA): the read issues kind-1, the DMA needs kind-1 (war)
+    let dma_read = !ia.is_empty() && !la.is_empty() && !rb.is_empty() && ra.is_empty();
+    let read_dma = !ib.is_empty() && !lb.is_empty() && !ra.is_empty() && rb.is_empty();
+    if dma_read {
+        return !ia.iter().any(|x| rb.contains(x));
+    }
+    if read_dma {
+        return !ia.iter().any(|x| lb.contains(x));
+    }
+    false
+}
+
+fn ring_tokens_of(rm: &RingModel, e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
+    {
         let dma = e.fence == Fence::Barrier && e.mem.is_some();
         let lds_read = e.fence == Fence::None && matches!(&e.mem, Some(a) if a.space == Space::Lds && !a.write);
         if dma {
@@ -120,7 +144,7 @@ fn ring_tokens(e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
             }
         }
         (vec![], vec![], vec![])
-    })
+    }
 }
 
 /// The state carried over a loop back edge: ring tokens move back by the iterations one trip advanced.

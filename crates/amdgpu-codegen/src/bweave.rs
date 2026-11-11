@@ -315,6 +315,7 @@ pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (us
         plan.units.iter().find(|u| u.id == id).and_then(|u| plan.phases.iter().find(|p| p.id == u.phase)).map_or(false, |p| !matches!(p.order, OrderSpec::Authored))
     };
     let (mut merged, mut fell_back) = (0usize, 0usize);
+    let rings = crate::sched::waits::RingModel::of(plan);
     for bi in 0..m.blocks.len() {
         for (skel, fills) in &plan.hints.interleave {
             if !free_unit(*skel) || fills.iter().any(|f| !free_unit(*f)) {
@@ -332,7 +333,31 @@ pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (us
                 continue;
             }
             let per = in_fill.len().div_ceil(mfma.len());
-            let g = crate::sched::depgraph::build(m, &b.insts, &b.term, false);
+            // ALU may cross the LDS-DMA fences (they order memory, not ALU), and a ring DMA is independent of the LDS reads of other
+            // slots / rings (the wait pass keeps the slot dependences); every other edge of the dependence graph stays
+            let g = {
+                let mut g = crate::sched::depgraph::build(m, &b.insts, &b.term, true);
+                if let Some(rm) = &rings {
+                    let eff: Vec<crate::sched::effects::Effects> = b.insts.iter().map(|i| crate::sched::effects::effects(m, i)).collect();
+                    for i in 0..g.n {
+                        let keep: Vec<(usize, u32)> = g.succs[i]
+                            .iter()
+                            .copied()
+                            .filter(|&(j, _)| !crate::sched::waits::ring_independent(rm, &eff[i], &b.insts[i], &eff[j], &b.insts[j]))
+                            .collect();
+                        g.succs[i] = keep;
+                    }
+                    for j in 0..g.n {
+                        g.preds[j].clear();
+                    }
+                    for i in 0..g.n {
+                        for &(j, l) in &g.succs[i].clone() {
+                            g.preds[j].push((i, l));
+                        }
+                    }
+                }
+                g
+            };
             // the new order: every instruction outside the two sets keeps its place relative to the first of them; the skeleton is
             // emitted in order, each skeleton instruction preceded by the fillers it depends on (transitively, in their order) and each
             // MFMA followed by up to `per` fillers whose predecessors are all placed
@@ -401,6 +426,15 @@ pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (us
                 merged += 1;
             } else {
                 fell_back += 1;
+                if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
+                    let bad = (0..g.n).flat_map(|i| g.succs[i].iter().map(move |&(j, _)| (i, j))).find(|&(i, j)| pos[i] >= pos[j]);
+                    if let Some((i, j)) = bad {
+                        eprintln!(
+                            "bweave interleave (skeleton unit {skel}): block {} keeps its order: {:?} (unit {}) must precede {:?} (unit {})",
+                            b.label, b.insts[i].op, b.insts[i].unit, b.insts[j].op, b.insts[j].unit
+                        );
+                    }
+                }
             }
         }
     }
