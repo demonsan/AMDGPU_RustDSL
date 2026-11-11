@@ -209,7 +209,15 @@ pub enum SyncRule {
     /// the consumer waits on `counter` for the producer, with at most `slack` newer operations outstanding (ring slots)
     Counted { producer: UnitId, consumer: UnitId, counter: String, slack: u32 },
     /// an inter-CTA protocol on a flag (kept and checked by gpu_protocol), with the memory order it requires
-    CrossCta { flag: RegRef, scope: String, protocol: CrossCtaProtocol, order: MemOrder },
+    CrossCta { flag: FlagRef, scope: String, protocol: CrossCtaProtocol, order: MemOrder },
+}
+
+/// The flag a cross-CTA protocol synchronises on: a DSL value, or a kernarg pointer by name (the last-arriver counter of
+/// `Contract::last_arrivers`: `counter_arg`, plus the region it guards).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlagRef {
+    Value(RegRef),
+    Kernarg { arg: String, region: Option<String> },
 }
 
 /// The split / merge variants of a cross-CTA reduction.
@@ -237,6 +245,10 @@ pub enum MemOrder {
 pub enum RegConstraint {
     Share(Vec<RegRef>),
     Separate(Vec<RegRef>),
+    /// a HARD pin of a value to arch VGPR `base` (today's `RegMark::PinV`)
+    Pin { value: RegRef, base: u32 },
+    /// the register buffers of one fragment ring (today's `RegMark::Ring`): allocated as a group
+    RegRing { name: String, bufs: Vec<RegRef> },
 }
 
 /// Optional guidance.
