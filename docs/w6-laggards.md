@@ -58,3 +58,26 @@ The loop bodies are now captured as `amdgpu_dsl::units::Units` and emitted by `a
 - `mla_decode_bf16_hp_p16`: 6.
 
 Next: a per-family ordering / scheduler policy on these units, measured with perf_ab, once backend-llvm-tail's fix of the default scheduler's MLA miscompile is in.
+
+## 5. hd192 small grids
+
+The same-run vendor ratios put the largest gaps here:
+- causal 1×16×16×4096²: 0.77×, run by the unpaired `_causal_np`, U = 256 = CUs;
+- full 1×8×8×4096²: 0.79–0.81×, run by the key split `_ks` S = 2, U = 128.
+
+**Dispatch alternatives, all measured negative.** `perf_ab --families fmha_hd192`, 7 reps:
+
+| rule variant | the case it targets | new / old |
+|---|---|--:|
+| non-causal S = 4 at U ≤ CUs / 2 | full 1×8×8×4096² | 0.872 FAIL |
+| causal ks2 at U = CUs | causal 1×16×16×4096² | 0.826 FAIL |
+| causal `np_q128` up to U = CUs | causal 1×16×16×4096² | 0.884 FAIL |
+
+So the choice among today's kernels is right, and the gap is inside the kernels. The untouched 4×16×16×2048² case moved by −2.1 % in the same run, which gives the harness's run-to-run noise on this family.
+
+**What the back-end Weaver could act on.** `fmha_fwd_bf16_v3_d` (hd192 / hd128) marks three weave regions:
+- `kv_stage`;
+- `v_phase`;
+- `m_phase`: `reorder` strategy on `m_phase` / `kv_stage`, and the `rewait` scheduler token for hd192.
+
+It has no `Units`, so no plan units. The next md5-neutral step, as for decode16 / MLA (§4), is to capture the three regions' contents as units. That gives the back-end Weaver phases it can mark *Free*, letting it reorder across the region boundaries where the dependences allow. A structural difference against the vendor kernel needs an ISA comparison like W5's (`tools/isa_diff.py`, `isa_cfg.py`), on the vendor's `fwd_hd192_hd128_bf16[_causal]` code objects, before any kernel change is chosen.
