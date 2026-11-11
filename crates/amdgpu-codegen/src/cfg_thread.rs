@@ -16,6 +16,9 @@ enum K {
     Bool(bool),
 }
 
+/// the largest block the pass clones (instructions)
+const MAX_CLONE: usize = 32;
+
 const VCC: VReg = u32::MAX;
 const SCC: VReg = u32::MAX - 1;
 
@@ -157,6 +160,10 @@ pub fn run(m: &mut MFunction) -> usize {
             }
             let e = &m.blocks[ei];
             let Term::CondGoto { on, target, fall } = e.term else { continue };
+            // never a loop header (that would be loop rotation, not threading), and only small blocks: the clone duplicates the block
+            if m.loops.iter().any(|(h, _)| *h == e.label) || e.insts.len() > MAX_CLONE {
+                continue;
+            }
             // the facts on this edge: the predecessor's own definitions (copies of constants)
             let mut env: HashMap<VReg, K> = HashMap::new();
             eval(m, &p.insts, &mut env, &gc);
