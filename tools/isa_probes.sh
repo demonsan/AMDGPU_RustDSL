@@ -10,6 +10,7 @@ for k in probe_smfmac_gen probe_lds_tr_b8_gen; do
 done
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/isa_probe_host.cpp -o build/isa/isa_probe_host -I"$R/include" -L"$R/lib" -lamdhip64 -Wl,-rpath,"$R/lib" || exit 1
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/isa/isa_probe_host build/isa build/isa/out || exit 1
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 for f in smfmac_16x16x128_fp8.map lds_tr_b8.map; do
   if cmp -s build/isa/out/$f crates/amdgpu-isa/data/$f; then echo "$f: identical to the committed map"; else echo "$f: DIFFERS from the committed map"; [ "${1:-}" = "--update" ] && cp build/isa/out/$f crates/amdgpu-isa/data/$f && echo "  updated"; fi
 done

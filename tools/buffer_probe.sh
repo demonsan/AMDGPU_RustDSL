@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # MUBUF probes on the GPU. Usage: bash tools/buffer_probe.sh [rw|lds|both]   (own backend; the lds forms are own-only)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

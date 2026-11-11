@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # B1 hardware check beyond 4 GiB (docs/op-coverage-tileops.md): HIP_VISIBLE_DEVICES=0 bash tools/big_addr_probe.sh [own|llvm-tail]
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/tileop
 BE=${1:-own}
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"

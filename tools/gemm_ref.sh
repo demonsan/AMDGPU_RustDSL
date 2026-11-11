@@ -3,6 +3,8 @@
 # inputs, checks sampled rows against a double-precision CPU reference and times both (median of REF_REPS).
 # Usage: HIP_VISIBLE_DEVICES=0 [GEMM_M=4096 GEMM_N=4096 GEMM_K=8192] [REF_VARIANT=pm0_sp64_u2_gm16_wide1_vf1] bash tools/gemm_ref.sh
 set -uo pipefail
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CO_DIR="${GEMM_CO_DIR:-/shared/amdgpu/home/blyu_qle/sessions/aiter_pr6696_co}"

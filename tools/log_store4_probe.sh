@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run probe_log_store4 (v_log_f32 + global_store_dwordx4) on the GPU with BOTH backends. Usage: bash tools/log_store4_probe.sh
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

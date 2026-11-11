@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # probe_mfma_scale_opsel on the GPU with both backends: the op_sel / op_sel_hi scale byte select of v_mfma_scale_f32_32x32x64_f8f6f4.
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

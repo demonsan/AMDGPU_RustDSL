@@ -2,6 +2,7 @@
 # Issue-level comparison vendor vs ours: rocprofv3 SQ counters of the aiter code object and of an amdc GEMM kernel, same process, same inputs.
 # usage: OURS_KERNEL=gemm_mxfp8_bs_v4 HIP_VISIBLE_DEVICES=0 bash tools/prof_gemm.sh   (repo clone on the node; env as for tools/gemm_ref.sh)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 K="${OURS_KERNEL:-gemm_mxfp8_bs_v4}"; R=/shared/apps/ubuntu/opt/rocm-7.0.2
 CO_DIR="${GEMM_CO_DIR:-/shared/amdgpu/home/blyu_qle/sessions/aiter_pr6696_co}"

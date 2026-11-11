@@ -20,3 +20,4 @@ g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/attn_host.cpp -o build/attn_
 echo "== run =="
 export ATTN_KERNEL="${KERNEL}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/attn_host "build/${KERNEL}.co"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/gpu_guard.sh"   # GPU tests only on GPUs 0-3

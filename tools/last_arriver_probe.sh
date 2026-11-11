@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Memory-order test of the fused-combine (last-arriver) pattern on the GPU. Usage: REPS=100 bash tools/last_arriver_probe.sh [kernel...]
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

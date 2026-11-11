@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 8-wave last-arriver memory-order test. Usage: RUNS=1000000 THRASH=1 STAGGER=4 bash tools/last_arriver8_probe.sh [kernel...]
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

@@ -7,6 +7,7 @@
 # Families: per-tensor FP8 (fp8pt_host), MXFP8 (ref_host, REF_DATA=normal), bf16 v3 hd128 and hd192/hd128 (attn_host), bf16 backward
 # (attn_bwd_host). The decode families (paged, MLA) are not in this script: their hosts take a dispatch plan (see §7.5).
 set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 OUT=${1:-/tmp/attn_table}
 AMDC=${AMDC:-/tmp/target-kfmha/release/amdc}
 CLANG=${CLANG:-/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang}

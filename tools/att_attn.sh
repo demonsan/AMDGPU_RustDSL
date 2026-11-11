@@ -8,6 +8,7 @@
 # example (hd192 / hd128 MLA prefill, causal, B1 H16 2048): OURS_ENV="ROWS=128 BLOCK=256 PAIR=0 DV=128" VENDOR_ENV="ROWS=128 BLOCK=256 DV=128" \
 #   bash tools/att_attn.sh hd192c fmha_fwd_hd192_hd128_bf16_v3_causal_np_q128 $AITER_HSA/fmha_v3_fwd/fwd_hd192_hd128_bf16_causal.co 1 16 16 2048 2048 1 192
 set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 TAG=$1; K=$2; VCO=$3; B=$4; H=$5; HK=$6; SQ=$7; SK=$8; CAUSAL=$9; D=${10:-128}
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
 DEC=${ATT_DECODER_DIR:-/shared/apps/ubuntu/opt/rocm-10.1.0/lib}

@@ -11,3 +11,4 @@ for K in probe_cvtchain_dsl probe_cvtchain_asm; do
 done
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/cvtchain_host.cpp -o build/cvtchain_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/cvtchain_host build/probe_cvtchain_dsl.co build/probe_cvtchain_asm.co
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3

@@ -7,6 +7,7 @@ set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; mkdir -p build/pm
 AMDC="${AMDC:-$(ls target/debug/amdc 2>/dev/null || echo amdc)}"; R="${ROCM_RT:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 REPS="${REPS:-5}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"; WHAT="${1:-all}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 asm() { "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$2" "$1" || exit 1; }
 
 if [ "$WHAT" = fmha ] || [ "$WHAT" = all ]; then

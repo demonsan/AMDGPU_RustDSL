@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Model-vs-hardware table for the sched_* microkernels: bash tools/sched_model_vs_hw.sh "<kernels>" ; env HIP_VISIBLE_DEVICES (default 1)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 printf "%-20s %-6s | %8s %8s %6s | %8s %8s %6s\n" kernel variant "mod1w" "hw1w" "err%" "mod2w" "hw2w" "err%"

@@ -326,7 +326,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 - **工具**（`tools/`）：厂商对照（`vendor_disasm.sh`、`vendor_analyze.py`）、汇编对照（`asm_diff.py`、`asm_regmap.py`、`loop_stats.py`、`nop_attrib.py`）、
   GEMM（`gemm_ref.sh`、`prof_gemm.sh`、`att_*.py`）、A/B（`ab_fmha.sh`、`ab_gemm.sh`、`ab_layout.sh`；变体可为 `kernel@spec` 或 `x.ir`）、探针（`*_probe.sh`）、LLVM（`llvm_build_llc.sh`、
   `llvm_conformance.sh`、`llvm_feature_audit.py`）、文档链接检查 `check_doc_links.py`。
-- **测量协议**：`.s`/`.co` 溯源、≥7 轮交错 A/B 或 8 布局中位数、同轮厂商、split 形状反复启动；GPU 隔离（每人固定 `HIP_VISIBLE_DEVICES`）。
+- **测量协议**：`.s`/`.co` 溯源、≥7 轮交错 A/B 或 8 布局中位数、同轮厂商、split 形状反复启动；GPU 隔离（每人固定 `HIP_VISIBLE_DEVICES`，只能是 GPU 0–3；所有 GPU 脚本 source `tools/gpu_guard.sh`，未设置或使用 4–7 即拒绝运行）。
 
 ---
 

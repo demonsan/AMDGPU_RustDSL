@@ -18,6 +18,7 @@ cd "$REPO"
 mkdir -p "$OUT"
 unset GPU_DEVICE_ORDINAL CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 export AMD_CARGO_TARGET="${AMD_CARGO_TARGET:-/tmp/amd-target-occ}"
 
 echo "[smfmac] emit (own backend)"

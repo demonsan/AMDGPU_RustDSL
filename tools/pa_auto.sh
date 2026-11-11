@@ -3,6 +3,7 @@
 # rule), emit + assemble that kernel, run tests/gpu/pa_host.cpp with the matching mode (fused / last-arriver) and split count.
 # usage (repo root, GPU node): HIP_VISIBLE_DEVICES=0 bash tools/pa_auto.sh B H HK CTX [PAGE]   env: AMDC (default: the container cargo run), O (build/pa_auto)
 set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 B=$1; H=$2; HK=$3; CTX=$4; P=${5:-16}
 R=${ROCM:-/shared/apps/ubuntu/opt/rocm-7.0.2}; CL=${CLANG:-/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang}; O=${O:-build/pa_auto}; mkdir -p "$O"
 amdc() { if [ -n "${AMDC:-}" ]; then "$AMDC" "$@"; else bash tools/container/cargo.sh run -q --bin amdc -- "$@"; fi; }

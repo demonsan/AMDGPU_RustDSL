@@ -10,6 +10,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; mkdir -p build/ab
 AMDC="${AMDC:-$(ls target/debug/amdc 2>/dev/null || echo amdc)}"; R="${ROCM_RT:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; C="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 [ -x build/gemm_ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/gemm_ref_host.cpp -o build/gemm_ref_host -I"$R/include" -Itests/gpu -I. -L"$R/lib" -lamdhip64 -Wl,-rpath,"$R/lib" || exit 1
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" REF_ITERS="${REF_ITERS:-100}" REF_WARMUP="${REF_WARMUP:-100}" REF_REPS=1 REF_ROWS="${REF_ROWS:-8}" OURS_TILE_M=256 OURS_TILE_N=256
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 for K in $KERNELS; do
   case "$K" in *@*) SP="--specialize ${K#*@}";; *) SP="";; esac
   "$AMDC" emit $(irsrc "${K%%@*}") --backend=own $SP --out build/ab/$K.s > build/ab/$K.emit.log 2>&1 || { echo "$K: emit failed"; tail -3 build/ab/$K.emit.log; continue; }
