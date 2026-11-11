@@ -34,8 +34,10 @@ use amdgpu_stage::{Cadence, Pipeline};
 /// priority ping-pong, two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe with the lazy reference
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
+/// Since W5 (docs/fmha-replica.md §4.9) it is built with the replica configuration: unscaled PV, the two-tile pass with static slots and
+/// threaded exits, the out-of-line lazy rollback and the vendor's instruction forms (perf_ab +1.7 % geomean, port_gate PASS).
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: false });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: true });
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
