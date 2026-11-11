@@ -149,12 +149,43 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 Err(e) => return Err(e),
             }
         }
+        // W3 B6c: before the whole kernel falls back, keep the schedule everywhere except the back-end-ordered (Free) plan phases, whose
+        // regions keep their emitted order (waits still recomputed); docs/w3-b5-b6.md section 4
+        if let Some(o) = free_phases_unordered(f, &opts) {
+            let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
+            let mut s = pass::MirState::new(base.clone());
+            match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
+                Ok(()) => {
+                    if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
+                        eprintln!("sched: {}: the Free phases keep their order (allocation failed with them scheduled)", f.name);
+                    }
+                    return Ok((s.m, s.alloc.expect("allocated")));
+                }
+                Err(e) if pass::retryable(&e) => last_err = e,
+                Err(e) => return Err(e),
+            }
+        }
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let cx = pass::PassCtx { f, path: pass::Path::Unscheduled, sched: None, hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
     let mut s = pass::MirState::new(base);
     pass::run_body(pass::UNSCHEDULED, &mut s, &cx)?;
     Ok((s.m, s.alloc.expect("allocated")))
+}
+
+/// The scheduler options with every region of a Free plan phase set to its emitted order (`rewait`), or None when no region belongs
+/// to a Free phase (B6c's per-phase fallback rung).
+pub fn free_phases_unordered(f: &amdgpu_dsl::Function, opts: &sched::Options) -> Option<sched::Options> {
+    let p = f.plan.as_ref()?;
+    let mut o = opts.clone();
+    let mut any = false;
+    for r in o.regions.iter_mut() {
+        if p.phases.iter().any(|ph| ph.name == r.name && !matches!(ph.order, amdgpu_dsl::plan::OrderSpec::Authored)) {
+            r.tokens = if r.tokens.trim().is_empty() { "rewait".to_string() } else { format!("{},rewait", r.tokens) };
+            any = true;
+        }
+    }
+    any.then_some(o)
 }
 
 /// Lower, schedule and allocate, then export post-RA MIR (no llc involved).

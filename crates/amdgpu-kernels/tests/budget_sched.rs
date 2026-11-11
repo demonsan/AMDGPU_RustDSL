@@ -33,3 +33,15 @@ fn authored_phases_and_explicit_limits_are_kept() {
     assert_eq!(tokens(&kernel(OrderSpec::Authored, "reorder")), "reorder");
     assert_eq!(tokens(&kernel(OrderSpec::Free, "reorder,limit=200")), "reorder,limit=200");
 }
+
+/// B6c: the per-phase fallback rung sets only the Free phases' regions to their emitted order.
+#[test]
+fn the_fallback_rung_unorders_only_free_phases() {
+    let f = kernel(OrderSpec::Free, "reorder");
+    let o = amdgpu_codegen::scheduler_options(&f).unwrap();
+    let r = amdgpu_codegen::free_phases_unordered(&f, &o).expect("a Free phase");
+    assert_eq!(r.regions.iter().find(|x| x.name == "w").unwrap().tokens, "reorder,limit=96,rewait");
+    let a = kernel(OrderSpec::Authored, "reorder");
+    let oa = amdgpu_codegen::scheduler_options(&a).unwrap();
+    assert!(amdgpu_codegen::free_phases_unordered(&a, &oa).is_none());
+}
