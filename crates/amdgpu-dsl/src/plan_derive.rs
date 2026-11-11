@@ -4,7 +4,7 @@
 //! anything is completed from the function's own declarations, so the back end reads ONE structure instead of region tokens, register marks, stage contracts and tile
 //! declarations:
 //! - `RegionDecl { authored, tokens }` -> `Phase::order` (`Authored` / `Free`) and `Hints::tokens`; `RegMark::Cap` -> `Phase::budget`;
-//! - `RegMark::Share` / `Separate` -> `reg_constraints` (value-level allocator constraints);
+//! - `RegMark::Share` / `Separate` / `PinV` / `Ring` -> `reg_constraints` (`Share`, `Separate`, `Pin`, `RegRing`: value-level allocator constraints);
 //! - phases whose units sit inside a loop -> `PhaseKind::LoopBody` (with the peeled prologue / epilogue counts of `rotate`);
 //! - the stage contracts (`live_out` of one stage matching `live_in` of a later one) -> `HandOff`s (registers or an LDS tile, with the recorded fragment layout);
 //! - LDS rings of the contract (`Contract::tiles`, more than one slot) -> `RingDecl`s, producer / consumer phases from the units inside the tile's produce / consume regions
@@ -126,7 +126,18 @@ pub fn derive(f: &mut Function) {
                     plan.reg_constraints.push(c);
                 }
             }
-            RegMark::PinV { .. } | RegMark::Ring { .. } => {}
+            RegMark::PinV { r, base } => {
+                let c = RegConstraint::Pin { value: *r, base: *base };
+                if !plan.reg_constraints.contains(&c) {
+                    plan.reg_constraints.push(c);
+                }
+            }
+            RegMark::Ring { name, bufs } => {
+                let c = RegConstraint::RegRing { name: name.clone(), bufs: bufs.clone() };
+                if !plan.reg_constraints.contains(&c) {
+                    plan.reg_constraints.push(c);
+                }
+            }
         }
     }
 
