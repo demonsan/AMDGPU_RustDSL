@@ -285,8 +285,16 @@ fn run_m0_pad(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     sched::m0::pad(&mut s.m);
     Ok(())
 }
-fn run_bweave_order(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
-    crate::bweave::order(&mut s.m, crate::bweave::OrderPolicy::Identity).map(|_| ())
+fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
+    crate::bweave::order(&mut s.m, crate::bweave::OrderPolicy::Identity)?;
+    // B4: the plan's interleave hints inside Free phases (no Free phase in a plan: nothing changes)
+    if let Some(p) = &cx.f.plan {
+        let (_, fell_back) = crate::bweave::interleave(&mut s.m, p);
+        if fell_back > 0 && std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
+            eprintln!("bweave {}: {fell_back} interleave hint(s) kept their order (a dependence forbids the merge)", cx.f.name);
+        }
+    }
+    Ok(())
 }
 fn run_soft_clause(s: &mut MirState, _: &PassCtx) -> Result<(), String> {
     let a = s.alloc.take().expect("allocated");
