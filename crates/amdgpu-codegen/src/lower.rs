@@ -330,6 +330,8 @@ struct Lowerer {
     /// register plan of the kernel (resolved to vregs in `finish`) and the stack of open weave / stage regions (ids into `mir.reg_hints.regions`)
     reg_plan: Vec<amdgpu_dsl::RegMark>,
     region_stack: Vec<u16>,
+    /// open plan units (`Stmt::UnitMark`): `MInst::unit` = innermost id + 1
+    unit_stack: Vec<u32>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -467,6 +469,7 @@ impl Lowerer {
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
             region_stack: Vec::new(),
+            unit_stack: Vec::new(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
@@ -635,6 +638,7 @@ impl Lowerer {
 
     fn push(&mut self, mut inst: MInst) {
         inst.region = self.region_stack.last().copied().unwrap_or(0);
+        inst.unit = self.unit_stack.last().map_or(0, |u| u + 1);
         if inst.origin == u32::MAX {
             inst.origin = self.cur_origin;
         }
@@ -2279,6 +2283,10 @@ impl Lowerer {
                 }
                 Stmt::StageEnd | Stmt::RegionMark { begin: false, .. } => {
                     self.region_stack.pop();
+                }
+                Stmt::UnitMark { id, begin: true } => self.unit_stack.push(*id),
+                Stmt::UnitMark { begin: false, .. } => {
+                    self.unit_stack.pop();
                 }
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
@@ -5178,6 +5186,7 @@ fn select_minmax(m: &mut MFunction) {
             };
             let mut mm = MInst::new(op).def(d).srcreg(a).srcreg(bo);
             mm.region = s.region;
+        mm.unit = s.unit;
             mm.origin = s.origin;
             b.insts[k] = mm;
             if let Some(p) = pre {
@@ -5271,6 +5280,7 @@ fn fuse_minmax3(m: &mut MFunction) {
                         };
                         let mut new = new;
                         new.region = inst.region;
+        new.unit = inst.unit;
                         new.origin = inst.origin;
                         b.insts[i] = new;
                         dead[j] = true;

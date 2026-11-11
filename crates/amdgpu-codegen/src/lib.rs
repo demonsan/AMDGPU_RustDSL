@@ -18,6 +18,7 @@ pub mod ir_print;
 pub mod diag;
 pub mod hazards;
 pub mod hzfill;
+pub mod bweave;
 pub mod pass;
 pub mod target;
 pub mod lower;

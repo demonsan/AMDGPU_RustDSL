@@ -611,6 +611,25 @@ pub fn print(f: &Function) -> String {
     for r in &f.regions {
         let _ = writeln!(s, "region_decl {r:?}");
     }
+    // the kernel plan (docs/two-weavers.md), one item per line; absent for kernels without a plan
+    if let Some(p) = &f.plan {
+        for x in &p.phases {
+            let _ = writeln!(s, "plan_phase {x:?}");
+        }
+        for x in &p.units {
+            let _ = writeln!(s, "plan_unit {x:?}");
+        }
+        for x in &p.deps {
+            let _ = writeln!(s, "plan_dep {x:?}");
+        }
+        for x in &p.handoffs {
+            let _ = writeln!(s, "plan_handoff {x:?}");
+        }
+        for x in &p.sync {
+            let _ = writeln!(s, "plan_sync {x:?}");
+        }
+        let _ = writeln!(s, "plan_hints {:?}", p.hints);
+    }
     let _ = writeln!(s, "contract {:#?}", f.contract);
     // types of values that no `Let` defines
     let mut defined = vec![false; f.value_tys.len()];
@@ -711,6 +730,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     let mut agpr: Vec<AgprMark> = Vec::new();
     let mut reg_plan: Vec<RegMark> = Vec::new();
     let mut regions: Vec<RegionDecl> = Vec::new();
+    let mut plan: Option<crate::plan::KernelPlan> = None;
     let mut contract = Contract::default();
     let mut extra_tys: Vec<(u32, DType)> = Vec::new();
     loop {
@@ -728,6 +748,12 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
             "agpr" => agpr.push(lx.typed()?),
             "reg_plan" => reg_plan.push(lx.typed()?),
             "region_decl" => regions.push(lx.typed()?),
+            "plan_phase" => plan.get_or_insert_with(Default::default).phases.push(lx.typed()?),
+            "plan_unit" => plan.get_or_insert_with(Default::default).units.push(lx.typed()?),
+            "plan_dep" => plan.get_or_insert_with(Default::default).deps.push(lx.typed()?),
+            "plan_handoff" => plan.get_or_insert_with(Default::default).handoffs.push(lx.typed()?),
+            "plan_sync" => plan.get_or_insert_with(Default::default).sync.push(lx.typed()?),
+            "plan_hints" => plan.get_or_insert_with(Default::default).hints = lx.typed()?,
             "contract" => contract = lx.typed()?,
             "values" => {
                 lx.expect_p('{')?;
@@ -768,7 +794,9 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     for (i, t) in tys.into_iter().enumerate() {
         value_tys.push(t.ok_or_else(|| IrErr(format!("%v{i}: no type (not defined by a Let and not listed in `values`)")))?);
     }
-    Ok(Function::from_parts(name, args, kernarg_size, workgroup, lds, contract, body, var_tys, value_tys, agpr, profile, lower_opts, sched_opts, reg_plan, regions))
+    let mut f = Function::from_parts(name, args, kernarg_size, workgroup, lds, contract, body, var_tys, value_tys, agpr, profile, lower_opts, sched_opts, reg_plan, regions);
+    f.plan = plan;
+    Ok(f)
 }
 
 fn parse_block(lx: &mut Lexer, tys: &mut Vec<Option<DType>>) -> Result<Vec<Node>, IrErr> {

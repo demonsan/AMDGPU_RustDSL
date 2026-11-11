@@ -191,6 +191,21 @@ by W4.
 
 Every step: zero `unsafe` in the core crates; `cargo test` + `run_all.sh` (incl. the hazard oracle) green; certificates unchanged.
 
+### 5.1 Features from the vendor-FMHA replica (W5, [fmha-replica.md](fmha-replica.md))
+
+kernel-opt measured these against the vendor MXFP8 FMHA. They are scheduled into the steps above as follows:
+
+| Feature | Where | Gate |
+|---|---|---|
+| missing MOps (`v_mov_b64` imm, `s_sub_u32`, `s_cmp_{ge,eq,le}_u32`, `s_addk_i32`, `s_or_b32`, `v_mul_i32_i24`, `v_cmp_nge_f32`, `v_mfma_f32_32x32x8_bf16`, `s_mov_b64 exec`) | first, next to B1: table rows + emit + LLVM rows + oracle coverage | md5 identical (unused until a kernel asks) |
+| VALU VCC write -> VCC read distance (2 -> 1) | done separately (`valu-vcc-valu` target row; `tools/vcc_hazard_probe.sh`) | W4 (md5 changes) |
+| authored `s_nop` fillers in pinned windows | already counted by the hazard passes (an explicit `s_nop N` covers N+1 states); checked in the replica | md5 identical |
+| cross-block hazard distance instead of block-end MFMA padding (`edgepad` generalised) | hazard pass over the CFG (state carried along fall-through / back edges), before B4 | W4 |
+| M0 planning across LDS-DMA issues (one M0 per group, offsets in the instruction) | B2 M0 item: M0 as a unit resource, grouping after ordering | md5 identical while order-preserving, then W4 |
+| SGPR operands for wave-uniform values in VALU, constant-bus aware | per-unit lowering (B2) + operand-form selection after RA | W4 |
+| block layout: cold blocks after the loop, branch polarity | a CFG layout pass on the graph (after B3) | W4 |
+| multi-exit loops at machine level (one exit per unrolled half) | DSL construct (kernel-opt) + CFG support in the graph (after B3) | W4 |
+
 ## 6. Front-end coordination (with sched)
 
 To be agreed before B0:

@@ -1198,6 +1198,9 @@ pub enum Stmt {
     /// named region (per-region pressure caps and reports, `RegMark::Cap`). Regions nest; a begin and its end sit in the same structural block.
     /// Emits no code.
     RegionMark { name: String, begin: bool },
+    /// A plan unit (docs/two-weavers.md; `plan::UnitDecl::id`): no code; the instructions lowered between begin and end are tagged with the unit
+    /// (`MInst::unit`). Emitted by the front-end Weaver around each spliced unit.
+    UnitMark { id: u32, begin: bool },
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -1556,6 +1559,9 @@ pub struct Function {
     /// Scheduler strategies of weave regions, keyed by region NAME (the labels of `weave_region_begin` / the Weaver / stage names): `declare_region(name, authored, tokens)`. A region without a
     /// declaration inherits its enclosing region's strategy (the kernel default at the top). Empty for every kernel that does not ask for per-region strategies (nothing changes then).
     pub regions: Vec<RegionDecl>,
+    /// The kernel plan of the front-end Weaver (docs/two-weavers.md): constraints and hints for the back end. None for every kernel without one
+    /// (nothing changes then).
+    pub plan: Option<plan::KernelPlan>,
 }
 
 /// Builder call sites of the values of a function (see `Function::src_locs`).
@@ -1734,7 +1740,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None };
         f.set_body(body);
         f
     }
@@ -1817,6 +1823,7 @@ impl FnBuilder {
             sched_opts: None,
             regions: Vec::new(),
             reg_plan: Vec::new(),
+            plan: None,
             },
             expr_consts: Default::default(),
             captures: Vec::new(),
@@ -2277,6 +2284,16 @@ impl FnBuilder {
     #[track_caller]
     pub fn reg_ring(&mut self, name: &str, bufs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Ring { name: name.to_string(), bufs: bufs.to_vec() });
+    }
+    /// Opens plan unit `id` (no code; docs/two-weavers.md): the statements until `unit_end(id)` belong to the unit.
+    #[track_caller]
+    pub fn unit_begin(&mut self, id: u32) {
+        self.push_stmt(Stmt::UnitMark { id, begin: true });
+    }
+    /// Closes plan unit `id` (see `Stmt::UnitMark`).
+    #[track_caller]
+    pub fn unit_end(&mut self, id: u32) {
+        self.push_stmt(Stmt::UnitMark { id, begin: false });
     }
     /// Opens a register-planning region (no code). Must be closed by `weave_region_end` in the same structural block.
     #[track_caller]
@@ -3675,6 +3692,7 @@ fn expect_ptr(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
 fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
     let mut depth = 0i64;
     let mut stack: Vec<(String, i64, usize)> = Vec::new();
+    let mut units: Vec<(u32, i64, usize)> = Vec::new();
     for (idx, st) in f.stmts().iter().enumerate() {
         match st {
             Stmt::BeginLoop { .. } | Stmt::BeginIf { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::StageBegin { .. } => depth += 1,
@@ -3685,11 +3703,20 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
                 Some(_) => {}
                 None => errs.push(format!("stmt {idx}: weave_region_end without an open region")),
             },
+            Stmt::UnitMark { id, begin: true } => units.push((*id, depth, idx)),
+            Stmt::UnitMark { id, begin: false } => match units.pop() {
+                Some((u, d, at)) if u != *id || d != depth => errs.push(format!("stmt {idx}: unit {id} end does not close unit {u} (opened at stmt {at}) in the same structural block")),
+                Some(_) => {}
+                None => errs.push(format!("stmt {idx}: unit {id} end without an open unit")),
+            },
             _ => {}
         }
     }
     for (n, _, at) in stack {
         errs.push(format!("stmt {at}: region `{n}` is never closed"));
+    }
+    for (u, _, at) in units {
+        errs.push(format!("stmt {at}: unit {u} is never closed"));
     }
 }
 
@@ -3698,6 +3725,9 @@ pub fn verify(f: &Function) -> Vec<String> {
     check_var_slices(f, &mut errs);
     check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
+    if let Some(p) = &f.plan {
+        errs.extend(plan::verify(p));
+    }
 
     // Region stack: values visible in the current scope.
     let mut scopes: Vec<HashSet<ValueId>> = vec![HashSet::new()];
@@ -4213,7 +4243,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } => {}
             Stmt::StageBegin { name, contract } => {
                 for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
                     if let Err(e) = opnd_ty(f, Opnd::Val(*v)) {
@@ -4576,6 +4606,7 @@ pub mod print;
 pub mod facts;
 pub use facts::Captured;
 pub mod ir_text;
+pub mod plan;
 mod ir_codec;
 pub mod specialize;
 pub use expr::{ev, ox, varx};
