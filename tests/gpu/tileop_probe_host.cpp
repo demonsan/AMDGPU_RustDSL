@@ -47,10 +47,14 @@ int main(int argc, char** argv) {
     hipFunction_t fn;
     CK(hipModuleLoad(&mod, co));
     CK(hipModuleGetFunction(&fn, mod, name));
+    // optional third kernarg (offset 16): PROBE_I32 (an i32 scalar the kernel reads with KernargI32)
+    const char* pi = std::getenv("PROBE_I32");
     struct {
         void* in;
         void* out;
-    } args{din, dout};
+        int n;
+        int pad;
+    } args{din, dout, pi ? std::atoi(pi) : 0, 0};
     size_t sz = sizeof(args);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     CK(hipModuleLaunchKernel(fn, 1, 1, 1, threads, 1, 1, 0, nullptr, nullptr, cfg));

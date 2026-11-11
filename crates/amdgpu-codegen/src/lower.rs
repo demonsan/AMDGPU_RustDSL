@@ -193,6 +193,13 @@ fn run_coalesce(m: &mut MFunction) -> Result<(), String> {
     }
     Ok(())
 }
+fn run_jthread(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("jthread") {
+        crate::cfg_thread::run(m);
+    }
+    Ok(())
+}
+
 fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
     dce(m);
     Ok(())
@@ -216,6 +223,7 @@ pub const CLEANUP: &[LowerPass] = {
         LowerPass { info: info("lower-coalesce", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_coalesce },
         LowerPass { info: info("lower-dce-final", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_dce_final },
         LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },
+        LowerPass { info: info("lower-jthread", Lower, Generic, "token jthread (branches on flags known per incoming edge)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_jthread },
     ]
 };
 

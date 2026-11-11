@@ -6,14 +6,17 @@ use amdgpu_dsl::{ev, CmpPred, CmpTy, DType, Ext, FnBuilder, Function, Op, Opnd};
 /// out[tid] = 1.0 when the loop left after an even tile (idx = 1 on that exit), 2.0 after an odd one; the loop walks n tiles two at a time.
 pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     let mut b = FnBuilder::new("probe_two_exit", 64);
-    b.arg("o", DType::Ptr, 0x00, 8);
-    b.arg("n", DType::I32, 0x08, 4);
-    b.arg("pad", DType::I32, 0x0C, 4);
+    // kernarg layout of tests/gpu/tileop_probe_host.cpp: in (unused), out, PROBE_I32
+    b.arg("i", DType::Ptr, 0x00, 8);
+    b.arg("o", DType::Ptr, 0x08, 8);
+    b.arg("n", DType::I32, 0x10, 4);
+    b.arg("pad", DType::I32, 0x14, 4);
+    b.arg_tensor("i", Ext::c(4));
     b.arg_tensor("o", Ext::c(64 * 4));
-    b.ka_range(0x08, 1, 64);
+    b.ka_range(0x10, 1, 64);
     b.lower_opts(tokens);
-    let po = b.let_(Op::KernargPtr { offset: 0x00 });
-    let n = b.let_(Op::KernargI32 { offset: 0x08 });
+    let po = b.let_(Op::KernargPtr { offset: 0x08 });
+    let n = b.let_(Op::KernargI32 { offset: 0x10 });
     let tid = b.let_(Op::WorkitemId);
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))]);
     let (it, idx) = (vars[0], vars[1]);
@@ -57,8 +60,53 @@ fn dump(m: &amdgpu_codegen::mir::MFunction) -> String {
 
 #[test]
 fn dump_two_exit_mir() {
-    let f = two_exit_kernel(&[]);
-    let m = amdgpu_codegen::compile_mir(&f).unwrap_or_else(|e| panic!("{e}"));
-    println!("{}", dump(&m));
-    assert!(!m.blocks.is_empty());
+    for tok in [&[][..], &["jthread"][..]] {
+        let f = two_exit_kernel(tok);
+        let m = amdgpu_codegen::compile_mir(&f).unwrap_or_else(|e| panic!("{e}"));
+        println!("== {tok:?}\n{}", dump(&m));
+    }
+}
+
+/// Without the token the exit block compares the flag and branches; with it each exit edge has its own copy of the exit block that jumps
+/// straight to its drain (the stores of 1.0 and 2.0), and no block branches on the flag any more.
+#[test]
+fn each_exit_goes_straight_to_its_drain() {
+    let lowered = |tok: &[&str]| {
+        let f = two_exit_kernel(tok);
+        amdgpu_dsl::ir_text::print(&f);
+        amdgpu_codegen::lower::with_opts(&[&["dce", "cmpfold"][..], tok].concat(), || amdgpu_codegen::lower::lower(&f)).unwrap()
+    };
+    let base = lowered(&[]);
+    let cmp_branch = |m: &amdgpu_codegen::mir::MFunction| {
+        m.blocks.iter().filter(|b| b.insts.iter().any(|i| i.op == amdgpu_codegen::mir::MOp::VCmpEqI32) && matches!(b.term, amdgpu_codegen::mir::Term::CondGoto { .. })).count()
+    };
+    assert_eq!(cmp_branch(&base), 0, "the flag compare feeds a cndmask; the branch is on the 0/1 value:\n{}", dump(&base));
+    let ne_branch = |m: &amdgpu_codegen::mir::MFunction| m.blocks.iter().filter(|b| b.insts.iter().any(|i| i.op == amdgpu_codegen::mir::MOp::VCmpEqI32) && matches!(b.term, amdgpu_codegen::mir::Term::Goto(_))).count();
+    assert_eq!(ne_branch(&base), 0);
+    let t = lowered(&["jthread"]);
+    assert_eq!(ne_branch(&t), 2, "two copies of the exit block, each ending in a jump:\n{}", dump(&t));
+    // the two copies go to different drains
+    let targets: Vec<u32> = t
+        .blocks
+        .iter()
+        .filter(|b| b.insts.iter().any(|i| i.op == amdgpu_codegen::mir::MOp::VCmpEqI32))
+        .filter_map(|b| if let amdgpu_codegen::mir::Term::Goto(x) = b.term { Some(x) } else { None })
+        .collect();
+    assert_eq!(targets.len(), 2);
+    assert_ne!(targets[0], targets[1], "{}", dump(&t));
+    // the threaded kernel still compiles end to end and its drain for idx == 1 stores 1.0 (0x3f800000) on the first exit's path
+    let f = two_exit_kernel(&["jthread"]);
+    amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Writes the own-tail asm of the kernel with and without the token for tools/jthread_probe.sh (hardware check).
+#[test]
+#[ignore]
+fn write_asm() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/jthread");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, tok) in [("base", &[][..]), ("jthread", &["jthread"][..])] {
+        let c = amdgpu_codegen::compile(&two_exit_kernel(tok)).unwrap();
+        std::fs::write(dir.join(format!("{name}.s")), c.asm).unwrap();
+    }
 }
