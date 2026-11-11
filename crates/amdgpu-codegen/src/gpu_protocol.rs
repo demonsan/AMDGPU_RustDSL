@@ -1223,6 +1223,66 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
 
 /// `verify_tiles` simulating at most `cap` loop iterations (and not checking the period claim, which needs the full horizon): for mutation tests that
 /// re-verify a kernel many times. A protocol error found within the cap is a real error; the full verification is `verify_tiles`.
+/// W3 B5: the plan's ring-slot claims are checked against the simulated kernel, never trusted. The back end lets a ring DMA pass an LDS
+/// read (and drops their waits) when the plan's iteration offsets put them in different slots (`sched::waits::RingModel`: producer offset
+/// d, reader offset c, slots S: different iff d != c mod S). If the concrete simulation shows the two touching the SAME slot inside one
+/// barrier interval, the plan lies and the reordered code could race: GV-PLAN-RING.
+fn check_plan_rings(f: &Function, tr: &Trace, diags: &mut Vec<(&'static str, Severity, usize, String)>) {
+    let Some(plan) = &f.plan else { return };
+    let Some(rm) = crate::sched::waits::RingModel::of(plan) else { return };
+    let units = unit_of_stmt(f);
+    let tile_of_ring: Vec<Option<usize>> = plan.rings.iter().map(|r| f.contract.tiles.iter().position(|t| t.name == r.name)).collect();
+    for v in plan_ring_violations(&rm, &units, &tile_of_ring, &tr.evs) {
+        diags.push(("GV-PLAN-RING", Severity::Error, v.0, v.1));
+    }
+}
+
+/// The innermost plan unit tag (`id + 1`, as `MInst::unit`) of every statement (0 = none).
+fn unit_of_stmt(f: &Function) -> Vec<u32> {
+    let mut stack: Vec<u32> = Vec::new();
+    f.stmts()
+        .iter()
+        .map(|s| match s {
+            Stmt::UnitMark { id, begin: true } => {
+                stack.push(*id + 1);
+                *stack.last().unwrap()
+            }
+            Stmt::UnitMark { begin: false, .. } => {
+                let u = stack.last().copied().unwrap_or(0);
+                stack.pop();
+                u
+            }
+            _ => stack.last().copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+/// (statement, message) for every DMA produce / consume pair of one ring that the plan calls different slots while the simulated
+/// events touch the same slot in the same barrier interval.
+fn plan_ring_violations(rm: &crate::sched::waits::RingModel, units: &[u32], tile_of_ring: &[Option<usize>], evs: &[Ev]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for p in evs.iter().filter(|e| e.produce && e.dma && !e.global) {
+        let Some(prods) = rm.producers.get(&units.get(p.stmt).copied().unwrap_or(0)) else { continue };
+        for q in evs.iter().filter(|e| !e.produce && !e.global && e.ord == p.ord && e.tile == p.tile && e.slot == p.slot) {
+            let Some(cons) = rm.consumers.get(&units.get(q.stmt).copied().unwrap_or(0)) else { continue };
+            for &(ri, s, d) in prods {
+                if tile_of_ring.get(ri).copied().flatten() != Some(p.tile) {
+                    continue;
+                }
+                for &(rj, _, c) in cons {
+                    if rj == ri && (d - c).rem_euclid(s as i64) != 0 {
+                        out.push((p.stmt, format!(
+                            "the plan puts the DMA at stmt {} (iteration offset {d}) and the read at stmt {} (offset {c}) in different slots of ring {ri} ({s} slots), but both touch slot {} in the same barrier interval: the back end would let them pass each other",
+                            p.stmt, q.stmt, p.slot
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize>) {
     let tiles = &f.contract.tiles;
     if tiles.is_empty() {
@@ -1304,6 +1364,9 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     for n in 1..=nmax {
         let t0 = enumerate_traces(f, 0, n, &div, &mut diags, &mut untagged);
         let t1 = enumerate_traces(f, 1, n, &div, &mut diags, &mut untagged);
+        for tr in t0.iter().chain(t1.iter()) {
+            check_plan_rings(f, tr, &mut diags);
+        }
         for a in &t0 {
             for b in &t1 {
                 if compatible(a, b) {
@@ -1508,4 +1571,44 @@ fn cone_has_val(f: &Function, o: &Opnd, target: u32) -> bool {
         op.operands().iter().any(|x| go(f, x, target, seen))
     }
     go(f, o, target, &mut HashSet::new())
+}
+
+#[cfg(test)]
+mod plan_ring_tests {
+    use super::*;
+    use crate::sched::waits::RingModel;
+
+    fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+    }
+
+    fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
+        let mut m = RingModel { slots: vec![slots], body_iters: 1, ..Default::default() };
+        m.producers.insert(2, vec![(0, slots, dma_iter)]);
+        m.consumers.insert(1, vec![(0, slots, read_iter)]);
+        m
+    }
+
+    /// stmt 0 is in unit tag 1 (the reader), stmt 1 in unit tag 2 (the DMA)
+    const UNITS: [u32; 2] = [1, 2];
+
+    #[test]
+    fn a_plan_that_separates_slots_the_kernel_shares_is_rejected() {
+        // the kernel: the read and the DMA of the same barrier interval both touch slot 1
+        let evs = vec![ev(false, false, 0, 1), ev(true, true, 1, 1)];
+        // a lying plan: DMA offset 2, read offset 1, 2 slots -> "different slots"
+        let v = plan_ring_violations(&model(2, 2, 1), &UNITS, &[Some(0)], &evs);
+        assert_eq!(v.len(), 1, "{v:?}");
+        // a truthful plan (same slot): nothing to report, the back end keeps the pair ordered
+        assert!(plan_ring_violations(&model(2, 2, 0), &UNITS, &[Some(0)], &evs).is_empty());
+    }
+
+    #[test]
+    fn different_slots_or_intervals_are_fine() {
+        let other_slot = vec![ev(false, false, 0, 0), ev(true, true, 1, 1)];
+        assert!(plan_ring_violations(&model(2, 2, 1), &UNITS, &[Some(0)], &other_slot).is_empty());
+        let mut later = vec![ev(false, false, 0, 1), ev(true, true, 1, 1)];
+        later[1].ord = 4; // separated by a barrier
+        assert!(plan_ring_violations(&model(2, 2, 1), &UNITS, &[Some(0)], &later).is_empty());
+    }
 }
