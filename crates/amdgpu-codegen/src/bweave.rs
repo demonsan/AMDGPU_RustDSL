@@ -229,6 +229,108 @@ pub fn report(m: &MFunction, g: &MUnitGraph, plan: Option<&amdgpu_dsl::plan::Ker
     s
 }
 
+// ------------------------------------------------------------------------------------------------ B3: ordering on the unit graph
+
+/// A maximal run of one block's instructions with the same unit tag (`MInst::unit`; 0 = glue).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seg {
+    pub unit: u32,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The segments of a block, in program order.
+pub fn block_segments(b: &Block) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::new();
+    for (i, inst) in b.insts.iter().enumerate() {
+        match out.last_mut() {
+            Some(s) if s.unit == inst.unit => s.end = i + 1,
+            _ => out.push(Seg { unit: inst.unit, start: i, end: i + 1 }),
+        }
+    }
+    out
+}
+
+/// Segment-level predecessors of a block: segment `j` depends on `i < j` when any instruction of `j` depends on one of `i` in the
+/// scheduler's dependence graph (registers incl. vcc / scc and partial writes, memory, fences; `sched::depgraph`).
+pub fn seg_preds(m: &MFunction, b: &Block, segs: &[Seg]) -> Vec<Vec<usize>> {
+    let g = crate::sched::depgraph::build(m, &b.insts, &b.term, false);
+    let mut seg_of = vec![0usize; b.insts.len()];
+    for (k, s) in segs.iter().enumerate() {
+        for i in s.start..s.end {
+            seg_of[i] = k;
+        }
+    }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); segs.len()];
+    for i in 0..g.n {
+        for &(j, _) in &g.succs[i] {
+            let (a, b2) = (seg_of[i], seg_of[j]);
+            if a != b2 && !preds[b2].contains(&a) {
+                preds[b2].push(a);
+            }
+        }
+    }
+    preds
+}
+
+/// How the back-end Weaver orders the segments of a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderPolicy {
+    /// today's order (B3: every phase is reproduced exactly)
+    Identity,
+}
+
+/// Is `ord` a permutation of the segments that keeps every dependence?
+pub fn is_valid_order(ord: &[usize], preds: &[Vec<usize>]) -> bool {
+    let mut pos = vec![usize::MAX; preds.len()];
+    for (p, &s) in ord.iter().enumerate() {
+        if s >= preds.len() || pos[s] != usize::MAX {
+            return false;
+        }
+        pos[s] = p;
+    }
+    if pos.iter().any(|p| *p == usize::MAX) {
+        return false;
+    }
+    preds.iter().enumerate().all(|(s, ps)| ps.iter().all(|&q| pos[q] < pos[s]))
+}
+
+/// Rewrites a block's instructions in segment order `ord`.
+pub fn apply_order(b: &mut Block, segs: &[Seg], ord: &[usize]) {
+    let old = std::mem::take(&mut b.insts);
+    let mut out = Vec::with_capacity(old.len());
+    for &k in ord {
+        out.extend_from_slice(&old[segs[k].start..segs[k].end]);
+    }
+    b.insts = out;
+}
+
+/// The back-end Weaver's ordering pass: per block, the segments are ordered by `policy` and the order is checked against the
+/// segment dependences before it is applied. Returns the number of blocks whose order changed.
+pub fn order(m: &mut MFunction, policy: OrderPolicy) -> Result<usize, String> {
+    let mut changed = 0;
+    for bi in 0..m.blocks.len() {
+        let segs = block_segments(&m.blocks[bi]);
+        if segs.len() < 2 {
+            continue;
+        }
+        let ord: Vec<usize> = match policy {
+            OrderPolicy::Identity => (0..segs.len()).collect(),
+        };
+        if ord.iter().enumerate().any(|(i, &k)| i != k) {
+            let preds = seg_preds(m, &m.blocks[bi], &segs);
+            if !is_valid_order(&ord, &preds) {
+                return Err(format!("bweave: block {} order {:?} breaks a dependence", m.blocks[bi].label, ord));
+            }
+            let mut b = std::mem::replace(&mut m.blocks[bi], Block::new(0));
+            apply_order(&mut b, &segs, &ord);
+            m.blocks[bi] = b;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +351,32 @@ mod tests {
             agpr_pin: Default::default(),
             reg_hints: Default::default(),
         }
+    }
+
+    #[test]
+    fn independent_segments_may_swap_dependent_ones_may_not() {
+        let mut b = Block::new(0);
+        let tag = |mut i: MInst, u: u32| {
+            i.unit = u;
+            i
+        };
+        // unit 1: v0 = 1; unit 2: v1 = 2 (independent); unit 3: v2 = v0 + v1 (depends on both)
+        b.insts = vec![
+            tag(MInst::new(MOp::VMovB32).def(0).imm(1), 1),
+            tag(MInst::new(MOp::VMovB32).def(1).imm(2), 2),
+            tag(MInst::new(MOp::VAddU32).def(2).srcreg(0).srcreg(1), 3),
+        ];
+        let m = mf(vec![b.clone()], 3);
+        let segs = block_segments(&m.blocks[0]);
+        assert_eq!(segs.len(), 3);
+        let preds = seg_preds(&m, &m.blocks[0], &segs);
+        assert!(is_valid_order(&[1, 0, 2], &preds), "units 1 and 2 are independent");
+        assert!(!is_valid_order(&[0, 2, 1], &preds), "unit 3 reads unit 2's result");
+        let mut b2 = b.clone();
+        apply_order(&mut b2, &segs, &[1, 0, 2]);
+        assert_eq!(b2.insts[0].unit, 2);
+        let mut m2 = m.clone();
+        assert_eq!(order(&mut m2, OrderPolicy::Identity).unwrap(), 0, "identity changes nothing");
     }
 
     #[test]
