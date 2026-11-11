@@ -129,3 +129,15 @@ fn salu32_selects_the_scalar_forms() {
     }
     strict_ok(&f);
 }
+
+/// Writes the own-tail asm of the salu32 kernel with and without the token for tools/salu32_probe.sh (hardware check).
+#[test]
+#[ignore]
+fn write_salu_asm() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/salu32");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, tok) in [("base", &[][..]), ("salu32", &["salu32"][..])] {
+        let c = amdgpu_codegen::compile(&salu_kernel(tok)).unwrap();
+        std::fs::write(dir.join(format!("{name}.s")), c.asm).unwrap();
+    }
+}
