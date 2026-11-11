@@ -8,8 +8,9 @@ description = "L2 stage layer: stage composition (fusion stage library), stage c
 [dependencies]
 amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-layout = { path = "../amdgpu-layout" }
-amdgpu-codegen = { path = "../amdgpu-codegen" }
 amdgpu-tile = { path = "../amdgpu-tile" }
+amdgpu-target = { path = "../amdgpu-target" }
 amdgpu-isa = { path = "../amdgpu-isa" }
 
 [dev-dependencies]
+amdgpu-codegen = { path = "../amdgpu-codegen" }

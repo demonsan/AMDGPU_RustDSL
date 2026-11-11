@@ -361,7 +361,7 @@ impl Body {
     /// use (first half of the B fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is
     /// reloaded); the scales of t+1 are read before the MMAs and installed at the end (partial lgkm waits). Captured units.
     fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> crate::stage::StageInst<'static> {
-        use amdgpu_codegen::weave::Units;
+        use crate::weave::Units;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (self.n_a(), bv.len());
         let half = nn / 2;
@@ -477,7 +477,7 @@ impl Body {
     /// Stage `move.ab_stage`: the DMA of one tile (A issues, then B issues); soffset = the wave-uniform tile origin, M0 = the first 1 KB block of
     /// each group of 4 issues; one captured unit per DMA instruction (each under the slot's write marker).
     fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> crate::stage::StageInst<'static> {
-        let mut u = amdgpu_codegen::weave::Units::new();
+        let mut u = crate::weave::Units::new();
         let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
             // mixed precision: A advances (images) key0 bytes (128 A bytes per image per 128-byte fp4 B tile)

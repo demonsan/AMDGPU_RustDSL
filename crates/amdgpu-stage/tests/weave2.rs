@@ -1,7 +1,7 @@
 //! weave2: captured units (derived dependencies / facts), statement-granularity split, loop rotation.
 
 use amdgpu_dsl::{FnBuilder, Function};
-use amdgpu_codegen::weave::{rotate, Hint, Part, RotStage, UnitClass, Units, Weaver};
+use amdgpu_stage::weave::{rotate, Hint, Part, RotStage, UnitClass, Units, Weaver};
 
 fn direct() -> Function {
     let mut b = FnBuilder::new("w2", 64);

@@ -3,6 +3,7 @@
 //! the allowlist below, which lists the documented opt-in toolboxes only:
 //!   (`weave_auto.rs`, the opt-in auto-weave tool with its AMDC_WEAVE_AUTO_* variables, moved to `amdgpu-codegen` (L4) with the Weaver and is outside the scanned crates; it never changes a shipped kernel)
 //!   * `amdgpu-stage/src/gemm/body.rs`: `GEMM_PROOF_DROP_KB` (proof negative test) and `gemm/mod.rs`: `GEMM_STAMP` (timestamp instrumentation), both off by default;
+//!   * `amdgpu-stage/src/weave_auto.rs`: the auto-weave experiment tool (AMDC_WEAVE_AUTO_*), opt-in, never changes a shipped kernel;
 //!   * `probes/mod.rs`: the hardware probe kernels (`PD_*`, `SCHED_WG`), not shipped kernels.
 //! Adding an entry here needs a reason in the commit message; the registry and every shipped kernel module stay env-free.
 use std::fs;
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 const ALLOW: &[(&str, &[&str])] = &[
     ("amdgpu-kernels/src/gemm/mod.rs", &["GEMM_STAMP"]),
     ("amdgpu-stage/src/gemm/body.rs", &["GEMM_PROOF_DROP_KB"]),
+("amdgpu-stage/src/weave_auto.rs", &["*"]),
     ("amdgpu-kernels/src/probes/mod.rs", &["PD_", "SCHED_WG"]),
 ];
 

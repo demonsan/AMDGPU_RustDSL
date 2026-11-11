@@ -15,5 +15,7 @@ pub mod gemm;
 pub mod pipeline;
 pub mod stage;
 pub mod templates;
+pub mod weave;
+pub mod weave_auto;
 
 pub use pipeline::{Cadence, PipeBody, Pipeline};
