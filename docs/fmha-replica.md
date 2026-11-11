@@ -163,3 +163,51 @@ Kernel `fmha_fwd_hd128_mxfp8_v3_replica` (registered, not dispatched; the md5 ma
 - The vendor's MFMA mix costs us 2–3 % with our schedule: the static counts are equal and the nops / waits nearly so (12 / 23 vs 13 / 20), so the difference is dynamic.
 - Unscaled PV is kept in the replica (it is the vendor's form) but **not** for `_vs128`.
 - Open: why the unscaled form runs slower in our order. Candidates are its source-C read timing / dependency rules in our hazard model and the scheduler's latency table; an ATT trace would settle it.
+
+### 4.3 Step 2: the two-tile pass with static slots and one drain per exit
+
+**Change.** `Pipeline::unroll2` (`TwoPhaseOffset`):
+
+```
+loop { tile it, static slot 0; idx = 1; break_if(it + 1 >= nkv - 1);
+       tile it + 1, static slot 1; idx = 0; it += 2; break_if(it >= nkv - 1) }
+if (idx == 1) { drain: last tile it + 1 in slot 1 } else { drain: last tile it in slot 0 }
+```
+
+Each drain keeps the full-tile / partial-tile `if`. Ring slot offsets become immediates, as in the vendor's alternating `0 / 0x4100`.
+
+**Class.** Expressible now. The DSL's `break_if` already allows several exits from one loop; the `RegStaged` cadence used the same idiom.
+- The vendor's layout (each exit edge jumps straight to its drain) is a **back-end Weaver** pass: jump threading on the per-edge constant `idx` plus drain layout. Agreed with backend-llvm-tail (W3): a plain MIR CFG pass, scheduled after the missing MOps.
+- So no DSL multi-exit construct is needed.
+
+**Static, group A loop vs the vendor's:**
+
+| | replica step 2 | vendor |
+|---|---:|---:|
+| instructions without fillers | 635 | 439 |
+| VALU / SALU | 442 / 24 | 226 / 46 |
+| MFMA scaled / unscaled / smfmac / helper | 16 / 16 / 4 / 2 | 16 / 16 / 4 / 2 |
+| `ds_read_b64_tr_b8` / `ds_read_b128` / LDS-DMA | 64 / 40 / 10 | 64 / 40 / 10 |
+| `s_waitcnt` / `s_nop` | 40 / 23 | 32 / 2 |
+
+The matrix, LDS and copy streams of the pass now have the vendor's exact counts. The VALU excess (+216) is the two inline rollback branches (about 100 each; out of line at the vendor, §3.2). Opcode alignment is 19 % because the inline rollback blocks interrupt the stream, and registers are still allocated differently (4 % equal up to renaming).
+
+**Gates** (`port_gate`, the replica as `_vs128`, STRESS skipped): **OVERALL PASS**.
+- BUILD, strict VERIFY (0 errors);
+- ACC16 15/15;
+- ACC64 vendor parity on all four paths;
+- DET 5/5;
+- the PERF rows.
+
+**Performance, same session (normal data, ratio to the same-run vendor):**
+
+| shape | `_vs128` | step 1 | **step 2** |
+|---|---:|---:|---:|
+| per-CU 64 blocks | 0.941× | 0.925× | **0.955×** (693.9 TF/s) |
+| B4H8S2048 | 0.973× | 0.948× | **0.981×** (1894.9) |
+| B1H8S8192 | 0.977× | 0.957× | **0.988×** (2508.1) |
+| B2H8S2048 | 0.953× | 0.952× | **0.968×** (1266.9) |
+
+**Reading.**
+- The two-tile pass with static slots more than recovers step 1's loss: +1.0 to +1.6 % over `_vs128` in vendor ratio.
+- Open: whether `unroll2` alone (with scaled PV) also helps `_vs128`. That is a separate, W4-gated proposal.

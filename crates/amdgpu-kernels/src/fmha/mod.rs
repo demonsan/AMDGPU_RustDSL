@@ -80,6 +80,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
         // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
         pipe.key_unclamped = true;
+        pipe.unroll2 = self.replica;
         let lut = blk.lut_copy(b);
         FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
     }
