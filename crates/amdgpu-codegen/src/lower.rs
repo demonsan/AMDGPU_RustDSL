@@ -4015,6 +4015,28 @@ impl Lowerer {
 
     /// A VALU op with plain V1 operands (constants materialised; e32 / VOP3 forms both accept them).
     fn v_plain(&mut self, dst: ValueId, op: MOp, srcs: &[Opnd]) -> Result<(), String> {
+        // `sgpr2` (W3 B2, the vendor's uniform operands): a wave-uniform value already in an SGPR is src0 of the e32 form of the
+        // commutative VOP2 ops (and of v_sub when it is the minuend); constant bus limit 1, so the other operand stays a VGPR
+        if opt_on("sgpr2") && srcs.len() == 2 {
+            const COMM: &[MOp] = &[MOp::VMinF32, MOp::VMaxI32, MOp::VMaxU32, MOp::VMinU32, MOp::VMulU32U24, MOp::VMulI32I24, MOp::VOrB32];
+            let comm = COMM.contains(&op);
+            if comm || op == MOp::VSubU32 {
+                let (a, b) = (srcs[0], srcs[1]);
+                let pick = match (self.sgpr_src(a), self.sgpr_src(b)) {
+                    (Some(s), _) if self.const_bits(b).is_none() && self.sgpr_src(b).is_none() => Some((s, b)),
+                    (None, Some(s)) if comm && self.const_bits(a).is_none() => Some((s, a)),
+                    _ => None,
+                };
+                if let Some((s, other)) = pick {
+                    let r = self.as_v1(other)?;
+                    self.touch(&[Src::Reg(s), Src::Reg(r)]);
+                    let d = self.new_vreg(RClass::V1);
+                    self.push(MInst::new(op).def(d).srcreg(s).srcreg(r));
+                    self.val.insert(dst, d);
+                    return Ok(());
+                }
+            }
+        }
         let mut rs = Vec::with_capacity(srcs.len());
         for s in srcs {
             rs.push(self.as_v1(*s)?);
