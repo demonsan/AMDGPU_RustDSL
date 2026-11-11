@@ -130,7 +130,8 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut aw: HashMap<VReg, usize> = HashMap::new();
         // high-half scalef32 conversion result -> any consumer needs one wait state
         let mut hiw: HashMap<VReg, usize> = HashMap::new();
-        // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
+        // strict: VALU write of vcc -> VALU read of vcc (target row `valu-vcc-valu`: 1 wait state; the pinned LLVM asks 2, the hardware needs 0 -
+        // tools/vcc_hazard_probe.sh - and the vendor FMHA uses 1 at 512 sites, docs/fmha-replica.md).
         let vccw = std::cell::Cell::new(0usize);
         let mut cycle = 0usize;
 
@@ -345,10 +346,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
             }
             if strict && inst.op.defines_vcc() {
-                vccw.set(cycle + 3);
+                vccw.set(cycle + 1 + crate::target::T.hazard("valu-vcc-valu").n() as usize);
             }
             if strict && matches!(inst.op, MOp::VPtrAdd) {
-                vccw.set(cycle + 3);
+                vccw.set(cycle + 1 + crate::target::T.hazard("valu-vcc-valu").n() as usize);
             }
             // an explicit `s_nop N` already in the stream (hand-authored blocks) covers N+1 wait states
             let spent = if inst.op == MOp::SNop { inst.imm.max(0) as usize + 1 } else { 1 };
