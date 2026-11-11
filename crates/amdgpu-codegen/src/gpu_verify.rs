@@ -2639,6 +2639,22 @@ pub fn verify_ir(f: &Function) -> Report {
     rep
 }
 
+/// The barrier / tile-protocol part of `verify_ir` alone (role barrier balance `GV-BAR`, the LDS / global tile protocol `GV-TILE-*` / `GV-PROTO-*`,
+/// last arrivers): the same verdicts for those codes as `verify_ir`, without the value / bounds analysis. For mutation tests that re-verify a kernel
+/// many times (`gpu_tiles.rs`: every barrier removed in turn).
+pub fn verify_ir_protocol(f: &Function) -> Report {
+    verify_ir_protocol_cap(f, None)
+}
+
+/// `verify_ir_protocol` simulating at most `cap` loop iterations (see `gpu_protocol::verify_tiles_cap`): a mutation test's fast check.
+pub fn verify_ir_protocol_cap(f: &Function, cap: Option<usize>) -> Report {
+    let mut rep = Report::default();
+    barrier_balance(f, &mut rep);
+    crate::gpu_protocol::verify_tiles_cap(f, &mut rep, cap);
+    crate::gpu_protocol::verify_last_arrivers(f, &mut rep);
+    rep
+}
+
 // --------------------------------------------------------------------------------------------------------------------------------------------
 // MIR level: register legality + path-sensitive wait / lifetime
 

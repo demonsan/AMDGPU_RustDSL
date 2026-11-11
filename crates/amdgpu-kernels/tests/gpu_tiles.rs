@@ -1,5 +1,5 @@
 //! gpu_verify v1.1: LDS tile lifetime / versioning. A two-role (producer wave / consumer wave) ring protocol, one positive case and one negative case per rule.
-use amdgpu_codegen::gpu_verify::{verify_ir, Report, Severity};
+use amdgpu_codegen::gpu_verify::{verify_ir, verify_ir_protocol_cap, Report, Severity};
 use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 #[derive(Clone, Copy)]
@@ -405,7 +405,9 @@ fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
         g.edit_stmts(|v| {
             v.remove(stmt);
         });
-        let m = verify_ir(&g);
+        // the barrier / tile-protocol analyses only (the codes this test looks for, without verify_ir's value / bounds analysis), simulating up to
+        // 4 loop iterations: a removed barrier shows within the first iterations; the unmutated kernel above gets the full verification
+        let m = verify_ir_protocol_cap(&g, Some(4));
         if !m.errors().iter().any(|e| e.code == "GV-BAR" || e.code.starts_with("GV-TILE")) {
             undetected.push(k);
         }

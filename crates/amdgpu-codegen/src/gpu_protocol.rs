@@ -67,6 +67,10 @@ struct Trace {
     evs: Vec<Ev>,
     /// the outcomes taken at wave-uniform runtime ifs: (stmt, outcome, workgroup-uniform)
     path: Vec<(usize, bool, bool)>,
+    /// `analyse_trace` of every event, computed once per trace (a trace is checked against several partner traces)
+    infos: Vec<TraceInfo>,
+    /// `bar_from[k]`: a barrier sits at item index k or later (suffix flags, len = items + 1)
+    bar_from: Vec<bool>,
 }
 
 /// Regions whose markers the intra-workgroup simulator must not interpret: counted-trust regions and inter-block (last-arriver) regions.
@@ -451,7 +455,9 @@ impl<'a> Sim<'a> {
                         // a runtime exit of the outermost loop: in its LAST simulated iteration each exit point is a decision (taken / not taken), so the
                         // code after every exit (e.g. a per-exit drain of a loop unrolled by two) is simulated too; keyed by the exit's ordinal in the
                         // iteration (workgroup-uniform: both roles leave at the same exit)
-                        CV::U if self.loop_depth == 1 && self.outer == self.n as i64 - 1 => {
+                        // (an exit with nothing protocol-relevant after it in the body - the loop test at the end - leaves exactly like the last
+                        // iteration ending: no decision)
+                        CV::U if self.loop_depth == 1 && self.outer == self.n as i64 - 1 && self.exit_matters(i) => {
                             let key = usize::MAX - self.brk_ord;
                             self.brk_ord += 1;
                             if self.choose(key, true) {
@@ -513,11 +519,29 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// Does anything protocol-relevant (barrier, tile marker, wait, fence, LDS access) follow the `break_if` at `i` in its loop body?
+    fn exit_matters(&self, i: usize) -> bool {
+        let f = self.f;
+        let mut depth = 0usize;
+        for s in &f.stmts()[i + 1..] {
+            match s {
+                Stmt::BeginLoop { .. } => depth += 1,
+                Stmt::EndLoop if depth == 0 => return false,
+                Stmt::EndLoop => depth -= 1,
+                Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::WaitLds { .. } | Stmt::WaitVm { .. } | Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => return true,
+                _ if is_lds_access(s).is_some() => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn exec_loop_body(&mut self, start: usize, end: usize) {
         self.exec(start, end);
     }
 }
 
+#[derive(Clone)]
 struct TraceInfo {
     /// item index at which the event is complete in its own wave
     done: Option<usize>,
@@ -956,8 +980,8 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
     let mut work: Vec<Vec<bool>> = vec![Vec::new()];
     let mut unsupported: Vec<(usize, String)> = Vec::new();
     while let Some(prefix) = work.pop() {
-        if out.len() + work.len() > 64 {
-            diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 64 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
+        if out.len() + work.len() > 256 {
+            diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
         let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0 };
@@ -972,7 +996,12 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
         }
         let taken = sim.taken.clone();
         let (items, evs) = (std::mem::take(&mut sim.items), std::mem::take(&mut sim.evs));
-        out.push(Trace { items, evs, path: taken });
+        let infos = evs.iter().map(|ev| analyse_trace(&items, ev)).collect();
+        let mut bar_from = vec![false; items.len() + 1];
+        for k in (0..items.len()).rev() {
+            bar_from[k] = bar_from[k + 1] || matches!(items[k], Item::Barrier { .. });
+        }
+        out.push(Trace { items, evs, path: taken, infos, bar_from });
     }
     for (stmt, msg) in unsupported {
         if !diags.iter().any(|d| d.0 == "GV-TILE-UNSUPPORTED" && d.2 == stmt) {
@@ -1000,25 +1029,37 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     }
     let mut infos: Vec<Info> = Vec::new();
     for (role, t) in traces.iter().enumerate() {
-        for ev in &t.evs {
+        for (k, ev) in t.evs.iter().enumerate() {
             if ev.n_acc == 0 {
                 diags.push(("GV-TILE-EMPTY", Severity::Warn, ev.stmt, format!("stmt {}: tile marker `{}` covers no LDS access", ev.stmt, f.contract.tiles[ev.tile].name)));
                 continue;
             }
-            let ti = analyse_trace(&t.items, ev);
+            let ti = &t.infos[k];
             infos.push(Info { role, ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
         }
     }
+    // the producers per (tile, slot): every consumer looks up its own slot instead of scanning all events
+    let mut prod_of: HashMap<(usize, i64), Vec<usize>> = HashMap::new();
+    for (k, x) in infos.iter().enumerate() {
+        if x.ev.produce {
+            prod_of.entry((x.ev.tile, x.ev.slot)).or_default().push(k);
+        }
+    }
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
+    // the location suffixes of the messages, formatted once per pair (not per consumer)
+    let wh_priv: [String; 2] = [0, 1].map(|r| format!("(role {r}, {n} iteration(s) simulated)"));
+    let wh: [[String; 2]; 2] = [0, 1].map(|r| [false, true].map(|g| format!("(role {r}, {n} iteration(s) simulated){}", if g { " [global region]" } else { "" })));
     for c in infos.iter().filter(|x| !x.ev.produce) {
         *checked += 1;
         if f.contract.tiles[c.ev.tile].private {
             // own-wave semantics: the wave reads a version it produced AND completed (wait_vm/wait_lds(0)) itself; no other wave is involved, so no barrier is required
             let tname = f.contract.tiles[c.ev.tile].name.clone();
-            let own: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && p.ev.tile == c.ev.tile && p.role == c.role).collect();
+            let mut own_k: Vec<usize> = prod_of.iter().filter(|((t, _), _)| *t == c.ev.tile).flat_map(|(_, v)| v.iter().copied()).filter(|&k| infos[k].role == c.role).collect();
+            own_k.sort_unstable();
+            let own: Vec<&Info> = own_k.iter().map(|&k| &infos[k]).collect();
             let completed: Vec<&&Info> = own.iter().filter(|p| p.done.map_or(false, |d| d < c.ev.start)).collect();
             let stmt = c.ev.stmt;
-            let where_ = format!("(role {}, {} iteration(s) simulated)", c.role, n);
+            let where_ = &wh_priv[c.role.min(1)];
             match completed.iter().max_by_key(|p| p.ev.start) {
                 None => {
                     let why = match own.iter().find(|p| p.ev.start < c.ev.start) {
@@ -1036,8 +1077,9 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         }
         let key = (c.ev.tile, c.ev.slot);
         // an owner read of a version this thread wrote itself before (owner write, program order): the thread's own words, no barrier needed
-        if is_owner(&c.ev) && infos.iter().any(|p| p.ev.produce && is_owner(&p.ev) && p.role == c.role && (p.ev.tile, p.ev.slot) == key && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
-            for q in infos.iter().filter(|q| q.ev.produce && (q.ev.tile, q.ev.slot) == key && q.ev.ver != c.ev.ver && !is_owner(&q.ev)) {
+        let slot_prods: &[usize] = prod_of.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
+        if is_owner(&c.ev) && slot_prods.iter().map(|&k| &infos[k]).any(|p| is_owner(&p.ev) && p.role == c.role && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
+            for q in slot_prods.iter().map(|&k| &infos[k]).filter(|q| q.ev.ver != c.ev.ver && !is_owner(&q.ev)) {
                 let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
                 if overlap {
                     diags.push(("GV-TILE-RACE", Severity::Error, c.ev.stmt, format!("stmt {}: owner read of `{}` (version {}) overlaps the shared write of version {} (stmt {}): no barrier separates them", c.ev.stmt, name(c.ev.tile), c.ev.ver, q.ev.ver, q.ev.stmt)));
@@ -1045,13 +1087,13 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
             continue;
         }
-        let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
+        let prods: Vec<&Info> = slot_prods.iter().map(|&k| &infos[k]).collect();
         let stmt = c.ev.stmt;
         let gl = c.ev.global;
-        let where_ = format!("(role {}, {} iteration(s) simulated){}", c.role, n, if gl { " [global region]" } else { "" });
+        let where_ = &wh[c.role.min(1)][gl as usize];
         // only a BARRIER after the uncompleted reads can order them against a next writer: reads still in flight when the wave's trace ends (the last tile of a
         // pipeline without a closing barrier, e.g. the `_t128` cadence) have no next writer to race with
-        if c.done.is_none() && traces[c.role].items.iter().skip(c.ev.last + 1).any(|it| matches!(it, Item::Barrier { .. })) {
+        if c.done.is_none() && traces[c.role].bar_from.get(c.ev.last + 1).copied().unwrap_or(false) {
             diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
         }
         // SHARED tile: the data is produced by OTHER waves (even of the same role) and consumed independently by every wave. A producer's own completion
@@ -1176,6 +1218,12 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
 }
 
 pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
+    verify_tiles_cap(f, rep, None)
+}
+
+/// `verify_tiles` simulating at most `cap` loop iterations (and not checking the period claim, which needs the full horizon): for mutation tests that
+/// re-verify a kernel many times. A protocol error found within the cap is a real error; the full verification is `verify_tiles`.
+pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize>) {
     let tiles = &f.contract.tiles;
     if tiles.is_empty() {
         return;
@@ -1244,6 +1292,8 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             }
         }
     }
+    let nmax = cap.map_or(nmax, |c| nmax.min(c));
+    let period_claim = if cap.is_some() { None } else { period_claim };
     let div = divergent_ifs(f);
     let own_reuse = rep.own_reuse.clone();
     let owned = rep.owned.clone();
