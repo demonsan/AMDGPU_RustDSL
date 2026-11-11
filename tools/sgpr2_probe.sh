@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hardware check of the `salu32` forms (s_sub_u32 / s_or_b32 / s_addk_i32 / s_cmp_ge_u32) and v_mul_i32_i24 on the test kernel of
+# Hardware check of the `sgpr2` lowering token (uniform SGPR operands of VALU ops) on the test kernel of
 # crates/amdgpu-kernels/tests/b2_operands.rs (uniform_operand_kernel). Usage: HIP_VISIBLE_DEVICES=0 bash tools/sgpr2_probe.sh
 set -uo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
