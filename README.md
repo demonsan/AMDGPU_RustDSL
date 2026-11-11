@@ -43,6 +43,8 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 
 ## 快速上手
 
+> **GPU 规则（2026-11-11）**：GPU 测试只允许使用 GPU 0–3，任何节点都不得使用 4–7。所有跑 GPU 的脚本都 source [`tools/gpu_guard.sh`](tools/gpu_guard.sh)：`HIP_VISIBLE_DEVICES`（或 `ROCR_VISIBLE_DEVICES`）未设置或含 0–3 以外的卡时直接退出 1。
+
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build

@@ -8,6 +8,7 @@ KS=$(python3 tools/mfma_dep.py build/dep/dep.s 2048 | sed 's/kernels: //')
 "$ASM/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/dep/dep.co build/dep/dep.s || exit 1
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/mfma_ceiling_host.cpp -o build/dep/host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" MPI=32
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 if [ -z "${ONLY_SUSTAINED:-}" ]; then
 echo "=== one CU (BLOCKS=1): cycles per MFMA, ITERS=2048, 8 launches"
 BLOCKS=1 ITERS=2048 REPS=8 ./build/dep/host build/dep/dep.co $KS | grep -E "^(s32|s16)"

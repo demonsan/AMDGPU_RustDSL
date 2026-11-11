@@ -4,6 +4,7 @@
 # usage (repo root of a tree that has tools/att_*.py, GPU node):  HIP_VISIBLE_DEVICES=0 PAH=/tmp/pa2/pah KCO=pa_decode16_bf16_hd128_p16_f.co CCO=attn_combine_bf16_hd128.co VCO=vendor.co bash tools/att_pa.sh <tag> [B H HK CTX]
 #   env: KREGEX (default pa_decode16), FUSED (1 = fused-combine kernel), KPREFIX / KSUFFIX (pa_host naming), PAGE (16), S (1), CUS, ATT_DECODER_DIR
 set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 TAG=${1:-pa}; B=${2:-16}; H=${3:-64}; HK=${4:-8}; CTX=${5:-2048}
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; DEC=${ATT_DECODER_DIR:-/shared/apps/ubuntu/opt/rocm-10.1.0/lib}; O=build/att/$TAG; rm -rf "$O"; mkdir -p "$O"
 VN=$(strings "$VCO" | grep -m1 '^_ZN5aiter')

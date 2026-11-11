@@ -5,6 +5,7 @@
 # usage (repo root, GPU node, amdc built): HIP_VISIBLE_DEVICES=0 bash tools/att_fmha.sh <tag> [B H S] [kernel]
 #   env: REF_DATA (default normal), ROWS_PER_BLOCK (default 256), REF_CO (vendor .co), ATT_DECODER_DIR (librocprof-trace-decoder)
 set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 TAG=${1:-att}; B=${2:-1}; H=${3:-8}; S=${4:-2048}; K=${5:-fmha_fwd_hd128_mxfp8_v3_vs128}
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
 DEC=${ATT_DECODER_DIR:-/shared/apps/ubuntu/opt/rocm-10.1.0/lib}

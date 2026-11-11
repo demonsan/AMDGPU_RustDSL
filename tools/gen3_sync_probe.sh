@@ -10,6 +10,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 ASM="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}"; HIPROOT="${HIPROOT:-/shared/apps/ubuntu/opt/rocm-7.2.4}"
 unset GPU_DEVICE_ORDINAL CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 OUT=build/gen3; mkdir -p "$OUT"
 LM="$ASM/llvm/bin/llvm-mc"; CLANG="$ASM/llvm/bin/clang"
 

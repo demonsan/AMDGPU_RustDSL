@@ -3,6 +3,8 @@
 #   REF_DATA=normal HIP_VISIBLE_DEVICES=0 AMDC=<amdc> bash tools/lgab.sh <kernel>[@spec][%VAR=val;VAR=val]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
 #   `%VAR=val;..` is exported only while that variant is emitted (e.g. `fmha_fwd_hd128_mxfp8_v3_vs128%AMDC_SCHED=1;AMDC_SCHED_OPTS=hoist=64`); variants are labelled by the whole string.
 set -u
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
 A=${AMDC:-/tmp/target-kfmha/debug/amdc}; V=${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}

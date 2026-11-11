@@ -33,6 +33,7 @@ ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 REF_CO="${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}"
 GPU="${HIP_VISIBLE_DEVICES:-0}"; export HIP_VISIBLE_DEVICES="$GPU"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 PERF_REPS="${PERF_REPS:-5}"; PERF_TOL="${PERF_TOL:-0.97}"; STRESS_RUNS="${STRESS_RUNS:-300}"; STRESS_MAXDIFF="${STRESS_MAXDIFF:-0.15}"   # shipped baseline: 0.066 (B1H2S200 split4) / 0.098 (B1H8S2048); recalibrate if a corruption could hide below it
 KN_VS128="${KN_VS128:-${P}_vs128}"; KN_T128="${KN_T128:-${P}_t128}"; KN_KVSPLIT="${KN_KVSPLIT:-${P}_kvsplit}"; KN_COMBINE="${KN_COMBINE:-${P}_kvsplit_combine8h}"
 B="build/pg_${TAG}"; mkdir -p "$B"

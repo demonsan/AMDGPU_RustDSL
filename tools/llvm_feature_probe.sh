@@ -7,6 +7,7 @@ ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/llvm_feature_host.cpp -o build/llvm_feature_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 emit() { bash tools/container/cargo.sh run -q --bin amdc -- emit "$1" --backend own --out "/work/build/$1.s" 2>&1 | grep -E "compile error" -A4; "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/$1.co" "build/$1.s" || echo "ASSEMBLE_FAIL $1"; }
 rc=0
 for K in kernarg ids roles lds branch loop atomic maskge k1 k2; do emit probe_llvm_$K; done

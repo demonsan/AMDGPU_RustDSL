@@ -9,6 +9,7 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/gate
 K="${1:-gemm_mxfp8_bs_v4}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 FAIL=0; note() { echo "$*"; }; bad() { echo "FAIL: $*"; FAIL=1; }
 echo "==== BUILD"
 out=$(bash tools/container/cargo.sh test -q -p amdgpu-kernels --test gemm_mxfp8 2>&1); echo "$out" | grep -E 'test result' || bad "cargo test"; echo "$out" | grep -q 'test result: ok' || bad "gemm tests"

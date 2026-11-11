@@ -4,6 +4,8 @@
 #   HIP_VISIBLE_DEVICES=0 bash tools/ab_fmha.sh <kernel>[@name=v,..]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
 #   `kernel@spec` emits with `--specialize spec` (docs/jit.md); the variant is labelled `kernel@spec` (only meaningful on a matching shape)
 set -u
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 # a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
 irname() { case "$1" in *.ir) sed -n 's/^dsl "\(.*\)"$/\1/p' "$1" | head -1;; *) echo "$1";; esac; }
 irsrc() { case "$1" in *.ir) echo "--from-ir $1";; *) echo "$1";; esac; }

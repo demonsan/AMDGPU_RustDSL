@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # probe_mfma_unscaled on the GPU with both backends (unscaled vs scaled-127/127 results must be identical).
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build

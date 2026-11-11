@@ -2,6 +2,7 @@
 # AGPR probes: emit, assemble, run, compare outputs of the pinned variants with the arch-VGPR reference.
 # usage (repo clone on the node): bash tools/agpr_probe.sh   (env HIP_VISIBLE_DEVICES, ASM_ROC)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/agpr
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-10.1.0}"; ASM="${ASM_ROC:-$ROC}"
 [ -x build/sched_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/sched_host.cpp -o build/sched_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1

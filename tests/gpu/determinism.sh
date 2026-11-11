@@ -2,6 +2,7 @@
 # Determinism check: every shape is run 3 times and the dumped bf16 output must be bit-identical.
 # Usage: REF_CO=/path/vendor.co bash tests/gpu/determinism.sh   (OUR_KERNEL, ROCM_PATH, HIP_VISIBLE_DEVICES optional)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"

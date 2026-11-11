@@ -5,6 +5,7 @@
 #   FMHA: HIP_VISIBLE_DEVICES=0 B=4 S=2048 RPB=256 bash tools/ab_layout.sh fmha <variant>...
 #   GEMM: HIP_VISIBLE_DEVICES=0 bash tools/ab_layout.sh gemm <variant>...        (gemm_ref_host default shape 4096x4096x8192)
 set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 # a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
 irname() { case "$1" in *.ir) sed -n 's/^dsl "\(.*\)"$/\1/p' "$1" | head -1;; *) echo "$1";; esac; }
 irsrc() { case "$1" in *.ir) echo "--from-ir $1";; *) echo "$1";; esac; }

@@ -10,6 +10,7 @@
 # usage (repo root, GPU node): HIP_VISIBLE_DEVICES=0 bash python/tests/run_all.sh [--full] [ops_check name filters ...]
 #   env: AMDGPU_JIT_AMDC (default: build the release amdc with tools/container/cargo.sh and use it), OUT (default build/py_checks)
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 FULL=0
 if [ "${1:-}" = "--full" ]; then FULL=1; shift; fi
 OUT=${OUT:-build/py_checks}

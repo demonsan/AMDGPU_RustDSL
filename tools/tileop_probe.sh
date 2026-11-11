@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hardware probe of the P1 base ops (docs/op-coverage-tileops.md §6.5).  Usage: HIP_VISIBLE_DEVICES=0 bash tools/tileop_probe.sh <probe> [own|llvm-tail]
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/tileop
 P=${1:?probe name}; BE=${2:-own}
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"

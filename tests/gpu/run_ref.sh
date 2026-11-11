@@ -2,6 +2,7 @@
 # Compare our fmha_fwd_hd128_mxfp8 with the vendor fwd_hd128_mxfp8.co (and a CPU model) on the GPU node.
 # Usage: REF_CO=/path/to/fwd_hd128_mxfp8.co bash tests/gpu/run_ref.sh
 set -uo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/gpu_guard.sh"   # GPU tests only on GPUs 0-3
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"
