@@ -305,6 +305,78 @@ pub fn apply_order(b: &mut Block, segs: &[Seg], ord: &[usize]) {
     b.insts = out;
 }
 
+/// B4: the plan's interleave hints inside `Free` phases. For a hint (skeleton unit, filler units) whose units all lie in one block and
+/// whose phase is `Free`, the filler instructions are spread over the skeleton: after each MFMA of the skeleton the next
+/// ceil(fillers / MFMAs) filler instructions. The merged block order is applied only when it keeps every edge of the instruction
+/// dependence graph (`sched::depgraph`); otherwise the block keeps its order. Returns (blocks merged, hints that fell back).
+pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (usize, usize) {
+    use amdgpu_dsl::plan::OrderSpec;
+    let free_unit = |id: u32| -> bool {
+        plan.units.iter().find(|u| u.id == id).and_then(|u| plan.phases.iter().find(|p| p.id == u.phase)).map_or(false, |p| !matches!(p.order, OrderSpec::Authored))
+    };
+    let (mut merged, mut fell_back) = (0usize, 0usize);
+    for bi in 0..m.blocks.len() {
+        for (skel, fills) in &plan.hints.interleave {
+            if !free_unit(*skel) || fills.iter().any(|f| !free_unit(*f)) {
+                continue;
+            }
+            let b = &m.blocks[bi];
+            let tag = |u: u32| u + 1;
+            let in_skel: Vec<usize> = (0..b.insts.len()).filter(|&i| b.insts[i].unit == tag(*skel)).collect();
+            let in_fill: Vec<usize> = (0..b.insts.len()).filter(|&i| fills.iter().any(|f| b.insts[i].unit == tag(*f))).collect();
+            if in_skel.is_empty() || in_fill.is_empty() {
+                continue;
+            }
+            let mfma: Vec<usize> = in_skel.iter().copied().filter(|&i| crate::op_attrs::attrs(b.insts[i].op).cost.pipe == Pipe::Mfma).collect();
+            if mfma.is_empty() {
+                continue;
+            }
+            let per = in_fill.len().div_ceil(mfma.len());
+            // the new order: every instruction outside the two sets keeps its place relative to the skeleton's first instruction;
+            // the skeleton is emitted with the fillers spread after its MFMAs
+            let first = in_skel[0].min(in_fill[0]);
+            let mut ord: Vec<usize> = Vec::with_capacity(b.insts.len());
+            let moved: std::collections::HashSet<usize> = in_skel.iter().chain(in_fill.iter()).copied().collect();
+            let mut placed = false;
+            let mut fi = in_fill.iter().copied().peekable();
+            for i in 0..b.insts.len() {
+                if moved.contains(&i) {
+                    if !placed && i == first {
+                        placed = true;
+                        for &s in &in_skel {
+                            ord.push(s);
+                            if crate::op_attrs::attrs(b.insts[s].op).cost.pipe == Pipe::Mfma {
+                                for _ in 0..per {
+                                    if let Some(f) = fi.next() {
+                                        ord.push(f);
+                                    }
+                                }
+                            }
+                        }
+                        ord.extend(fi.by_ref());
+                    }
+                    continue;
+                }
+                ord.push(i);
+            }
+            let g = crate::sched::depgraph::build(m, &b.insts, &b.term, false);
+            let mut pos = vec![0usize; ord.len()];
+            for (k, &i) in ord.iter().enumerate() {
+                pos[i] = k;
+            }
+            let ok = ord.len() == b.insts.len() && (0..g.n).all(|i| g.succs[i].iter().all(|&(j, _)| pos[i] < pos[j]));
+            if ok {
+                let old = m.blocks[bi].insts.clone();
+                m.blocks[bi].insts = ord.iter().map(|&i| old[i].clone()).collect();
+                merged += 1;
+            } else {
+                fell_back += 1;
+            }
+        }
+    }
+    (merged, fell_back)
+}
+
 /// The back-end Weaver's ordering pass: per block, the segments are ordered by `policy` and the order is checked against the
 /// segment dependences before it is applied. Returns the number of blocks whose order changed.
 pub fn order(m: &mut MFunction, policy: OrderPolicy) -> Result<usize, String> {
@@ -395,5 +467,86 @@ mod tests {
         assert!(g.deps.contains(&MDep { from: 2, to: 3, kind: MDepKind::Reg(1) }));
         assert_eq!(g.units[2].live_in, vec![0]);
         assert_eq!(g.units[2].live_out, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::*;
+    use amdgpu_dsl::plan::*;
+
+    fn mf(blocks: Vec<Block>, n: usize) -> MFunction {
+        MFunction {
+            name: "g".into(),
+            args: Vec::new(),
+            kernarg_size: 0,
+            workgroup_size: 64,
+            lds_bytes: 0,
+            blocks,
+            vregs: (0..n).map(|i| if i < 4 { RClass::V4 } else { RClass::V1 }).collect(),
+            loops: Vec::new(),
+            alias: Default::default(),
+            elide_fallthrough: false,
+            edge_pad: false,
+            agpr_pin: Default::default(),
+            reg_hints: Default::default(),
+        }
+    }
+
+    fn plan(order: OrderSpec) -> KernelPlan {
+        let u = |id, name: &str, class| UnitDecl { id, name: name.into(), phase: 0, class, anchor: false, iter: 0, latency: 0, roles: 0 };
+        KernelPlan {
+            phases: vec![Phase { id: 0, name: "p".into(), parent: None, kind: PhaseKind::Straight, order, budget: Budget::default() }],
+            units: vec![u(0, "exp", UnitClass::Valu), u(1, "qk", UnitClass::Mfma)],
+            hints: Hints { interleave: vec![(1, vec![0])], ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    /// unit 0 (fillers): four independent VALU ops; unit 1 (skeleton): two independent MFMAs.
+    fn block() -> Block {
+        let mut b = Block::new(0);
+        let tag = |mut i: MInst, u: u32| {
+            i.unit = u;
+            i
+        };
+        for k in 0..4u32 {
+            b.insts.push(tag(MInst::new(MOp::VMovB32).def(4 + k).imm(k as i64), 1));
+        }
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(0).srcreg(1).srcreg(1), 2));
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(2).srcreg(3).srcreg(3), 2));
+        b
+    }
+
+    #[test]
+    fn a_free_phase_spreads_the_fillers_over_the_mfmas() {
+        let mut m = mf(vec![block()], 8);
+        assert_eq!(interleave(&mut m, &plan(OrderSpec::Free)), (1, 0));
+        let ops: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert_eq!(ops, vec![MOp::VMfma16x16x32Bf16Z, MOp::VMovB32, MOp::VMovB32, MOp::VMfma16x16x32Bf16Z, MOp::VMovB32, MOp::VMovB32]);
+    }
+
+    #[test]
+    fn an_authored_phase_keeps_its_order() {
+        let mut m = mf(vec![block()], 8);
+        let before: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert_eq!(interleave(&mut m, &plan(OrderSpec::Authored)), (0, 0));
+        assert_eq!(m.blocks[0].insts.iter().map(|i| i.op).collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn a_dependence_blocks_the_merge() {
+        let mut b = block();
+        // the first MFMA now reads a filler's result: the filler may not move after it
+        b.insts[4] = {
+            let mut i = MInst::new(MOp::VMfma16x16x32Bf16Z).def(0).srcreg(1).srcreg(1);
+            i.unit = 2;
+            i.srcs[0] = Src::Reg(4);
+            i
+        };
+        let mut m = mf(vec![b], 8);
+        m.vregs[4] = RClass::V4;
+        let (merged, fell) = interleave(&mut m, &plan(OrderSpec::Free));
+        assert_eq!((merged, fell), (0, 1));
     }
 }
