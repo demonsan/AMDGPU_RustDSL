@@ -267,7 +267,8 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         }
         let seg_len = |r: VReg| -> usize { segs[r as usize].iter().map(|(a, b)| b - a + 1).sum() };
         let mut order: Vec<(usize, usize, VReg, RClass)> = vregs.clone();
-        order.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
+        // pinned values first (their registers are fixed: placing them before the free values keeps the pin honourable), then wide tuples
+        order.sort_by_key(|x| (plan.pin(x.2).is_none(), std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
         for (s, e, r, c) in order {
             let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
@@ -277,7 +278,10 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let mut i = lo;
             while i + width <= VGPR_COUNT {
                 let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i);
-                if pin_ok && i % width == 0 && (0..width).all(|k| !forbid[i + k] && occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
+                // tuple alignment: the allocator's own rule is width alignment; an explicit pin needs only the ISA's even alignment (gfx90a+:
+                // 64-bit aligned VGPR tuples; the vendor FMHA keeps its S tiles at v[52:67])
+                let aligned = i % width == 0 || (plan.pin(r).is_some() && i % 2 == 0);
+                if pin_ok && aligned && (0..width).all(|k| !forbid[i + k] && occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
                     found = Some(i);
                     break;
                 }
@@ -285,7 +289,19 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             }
             if found.is_none() {
                 if let Some(b) = plan.pin(r) {
-                    return Err(format!("register plan: pin of {} at v{b} cannot be honoured (another value is live there, or a separate partner sits there)", plan.name(r)));
+                    let bi = b as usize;
+                    let why = if (bi..bi + width).any(|k| forbid[k]) {
+                        let others: Vec<String> = plan
+                            .pins
+                            .iter()
+                            .filter(|(&p, &pb)| p != r && start[p as usize] != usize::MAX && start[p as usize] <= e && s <= end[p as usize] && (pb as usize) < bi + width && bi < pb as usize + m.vreg_class(p).dwords() as usize)
+                            .map(|(&p, &pb)| format!("{} at v{pb} [{}..{}]", plan.name(p), start[p as usize], end[p as usize]))
+                            .collect();
+                        format!("forbidden by overlapping pins: {}", others.join(", "))
+                    } else {
+                        format!("occupied: {:?}", (bi..bi + width).map(|k| occ[k].iter().filter(|(os, oe)| my.iter().any(|(ms, me)| !(*oe < *ms || *me < *os))).count()).collect::<Vec<_>>())
+                    };
+                    return Err(format!("register plan: pin of {} [{s}..{e}] at v{b} cannot be honoured ({why})", plan.name(r)));
                 }
             }
             let slot = found.ok_or_else(|| {
@@ -628,9 +644,10 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
                 let rd = range(phys, m, d);
                 let ra = range(phys, m, regs[0]);
                 let rb = range(phys, m, regs[1]);
+                // gfx90a+ ISA: register tuples are 64-bit (even) aligned; no width alignment (the vendor FMHA's v_smfmac reads v[52:59])
                 for (name, r) in [("A", ra), ("B", rb), ("D", rd)] {
                     let width = r.1 - r.0;
-                    if r.0 % width != 0 || r.0 % 2 != 0 {
+                    if r.0 % 2 != 0 {
                         return Err(format!(
                             "block {bi} inst {ii}: SMFMAC operand {name} at v{} is not aligned to its width {}",
                             r.0, width
@@ -666,11 +683,12 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
             let ra = range(phys, m, a);
             let rb = range(phys, m, b_src);
             let rc = range(phys, m, c);
-            // ISA: operands are contiguous and the base register is aligned to
-            // the operand width (and at least even aligned).
+            // ISA (gfx90a+): operands are contiguous register tuples, 64-bit (even) aligned. The allocator places its own tuples at their width,
+            // but the hardware needs only the even alignment: the vendor MXFP8 FMHA (aiter, public) runs v_mfma_scale ... v[52:67], v[20:27] /
+            // v_mfma_f32_32x32x64_f8f6f4 v[116:131] (docs/fmha-replica.md R3 step 3).
             for (name, r) in [("A", ra), ("B", rb), ("C/D", rd)] {
                 let width = r.1 - r.0;
-                if r.0 % width != 0 || r.0 % 2 != 0 {
+                if r.0 % 2 != 0 {
                     return Err(format!(
                         "block {bi} inst {ii}: MFMA operand {name} at v{} is not aligned to its width {}",
                         r.0, width
@@ -1117,7 +1135,8 @@ impl Plan {
         let free = |i: usize| i % w == 0 && i + w <= VGPR_COUNT && (i..i + w).all(|k| !mask[k]);
         if let Some(b) = self.pins.get(&r) {
             let b = *b as usize;
-            if free(b) {
+            // an explicit pin needs only the ISA's even tuple alignment (see the TwoPhase path)
+            if b % 2 == 0 && b + w <= VGPR_COUNT && (b..b + w).all(|k| !mask[k]) {
                 return Ok(Some(b));
             }
             return Err(format!("register plan: pin of {} ({c:?}) at v{b} cannot be honoured: the registers are taken by a value live at the same time or by a separate partner", self.name(r)));

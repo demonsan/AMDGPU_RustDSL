@@ -277,6 +277,19 @@ impl OnlineSoftmax {
         b.mul_f32(lf, c)
     }
 
+    /// The row sum in the unscaled-PV convention (`AttnBody3::pv_unscaled`): the smfmac dwords as they are, 16 x `l_total`.
+    pub fn l_total_unit(&self, b: &mut FnBuilder) -> ValueId {
+        if let Some([d0, d1]) = self.smf.rows2 {
+            let x0 = b.frag4_lane(Opnd::Var(self.l_acc()), d0);
+            let x1 = b.frag4_lane(Opnd::Var(self.l_acc()), d1);
+            let f0 = b.bitcast_f32(x0);
+            let f1 = b.bitcast_f32(x1);
+            return b.add_f32(f0, f1);
+        }
+        let d2 = b.frag4_lane(Opnd::Var(self.l_acc()), 2);
+        b.bitcast_f32(d2)
+    }
+
     /// `log2(l) - 512 b` (the split-independent log-sum-exp of the KV-split partials: P = 2^(x + 512 b - 127)).
     pub fn lse(&self, b: &mut FnBuilder, l_tot: ValueId) -> ValueId {
         let bias2 = self.bias.expect("OnlineSoftmax: state not bound");

@@ -99,3 +99,149 @@ Plan: a new kernel (`fmha_fwd_hd128_mxfp8_v3_replica`) built on the existing sta
 3. **Registers:** the vendor's VGPR roles pinned (O v116–179, S v52–115, K / V v20–51, Q v4–19, P reusing S) through the DSL's register plan (`pin_vgpr_at`, shares).
 4. **Order:** per phase, the vendor's instruction order through weave regions / authored order. Counted safe-asm windows only where the DSL cannot state the order.
 5. **Two-exit loop / cold blocks:** as far as the DSL allows; the rest is listed against §3.6.
+
+### 4.1 Starting point: the steady loops side by side
+
+`isa_diff.py ours.s vendor.dis --range-a BB7:BB8 --range-b label_block_A_loop:label_block_A_drain1` compares group A's loop. Ours runs one tile per pass, the vendor two:
+
+| per tile | ours | vendor (pass / 2) |
+|---|---:|---:|
+| instructions without fillers | 463 | 220 |
+| VALU | 361 | 113 |
+| scaled QK MFMA / unscaled PV MFMA | 16 / 0 (PV scaled) | 8 / 8 |
+| `ds_read_b64_tr_b8` / `ds_read_b128` | 32 / 16 | 32 / 16 |
+| LDS-DMA issues | 5 | 5 |
+| `v_pk_add_f32` + `v_pk_mul_f32` (rebase) | 32 + 32 | 0 (out-of-line rollback blocks) |
+| `v_perm_b32` + `v_pk_sub_u16` + `v_and_b32` (our P / scale path) | 32 + 32 + 32 | 0 |
+| `v_max3_f32`, `v_cvt_pknorm_u16_f32`, `v_cvt_scalef32_pk_fp8_bf16` | 31, 32, 32 | 32, 32, 32 |
+| `s_waitcnt` / `s_nop` | 20 / 11 | 16 / 1 |
+
+What the table shows:
+- **Same counts:** the reads, the copies and the softmax core are already the same per tile.
+- **The rebase:** ours is our lazy recipe's rollback branch, laid out *inline* in the loop body (an `if`), whereas the vendor's rollback blocks are out of line. That is the block-layout item of §3.6, not an algorithm difference.
+- **The real algorithm differences:**
+  - PV through the scaled MFMA (the vendor: unscaled);
+  - 96 VALU per tile of `v_perm` / `v_pk_sub_u16` / `v_and` that the vendor does not have (traced in §4.2: the LUT copy, not the long-sequence loop);
+  - one tile per pass, against the vendor's two-tile unrolled pass with two exits.
+- **Exact operand equality is 1.8 %:** registers are allocated differently, the gap §4 step 3 addresses.
+
+### 4.2 Step 1: unscaled PV; where the 96 extra VALU come from
+
+**Trace.** `_vs128` has two versions of each group's loop:
+- the **LUT copy** (`FmhaBlock::lut_copy`: sequences of fewer than 4 key tiles keep the LUT-corrected fp8 conversion, `reduce.rs`: `perm` → `pk_sub_u16`), loops `BB7` / `BB26`;
+- the **vendor-recipe copy** (`set_vendor_ref`, lazy rebase), loops `BB48` / `BB67`.
+
+The 96 VALU are the LUT correction and live only in the short-sequence copy. The vendor has no such copy (it accepts the larger error on short sequences; our port gate measured 1.31× the vendor's mean error without it at S = 300, SK = 129). The comparison below uses the vendor-recipe loop.
+
+**Change.**
+- `AttnBody3::pv_unscaled`: PV through `v_mfma_f32_32x32x64_f8f6f4`, i.e. the DSL's `var_mfma_fp8_32x32x64`, as the vendor does;
+- the row sum without its 1/16 (`OnlineSoftmax::l_total_unit`), so O / l is unchanged (powers of two).
+
+Kernel `fmha_fwd_hd128_mxfp8_v3_replica` (registered, not dispatched; the md5 manifest gains this one entry). **Class: expressible now** — no new DSL or backend feature was needed.
+
+| | `_vs128` (vendor-recipe loop) | replica step 1 | vendor (per tile) |
+|---|---:|---:|---:|
+| instructions / tile without fillers (incl. the inline rollback branch) | 337 | 335 | 220 (+ out-of-line rollback) |
+| scaled / unscaled MFMA per tile | 16 / 0 | 8 / 8 | 8 / 8 |
+| opcode alignment with the vendor loop | 36.8 % | 39.1 % | — |
+| registers identical up to renaming | — | 3.8 % | — |
+
+**Gates.**
+- `gpu-verify --strict`: 0 errors.
+- `port_gate` (replica as `_vs128`, STRESS skipped): BUILD, VERIFY, ACC16 15/15, ACC64 vendor parity on all paths (15/15, 15/15, 15/15, 13/13) and DET 5/5 all PASS.
+
+**Performance, same run (normal data, TF/s, ratio to the vendor in the same run):**
+
+| shape | `_vs128` | replica step 1 | change |
+|---|---|---|---:|
+| per-CU 64 blocks | 688.3 (0.941×) | 670.6 (0.925×) | −2.6 % |
+| B4H8S2048 | 1883.9 (0.973×) | 1829.2 (0.948×) | −2.9 % |
+| B1H8S8192 | 2484.0 (0.977×) | 2427.9 (0.957×) | −2.3 % |
+| B2H8S2048 | 1247.5 (0.953×) | 1228.5 (0.952×) | −1.5 % |
+
+**Reading.**
+- The vendor's MFMA mix costs us 2–3 % with our schedule: the static counts are equal and the nops / waits nearly so (12 / 23 vs 13 / 20), so the difference is dynamic.
+- Unscaled PV is kept in the replica (it is the vendor's form) but **not** for `_vs128`.
+- Open: why the unscaled form runs slower in our order. Candidates are its source-C read timing / dependency rules in our hazard model and the scheduler's latency table; an ATT trace would settle it.
+
+### 4.3 Step 2: the two-tile pass with static slots and one drain per exit
+
+**Change.** `Pipeline::unroll2` (`TwoPhaseOffset`):
+
+```
+loop { tile it, static slot 0; idx = 1; break_if(it + 1 >= nkv - 1);
+       tile it + 1, static slot 1; idx = 0; it += 2; break_if(it >= nkv - 1) }
+if (idx == 1) { drain: last tile it + 1 in slot 1 } else { drain: last tile it in slot 0 }
+```
+
+Each drain keeps the full-tile / partial-tile `if`. Ring slot offsets become immediates, as in the vendor's alternating `0 / 0x4100`.
+
+**Class.** Expressible now. The DSL's `break_if` already allows several exits from one loop; the `RegStaged` cadence used the same idiom.
+- The vendor's layout (each exit edge jumps straight to its drain) is a **back-end Weaver** pass: jump threading on the per-edge constant `idx` plus drain layout. Agreed with backend-llvm-tail (W3): a plain MIR CFG pass, scheduled after the missing MOps.
+- So no DSL multi-exit construct is needed.
+
+**Static, group A loop vs the vendor's:**
+
+| | replica step 2 | vendor |
+|---|---:|---:|
+| instructions without fillers | 635 | 439 |
+| VALU / SALU | 442 / 24 | 226 / 46 |
+| MFMA scaled / unscaled / smfmac / helper | 16 / 16 / 4 / 2 | 16 / 16 / 4 / 2 |
+| `ds_read_b64_tr_b8` / `ds_read_b128` / LDS-DMA | 64 / 40 / 10 | 64 / 40 / 10 |
+| `s_waitcnt` / `s_nop` | 40 / 23 | 32 / 2 |
+
+The matrix, LDS and copy streams of the pass now have the vendor's exact counts. The VALU excess (+216) is the two inline rollback branches (about 100 each; out of line at the vendor, §3.2). Opcode alignment is 19 % because the inline rollback blocks interrupt the stream, and registers are still allocated differently (4 % equal up to renaming).
+
+**Gates** (`port_gate`, the replica as `_vs128`, STRESS skipped): **OVERALL PASS**.
+- BUILD, strict VERIFY (0 errors);
+- ACC16 15/15;
+- ACC64 vendor parity on all four paths;
+- DET 5/5;
+- the PERF rows.
+
+**Performance, same session (normal data, ratio to the same-run vendor):**
+
+| shape | `_vs128` | step 1 | **step 2** |
+|---|---:|---:|---:|
+| per-CU 64 blocks | 0.941× | 0.925× | **0.955×** (693.9 TF/s) |
+| B4H8S2048 | 0.973× | 0.948× | **0.981×** (1894.9) |
+| B1H8S8192 | 0.977× | 0.957× | **0.988×** (2508.1) |
+| B2H8S2048 | 0.953× | 0.952× | **0.968×** (1266.9) |
+
+**Reading.**
+- The two-tile pass with static slots more than recovers step 1's loss: +1.0 to +1.6 % over `_vs128` in vendor ratio.
+- Open: whether `unroll2` alone (with scaled PV) also helps `_vs128`. That is a separate, W4-gated proposal.
+
+### 4.4 Step 3: the vendor's VGPR roles as register pins
+
+The vendor's accumulator registers (group A loop) are:
+- **S**, QK destinations: `v[52:67] v[68:83] v[84:99] v[100:115]`;
+- **O**, PV destinations: `v[116:131] … v[164:179]`;
+- K / V fragments: `v[20:51]`;
+- Q: `v[4:19]`;
+- P: `v[52:67]`, reusing S.
+
+The DSL states them with `pin_vgpr_at` (`AttnBody3::pin_roles`). Pinning showed three things.
+
+1. **A verification rule was wrong.** Our allocator checks required MFMA / SMFMAC operand tuples to sit at a multiple of their width (`v[52:67]` rejected: "not aligned to its width 16"). The ISA requirement on gfx90a+ is only 64-bit (even) alignment, and the vendor kernel runs `v_mfma_scale … v[52:67], v[20:27]` / `v_mfma_f32_32x32x64_f8f6f4 v[116:131]`. → **Safety rule: wrong, fixed** (`regalloc.rs`):
+   - the checks require even alignment;
+   - the allocator still places its own tuples at their width, but an explicit pin needs only even alignment;
+   - md5 manifest unchanged.
+2. **The allocator placed pins last.** The `TwoPhase` allocator ordered values by width then length, so a pinned V16 could find its registers already taken. → Pinned values are now allocated first (md5 unchanged), and the pin error says what blocks it: forbidding pins, or the occupancy.
+3. **Pins cost performance with our schedule.**
+   - **S pinned** (vendor numbers, 248 VGPRs, scheduled normally): port_gate correctness all PASS. But same-session performance drops to 0.889× / 0.974× / 0.946× / 0.897× the vendor (per-CU / B4H8S2048 / B1H8S8192 / B2H8S2048), against 0.955× / 0.981× / 0.988× / 0.968× unpinned (step 2).
+   - **S and O pinned:** the scheduler runs out of VGPRs in two of the four body copies and falls back to the unscheduled order; loop invariants spill to LDS (16 KiB / 32 KiB). Result 0.863× / 0.917× / 0.928× / 0.885×.
+   - **Q at `v[4:19]`:** not honourable. A value of ours is live there from the prelude on, because our prelude and other residents are not the vendor's.
+
+**Reading.** Pinning a subset of the vendor's register numbers onto *our* schedule and *our* other residents is expressible, but it is not a replica: the vendor's numbers belong to its whole allocation and order. 1:1 registers need:
+- the back-end Weaver's **schedule-aware register allocation**, i.e. allocate the remaining values around a full plan;
+- the **full plan** stated in the DSL: K / V fragments, P reusing S, the scale words, all transient read results.
+
+The replica therefore keeps `pin_roles` **off** (its asm is step 2's). The two allocator fixes stay; both are md5-neutral.
+
+| Difference | Class |
+|---|---|
+| MFMA tuple at a non-width-aligned base | safety rule — was wrong, fixed |
+| pins allocated after free values | back-end allocator — fixed (pins first) |
+| a pinned role subset degrades our schedule; Q's registers taken by our prelude | **back-end Weaver**: schedule-aware RA around a complete register plan |
+| K / V / P / scale-word registers (transient values, the vendor's rotation `v[20:51]`, P in S) | **DSL**: a register plan for transient fragments (`reg_share` exists; a rotation / ring plan for read results does not) |
