@@ -225,6 +225,7 @@ pub enum MOp {
     VMinU32,
     VSubU32,
     VMulU32U24,
+    VMulI32I24,
     VAshrI32,
     VMulHiU32,
     VMulHiI32,
@@ -563,7 +564,13 @@ pub enum MOp {
     SLshrB32,
     SAndB32,
     SXorB32,
+    SSubU32,
+    SOrB32,
+    SAddkI32,
     SCmpLtI32,
+    SCmpEqU32,
+    SCmpGeU32,
+    SCmpLeU32,
     /// `s_min_i32` (writes SCC)
     SMinI32,
     /// `s_cselect_b32 d, a, b`: d = SCC ? a : b (reads SCC; lowered right after its `s_cmp`)

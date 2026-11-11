@@ -975,6 +975,7 @@ impl FromIr for BinOp {
             "MinU32" => { v.expect_unit("MinU32")?; Ok(BinOp::MinU32) }
             "SubU32" => { v.expect_unit("SubU32")?; Ok(BinOp::SubU32) }
             "MulU32U24" => { v.expect_unit("MulU32U24")?; Ok(BinOp::MulU32U24) }
+            "MulI32I24" => { v.expect_unit("MulI32I24")?; Ok(BinOp::MulI32I24) }
             "AshrI32" => { v.expect_unit("AshrI32")?; Ok(BinOp::AshrI32) }
             "MulHiU32" => { v.expect_unit("MulHiU32")?; Ok(BinOp::MulHiU32) }
             "MulHiI32" => { v.expect_unit("MulHiI32")?; Ok(BinOp::MulHiI32) }
@@ -999,6 +1000,7 @@ impl IrIds for BinOp {
             BinOp::MinU32 => {}
             BinOp::SubU32 => {}
             BinOp::MulU32U24 => {}
+            BinOp::MulI32I24 => {}
             BinOp::AshrI32 => {}
             BinOp::MulHiU32 => {}
             BinOp::MulHiI32 => {}

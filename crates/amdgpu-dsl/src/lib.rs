@@ -130,9 +130,10 @@ impl From<f32> for Opnd {
 pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3, Ffbl, Ffbh }
 
 /// Binary VALU ops. `AshrI32(a, b)` = a >> b (arithmetic); `MulHi*` = high 32 bits of the 64-bit product; `MulU32U24` = low 24 bits x low 24 bits;
+/// `MulI32I24` = the SIGNED low 24 bits of both operands multiplied (low 32 bits of the product; operands must fit in 24 signed bits);
 /// `Pk*F16` operate on two f16 halves of a dword (a `U32` container).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd }
+pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, MulI32I24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd }
 
 /// Ternary VALU ops. `MadU32U24(a, b, c)` = a[23:0] * b[23:0] + c; `LshlAddU32(a, s, c)` = (a << s) + c; `Add3U32` = a + b + c;
 /// `BfeU32 / BfeI32(x, off, width)` = bit-field extract; `BfiB32(mask, a, b)` = (mask & a) | (!mask & b); `PkFmaF16` on f16 pairs.

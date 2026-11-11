@@ -1343,10 +1343,28 @@ impl Lowerer {
         (self.mir.vreg_class(r) == RClass::S1).then_some(Src::Reg(r))
     }
 
+    /// `salu32`: `dst = x + k` with k a signed 16-bit constant as `s_addk_i32` (false when the form does not apply).
+    fn addk(&mut self, dst: ValueId, a: Opnd, b: Opnd) -> Result<bool, String> {
+        let (x, k) = match (self.const_bits(a), self.const_bits(b)) {
+            (None, Some(k)) => (a, k),
+            (Some(k), None) => (b, k),
+            _ => return Ok(false),
+        };
+        if !(i16::MIN as i64..=i16::MAX as i64).contains(&k) {
+            return Ok(false);
+        }
+        let Src::Reg(r) = self.s_operand(x)? else { return Ok(false) };
+        self.touch(&[Src::Reg(r)]);
+        let d = self.new_vreg(RClass::S1);
+        self.push(MInst::new(MOp::SAddkI32).def(d).srcreg(r).imm(k));
+        self.val.insert(dst, d);
+        Ok(true)
+    }
+
     /// `dst = a <op> b` in SALU (both operands uniform).
     fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
-        let commutative = matches!(op, MOp::SAddU32 | MOp::SMulI32 | MOp::SAndB32 | MOp::SXorB32);
+        let commutative = matches!(op, MOp::SAddU32 | MOp::SMulI32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SOrB32);
         if matches!(sa, Src::Imm(_)) && matches!(sb, Src::Reg(_)) && commutative {
             std::mem::swap(&mut sa, &mut sb);
         }
@@ -2553,6 +2571,27 @@ impl Lowerer {
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
+                    // `salu32`: an unsigned (or equality) compare of two wave-uniform integers branches on SCC: `s_cmp_{eq,ge,le}_u32`
+                    Op::Cmp { pred: pred @ (amdgpu_dsl::CmpPred::Eq | amdgpu_dsl::CmpPred::Ge | amdgpu_dsl::CmpPred::Le), ty, a, b }
+                        if opt_on("salu32") && (ty == amdgpu_dsl::CmpTy::U32 || pred == amdgpu_dsl::CmpPred::Eq) && self.scalar_src(a).is_some() && self.scalar_src(b).is_some() =>
+                    {
+                        let (mut sa, sb) = (self.scalar_src(a).unwrap(), self.scalar_src(b).unwrap());
+                        if let Src::Imm(k) = sa {
+                            let r = self.new_vreg(RClass::S1);
+                            self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
+                            sa = Src::Reg(r);
+                        }
+                        let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                        self.touch(&regs);
+                        let op = match pred {
+                            amdgpu_dsl::CmpPred::Eq => MOp::SCmpEqU32,
+                            amdgpu_dsl::CmpPred::Ge => MOp::SCmpGeU32,
+                            _ => MOp::SCmpLeU32,
+                        };
+                        self.push(MInst::new(op).src(sa).src(sb));
+                        let on = if negate { Pred::Scc0 } else { Pred::Scc1 };
+                        return Ok((on, regs));
+                    }
                     // `cmpneg`: a generic compare branches on vcc directly (no 0/1 materialisation)
                     Op::Cmp { pred, ty, a, b } if opt_on("cmpneg") => {
                         let ra = self.as_v1(a)?;
@@ -2644,7 +2683,11 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SReadPhys).def(d).imm(phys));
                 self.val.insert(dst, d);
             }
+            // `salu32`: a uniform `x + simm16` is `s_addk_i32`
+            Op::AddI32(a, b) if self.uniform.contains(&dst) && opt_on("salu32") && self.addk(dst, *a, *b)? => {}
             Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
+            Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SSubU32, *a, *b)?,
+            Op::Bin(amdgpu_dsl::BinOp::OrB32, a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SOrB32, *a, *b)?,
             Op::MulI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMulI32, *a, *b)?,
             Op::ShlI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SShlB32, *a, *b)?,
             Op::LshrI32(Opnd::Val(a), b) if self.uniform.contains(&dst) && matches!(self.defs.get(a), Some(Op::WorkitemId)) => {
@@ -4337,6 +4380,8 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
                         Op::MinI32(a, b) if ext => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        // `salu32`: uniform u32 subtract / or in SALU
+                        Op::Bin(amdgpu_dsl::BinOp::SubU32 | amdgpu_dsl::BinOp::OrB32, a, b) if opt_on("salu32") => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
                         Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) if ext => {
                             if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
                                 ucond.insert(*dst);
@@ -4783,6 +4828,7 @@ fn bin_mop(o: amdgpu_dsl::BinOp) -> MOp {
         B::MinU32 => MOp::VMinU32,
         B::SubU32 => MOp::VSubU32,
         B::MulU32U24 => MOp::VMulU32U24,
+        B::MulI32I24 => MOp::VMulI32I24,
         B::AshrI32 => MOp::VAshrI32,
         B::MulHiU32 => MOp::VMulHiU32,
         B::MulHiI32 => MOp::VMulHiI32,
