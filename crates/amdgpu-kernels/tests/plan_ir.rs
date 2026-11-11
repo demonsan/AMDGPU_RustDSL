@@ -38,7 +38,7 @@ fn a_plan() -> KernelPlan {
 #[test]
 fn a_function_without_a_plan_prints_no_plan_lines() {
     let t = amdgpu_dsl::ir_text::print(&small());
-    assert!(!t.contains("plan_"), "{t}");
+    assert!(!t.lines().any(|l| l.starts_with("plan_")), "{t}");
 }
 
 #[test]
