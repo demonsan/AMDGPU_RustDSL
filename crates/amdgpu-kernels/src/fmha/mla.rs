@@ -309,7 +309,10 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
     let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
     b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
-    b.finish()
+    // W6 (docs/w6-laggards.md §6): the list scheduler with reordering on the MLA body (perf_ab: +7 .. +23 %)
+    let mut f = b.finish();
+    f.sched_opts = Some("reorder".to_string());
+    f
 }
 
 /// Head-parallel MLA decode for many heads (`mla_decode_bf16_hp_p<P>`, H >= 64): the CTA's 4 waves are 4 groups of 16 heads that SHARE the
@@ -581,5 +584,8 @@ pub fn mla_decode_bf16_hp(name: &str, page: i32) -> Function {
     let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(s_n) + ev(z)) << 2);
     let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
     b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
-    b.finish()
+    // W6 (docs/w6-laggards.md §6): the list scheduler with reordering on the MLA body (perf_ab: +7 .. +23 %)
+    let mut f = b.finish();
+    f.sched_opts = Some("reorder".to_string());
+    f
 }
