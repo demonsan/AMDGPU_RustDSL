@@ -207,6 +207,47 @@ fn run_coldlayout(m: &mut MFunction) -> Result<(), String> {
     Ok(())
 }
 
+fn run_movb64(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("movb64") {
+        merge_zero_pairs(m);
+    }
+    Ok(())
+}
+
+/// `movb64`: two adjacent writes of zero into the dwords 2k, 2k+1 of one tuple become one `v_mov_b64 v[..], 0` (fragment / accumulator
+/// zero-init, the vendor form).
+fn merge_zero_pairs(m: &mut MFunction) {
+    let zeros: std::collections::HashSet<VReg> = m
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| i.op == MOp::VMovB32 && i.srcs.is_empty() && i.imm == 0)
+        .filter_map(|i| i.dst)
+        .collect();
+    let is_zero_write = |i: &MInst| i.op == MOp::VWriteSub && matches!(i.srcs.first(), Some(Src::Reg(z)) if zeros.contains(z));
+    for b in m.blocks.iter_mut() {
+        let insts = std::mem::take(&mut b.insts);
+        let mut out: Vec<MInst> = Vec::with_capacity(insts.len());
+        let mut i = 0;
+        while i < insts.len() {
+            let x = &insts[i];
+            if is_zero_write(x) && x.imm % 2 == 0 && i + 1 < insts.len() {
+                let y = &insts[i + 1];
+                if is_zero_write(y) && y.dst == x.dst && y.imm == x.imm + 1 {
+                    let mut n = x.clone();
+                    n.op = MOp::VZeroSub2;
+                    n.srcs.clear();
+                    out.push(n);
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(insts[i].clone());
+            i += 1;
+        }
+        b.insts = out;
+    }
+}
 fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
     dce(m);
     Ok(())
@@ -228,6 +269,7 @@ pub const CLEANUP: &[LowerPass] = {
         LowerPass { info: info("lower-remat", Lower, Generic, "ladder rungs remat1..4", &[Indirect("outer ladder; register_accounting.rs")]), run: run_remat },
         LowerPass { info: info("lower-lds-spill", Lower, Param, "ladder rungs ldsspill8..64 (re-inserts waits)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_lds_spill },
         LowerPass { info: info("lower-coalesce", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_coalesce },
+        LowerPass { info: info("lower-movb64", Lower, Only, "token movb64 (zero pairs -> v_mov_b64)", &[Test("crates/amdgpu-kernels/tests/mops_w5.rs")]), run: run_movb64 },
         LowerPass { info: info("lower-dce-final", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_dce_final },
         LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },
         LowerPass { info: info("lower-jthread", Lower, Generic, "token jthread (branches on flags known per incoming edge)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_jthread },
@@ -2497,6 +2539,26 @@ impl Lowerer {
                         let rb = self.as_v1(b)?;
                         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpLtF32).srcreg(ra).srcreg(rb));
+                        let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                        return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
+                    }
+                    // `cmpneg`: a per-lane `!(a >= b)` on f32 is ONE compare, `v_cmp_nge_f32` (true on NaN, like the negation), instead of the
+                    // compare, a 0/1 materialisation, an xor and a second compare
+                    Op::NotI1(Opnd::Val(iv)) if opt_on("cmpneg") && matches!(self.defs.get(&iv), Some(Op::Cmp { pred: amdgpu_dsl::CmpPred::Ge, ty: amdgpu_dsl::CmpTy::F32, .. })) => {
+                        let Some(Op::Cmp { a, b, .. }) = self.defs.get(&iv).cloned() else { unreachable!() };
+                        let ra = self.as_v1(a)?;
+                        let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                        self.push(MInst::new(MOp::VCmpNgeF32).srcreg(ra).srcreg(rb));
+                        let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                        return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
+                    }
+                    // `cmpneg`: a generic compare branches on vcc directly (no 0/1 materialisation)
+                    Op::Cmp { pred, ty, a, b } if opt_on("cmpneg") => {
+                        let ra = self.as_v1(a)?;
+                        let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                        self.push(MInst::new(cmp_mop(pred, ty)).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }

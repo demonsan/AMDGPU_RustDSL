@@ -114,6 +114,13 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
                 e.writes = vec![sl[(inst.imm as usize).min(sl.len() - 1)]];
             }
         }
+        RegFx::SubWrite2 => {
+            if let Some(d) = inst.dst {
+                let sl = reg_slots(m, d);
+                let k = (inst.imm as usize).min(sl.len().saturating_sub(2));
+                e.writes = sl[k..(k + 2).min(sl.len())].to_vec();
+            }
+        }
         RegFx::SubRead => {
             if let Some(r) = src_reg(0) {
                 let sl = reg_slots(m, r);

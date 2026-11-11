@@ -250,6 +250,7 @@ pub enum MOp {
     VCmpLeF32,
     VCmpGtF32,
     VCmpGeF32,
+    VCmpNgeF32,
     VCmpEqF32,
     VCmpNeF32,
     VCmpLgF32,
@@ -281,11 +282,14 @@ pub enum MOp {
     VCndmask,
     // fragments / matrix cores
     VWriteSub,
+    VZeroSub2,
     VReadSub,
     VMfma16x16x16F16,
     VMfma32x32x8F16,
     /// 32x32x8 f16 MFMA with an inline-zero accumulator: D = A x B (srcs: a, b).
     VMfma32x32x8F16Z,
+    VMfma32x32x8Bf16,
+    VMfma32x32x8Bf16Z,
     VMfma16x16x32Fp8,
     VMfma32x32x16Fp8,
     VMfmaScale32x32x64Fp8,
@@ -1007,14 +1011,14 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         }
                     }
                 }
-                MOp::VMfma32x32x8F16Z => {
+                MOp::VMfma32x32x8F16Z | MOp::VMfma32x32x8Bf16Z => {
                     if let Some(d) = inst.dst {
                         if !m.vreg_class(d).same_width_vector(RClass::V16) {
                             errs.push(format!("block {bi} inst {ii}: f16 mfma dst must be V16"));
                         }
                     }
                 }
-                MOp::VMfma32x32x8F16 => {
+                MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8Bf16 => {
                     if let Some(d) = inst.dst {
                         if !m.vreg_class(d).same_width_vector(RClass::V16) {
                             errs.push(format!("block {bi} inst {ii}: wide mfma dst must be V16"));
@@ -1031,6 +1035,14 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: wide mfma operand {k} is not a register"
                             )),
+                        }
+                    }
+                }
+                MOp::VZeroSub2 => {
+                    if let Some(d) = inst.dst {
+                        let n = m.vreg_class(d).dwords() as i64;
+                        if !matches!(m.vreg_class(d), RClass::V2 | RClass::V4 | RClass::V8 | RClass::V16) || inst.imm % 2 != 0 || inst.imm + 2 > n {
+                            errs.push(format!("block {bi} inst {ii}: v_mov_b64 zero pair must be an even dword pair inside a vector tuple"));
                         }
                     }
                 }

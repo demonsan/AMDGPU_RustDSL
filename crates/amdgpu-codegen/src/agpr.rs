@@ -188,6 +188,14 @@ pub fn assign(m: &mut MFunction) -> Result<AgprStats, String> {
                     }
                     continue;
                 }
+                MOp::VZeroSub2 if inst.dst.map_or(false, |d| cx.is_a(d)) => {
+                    let d = inst.dst.unwrap();
+                    for k in 0..2 {
+                        let lane = cx.dword(d, inst.imm as u32 + k);
+                        cx.write_imm(&mut out, lane, 0);
+                    }
+                    continue;
+                }
                 MOp::VWriteSub if inst.dst.map_or(false, |d| cx.is_a(d)) => {
                     let d = inst.dst.unwrap();
                     let lane = cx.dword(d, inst.imm as u32);

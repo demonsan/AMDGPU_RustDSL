@@ -613,6 +613,15 @@ pub fn print(f: &Function) -> String {
     }
     // the kernel plan (docs/two-weavers.md), one item per line; absent for kernels without a plan
     if let Some(p) = &f.plan {
+        if let Some(c) = &p.cta {
+            let _ = writeln!(s, "plan_cta {c:?}");
+        }
+        for x in &p.roles {
+            let _ = writeln!(s, "plan_role {x:?}");
+        }
+        for x in &p.rings {
+            let _ = writeln!(s, "plan_ring {x:?}");
+        }
         for x in &p.phases {
             let _ = writeln!(s, "plan_phase {x:?}");
         }
@@ -627,6 +636,9 @@ pub fn print(f: &Function) -> String {
         }
         for x in &p.sync {
             let _ = writeln!(s, "plan_sync {x:?}");
+        }
+        for x in &p.reg_constraints {
+            let _ = writeln!(s, "plan_reg {x:?}");
         }
         let _ = writeln!(s, "plan_hints {:?}", p.hints);
     }
@@ -748,6 +760,10 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
             "agpr" => agpr.push(lx.typed()?),
             "reg_plan" => reg_plan.push(lx.typed()?),
             "region_decl" => regions.push(lx.typed()?),
+            "plan_cta" => plan.get_or_insert_with(Default::default).cta = Some(lx.typed()?),
+            "plan_role" => plan.get_or_insert_with(Default::default).roles.push(lx.typed()?),
+            "plan_ring" => plan.get_or_insert_with(Default::default).rings.push(lx.typed()?),
+            "plan_reg" => plan.get_or_insert_with(Default::default).reg_constraints.push(lx.typed()?),
             "plan_phase" => plan.get_or_insert_with(Default::default).phases.push(lx.typed()?),
             "plan_unit" => plan.get_or_insert_with(Default::default).units.push(lx.typed()?),
             "plan_dep" => plan.get_or_insert_with(Default::default).deps.push(lx.typed()?),

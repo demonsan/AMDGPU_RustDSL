@@ -5,7 +5,7 @@
 //! naming it. HINTS may be ignored. A function without a plan compiles exactly as before (every weave region `Authored`, no
 //! budget). Unit ids are the ids of the `Stmt::UnitMark` markers around each unit's statements.
 
-use crate::{RegRef, VarId};
+use crate::{Ext, RegRef, VarId};
 
 pub type PhaseId = u32;
 pub type UnitId = u32;
@@ -13,12 +13,66 @@ pub type UnitId = u32;
 /// The kernel plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KernelPlan {
+    /// CTA shape and occupancy target (None: the function's workgroup size, no target)
+    pub cta: Option<CtaShape>,
+    /// wave roles (which waves issue the DMA, which compute, the pair split); empty = every wave runs every unit
+    pub roles: Vec<RoleDecl>,
+    pub rings: Vec<RingDecl>,
     pub phases: Vec<Phase>,
     pub units: Vec<UnitDecl>,
     pub deps: Vec<Dep>,
     pub handoffs: Vec<HandOff>,
     pub sync: Vec<SyncRule>,
+    pub reg_constraints: Vec<RegConstraint>,
     pub hints: Hints,
+}
+
+/// The CTA the plan was made for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CtaShape {
+    pub threads: u32,
+    pub waves: u32,
+    /// waves per SIMD the plan's budgets assume
+    pub occupancy: Option<u32>,
+}
+
+/// A set of waves of the CTA (bit i = wave i).
+pub type WaveMask = u64;
+
+/// A named wave role (tile `Role` / `Roles`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleDecl {
+    pub name: String,
+    pub waves: WaveMask,
+}
+
+/// How a ring advances (the pipeline templates' cadences).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cadence {
+    TwoPhaseOffset,
+    OneWindow,
+    RegStaged,
+}
+
+/// Who owns a ring: the whole CTA (LDS shared by its waves) or each wave (wave-private rings, decode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingOwner {
+    Cta,
+    Wave,
+}
+
+/// A multi-slot buffer between a producer and a consumer phase; the slot-version arithmetic (`SlotIdx`, versioned markers) the tile
+/// verifier checks is keyed on `id`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RingDecl {
+    pub id: u32,
+    pub name: String,
+    pub slots: u32,
+    pub bytes_per_slot: u32,
+    pub cadence: Cadence,
+    pub producer_phase: PhaseId,
+    pub consumer_phase: PhaseId,
+    pub owner: RingOwner,
 }
 
 /// A phase: a weave region (today's `RegionMark` name) with its order rule and resource budget.
@@ -36,8 +90,9 @@ pub struct Phase {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PhaseKind {
     Straight,
-    /// the body of a loop over `var` (`trip`: the iteration count when known)
-    LoopBody { var: Option<VarId>, trip: Option<u32> },
+    /// the body of a loop over `var`: `trip` = the iteration count (symbolic), `peel` = (prologue, epilogue) iterations the front end's
+    /// rotation peels (until the back end rotates itself, step B5)
+    LoopBody { var: Option<VarId>, trip: Option<Ext>, peel: (u32, u32) },
     Branch,
 }
 
@@ -98,6 +153,8 @@ pub struct UnitDecl {
     pub iter: i32,
     /// nominal issue -> result latency (cycles), for priorities only
     pub latency: u32,
+    /// the waves that execute the unit (0 = all)
+    pub roles: WaveMask,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,8 +184,8 @@ pub enum RegFileKind {
 /// How a value crosses phases.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Via {
-    /// in registers of `file`, at `pin` when fixed
-    Reg { file: RegFileKind, pin: Option<u32> },
+    /// in registers of `file`, at `pin` (first register) when fixed, `dwords` long, starting on a multiple of `align`
+    Reg { file: RegFileKind, pin: Option<u32>, dwords: u32, align: u32 },
     Lds { offset: u32, bytes: u32 },
     Global,
 }
@@ -151,8 +208,35 @@ pub enum SyncRule {
     Barrier { after: UnitId, before: UnitId },
     /// the consumer waits on `counter` for the producer, with at most `slack` newer operations outstanding (ring slots)
     Counted { producer: UnitId, consumer: UnitId, counter: String, slack: u32 },
-    /// an inter-CTA protocol on a flag (kept and checked by gpu_protocol)
-    CrossCta { flag: RegRef, scope: String },
+    /// an inter-CTA protocol on a flag (kept and checked by gpu_protocol), with the memory order it requires
+    CrossCta { flag: RegRef, scope: String, protocol: CrossCtaProtocol, order: MemOrder },
+}
+
+/// The split / merge variants of a cross-CTA reduction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CrossCtaProtocol {
+    /// the last CTA to arrive (atomic `counter`) merges the `partials`
+    LastArriver { counter: RegRef, partials: Vec<RegRef> },
+    /// a separate merge kernel
+    SeparateKernel,
+    /// the merge happens inside the CTA through LDS
+    InCtaLds,
+}
+
+/// The fences a protocol needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemOrder {
+    Relaxed,
+    Release,
+    Acquire,
+    AcqRel,
+}
+
+/// A register-allocation constraint on values (today's `RegMark::Share` / `Separate`): nothing moves, so these are not hand-offs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegConstraint {
+    Share(Vec<RegRef>),
+    Separate(Vec<RegRef>),
 }
 
 /// Optional guidance.
@@ -208,6 +292,27 @@ pub fn verify(p: &KernelPlan) -> Vec<String> {
                 if !known(*a) || !known(*b) {
                     errs.push(format!("plan: phase `{}` order edge {a} -> {b} names an unknown unit", ph.name));
                 }
+            }
+        }
+    }
+    for r in &p.rings {
+        if !phase_ids.contains(&r.producer_phase) || !phase_ids.contains(&r.consumer_phase) {
+            errs.push(format!("plan: ring `{}` names an unknown phase", r.name));
+        }
+        if r.slots == 0 {
+            errs.push(format!("plan: ring `{}` has no slots", r.name));
+        }
+    }
+    if let Some(c) = &p.cta {
+        let all: WaveMask = if c.waves >= 64 { u64::MAX } else { (1u64 << c.waves) - 1 };
+        for r in &p.roles {
+            if r.waves & !all != 0 {
+                errs.push(format!("plan: role `{}` names waves outside the CTA's {}", r.name, c.waves));
+            }
+        }
+        for u in &p.units {
+            if u.roles & !all != 0 {
+                errs.push(format!("plan: unit `{}` runs on waves outside the CTA's {}", u.name, c.waves));
             }
         }
     }

@@ -91,6 +91,12 @@ pub struct Feedback {                // back end -> front end, per kernel (writt
 }
 ```
 
+Additions after sched's review (in `plan.rs`): `KernelPlan::cta` (threads, waves, occupancy target), `roles` (`RoleDecl`: named wave
+sets) and `UnitDecl::roles` (the waves that run a unit), `rings` (`RingDecl`: slots, bytes per slot, cadence, producer / consumer phase,
+owner CTA / wave; the slot-version checks key on its id), `LoopBody { trip: Ext, peel }` (symbolic trip, the front end's peeled
+iterations until B5), `Via::Reg { pin, dwords, align }`, `SyncRule::CrossCta { protocol: LastArriver | SeparateKernel | InCtaLds,
+order }`, and `reg_constraints` (`Share` / `Separate` stay value-level allocator constraints, not hand-offs).
+
 Rules: constraints are binding, so violating one is a compile error naming the constraint, never a silent fallback. Hints
 may be ignored. A phase without a plan entry gets `OrderSpec::Authored` and no budget, which is exactly today's behaviour
 for code outside weave regions.

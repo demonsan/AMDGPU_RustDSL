@@ -29,6 +29,8 @@ impl Recipe {
 
 /// Constants + loop state of the online softmax. Create it outside the loop (`new`), register `state()` with the pipeline and `bind` the variables.
 pub struct OnlineSoftmax {
+    /// the lazy rollback test as `!(thr >= max)` (the vendor's NaN-taking `v_cmp_nge_f32` with the `cmpneg` lowering) instead of `thr < max`
+    pub nan_rollback: bool,
     pub recipe: Recipe,
     pub smf: SmfmacOnes,
     pub ones_f16: ValueId,
@@ -62,7 +64,7 @@ impl OnlineSoftmax {
         let wi = b.c_i32(0x4800_4800);
         let bias_init = b.frag2(wi, wi);
         let zero4 = b.frag_zero(DType::Frag4);
-        OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, conv_s: one_f, zero4, bias: None, la: None }
+        OnlineSoftmax { nan_rollback: false, recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, conv_s: one_f, zero4, bias: None, la: None }
     }
     /// Overrides the rollback threshold (scaled max units).
     /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132
@@ -178,7 +180,12 @@ impl OnlineSoftmax {
             flat.extend(masked_values(b, s, i, mask, self.neg_big));
         }
         let mt = row_max(b, &flat);
-        let grow = b.cmp_lt_f32(self.thr, mt);
+        let grow = if self.nan_rollback {
+            let ge = b.cmp(amdgpu_dsl::CmpPred::Ge, amdgpu_dsl::CmpTy::F32, self.thr, mt);
+            b.let_(Op::NotI1(Opnd::Val(ge)))
+        } else {
+            b.cmp_lt_f32(self.thr, mt)
+        };
         {
             // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
             let any = b.any_lane(grow);
@@ -275,6 +282,19 @@ impl OnlineSoftmax {
         let lf = b.bitcast_f32(d2);
         let c = b.c_f32(0.0625);
         b.mul_f32(lf, c)
+    }
+
+    /// The row sum in the unscaled-PV convention (`AttnBody3::pv_unscaled`): the smfmac dwords as they are, 16 x `l_total`.
+    pub fn l_total_unit(&self, b: &mut FnBuilder) -> ValueId {
+        if let Some([d0, d1]) = self.smf.rows2 {
+            let x0 = b.frag4_lane(Opnd::Var(self.l_acc()), d0);
+            let x1 = b.frag4_lane(Opnd::Var(self.l_acc()), d1);
+            let f0 = b.bitcast_f32(x0);
+            let f1 = b.bitcast_f32(x1);
+            return b.add_f32(f0, f1);
+        }
+        let d2 = b.frag4_lane(Opnd::Var(self.l_acc()), 2);
+        b.bitcast_f32(d2)
     }
 
     /// `log2(l) - 512 b` (the split-independent log-sum-exp of the KV-split partials: P = 2^(x + 512 b - 127)).

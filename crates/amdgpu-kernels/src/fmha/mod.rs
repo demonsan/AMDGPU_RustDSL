@@ -35,7 +35,7 @@ use amdgpu_stage::{Cadence, Pipeline};
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots);
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: false });
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
@@ -44,6 +44,13 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     f
 }
 
+/// W5 / R3 (docs/fmha-replica.md §4): the `_vs128` structure moved step by step onto the vendor kernel's algorithm and schedule. Step 1: PV
+/// through the unscaled fp8 MFMA (the vendor's form). Experimental, not dispatched.
+pub fn fmha_fwd_hd128_mxfp8_v3_replica() -> Function {
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
+}
 /// Values shared between the slots of the FMHA kernels (what the generated skeletons' `Cx` carries).
 pub(crate) struct FmhaCx {
     io: FmhaIo,
@@ -55,12 +62,19 @@ pub(crate) struct FmhaCx {
 }
 
 /// The slots of `_vs128` (`skeleton_vs128.rs`, generated from `graph::graph_vs128()`).
-pub(crate) struct Vs128Slots;
+pub(crate) struct Vs128Slots {
+    /// the W5 replica steps (`fmha_fwd_hd128_mxfp8_v3_replica`)
+    pub(crate) replica: bool,
+}
 
 impl skeleton_vs128::Vs128Slots for Vs128Slots {
     type Cx = FmhaCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
         b.compile_profile(CompileProfile::Vs128);
+        if self.replica {
+            // R3 step 4a: the vendor's instruction forms (v_cmp_nge_f32 rollback test, v_mov_b64 zeroing)
+            b.lower_opts(&["cmpneg", "movb64"]);
+        }
         let io = declare_io(b, 256, false);
         let blk = block3_x(&io, b, 8, true);
         let roles = Roles::split(b, &blk.lane, 4);
@@ -70,6 +84,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
         // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
         pipe.key_unclamped = true;
+        pipe.unroll2 = self.replica;
         let lut = blk.lut_copy(b);
         FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
     }
@@ -78,6 +93,8 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
     }
     fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
         let (io, blk, roles, ring, lut) = (&cx.io, &cx.blk, &cx.roles, &cx.ring, cx.lut);
+        // (the vendor's Q fragments sit at v[4:19]; pinning them is not honourable here: a value of ours is live there from the prelude on, see
+        // docs/fmha-replica.md §4.4)
         versioned(b, lut, |b, lut| {
             roles.each(b, |b, role| {
                 let wid = roles.wave_id(b, role);
@@ -91,6 +108,10 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 }
                 body.setprio = true;
                 body.biasonce = true;
+                body.pv_unscaled = self.replica;
+                body.sm.nan_rollback = self.replica;
+                // R3 step 3 (pinned VGPR roles) measured -4 .. -7 % with our schedule: off (docs/fmha-replica.md §4.4)
+                body.pin_roles = false;
                 pipe.run(b, role, &mut body);
                 let fin = body.out_scale(b);
                 store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin);

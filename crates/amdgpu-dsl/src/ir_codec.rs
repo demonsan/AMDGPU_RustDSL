@@ -1480,23 +1480,191 @@ impl FromIr for KernelPlan {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         v.expect_struct("KernelPlan")?;
         Ok(KernelPlan {
+            cta: FromIr::from_ir(v.field("cta")?)?,
+            roles: FromIr::from_ir(v.field("roles")?)?,
+            rings: FromIr::from_ir(v.field("rings")?)?,
             phases: FromIr::from_ir(v.field("phases")?)?,
             units: FromIr::from_ir(v.field("units")?)?,
             deps: FromIr::from_ir(v.field("deps")?)?,
             handoffs: FromIr::from_ir(v.field("handoffs")?)?,
             sync: FromIr::from_ir(v.field("sync")?)?,
+            reg_constraints: FromIr::from_ir(v.field("reg_constraints")?)?,
             hints: FromIr::from_ir(v.field("hints")?)?,
         })
     }
 }
 impl IrIds for KernelPlan {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.cta, fv, fr);
+        IrIds::ids(&mut self.roles, fv, fr);
+        IrIds::ids(&mut self.rings, fv, fr);
         IrIds::ids(&mut self.phases, fv, fr);
         IrIds::ids(&mut self.units, fv, fr);
         IrIds::ids(&mut self.deps, fv, fr);
         IrIds::ids(&mut self.handoffs, fv, fr);
         IrIds::ids(&mut self.sync, fv, fr);
+        IrIds::ids(&mut self.reg_constraints, fv, fr);
         IrIds::ids(&mut self.hints, fv, fr);
+    }
+}
+
+impl FromIr for CtaShape {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("CtaShape")?;
+        Ok(CtaShape {
+            threads: FromIr::from_ir(v.field("threads")?)?,
+            waves: FromIr::from_ir(v.field("waves")?)?,
+            occupancy: FromIr::from_ir(v.field("occupancy")?)?,
+        })
+    }
+}
+impl IrIds for CtaShape {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.threads, fv, fr);
+        IrIds::ids(&mut self.waves, fv, fr);
+        IrIds::ids(&mut self.occupancy, fv, fr);
+    }
+}
+
+impl FromIr for RoleDecl {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("RoleDecl")?;
+        Ok(RoleDecl {
+            name: FromIr::from_ir(v.field("name")?)?,
+            waves: FromIr::from_ir(v.field("waves")?)?,
+        })
+    }
+}
+impl IrIds for RoleDecl {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.name, fv, fr);
+        IrIds::ids(&mut self.waves, fv, fr);
+    }
+}
+
+impl FromIr for Cadence {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "TwoPhaseOffset" => { v.expect_unit("TwoPhaseOffset")?; Ok(Cadence::TwoPhaseOffset) }
+            "OneWindow" => { v.expect_unit("OneWindow")?; Ok(Cadence::OneWindow) }
+            "RegStaged" => { v.expect_unit("RegStaged")?; Ok(Cadence::RegStaged) }
+            other => Err(v.err(format!("unknown Cadence variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for Cadence {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            Cadence::TwoPhaseOffset => {}
+            Cadence::OneWindow => {}
+            Cadence::RegStaged => {}
+        }
+    }
+}
+
+impl FromIr for RingOwner {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Cta" => { v.expect_unit("Cta")?; Ok(RingOwner::Cta) }
+            "Wave" => { v.expect_unit("Wave")?; Ok(RingOwner::Wave) }
+            other => Err(v.err(format!("unknown RingOwner variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for RingOwner {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            RingOwner::Cta => {}
+            RingOwner::Wave => {}
+        }
+    }
+}
+
+impl FromIr for RingDecl {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("RingDecl")?;
+        Ok(RingDecl {
+            id: FromIr::from_ir(v.field("id")?)?,
+            name: FromIr::from_ir(v.field("name")?)?,
+            slots: FromIr::from_ir(v.field("slots")?)?,
+            bytes_per_slot: FromIr::from_ir(v.field("bytes_per_slot")?)?,
+            cadence: FromIr::from_ir(v.field("cadence")?)?,
+            producer_phase: FromIr::from_ir(v.field("producer_phase")?)?,
+            consumer_phase: FromIr::from_ir(v.field("consumer_phase")?)?,
+            owner: FromIr::from_ir(v.field("owner")?)?,
+        })
+    }
+}
+impl IrIds for RingDecl {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.id, fv, fr);
+        IrIds::ids(&mut self.name, fv, fr);
+        IrIds::ids(&mut self.slots, fv, fr);
+        IrIds::ids(&mut self.bytes_per_slot, fv, fr);
+        IrIds::ids(&mut self.cadence, fv, fr);
+        IrIds::ids(&mut self.producer_phase, fv, fr);
+        IrIds::ids(&mut self.consumer_phase, fv, fr);
+        IrIds::ids(&mut self.owner, fv, fr);
+    }
+}
+
+impl FromIr for CrossCtaProtocol {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "LastArriver" => { v.expect_struct("LastArriver")?; Ok(CrossCtaProtocol::LastArriver { counter: FromIr::from_ir(v.field("counter")?)?, partials: FromIr::from_ir(v.field("partials")?)? }) }
+            "SeparateKernel" => { v.expect_unit("SeparateKernel")?; Ok(CrossCtaProtocol::SeparateKernel) }
+            "InCtaLds" => { v.expect_unit("InCtaLds")?; Ok(CrossCtaProtocol::InCtaLds) }
+            other => Err(v.err(format!("unknown CrossCtaProtocol variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for CrossCtaProtocol {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            CrossCtaProtocol::LastArriver { counter, partials } => { IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*partials), fv, fr); }
+            CrossCtaProtocol::SeparateKernel => {}
+            CrossCtaProtocol::InCtaLds => {}
+        }
+    }
+}
+
+impl FromIr for MemOrder {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Relaxed" => { v.expect_unit("Relaxed")?; Ok(MemOrder::Relaxed) }
+            "Release" => { v.expect_unit("Release")?; Ok(MemOrder::Release) }
+            "Acquire" => { v.expect_unit("Acquire")?; Ok(MemOrder::Acquire) }
+            "AcqRel" => { v.expect_unit("AcqRel")?; Ok(MemOrder::AcqRel) }
+            other => Err(v.err(format!("unknown MemOrder variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for MemOrder {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            MemOrder::Relaxed => {}
+            MemOrder::Release => {}
+            MemOrder::Acquire => {}
+            MemOrder::AcqRel => {}
+        }
+    }
+}
+
+impl FromIr for RegConstraint {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Share" => { v.expect_tuple("Share", 1)?; Ok(RegConstraint::Share(FromIr::from_ir(v.item(0)?)?)) }
+            "Separate" => { v.expect_tuple("Separate", 1)?; Ok(RegConstraint::Separate(FromIr::from_ir(v.item(0)?)?)) }
+            other => Err(v.err(format!("unknown RegConstraint variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for RegConstraint {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            RegConstraint::Share(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            RegConstraint::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+        }
     }
 }
 
@@ -1528,7 +1696,7 @@ impl FromIr for PhaseKind {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
             "Straight" => { v.expect_unit("Straight")?; Ok(PhaseKind::Straight) }
-            "LoopBody" => { v.expect_struct("LoopBody")?; Ok(PhaseKind::LoopBody { var: FromIr::from_ir(v.field("var")?)?, trip: FromIr::from_ir(v.field("trip")?)? }) }
+            "LoopBody" => { v.expect_struct("LoopBody")?; Ok(PhaseKind::LoopBody { var: FromIr::from_ir(v.field("var")?)?, trip: FromIr::from_ir(v.field("trip")?)?, peel: FromIr::from_ir(v.field("peel")?)? }) }
             "Branch" => { v.expect_unit("Branch")?; Ok(PhaseKind::Branch) }
             other => Err(v.err(format!("unknown PhaseKind variant `{other}`"))),
         }
@@ -1538,7 +1706,7 @@ impl IrIds for PhaseKind {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
             PhaseKind::Straight => {}
-            PhaseKind::LoopBody { var, trip } => { if let Some(x) = (*var).as_mut() { fr(x); } IrIds::ids(&mut (*trip), fv, fr); }
+            PhaseKind::LoopBody { var, trip, peel } => { if let Some(x) = (*var).as_mut() { fr(x); } IrIds::ids(&mut (*trip), fv, fr); IrIds::ids(&mut (*peel), fv, fr); }
             PhaseKind::Branch => {}
         }
     }
@@ -1645,6 +1813,7 @@ impl FromIr for UnitDecl {
             anchor: FromIr::from_ir(v.field("anchor")?)?,
             iter: FromIr::from_ir(v.field("iter")?)?,
             latency: FromIr::from_ir(v.field("latency")?)?,
+            roles: FromIr::from_ir(v.field("roles")?)?,
         })
     }
 }
@@ -1657,6 +1826,7 @@ impl IrIds for UnitDecl {
         IrIds::ids(&mut self.anchor, fv, fr);
         IrIds::ids(&mut self.iter, fv, fr);
         IrIds::ids(&mut self.latency, fv, fr);
+        IrIds::ids(&mut self.roles, fv, fr);
     }
 }
 
@@ -1723,7 +1893,7 @@ impl IrIds for RegFileKind {
 impl FromIr for Via {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
-            "Reg" => { v.expect_struct("Reg")?; Ok(Via::Reg { file: FromIr::from_ir(v.field("file")?)?, pin: FromIr::from_ir(v.field("pin")?)? }) }
+            "Reg" => { v.expect_struct("Reg")?; Ok(Via::Reg { file: FromIr::from_ir(v.field("file")?)?, pin: FromIr::from_ir(v.field("pin")?)?, dwords: FromIr::from_ir(v.field("dwords")?)?, align: FromIr::from_ir(v.field("align")?)? }) }
             "Lds" => { v.expect_struct("Lds")?; Ok(Via::Lds { offset: FromIr::from_ir(v.field("offset")?)?, bytes: FromIr::from_ir(v.field("bytes")?)? }) }
             "Global" => { v.expect_unit("Global")?; Ok(Via::Global) }
             other => Err(v.err(format!("unknown Via variant `{other}`"))),
@@ -1733,7 +1903,7 @@ impl FromIr for Via {
 impl IrIds for Via {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            Via::Reg { file, pin } => { IrIds::ids(&mut (*file), fv, fr); IrIds::ids(&mut (*pin), fv, fr); }
+            Via::Reg { file, pin, dwords, align } => { IrIds::ids(&mut (*file), fv, fr); IrIds::ids(&mut (*pin), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); IrIds::ids(&mut (*align), fv, fr); }
             Via::Lds { offset, bytes } => { IrIds::ids(&mut (*offset), fv, fr); IrIds::ids(&mut (*bytes), fv, fr); }
             Via::Global => {}
         }
@@ -1767,7 +1937,7 @@ impl FromIr for SyncRule {
         match v.name()? {
             "Barrier" => { v.expect_struct("Barrier")?; Ok(SyncRule::Barrier { after: FromIr::from_ir(v.field("after")?)?, before: FromIr::from_ir(v.field("before")?)? }) }
             "Counted" => { v.expect_struct("Counted")?; Ok(SyncRule::Counted { producer: FromIr::from_ir(v.field("producer")?)?, consumer: FromIr::from_ir(v.field("consumer")?)?, counter: FromIr::from_ir(v.field("counter")?)?, slack: FromIr::from_ir(v.field("slack")?)? }) }
-            "CrossCta" => { v.expect_struct("CrossCta")?; Ok(SyncRule::CrossCta { flag: FromIr::from_ir(v.field("flag")?)?, scope: FromIr::from_ir(v.field("scope")?)? }) }
+            "CrossCta" => { v.expect_struct("CrossCta")?; Ok(SyncRule::CrossCta { flag: FromIr::from_ir(v.field("flag")?)?, scope: FromIr::from_ir(v.field("scope")?)?, protocol: FromIr::from_ir(v.field("protocol")?)?, order: FromIr::from_ir(v.field("order")?)? }) }
             other => Err(v.err(format!("unknown SyncRule variant `{other}`"))),
         }
     }
@@ -1777,7 +1947,7 @@ impl IrIds for SyncRule {
         match self {
             SyncRule::Barrier { after, before } => { IrIds::ids(&mut (*after), fv, fr); IrIds::ids(&mut (*before), fv, fr); }
             SyncRule::Counted { producer, consumer, counter, slack } => { IrIds::ids(&mut (*producer), fv, fr); IrIds::ids(&mut (*consumer), fv, fr); IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*slack), fv, fr); }
-            SyncRule::CrossCta { flag, scope } => { IrIds::ids(&mut (*flag), fv, fr); IrIds::ids(&mut (*scope), fv, fr); }
+            SyncRule::CrossCta { flag, scope, protocol, order } => { IrIds::ids(&mut (*flag), fv, fr); IrIds::ids(&mut (*scope), fv, fr); IrIds::ids(&mut (*protocol), fv, fr); IrIds::ids(&mut (*order), fv, fr); }
         }
     }
 }

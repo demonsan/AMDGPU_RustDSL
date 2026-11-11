@@ -13,24 +13,32 @@ fn small() -> amdgpu_dsl::Function {
 
 fn a_plan() -> KernelPlan {
     KernelPlan {
+        cta: Some(CtaShape { threads: 512, waves: 8, occupancy: Some(1) }),
+        roles: vec![RoleDecl { name: "dma".into(), waves: 0b1100_0000 }, RoleDecl { name: "mma".into(), waves: 0b0011_1111 }],
+        rings: vec![RingDecl { id: 0, name: "kv".into(), slots: 3, bytes_per_slot: 32768, cadence: Cadence::TwoPhaseOffset, producer_phase: 1, consumer_phase: 1, owner: RingOwner::Cta }],
         phases: vec![
             Phase { id: 0, name: "main".into(), parent: None, kind: PhaseKind::Straight, order: OrderSpec::Authored, budget: Budget::default() },
             Phase {
                 id: 1,
                 name: "loop".into(),
                 parent: Some(0),
-                kind: PhaseKind::LoopBody { var: None, trip: Some(8) },
+                kind: PhaseKind::LoopBody { var: None, trip: Some(amdgpu_dsl::Ext::c(8)), peel: (1, 1) },
                 order: OrderSpec::Partial(vec![(0, 1)]),
                 budget: Budget { vgpr: Some(128), agpr: Some(64), sgpr: None, lds_bytes: Some(65536), inflight: vec![("vmcnt".into(), 6)], m0: M0Use::Owned },
             },
         ],
         units: vec![
-            UnitDecl { id: 0, name: "dma".into(), phase: 1, class: UnitClass::Dma, anchor: false, iter: 1, latency: 500 },
-            UnitDecl { id: 1, name: "mma".into(), phase: 1, class: UnitClass::Mfma, anchor: false, iter: 0, latency: 64 },
+            UnitDecl { id: 0, name: "dma".into(), phase: 1, class: UnitClass::Dma, anchor: false, iter: 1, latency: 500, roles: 0b1100_0000 },
+            UnitDecl { id: 1, name: "mma".into(), phase: 1, class: UnitClass::Mfma, anchor: false, iter: 0, latency: 64, roles: 0 },
         ],
         deps: vec![Dep { from: 0, to: 1, kind: DepKind::Memory("lds".into()), distance: 1 }],
-        handoffs: vec![HandOff { value: RegRef::Var(amdgpu_dsl::VarId(0)), from: 0, to: 1, via: Via::Reg { file: RegFileKind::Agpr, pin: Some(0) }, layout: Some("acc16x16".into()) }],
-        sync: vec![SyncRule::Counted { producer: 0, consumer: 1, counter: "vmcnt".into(), slack: 2 }, SyncRule::Barrier { after: 0, before: 1 }],
+        handoffs: vec![HandOff { value: RegRef::Var(amdgpu_dsl::VarId(0)), from: 0, to: 1, via: Via::Reg { file: RegFileKind::Agpr, pin: Some(0), dwords: 16, align: 4 }, layout: Some("acc16x16".into()) }],
+        sync: vec![
+            SyncRule::Counted { producer: 0, consumer: 1, counter: "vmcnt".into(), slack: 2 },
+            SyncRule::Barrier { after: 0, before: 1 },
+            SyncRule::CrossCta { flag: RegRef::Var(amdgpu_dsl::VarId(0)), scope: "agent".into(), protocol: CrossCtaProtocol::SeparateKernel, order: MemOrder::AcqRel },
+        ],
+        reg_constraints: vec![RegConstraint::Separate(vec![RegRef::Var(amdgpu_dsl::VarId(0))])],
         hints: Hints { interleave: vec![(1, vec![0])], priority: vec![(1, 2)], prefetch_depth: vec![(1, 2)], tokens: vec![(1, "ldsink=1".into())] },
     }
 }
@@ -57,11 +65,12 @@ fn verify_rejects_a_plan_with_unknown_ids() {
     let mut p = a_plan();
     assert!(verify(&p).is_empty(), "{:?}", verify(&p));
     p.deps.push(Dep { from: 0, to: 9, kind: DepKind::Data, distance: 0 });
-    p.units.push(UnitDecl { id: 1, name: "dup".into(), phase: 7, class: UnitClass::Valu, anchor: false, iter: 0, latency: 8 });
+    p.units.push(UnitDecl { id: 1, name: "dup".into(), phase: 7, class: UnitClass::Valu, anchor: false, iter: 0, latency: 8, roles: 1 << 9 });
     let e = verify(&p);
     assert!(e.iter().any(|x| x.contains("unknown unit")), "{e:?}");
     assert!(e.iter().any(|x| x.contains("unit id 1 twice")), "{e:?}");
     assert!(e.iter().any(|x| x.contains("unknown phase 7")), "{e:?}");
+    assert!(e.iter().any(|x| x.contains("outside the CTA")), "{e:?}");
     let mut f = small();
     f.plan = Some(p);
     assert!(amdgpu_dsl::verify(&f).iter().any(|x| x.starts_with("plan:")));

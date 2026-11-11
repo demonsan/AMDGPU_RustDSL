@@ -122,12 +122,15 @@ pub struct Pipeline {
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
+    /// `TwoPhaseOffset`: two tiles per loop pass with STATIC ring slots (0 then 1, the vendor kernel's unrolled pair; docs/fmha-replica.md R3 step
+    /// 2): an exit after each tile, `idx` records which half the loop left from and the peeled last tile runs in slot `idx`
+    pub unroll2: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2 }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -278,6 +281,44 @@ impl Pipeline {
             b.end_if();
             return;
         }
+        if self.cadence == Cadence::TwoPhaseOffset && self.unroll2 {
+            // first half: tile `it` (even) in slot 0
+            self.iter_tp2(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true, true);
+            let one = b.c_i32(1);
+            b.set_var(idx, one);
+            let mid = b.bind_i32(varx(it) + 1);
+            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
+            b.break_if(stop1);
+            // second half: tile it + 1 (odd) in slot 1
+            self.iter_tp2(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true, true);
+            let zero = b.c_i32(0);
+            b.set_var(idx, zero);
+            let it2 = b.bind_i32(varx(it) + 2);
+            b.set_var(it, it2);
+            let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
+            b.break_if(stop2);
+            b.end_loop();
+            // the last tile: it + idx, in slot idx. One drain per exit with its STATIC slot (the vendor's drain1 / drain0): `if (idx == 1)
+            // {drain in slot 1} else {drain in slot 0}`; the back-end Weaver threads each exit edge (known `idx`) straight to its drain
+            let last_barrier = role != Role::B;
+            // `0 < idx` (idx is 0 / 1): a less-than compare, which the back-end jump threading folds per edge (`jthread`)
+            let which = b.bind_cond(I32::c(0).lt(varx(idx)));
+            b.begin_if(which);
+            for k in [1, 0] {
+                let it_t = b.bind_i32(varx(it) + k);
+                let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
+                b.begin_if(is_tail);
+                self.iter_tp2(b, role, body, Opnd::Val(it_t), Opnd::I32(k), true, false, last_barrier);
+                b.else_();
+                self.iter_tp2(b, role, body, Opnd::Val(it_t), Opnd::I32(k), false, false, last_barrier);
+                b.end_if();
+                if k == 1 {
+                    b.else_();
+                }
+            }
+            b.end_if();
+            return;
+        }
         let i_next = self.iter(b, role, body, it, idx, false, true, true);
         b.set_var(idx, i_next);
         let it_next = b.bind_i32(varx(it) + 1);
@@ -303,6 +344,45 @@ impl Pipeline {
                 n2.off_v(b, *s);
             }
         }
+    }
+
+    /// One `TwoPhaseOffset` iteration of tile `it` (a bound value) in the static ring slot `slot` (`unroll2`); the same rotated weave as `iter`.
+    #[allow(clippy::too_many_arguments)]
+    fn iter_tp2(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool, last_barrier: bool) {
+        let nkv = ev(self.nkv);
+        let other = match slot {
+            Opnd::I32(k) => Opnd::I32(1 - k),
+            o => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
+        };
+        let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
+        let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
+        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2: None, masked, staged, tile_rows: self.tile_rows };
+        self.prebind(b, &t);
+        let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+        let (lg, unclamped) = (self.lg(), self.key_unclamped);
+        rotate(b, &TWO_PHASE_PARTS, stage_sel, None, &mut |b, i| match i {
+            0 => {
+                let k = if unclamped { b.let_i32((amdgpu_dsl::ox(it) + 1) << lg) } else { b.let_i32(nn.clone() << lg) };
+                body.stage(b, role, &k, &t.next);
+            }
+            1 => body.v_phase(b, role, &t),
+            2 => {
+                b.wait_vm(0);
+                body.stage_complete(b, role, &t.next);
+            }
+            3 => {
+                b.wait_lds(0);
+                b.barrier();
+            }
+            4 => body.m_phase(b, role, &t),
+            5 => {
+                b.wait_lds(0);
+                if last_barrier {
+                    b.barrier();
+                }
+            }
+            _ => unreachable!(),
+        });
     }
 
     /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot`.
