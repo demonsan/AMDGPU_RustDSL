@@ -75,7 +75,7 @@ independent of the addresses. As a TV layout over the source tile "64 lanes x 8 
 ## 3. Reproduce
 
 ```
-HIP_VISIBLE_DEVICES=4 bash tools/isa_probes.sh            # re-runs the probes, compares with the committed maps
+HIP_VISIBLE_DEVICES=0 bash tools/isa_probes.sh            # re-runs the probes, compares with the committed maps
 cargo test -p amdgpu-isa                                   # replays the committed maps against the atoms
 ```
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Paged decode the way a host launches it: ask `amdc dispatch decode16` for the plan (crates/amdgpu-graph/src/dispatch.rs `decode16_plan`, the single
 # rule), emit + assemble that kernel, run tests/gpu/pa_host.cpp with the matching mode (fused / last-arriver) and split count.
-# usage (repo root, GPU node): HIP_VISIBLE_DEVICES=6 bash tools/pa_auto.sh B H HK CTX [PAGE]   env: AMDC (default: the container cargo run), O (build/pa_auto)
+# usage (repo root, GPU node): HIP_VISIBLE_DEVICES=0 bash tools/pa_auto.sh B H HK CTX [PAGE]   env: AMDC (default: the container cargo run), O (build/pa_auto)
 set -euo pipefail
 B=$1; H=$2; HK=$3; CTX=$4; P=${5:-16}
 R=${ROCM:-/shared/apps/ubuntu/opt/rocm-7.0.2}; CL=${CLANG:-/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang}; O=${O:-build/pa_auto}; mkdir -p "$O"

@@ -8,6 +8,6 @@ g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/mfma_cform_host.cpp -o build
 for BE in own llvm-tail; do
   bash tools/container/cargo.sh run -q --bin amdc -- emit probe_mfma_cform --backend $BE --out /work/build/probe_mfma_cform_$BE.s 2>&1 | grep -E "wrote|rror" || exit 1
   "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/probe_mfma_cform_$BE.co build/probe_mfma_cform_$BE.s || exit 1
-  echo "[$BE] $(HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" ./build/mfma_cform_host build/probe_mfma_cform_$BE.co | tr '\n' ' ')"
+  echo "[$BE] $(HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/mfma_cform_host build/probe_mfma_cform_$BE.co | tr '\n' ' ')"
   grep -E "v_mfma_scale" build/probe_mfma_cform_$BE.s
 done

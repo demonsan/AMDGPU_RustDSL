@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B1 hardware check beyond 4 GiB (docs/op-coverage-tileops.md): HIP_VISIBLE_DEVICES=6 bash tools/big_addr_probe.sh [own|llvm-tail]
+# B1 hardware check beyond 4 GiB (docs/op-coverage-tileops.md): HIP_VISIBLE_DEVICES=0 bash tools/big_addr_probe.sh [own|llvm-tail]
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/tileop
 BE=${1:-own}

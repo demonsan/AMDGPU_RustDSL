@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Batch-2 matrix: emit + assemble every kernel, then correctness (small odd shapes) and bandwidth (~1 GB working sets) with the host drivers in tests/gpu. One line per case.
 # usage (on a gfx950 node, from the repo root, with $AMDC = a built amdc): bash tools/b2_matrix.sh [out]   (the vendor harness is separate: tools/vendor_membound.sh)
-export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4}
+export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 A=${AMDC:-/tmp/target-b2/debug/amdc}; R=${ROCM:-/shared/apps/ubuntu/opt/rocm-7.0.2}; CL=${CLANG:-/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang}; O=${1:-build/b2}
 mkdir -p $O
 for h in eltwise rows quant cast rope cache topk dequant cache_blocked moe_sorting sampling moe_reduce gated cache_fp8 conv1d_update moe_gate topk_per_row conv1d_fwd cache_blocked_fp8 qknorm_rope_kv mxnorm mla_cache eltwise_bias mxfp6; do [ -x $O/${h}_host ] || $R/bin/amdclang++ -x hip -O2 --offload-arch=gfx950 --rocm-path=$R -std=c++17 tests/gpu/${h}_host.cpp -o $O/${h}_host -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib 2>&1 | grep error; done

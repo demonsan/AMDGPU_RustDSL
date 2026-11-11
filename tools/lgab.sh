@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/ab_fmha.sh with per-variant EMIT environment: same-run A/B of FMHA kernel variants (emit + assemble each, a 64-row accuracy check per shape, REPS interleaved timing rounds, medians).
-#   REF_DATA=normal HIP_VISIBLE_DEVICES=4 AMDC=<amdc> bash tools/lgab.sh <kernel>[@spec][%VAR=val;VAR=val]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
+#   REF_DATA=normal HIP_VISIBLE_DEVICES=0 AMDC=<amdc> bash tools/lgab.sh <kernel>[@spec][%VAR=val;VAR=val]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
 #   `%VAR=val;..` is exported only while that variant is emitted (e.g. `fmha_fwd_hd128_mxfp8_v3_vs128%AMDC_SCHED=1;AMDC_SCHED_OPTS=hoist=64`); variants are labelled by the whole string.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
@@ -24,7 +24,7 @@ for k in "${KS[@]}"; do
   v=$($A gpu-verify "$(kn "$k")" --strict $(ksp "$k") 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
   echo "$k: md5 $(md5sum < build/lgab/$f.s | cut -c1-12) $(grep -E '\.vgpr_count:' build/lgab/$f.s | tr -s ' ') waits0=$(grep -c 's_waitcnt lgkmcnt(0)' build/lgab/$f.s) | $v"
 done
-run() { local f=$(lab "$3"); env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/lgab/$f.co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
+run() { local f=$(lab "$3"); env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/lgab/$f.co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
 for s in "${SH[@]}"; do set -- $s
   for k in "${KS[@]}"; do echo "acc B$1 S$2 $k: $(run $1 $2 $k REF_ROWS=64 REF_WARMUP=2 REF_ITERS=2 | grep -E 'kernel +vs CPU: ' | sed -E 's/checked=[0-9]+ //;s/ max\|ref\|=[0-9.]+//;s/ kernel +vs CPU://;s/worst_err=[^ ]+ //' | tr '\n' ' ')"; done
 done

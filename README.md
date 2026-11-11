@@ -78,19 +78,19 @@ REF_ROWS=64 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto REF_CO=<vendor.co> bash tests/g
 REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_WARMUP=150 REF_ITERS=100 ./build/ref_host <vendor.co>
 
 # 门禁
-HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3     # FMHA 全套验收（精度=厂商持平；性能=同轮厂商比 ≥ 0.97×记录的出厂比；ACC_STRICT=1 用旧 bad=0 判据）
-HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh gemm_mxfp8_bs_v4            # GEMM（BUILD / VERIFY / ACC / DET / PERF 对照厂商）
+HIP_VISIBLE_DEVICES=0 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3     # FMHA 全套验收（精度=厂商持平；性能=同轮厂商比 ≥ 0.97×记录的出厂比；ACC_STRICT=1 用旧 bad=0 判据）
+HIP_VISIBLE_DEVICES=0 bash tools/gemm_gate.sh gemm_mxfp8_bs_v4            # GEMM（BUILD / VERIFY / ACC / DET / PERF 对照厂商）
 
 # 确定性 / 性能矩阵
 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto bash tests/gpu/determinism.sh
-HIP_VISIBLE_DEVICES=4 bash tools/perf_matrix.sh                         # FMHA 25 形状 + GEMM 6 形状，同轮对照厂商
+HIP_VISIBLE_DEVICES=0 bash tools/perf_matrix.sh                         # FMHA 25 形状 + GEMM 6 形状，同轮对照厂商
 
 # 文档链接检查
 python tools/check_doc_links.py
 
 # Python JIT（纯标准库，subprocess 调 amdc + ROCm clang，磁盘缓存，默认按形状特化；docs/python-jit.md）
 python3 -c "import sys; sys.path.insert(0, 'python'); import amdgpu_jit as aj; help(aj.gemm_mxfp8_blockscale)"
-HIP_VISIBLE_DEVICES=5 AMDGPU_JIT_AMDC=target/release/amdc python3 python/tests/node_check.py   # 与 C++ harness 逐位一致、缓存、开销、特化 vs 通用
+HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=target/release/amdc python3 python/tests/node_check.py   # 与 C++ harness 逐位一致、缓存、开销、特化 vs 通用
 ```
 
 **LLVM pin**：ROCm 10.1.0（AMD LLVM 24.0.0git，方言 `llvm24`）。ROCm 10 不自带 `llc`，用

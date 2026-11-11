@@ -363,8 +363,8 @@ REF_ROWS=64 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto REF_CO=<vendor.co> bash tests/g
 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto bash tests/gpu/determinism.sh
 
 # 门禁
-HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3
-HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh
+HIP_VISIBLE_DEVICES=0 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3
+HIP_VISIBLE_DEVICES=0 bash tools/gemm_gate.sh
 ```
 
 ---

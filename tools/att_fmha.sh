@@ -2,7 +2,7 @@
 # Warm ATT (rocprofv3 thread trace, CU 1 SIMD 0) of our FMHA kernel and the vendor kernel on the same inputs, one dispatch each
 # (the 5th of the run: warm). Output: build/att/<tag>/{ours,vendor}/... + the per-class table (tools/att_classes.py) and the MFMA-gap
 # attribution (tools/att_gaps.py) of each.
-# usage (repo root, GPU node, amdc built): HIP_VISIBLE_DEVICES=5 bash tools/att_fmha.sh <tag> [B H S] [kernel]
+# usage (repo root, GPU node, amdc built): HIP_VISIBLE_DEVICES=0 bash tools/att_fmha.sh <tag> [B H S] [kernel]
 #   env: REF_DATA (default normal), ROWS_PER_BLOCK (default 256), REF_CO (vendor .co), ATT_DECODER_DIR (librocprof-trace-decoder)
 set -u
 TAG=${1:-att}; B=${2:-1}; H=${3:-8}; S=${4:-2048}; K=${5:-fmha_fwd_hd128_mxfp8_v3_vs128}

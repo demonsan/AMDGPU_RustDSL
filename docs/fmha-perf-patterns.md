@@ -382,7 +382,7 @@
 `fmha_fwd_hd128_mxfp8_vs2`：`..._vs2_vs128`、`..._vs2_t128`、`..._vs2_kvsplit`、`..._vs2_kvsplit_combine8h`
 （以 `fmha_fwd_hd128_mxfp8_vs` 开头 → 得到 vendor-structure lowering 选项与 full scheduler；后缀 `_t128`/`_kvsplit` 触发各自附加项；
 combine 名字含 `combine8` 供 ref_host 推断每线程元素数）。注意 `..._vs2_kvsplit_combine8h` 会比出厂 combine 多拿到 lowering 选项和调度器 —— 需要在 PERF 中确认不回退。
-门禁命令：`HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_vs2`（未移植的 kernel 用 `KN_T128=fmha_fwd_hd128_mxfp8_t128` 等回落到出厂）。
+门禁命令：`HIP_VISIBLE_DEVICES=0 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_vs2`（未移植的 kernel 用 `KN_T128=fmha_fwd_hd128_mxfp8_t128` 等回落到出厂）。
 
 ---
 

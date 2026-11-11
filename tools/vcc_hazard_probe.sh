@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VALU-writes-VCC -> VALU-reads-VCC hazard probe (tools/vcc_hazard_probe.py).  Usage: HIP_VISIBLE_DEVICES=6 bash tools/vcc_hazard_probe.sh
+# VALU-writes-VCC -> VALU-reads-VCC hazard probe (tools/vcc_hazard_probe.py).  Usage: HIP_VISIBLE_DEVICES=0 bash tools/vcc_hazard_probe.sh
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/vcc
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"

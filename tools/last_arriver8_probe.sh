@@ -14,5 +14,5 @@ KERNELS=("$@"); [ ${#KERNELS[@]} -gt 0 ] || KERNELS=(probe_la8 probe_la8_lite pr
 for K in "${KERNELS[@]}"; do
   bash tools/container/cargo.sh run -q --bin amdc -- emit $K --backend "${BACKEND:-own}" --out /work/build/$K.s 2>&1 | grep -E "wrote|error" || exit 1
   "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/$K.co build/$K.s || exit 1
-  HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" ./build/last_arriver8_host build/$K.co $K build/probe_la_verify.co "${RUNS:-100000}" "${THRASH:-0}" "${STAGGER:-4}" | tail -13
+  HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/last_arriver8_host build/$K.co $K build/probe_la_verify.co "${RUNS:-100000}" "${THRASH:-0}" "${STAGGER:-4}" | tail -13
 done

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MFMA result latency per operand format (tools/mfma_lat_probe.py).  Usage: HIP_VISIBLE_DEVICES=6 bash tools/mfma_lat_probe.sh
+# MFMA result latency per operand format (tools/mfma_lat_probe.py).  Usage: HIP_VISIBLE_DEVICES=0 bash tools/mfma_lat_probe.sh
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/mlat
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"

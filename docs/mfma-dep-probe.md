@@ -63,4 +63,4 @@
   不来自 MFMA 发射形态；穿插的 VALU 量才是对功耗墙下时钟影响最大的因素（5 条 VALU/MFMA 就是 −7 %）。
 * 不覆盖：A/B 在 AGPR 里的形态（前次探针在周期上无差别，未测时钟）、真实 FMHA 的 LDS / VMEM 流量对功耗的贡献。
 
-复现：`HIP_VISIBLE_DEVICES=4 SECS=4 bash tools/mfma_dep.sh`（全部），`ONLY_SUSTAINED=1 [REV=1] ...`（只做持续时钟 / 功耗）。
+复现：`HIP_VISIBLE_DEVICES=0 SECS=4 bash tools/mfma_dep.sh`（全部），`ONLY_SUSTAINED=1 [REV=1] ...`（只做持续时钟 / 功耗）。

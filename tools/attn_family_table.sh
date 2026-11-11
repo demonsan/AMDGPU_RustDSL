@@ -2,7 +2,7 @@
 # Same-run attention-family ratio table (docs/op-coverage-design.md §7.5 "attention 各族与厂商的当前比值汇总"): one GPU session, every
 # prefill / backward family against its aiter gfx950 vendor kernel on the same shapes, ours and the vendor alternating.
 #
-# Usage (on the node, repo root):  HIP_VISIBLE_DEVICES=5 bash tools/attn_family_table.sh [out_dir]
+# Usage (on the node, repo root):  HIP_VISIBLE_DEVICES=0 bash tools/attn_family_table.sh [out_dir]
 # Needs the release amdc (AMDC, default /tmp/target-kfmha/release/amdc), clang (CLANG), hipcc (HIPCC) and the aiter hsa tree (AITER_HSA).
 # Families: per-tensor FP8 (fp8pt_host), MXFP8 (ref_host, REF_DATA=normal), bf16 v3 hd128 and hd192/hd128 (attn_host), bf16 backward
 # (attn_bwd_host). The decode families (paged, MLA) are not in this script: their hosts take a dispatch plan (see §7.5).

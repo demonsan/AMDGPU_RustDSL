@@ -79,7 +79,7 @@ The vendor kernel and legacy/dsl/env-override kernels keep the historical hand p
   asserts + JSON vs the hand 656/648/36-byte ABI facts for all four shipped v3 kernels).
 - `g++ -std=c++17 -D__HIP_PLATFORM_AMD__ -Itests/gpu -I$ROCM/include` compiles `ref_host.cpp` and the
   generated headers.
-- `tests/gpu/determinism.sh` with `OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`, `HIP_VISIBLE_DEVICES=7`,
+- `tests/gpu/determinism.sh` with `OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`, `HIP_VISIBLE_DEVICES=0`,
   generated vs `REF_GEN_ABI_OFF=1`, all 5 shapes bit-identical:
 
 | shape | generated md5 (3 runs) | hand md5 (3 runs) |

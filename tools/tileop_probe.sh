@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hardware probe of the P1 base ops (docs/op-coverage-tileops.md §6.5).  Usage: HIP_VISIBLE_DEVICES=6 bash tools/tileop_probe.sh <probe> [own|llvm-tail]
+# Hardware probe of the P1 base ops (docs/op-coverage-tileops.md §6.5).  Usage: HIP_VISIBLE_DEVICES=0 bash tools/tileop_probe.sh <probe> [own|llvm-tail]
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/tileop
 P=${1:?probe name}; BE=${2:-own}

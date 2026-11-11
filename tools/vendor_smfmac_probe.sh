@@ -17,7 +17,7 @@ OUT="${VENDOR_WORK:-$REPO/build/vendor}"
 cd "$REPO"
 mkdir -p "$OUT"
 unset GPU_DEVICE_ORDINAL CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
-export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-5}"
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 export AMD_CARGO_TARGET="${AMD_CARGO_TARGET:-/tmp/amd-target-occ}"
 
 echo "[smfmac] emit (own backend)"

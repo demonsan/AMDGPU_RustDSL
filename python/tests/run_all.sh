@@ -7,7 +7,7 @@
 #   crates/amdgpu-kernels/tests/dispatch_compile.rs (--ignored, release) every reachable kernel compiles
 #   crates/amdgpu-codegen/tests/hazard_oracle.rs (release) the enforcing LLVM hazard oracle (skipped by debug cargo test)
 #   python/tests/node_check.py   (--full) bit identity vs the C++ harnesses, cache behaviour, launch overhead
-# usage (repo root, GPU node): HIP_VISIBLE_DEVICES=6 bash python/tests/run_all.sh [--full] [ops_check name filters ...]
+# usage (repo root, GPU node): HIP_VISIBLE_DEVICES=0 bash python/tests/run_all.sh [--full] [ops_check name filters ...]
 #   env: AMDGPU_JIT_AMDC (default: build the release amdc with tools/container/cargo.sh and use it), OUT (default build/py_checks)
 set -uo pipefail
 FULL=0

@@ -74,3 +74,5 @@ docs in Chinese in `docs/op-coverage-design.md` (relative links, `python tools\c
 archive/bwd-dkdv-pair, archive/bwd-fused, archive/decode16-f8, archive/decode16-kr, archive/decode16-lastc, archive/decode16-lookahead,
 archive/decode16-prefetch, archive/decode16-v2, archive/mxfp4-a-swizzle, archive/mxfp4-regb, archive/mxfp4-regb2, archive/sched-pa-lookup, plus older
 fmha / scheduler tags (`git tag -l "archive/*"`).
+
+**GPU rule (user, 2026-11-11):** GPU tests run only on GPUs 0-3, never 4-7, on every node. kernel-opt uses GPU 0 (`HIP_VISIBLE_DEVICES=0`); the repo scripts default to 0 since branch `gpu-rule-defaults`.

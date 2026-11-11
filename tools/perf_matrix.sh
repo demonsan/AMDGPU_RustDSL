@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Same-run perf sweep vs the vendor (docs/perf-matrix.md): FMHA fwd hd128 mxfp8 (shipped `_auto` set vs ref_mxfp8.co) and MXFP8 blockscale GEMM v4 (vs the aiter 4wave .co).
-# usage (repo clone on the GPU node, amdc built): HIP_VISIBLE_DEVICES=4 bash tools/perf_matrix.sh [fmha|gemm|all]     env: REPS (5), AMDC, REF_CO, GEMM_CO_DIR,
+# usage (repo clone on the GPU node, amdc built): HIP_VISIBLE_DEVICES=0 bash tools/perf_matrix.sh [fmha|gemm|all]     env: REPS (5), AMDC, REF_CO, GEMM_CO_DIR,
 # REF_DATA (FMHA inputs: normal (default; realistic N(0,1) MXFP8) | lcg (the harness palette) | uniform)
 # Raw output: build/pm/raw_fmha.txt, build/pm/raw_gemm.txt (one line per run); tools/perf_matrix_md.py turns them into the markdown tables.
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; mkdir -p build/pm
 AMDC="${AMDC:-$(ls target/debug/amdc 2>/dev/null || echo amdc)}"; R="${ROCM_RT:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
-REPS="${REPS:-5}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}"; WHAT="${1:-all}"
+REPS="${REPS:-5}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"; WHAT="${1:-all}"
 asm() { "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$2" "$1" || exit 1; }
 
 if [ "$WHAT" = fmha ] || [ "$WHAT" = all ]; then

@@ -220,7 +220,7 @@
 
 ```
 hipcc 或 amdclang++ -x hip -O3 --offload-arch=gfx950 tests/gpu/membw_survey.cpp -o membw_survey
-HIP_VISIBLE_DEVICES=4 ./membw_survey 2048     # 工作集 MiB（2048 与 256 各跑一次）
+HIP_VISIBLE_DEVICES=0 ./membw_survey 2048     # 工作集 MiB（2048 与 256 各跑一次）
 ```
 
 输出：`hipMemcpy` D2D、拷贝（宽度 / 展开 / `nt` / 按 tile vs grid-stride × grid 倍数）、只读、只写；"r+w" 为读写字节和除以时间。`rmsnorm_quant_fp8_n4096`：`tests/gpu/rmsnorm_quant_host.cpp`（`rmsnorm_quant_host <co> <kernel> 16384 4096 300`）。

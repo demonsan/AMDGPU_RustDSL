@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # topk_softmax: ours vs aiter, same run (tokens 4096 / 65536 / 524288); needs build/b2/vendor_membound_host (tools/vendor_membound.sh) and the two kernels emitted as build/b2/*.co
-export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4}
+export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 TK=build/b2/topk_host; V=build/b2/vendor_membound_host
 $TK build/b2/topk_softmax_bf16_e128_k8.co topk_softmax_bf16_e128_k8 4096 128 8 plain 100 | tail -1
 TOPK=8 $V topk_softmax 4096 128 100

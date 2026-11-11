@@ -2,7 +2,7 @@
 """Host time per launch of the Python ops (GPU node; stdlib only): paged_decode_bf16 (fused and last-arriver), rmsnorm (generic launch),
 gemm bf16; first call excluded, N calls back to back without synchronisation (the launch is asynchronous), with and without the contract check.
 
-    HIP_VISIBLE_DEVICES=6 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/launch_overhead.py
+    HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/launch_overhead.py
 """
 import os
 import struct

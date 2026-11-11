@@ -209,13 +209,13 @@ contract check on / off):
 
 ## Checks on the GPU node
 
-`HIP_VISIBLE_DEVICES=6 bash python/tests/run_all.sh [--full] [filters]` runs all of them (unit tests, `ops_check.py`, `decode_check.py`;
+`HIP_VISIBLE_DEVICES=0 bash python/tests/run_all.sh [--full] [filters]` runs all of them (unit tests, `ops_check.py`, `decode_check.py`;
 `--full` adds `node_check.py`) and prints a table of every op check with an OVERALL line.
 
 
 ```bash
 python3 -m unittest discover -s python/tests -p 'test_unit.py'                 # host only
-HIP_VISIBLE_DEVICES=5 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/node_check.py
+HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/node_check.py
 ```
 
 `node_check.py` replays the inputs the C++ harnesses generate (`INPUT_DUMP` in `tests/gpu/gemm_ref_host.cpp`, `REF_INPUT_DUMP` in

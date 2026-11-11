@@ -2,7 +2,7 @@
 """GPU-node check of the amdgpu_jit ops (torch-free, stdlib only): each op on random data against a Python reference that follows the
 C++ host reference of its kernel family (tests/gpu/*_host.cpp: formulas and tolerances). Small shapes (the references are pure Python).
 
-    HIP_VISIBLE_DEVICES=6 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/ops_check.py [name-substring ...]
+    HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/ops_check.py [name-substring ...]
 """
 import math
 import os

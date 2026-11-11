@@ -2,8 +2,8 @@
 # Layout-median A/B of kernel variants (`kernel` or `kernel@name=v,..` = `--specialize`, docs/jit.md): every variant is emitted once, then for
 # each code shift (LAYOUT_PADS leading `s_nop 0` in the entry block) all variants are timed interleaved; prints per-variant per-pad TF/s and the
 # median over pads (single-layout comparisons move by ~2%, docs/current-status.md §4.5).
-#   FMHA: HIP_VISIBLE_DEVICES=6 B=4 S=2048 RPB=256 bash tools/ab_layout.sh fmha <variant>...
-#   GEMM: HIP_VISIBLE_DEVICES=6 bash tools/ab_layout.sh gemm <variant>...        (gemm_ref_host default shape 4096x4096x8192)
+#   FMHA: HIP_VISIBLE_DEVICES=0 B=4 S=2048 RPB=256 bash tools/ab_layout.sh fmha <variant>...
+#   GEMM: HIP_VISIBLE_DEVICES=0 bash tools/ab_layout.sh gemm <variant>...        (gemm_ref_host default shape 4096x4096x8192)
 set -u
 # a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
 irname() { case "$1" in *.ir) sed -n 's/^dsl "\(.*\)"$/\1/p' "$1" | head -1;; *) echo "$1";; esac; }

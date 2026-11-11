@@ -7,7 +7,7 @@
   3. steady-state launch overhead (host time per call, with and without the contract check);
   4. specialized vs generic performance (hip events, interleaved rounds).
 
-Usage (repo root, GPU node):  HIP_VISIBLE_DEVICES=5 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/node_check.py [--quick] [--skip-perf]
+Usage (repo root, GPU node):  HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/node_check.py [--quick] [--skip-perf]
 Env: REF_CO (vendor FMHA .co, default the session copy), ROCM_PATH (HIP headers/libs for building the harnesses).
 """
 import argparse

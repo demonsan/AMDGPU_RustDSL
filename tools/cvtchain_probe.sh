@@ -10,4 +10,4 @@ for K in probe_cvtchain_dsl probe_cvtchain_asm; do
   "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/$K.co build/$K.s || exit 1
 done
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/cvtchain_host.cpp -o build/cvtchain_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
-HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" ./build/cvtchain_host build/probe_cvtchain_dsl.co build/probe_cvtchain_asm.co
+HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/cvtchain_host build/probe_cvtchain_dsl.co build/probe_cvtchain_asm.co

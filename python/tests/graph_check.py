@@ -6,7 +6,7 @@ the same random data. Both must agree with the Python reference of the graph (th
 other within the quantization step. This checks that each fusion rule's pattern computes what its fused kernel computes. The graphs whose
 ops have no standalone kernel (add, qknorm) are checked fused against the reference only.
 
-    HIP_VISIBLE_DEVICES=6 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/graph_check.py
+    HIP_VISIBLE_DEVICES=0 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/graph_check.py
 """
 import os
 import sys

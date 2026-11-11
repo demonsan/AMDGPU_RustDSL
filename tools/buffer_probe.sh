@@ -12,6 +12,6 @@ for M in ${1:-both}; do
     bash tools/container/cargo.sh run -q --bin amdc -- emit $K --backend $BE --out /work/build/$K.s 2>&1 | grep -E "wrote|compile error" -A4 || exit 1
     "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/$K.co build/$K.s || exit 1
     echo "== $K ($BE)"; grep -E "buffer_(load|store)" build/$K.s | head -12
-    HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" ./build/buffer_host $T build/$K.co
+    HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/buffer_host $T build/$K.co
   done
 done

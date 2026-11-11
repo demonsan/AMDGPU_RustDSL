@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # MXFP8 blockscale GEMM reference: runs the aiter PR #6696 4-wave pin-AGPR code object (and optionally ours, OURS_CO/OURS_KNAME) on identical
 # inputs, checks sampled rows against a double-precision CPU reference and times both (median of REF_REPS).
-# Usage: HIP_VISIBLE_DEVICES=6 [GEMM_M=4096 GEMM_N=4096 GEMM_K=8192] [REF_VARIANT=pm0_sp64_u2_gm16_wide1_vf1] bash tools/gemm_ref.sh
+# Usage: HIP_VISIBLE_DEVICES=0 [GEMM_M=4096 GEMM_N=4096 GEMM_K=8192] [REF_VARIANT=pm0_sp64_u2_gm16_wide1_vf1] bash tools/gemm_ref.sh
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
@@ -26,4 +26,4 @@ if [ -n "${OURS_KERNEL:-}" ]; then
     OURS_ENV=(OURS_CO="build/$OURS_KERNEL.co" OURS_KNAME="$OURS_KERNEL" OURS_TILE_M="${OURS_TILE_M:-128}" OURS_TILE_N="${OURS_TILE_N:-128}" OURS_DUMP="${OURS_DUMP:-}")
 fi
 [ -n "${SKIP_REF:-}" ] && IMG=""
-env REF_CO="$IMG" REF_KNAME="$SYM" "${OURS_ENV[@]}" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6}" ./build/gemm_ref_host
+env REF_CO="$IMG" REF_KNAME="$SYM" "${OURS_ENV[@]}" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/gemm_ref_host

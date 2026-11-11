@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # MFMA dependency / operand-reuse probe (tools/mfma_dep.py): cycles per MFMA (one CU, in-kernel s_memtime), then the sustained full-chip effective clock and the SMU power per pattern.
-# usage: HIP_VISIBLE_DEVICES=4 bash tools/mfma_dep.sh        env: ASM_ROC, ROCM_PATH, SMI (amd-smi), SECS (sustained seconds per pattern, default 3)
+# usage: HIP_VISIBLE_DEVICES=0 bash tools/mfma_dep.sh        env: ASM_ROC, ROCM_PATH, SMI (amd-smi), SECS (sustained seconds per pattern, default 3)
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; mkdir -p build/dep
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; ASM="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}"; SMI="${SMI:-$ROC/bin/amd-smi}"; SECS="${SECS:-3}"
 KS=$(python3 tools/mfma_dep.py build/dep/dep.s 2048 | sed 's/kernels: //')
 "$ASM/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/dep/dep.co build/dep/dep.s || exit 1
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/mfma_ceiling_host.cpp -o build/dep/host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
-export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" MPI=32
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" MPI=32
 if [ -z "${ONLY_SUSTAINED:-}" ]; then
 echo "=== one CU (BLOCKS=1): cycles per MFMA, ITERS=2048, 8 launches"
 BLOCKS=1 ITERS=2048 REPS=8 ./build/dep/host build/dep/dep.co $KS | grep -E "^(s32|s16)"

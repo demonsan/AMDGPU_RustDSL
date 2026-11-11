@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Warm ATT (rocprofv3 thread trace, one CU, SIMD 0) of a paged-decode kernel and of the aiter vendor kernel on the same data, one dispatch each (the 5th of the run), with the per-class table (tools/att_classes.py)
 # and the MFMA-gap attribution (tools/att_gaps.py). The CU that hosts a wave of a 128-CTA grid is not predictable: the script tries CUS (default "1 2 0 3 4 5 6 7") until the trace has instructions.
-# usage (repo root of a tree that has tools/att_*.py, GPU node):  HIP_VISIBLE_DEVICES=4 PAH=/tmp/pa2/pah KCO=pa_decode16_bf16_hd128_p16_f.co CCO=attn_combine_bf16_hd128.co VCO=vendor.co bash tools/att_pa.sh <tag> [B H HK CTX]
+# usage (repo root of a tree that has tools/att_*.py, GPU node):  HIP_VISIBLE_DEVICES=0 PAH=/tmp/pa2/pah KCO=pa_decode16_bf16_hd128_p16_f.co CCO=attn_combine_bf16_hd128.co VCO=vendor.co bash tools/att_pa.sh <tag> [B H HK CTX]
 #   env: KREGEX (default pa_decode16), FUSED (1 = fused-combine kernel), KPREFIX / KSUFFIX (pa_host naming), PAGE (16), S (1), CUS, ATT_DECODER_DIR
 set -u
 TAG=${1:-pa}; B=${2:-16}; H=${3:-64}; HK=${4:-8}; CTX=${5:-2048}

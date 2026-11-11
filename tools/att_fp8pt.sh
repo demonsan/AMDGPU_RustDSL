@@ -2,7 +2,7 @@
 # Warm ATT (rocprofv3 thread trace, CU 1 SIMD 0) of the per-tensor FP8 prefill (ours) and aiter's fwd_hd128_fp8[_causal].co on the same inputs
 # (tests/gpu/fp8pt_host.cpp, SCALAR_DS=1), one dispatch each (the 5th: warm), then the per-class table (tools/att_classes.py) and the MFMA-gap
 # attribution (tools/att_gaps.py) of each - as tools/att_fmha.sh does for the MXFP8 kernels.
-# usage (repo root, GPU node, amdc built): HIP_VISIBLE_DEVICES=5 bash tools/att_fp8pt.sh <tag> [B H S causal]
+# usage (repo root, GPU node, amdc built): HIP_VISIBLE_DEVICES=0 bash tools/att_fp8pt.sh <tag> [B H S causal]
 set -u
 TAG=${1:-att}; B=${2:-2}; H=${3:-32}; S=${4:-8192}; C=${5:-0}
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang

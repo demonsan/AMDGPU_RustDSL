@@ -93,8 +93,8 @@ cargo run --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend own --out v
 cargo run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_v3_vs128 --strict           # 0 error；打印证书
 cargo run --bin amdc -- regplan fmha_fwd_hd128_mxfp8_v3_vs128                       # 每个 weave / stage 区域的真实寄存器峰值
 cargo test -p amdgpu-tile --test weave --test stage_registry --test opgraph
-HIP_VISIBLE_DEVICES=5 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 mytag          # GPU 验收 gate
-HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh fmha_fwd_hd128_mxfp8_v3_vs128 <变体> -- "4 2048" "1 8192"
+HIP_VISIBLE_DEVICES=0 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 mytag          # GPU 验收 gate
+HIP_VISIBLE_DEVICES=0 bash tools/ab_fmha.sh fmha_fwd_hd128_mxfp8_v3_vs128 <变体> -- "4 2048" "1 8192"
 ```
 
 - **gate 判定**：

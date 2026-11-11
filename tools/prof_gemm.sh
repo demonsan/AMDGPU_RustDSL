@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Issue-level comparison vendor vs ours: rocprofv3 SQ counters of the aiter code object and of an amdc GEMM kernel, same process, same inputs.
-# usage: OURS_KERNEL=gemm_mxfp8_bs_v4 HIP_VISIBLE_DEVICES=4 bash tools/prof_gemm.sh   (repo clone on the node; env as for tools/gemm_ref.sh)
+# usage: OURS_KERNEL=gemm_mxfp8_bs_v4 HIP_VISIBLE_DEVICES=0 bash tools/prof_gemm.sh   (repo clone on the node; env as for tools/gemm_ref.sh)
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 K="${OURS_KERNEL:-gemm_mxfp8_bs_v4}"; R=/shared/apps/ubuntu/opt/rocm-7.0.2

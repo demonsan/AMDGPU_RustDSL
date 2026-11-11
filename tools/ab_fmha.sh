@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Same-run A/B of FMHA kernel variants (by name) on the filled shapes: emit + assemble each kernel, a 64-row accuracy check per shape
 # (ours vs CPU, vendor vs CPU), then REPS interleaved timing rounds; prints the medians.
-#   HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh <kernel>[@name=v,..]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
+#   HIP_VISIBLE_DEVICES=0 bash tools/ab_fmha.sh <kernel>[@name=v,..]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
 #   `kernel@spec` emits with `--specialize spec` (docs/jit.md); the variant is labelled `kernel@spec` (only meaningful on a matching shape)
 set -u
 # a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
@@ -25,7 +25,7 @@ for k in "${KS[@]}"; do
   v=$($A gpu-verify $(irsrc "${k%%@*}") --strict $(ksp "$k") 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
   echo "$k: md5 $(md5sum < build/ab/$(lab "$k").s | cut -c1-12) $(grep -E '\.vgpr_count:' build/ab/$(lab "$k").s | tr -s ' ') | $v"
 done
-run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$(lab "$3").co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
+run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$(lab "$3").co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
 for s in "${SH[@]}"; do set -- $s
   for k in "${KS[@]}"; do echo "acc B$1 S$2 $k: $(run $1 $2 $k REF_ROWS=64 REF_WARMUP=2 REF_ITERS=2 | grep -E 'kernel +vs CPU: ' | sed -E 's/checked=[0-9]+ //;s/ max\|ref\|=[0-9.]+//;s/ kernel +vs CPU://;s/worst_err=[^ ]+ //' | tr '\n' ' ')"; done
 done

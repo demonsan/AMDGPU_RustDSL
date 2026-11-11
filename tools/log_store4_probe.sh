@@ -8,5 +8,5 @@ g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/log_store4_host.cpp -o build
 for BE in own llvm-tail; do
   bash tools/container/cargo.sh run -q --bin amdc -- emit probe_log_store4 --backend $BE --out /work/build/probe_log_store4_$BE.s 2>&1 | grep -E "wrote|error" || exit 1
   "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/probe_log_store4_$BE.co build/probe_log_store4_$BE.s || exit 1
-  echo "[$BE] $(HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" ./build/log_store4_host build/probe_log_store4_$BE.co | tr '\n' ' ')"
+  echo "[$BE] $(HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/log_store4_host build/probe_log_store4_$BE.co | tr '\n' ' ')"
 done
