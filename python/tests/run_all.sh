@@ -6,6 +6,7 @@
 #   python/tests/test_unit.py    host-only unit tests
 #   crates/amdgpu-kernels/tests/dispatch_compile.rs (--ignored, release) every reachable kernel compiles
 #   crates/amdgpu-codegen/tests/hazard_oracle.rs (release) the enforcing LLVM hazard oracle (skipped by debug cargo test)
+#   crates/amdgpu-kernels/tests/verify_reachable.rs (release) every reachable kernel passes strict gpu-verify (allowlist: probe_*, gv_attack_*)
 #   python/tests/node_check.py   (--full) bit identity vs the C++ harnesses, cache behaviour, launch overhead
 # usage (repo root, GPU node): HIP_VISIBLE_DEVICES=0 bash python/tests/run_all.sh [--full] [ops_check name filters ...]
 #   env: AMDGPU_JIT_AMDC (default: build the release amdc with tools/container/cargo.sh and use it), OUT (default build/py_checks)
@@ -25,15 +26,17 @@ t0=$(date +%s)
 bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test dispatch_compile -- --include-ignored > "$OUT/compile.log" 2>&1; comp=$?
 # the hazard oracle: every pair where the pinned LLVM inserts more wait states than our hazard passes must be explained (docs/trust-inventory.md 5.2)
 bash tools/container/cargo.sh test -q --release -p amdgpu-codegen --test hazard_oracle -- --include-ignored > "$OUT/oracle.log" 2>&1; orc=$?
+# every reachable kernel passes the strict GPU-semantics verification (0 errors; only probes / attack kernels allowlisted)
+bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test verify_reachable -- --include-ignored > "$OUT/verify.log" 2>&1; ver=$?
 python3 -m unittest discover -s python/tests -p 'test_unit.py' > "$OUT/unit.log" 2>&1; unit=$?
 python3 python/tests/ops_check.py "$@" > "$OUT/ops.log" 2>&1; ops=$?
 python3 python/tests/decode_check.py > "$OUT/decode.log" 2>&1; dec=$?
 python3 python/tests/graph_check.py > "$OUT/graph.log" 2>&1; gr=$?
 nc=skipped
 if [ $FULL = 1 ]; then python3 python/tests/node_check.py --skip-perf > "$OUT/node.log" 2>&1 && nc=PASS || nc=FAIL; fi
-python3 - "$OUT" "$unit" "$ops" "$dec" "$nc" "$(( $(date +%s) - t0 ))" "$comp" "$orc" <<'PY'
+python3 - "$OUT" "$unit" "$ops" "$dec" "$nc" "$(( $(date +%s) - t0 ))" "$comp" "$orc" "$ver" <<'PY'
 import re, sys
-out, unit, ops, dec, nc, secs, comp, orc = sys.argv[1:]
+out, unit, ops, dec, nc, secs, comp, orc, ver = sys.argv[1:]
 rows = []
 for f in ("ops.log", "decode.log", "graph.log"):
     for line in open(f"{out}/{f}", encoding="utf-8", errors="replace"):
@@ -49,8 +52,8 @@ for n, s, d in rows:
     print(f"| {n.ljust(w)} | {s:6} | {d} |")
 npass = sum(1 for r in rows if r[1] == "PASS")
 cmp_ok = comp == "0"
-print(f"\nop checks: {npass} / {len(rows)} PASS;  kernel compile + assemble sweep: {'PASS' if cmp_ok else 'FAIL (see compile.log)'};  hazard oracle: {'PASS' if orc == '0' else 'FAIL (see oracle.log)'};  unit tests: {'PASS' if unit == '0' else 'FAIL'};  node_check: {nc};  {secs} s;  logs: {out}/")
-ok = npass == len(rows) and rows and unit == "0" and nc != "FAIL" and cmp_ok and orc == "0"
+print(f"\nop checks: {npass} / {len(rows)} PASS;  kernel compile + assemble sweep: {'PASS' if cmp_ok else 'FAIL (see compile.log)'};  hazard oracle: {'PASS' if orc == '0' else 'FAIL (see oracle.log)'};  strict gpu-verify of every reachable kernel: {'PASS' if ver == '0' else 'FAIL (see verify.log)'};  unit tests: {'PASS' if unit == '0' else 'FAIL'};  node_check: {nc};  {secs} s;  logs: {out}/")
+ok = npass == len(rows) and rows and unit == "0" and nc != "FAIL" and cmp_ok and orc == "0" and ver == "0"
 print("OVERALL:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
 PY
