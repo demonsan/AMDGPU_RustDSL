@@ -20,7 +20,7 @@ fn two_units(tokens: &[&str]) -> Function {
     let tid = b.let_(Op::WorkitemId);
     for (u, base) in [(0u32, 0i32), (1, 256)] {
         b.unit_begin(u);
-        let x = b.bind_i32(ev(tid) * 7 + n);
+        let x = b.bind_i32(ev(tid) * 7 + ev(n));
         let off = b.bind_i32((ev(tid) << 2) + base);
         let q = b.ptr_add(po, off);
         let f = b.let_(Op::BitcastF32(x.into()));
