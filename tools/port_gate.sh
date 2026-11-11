@@ -163,9 +163,10 @@ fi
 # ---------------------------------------------------------------- PERF (same run vs the vendor, median)
 # recorded shipped numbers (Main f2759cd / 0668c54 gate, GPU 5): TF/s and the ratio to the same-run vendor
 PERF_DATA="${PERF_DATA:-normal}"
-# recorded shipped numbers on PERF_DATA=normal (xcd-order gate, Main bf08b7b0, GPU 5, 2026-11-08): TF/s and the ratio to the same-run vendor
-declare -A REC=([b1h8s2048]=740 [percu64]=694 [b4h8s2048]=1804 [b1h8s8192]=2416 [b2h8s2048]=1279 [lp_vs128]=684 [lp_t128]=1173)
-declare -A REC_RATIO=([b1h8s2048]=1.025 [percu64]=0.959 [b4h8s2048]=0.976 [b1h8s8192]=0.988 [b2h8s2048]=0.978 [lp_vs128]=0.948 [lp_t128]=0.901)
+# recorded shipped numbers on PERF_DATA=normal (W5 replica-configuration _vs128 gate, Main 5015a2e4 candidate, GPU 0, 2026-11-11; the _t128 row from the
+# xcd-order gate, Main bf08b7b0, GPU 5, 2026-11-08): TF/s and the ratio to the same-run vendor
+declare -A REC=([b1h8s2048]=752 [percu64]=702 [b4h8s2048]=1925 [b1h8s8192]=2511 [b2h8s2048]=1270 [lp_vs128]=703 [lp_t128]=1173)
+declare -A REC_RATIO=([b1h8s2048]=1.037 [percu64]=0.971 [b4h8s2048]=0.983 [b1h8s8192]=0.991 [b2h8s2048]=0.973 [lp_vs128]=0.972 [lp_t128]=0.901)
 median() { sort -g | awk '{a[NR]=$1} END {if (NR == 0) print "nan"; else if (NR % 2) print a[(NR + 1) / 2]; else print (a[NR / 2] + a[NR / 2 + 1]) / 2}'; }
 ratio_verdict() { awk -v c="$1" -v v="$2" -v r="$3" -v t="$PERF_TOL" 'BEGIN{q = (v > 0) ? c / v : 0; print (q >= t * r) ? "PASS" : "FAIL"}'; }
 if ! skip SKIP_PERF; then
