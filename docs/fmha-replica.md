@@ -330,6 +330,37 @@ Next steps:
 1. The two expressible weave-order changes (V prefetch, PV block before QK).
 2. The distance-2 copy ring with in-window issue. This is a pipeline extension.
 
+### 4.8 Step 4c: the vendor's matrix-phase order, authored (measured negative)
+
+**Change.** `declare_region("m_phase", authored = true)` keeps the merged `mma.pv` + `mma.qk` stage in its declaration order: row sums, the PV block with its V reads, the helper MFMA, then the QK block with its K reads. That is the vendor's M-phase order. List scheduling, slot filling and ldshoist are off inside the region; waits are recomputed.
+
+**Static.**
+- Opcode alignment with the vendor's loop rises from 28 % to **55 %**.
+- Instruction count unchanged (437).
+- Waits / nops 46 / 30 (vendor 32 / 2).
+
+**Performance (same session, × vendor):**
+
+| shape | authored | step 4b in an earlier session |
+|---|---:|---:|
+| per-CU | 0.894× | 0.971× |
+| B4H8S2048 | 0.938× | 0.993× |
+| B1H8S8192 | 0.951× | 0.989× |
+| B2H8S2048 | 0.918× | 0.978× |
+
+That is −4 … −8 %. **Not adopted**; the replica keeps step 4b.
+
+**Reading.** The vendor's matrix-phase order performs only together with what goes with it:
+- the **V prefetch** before the barrier (§4.7: our first PV MFMA now waits on its own reads, 46 waits);
+- its **register rotation**: K / V fragments in `v[20:51]`, so reads for the next MFMA never wait on the previous one's operands;
+- its **copy issue points** inside the QK window.
+
+Our list scheduler, given our registers and waits, finds a faster order than the vendor's order does on our registers. Making the authored order fast needs:
+- the V prefetch (a DSL weave change, next);
+- the **back-end Weaver's schedule-aware RA** for the fragment rotation, the same requirement as §4.4.
+
+**Method note.** An environment toggle does not reach `amdc` inside `port_gate`, because the gate emits through the container. Same-session A/Bs therefore need two kernel names. The pin A/B numbers in §4.4 come from separate builds, not toggles.
+
 ## 5. Findings so far, per difference class (the deliverable)
 
 | Difference from the vendor kernel | Class | State |
@@ -349,6 +380,7 @@ Next steps:
 | M0 written per LDS-DMA issue | back-end Weaver: M0 planning | W3 B2 |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
 | Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension | analysed (§4.7), next |
-| V-fragment prefetch before the barrier; PV block before QK | expressible (weave order) | analysed (§4.7), next |
+| PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % on our registers / waits (§4.8): needs the V prefetch and schedule-aware RA |
+| V-fragment prefetch before the barrier | expressible (weave order) | next |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
 | gpu_verify on lifted vendor code | proofs only for what the DSL expresses; lifted asm is opaque | — |
