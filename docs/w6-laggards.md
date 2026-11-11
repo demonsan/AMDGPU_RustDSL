@@ -81,3 +81,15 @@ So the choice among today's kernels is right, and the gap is inside the kernels.
 - `m_phase`: `reorder` strategy on `m_phase` / `kv_stage`, and the `rewait` scheduler token for hd192.
 
 It has no `Units`, so no plan units. The next md5-neutral step, as for decode16 / MLA (§4), is to capture the three regions' contents as units. That gives the back-end Weaver phases it can mark *Free*, letting it reorder across the region boundaries where the dependences allow. A structural difference against the vendor kernel needs an ISA comparison like W5's (`tools/isa_diff.py`, `isa_cfg.py`), on the vendor's `fwd_hd192_hd128_bf16[_causal]` code objects, before any kernel change is chosen.
+
+**Step 1 done (md5-neutral).** The three phases of `fmha_fwd_bf16_v3_d` are Weaver units inside their existing weave regions:
+
+| plan label | units |
+|---|---|
+| `bf16v3.kv_stage` | `kv.stage`, `kv.rope` |
+| `bf16v3.v_phase` | `v.mask`, `v.max`, `v.rescale`, `v.exp` |
+| `bf16v3.m_phase` | `m.pv`, `m.qk` |
+
+- `weave-report fmha_fwd_hd192_hd128_bf16_v3` shows 66 plan units.
+- The md5 manifest is identical (235 / 0).
+- `compose_facts.rs` is regenerated (`tools/regen_compose_facts.sh`); `cargo test` 557 / 0.

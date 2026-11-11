@@ -168,6 +168,9 @@ impl PipeBody for Body<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
         // (weave region markers: no code, the scheduler strategies of AMDC_SCHED_REGION / `declare_region` attach to these names, as in the MXFP8 kernels)
         b.weave_region_begin("kv_stage");
+        // the stage as Weaver units in the authored order (docs/w6-laggards.md): plan units, no code change
+        let mut units = amdgpu_dsl::units::Units::new();
+        let (_, (so, rs)) = units.capture(b, "kv.stage", |b| {
         // group A stages K, group B stages V (each the whole 32 KB tile: 8 issues of 1 KB per wave)
         let r = self.ring;
         let (sh, vo, rs, so0) = match role {
@@ -183,7 +186,11 @@ impl PipeBody for Body<'_> {
                 b.buffer_load_lds_b128(rs, *v, so, m0, 0);
             }
         });
+        (so, rs)
+        });
         // hd192: group A also stages the K rope part (16 KB: 4 issues per wave)
+        let r = self.ring;
+        units.capture(b, "kv.rope", |b| {
         if let (Some(kbs), Role::A) = (&r.kbs, role) {
             let base2 = { let o = kbs.at(slot).off_v(b); b.bind_i32(o + kbs.base as i32) };
             kbs.at(slot).write(b, |b| {
@@ -193,6 +200,8 @@ impl PipeBody for Body<'_> {
                 }
             });
         }
+        });
+        amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.kv_stage").seq().emit(b);
         b.weave_region_end();
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
@@ -219,6 +228,8 @@ impl PipeBody for Body<'_> {
         b.weave_region_begin("v_phase");
         let (m_v, l_v) = (self.m.expect("m"), self.l.expect("l"));
         let s = self.s.clone();
+        let mut units = amdgpu_dsl::units::Units::new();
+        units.capture(b, "v.mask", |b| {
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
         let key_t = b.bind_i32(t.key0());
         let partial = b.bind_cond((ev(key_t) + (self.kt - 1)).gt(ev(self.lim_min)));
@@ -237,6 +248,8 @@ impl PipeBody for Body<'_> {
             }
         }
         b.end_if();
+        });
+        let (_, (sv, mt)) = units.capture(b, "v.max", |b| {
         let mut sv: Vec<ValueId> = Vec::with_capacity(64);
         for blk in 0..self.nb {
             for r in 0..16u8 {
@@ -253,6 +266,9 @@ impl PipeBody for Body<'_> {
         let (pa, pb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
         let mt = b.max_f32(pa, pb);
         let mt = b.mul_f32(mt, self.csc);
+        (sv, mt)
+        });
+        units.capture(b, "v.rescale", |b| {
         // lazy reference: moves (to max(m, tile max)) when some lane's tile max passes m by 8 (wave-level branch)
         let thr = b.c_f32(8.0);
         let mlim = b.add_f32(Opnd::Var(m_v), thr);
@@ -272,6 +288,8 @@ impl PipeBody for Body<'_> {
             b.set_var(m_v, mn);
         }
         b.end_if();
+        });
+        let (_, pw) = units.capture(b, "v.exp", |b| {
         let zf = b.c_f32(0.0);
         let nm = b.sub_f32(zf, Opnd::Var(m_v));
         let p: Vec<ValueId> = sv
@@ -288,13 +306,17 @@ impl PipeBody for Body<'_> {
         let l_new = b.add_f32(Opnd::Var(l_v), ps);
         b.set_var(l_v, l_new);
         // P words in the PV order: step t (16 keys) = block t / 2, values 8 (t % 2) + 0..7
-        self.p = (0..(self.kt / 16) as usize)
+        let pw: Vec<ValueId> = (0..(self.kt / 16) as usize)
             .flat_map(|t| {
                 let i0 = 16 * (t / 2) + 8 * (t % 2);
                 (0..4).map(move |j| (i0 + 2 * j, i0 + 2 * j + 1)).collect::<Vec<_>>()
             })
             .map(|(a, c)| b.cvt_pk_bf16_f32(p[a], p[c]))
             .collect();
+        pw
+        });
+        amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.v_phase").seq().emit(b);
+        self.p = pw;
         b.weave_region_end();
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
@@ -302,11 +324,13 @@ impl PipeBody for Body<'_> {
             b.set_prio(1);
         }
         b.weave_region_begin("m_phase");
-        self.pv(b, &t.cur);
+        let mut units = amdgpu_dsl::units::Units::new();
+        units.capture(b, "m.pv", |b| self.pv(b, &t.cur));
         if t.staged {
             let s = self.s.clone();
-            self.qk(b, &t.next, Some(&s));
+            units.capture(b, "m.qk", |b| self.qk(b, &t.next, Some(&s)));
         }
+        amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.m_phase").seq().emit(b);
         b.weave_region_end();
     }
 }
