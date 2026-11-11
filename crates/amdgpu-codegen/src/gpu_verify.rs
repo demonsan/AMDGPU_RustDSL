@@ -1619,8 +1619,23 @@ impl<'a> An<'a> {
             Opnd::Val(c) => match self.defs.get(c) {
                 Some(Op::CmpLtI32(x, k)) => {
                     // `c < v` with a constant on the left refines `v` (mode 2: v >= c + 1 / v <= c); otherwise `x < k` refines x (mode 0)
-                    let xi = self.int_of(x);
-                    if xi.point_const().is_some() && self.int_of(k).point_const().is_none() { Some((*k, xi, 2u8)) } else { Some((*x, self.int_of(k), 0u8)) }
+                    // a literal constant on the left (its interval may carry redundant symbolic bounds, so ask its definition, not
+                    // the interval) refines the right operand: `0 < idx ? idx - 1 : 2` (the select-cycled ring slot)
+                    let lit = |o: &Opnd| match o {
+                        Opnd::I32(c) => Some(*c as i128),
+                        Opnd::Val(v) => match self.defs.get(v) {
+                            Some(Op::ConstI32(c)) => Some(*c as i128),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let xi = match lit(x) {
+                        Some(c) => Itv::konst(c),
+                        None => self.int_of(x),
+                    };
+                    let x_const = lit(x).is_some() || xi.point_const().is_some();
+                    let k_const = lit(k).is_some() || self.int_of(k).point_const().is_some();
+                    if x_const && !k_const { Some((*k, xi, 2u8)) } else { Some((*x, self.int_of(k), 0u8)) }
                 }
                 Some(Op::CmpGeI32(x, k)) => Some((*x, self.int_of(k), 1u8)),
                 _ => None,
