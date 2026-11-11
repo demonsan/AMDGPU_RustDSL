@@ -190,6 +190,18 @@ pub fn scheduler_options(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
             d
         });
         base.regions = decls.iter().map(|r| sched::region::RegionSpec { name: r.name.clone(), authored: r.authored, tokens: r.tokens.clone() }).collect();
+        // W3 B6a: the VGPR budget of a back-end-ordered (Free) plan phase is the scheduler's pressure limit inside its region, unless the
+        // region's own tokens set one (docs/w3-b5-b6.md section 4)
+        if let Some(p) = &f.plan {
+            for r in base.regions.iter_mut() {
+                let budget = p.phases.iter().find(|ph| ph.name == r.name && !matches!(ph.order, amdgpu_dsl::plan::OrderSpec::Authored)).and_then(|ph| ph.budget.vgpr);
+                if let Some(v) = budget {
+                    if !r.tokens.split(',').any(|t| t.trim().starts_with("limit=")) {
+                        r.tokens = if r.tokens.trim().is_empty() { format!("limit={v}") } else { format!("{},limit={v}", r.tokens) };
+                    }
+                }
+            }
+        }
     }
     o
 }
