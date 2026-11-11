@@ -272,6 +272,9 @@ pub struct AttnBody3<'a> {
     /// PV through the UNSCALED fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`, the vendor's form): O accumulates 16x the scaled form's value, so
     /// the row sum drops its 1/16 (`OnlineSoftmax::l_total_unit`); the quotient O / l is unchanged (powers of two)
     pub pv_unscaled: bool,
+    /// pin the S accumulators to the vendor kernel's VGPR roles (docs/fmha-replica.md R3 step 3): S tiles at v52 + 16 s
+    pub pin_roles: bool,
+    pinned: std::cell::Cell<bool>,
 }
 
 /// The causal mask of a block: key k of this lane's query row is visible when `k < min(row + qoff1, kv_len)` (computed in the masking branch); the
@@ -303,7 +306,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -549,6 +552,16 @@ impl PipeBody for AttnBody3<'_> {
         self.s = Some(AccTile::from_vars(s));
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if self.pin_roles && !self.pinned.get() {
+            let (s, o) = (self.s.expect("S"), self.o.expect("O"));
+            for k in 0..4 {
+                b.pin_vgpr_at(amdgpu_dsl::RegRef::Var(s.accs[k].var), 52 + 16 * k as u32);
+                // O at v116 + 16 e as well (the vendor's) leaves our other values too little room: the scheduler falls back to the
+                // unscheduled order and loop invariants spill to LDS (-7 .. -12 %, docs/fmha-replica.md §4.4)
+                let _ = o;
+            }
+            self.pinned.set(true);
+        }
         if self.setprio {
             b.set_prio(0);
         }

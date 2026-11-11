@@ -89,6 +89,8 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
     }
     fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
         let (io, blk, roles, ring, lut) = (&cx.io, &cx.blk, &cx.roles, &cx.ring, cx.lut);
+        // (the vendor's Q fragments sit at v[4:19]; pinning them is not honourable here: a value of ours is live there from the prelude on, see
+        // docs/fmha-replica.md §4.4)
         versioned(b, lut, |b, lut| {
             roles.each(b, |b, role| {
                 let wid = roles.wave_id(b, role);
@@ -103,6 +105,8 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 body.setprio = true;
                 body.biasonce = true;
                 body.pv_unscaled = self.replica;
+                // R3 step 3 (pinned VGPR roles) measured -4 .. -7 % with our schedule: off (docs/fmha-replica.md §4.4)
+                body.pin_roles = false;
                 pipe.run(b, role, &mut body);
                 let fin = body.out_scale(b);
                 store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin);

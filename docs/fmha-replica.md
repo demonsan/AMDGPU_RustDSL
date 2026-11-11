@@ -211,3 +211,37 @@ The matrix, LDS and copy streams of the pass now have the vendor's exact counts.
 **Reading.**
 - The two-tile pass with static slots more than recovers step 1's loss: +1.0 to +1.6 % over `_vs128` in vendor ratio.
 - Open: whether `unroll2` alone (with scaled PV) also helps `_vs128`. That is a separate, W4-gated proposal.
+
+### 4.4 Step 3: the vendor's VGPR roles as register pins
+
+The vendor's accumulator registers (group A loop) are:
+- **S**, QK destinations: `v[52:67] v[68:83] v[84:99] v[100:115]`;
+- **O**, PV destinations: `v[116:131] … v[164:179]`;
+- K / V fragments: `v[20:51]`;
+- Q: `v[4:19]`;
+- P: `v[52:67]`, reusing S.
+
+The DSL states them with `pin_vgpr_at` (`AttnBody3::pin_roles`). Pinning showed three things.
+
+1. **A verification rule was wrong.** Our allocator checks required MFMA / SMFMAC operand tuples to sit at a multiple of their width (`v[52:67]` rejected: "not aligned to its width 16"). The ISA requirement on gfx90a+ is only 64-bit (even) alignment, and the vendor kernel runs `v_mfma_scale … v[52:67], v[20:27]` / `v_mfma_f32_32x32x64_f8f6f4 v[116:131]`. → **Safety rule: wrong, fixed** (`regalloc.rs`):
+   - the checks require even alignment;
+   - the allocator still places its own tuples at their width, but an explicit pin needs only even alignment;
+   - md5 manifest unchanged.
+2. **The allocator placed pins last.** The `TwoPhase` allocator ordered values by width then length, so a pinned V16 could find its registers already taken. → Pinned values are now allocated first (md5 unchanged), and the pin error says what blocks it: forbidding pins, or the occupancy.
+3. **Pins cost performance with our schedule.**
+   - **S pinned** (vendor numbers, 248 VGPRs, scheduled normally): port_gate correctness all PASS. But same-session performance drops to 0.889× / 0.974× / 0.946× / 0.897× the vendor (per-CU / B4H8S2048 / B1H8S8192 / B2H8S2048), against 0.955× / 0.981× / 0.988× / 0.968× unpinned (step 2).
+   - **S and O pinned:** the scheduler runs out of VGPRs in two of the four body copies and falls back to the unscheduled order; loop invariants spill to LDS (16 KiB / 32 KiB). Result 0.863× / 0.917× / 0.928× / 0.885×.
+   - **Q at `v[4:19]`:** not honourable. A value of ours is live there from the prelude on, because our prelude and other residents are not the vendor's.
+
+**Reading.** Pinning a subset of the vendor's register numbers onto *our* schedule and *our* other residents is expressible, but it is not a replica: the vendor's numbers belong to its whole allocation and order. 1:1 registers need:
+- the back-end Weaver's **schedule-aware register allocation**, i.e. allocate the remaining values around a full plan;
+- the **full plan** stated in the DSL: K / V fragments, P reusing S, the scale words, all transient read results.
+
+The replica therefore keeps `pin_roles` **off** (its asm is step 2's). The two allocator fixes stay; both are md5-neutral.
+
+| Difference | Class |
+|---|---|
+| MFMA tuple at a non-width-aligned base | safety rule — was wrong, fixed |
+| pins allocated after free values | back-end allocator — fixed (pins first) |
+| a pinned role subset degrades our schedule; Q's registers taken by our prelude | **back-end Weaver**: schedule-aware RA around a complete register plan |
+| K / V / P / scale-word registers (transient values, the vendor's rotation `v[20:51]`, P in S) | **DSL**: a register plan for transient fragments (`reg_share` exists; a rotation / ring plan for read results does not) |
