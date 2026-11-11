@@ -20,13 +20,32 @@ pub struct Weaver {
     plan_label: String,
     /// (skeleton unit, the fillers placed in its shadow) of a `spread`
     interleave: Vec<(UnitId, Vec<UnitId>)>,
+    /// the recorded phase is `OrderSpec::Free` (the back-end Weaver may reorder its units within the dependences, sync rules and budget)
+    free: bool,
+    /// the recorded phase's register budget (B6a: the scheduler's pressure limit in the phase)
+    budget: Budget,
 }
 
 impl Weaver {
     pub fn new(units: Units) -> Weaver {
-        Weaver { units, order: None, label: String::new(), explicit: false, plan_label: String::new(), interleave: Vec::new() }
+        Weaver { units, order: None, label: String::new(), explicit: false, plan_label: String::new(), interleave: Vec::new(), free: false, budget: Budget::default() }
     }
     /// A plan-only phase name (no region is emitted): the units still get plan entries and unit marks.
+    /// Records the phase as `OrderSpec::Free` (docs/w3-b5-b6.md): the emitted order stays the authored one; the back-end Weaver may reorder.
+    pub fn free(mut self) -> Weaver {
+        self.free = true;
+        self
+    }
+    /// The phase's arch-VGPR budget (B6a).
+    pub fn budget_vgpr(mut self, vgpr: u32) -> Weaver {
+        self.budget.vgpr = Some(vgpr);
+        self
+    }
+    /// An interleave hint without changing the emission order: `fillers` are to be placed in the shadow of `skeleton` (the back-end merge, B4).
+    pub fn interleave(mut self, skeleton: UnitId, fillers: Vec<UnitId>) -> Weaver {
+        self.interleave.push((skeleton, fillers));
+        self
+    }
     pub fn plan_label(mut self, label: impl Into<String>) -> Weaver {
         self.plan_label = label.into();
         self
@@ -39,7 +58,7 @@ impl Weaver {
     /// Statement granularity: every unit split into its node groups (`Units::split`); an explicit order is dropped (re-order the
     /// sub-units with `order` / a strategy afterwards).
     pub fn fine(self) -> Weaver {
-        Weaver { units: self.units.split(), order: None, label: self.label, explicit: false, plan_label: self.plan_label, interleave: Vec::new() }
+        Weaver { units: self.units.split(), order: None, label: self.label, explicit: false, plan_label: self.plan_label, interleave: Vec::new(), free: self.free, budget: self.budget }
     }
     /// The units of the weave (strategies read their facts).
     pub fn units(&self) -> &Units {
@@ -108,7 +127,11 @@ impl Weaver {
     /// Checks the order (a permutation of the units and a topological order of their dependencies) and emits.
     /// A labelled weave is wrapped in a weave region of that name (no code): the backend's register caps / reports and the scheduler's per-region
     /// strategies key on it (docs/weaver-regs.md). Units with internal control flow (class `Branch`) stay inside the region.
-    pub fn emit(mut self, b: &mut FnBuilder) {
+    pub fn emit(self, b: &mut FnBuilder) {
+        self.emit_phase(b);
+    }
+    /// `emit`, returning the id of the recorded plan phase (None for an unnamed weave): for ring declarations that name their phases.
+    pub fn emit_phase(mut self, b: &mut FnBuilder) -> Option<plan::PhaseId> {
         // statement-granularity experiment switch: split into statement groups (derived dependences), then the cost-based order
         if !self.explicit && !self.label.is_empty() && crate::weave_auto::env_stmt_enabled(&self.label) {
             self = self.fine();
@@ -121,6 +144,7 @@ impl Weaver {
         // the plan (docs/two-weavers.md): one phase per weave, its units in emission order with their dependences, the interleave hints; each unit's statements are
         // bracketed by `UnitMark`s (no code) with the plan unit id. An unnamed weave (no label, no plan label) records nothing.
         let phase_name = if label.is_empty() { self.plan_label.clone() } else { label.clone() };
+        let phase_id: Option<plan::PhaseId> = if phase_name.is_empty() { None } else { Some(b.plan_mut().phases.len() as u32) };
         let unit_ids: Vec<u32> = if phase_name.is_empty() {
             Vec::new()
         } else {
@@ -131,7 +155,7 @@ impl Weaver {
             for (pos, &i) in ord.iter().enumerate() {
                 ids[i] = base + pos as u32;
             }
-            p.phases.push(Phase { id: phase, name: phase_name, parent: None, kind: PhaseKind::Straight, order: OrderSpec::Authored, budget: Budget::default() });
+            p.phases.push(Phase { id: phase, name: phase_name, parent: None, kind: PhaseKind::Straight, order: if self.free { OrderSpec::Free } else { OrderSpec::Authored }, budget: self.budget.clone() });
             for &i in &ord {
                 let u = &self.units.v[i];
                 p.units.push(UnitDecl { id: ids[i], name: u.name.clone(), phase, class: plan_class(u.class), anchor: u.hint == Hint::Anchor, iter: u.iter, latency: u.latency, roles: 0 });
@@ -164,7 +188,17 @@ impl Weaver {
         if !label.is_empty() {
             b.weave_region_end();
         }
+        phase_id
     }
+}
+
+/// Declares a ring of the kernel plan (docs/w3-b5-b6.md: B5 reads its depth; the slot of a unit with iteration offset `d` is `d mod slots`).
+/// Returns the ring id.
+pub fn declare_ring(b: &mut FnBuilder, name: &str, slots: u32, bytes_per_slot: u32, cadence: plan::Cadence, producer: plan::PhaseId, consumer: plan::PhaseId) -> u32 {
+    let p = b.plan_mut();
+    let id = p.rings.len() as u32;
+    p.rings.push(plan::RingDecl { id, name: name.to_string(), slots, bytes_per_slot, cadence, producer_phase: producer, consumer_phase: consumer, owner: plan::RingOwner::Cta });
+    id
 }
 
 fn plan_class(c: UnitClass) -> plan::UnitClass {
