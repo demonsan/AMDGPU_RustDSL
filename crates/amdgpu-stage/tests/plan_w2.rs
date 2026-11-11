@@ -1,8 +1,8 @@
 //! The kernel plan the front end derives (docs/two-weavers.md 6.1): phases / units / dependences / interleave hints from the Weaver, order / tokens / budgets / loop kinds / CTA shape
 //! from the declarations at `finish`.
 
-use amdgpu_dsl::plan::{verify, DepKind, OrderSpec, PhaseKind, RegConstraint};
-use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, RegRef};
+use amdgpu_dsl::plan::{verify, CrossCtaProtocol, DepKind, FlagRef, MemOrder, OrderSpec, PhaseKind, RegConstraint, SyncRule};
+use amdgpu_dsl::{DType, Ext, FnBuilder, Op, Opnd, RegRef};
 use amdgpu_stage::weave::{Units, Weaver};
 
 /// a -> b (b uses a's value) and an independent c
@@ -70,4 +70,34 @@ fn a_kernel_that_never_weaves_has_no_plan() {
     let mut fb = FnBuilder::new("plain", 64);
     fb.c_i32(1);
     assert!(fb.finish().plan.is_none());
+}
+
+#[test]
+fn a_last_arriver_pattern_of_the_contract_becomes_a_cross_cta_sync_rule() {
+    let mut fb = FnBuilder::new("la_t", 64);
+    fb.arg("part", DType::Ptr, 0, 8);
+    fb.arg("counter", DType::Ptr, 8, 8);
+    fb.arg("nblocks", DType::I32, 24, 4);
+    fb.arg_tensor("part", Ext::ka(24) * Ext::c(256));
+    fb.arg_tensor("counter", Ext::c(4));
+    fb.buf_region("part", "part", Ext::c(0), Ext::ka(24) * Ext::c(256));
+    fb.buf_last_arriver("part", "counter", Ext::ka(24));
+    let u = three(&mut fb);
+    Weaver::new(u).phase("w").seq().emit(&mut fb);
+    let f = fb.finish();
+    let p = f.plan.as_ref().unwrap();
+    assert!(verify(p).is_empty(), "{:?}", verify(p));
+    let rule = p.sync.iter().find(|r| matches!(r, SyncRule::CrossCta { .. })).expect("a CrossCta rule");
+    let SyncRule::CrossCta { flag, scope, protocol, order } = rule else { unreachable!() };
+    assert_eq!(flag, &FlagRef::Kernarg { arg: "counter".into(), region: Some("part".into()) });
+    assert_eq!(scope, "device");
+    assert_eq!(*order, MemOrder::AcqRel);
+    match protocol {
+        CrossCtaProtocol::LastArriver { counter, partials, splits } => {
+            assert_eq!(counter, flag);
+            assert_eq!(partials, &vec!["part".to_string()]);
+            assert!(splits.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
 }

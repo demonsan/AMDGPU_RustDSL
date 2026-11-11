@@ -9,6 +9,7 @@
 //! - the stage contracts (`live_out` of one stage matching `live_in` of a later one) -> `HandOff`s (registers or an LDS tile, with the recorded fragment layout);
 //! - LDS rings of the contract (`Contract::tiles`, more than one slot) -> `RingDecl`s, producer / consumer phases from the units inside the tile's produce / consume regions
 //!   (private tiles: one ring per wave); the cadence is inferred from the slot count (3 slots: one window, else the two-phase offset form);
+//! - the contract's last-arriver patterns -> `SyncRule::CrossCta` (`FlagRef::Kernarg` counter, the guarded global region, AcqRel);
 //! - the CTA shape from the workgroup size.
 //! Nothing here changes any instruction: the plan is data (the md5 manifest of the emitted assembly is the gate).
 
@@ -224,6 +225,19 @@ pub fn derive(f: &mut Function) {
                 consumer_phase,
                 owner: if t.private { RingOwner::Wave } else { RingOwner::Cta },
             });
+        }
+    }
+    // cross-CTA protocols: the opt-in last-arriver patterns of the contract (counter by kernarg name, the global region it guards)
+    for la in &f.contract.last_arrivers {
+        let flag = FlagRef::Kernarg { arg: la.counter_arg.clone(), region: Some(la.region.clone()) };
+        let r = SyncRule::CrossCta {
+            flag: flag.clone(),
+            scope: "device".into(),
+            protocol: CrossCtaProtocol::LastArriver { counter: flag, partials: vec![la.region.clone()], splits: Some(la.splits.clone()) },
+            order: MemOrder::AcqRel,
+        };
+        if !plan.sync.contains(&r) {
+            plan.sync.push(r);
         }
     }
     f.plan = Some(plan);
