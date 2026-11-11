@@ -109,6 +109,9 @@ pub struct Pipeline {
     /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete` (the
     /// verifier checks the completion with the counted-vmcnt rule).
     pub vm_inflight: u8,
+    /// `TwoPhaseOffset` + `unroll2`: the body stages tile t + 2 itself in its matrix phase (`TileIt::n2` = the static slot of t, generation
+    /// t + 2; docs/fmha-replica.md R3 step 5, the vendor's copy distance); the prologue stages tiles 0 and 1, part 0 stages nothing
+    pub ahead2: bool,
     /// `RegStaged`: the DMAs of tile 1 (staged after `prologue_stores`) that may still be in flight at the prologue barrier: tile 1 is first read after
     /// the loop's first top-of-tile wait + barrier
     pub late_tile1_vm: u8,
@@ -130,7 +133,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -166,6 +169,12 @@ impl Pipeline {
             body.stage(b, role, &key1, &s1);
             b.wait_vm(0);
             body.stage_complete(b, role, &s1);
+        }
+        if self.ahead2 {
+            assert!(self.cadence == Cadence::TwoPhaseOffset && self.unroll2, "ahead2: TwoPhaseOffset with unroll2");
+            // tile 1 as well (completed by the first iteration's wait: it is the first `next`)
+            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
+            body.stage(b, role, &key1, &SlotIdx::new(1, 1));
         }
         body.prologue_stores(b, role);
         if self.cadence == Cadence::RegStaged {
@@ -356,11 +365,13 @@ impl Pipeline {
         };
         let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
         let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
-        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2: None, masked, staged, tile_rows: self.tile_rows };
+        let n2 = if self.ahead2 { let it_p2 = b.let_i32(amdgpu_dsl::ox(it) + 2); Some(SlotIdx::new(slot, b.bind_opnd(&it_p2))) } else { None };
+        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2, masked, staged, tile_rows: self.tile_rows };
         self.prebind(b, &t);
         let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
-        let (lg, unclamped) = (self.lg(), self.key_unclamped);
+        let (lg, unclamped, ahead2) = (self.lg(), self.key_unclamped, self.ahead2);
         rotate(b, &TWO_PHASE_PARTS, stage_sel, None, &mut |b, i| match i {
+            0 if ahead2 => {}
             0 => {
                 let k = if unclamped { b.let_i32((amdgpu_dsl::ox(it) + 1) << lg) } else { b.let_i32(nn.clone() << lg) };
                 body.stage(b, role, &k, &t.next);

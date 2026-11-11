@@ -37,7 +37,7 @@ use amdgpu_stage::{Cadence, Pipeline};
 /// Since W5 (docs/fmha-replica.md §4.9) it is built with the replica configuration: unscaled PV, the two-tile pass with static slots and
 /// threaded exits, the out-of-line lazy rollback and the vendor's instruction forms (perf_ab +1.7 % geomean, port_gate PASS).
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: true });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: true, ring2: false });
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
@@ -49,7 +49,14 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
 /// W5 / R3 (docs/fmha-replica.md §4): the `_vs128` structure moved step by step onto the vendor kernel's algorithm and schedule. Step 1: PV
 /// through the unscaled fp8 MFMA (the vendor's form). Experimental, not dispatched.
 pub fn fmha_fwd_hd128_mxfp8_v3_replica() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true, ring2: false });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
+}
+/// R3 step 5 (docs/fmha-replica.md): the replica with the vendor's copy distance - tile t + 2 staged in the matrix phase of tile t, K in 2 slots,
+/// V in 4 (slot t & 3). Experimental, not dispatched.
+pub fn fmha_fwd_hd128_mxfp8_v3_ring2() -> Function {
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_ring2", &mut Vs128Slots { replica: true, ring2: true });
     f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     f
 }
@@ -67,6 +74,8 @@ pub(crate) struct FmhaCx {
 pub(crate) struct Vs128Slots {
     /// the W5 replica steps (`fmha_fwd_hd128_mxfp8_v3_replica`)
     pub(crate) replica: bool,
+    /// R3 step 5: copy distance 2, K 2 / V 4 slots (`fmha_fwd_hd128_mxfp8_v3_ring2`)
+    pub(crate) ring2: bool,
 }
 
 impl skeleton_vs128::Vs128Slots for Vs128Slots {
@@ -80,13 +89,14 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         let io = declare_io(b, 256, false);
         let blk = block3_x(&io, b, 8, true);
         let roles = Roles::split(b, &blk.lane, 4);
-        let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+        let mut ring = if self.ring2 { KvRing3::new_kv(b, &io, &blk, &roles, 2, 4, true) } else { KvRing3::new(b, &io, &blk, &roles, 2) };
         ring.enable_buffer_dma(b);
         ring.enable_buffer_kd(b);
         let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
         // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
         pipe.key_unclamped = true;
         pipe.unroll2 = self.replica;
+        pipe.ahead2 = self.ring2;
         let lut = blk.lut_copy(b);
         FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
     }
@@ -115,6 +125,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 body.sm.cold_rollback = self.replica;
                 // R3 step 3 (pinned VGPR roles) measured -4 .. -7 % with our schedule: off (docs/fmha-replica.md §4.4)
                 body.pin_roles = false;
+                body.ahead2 = self.ring2;
                 pipe.run(b, role, &mut body);
                 let fin = body.out_scale(b);
                 store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin);

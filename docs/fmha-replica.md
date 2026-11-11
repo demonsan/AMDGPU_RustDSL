@@ -387,6 +387,35 @@ The gain needs the combination. The two-tile pass alone is neutral, and unscaled
 
 After the fixes all 54 removals are detected; `cargo test` 548 / 0.
 
+### 4.10 R3 step 5: copy distance 2 (K 2 / V 4 slots), with the B5 placement — correct, still slower (not adopted)
+
+Kernel `fmha_fwd_hd128_mxfp8_v3_ring2`: experimental, registered, not dispatched.
+
+**The ring.**
+- `Pipeline::ahead2`: the body stages tile t + 2 in the matrix phase of tile t; the prologue stages tiles 0 and 1.
+- `KvRing3::new_kv(.., 2, 4, ..)`. K goes into the slot of t: both groups' QK(t) readers are past the barrier that opens the phase. V goes into slot (t + 2) & 3, and PV reads V from slot t & 3.
+- The masked slot keeps the LDS bounds provable. Strict verify: 0 errors, including `GV-PLAN-RING`, the check that the plan's slot claims agree with the simulated protocol.
+
+**B5 plan.** In the matrix-phase merge:
+- PV(t) units carry iter = h, QK(t + 1) units h + 1, and the DMA units of t + 2 (`UnitClass::Dma`) h + 2, with h the half of the two-tile pass;
+- the phase is `Free`, with one interleave hint per QK MFMA unit;
+- there are no explicit waits inside.
+
+The back end (origin/b4ring) takes ring membership from the units' tile markers, orders after the auto-wait strip and recomputes the waits with the ring tokens. It places 16 DMAs between QK MFMAs per loop body.
+
+**port_gate** (STRESS included). Correctness: ACC16 / ACC64 / DET / STRESS all PASS; ring reuse is what STRESS would catch. Performance, same session as the shipped `_vs128` (node 53, GPU 0):
+
+| shape | `_vs128` (shipped) | ring2, copies at the phase start | ring2 + B5 placement | B5 vs `_vs128` |
+|---|--:|--:|--:|--:|
+| per-CU 64 (TF/s, ×vendor) | 704.9 (0.970×) | 0.885× (earlier session) | 659.4 (0.913×) | 0.935 |
+| B4H8S2048 | 1906.6 (1.013×) | 0.937× | 1827.0 (0.954×) | 0.958 |
+| B1H8S8192 | 2515.6 (0.993×) | 0.955× | 2452.7 (0.967×) | 0.975 |
+| B2H8S2048 | 1286.0 (0.985×) | — | 1204.7 (0.924×) | 0.937 |
+
+**Result.** The B5 placement recovers about half the loss of the hand-placed copies: per-CU 0.862× → 0.913× against the vendor. The distance-2 ring as a whole is still 2.5–6.5 % slower than the shipped distance-1 ring. **Not adopted.**
+
+The §4 finding stands in a weaker form: copies landing during the M phase cost its LDS reads more than the earlier issue gains, even when they are woven into the QK MFMAs. The vendor's ring may only pay off together with its register plan (B6b: the K / V fragment rotation) and its M-phase order (§4.8).
+
 ### 4.11 The W3 B2 tokens on the shipped configuration: `m0reuse`, `sgpr`, `sgpr2` — neutral
 
 `lower_opts` of `_vs128` / `_replica` + `m0reuse` (one M0 write per group of DMAs with the same LDS base) + `sgpr` + `sgpr2` (uniform SGPR operands of VALU).
@@ -417,7 +446,7 @@ After the fixes all 54 removals are detected; `cargo test` 548 / 0.
 | The vendor's register numbers (roles) | back-end Weaver: schedule-aware RA around a full plan; DSL: register plans for transient fragments | pins cost −4 … −12 % on our schedule; off (§4.4) |
 | M0 written per LDS-DMA issue | back-end Weaver: M0 planning | available as opt-in `m0reuse` (54 → 18 M0 writes); neutral on the replica (§4.11), not adopted |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
-| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension + back-end Weaver B5 | ring built (`_ring2`, K 2 / V 4 slots, §4.10): correct, −9 … −11 % with the copies at the matrix-phase start; the B5 merge into the QK MFMAs not yet firing (with backend) |
+| Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension + back-end Weaver B5 | built (`_ring2`, §4.10): correct (port_gate incl. STRESS), the B5 merge places the copies between the QK MFMAs; still −2.5 … −6.5 % vs `_vs128` (not adopted; next with B6b and the M-phase order) |
 | PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % on our registers / waits (§4.8): **blocked on W3 B4+** (schedule-aware RA), with the V prefetch |
 | V-fragment prefetch before the barrier | expressible (weave order) | **blocked on W3 B4+** (pays only with the authored order + schedule-aware RA) |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |

@@ -94,6 +94,21 @@ impl KvRing3 {
         lds.commit(b);
         Self::parts(b, io, blk, roles, slots, kscale, [ks, vs, kd, ones, q1, q0, epi])
     }
+    /// Separate K and V rings (`kslots` / `vslots`; the K scales follow K): the copy-distance-2 form (R3 step 5: K 2 slots, V 4 slots, the
+    /// V slot of tile t is t & 3).
+    pub fn new_kv(b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, kslots: u32, vslots: u32, kscale: bool) -> KvRing3 {
+        let mut lds = LdsPlan::new();
+        let ks = lds.ring("K", 16384, kslots, Layout::FMHA_SWZ);
+        let vs = lds.ring("V", 16384, vslots, Layout::FMHA_SWZ);
+        let kd = lds.ring("KD", 512, kslots, Layout::Linear);
+        lds.at(16384 * (kslots + vslots) as i64 + 2048);
+        let ones = lds.tile("ones", 2048, Layout::Linear);
+        let q1 = lds.tile("Q1", 16384, Layout::Linear);
+        let q0 = lds.tile("Q0", 16384, Layout::Linear);
+        let epi = lds.private("epi", 4096, 8, &[&q1, &q0]);
+        lds.commit(b);
+        Self::parts(b, io, blk, roles, kslots, kscale, [ks, vs, kd, ones, q1, q0, epi])
+    }
     /// The same ring (LDS regions) with every lane partition and copy rebuilt from `blk` / `roles` (fresh values: a second pass over the ring
     /// does not keep the first pass's address registers live; the paired causal form).
     pub fn rebuilt(&self, b: &mut FnBuilder, io: &dyn Operands, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
@@ -274,6 +289,9 @@ pub struct AttnBody3<'a> {
     pub pv_unscaled: bool,
     /// pin the S accumulators to the vendor kernel's VGPR roles (docs/fmha-replica.md R3 step 3): S tiles at v52 + 16 s
     pub pin_roles: bool,
+    /// the copy-distance-2 form (`Pipeline::ahead2`, `KvRing3::new_kv(.., 2, 4, ..)`): the matrix phase of tile t stages tile t + 2 (K into
+    /// `TileIt::n2`, V into slot (t + 2) & 3) and PV reads V from slot t & 3
+    pub ahead2: bool,
     pinned: std::cell::Cell<bool>,
 }
 
@@ -306,7 +324,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -497,6 +515,13 @@ impl<'a> AttnBody3<'a> {
         res
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
+    /// The V slot of tile `it + d` in the 4-slot V ring of the `ahead2` form: (it + d) & 3, generation it + d.
+    fn vslot(&self, b: &mut FnBuilder, it: Opnd, d: i32) -> SlotIdx {
+        let g = b.let_i32(amdgpu_dsl::ox(it) + d);
+        let s = b.let_i32(g.clone() & 3);
+        let (s, g) = (b.bind_opnd(&s), b.bind_opnd(&g));
+        SlotIdx::new(s, g)
+    }
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
         self.pv_units(b, slot, w).emit_all(b);
     }
@@ -598,7 +623,16 @@ impl PipeBody for AttnBody3<'_> {
         self.p.push(nb);
         self.p_staged = false;
     }
-    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+    fn m_phase(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
+        let vcur = if self.ahead2 { self.vslot(b, t.it.clone(), 0) } else { t.cur.clone() };
+        // the key and slot of tile t + 2 (bound here, before the units are captured: values bound in this stream must not reuse constants first
+        // bound inside a captured unit, which is emitted later)
+        let pre2 = (self.ahead2 && t.staged).then(|| {
+            let key2 = b.let_i32((amdgpu_dsl::ox(t.it.clone()) + 2) * t.tile_rows as i32);
+            let slot = if role == Role::B { self.vslot(b, t.it.clone(), 2) } else { t.n2.clone().expect("ahead2: n2") };
+            (key2, slot)
+        });
+
         let mut w = std::mem::take(&mut self.p);
         let bias = match self.bias_next.take() {
             Some(op) => op,
@@ -615,15 +649,53 @@ impl PipeBody for AttnBody3<'_> {
             c.live_in.push(p_val(w.clone()));
             c.scalars_in = bias_scalar(bias);
         }
-        c.scalars_in.extend(t.cur.offset_scalars());
+        c.scalars_in.extend(vcur.offset_scalars());
         if t.staged {
             c.scalars_in.extend(t.next.offset_scalars());
         }
-        let mut insts = vec![crate::stage::StageInst::new("mma.pv", crate::stage::Prim::A, "pv", Default::default(), self.pv_units(b, &t.cur, &w))];
-        if t.staged {
-            insts.push(crate::stage::StageInst::new("mma.qk", crate::stage::Prim::A, "qk", Default::default(), self.qk_units(b, &t.next, s, bias)));
+        // the units' iteration offsets relative to the pass (B5 slot tokens: unit of ring R with iter d uses slot d mod S): PV(t) k, QK(t + 1)
+        // k + 1, the copies of t + 2 k + 2, with k the half of the two-tile pass (the static slot of t)
+        let half = if self.ahead2 { match t.cur.slot { Opnd::I32(k) => k, _ => 0 } } else { 0 };
+        let mut pv_u = self.pv_units(b, &vcur, &w);
+        if self.ahead2 {
+            for x in pv_u.v.iter_mut() {
+                x.iter = half;
+            }
         }
-        let (cur, next, staged) = (t.cur.clone(), t.next.clone(), t.staged);
+        let n_pv = pv_u.v.len();
+        let mut insts = vec![crate::stage::StageInst::new("mma.pv", crate::stage::Prim::A, "pv", Default::default(), pv_u)];
+        let mut hint: Option<Vec<(usize, Vec<usize>)>> = None;
+        if t.staged {
+            let mut qk_u = self.qk_units(b, &t.next, s, bias);
+            if self.ahead2 {
+                for x in qk_u.v.iter_mut() {
+                    x.iter = half + 1;
+                }
+            }
+            let n_qk = qk_u.v.len();
+            let mfmas: Vec<usize> = qk_u.v.iter().enumerate().filter(|(_, u)| u.class == amdgpu_dsl::units::UnitClass::Mfma).map(|(i, _)| n_pv + i).collect();
+            insts.push(crate::stage::StageInst::new("mma.qk", crate::stage::Prim::A, "qk", Default::default(), qk_u));
+        // tile t + 2: K into the slot of t (its QK readers, both groups, are past the barrier before this phase), V into (t + 2) & 3; as DMA
+        // units with iteration offset 2 in this (Free) phase, interleaved into the QK MFMAs by the back-end Weaver (B5)
+        // (captured after PV / QK: emitted after them, so the bindings the copy shares with them are defined first)
+        let dma = if let Some((key2, slot)) = pre2 {
+            let mut u = self.ring.stage_units(b, role, &key2, &slot).expect("ahead2: the buffer-DMA staging units");
+            for x in u.v.iter_mut() {
+                x.iter = half + 2;
+            }
+            Some(u)
+        } else {
+            None
+        };
+            if let Some(u) = dma {
+                // one hint per QK MFMA unit: the copies spread in order, about the same number after each
+                let fillers: Vec<usize> = (n_pv + n_qk..n_pv + n_qk + u.v.len()).collect();
+                let per = fillers.len().div_ceil(mfmas.len().max(1));
+                hint = Some(mfmas.iter().zip(fillers.chunks(per.max(1))).map(|(&m, f)| (m, f.to_vec())).collect());
+                insts.push(crate::stage::StageInst::new("dma.t2", crate::stage::Prim::A, "stage", Default::default(), u));
+            }
+        }
+        let (cur, next, staged) = (vcur.clone(), t.next.clone(), t.staged);
         crate::stage::merge("m_phase", c, insts)
             .handover(move |_b| {
                 let mut s = cur.offset_scalars();
@@ -632,7 +704,10 @@ impl PipeBody for AttnBody3<'_> {
                 }
                 (Vec::new(), s)
             })
-            .emit(b);
+            .emit_with(b, move |w| match hint {
+                Some(hs) => hs.into_iter().fold(w.seq().free(), |w, (m, f)| w.interleave(m, f)),
+                None => w.seq(),
+            });
         if let (Some(pt), true) = (self.blk.pt, t.staged) {
             // per-tensor FP8: the next tile's S scaled by m at the end of the matrix phase, where it is produced. At the start of the softmax
             // phase (the first version) the 32 v_pk_mul lengthened the VALU phase that both ping-pong groups wait on (sched's ATT: VALU stall
