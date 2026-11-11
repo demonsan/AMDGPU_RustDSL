@@ -377,7 +377,7 @@ fn add_cost(a: &mut UnitCost, b: &UnitCost) {
     a.xdl_busy = a.xdl_busy.max(b.xdl_busy);
 }
 
-fn data_dep(a: &Facts, b: &Facts) -> bool {
+pub fn data_dep(a: &Facts, b: &Facts) -> bool {
     let hits = |x: &[amdgpu_dsl::VarId], y: &[amdgpu_dsl::VarId]| x.iter().any(|v| y.contains(v));
     b.uses.iter().any(|u| a.defs.contains(u)) || hits(&a.var_writes, &b.var_reads) || hits(&a.var_reads, &b.var_writes) || hits(&a.var_writes, &b.var_writes)
 }

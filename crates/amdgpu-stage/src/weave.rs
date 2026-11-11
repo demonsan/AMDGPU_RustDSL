@@ -5,6 +5,7 @@
 //! (which order, which spread) stay at the call site: nothing here is a scheduler. [`rotate`] is the software-pipelined emission by iteration offsets.
 //! (The unit capture container itself - `Unit`, `Units`, `Hint`, `UnitClass` - lives in `amdgpu_dsl::units`; it is re-exported here.)
 
+use amdgpu_dsl::plan::{self, Budget, Dep, DepKind, OrderSpec, Phase, PhaseKind, UnitDecl};
 use amdgpu_dsl::FnBuilder;
 pub use amdgpu_dsl::units::{Hint, RegProfile, Unit, UnitClass, UnitId, Units};
 
@@ -15,11 +16,20 @@ pub struct Weaver {
     label: String,
     /// the kernel gave the order (`order` / `spread`): never overridden by the experiment switches (`weave_auto`)
     explicit: bool,
+    /// the name of the plan phase of an unlabelled weave (no weave region is emitted for it; `rotate` names its loop parts)
+    plan_label: String,
+    /// (skeleton unit, the fillers placed in its shadow) of a `spread`
+    interleave: Vec<(UnitId, Vec<UnitId>)>,
 }
 
 impl Weaver {
     pub fn new(units: Units) -> Weaver {
-        Weaver { units, order: None, label: String::new(), explicit: false }
+        Weaver { units, order: None, label: String::new(), explicit: false, plan_label: String::new(), interleave: Vec::new() }
+    }
+    /// A plan-only phase name (no region is emitted): the units still get plan entries and unit marks.
+    pub fn plan_label(mut self, label: impl Into<String>) -> Weaver {
+        self.plan_label = label.into();
+        self
     }
     /// A label for reports / errors (the phase name).
     pub fn phase(mut self, label: impl Into<String>) -> Weaver {
@@ -29,7 +39,7 @@ impl Weaver {
     /// Statement granularity: every unit split into its node groups (`Units::split`); an explicit order is dropped (re-order the
     /// sub-units with `order` / a strategy afterwards).
     pub fn fine(self) -> Weaver {
-        Weaver { units: self.units.split(), order: None, label: self.label, explicit: false }
+        Weaver { units: self.units.split(), order: None, label: self.label, explicit: false, plan_label: self.plan_label, interleave: Vec::new() }
     }
     /// The units of the weave (strategies read their facts).
     pub fn units(&self) -> &Units {
@@ -56,13 +66,28 @@ impl Weaver {
         }
         let mut ord: Vec<UnitId> = (0..n).filter(|&i| !placed[i]).collect();
         let mut fi = fillers.iter().copied().peekable();
+        self.interleave.clear();
         for &s in skeleton {
             ord.push(s);
+            let mut shadow = Vec::new();
             for _ in 0..per {
                 match fi.next() {
-                    Some(f) => ord.push(f),
+                    Some(f) => {
+                        ord.push(f);
+                        shadow.push(f);
+                    }
                     None => break,
                 }
+            }
+            if !shadow.is_empty() {
+                self.interleave.push((s, shadow));
+            }
+        }
+        if let (Some(last), true) = (skeleton.last(), fi.peek().is_some()) {
+            let rest: Vec<UnitId> = fi.clone().collect();
+            match self.interleave.iter_mut().find(|(s, _)| s == last) {
+                Some((_, sh)) => sh.extend(rest),
+                None => self.interleave.push((*last, rest)),
             }
         }
         ord.extend(fi);
@@ -93,17 +118,64 @@ impl Weaver {
         }
         let ord = self.plan();
         let label = self.label.clone();
+        // the plan (docs/two-weavers.md): one phase per weave, its units in emission order with their dependences, the interleave hints; each unit's statements are
+        // bracketed by `UnitMark`s (no code) with the plan unit id. An unnamed weave (no label, no plan label) records nothing.
+        let phase_name = if label.is_empty() { self.plan_label.clone() } else { label.clone() };
+        let unit_ids: Vec<u32> = if phase_name.is_empty() {
+            Vec::new()
+        } else {
+            let p = b.plan_mut();
+            let phase = p.phases.len() as u32;
+            let base = p.units.len() as u32;
+            let mut ids = vec![0u32; ord.len()];
+            for (pos, &i) in ord.iter().enumerate() {
+                ids[i] = base + pos as u32;
+            }
+            p.phases.push(Phase { id: phase, name: phase_name, parent: None, kind: PhaseKind::Straight, order: OrderSpec::Authored, budget: Budget::default() });
+            for &i in &ord {
+                let u = &self.units.v[i];
+                p.units.push(UnitDecl { id: ids[i], name: u.name.clone(), phase, class: plan_class(u.class), anchor: u.hint == Hint::Anchor, iter: u.iter, latency: u.latency, roles: 0 });
+            }
+            for &i in &ord {
+                for &d in &self.units.v[i].deps {
+                    let kind = if crate::weave_auto::data_dep(&self.units.v[d].summary, &self.units.v[i].summary) { DepKind::Data } else { DepKind::Order };
+                    p.deps.push(Dep { from: ids[d], to: ids[i], kind, distance: 0 });
+                }
+            }
+            for (s, fillers) in &self.interleave {
+                p.hints.interleave.push((ids[*s], fillers.iter().map(|&f| ids[f]).collect()));
+            }
+            ids
+        };
         let mut slots: Vec<Option<Unit>> = self.units.v.into_iter().map(Some).collect();
         if !label.is_empty() {
             b.weave_region_begin(&label);
         }
         for i in ord {
             let u = slots[i].take().expect("weave: unit emitted twice");
-            b.splice(u.cap);
+            if unit_ids.is_empty() {
+                b.splice(u.cap);
+            } else {
+                b.unit_begin(unit_ids[i]);
+                b.splice(u.cap);
+                b.unit_end(unit_ids[i]);
+            }
         }
         if !label.is_empty() {
             b.weave_region_end();
         }
+    }
+}
+
+fn plan_class(c: UnitClass) -> plan::UnitClass {
+    match c {
+        UnitClass::Mfma => plan::UnitClass::Mfma,
+        UnitClass::Valu => plan::UnitClass::Valu,
+        UnitClass::LdsRead => plan::UnitClass::LdsRead,
+        UnitClass::Dma => plan::UnitClass::Dma,
+        UnitClass::Salu => plan::UnitClass::Salu,
+        UnitClass::Branch => plan::UnitClass::Branch,
+        UnitClass::Setup => plan::UnitClass::Setup,
     }
 }
 
@@ -163,7 +235,11 @@ pub fn rotate(b: &mut FnBuilder, parts: &[Part], stage: RotStage, order: Option<
         let (id, ()) = if p.anchor { u.anchor(b, p.name, |b| build(b, i)) } else { u.capture(b, p.name, |b| build(b, i)) };
         u.set_iter(id, p.iter);
     }
-    let w = Weaver::new(u);
+    let w = Weaver::new(u).plan_label(match stage {
+        RotStage::Prologue => "rotate.prologue",
+        RotStage::Steady => "rotate.steady",
+        RotStage::Epilogue => "rotate.epilogue",
+    });
     match order {
         Some(o) => w.order(o).emit(b),
         None => w.seq().emit(b),

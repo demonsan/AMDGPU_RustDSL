@@ -219,3 +219,14 @@ To be agreed before B0:
 - the plan's place in the IR (a `Function::plan` field) and the irv1 printing order;
 - how stage contracts become `HandOff::layout` and `SyncRule::Counted` (the contracts remain the checker);
 - which experiments edit the plan (front end) and which stay back-end recovery (`Feedback::rungs`).
+
+### 6.1 Status of the front-end derivation (W2b, sched)
+
+`amdgpu_stage::weave::Weaver::emit` records the plan while it emits (no behaviour change: the asm md5 manifest is identical):
+- one `Phase` per weave: the labelled weaves (`Weaver::phase`, i.e. the weave regions) keep their region name; the unlabelled weaves of `rotate` get plan-only names `rotate.prologue` / `rotate.steady` / `rotate.epilogue` (no region is emitted for them);
+  `OrderSpec::Authored` (today every weave emits its declaration or explicit order);
+- one `UnitDecl` per unit in emission order (id = the position in `plan.units`, class, `anchor` from the `Anchor` hint, `iter` from `rotate`, nominal latency) and one `Dep` per derived dependence (`Data` when a value
+  flows from the producer to the consumer, otherwise `Order`; `distance` 0);
+- `Hints::interleave` from `Weaver::spread` (skeleton unit -> the fillers placed in its shadow);
+- each unit's statements are bracketed by `Stmt::UnitMark` with the unit's plan id, so `MInst::unit` ties the lowered instructions to it (`amdc weave-report` shows `N plan units`).
+Not yet derived (W2c): `RegionDecl` / `RegMark::Cap` into `Phase::order` / `Phase::budget` / `Hints::tokens`, `LoopBody` kinds and trip counts, CTA shape, roles, rings (pipeline templates), hand-offs and sync rules (stage contracts).

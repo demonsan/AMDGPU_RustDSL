@@ -2297,6 +2297,10 @@ impl FnBuilder {
     pub fn reg_ring(&mut self, name: &str, bufs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Ring { name: name.to_string(), bufs: bufs.to_vec() });
     }
+    /// The kernel plan under construction (docs/two-weavers.md), created on first use. Only the front end (the Weaver) writes it; a kernel that never weaves has no plan.
+    pub fn plan_mut(&mut self) -> &mut plan::KernelPlan {
+        self.f.plan.get_or_insert_with(Default::default)
+    }
     /// Opens plan unit `id` (no code; docs/two-weavers.md): the statements until `unit_end(id)` belong to the unit.
     #[track_caller]
     pub fn unit_begin(&mut self, id: u32) {
