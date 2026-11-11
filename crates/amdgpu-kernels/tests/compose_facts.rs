@@ -6,7 +6,7 @@ use amdgpu_kernels::{compose_facts_gen, reachable, registry};
 fn the_compose_facts_match_the_kernels_plans() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../amdgpu-graph/src/compose_facts.rs");
     let have = std::fs::read_to_string(path).unwrap_or_default().replace("\r\n", "\n");
-    assert_eq!(have, compose_facts_gen::source(), "crates/amdgpu-graph/src/compose_facts.rs is stale: regenerate with `amdc compose-facts --out crates/amdgpu-graph/src/compose_facts.rs`");
+    assert_eq!(have, compose_facts_gen::source(), "crates/amdgpu-graph/src/compose_facts.rs is stale: a kernel plan changed: run `bash tools/regen_compose_facts.sh` (= `amdc compose-facts --out crates/amdgpu-graph/src/compose_facts.rs`) and commit the file");
 }
 
 #[test]
