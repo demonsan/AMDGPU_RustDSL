@@ -93,3 +93,31 @@ It has no `Units`, so no plan units. The next md5-neutral step, as for decode16 
 - `weave-report fmha_fwd_hd192_hd128_bf16_v3` shows 66 plan units.
 - The md5 manifest is identical (235 / 0).
 - `compose_facts.rs` is regenerated (`tools/regen_compose_facts.sh`); `cargo test` 557 / 0.
+
+**Step 2: ISA comparison with the vendor's `fwd_hd192_hd128_bf16`.** The aiter code object is disassembled at run time with ROCm 10.1 `llvm-objdump`; nothing vendor-derived is committed. Tools: `isa_cfg.py`, `isa_diff.py`. Group A's main loop:
+
+| | ours `fmha_fwd_hd192_hd128_bf16_v3` | vendor |
+|---|---:|---:|
+| tiles per loop pass | 1 | **2** (exits after each tile, to one shared drain) |
+| instructions per tile (without fillers) | 837 | 675 |
+| `v_mfma_f32_32x32x16_bf16` / `ds_read_b64_tr_b16` / `ds_read_b128` per tile | 80 / 64 / 48 | 80 / 64 / 48 |
+| VALU per tile | 575 | 423 |
+| `s_waitcnt` / `s_nop` per tile | **83 / 59** | **5 / 3.5** |
+| LDS-DMA issues per tile | 12 | 20 |
+| barriers per tile | 2 | 4 |
+| `s_setprio` | 2 | 0 |
+| VGPRs / LDS | 252 / 160 KiB | — |
+
+What the comparison shows:
+1. **Same matrix work.** The MFMA and LDS-read counts per tile are identical, so the gap is in the order and the VALU.
+2. **The vendor interleaves its softmax VALU with the MFMA stream in each wave.** The loop opens with `v_exp_f32` × 63 woven between 45 MFMAs and 32 V reads. Our kernel separates a VALU phase and an M phase per wave group, a ping-pong of two groups with `s_setprio`. The vendor waits 5 times per tile; we wait 83 times and pad 59 nops, because every phase drains its loads before the next.
+3. **The vendor runs two tiles per pass** (the same shape as the W5 replica's step 2) and spends no instructions on our per-tile masking address arithmetic: 111 `v_add_u32` and 64 `v_cmp_ge_i32` against its 64 `v_cmp_lt_i32` per tile.
+
+Classes:
+- (2) is a **back-end Weaver** capability: interleaving two phases' units in one wave (Free phases with interleave hints). It also depends on the **front end** choosing a single-group, in-wave pipelined plan for this family, which is a different composition from today's ping-pong.
+- (3) is **expressible now**: `Pipeline::unroll2` plus a cheaper mask (hoisting the key index arithmetic).
+
+These are the next measurable steps:
+- `unroll2` on the bf16 v3 pipeline;
+- the mask arithmetic;
+- then, with W3's interleaving, the in-wave softmax / MFMA weave.
