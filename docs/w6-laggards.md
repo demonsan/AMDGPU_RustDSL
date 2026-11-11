@@ -172,3 +172,25 @@ It relies on backend-llvm-tail's SCC fix (`origin/sccfix`): the descriptor pseud
 | decode | scheduler on every form (rejected) | 1.009 | the fused `_f` form lost 0.4–1.6 % |
 
 The correctness markers of the harness hosts (`MLA_OK`, `PA_OK`) held in every run.
+
+### 5.2 B4 on bf16 v3: PV(t) woven into the softmax of tile t — measured negative
+
+**Correction to §5.1.** The vendor's loop head weaves its exps between **PV** MFMAs. The 32 `ds_read_b64_tr_b16` among them are V reads, so it overlaps exp(t) with PV(t), not with QK(t + 1). In our pipeline that needs no ring change: V(t) is published one iteration earlier.
+
+**Change** (`V3Opts::pv_early`, option kept, default off):
+- PV(t) moves from the matrix phase to the end of the softmax phase;
+- `{v.exp, m.pv}` becomes one Free plan phase (`Weaver::free`) with `interleave(m.pv, [v.exp])`;
+- the matrix phase keeps QK(t + 1); the barriers stay outside as anchors.
+
+The B4 merge did weave the exps between the PV MFMAs in the emitted loop, and strict verify passes.
+
+**perf_ab** (old = Main `f42c2ef5`, 7 reps):
+
+| variant | `fmha_bf16` geomean | `fmha_hd192` geomean |
+|---|--:|--:|
+| `pv_early` | 0.918 FAIL (causal 0.83–0.92, full 0.95–0.98) | 0.933 FAIL |
+| `pv_early` without `s_setprio` | 0.916 FAIL | 0.932 FAIL |
+
+**Not adopted.**
+
+**Cause.** In our two-group ping-pong, moving PV into the softmax phase takes the 32 PV MFMAs out of the matrix phase. The group in its softmax phase then competes for the matrix pipe with the other group's matrix phase, which now holds only QK. The phases also stop alternating cleanly: one is long and mixed, the other short. The vendor's in-wave overlap belongs to a different composition (no priority ping-pong, 4 barriers per tile, two tiles per pass). Reproducing it is a front-end composition change: a single-group or re-balanced phase plan, a W2 / front-end Weaver decision, not a B4 placement. Until such a plan exists, the B4 merge has no profitable Free phase in this kernel.
