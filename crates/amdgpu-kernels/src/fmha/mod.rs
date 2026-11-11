@@ -73,7 +73,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         b.compile_profile(CompileProfile::Vs128);
         if self.replica {
             // R3 step 4a: the vendor's instruction forms (v_cmp_nge_f32 rollback test, v_mov_b64 zeroing)
-            b.lower_opts(&["cmpneg", "movb64"]);
+            b.lower_opts(&["cmpneg", "movb64", "jthread", "coldlayout"]);
         }
         let io = declare_io(b, 256, false);
         let blk = block3_x(&io, b, 8, true);
@@ -110,6 +110,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 body.biasonce = true;
                 body.pv_unscaled = self.replica;
                 body.sm.nan_rollback = self.replica;
+                body.sm.cold_rollback = self.replica;
                 // R3 step 3 (pinned VGPR roles) measured -4 .. -7 % with our schedule: off (docs/fmha-replica.md §4.4)
                 body.pin_roles = false;
                 pipe.run(b, role, &mut body);

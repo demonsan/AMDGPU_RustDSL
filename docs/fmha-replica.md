@@ -267,14 +267,51 @@ The replica therefore keeps `pin_roles` **off** (its asm is step 2's). The two a
 | B1H8S8192 | 0.980× | **0.991×** (2515.3) |
 | B2H8S2048 | 0.962× | **0.981×** (1278.2) |
 
+### 4.6 Step 4b: exit threading and out-of-line rollback blocks (back-end Weaver passes)
+
+**Change.**
+- The replica adds two lowering tokens, both from backend-llvm-tail, Main `720eab3c`:
+  - `jthread`: each loop exit jumps straight to its drain; all 8 exit edges are threaded;
+  - `coldlayout`: the blocks of an `if` marked unlikely go after all hot code, the hot path falls through, and the cold path jumps back.
+- The lazy rollback is marked with `b.begin_if_unlikely` (`OnlineSoftmax::cold_rollback`).
+- VGPRs unchanged (248); strict verify 0 errors.
+
+**Static, group A loop (hot blocks only) vs the vendor's:**
+
+| | replica 4b | vendor |
+|---|---:|---:|
+| instructions without fillers | **437** | 439 |
+| VALU / SALU | 247 / 24 | 226 / 46 |
+| MFMA, LDS reads, LDS-DMA | equal | equal |
+| `s_waitcnt` / `s_nop` | 40 / 22 | 32 / 2 |
+| opcode alignment | 28.4 % | — |
+
+The loop now has the vendor's size and instruction mix. What is left:
+- order: the alignment is 28 % (§4.7);
+- 21 VALU more / 22 SALU fewer: the vendor keeps uniform values in SGPRs and does its address arithmetic on the scalar unit;
+- waits and nops: 40 / 22 here vs 32 / 2 at the vendor.
+
+**Gates.** port_gate OVERALL PASS.
+
+**Performance, same session (× vendor):**
+
+| shape | `_vs128` | replica 4b |
+|---|---:|---:|
+| per-CU 64 blocks | 0.952× | **0.971×** (700.2 TF/s) |
+| B4H8S2048 | 1.012×¹ | **0.993×** (1920.6 TF/s vs 1830.4) |
+| B1H8S8192 | 0.979× | **0.989×** |
+| B2H8S2048 | 0.970× | **0.978×** |
+
+¹ The vendor measured low in that run (1808.7 vs 1933.2 TF/s); the absolute TF/s favour the replica by 4.9 %.
+
 ## 5. Findings so far, per difference class (the deliverable)
 
 | Difference from the vendor kernel | Class | State |
 |---|---|---|
 | Unscaled PV MFMA (8 + 8 per tile) | expressible now (DSL `var_mfma_fp8_32x32x64`) | in the replica (step 1) |
 | Two tiles per loop pass, static ring slots, one drain per exit | expressible now (`Pipeline::unroll2`, `break_if` with a `which` variable) | in the replica (step 2) |
-| Each exit edge jumping straight to its drain | back-end Weaver: jump threading on a per-edge constant | pass `jthread` (backend-llvm-tail), to apply |
-| Rollback blocks out of line (after the hot code, hot path falls through) | back-end Weaver: cold-block layout + a DSL hint (`begin_if_unlikely`) | agreed design (backend-llvm-tail) |
+| Each exit edge jumping straight to its drain | back-end Weaver: jump threading on a per-edge constant | in the replica (`jthread`, step 4b) |
+| Rollback blocks out of line (after the hot code, hot path falls through) | back-end Weaver: cold-block layout + a DSL hint (`begin_if_unlikely`) | in the replica (`coldlayout`, step 4b); VGPRs unchanged |
 | `v_cmp_nge_f32`, `v_mov_b64`, `v_mfma_f32_32x32x8_bf16` | missing MIR ops → opt-in lowering patterns | the first two in the replica (step 4a); the bf16 helper is next |
 | Scalar forms (`s_sub_u32`, `s_cmp_*_u32`, `s_addk_i32`, `s_or_b32`), `v_mul_i32_i24` | missing MIR ops / lowering patterns | low priority |
 | Wave-uniform values as SGPR operands of VALU (12.8 % of the vendor's instructions) | back-end Weaver / lowering (constant-bus aware operand choice) | W3 B2 |

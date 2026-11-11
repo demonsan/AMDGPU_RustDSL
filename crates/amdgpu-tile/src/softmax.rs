@@ -31,6 +31,9 @@ impl Recipe {
 pub struct OnlineSoftmax {
     /// the lazy rollback test as `!(thr >= max)` (the vendor's NaN-taking `v_cmp_nge_f32` with the `cmpneg` lowering) instead of `thr < max`
     pub nan_rollback: bool,
+    /// the lazy rollback branch marked unlikely (`FnBuilder::begin_if_unlikely`): with the `coldlayout` lowering token its blocks go after the
+    /// hot code, as the vendor's rollback blocks (docs/fmha-replica.md)
+    pub cold_rollback: bool,
     pub recipe: Recipe,
     pub smf: SmfmacOnes,
     pub ones_f16: ValueId,
@@ -64,7 +67,7 @@ impl OnlineSoftmax {
         let wi = b.c_i32(0x4800_4800);
         let bias_init = b.frag2(wi, wi);
         let zero4 = b.frag_zero(DType::Frag4);
-        OnlineSoftmax { nan_rollback: false, recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, conv_s: one_f, zero4, bias: None, la: None }
+        OnlineSoftmax { nan_rollback: false, cold_rollback: false, recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, conv_s: one_f, zero4, bias: None, la: None }
     }
     /// Overrides the rollback threshold (scaled max units).
     /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132
@@ -189,7 +192,11 @@ impl OnlineSoftmax {
         {
             // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
             let any = b.any_lane(grow);
-            b.begin_if(Opnd::Val(any));
+            if self.cold_rollback {
+                b.begin_if_unlikely(Opnd::Val(any));
+            } else {
+                b.begin_if(Opnd::Val(any));
+            }
         }
         {
             let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
