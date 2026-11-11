@@ -267,6 +267,9 @@ def _tile(kernel):
 def gemm():
     out = []
     shapes = [(4096, 4096, 8192), (8192, 8192, 8192), (1024, 7168, 2048), (256, 7168, 2048), (64, 8192, 8192), (16, 8192, 8192), (32, 4096, 14336)]
+    # the shapes the rule changes of the composition search were fitted on (docs/compose-gemm-evidence.md) and hold-out shapes it was not fitted on (K = 6144, N = 8192, other M)
+    shapes += [(2048, 7168, 7168), (1280, 7168, 4096), (192, 4096, 4096), (256, 4096, 8192), (128, 7168, 8192), (768, 4096, 8192)]
+    shapes += [(320, 8192, 6144), (576, 7168, 6144), (1152, 4096, 6144), (1792, 8192, 4096), (160, 4096, 8192), (96, 8192, 8192)]
     for kind, fam in GEMM_KINDS:
         for (m, n, k) in shapes:
             def build(side, kind=kind, fam=fam, m=m, n=n, k=k):

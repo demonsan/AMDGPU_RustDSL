@@ -89,32 +89,71 @@ pub fn bwd_causal_kernels() -> (&'static str, &'static str) {
     ("fmha_bwd_dq_hd128_bf16_causal", "fmha_bwd_dkdv_hd128_bf16_causal")
 }
 
-/// int8 A8W8 GEMM (`gemm_a8w8_i8[_128|_64[_splitk]]`, per-token x per-channel scales; the same rule picks `gemm_a8w8_rowcol_fp8[_128|_64[_splitk]]`):
-/// (CTA rows, split-K S). The 64-row forms run the 3-slot ring (`GemmConfig::depth3`). 256 x 256 when that grid
-/// fills the CUs, else 128 x 128 when that does, else 64 x 128 with the smallest S (<= 4, power of two) giving S CTAs >= CUs (S > 1:
-/// `gemm_a8w8_i8_64_splitk` + `gemm_splitk_reduce_s<S>_rc`). Same run vs the best aiter i8gemm tile: 4096^3 68.9 vs 112 us, 2048x4096^2
-/// 42.3 vs 55.2, 1024x4096x8192 51.9 vs 50.8, 512x7168x4096 23.6 vs 25.5, 256x7168x4096 20.0 vs 14.0, 128x4096x8192 (S 4) 16.2 vs 17.7,
-/// 64x8192^2 (S 4) 19.1 vs 18.9.
-pub fn i8_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
-    if (m / 256) * (n / 256) >= cus {
+/// Fill of the CUs (percent of `cus`, counted in 256 x 256 CTAs) from which the 256-row GEMM form beats the 128-row one. Measured same-run on MI355X (node 53, GPU 1, 7 interleaved repetitions,
+/// K = 4096, N = 4096 and 7168, M = 1024 .. 4096 in steps of 256; bf16, int8 and fp8 per-token x per-channel agree): the 128 x 128 form wins up to 128 CTAs of 256 (fill 50 %: bf16 2048x4096 74.3 vs 80.1 us,
+/// int8 41.8 vs 47.0, fp8 40.3 vs 46.1; 112 CTAs 1024x7168: 37.7 vs 44.7 int8), the 256 x 256 form wins from 140 CTAs (fill 55 %: 1280x7168 int8 48.6 vs 56.7, bf16 83.6 vs 96.7, fp8 47.4 vs 55.6;
+/// 144 CTAs 2304x4096: 48.9 vs 57.5) with the gap growing to 17 - 28 % at fill 88 - 98 % (2048x7168 int8 59.5 vs 74.4, fp8 58.3 vs 73.2, bf16 101.4 vs 126.5). The threshold is the midpoint of the
+/// last loss (128 CTAs) and the first win (140), 53 %. (The previous rule, 100 %, picked the 128 form for the whole 50 - 100 % band, 15 - 28 % slower.)
+const F256_PERCENT: u64 = 53;
+
+/// The 64 x 128 GEMM form's time model (us), fitted to the measured same-run times of `tools/compose_search.py check-gemm` (node 53, GPU 1, 7 interleaved repetitions, M = 64 .. 512, N = 4096 / 7168, K = 4096 /
+/// 8192; docs/compose-gemm-evidence.md): `a + b K / (4096 S) + [S > 1] (r0 + r1 S M N / 8e6)` for a one-round grid (`c S <= CUs`, c = ceil(M/64) ceil(N/128)): a fixed launch + epilogue part, the K loop split S
+/// ways, and the split-K reduce (fixed + the S fp32 partials of the M x N output). Constants per operand width: (a, b, r0, r1). Mean error 5.6 % (8-bit, 72 points), 7.6 % (bf16, 27 points); the rule built on
+/// it has 0.0 - 0.1 % mean regret against the measured best split (the previous rule: 9.5 % mean, 45 % worst, on the 8-bit kinds).
+const SPLIT64_8BIT: (f64, f64, f64, f64) = (2.55, 10.13, 0.86, 22.25);
+const SPLIT64_BF16: (f64, f64, f64, f64) = (0.63, 22.18, 0.96, 27.90);
+
+fn split64_us(p: (f64, f64, f64, f64), m: u64, n: u64, k: u64, s: u64) -> f64 {
+    let split = if s > 1 { p.2 + p.3 * (s * m * n) as f64 / 8.0e6 } else { 0.0 };
+    p.0 + p.1 * k as f64 / (4096.0 * s as f64) + split
+}
+
+/// The split-K factor of the 64-row form: the S in {1, 2, 4} the model predicts fastest among those the kernels allow (the reduce covers N in 1024-column blocks, the 3-slot ring needs whole 256-element K
+/// pairs per part) and that keep the grid within one round (`c S <= CUs`).
+fn split64(p: (f64, f64, f64, f64), m: u64, n: u64, k: u64, cus: u64) -> u32 {
+    let c = m.div_ceil(64) * n.div_ceil(128);
+    let mut best = (split64_us(p, m, n, k, 1), 1u64);
+    for s in [2u64, 4] {
+        if c * s <= cus && n % 1024 == 0 && k % (256 * s) == 0 {
+            let t = split64_us(p, m, n, k, s);
+            if t < best.0 {
+                best = (t, s);
+            }
+        }
+    }
+    best.1 as u32
+}
+
+/// int8 A8W8 GEMM (`gemm_a8w8_i8[_128|_64[_splitk]]`, per-token x per-channel scales; the same rule picks `gemm_a8w8_rowcol_fp8[_128|_64[_splitk]]`): (CTA rows, split-K S). 256 x 256 from 53 % fill of the CUs
+/// (`F256_PERCENT`), else 128 x 128 when that grid fills the CUs, else the 64 x 128 3-slot form with the split `split64` predicts. Same run (node 53) vs the measured best of the whole candidate set: the
+/// evidence shapes of docs/compose-gemm-evidence.md and the sweeps behind `F256_PERCENT` / `SPLIT64_*`. (Earlier evidence vs the best aiter i8gemm tile: 4096^3 68.9 vs 112 us, 2048x4096^2 42.3 vs 55.2,
+/// 1024x4096x8192 51.9 vs 50.8, 512x7168x4096 23.6 vs 25.5, 256x7168x4096 20.0 vs 14.0, 128x4096x8192 (S 4) 16.2 vs 17.7, 64x8192^2 (S 4) 19.1 vs 18.9.)
+pub fn i8_gemm_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
+    // the 256 x 256 form from a little over half the CUs filled (`F256_PERCENT`): measured crossover (docs/compose-gemm-evidence.md, fill sweep)
+    if (m / 256) * (n / 256) * 100 >= F256_PERCENT * cus {
         return (256, 1);
     }
     if m.div_ceil(128) * n.div_ceil(128) >= cus {
         return (128, 1);
     }
-    let c = m.div_ceil(64) * n.div_ceil(128);
-    // (3-slot 64-row forms: a grid of >= 3/4 of the CUs runs unsplit - 256x7168: S1 18.5 vs S2 23.6 us blockscale)
-    let mut s = 1u64;
-    while s < 4 && c * s < cus && 4 * c < 3 * cus {
-        s *= 2;
-    }
-    (64, s as u32)
+    (64, split64(SPLIT64_8BIT, m, n, k, cus))
 }
 
-/// bf16 A16W16 GEMM (`gemm_a16w16_bf16[_128|_64[_splitk]]`): the int8 rule (`i8_gemm_config`); the 64-row forms run the 3-slot ring.
-/// Same run: 128x4096x8192 S4 18.7 us (128 tile 74.0, 256 tile 133.0), 64x8192^2 S4 26.7 (133.4), 256x7168x4096 23.0 (41.3 / 69.1).
-pub fn bf16_gemm_config(m: u64, n: u64, cus: u64) -> (u32, u32) {
-    i8_gemm_config(m, n, cus)
+/// bf16 A16W16 GEMM (`gemm_a16w16_bf16[_128|_128_splitk|_64[_splitk]]`): the int8 rule with the bf16 split constants, plus the 128 x 128 split form: for K >= 6144 and a 128-row grid of 0.625 .. 1 x CUs (bf16
+/// is compute-bound enough that two half-K CTAs per CU beat one: K = 8192, M 640 .. 1024 x N 4096, M 384 .. 512 x N 7168: `_128_splitk` S2 5 - 12 % faster than `_64` S1 / `_128` S1, 512x7168x7168 8.9 %;
+/// at K = 4096 and above the grid it loses).
+pub fn bf16_gemm_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
+    if (m / 256) * (n / 256) * 100 >= F256_PERCENT * cus {
+        return (256, 1);
+    }
+    let g128 = m.div_ceil(128) * n.div_ceil(128);
+    if k >= 6144 && n % 1024 == 0 && k % 256 == 0 && 8 * g128 >= 5 * cus && g128 <= cus {
+        return (128, 2);
+    }
+    if g128 >= cus {
+        return (128, 1);
+    }
+    (64, split64(SPLIT64_BF16, m, n, k, cus))
 }
 
 /// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
@@ -340,11 +379,26 @@ mod tests {
 
     #[test]
     fn i8_gemm_rule() {
-        assert_eq!(super::i8_gemm_config(4096, 4096, 256), (256, 1));
-        assert_eq!(super::i8_gemm_config(2048, 4096, 256), (128, 1));
-        assert_eq!(super::i8_gemm_config(512, 7168, 256), (64, 1));
-        assert_eq!(super::i8_gemm_config(128, 4096, 256), (64, 4));
-        assert_eq!(super::i8_gemm_config(64, 8192, 256), (64, 4));
+        assert_eq!(super::i8_gemm_config(4096, 4096, 4096, 256), (256, 1));
+        assert_eq!(super::i8_gemm_config(2048, 4096, 4096, 256), (128, 1));
+        // the 256 x 256 form from 53 % fill: 128 CTAs (50 %) stay 128, 140 CTAs (55 %) and the 224 / 252 CTA grids take 256
+        assert_eq!(super::i8_gemm_config(1792, 4096, 4096, 256), (128, 1));
+        assert_eq!(super::i8_gemm_config(1280, 7168, 4096, 256), (256, 1));
+        assert_eq!(super::i8_gemm_config(2304, 4096, 4096, 256), (256, 1));
+        assert_eq!(super::i8_gemm_config(2048, 7168, 4096, 256), (256, 1));
+        assert_eq!(super::i8_gemm_config(512, 7168, 4096, 256), (64, 1));
+        assert_eq!(super::i8_gemm_config(128, 4096, 8192, 256), (64, 4));
+        assert_eq!(super::i8_gemm_config(64, 8192, 8192, 256), (64, 4));
+        // the split follows K and the grid: a short K or a larger grid runs unsplit, a mid grid at a long K splits in two (measured: 192x4096x4096 S1 12.0 us vs the old S4 16.2; 256x4096x8192 S2 18.3 vs S1 21.8)
+        assert_eq!(super::i8_gemm_config(192, 4096, 4096, 256), (64, 1));
+        assert_eq!(super::i8_gemm_config(128, 7168, 4096, 256), (64, 1));
+        assert_eq!(super::i8_gemm_config(256, 4096, 8192, 256), (64, 2));
+        assert_eq!(super::i8_gemm_config(64, 4096, 4096, 256), (64, 4));
+        // bf16: the 128 x 128 split form at a long K and a 0.625 .. 1 x CUs 128-row grid
+        assert_eq!(super::bf16_gemm_config(768, 4096, 8192, 256), (128, 2));
+        assert_eq!(super::bf16_gemm_config(512, 7168, 8192, 256), (128, 2));
+        assert_eq!(super::bf16_gemm_config(768, 4096, 4096, 256), (64, 1));
+        assert_eq!(super::bf16_gemm_config(1280, 4096, 8192, 256), (128, 1));
     }
 }
 
@@ -363,11 +417,16 @@ pub fn gemm_kernels(kind: &str, m: u64, n: u64, k: u64, cus: u64) -> Option<(Str
         "mxfp4" => return Some(("gemm_a4w4_mxfp4".into(), 1, None)),
         _ => return None,
     };
-    let (rows, s) = if kind == "fp8_blockscale" { blockscale_config(m, n, k, cus) } else { i8_gemm_config(m, n, cus) };
+    let (rows, s) = match kind {
+        "fp8_blockscale" => blockscale_config(m, n, k, cus),
+        "bf16" => bf16_gemm_config(m, n, k, cus),
+        _ => i8_gemm_config(m, n, k, cus),
+    };
     let s = if s > 1 && n % 1024 != 0 { 1 } else { s };
     let name = match (rows, s > 1) {
         (256, _) => base.to_string(),
         (128, _) if kind == "fp8_blockscale" => base.to_string(),
+        (128, true) => format!("{base}_128_splitk"),
         (128, _) => format!("{base}_128"),
         (_, false) => format!("{base}_64"),
         (_, true) => format!("{base}_64_splitk"),

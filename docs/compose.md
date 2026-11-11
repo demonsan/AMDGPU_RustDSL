@@ -45,3 +45,16 @@ The rules above are fitted by hand today. `compose_search` makes the fitting a r
 - bf16 `512x7168x7168` (+8.9 %, `_128_splitk` S2) and `1024x4096x8192` (+5.9 %, `_128_splitk` S2): the split 128-tile forms the bf16 rule never picks;
 - int8 `64x8192x8192`: S2 is 3.8 % faster than the rule's S4 (fp8 per-token: +2.5 %, within tolerance).
 These are rule CANDIDATES, not changes: a rule change goes through the `perf_ab` gate with the new evidence recorded in `dispatch.rs`.
+
+## Rule updates derived from the search (GEMM, 2026-11-12)
+
+The search found rule defects, and the rules in `dispatch.rs` now follow the measurements ([`compose-gemm-sweeps.md`](compose-gemm-sweeps.md): the sweeps and the gate; node 53, GPU 1, interleaved, 7 repetitions):
+1. **The 256 x 256 tile from 53 % fill** (`F256_PERCENT`; was 100 %): bf16, int8 and fp8 per-token x per-channel agree: the 128 tile wins up to 128 CTAs of 256 (fill 50 %), the 256 tile from 140 (55 %), by 17 - 28 % at fill 88 - 98 %.
+   The threshold is the midpoint of the last loss and the first win.
+2. **The split-K factor of the 64 x 128 form is a model, not a ladder**: `a + b K / (4096 S) + [S > 1] (r0 + r1 S M N / 8e6)` (a fixed part, the K loop split S ways, the reduce's fixed part and its fp32 partials) fitted per
+   operand width (72 points 8-bit, 27 bf16; mean error 5.6 % / 7.6 %), and the rule takes the S in {1, 2, 4} it predicts fastest among those the kernels allow and one round of CTAs. The rule depends on K now
+   (`i8_gemm_config` / `bf16_gemm_config` take it): the old ladder split short-K small grids that are fastest unsplit (up to 45 % slower). Against the measured best split on the sweep: mean regret 0.0 - 0.1 % (old rule 9.5 % on int8 / fp8).
+3. **bf16 128 x 128 split form** (`gemm_a16w16_bf16_128_splitk` S2) for K >= 6144 on a 128-row grid of 0.625 - 1 x CUs: 5 - 12 % faster than `_64` / `_128` unsplit; shorter K and larger grids lose.
+
+Gate (`perf_ab.py --families gemm`, old = the tree before the rule change): **PASS**, 79 cases, family geometric mean **1.042**, 19 cases IMPROVED (1.04 - 1.33x), none failing. The hold-out shapes (K = 6144, N = 8192, other M; not
+used by the fits) are among the improved ones (1792x8192x4096 +23 - 26 %, 160x4096x8192 +9 - 13 %, 320x8192x6144 bf16 +6 %) and the rest are unchanged.

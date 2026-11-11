@@ -129,9 +129,72 @@ impl Candidate {
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// attention families: the split decisions (decode16 splits, prefill key splits)
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+fn attn_candidate(kernel: String, combine: Option<String>, splits: u32, ctas: u64, cus: u64, work_per_cta: f64, merge: f64) -> Candidate {
+    let rounds = ctas.div_ceil(cus.max(1));
+    let lds_bytes = crate::compose::facts(&kernel).map(|f| f.lds_bytes).unwrap_or(0);
+    // coarse model: rounds over the CUs x the per-CTA key loop (+ the partial merge per split); relative only
+    Candidate { kernel, reduce: combine, splits, tile: (0, 0), ctas, rounds, ring_slots: 2, lds_bytes, model_us: rounds as f64 * work_per_cta + merge * splits as f64 }
+}
+
+/// Candidates of a paged decode launch (bf16, hd128, G <= 16): the fused form (S = 1) and, for pages >= 16, the last-arriver form `_c` with S in {2, 4, 8, 16} key splits (at least 256 keys per split).
+pub fn decode16_candidates(b: u64, hk: u64, ctx: u64, page: u32, cus: u64) -> Vec<Candidate> {
+    let n = b * hk;
+    let mut out = vec![attn_candidate(format!("pa_decode16_bf16_hd128_p{page}_f"), None, 1, n, cus, ctx as f64 * 0.01, 0.0)];
+    if page >= 16 {
+        for s in [2u32, 4, 8, 16] {
+            if ctx / s as u64 >= 256 {
+                out.push(attn_candidate(format!("pa_decode16_bf16_hd128_p{page}_c"), None, s, n * s as u64, cus, ctx as f64 / s as f64 * 0.01, 0.3));
+            }
+        }
+    }
+    out
+}
+
+/// Candidates of a bf16 hd128 prefill launch: non-causal the plain kernel and `_ks` with S in {2, 4}; causal the paired `_causal` (+ `_causal_ks` S in {2, 4}), the 128-row `_causal_q128` and the tiny-grid
+/// `fmha_fwd_hd128_bf16_causal`. Splits need at least four key tiles of 128 per part; a split adds the combine kernel.
+pub fn prefill_bf16_candidates(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: u64) -> Vec<Candidate> {
+    let u = b * h * sq.div_ceil(256);
+    let kt = sk.div_ceil(128);
+    let combine = Some("attn_combine_bf16_hd128_q16".to_string());
+    let mut out = Vec::new();
+    let paired = (u + 1) / 2;
+    if !causal {
+        out.push(attn_candidate("fmha_fwd_hd128_bf16_v3".into(), None, 1, u, cus, kt as f64, 0.0));
+        for s in [2u32, 4] {
+            if kt >= 4 * s as u64 {
+                out.push(attn_candidate("fmha_fwd_hd128_bf16_v3_ks".into(), combine.clone(), s, u * s as u64, cus, kt as f64 / s as f64, 2.0));
+            }
+        }
+    } else {
+        out.push(attn_candidate("fmha_fwd_hd128_bf16_v3_causal".into(), None, 1, paired, cus, kt as f64, 0.0));
+        for s in [2u32, 4] {
+            if kt >= 4 * s as u64 {
+                out.push(attn_candidate("fmha_fwd_hd128_bf16_v3_causal_ks".into(), combine.clone(), s, paired * s as u64, cus, kt as f64 / s as f64, 2.0));
+            }
+        }
+        out.push(attn_candidate("fmha_fwd_hd128_bf16_v3_causal_q128".into(), None, 1, paired * 2, cus, kt as f64 / 2.0, 0.0));
+        out.push(attn_candidate("fmha_fwd_hd128_bf16_causal".into(), None, 1, u * 2, cus, kt as f64 / 2.0, 0.0));
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode16_and_prefill_have_split_candidates() {
+        let d = decode16_candidates(4, 8, 8192, 16, 256);
+        assert!(d.iter().any(|c| c.splits == 1) && d.iter().any(|c| c.splits == 4 && c.kernel.ends_with("_c")), "{d:?}");
+        assert!(decode16_candidates(4, 8, 8192, 8, 256).iter().all(|c| c.splits == 1), "pages below 16 run the fused form only");
+        let p = prefill_bf16_candidates(1, 8, 4096, 4096, false, 256);
+        assert!(p.iter().any(|c| c.splits == 2 && c.reduce.is_some()) && p.iter().any(|c| c.splits == 1), "{p:?}");
+        assert!(prefill_bf16_candidates(1, 8, 4096, 4096, true, 256).iter().any(|c| c.kernel.ends_with("_causal_q128")));
+    }
 
     #[test]
     fn small_m_has_split_candidates_and_a_big_grid_does_not() {
