@@ -714,6 +714,17 @@ impl Lowerer {
         self.mir.blocks[self.cur].term = t;
     }
 
+    /// Forgets every lowering cache whose entries were materialised by earlier code (`unitlocal`).
+    fn unit_boundary(&mut self) {
+        self.consts.clear();
+        self.converted.clear();
+        self.rfl_cache.clear();
+        for (c, v) in self.scope_snaps.iter_mut() {
+            c.clear();
+            v.clear();
+        }
+    }
+
     fn start_block(&mut self, label: u32) {
         self.rfl_cache.clear();
         let mut b = Block::new(label);
@@ -2381,9 +2392,18 @@ impl Lowerer {
                     self.region_stack.pop();
                 }
                 Stmt::BranchHint { unlikely } => self.next_if_cold = *unlikely,
-                Stmt::UnitMark { id, begin: true } => self.unit_stack.push(*id),
-                Stmt::UnitMark { begin: false, .. } => {
-                    self.unit_stack.pop();
+                Stmt::UnitMark { id, begin } => {
+                    if *begin {
+                        self.unit_stack.push(*id);
+                    } else {
+                        self.unit_stack.pop();
+                    }
+                    // `unitlocal` (W3 B2, docs/two-weavers.md section 3.2): a unit must not depend on lowering caches filled by another unit
+                    // (the back end may reorder units): constants, scalar->vector conversions and readfirstlane results are re-materialised
+                    // per unit, including in the snapshots an enclosing if / loop restores later
+                    if opt_on("unitlocal") {
+                        self.unit_boundary();
+                    }
                 }
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
