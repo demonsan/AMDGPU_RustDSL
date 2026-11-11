@@ -508,6 +508,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCmpLeF32 => cmp(a, inst, "v_cmp_le_f32_e32"),
         MOp::VCmpGtF32 => cmp(a, inst, "v_cmp_gt_f32_e32"),
         MOp::VCmpGeF32 => cmp(a, inst, "v_cmp_ge_f32_e32"),
+        MOp::VCmpNgeF32 => cmp(a, inst, "v_cmp_nge_f32_e32"),
         MOp::VCmpEqF32 => cmp(a, inst, "v_cmp_eq_f32_e32"),
         MOp::VCmpNeF32 => cmp(a, inst, "v_cmp_neq_f32_e32"),
         MOp::VCmpLgF32 => cmp(a, inst, "v_cmp_lg_f32_e32"),
@@ -553,6 +554,11 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             src1(a, inst.srcs[1])
         )],
+        MOp::VZeroSub2 => {
+            // Zero two dwords of a register tuple.
+            let base = v(a, inst.dst.expect("dst")) + inst.imm as u32;
+            vec![format!("v_mov_b64 v[{}:{}], 0", base, base + 1)]
+        }
         MOp::VWriteSub => {
             // Write one dword of a register tuple.
             let base = v(a, inst.dst.expect("dst"));
@@ -578,6 +584,28 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, a_reg, 2),
                 tuple(a, b_reg, 2),
                 tuple(a, c_reg, 16)
+            )]
+        }
+        MOp::VMfma32x32x8Bf16 => {
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let c_reg = reg_of(&inst.srcs[2]);
+            vec![format!(
+                "v_mfma_f32_32x32x8_bf16 {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, a_reg, 2),
+                tuple(a, b_reg, 2),
+                tuple(a, c_reg, 16)
+            )]
+        }
+        MOp::VMfma32x32x8Bf16Z => {
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            vec![format!(
+                "v_mfma_f32_32x32x8_bf16 {}, {}, {}, 0",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, a_reg, 2),
+                tuple(a, b_reg, 2)
             )]
         }
         MOp::VMfma32x32x8F16Z => {

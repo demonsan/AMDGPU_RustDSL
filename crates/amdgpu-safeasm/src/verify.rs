@@ -20,7 +20,7 @@ use crate::seq::{PK_TO_TRANS, TRANS_RESULT};
 /// Result latency in wait states of a matrix op (hazards.rs `mfma_latency`; the scaled/sparse ops use 20).
 fn result_latency(op: &str) -> u32 {
     match op {
-        "VMfma32x32x8F16Z" | "VMfma32x32x8F16" | "VMfma16x16x16F16" | "VMfma16x16x32Fp8" | "VMfma32x32x16Fp8" => 12,
+        "VMfma32x32x8F16Z" | "VMfma32x32x8F16" | "VMfma32x32x8Bf16Z" | "VMfma32x32x8Bf16" | "VMfma16x16x16F16" | "VMfma16x16x32Fp8" | "VMfma32x32x16Fp8" => 12,
         _ => MATRIX_RESULT,
     }
 }

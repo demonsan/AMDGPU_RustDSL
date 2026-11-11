@@ -152,6 +152,7 @@ VPkFmaF16   | V1 <- V1 V1 V1 | {d} = nofpexcept V_PK_FMA_F16 8, {s0}, 8, {s1}, 8
 VCmpLeF32   | <- V1 V1 | nofpexcept V_CMP_LE_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCmpGtF32   | <- V1 V1 | nofpexcept V_CMP_GT_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCmpGeF32   | <- V1 V1 | nofpexcept V_CMP_GE_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpNgeF32  | <- V1 V1 | nofpexcept V_CMP_NGE_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCmpEqF32   | <- V1 V1 | nofpexcept V_CMP_EQ_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCmpNeF32   | <- V1 V1 | nofpexcept V_CMP_NEQ_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCmpLgF32   | <- V1 V1 | nofpexcept V_CMP_LG_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
@@ -180,6 +181,8 @@ VReadSub    | V1 <- V2 | {d} = V_MOV_B32_e32 {s0sub}, implicit $exec
 VMfma16x16x16F16 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X16F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16Z | V16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8Bf16 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X8BF16_1K_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8Bf16Z | V16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8BF16_1K_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Fp8 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Bf16 | V4 <- V4 V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Bf16Z | V4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
@@ -431,6 +434,8 @@ VMfmaScale32x32x64A8B8Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F
 VMfma16x16x16F16@a | A4 <- V2 V2 A4 | {d} = V_MFMA_F32_16X16X16F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16@a | A16 <- V2 V2 A16 | {d} = V_MFMA_F32_32X32X8F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16Z@a | A16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8F16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8Bf16@a | A16 <- V2 V2 A16 | {d} = V_MFMA_F32_32X32X8BF16_1K_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8Bf16Z@a | A16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8BF16_1K_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Fp8@a | A4 <- V2 V2 A4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Bf16@a | A4 <- V4 V4 A4 | {d} = V_MFMA_F32_16X16X32_BF16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Bf16Z@a | A4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
