@@ -41,3 +41,43 @@ Tried two rule changes:
 The back-end Weaver orders **units**. decode16, MLA and the backward dq have none (no `Units` / Weaver capture), so back-end ordering cannot act on them yet. The default scheduler measured +3–4 % on decode16 and +7 % on MLA at some shapes, but breaks MLA correctness at B32H16C2048 / B4H16C16384; backend-llvm-tail is fixing that first. Next:
 1. Express the decode16 and MLA bodies as Weaver units in today's emission order. This is md5-neutral: `Stmt::UnitMark` brackets do not change codegen.
 2. Then a per-family scheduler / ordering policy, measured with perf_ab.
+
+## 4. decode16 and MLA bodies as Weaver units (md5-neutral)
+
+The loop bodies are now captured as `amdgpu_dsl::units::Units` and emitted by `amdgpu_stage::weave::Weaver::seq` with a plan label (no weave region), in today's order. The plan records the units, and the `UnitMark` brackets carry no code, so the md5 manifest is identical (235 / 0) and `cargo test` passes 552 / 0.
+
+| kernel family | plan label | units |
+|---|---|---|
+| `pa_decode16_*` (all forms) | `decode16.loop` | `decode16.issue`, `wait_k` (anchor), `qk`, `softmax`, `wait_v` (anchor), `vconv`, `pv` |
+| `mla_decode_bf16_p*` | `mla.loop` | `mla.issue`, `wait0` / `qk0`, `wait1` / `qk1` (anchors + reads / MFMAs per half), `softmax`, `pv` |
+| `mla_decode_bf16_hp_p*` | `mla_hp.tile` (per tile of the `PairRing`) | `mla_hp.qk`, `softmax`, `pv` |
+
+`amdc weave-report` now shows the plan units:
+- `pa_decode16_bf16_hd128_p16_f` / `_c`: 6;
+- `mla_decode_bf16_p16`: 7;
+- `mla_decode_bf16_hp_p16`: 6.
+
+Next: a per-family ordering / scheduler policy on these units, measured with perf_ab, once backend-llvm-tail's fix of the default scheduler's MLA miscompile is in.
+
+## 5. hd192 small grids
+
+The same-run vendor ratios put the largest gaps here:
+- causal 1×16×16×4096²: 0.77×, run by the unpaired `_causal_np`, U = 256 = CUs;
+- full 1×8×8×4096²: 0.79–0.81×, run by the key split `_ks` S = 2, U = 128.
+
+**Dispatch alternatives, all measured negative.** `perf_ab --families fmha_hd192`, 7 reps:
+
+| rule variant | the case it targets | new / old |
+|---|---|--:|
+| non-causal S = 4 at U ≤ CUs / 2 | full 1×8×8×4096² | 0.872 FAIL |
+| causal ks2 at U = CUs | causal 1×16×16×4096² | 0.826 FAIL |
+| causal `np_q128` up to U = CUs | causal 1×16×16×4096² | 0.884 FAIL |
+
+So the choice among today's kernels is right, and the gap is inside the kernels. The untouched 4×16×16×2048² case moved by −2.1 % in the same run, which gives the harness's run-to-run noise on this family.
+
+**What the back-end Weaver could act on.** `fmha_fwd_bf16_v3_d` (hd192 / hd128) marks three weave regions:
+- `kv_stage`;
+- `v_phase`;
+- `m_phase`: `reorder` strategy on `m_phase` / `kv_stage`, and the `rewait` scheduler token for hd192.
+
+It has no `Units`, so no plan units. The next md5-neutral step, as for decode16 / MLA (§4), is to capture the three regions' contents as units. That gives the back-end Weaver phases it can mark *Free*, letting it reorder across the region boundaries where the dependences allow. A structural difference against the vendor kernel needs an ISA comparison like W5's (`tools/isa_diff.py`, `isa_cfg.py`), on the vendor's `fwd_hd192_hd128_bf16[_causal]` code objects, before any kernel change is chosen.
