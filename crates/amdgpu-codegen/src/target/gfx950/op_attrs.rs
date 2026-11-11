@@ -1026,8 +1026,10 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         BufferStoreDwordX4 => a("buffer_store_dwordx4", st).mem(G, true, Base::Unknown, 16).wide_store(0).agpr(false, 0b1),
         BufferLoadDwordX4Lds => a("buffer_load_dwordx4", dma).mem(G, false, Base::Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
         BufferLoadDwordX1Lds => a("buffer_load_dword", dma).mem(G, false, Base::Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
-        SBufferRsrc => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
-        SBufferRsrcDyn => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
+        // the expansion masks the base's high word with `s_and_b32`, which writes SCC (a scheduler moving the pseudo between an `s_cmp` and its
+        // `s_cselect` corrupted the selected value: MLA decode under the default scheduler; tests/emit_effects.rs checks every expansion)
+        SBufferRsrc => a("s_mov_b32", c(Salu, 4, 4, Unknown)).scc(false, true),
+        SBufferRsrcDyn => a("s_mov_b32", c(Salu, 4, 4, Unknown)).scc(false, true),
         GlobalStoreU16 => a("global_store_short", st).mem(G, true, Src(0), 2).agpr(false, 0b10),
         GlobalStoreF32 => a("global_store_dword", st).mem(G, true, Src(0), 4).agpr(false, 0b10),
         GlobalStoreF32x4 => a("global_store_dwordx4", st).mem(G, true, Src(0), 16).wide_store(1).agpr(false, 0b10),
