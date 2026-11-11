@@ -200,6 +200,13 @@ fn run_jthread(m: &mut MFunction) -> Result<(), String> {
     Ok(())
 }
 
+fn run_coldlayout(m: &mut MFunction) -> Result<(), String> {
+    if opt_on("coldlayout") {
+        crate::cfg_thread::cold_layout(m);
+    }
+    Ok(())
+}
+
 fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
     dce(m);
     Ok(())
@@ -224,6 +231,7 @@ pub const CLEANUP: &[LowerPass] = {
         LowerPass { info: info("lower-dce-final", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_dce_final },
         LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },
         LowerPass { info: info("lower-jthread", Lower, Generic, "token jthread (branches on flags known per incoming edge)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_jthread },
+        LowerPass { info: info("lower-coldlayout", Lower, Generic, "token coldlayout (blocks of `begin_if_unlikely` branches after the hot code)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_coldlayout },
     ]
 };
 
@@ -340,6 +348,10 @@ struct Lowerer {
     region_stack: Vec<u16>,
     /// open plan units (`Stmt::UnitMark`): `MInst::unit` = innermost id + 1
     unit_stack: Vec<u32>,
+    /// `Stmt::BranchHint` for the next `BeginIf`; per open if: is its then-branch cold; the depth of open cold then-branches
+    next_if_cold: bool,
+    cold_ifs: Vec<bool>,
+    cold_depth: u32,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -478,6 +490,9 @@ impl Lowerer {
             reg_plan: f.reg_plan.clone(),
             region_stack: Vec::new(),
             unit_stack: Vec::new(),
+            next_if_cold: false,
+            cold_ifs: Vec::new(),
+            cold_depth: 0,
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
@@ -659,7 +674,9 @@ impl Lowerer {
 
     fn start_block(&mut self, label: u32) {
         self.rfl_cache.clear();
-        self.mir.blocks.push(Block::new(label));
+        let mut b = Block::new(label);
+        b.cold = self.cold_depth > 0;
+        self.mir.blocks.push(b);
         self.cur = self.mir.blocks.len() - 1;
     }
 
@@ -2143,6 +2160,11 @@ impl Lowerer {
                     let else_l = self.fresh_label();
                     let end_l = self.fresh_label();
                     self.set_term(Term::CondGoto { on, target: then_l, fall: else_l });
+                    let cold = std::mem::take(&mut self.next_if_cold);
+                    self.cold_ifs.push(cold);
+                    if cold {
+                        self.cold_depth += 1;
+                    }
                     self.start_block(then_l);
                     self.if_stack.push((else_l, end_l));
                 }
@@ -2173,6 +2195,12 @@ impl Lowerer {
                     }
                     let (else_l, end_l) = *self.if_stack.last().ok_or("else without if")?;
                     self.set_term(Term::Goto(end_l));
+                    // the cold part of a hinted if is its then-branch only
+                    if let Some(c) = self.cold_ifs.last_mut() {
+                        if std::mem::take(c) {
+                            self.cold_depth -= 1;
+                        }
+                    }
                     self.start_block(else_l);
                 }
                 Stmt::StoreLdsB128 { addr, value } => {
@@ -2292,6 +2320,7 @@ impl Lowerer {
                 Stmt::StageEnd | Stmt::RegionMark { begin: false, .. } => {
                     self.region_stack.pop();
                 }
+                Stmt::BranchHint { unlikely } => self.next_if_cold = *unlikely,
                 Stmt::UnitMark { id, begin: true } => self.unit_stack.push(*id),
                 Stmt::UnitMark { begin: false, .. } => {
                     self.unit_stack.pop();
@@ -2361,6 +2390,9 @@ impl Lowerer {
                         self.converted = v;
                     }
                     let (else_l, end_l) = self.if_stack.pop().ok_or("endif without if")?;
+                    if self.cold_ifs.pop() == Some(true) {
+                        self.cold_depth -= 1;
+                    }
                     if self.else_started.remove(&else_l) {
                         // current block ends the else branch
                         if dirty_then || differs {

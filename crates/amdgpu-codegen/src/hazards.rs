@@ -402,7 +402,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         }
         let l = next_label;
         next_label += 1;
-        let pad = Block { label: l, insts, term: Term::Goto(to), pred: None };
+        let pad = Block { label: l, insts, term: Term::Goto(to), pred: None, cold: false };
         let is_fall = match &mut m.blocks[bi].term {
             Term::CondGoto { target, fall, .. } => {
                 if *fall == to {

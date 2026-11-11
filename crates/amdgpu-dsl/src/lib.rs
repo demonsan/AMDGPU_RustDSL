@@ -1201,6 +1201,9 @@ pub enum Stmt {
     /// A plan unit (docs/two-weavers.md; `plan::UnitDecl::id`): no code; the instructions lowered between begin and end are tagged with the unit
     /// (`MInst::unit`). Emitted by the front-end Weaver around each spliced unit.
     UnitMark { id: u32, begin: bool },
+    /// Branch-frequency hint for the `BeginIf` that follows (no code): `unlikely` = its then-branch is cold (laid out after the hot code by
+    /// the `coldlayout` lowering token).
+    BranchHint { unlikely: bool },
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -2218,6 +2221,14 @@ impl FnBuilder {
 
     #[track_caller]
     pub fn begin_if(&mut self, cond: impl Into<Opnd>) {
+        self.push_stmt(Stmt::BeginIf { cond: cond.into() });
+    }
+
+    /// `begin_if` whose then-branch is rarely taken (a rollback / overflow path): the hint lets the back end lay the branch out of the hot
+    /// path (lowering token `coldlayout`); without the token it changes nothing.
+    #[track_caller]
+    pub fn begin_if_unlikely(&mut self, cond: impl Into<Opnd>) {
+        self.push_stmt(Stmt::BranchHint { unlikely: true });
         self.push_stmt(Stmt::BeginIf { cond: cond.into() });
     }
 
@@ -3703,6 +3714,7 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
                 Some(_) => {}
                 None => errs.push(format!("stmt {idx}: weave_region_end without an open region")),
             },
+            Stmt::BranchHint { .. } if !matches!(f.stmts().get(idx + 1), Some(Stmt::BeginIf { .. })) => errs.push(format!("stmt {idx}: a branch hint must be followed by an `if`")),
             Stmt::UnitMark { id, begin: true } => units.push((*id, depth, idx)),
             Stmt::UnitMark { id, begin: false } => match units.pop() {
                 Some((u, d, at)) if u != *id || d != depth => errs.push(format!("stmt {idx}: unit {id} end does not close unit {u} (opened at stmt {at}) in the same structural block")),
@@ -4243,7 +4255,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } => {}
             Stmt::StageBegin { name, contract } => {
                 for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
                     if let Err(e) = opnd_ty(f, Opnd::Val(*v)) {

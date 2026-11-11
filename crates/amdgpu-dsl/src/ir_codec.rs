@@ -640,6 +640,7 @@ impl FromIr for Stmt {
             "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
             "RegionMark" => { v.expect_struct("RegionMark")?; Ok(Stmt::RegionMark { name: FromIr::from_ir(v.field("name")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
             "UnitMark" => { v.expect_struct("UnitMark")?; Ok(Stmt::UnitMark { id: FromIr::from_ir(v.field("id")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
+            "BranchHint" => { v.expect_struct("BranchHint")?; Ok(Stmt::BranchHint { unlikely: FromIr::from_ir(v.field("unlikely")?)? }) }
             "TileProduce" => { v.expect_struct("TileProduce")?; Ok(Stmt::TileProduce { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
             "TileConsume" => { v.expect_struct("TileConsume")?; Ok(Stmt::TileConsume { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
             "TileEnd" => { v.expect_unit("TileEnd")?; Ok(Stmt::TileEnd) }
@@ -705,6 +706,7 @@ impl IrIds for Stmt {
             Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
             Stmt::RegionMark { name, begin } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
             Stmt::UnitMark { id, begin } => { IrIds::ids(&mut (*id), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
+            Stmt::BranchHint { unlikely } => { IrIds::ids(&mut (*unlikely), fv, fr); }
             Stmt::TileProduce { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileConsume { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileEnd => {}

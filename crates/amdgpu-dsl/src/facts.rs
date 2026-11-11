@@ -268,7 +268,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e = oe;
             (c, vec![], false)
         }
-        Stmt::StageBegin { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {
+        Stmt::StageBegin { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {
             e.marker = true;
             (ResClass::Marker, vec![], false)
         }

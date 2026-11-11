@@ -4,6 +4,7 @@
 use amdgpu_dsl::{ev, CmpPred, CmpTy, DType, Ext, FnBuilder, Function, Op, Opnd};
 
 /// out[tid] = 1.0 when the loop left after an even tile (idx = 1 on that exit), 2.0 after an odd one; the loop walks n tiles two at a time.
+/// A rarely taken branch (`begin_if_unlikely`, it == 2) writes 3.0 to out[64 + tid] (n >= 3); otherwise that word stays untouched.
 pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     let mut b = FnBuilder::new("probe_two_exit", 64);
     // kernarg layout of tests/gpu/tileop_probe_host.cpp: in (unused), out, PROBE_I32
@@ -12,7 +13,7 @@ pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     b.arg("n", DType::I32, 0x10, 4);
     b.arg("pad", DType::I32, 0x14, 4);
     b.arg_tensor("i", Ext::c(4));
-    b.arg_tensor("o", Ext::c(64 * 4));
+    b.arg_tensor("o", Ext::c(128 * 4));
     b.ka_range(0x10, 1, 64);
     b.lower_opts(tokens);
     let po = b.let_(Op::KernargPtr { offset: 0x08 });
@@ -20,6 +21,14 @@ pub fn two_exit_kernel(tokens: &[&str]) -> Function {
     let tid = b.let_(Op::WorkitemId);
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))]);
     let (it, idx) = (vars[0], vars[1]);
+    let two = b.c_i32(2);
+    let rare = b.cmp(CmpPred::Eq, CmpTy::I32, Opnd::Var(it), two);
+    b.begin_if_unlikely(rare);
+    let off2 = b.bind_i32((ev(tid) << 2) + 256);
+    let q2 = b.ptr_add(po, off2);
+    let three = b.c_f32(3.0);
+    b.store_f32(q2, 0, three);
+    b.end_if();
     // tile it (slot 0)
     b.set_var(idx, Opnd::I32(1));
     let it1 = b.bind_i32(amdgpu_dsl::varx(it) + 1);
@@ -106,8 +115,20 @@ fn each_exit_goes_straight_to_its_drain() {
 fn write_asm() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/jthread");
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, tok) in [("base", &[][..]), ("jthread", &["jthread"][..])] {
+    for (name, tok) in [("base", &[][..]), ("jthread", &["jthread"][..]), ("cold", &["jthread", "coldlayout"][..])] {
         let c = amdgpu_codegen::compile(&two_exit_kernel(tok)).unwrap();
         std::fs::write(dir.join(format!("{name}.s")), c.asm).unwrap();
     }
+}
+
+/// `coldlayout`: the unlikely branch's store comes after the hot code (after `s_endpgm`), the hot loop falls through.
+#[test]
+fn the_unlikely_branch_is_laid_out_after_the_hot_code() {
+    let asm = |tok: &[&str]| amdgpu_codegen::compile(&two_exit_kernel(tok)).unwrap().asm;
+    let base = asm(&[]);
+    let cold = asm(&["coldlayout"]);
+    let three = "0x40400000";
+    let pos = |a: &str, s: &str| a.find(s).unwrap_or_else(|| panic!("{s} not found:\n{a}"));
+    assert!(pos(&base, three) < pos(&base, "s_endpgm"), "without the token the branch stays in place:\n{base}");
+    assert!(pos(&cold, three) > pos(&cold, "s_endpgm"), "with it the branch follows the hot code:\n{cold}");
 }

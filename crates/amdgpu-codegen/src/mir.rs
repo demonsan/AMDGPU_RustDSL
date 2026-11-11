@@ -681,11 +681,13 @@ pub struct Block {
     pub insts: Vec<MInst>,
     pub term: Term,
     pub pred: Option<Pred>,
+    /// a block of a branch hinted unlikely (`Stmt::BranchHint`): laid out after the hot code by `coldlayout`
+    pub cold: bool,
 }
 
 impl Block {
     pub fn new(label: u32) -> Self {
-        Block { label, insts: Vec::new(), term: Term::Endpgm, pred: None }
+        Block { label, insts: Vec::new(), term: Term::Endpgm, pred: None, cold: false }
     }
 }
 

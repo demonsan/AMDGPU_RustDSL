@@ -64,6 +64,16 @@ fn eval(m: &MFunction, insts: &[MInst], env: &mut HashMap<VReg, K>, gc: &HashMap
         };
         let (dst, out): (Option<VReg>, Option<K>) = match i.op {
             MOp::VMovB32 | MOp::SMovB32 => (i.dst, if i.srcs.is_empty() { Some(K::Int(i.imm)) } else { s(0).and_then(|x| val(env, x)).map(K::Int) }),
+            // SGPR -> VGPR copy (a scalarized flag read by a vector compare)
+            MOp::VMovFromS => (i.dst, s(0).and_then(|x| val(env, x)).map(K::Int)),
+            // scc ? srcs[0] : srcs[1]
+            MOp::SCselectB32 => {
+                let o = match env.get(&SCC) {
+                    Some(K::Bool(c)) => s(if *c { 0 } else { 1 }).and_then(|x| val(env, x)).map(K::Int),
+                    _ => None,
+                };
+                (i.dst, o)
+            }
             MOp::VCmpEqI32 | MOp::VCmpEqU32 => (Some(VCC), cmp(env, &|a, b| a == b, false)),
             MOp::VCmpNeI32 => (Some(VCC), cmp(env, &|a, b| a != b, false)),
             MOp::VCmpLtI32 => (Some(VCC), cmp(env, &|a, b| a < b, false)),
@@ -212,4 +222,20 @@ fn remove_unreachable(m: &mut MFunction) {
         k += 1;
         keep
     });
+}
+
+/// `coldlayout`: the blocks of branches hinted unlikely (`Block::cold`) move after every hot block (stable order on both sides). Every
+/// terminator names its targets, so the order changes only which edges fall through; the cold path ends in a jump back to its join.
+pub fn cold_layout(m: &mut MFunction) -> usize {
+    if m.blocks.first().map_or(true, |b| b.cold) {
+        return 0;
+    }
+    let n = m.blocks.iter().filter(|b| b.cold).count();
+    if n > 0 {
+        let blocks = std::mem::take(&mut m.blocks);
+        let (hot, cold): (Vec<Block>, Vec<Block>) = blocks.into_iter().partition(|b| !b.cold);
+        m.blocks = hot;
+        m.blocks.extend(cold);
+    }
+    n
 }
