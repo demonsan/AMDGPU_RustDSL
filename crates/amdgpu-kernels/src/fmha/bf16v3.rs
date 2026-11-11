@@ -67,6 +67,9 @@ struct Body<'a> {
     /// keys per tile and its 32-key blocks
     kt: i32,
     nb: usize,
+    /// PV(t) at the end of the softmax phase of tile t (the vendor's in-wave overlap): one Free plan phase {v.exp, m.pv} with the interleave hint
+    /// (the back-end merge places the exps of each 16-key step ahead of its MFMAs, docs/w6-laggards.md §5.1); the matrix phase keeps QK(t + 1)
+    pv_early: bool,
 }
 
 impl Body<'_> {
@@ -315,8 +318,22 @@ impl PipeBody for Body<'_> {
             .collect();
         pw
         });
+        if !self.pv_early {
+            amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.v_phase").seq().emit(b);
+            self.p = pw;
+            b.weave_region_end();
+            return;
+        }
+        // pv_early: v.exp moves into its own Free phase with PV(t)
+        let mut exp_unit = units.v.pop().expect("v.exp unit");
+        // (its dependences on the authored units stay program order: the phases are emitted in sequence)
+        exp_unit.deps.clear();
         amdgpu_stage::weave::Weaver::new(units).plan_label("bf16v3.v_phase").seq().emit(b);
+        let mut fu = amdgpu_dsl::units::Units::new();
+        fu.v.push(exp_unit);
         self.p = pw;
+        let (pv_id, _) = fu.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+        amdgpu_stage::weave::Weaver::new(fu).plan_label("bf16v3.v_pv").seq().free().interleave(pv_id, vec![0]).emit(b);
         b.weave_region_end();
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
@@ -325,7 +342,9 @@ impl PipeBody for Body<'_> {
         }
         b.weave_region_begin("m_phase");
         let mut units = amdgpu_dsl::units::Units::new();
-        units.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+        if !self.pv_early {
+            units.capture(b, "m.pv", |b| self.pv(b, &t.cur));
+        }
         if t.staged {
             let s = self.s.clone();
             units.capture(b, "m.qk", |b| self.qk(b, &t.next, Some(&s)));
@@ -353,7 +372,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let pair = dqk == 192 && !split && !name.contains("_np");
     // `_q128`: the 128-row / 64-key-tile form (mid-size causal grids, `dispatch`)
     let small = name.ends_with("_q128");
-    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small })
+    fmha_fwd_bf16_v3_o(name, causal, split, dqk, V3Opts { fresh2: pair, pair192: pair, small, pv_early: false })
 }
 
 /// Build options of `fmha_fwd_bf16_v3_d` (A/B variants).
@@ -365,6 +384,8 @@ pub struct V3Opts {
     pub pair192: bool,
     /// 128 query rows (two groups of 2 waves) x 64-key tiles: 64 KB (hd192 80 KB) of LDS, two workgroups per CU
     pub small: bool,
+    /// PV(t) in the softmax phase as one Free phase with the exps (`Body::pv_early`)
+    pub pv_early: bool,
 }
 
 /// `fmha_fwd_bf16_v3_d` with build options.
@@ -586,7 +607,7 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
     roles.each(&mut b, |b, role| {
         let mut body = Body {
             ring: &ring, kind, qf: &qf, kr: &lp.kr, kr2: &lp.kr2, vr: lp.vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true, kt, nb: (kt / 32) as usize,
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true, kt, nb: (kt / 32) as usize, pv_early: opts.pv_early,
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
