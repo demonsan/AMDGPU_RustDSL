@@ -296,6 +296,7 @@ pub struct AttnBody3<'a> {
     /// i mod 4, the vendor's v[20:51]): a read for the next MFMA never waits on the previous MFMA's operands
     pub frag_ring: bool,
     frags: std::cell::RefCell<Vec<amdgpu_dsl::RegRef>>,
+    frags_seq: std::cell::Cell<u32>,
     pinned: std::cell::Cell<bool>,
 }
 
@@ -328,7 +329,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, frag_ring: false, frags: Default::default(), setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, frag_ring: false, frags: Default::default(), frags_seq: Default::default(), setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -718,7 +719,9 @@ impl PipeBody for AttnBody3<'_> {
         let fr = std::mem::take(&mut *self.frags.borrow_mut());
         if self.frag_ring {
             // the matrix phase's fragments in issue order: V of PV(t), then K of QK(t + 1)
-            b.reg_rotate("kv", 4, &fr);
+            let n = self.frags_seq.get();
+            self.frags_seq.set(n + 1);
+            b.reg_rotate(&format!("kv{n}"), 4, &fr);
         }
         if let (Some(pt), true) = (self.blk.pt, t.staged) {
             // per-tensor FP8: the next tile's S scaled by m at the end of the matrix phase, where it is produced. At the start of the softmax
