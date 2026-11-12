@@ -251,17 +251,21 @@ yet; such a part is md5-identical by construction and is enabled per kernel with
 | B2 per-unit lowering caches | lowering token `unitlocal` | opt-in | `tests/unit_local.rs` |
 | B2 uniform SGPR operands | tokens `sgpr` (binary ops, compares), `sgpr2` (commutative VOP2 ops, `v_sub` minuend) | opt-in | `tests/b2_operands.rs`, `tools/sgpr2_probe.sh` (hardware) |
 | B2 M0 grouping of LDS-DMA issues | policy `m0_reuse` (GEMM) or token `m0reuse` (any kernel; the replica: 54 -> 18 M0 writes) | live for GEMM, opt-in elsewhere | md5; port_gate when a kernel adopts it |
-| B2 waits on the unscheduled path | - | not started (md5-changing, a W4-gated step) | - |
-| B3 ordering pass `bweave-order` (identity) | head of both pass bodies | live | md5 |
-| B4 instruction-level interleave in Free phases | `bweave::interleave` (plan `Hints::interleave`, dependency-aware merge, checked against `sched::depgraph`) | live, acts only on Free phases (none shipped yet) | md5; unit tests; perf_ab + port_gate per kernel |
-| B5 ring-slot dependences in the wait pass | `sched/waits.rs` `RingModel` (RAW DMA -> read, WAR read -> DMA, ageing at back edges) | active only for a plan with a cross-iteration DMA in a Free phase | `tests/ring_waits.rs` (mutation tests) |
+| B2 waits on the unscheduled path | unscheduled body: allocation with lowering's waits in place, then `waits-strip-auto` + `waitcnt-recompute` + `hazard-value` + `verify-waits` on the allocated order | live | perf_ab all families; the situv2 regression of the first version (recompute before RA shifted the allocation) fixed by recomputing after RA |
+| B3 ordering pass `bweave-order` (authored order) | scheduled body after `waits-strip-auto` (lowering's program-order waits do not pin a merge); unscheduled body at its head | live | md5 |
+| B4 instruction-level interleave in Free phases | `bweave::interleave_with` (plan `Hints::interleave`; each skeleton instruction preceded by the fillers it depends on; validated against `sched::depgraph` built with ALU across LDS-DMA fences, minus ring DMA / read edges of different slots or tiles) | live, acts only on Free phases (none shipped yet; kernel-opt's `ring2` experiment uses it) | md5; unit tests; perf_ab + port_gate per kernel |
+| B5 ring-slot dependences in the wait pass | `sched/waits.rs` `RingModel::of_function` (ring membership per unit from its tile markers; RAW DMA -> read, WAR read -> DMA, ageing at back edges) | active only for a plan with a cross-iteration DMA in a Free phase | `tests/ring_waits.rs` (mutation tests); `gpu_verify` GV-PLAN-RING checks the plan's slot claims against the protocol simulation |
 | B6a phase budgets as scheduler limits | `scheduler_options` (Free phases) | live, Free phases only | md5; `tests/budget_sched.rs` |
-| B6b register rotation | `RegMark::Ring` / `RegConstraint::RegRing` (disjoint buffers, `regplan`) | live (existing allocator constraint) | `regplan` verification |
+| B6b register buffers / rotation | `RegMark::Ring` (pairwise disjoint buffers, live); `reg_rotate` / `RegMark::Rotate` (fragment i in buffer i mod n: one register per residue class from `lower-rotate`, liveness-checked) | disjoint buffers live; rotation on branch `rotate`, not merged until a kernel compiles with it (the replica's `ring2r` needs 263 > 256 live dwords) | `regplan` verification; the rotation test on branch `rotate` |
 | B6c per-phase fallback | the rung before the unscheduled fallback | live, Free phases only | `tests/budget_sched.rs` |
 | CFG: jump threading, cold-block layout | tokens `jthread`, `coldlayout` (`cfg_thread.rs`, `begin_if_unlikely`) | opt-in (the replica uses them) | `tests/jthread.rs`, `tools/jthread_probe.sh` |
 | W5 instruction forms | tokens `cmpneg`, `movb64`, `salu32`; `BinOp::MulI32I24`; bf16 32x32x8 MFMA | opt-in | `tests/mops_w5.rs`, `tools/salu32_probe.sh` |
 | implicit SCC / VCC effects of every expansion | `tests/emit_effects.rs` | live check | cargo test |
+| VALU VCC write -> VALU VCC read distance 1 (was 2) | target row `valu-vcc-valu` | live (user decision; vs128 B4 S2048 -0.5..0.8 % accepted) | perf_ab --quick, port_gate, hazard oracle allowance |
+| verifier: select-refined loop variables | `gpu_verify` (`recompute` applies the override to `Opnd::Var`; a literal constant decides the refinement side) | live | `tests/gv_cycled_slot.rs` |
 | B7 removal of tokens / switches / ladders | - | not started | - |
+
+The pass list as built: `amdc passes --target gfx950` (catalogue: [pass-catalog.md](pass-catalog.md) section 9).
 
 Gates for every step: md5 manifest (or, for a behaviour change, `tools/perf_ab.sh --quick` PASS against Main plus `tools/port_gate.sh` for the
 shipped FMHA set), certificates unchanged, `cargo test`, `python/tests/run_all.sh` (incl. the hazard oracle). Design of B5 / B6:

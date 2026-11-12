@@ -354,7 +354,7 @@ const PHYS_WAR: Pass = Pass { info: info("hazard-phys-war", Post, Only, "always"
 const HZFILL: Pass = Pass { info: info("hz-fill", Post, Only, "scheduler token hzfill (strict on the scheduled path)", &[Test("crates/amdgpu-kernels/tests/hzfill.rs")]), run: run_hzfill };
 const M0_PAD: Pass = Pass { info: info("m0-pad", Post, Only, "always", &[Indirect("md5 manifest")]), run: run_m0_pad };
 const BWEAVE_ORDER: Pass = Pass {
-    info: info("bweave-order", Mir, Generic, "always (B3: every phase in today's order)", &[Test("crates/amdgpu-codegen/src/bweave.rs"), Indirect("md5 manifest")]),
+    info: info("bweave-order", Mir, Generic, "always (B3: authored order; B4: the interleave hints of Free phases, ring-aware)", &[Test("crates/amdgpu-codegen/src/bweave.rs"), Indirect("md5 manifest")]),
     run: run_bweave_order,
 };
 const SOFT_CLAUSE: Pass = Pass {

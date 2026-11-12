@@ -422,6 +422,21 @@ Additions the output should support: `--json`; `--check` (every pass must list >
   `_t128`, are declared by that kernel as `lower_opts`). `policy_name` remains only for the `AMDC_SCHED_ADD` experiment matching.
 - Every step: md5 manifest 0 differences (234 kernels), certificates unchanged.
 
+## 9. Current pipeline (Main ed666ee4, `amdc passes --target gfx950`)
+
+63 rows: 16 front (3 source, 12 lowering incl. `lower-movb64`, `lower-jthread`, `lower-coldlayout`, then `assign-agpr`), 25 scheduled, 19
+unscheduled, 3 back. Changes since section 8:
+- **scheduled body:** `sched-cfg-cleanup`, `waits-strip-auto`, then `bweave-order` (the back-end Weaver: authored order plus the interleave
+  hints of Free phases, docs/two-weavers.md section 7), then the scheduler passes as before; `hazard-soft-clause` closes the body.
+- **unscheduled body:** `bweave-order`, `sched-phase-strip`, M0 / pin / `hazard-value` / `verify-mir-structure` / `verify-waits`, `regalloc`
+  with lowering's waits in place, then `waits-strip-auto`, `waitcnt-recompute`, `hazard-value` and `verify-waits` again on the allocated order
+  (W3 B2), then the post-RA hazards.
+- **wait pass:** with a plan whose Free phase moves an LDS-DMA across iterations, `waitcnt-recompute` / `verify-waits` add the ring-slot
+  dependences (`RingModel`, docs/w3-b5-b6.md).
+- **retry ladders:** unchanged (outer: `remat1..4`, `ldsspill8..64`; inner: pressure cuts / hoist caps / launch budget); before the
+  unscheduled fallback, a rung that keeps the schedule except in the Free phases (B6c).
+- **verification:** `tests/emit_effects.rs` (each expansion's implicit SCC / VCC effects declared), GV-PLAN-RING.
+
 ## Appendix: counts
 
 Catalogued: 7 pre-lowering IR / analysis rows, 7 lowering rows, 1 AGPR row, 13 scheduling rows (+4 scheduler analyses), 3 MIR check / hazard rows,
