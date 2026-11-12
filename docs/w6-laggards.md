@@ -318,3 +318,7 @@ Neither a deeper ring nor more CTAs per CU (§7: two rounds −10 %) moves F. On
 - Built and not dispatched: (a), the in-kernel reduce.
 - Measured negative, with the cause: (c), deeper streaming.
 - Proposed: the split-rule refit with the S = 8 data (sched).
+
+## 8. MXFP4 GEMM — closed at 0.85–0.90×
+
+Baseline, scheduler options, a B-direct-to-register prototype (−10 … −15 %; TA pressure halved, bank conflicts unchanged) and the bank-conflict attribution (about 84 % from the A reads, about 16 % from the LDS epilogue) are in [`mxfp4-gemm-profile.md`](mxfp4-gemm-profile.md), section W6. The remaining gap is aiter's composition (B in registers with a register plan sized for it), not a single lever.
