@@ -8,7 +8,7 @@ This replaces the earlier snapshot (v10 vs `d4349932`).
 
 ## Verdict
 
-**Every family is OK: no family geometric mean is below 1.0 beyond noise, and 112 of the 326 case rows are IMPROVED. 4 case rows were below 1.0 beyond the 3-repetition noise; 3 of them are noise (the 9-repetition re-run passes), 1 is a real regression of 3.3 % on one memory-bound kernel (below), reported to the back-end owner.**
+**Every family is OK: no family geometric mean is below 1.0 beyond noise, and 112 of the 326 case rows are IMPROVED. 4 case rows were below 1.0 beyond the 3-repetition noise; 3 of them are noise (the 9-repetition re-run passes), 1 is a real regression of 3.3 % on one memory-bound kernel (below), reported to and fixed by the back-end owner (`sitfix`).**
 
 | family | cases | geomean new/old | allowed drop | verdict |
 |---|--:|--:|--:|---|
@@ -37,8 +37,8 @@ the MoE block_m band, the head-parallel MLA at short context); the others are ke
 | moe/fp4/M2048D7168I256E64K8#stage1 | 0.975 | noise: the fp4 stage kernels are the same at E64 r 256 (the block_m rule is unchanged there) | 1.004 (OK, 3.9 %) |
 | **mb/situv2_mul_quant d4096** | 0.969 | **real**: `situv2_mul_quant_fp8_d4096` has different assembly (md5 22e093ac in v10, 5651eda5 in the final Main) | **0.967 (FAIL, allowed drop 2.4 %)**: 4609 -> 4456 GB/s |
 
-**The one regression:** in v10 the kernel's 16 global loads are consumed through staged partial waits (`s_waitcnt vmcnt(15)`, `vmcnt(7)`, then `vmcnt(6)` .. `vmcnt(0)` between the 8 compute groups; 14 `s_waitcnt` in total); in the final Main there are no partial `vmcnt` waits after the early `s_waitcnt vmcnt(0)` (8 `s_waitcnt`,
-`lgkmcnt` is staged instead), so all loaded data is awaited before compute and the load-to-use overlap is lost. The scoreboard wait pass (the `uwaits` work) is the likely cause; the note with the two assemblies (`/tmp/sit_old.s` / `/tmp/sit_new.s` on node 53) went to the back-end owner. It is one case of the 91 memory-bound cases (family geometric mean 1.005).
+**The one regression:** a real 3.3 % loss from code churn, not from lost wait staging (my first reading). The kernel has an explicit `wait_vm(0)` right after its 16 loads in both trees; v10's later `vmcnt(15) .. (0)` waits were dead after that drain. The cause (back-end owner's analysis): `uwaits` recomputed the waits
+BEFORE register allocation, which shifted the linear-scan positions, so the registers and the hazard-fill order changed (2429 non-wait lines differ). Fixed on `origin/sitfix` (the unscheduled path allocates with lowering's waits in place and recomputes the waits after RA): `situv2_mul_quant_fp8_d4096` is v10's code again, minus the dead waits. It is one case of the 91 memory-bound cases (family geometric mean 1.005).
 
 Re-run (`--only` the four ids, 9 repetitions):
 
