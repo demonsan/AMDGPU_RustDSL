@@ -74,6 +74,10 @@ pub struct GemmConfig {
     /// 3-slot LDS ring (`Pipeline::rs_depth` 3): tile t + 3 is staged while t + 2 is still in flight (counted top wait) - small CTAs whose
     /// per-tile compute is shorter than the memory latency. Unit-scale forms only (no other VMEM in the loop).
     pub depth3: bool,
+    /// split-K with the reduce in the kernel (`_lc`): the last of the S split CTAs of an output tile (atomic ticket on `ptr_cnt[by NT + bx]`,
+    /// kernarg 104, u32 [tiles][4 waves], zero before the first launch; the last CTA resets it) sums the S fp32 partials of the tile's real rows, applies the
+    /// per-token x per-channel scales and stores bf16 C to `ptr_out` (kernarg 96): one launch instead of the main kernel + `gemm_splitk_reduce`
+    pub lastc: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -177,7 +181,7 @@ pub enum MoeStage {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false, lastc: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -207,6 +211,10 @@ impl GemmConfig {
     /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
     pub fn splitk(self) -> GemmConfig {
         GemmConfig { split_k: true, ..self }
+    }
+    /// Split-K with the in-kernel last-arriver reduce (`GemmConfig::lastc`).
+    pub fn splitk_lc(self) -> GemmConfig {
+        GemmConfig { split_k: true, lastc: true, ..self }
     }
     /// MXFP4 A4W4 (`gemm_a4w4_mxfp4`): fp4 operands, 1 x 32 E8M0 scales in the scaled MFMAs.
     pub fn a4w4() -> GemmConfig {
@@ -265,11 +273,14 @@ pub fn by_name(name: &str) -> Option<Function> {
         // bf16 64 x 128 on the 3-slot ring (256x7168x4096 41.3 (128) -> 23.5 us, 128x4096x8192 74.0 -> 37.3)
         "gemm_a16w16_bf16_64" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() })),
         "gemm_a16w16_bf16_64_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() }.splitk())),
+        "gemm_a16w16_bf16_64_splitk_lc" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64_splitk_lc", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a16w16_128() }.splitk_lc())),
         "gemm_a8w8_i8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_i8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
+        "gemm_a8w8_i8_64_splitk_lc" => Some(gemm_mxfp8_bs("gemm_a8w8_i8_64_splitk_lc", GemmConfig { elem: Elem::I8, cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk_lc())),
         // (fp8 per-token: 256x7168x4096 22.98 (128) -> 13.60 us, 1024x4096x8192 51.6 -> 46.0)
         "gemm_a8w8_rowcol_fp8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_rowcol_fp8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
+        "gemm_a8w8_rowcol_fp8_64_splitk_lc" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64_splitk_lc", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk_lc())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
@@ -278,6 +289,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         // the mid / small-M forms (`dispatch::blockscale_config`)
         "gemm_a8w8_blockscale_64" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_blockscale() })),
         "gemm_a8w8_blockscale_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_blockscale() }.splitk())),
+        "gemm_a8w8_blockscale_64_splitk_lc" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_64_splitk_lc", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_blockscale() }.splitk_lc())),
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
         n if n.starts_with("moe_sum_bf16h_k") => n["moe_sum_bf16h_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16_x(n, k, true)),
@@ -409,6 +421,8 @@ pub(crate) struct GemmCx {
     wave_m: i64,
     wave_n: i64,
     stamp_ctx: Option<(ValueId, ValueId, bool)>,
+    /// `lastc`: the LDS word that broadcasts the CTA's ticket
+    tk: Option<Shared>,
 }
 
 /// The slots of the GEMM v4 skeleton (`skeleton_v4.rs`, generated from `graph::graph()`): the orchestration the graph leaves to the kernel.
@@ -430,6 +444,17 @@ impl skeleton_v4::V4Slots for GemmSlots {
     declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor, cfg.elem.a_images(), cfg.moe_bias);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
+    if cfg.lastc {
+        assert!(cfg.split_k && stamp_mode.is_none() && !cfg.batched && cfg.moe.is_none() && cfg.conv.is_none() && cta_n == 128, "lastc: plain split-K, 128 columns");
+        b.arg("ptr_out", DType::Ptr, 96, 8);
+        b.arg("ptr_cnt", DType::Ptr, 104, 8);
+        let (mt, nt) = (Ext::sym("MT"), Ext::sym("NT"));
+        b.arg_tensor("ptr_out", Ext::c(2 * cta_m * cta_n) * mt.clone() * nt.clone());
+        b.arg_tensor("ptr_cnt", Ext::c(16) * mt.clone() * nt.clone());
+        // the S slices of fp32 partials: written by the S split CTAs (generation = split id), read in full by the tile's last arriver
+        b.buf_region("ws", "ptr_c", Ext::c(0), Ext::c(4 * cta_m * cta_n) * Ext::sym("S") * mt * nt);
+        b.buf_last_arriver("ws", "ptr_cnt", Ext::sym("S"));
+    }
     if stamp_mode.is_some() {
         b.arg("dbg_stamps", DType::Ptr, 96, 8);
         b.arg_tensor("dbg_stamps", Ext::sym("MT") * Ext::sym("NT") * Ext::c((4 * STAMP_SLOTS * 4) as i64));
@@ -539,6 +564,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     } else {
         None
     };
+    let tk: Option<Shared> = None;
     lds.commit(b);
 
     // ---- operand reads: the 16-row blocks of the wave (padded A: a 16-row block = two 1056-byte blocks of 8 rows; B 2048 bytes) ----
@@ -880,7 +906,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     if let Some(mc) = &moe_cx {
         b.begin_if(Opnd::Val(mc.live));
     }
-    GemmCx { cfg, moe: moe_cx, rsrc_sfa_e: Some((rsrc_sfa, rsrc_sfb)), body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
+    GemmCx { cfg, moe: moe_cx, rsrc_sfa_e: Some((rsrc_sfa, rsrc_sfb)), body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx, tk }
     }
     fn pipeline(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) -> Pipeline {
         if let Some((buf, rec, _)) = cx.stamp_ctx {
@@ -914,6 +940,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         PipeBody::post_wait(&mut cx.body, b, role, t)
     }
     fn epilogue(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) {
+        let cx_tk = cx.tk.clone();
         let GemmCx { cfg, body, ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx, .. } = cx;
         let (cfg, lane, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx) = (*cfg, *lane, *ptr_c, *m_v, *n_v, *bx, *by, *wm, *wn, *lg_m, *lg_n, *wave_m, *wave_n, *stamp_ctx);
         let (ctx, mma, s_lane, s_n, s_wm, s_wn) = (&*ctx, &*mma, &*s_lane, &*s_n, &*s_wm, &*s_wn);
@@ -965,6 +992,10 @@ impl skeleton_v4::V4Slots for GemmSlots {
             }
         }
         let plan = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::GLOBAL, &ctx.dyns);
+        if cfg.lastc {
+            lastc_epilogue(b, &plan, ctx, &body.acc, (body.rsrc_sfa, body.rsrc_sfb), cfg, c_org, z, mp, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, ptr_c);
+            return;
+        }
         let bases: Vec<ValueId> = plan.bases.iter().map(|e| {
             let o = b.bind_i32(ctx.lower(e));
             b.ptr_add(cb, o)
@@ -1027,4 +1058,138 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.stamp_store(buf, rec, 4, st);
     }
     }
+}
+
+/// The `lastc` split-K epilogue (the fused-combine pattern of `pa_decode16_*_c`, verified by `buf_last_arriver`): every WAVE writes its fp32
+/// partial blocks (real rows only, write-through `sc1` buffer stores) into slice z of `ptr_c`, releases (`fence_release_lite`) and takes one
+/// ticket on `ptr_cnt[by NT + bx]` (lane 0; the other lanes' offsets are out of range). The 4 S arrivals of an output tile see tickets
+/// 0 .. 4 S - 1; the wave with ticket 4 S - 1 acquires (`fence_acquire_lite`, coherent `sc1` loads), sums the S slices of the tile's real rows,
+/// applies the per-token x per-channel scales, stores bf16 to `ptr_out` and resets the counter. No barrier: the waves arrive independently.
+#[allow(clippy::too_many_arguments)]
+fn lastc_epilogue(b: &mut FnBuilder, plan: &amdgpu_layout::OffsetPlan, ctx: &Ctx, acc: &[VarId], scl: (ValueId, ValueId), cfg: Cfg, c_org: ValueId, z: ValueId, mp: ValueId, m_v: ValueId, n_v: ValueId, bx: ValueId, by: ValueId, wm: ValueId, wn: ValueId, lg_m: i32, lg_n: i32, wave_m: i64, wave_n: i64, ptr_c: ValueId) {
+    let sc1 = amdgpu_dsl::CachePolicy { sc0: false, sc1: true, nt: false };
+    let s_v = b.let_(Op::KernargI32 { offset: 36 });
+    let c0 = b.c_i32(0);
+    let big = b.c_i32(0x7fff_fff0);
+    let r_ws = { let v = b.bind_i32(ev(s_v) * ev(mp) * ev(n_v) * 4); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptr_c, v) };
+    let nj = (wave_n / 16) as usize;
+    for i in 0..(wave_m / 16) as usize {
+        let r0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * wave_m as i32 + 16 * i as i32);
+        let live = b.bind_cond(ev(r0).lt(ev(m_v)));
+        b.begin_if(Opnd::Val(live));
+        let vos: Vec<ValueId> = (0..nj).map(|j| { let (bi, _) = plan.issues[i * nj + j]; b.bind_i32(ev(c_org) + ctx.lower(&plan.bases[bi])) }).collect();
+        b.buf_produce("ws", z);
+        for j in 0..nj {
+            let n = i * nj + j;
+            let (_, imm) = plan.issues[n];
+            b.buffer_store_c(r_ws, Some(Opnd::Val(vos[j])), c0, imm as u32, Opnd::Var(acc[n]), amdgpu_dsl::MemTy::B128, false, sc1);
+        }
+        b.tile_end();
+        b.end_if();
+    }
+    // ---- release, the wave's ticket, the last arriving wave of the output tile combines ----
+    b.fence_release_lite();
+    let tid = b.let_(Op::WorkitemId);
+    let lane = b.bind_i32(ev(tid) & 63);
+    let is0 = b.bind_cond(ev(lane).lt(1));
+    let p_cnt = b.let_(Op::KernargPtr { offset: 104 });
+    let nt = b.bind_i32(ev(n_v).lshr(lg_n));
+    let mtiles = b.bind_i32(ev(mp).lshr(lg_m));
+    // one counter per (output tile, wave): the S waves that own the same wave_m x wave_n block arrive on it
+    let wave = b.bind_i32(ev(wm) + (ev(wn) << 1));
+    let gofs = b.bind_i32((((ev(by) * ev(nt) + ev(bx)) << 2) + ev(wave)) << 2);
+    let ncnt = { let v = b.bind_i32(ev(mtiles) * ev(nt) * 16); b.read_first_lane(v) };
+    let r_cnt = b.buffer_desc_dyn(p_cnt, ncnt);
+    let cvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(gofs), b: Opnd::Val(big) });
+    let c1 = b.c_i32(1);
+    let old = b.buffer_atomic_add_ret(r_cnt, cvo, c0, 0, c1);
+    let last = b.bind_i32(ev(s_v) - 1);
+    let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old), Opnd::Val(last)));
+    let any = b.any_lane(is_last);
+    b.wg_winner(any, &[2], "last arriver: the S waves owning one wave block of an output tile (one per split CTA) take tickets 0..S-1 on one counter; only ticket S - 1 runs the combine of that block");
+    b.begin_if(Opnd::Val(any));
+    {
+        b.fence_acquire_lite();
+        let zf = b.c_f32(0.0);
+        // the wave's wave_m x wave_n block; lane l: columns 4 (l % 16) .. + 3 of it, rows l / 16 + 4 q
+        let cg = b.bind_i32(ev(lane) & 15);
+        let rr = b.bind_i32(ev(lane).lshr(4));
+        let col = b.bind_i32((ev(bx) << lg_n) + ev(wn) * wave_n as i32 + (ev(cg) << 2));
+        let mn = { let v = b.bind_i32(ev(m_v) * ev(n_v)); b.read_first_lane(v) };
+        let p_out = b.let_(Op::KernargPtr { offset: 96 });
+        let r_out = { let v = b.bind_i32(ev(mn) << 1); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_out, v) };
+        let slice4 = { let v = b.bind_i32(ev(mp) * ev(n_v) * 4); b.read_first_lane(v) };
+        let rowcol = cfg.scales == Scales::RowCol;
+        let sb = rowcol.then(|| { let o = b.bind_i32(ev(col) << 2); b.buffer_load_b128(scl.1, o, 0i32, 0) });
+        // the row quads of the block that hold real rows: nq = ceil((M - row0) / 4), at most wave_m / 4 (the winner only runs with row0 < M)
+        let row0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * wave_m as i32);
+        let rows = b.bind_i32((ev(m_v) - ev(row0)).min(wave_m as i32).max(1));
+        let nq = { let v = b.bind_i32((ev(rows) + 3).lshr(2)); b.read_first_lane(v) };
+        let qv = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        b.assume_trusted(qv[0], Ext::c(0), Ext::c(wave_m / 4 - 1), "row-quad counter: starts at 0, the loop exits once q + 1 >= nq <= wave_m / 4");
+        {
+            let row = b.bind_i32(ev(row0) + (amdgpu_dsl::varx(qv[0]) << 2) + ev(rr));
+            let rlive = b.bind_cond(ev(row).lt(ev(m_v)));
+            let e0 = b.bind_i32((ev(row) * ev(n_v) + ev(col)) << 2);
+            let vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(rlive), a: Opnd::Val(e0), b: Opnd::Val(big) });
+            let st: Vec<(DType, Opnd)> = std::iter::once((DType::I32, Opnd::I32(0))).chain((0..4).map(|_| (DType::F32, Opnd::Val(zf)))).collect();
+            let v = b.begin_loop(&st);
+            let si = amdgpu_dsl::varx(v[0]);
+            b.assume_trusted(v[0], Ext::c(0), Ext::sym("S") - Ext::c(1), "split counter: starts at 0, steps by 4, the loop exits once s + 4 >= S");
+            // 4 splits per iteration, their loads in flight together (a split past S reads out of range: 0)
+            let xs: Vec<ValueId> = (0..4i32)
+                .map(|u| {
+                    let su = b.bind_i32(si.clone() + u);
+                    let lv = b.bind_cond(ev(su).lt(ev(s_v)));
+                    let vu = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lv), a: Opnd::Val(vo), b: Opnd::Val(big) });
+                    let so = { let x = b.bind_i32(ev(su) * ev(slice4)); b.read_first_lane(x) };
+                    b.buf_consume("ws", Opnd::Val(su));
+                    let x = b.buffer_load_c(r_ws, Some(Opnd::Val(vu)), so, 0, amdgpu_dsl::MemTy::B128, sc1);
+                    b.tile_end();
+                    x
+                })
+                .collect();
+            for r in 0..4u8 {
+                let mut a = Opnd::Var(v[1 + r as usize]);
+                for x in &xs {
+                    let f = b.frag4_lane(Opnd::Val(*x), r);
+                    let f = b.bitcast_f32(f);
+                    a = Opnd::Val(b.add_f32(a, f));
+                }
+                b.set_var(v[1 + r as usize], a);
+            }
+            let n1 = b.bind_i32(si + 4);
+            b.set_var(v[0], n1);
+            let dn = b.bind_cond(ev(n1).ge(ev(s_v)));
+            b.break_if(dn);
+            b.end_loop();
+            let mut y: Vec<ValueId> = (0..4).map(|r| { let z0 = b.c_f32(0.0); b.add_f32(Opnd::Var(v[1 + r]), z0) }).collect();
+            if let Some(sb) = sb {
+                let ra = b.bind_i32(ev(row) << 2);
+                let ra = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(rlive), a: Opnd::Val(ra), b: Opnd::Val(big) });
+                let sa = b.buffer_load_f32(scl.0, ra, 0i32, 0);
+                for (r, yv) in y.iter_mut().enumerate() {
+                    let c = b.frag4_lane(Opnd::Val(sb), r as u8);
+                    let c = b.bitcast_f32(c);
+                    let s = b.mul_f32(sa, c);
+                    *yv = b.mul_f32(*yv, s);
+                }
+            }
+            let w0 = b.cvt_pk_bf16_f32(y[0], y[1]);
+            let w1 = b.cvt_pk_bf16_f32(y[2], y[3]);
+            let f2 = b.frag2(w0, w1);
+            let oo = b.bind_i32((ev(row) * ev(n_v) + ev(col)) << 1);
+            let oo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(rlive), a: Opnd::Val(oo), b: Opnd::Val(big) });
+            b.buffer_store_b64(r_out, oo, 0i32, 0, f2);
+        }
+        let q1 = b.bind_i32(amdgpu_dsl::varx(qv[0]) + 1);
+        b.set_var(qv[0], q1);
+        let qd = b.bind_cond(ev(q1).ge(ev(nq)));
+        b.break_if(qd);
+        b.end_loop();
+        // the counter back to 0 for the next launch (lane 0)
+        let zc = b.c_i32(0);
+        b.buffer_store_c(r_cnt, Some(Opnd::Val(cvo)), c0, 0, zc, amdgpu_dsl::MemTy::B32, false, sc1);
+    }
+    b.end_if();
 }

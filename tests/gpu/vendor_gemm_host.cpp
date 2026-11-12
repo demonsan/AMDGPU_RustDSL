@@ -298,10 +298,22 @@ int main(int argc, char** argv) {
         a.u32(92, MP);
         a.u32(88, (kind == "f4" ? K / 256 : kind == "bf16" ? K / 64 : K / 128) / splitk);
         gz = splitk;
+        const std::string knm(kn);
+        if (knm.size() > 3 && knm.compare(knm.size() - 3, 3, "_lc") == 0) {
+            // in-kernel last-arriver reduce: bf16 C at 96, the tile counters (u32 [MP / tileM][N / tileN][4 waves], zero; the kernel resets them) at 104
+            void* dCnt = nullptr;
+            const size_t cb = (size_t)(MP / tM) * (N / tN) * 4 * 4;
+            HC(hipMalloc(&dCnt, cb + 256));
+            HC(hipMemset(dCnt, 0, cb + 256));
+            if (a.b.size() < 112) a.b.resize(112);
+            a.ptr(96, dC);
+            a.ptr(104, dCnt);
+        } else {
         hipModule_t rmod;
         HC(hipModuleLoad(&rmod, getenv("REDUCE_CO")));
         HC(hipModuleGetFunction(&rfn, rmod, getenv("REDUCE_KN")));
         ra.ptr(0, dWS); ra.ptr(8, dC); ra.ptr(16, dSA); ra.ptr(24, dSB); ra.u32(32, M); ra.u32(36, N); ra.u32(40, splitk); ra.u32(44, MP); ra.b.resize(48);
+        }
     }
     // BATCH=n (ours_v4_bf16 / ours_v4_rowcol_fp8 with a `_bmm` kernel): n dense batches; the LAST batch holds the reference data (the others
     // are filled with 0x3c bytes), grid z = n; the check reads the last batch's C

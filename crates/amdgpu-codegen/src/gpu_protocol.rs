@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use amdgpu_dsl::{Function, Op, Opnd, Stmt, ValueId, VarId};
+use amdgpu_dsl::{AtomicOp, Function, Op, Opnd, Stmt, ValueId, VarId};
 
 use crate::gpu_verify::{Report, Severity};
 
@@ -192,10 +192,15 @@ fn is_global_access(st: &Stmt) -> Option<(bool, bool)> {
     match st {
         Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x2 { .. } | Stmt::StoreF32x4 { .. } => Some((true, false)),
         Stmt::StoreF32Wt { .. } => Some((true, true)),
+        // buffer forms: write-through / coherent with `sc1`
+        Stmt::BufferStoreN { cache, .. } => Some((true, cache.sc1)),
+        Stmt::BufferStore { .. } => Some((true, false)),
         Stmt::StoreGlobalN { .. } | Stmt::AtomicGlobalNoRet { .. } => Some((true, false)),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } => Some((false, false)),
             Op::LoadF32Coherent { .. } => Some((false, true)),
+            Op::BufferLoadN { cache, .. } => Some((false, cache.sc1)),
+            Op::BufferLoad { .. } => Some((false, false)),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } => Some((false, false)),
             Op::AtomicGlobal { .. } => Some((true, false)),
             _ => None,
@@ -1511,6 +1516,8 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         // ticket: the atomic on the counter after the stores
         let ticket = f.stmts().iter().enumerate().skip(last_store + 1).find_map(|(i, s)| match s {
             Stmt::Let { dst, op: Op::AtomicAddU32 { base, .. } } if ptr_arg(f, base, 0).as_deref() == Some(la.counter_arg.as_str()) => Some((i, *dst)),
+            // the buffer form: an atomic add through a descriptor over the counter pointer (one lane takes it, the others are out of range)
+            Stmt::Let { dst, op: Op::BufferAtomicRet { op: AtomicOp::AddU32, rsrc, .. } } if rsrc_arg(f, rsrc).as_deref() == Some(la.counter_arg.as_str()) => Some((i, *dst)),
             _ => None,
         });
         let Some((ticket_idx, ticket_val)) = ticket else {
@@ -1529,7 +1536,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
             continue;
         }
-        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. } | Op::BufferAtomicRet { op: AtomicOp::AddU32, .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
         if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
             fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
         }
@@ -1555,6 +1562,16 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         if !rep.errors().iter().any(|e| e.msg.contains(&format!("last-arriver `{region}`"))) {
             rep.ok("last-arriver");
         }
+    }
+}
+
+/// The pointer kernarg a buffer descriptor is built over (`BufferRsrc` / `BufferRsrcDyn` of a kernarg pointer, possibly offset).
+fn rsrc_arg(f: &Function, o: &Opnd) -> Option<String> {
+    let Opnd::Val(v) = o else { return None };
+    let op = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
+    match op {
+        Op::BufferRsrc { base, .. } | Op::BufferRsrcDyn { base, .. } => ptr_arg(f, base, 0),
+        _ => None,
     }
 }
 

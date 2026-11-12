@@ -258,3 +258,40 @@ The split-K epilogue stores a 16-row block only when it holds a real row: one wa
 - md5: the 7 split-K kernels change.
 
 Next: (a) the reduce inside the main kernel (one launch: a last-arriver per output tile) and (c) deeper weight streaming per CU.
+
+### 7.2 (a) the split-K reduce inside the kernel (`_64_splitk_lc`) — correct, not dispatched
+
+Kernels `gemm_a16w16_bf16_64_splitk_lc`, `gemm_a8w8_i8_64_splitk_lc`, `gemm_a8w8_rowcol_fp8_64_splitk_lc` and `gemm_a8w8_blockscale_64_splitk_lc` (`GemmConfig::splitk_lc`). New kernargs: `ptr_out` at 96 (bf16 C) and `ptr_cnt` at 104 (u32 counters `[tiles][4 waves]`, zero before the first launch; the kernel resets them).
+
+**How it works.** Each wave:
+1. writes its fp32 partial blocks (real rows only) with write-through `sc1` buffer stores;
+2. releases (`fence_release_lite`);
+3. takes one ticket on its block's counter (lane 0).
+
+The wave that draws ticket S − 1 for its block then:
+- acquires;
+- sums the S slices of the block's real rows with coherent `sc1` loads, 4 splits in flight per step;
+- applies the per-token × per-channel scales;
+- stores bf16 and resets the counter.
+
+There is no barrier. An earlier variant had one ticket per CTA and the combine done by a single wave: M = 64 took 47 µs against 9.
+
+**Verification.** `buf_last_arriver` now accepts the buffer forms: `sc1` buffer stores and loads as write-through / coherent, and a buffer atomic through a descriptor over the counter as the ticket (`gpu_protocol::rsrc_arg`). The four kernels prove `last-arriver` with 0 errors.
+
+**Correctness.** Full-row checks for M = 1 / 7 / 33 / 64 / 100 at N = K = 4096, all kinds: 0 bad. The host's `vendor_gemm_host` runs `_lc` kernels with zeroed counters and no reduce launch.
+
+**Performance, same session.** Timed with back-to-back launches, so the reduce launch is mostly hidden by launch pipelining:
+
+| shape | fp8 per-token × per-channel, reduce → `_lc` | bf16, reduce → `_lc` |
+|---|---|---|
+| 1 × 8192² | 16.4 → 15.9 µs | 23.9 → 23.9 µs |
+| 1 × 7168² | 11.4 → 11.1 µs | 18.6 → 17.7 µs |
+| 4 × 4096² | 6.8 → 6.8 µs | 9.2 → 8.8 µs |
+| 16 × 8192² | 16.3 → 17.3 µs | 24.3 → 25.3 µs |
+| 32 × 8192² | 17.1 → 19.9 µs | 25.0 → 27.2 µs |
+
+The rocprofv3 per-kernel 4.4 µs of the reduce does not show up end-to-end, because consecutive launches overlap. The in-kernel combine saves 0–5 % at M ≤ 4 and costs 6–16 % from M = 16, where the last arrivers' combine tail is serial behind the main loop.
+
+**Not dispatched.** The ABI addition, through the hosts, the JIT and the graph plans, is not worth +3–5 % at M ≤ 4. The kernels and the verifier extension stay as the fused-combine building block.
+
+**Next: (c) deeper weight streaming.** It is the larger lever: the 8-bit main kernel streams at 4.2 TB/s where bf16 reaches 5.4 TB/s.
