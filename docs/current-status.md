@@ -1,7 +1,7 @@
 # 当前状态总览（authoritative snapshot）
 
-本文件是仓库的**唯一权威当前状态快照**（v9.2，Main `08cd00a4`：在 v9（对照 aiter kernel zoo 的基础算子覆盖、TIRx 式 tile-op 层、64 位寻址、
-结构化诊断）之上，本轮补上跨工作组写不相交证明、信任清单、Python 算子层与启动开销、一批正确性修复，见 §1.1）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
+本文件是仓库的**唯一权威当前状态快照**（v11，Main `a65de21a`：在 v10 四层重构之上，本轮按 [`two-weavers-plan.md`](two-weavers-plan.md) 建成“四层 + 两个 Weaver”结构，
+并做了 W4 性能基线、W5 厂商 FMHA 复刻与 W6 落后族优化，见 §1.0；v9.2 的记录保留在 §1.1）。数字来自 MI355X / gfx950（`mi355-gpu-53`）上的同轮硬件测量，复现命令见 §8。
 厂商事实在 [`vendor-spec.md`](vendor-spec.md)，设计规格在 [`design.md`](design.md)；历史逐轮记录与各代设计研究在
 [`archive/`](archive/README.md)（其中的数字、kernel 名与开关只代表当时的状态）。
 
@@ -15,7 +15,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`，Main `08cd00a4`）：`_vs128` `dd009e44`、`_t128` `84269a3b`、`_kvsplit` `240ecbae`、`_kvsplit_combine8h` `24a95a51`（v9.2：nop 填充与 M0 修复改变了 `_t128` / `_kvsplit`，VALU 写 SGPR 的冒险填充又改变了 `_vs128`，见 §6.3；`port_gate` 全部 PASS）。
+  asm md5（`--backend own`，Main `a65de21a`）：`_vs128` `b7a3a2ac`、`_t128` `84269a3b`、`_kvsplit` `240ecbae`、`_kvsplit_combine8h` `24a95a51`（v11：`_vs128` 改为 W5 复刻配置，再经 SCC 修复重排，见 §1.0；其余三个与 v9.2 相同；`port_gate` 全部 PASS）。
 - **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-08，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**740 TF/s（1.025× 厂商）**；
   铺满网格 B4H8S2048 **1804（0.976×）** / B1H8S8192 **2416（0.988×）** / B2H8S2048 **1279（0.978×）**；`_vs128` 每 CU 64 blocks **694（0.959×）**；`_t128` B2H8S2048 layout 中位数 **1173（0.901×）**。
   25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.929–1.063×，几何平均 **0.992**（之前 0.980）。最近一步是厂商的 XCD 感知 block 顺序（K/V 的 L2 命中率 20 % → 77 %，[`fmha-wave-org.md`](fmha-wave-org.md)）。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
@@ -38,11 +38,78 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `v_pk_fma_f32`、片段视图与原地拼接、`tileop::ewise / apply2 / allreduce`，每条都过“属性表 → 双后端 → hazard oracle → 硬件探针”闭环。
 - **64 位寻址**：`ptr_mad` 把描述符基址移到 tile / expert / slot（> 4 GiB 张量），验证器证明移动后的描述符仍在 extent 内。
 - **结构化诊断**：`--json`、`amdc summary`、`amdc srcmap`（[`diagnostics.md`](diagnostics.md)）。
-- `cargo test` **121 个测试目标 / 519 项全绿**；Python 节点检查 `python/tests/run_all.sh`：52 / 52 算子检查 + 可达 kernel 编译 / 汇编扫描 PASS。
-- 严格 GPU 语义证书：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**。
+- `cargo test` **144 个测试目标 / 586 项全绿**（Main `a65de21a`）；md5 清单 **240 个 kernel**、0 差异；Python 节点检查 `python/tests/run_all.sh` OVERALL PASS：62 / 62 算子检查 + 可达 kernel 编译 / 汇编扫描 + hazard oracle + **每个可达 kernel 的严格 gpu-verify**（v11 新增的守卫，`crates/amdgpu-kernels/tests/verify_reachable.rs`）。
+- 严格 GPU 语义证书（Main `a65de21a`）：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**（与 v9.2 相同）。
   信任清单与每一项的去留见 [`trust-inventory.md`](trust-inventory.md)。
 
-### 1.1 v9.2 本轮（2026-11-09 / 10）
+### 1.0 v11 本轮（2026-11-11 / 12）：四层 + 两个 Weaver
+
+**结构（已建成，[`two-weavers-plan.md`](two-weavers-plan.md)，接口设计 [`two-weavers.md`](two-weavers.md)，v10 分层 [`refactor-4layer-plan.md`](refactor-4layer-plan.md)）**
+
+| 部分 | crate | 本轮状态 |
+|---|---|---|
+| L1 图 | `amdgpu-graph` | 算子图、融合与分派规则（`dispatch.rs`）、`compose_facts.rs`（由每个 kernel 的 Weaver 计划生成，`tools/regen_compose_facts.sh`） |
+| L2 stage | `amdgpu-stage` | stage 实例与合同、流水线模板（`pipeline.rs`：`TwoPhaseOffset` / `OneWindow` / `RegStaged`，`unroll2`、`ahead2`）、前端 Weaver（`weave.rs`：单元捕获、`free` / `interleave` / 预算 / 环声明的计划 API） |
+| L3 功能块 | `amdgpu-tile`、`amdgpu-layout`、`amdgpu-isa` | tile op、片段、copy / DMA、softmax、归约、epilogue、指令 atom |
+| L4 IR + 后端 Weaver | `amdgpu-dsl`、`amdgpu-codegen`、`amdgpu-target` | 计划（`plan.rs`：phase / unit / ring / sync / 寄存器约束）、后端 Weaver：B4 自由 phase 内的指令级交织、B5 跨迭代放置（环槽令牌、按依赖重算等待）、B6a phase 寄存器预算、B6b `reg_rotate`、B6c 按 phase 的分配回退；验证器（`gpu_verify`，本轮新增 `GV-PLAN-RING`） |
+
+全部 12 个 crate 零 `unsafe`（10 个声明 `#![forbid(unsafe_code)]`；`amdgpu-graph` / `amdgpu-stage` 源码中没有 `unsafe`）。
+
+**W4 性能基线**（[`perf-ab.md`](perf-ab.md)，[`perf-v11-vs-v10.md`](perf-v11-vs-v10.md)）：`tools/perf_ab.sh` 对每个集成 kernel 族做同轮新旧 A/B（含厂商列），每个改变行为的合并都过它。v11 对 v10 的全族同轮对照：**没有任何族变慢**；gemm 1.040（组合搜索的规则更新）、mla 1.139、decode 1.011、fmha_mxfp8 1.015，其余族在噪声内。本轮新增 `gemv` 族（小 M GEMM，60 例）。
+
+**本轮改变的出厂 md5 与门禁**（数字与证据见所引文档）：
+
+| kernel | 变化 | 门禁 |
+|---|---|---|
+| `fmha_fwd_hd128_mxfp8_v3_vs128` | W5 复刻配置（无缩放 PV、两 tile 一趟、跳转线程化、冷回滚块、厂商指令形式），再经 SCC 修复（`b7a3a2ac`） | `port_gate` PASS；perf_ab fmha_mxfp8 1.017（[`fmha-replica.md`](fmha-replica.md) §4.9） |
+| `mla_decode_bf16_p*` / `_hp_p*`、`attn_combine_bf16_hd512` | 每 kernel 打开带重排的 list 调度器（依赖 SCC 修复） | perf_ab mla 1.139，4/4 IMPROVED；正确性标记（[`w6-laggards.md`](w6-laggards.md) §6） |
+| `pa_decode16_bf16_hd128_p16_c` | 同上，仅 last-arriver 形式 | perf_ab decode 1.012–1.015（§6） |
+| 7 个 split-K GEMM（`*_64_splitk`、`*_128_splitk`、`gemm_a8w8_blockscale_splitk`） | fp32 部分和只写含真实行的 16 行块 | 全行检查 0 bad、严格验证、`run_all` PASS；perf_ab gemv 1.060（[`w6-laggards.md`](w6-laggards.md) §7.1） |
+| 一批由 list 调度器排序的 kernel（含 `_vs128`） | 后端：描述符伪指令声明 SCC 写入后调度重排（正确性修复） | backend 的门禁（perf_ab、`port_gate`、`run_all`）；变化的 kernel 见 `tests/golden/md5_manifest.tsv` 的提交历史 |
+
+新增但不分派的 kernel：`fmha_fwd_hd128_mxfp8_v3_ring2`（距离 2 的拷贝环 + B5，测试载体）、`*_64_splitk_lc`（kernel 内 last-arriver 归约，4 个 dtype）。
+
+**与厂商的比值（同轮，比 = 厂商时间 / ours）**，在 §1.1 的表上本轮的变化：
+
+| 族 | v11 |
+|---|---|
+| 出厂 MXFP8 FMHA（`port_gate`，`_vs128` 复刻配置） | 每 CU 0.971×、B4H8S2048 0.983×、B1H8S8192 0.991×、B2H8S2048 0.973×、8 布局中位数 0.972×（[`fmha-replica.md`](fmha-replica.md) §4.9）；KV-split 与 `_t128` 本轮未变（§1.1 的数字） |
+| MLA decode | 对 v10 快 1.07–1.23×（几何 1.139） |
+| paged decode16 | 对 v10 快 1.02–1.04×（split 形状） |
+| GEMM 族 | 对 v10 几何 1.040（规则）；小 M（M ≤ 64）再 +2–14 %（gemv 几何 1.060）；MXFP4 仍 0.85–0.90×（已关闭，原因见 [`mxfp4-gemm-profile.md`](mxfp4-gemm-profile.md) W6 节） |
+| bf16 / hd192 prefill、反向、MoE、访存受限 | 与 v10 持平（噪声内）；hd192 小网格 0.77–0.81× 仍为最大差距（[`w6-laggards.md`](w6-laggards.md) §5） |
+
+**W5：厂商 MXFP8 FMHA 1:1 复刻（[`fmha-replica.md`](fmha-replica.md)）**
+- 工具：`tools/isa_diff.py`、`isa_forms.py`、`isa_cfg.py`。
+- 复刻 kernel `fmha_fwd_hd128_mxfp8_v3_replica`：热循环 437 对厂商 439 条指令。
+- 采用为出厂 `_vs128` 的五步：无缩放 PV、两 tile 一趟、厂商指令形式、跳转线程化、冷回滚块。
+- 测得为负、未采用：钉住寄存器 −4…−12 %，厂商 M 阶段顺序 −4…−8 %。
+- 距离 2 拷贝环（ring2）：B5 放置后仍 −2.5…−6.5 %。加上 B6b 寄存器轮转与厂商 M 阶段顺序后为每 CU 0.829× 厂商（出厂 0.982×）。结论：厂商的组合需要它自己的寄存器计划，这条线在当前寄存器计划下关闭（§4.10、§5）。
+- 差异分类表见 §5。
+
+**W6：落后族（[`w6-laggards.md`](w6-laggards.md)）**
+- 采用：
+  - MLA / decode16 的调度器策略（+13.9 % / +1.5 %）；
+  - 小 M split-K 只写真实行（+6 %）。
+- 作为构件合入、不分派：
+  - decode16 / MLA / bf16 v3 的 Weaver 单元；
+  - kernel 内 last-arriver 归约，以及 `buf_last_arriver` 对 buffer 形式的验证扩展；
+  - `Pipeline::ahead2` 与 `KvRing3::new_kv`；
+  - Weaver 计划 API。
+- 测得为负、记录原因后关闭：
+  - lowering token 用在落后族上（中性）；
+  - hd192 分派变体（−12…−17 %）；
+  - bf16 v3 把 PV 移入 softmax 的 B4 交织（−7…−8 %）；
+  - 单组 in-wave 流水原型（−9…−20 %）；
+  - 更深的 GEMV 权重流（−0…−4 %；稳态流已达约 8.7 TB/s，小 M 差距是每次调用约 8.8 µs 的固定部分）；
+  - MXFP4 的 B 直进寄存器原型（−10…−15 %）。
+
+**验证与工具**
+- `gpu_tiles` 的屏障变异测试在 debug 下从 >25 分钟降到 191 秒：协议检查按 trace 缓存，并带变异用的迭代上限。
+- 退出决策的路径上限从 64 提到 256：修复了 `fmha_fwd_hd128_fp8pt_v3_causal` 被推过上限的问题。
+- 新守卫 `verify_reachable`：每个可达 kernel 严格验证 0 错误。
+
+### 1.1 v9.2（2026-11-09 / 10，历史记录）
 
 - **与厂商的比值（同进程同数据，比 = 厂商时间 / ours）**，详见 [`op-coverage-design.md`](op-coverage-design.md) §7.4–§7.8 的汇总表与 [`op-coverage-membound.md`](op-coverage-membound.md) 的总表：
 
