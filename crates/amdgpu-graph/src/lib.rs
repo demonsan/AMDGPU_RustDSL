@@ -6,6 +6,8 @@
 //! * [`dispatch`]: the host-side rules that pick a kernel form and its parameters for a launch shape (measured same-run against the vendor kernels). Moved from `amdgpu-kernels::dispatch`;
 //!   the rules only return names and numbers, the tests that check the names are registered live in `amdgpu-kernels/tests/dispatch_compile.rs`.
 
+#![forbid(unsafe_code)]
+
 pub mod compose;
 pub mod compose_facts;
 pub mod compose_search;

@@ -8,6 +8,8 @@
 //!
 //! Moved from `amdgpu-tile` (M7 of docs/crate-split.md); `TileIt` stays in `amdgpu_tile::lane` (L3 data).
 
+#![forbid(unsafe_code)]
+
 pub mod attention;
 pub mod components;
 pub mod contract_stage;
