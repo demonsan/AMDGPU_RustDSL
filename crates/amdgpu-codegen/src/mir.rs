@@ -749,6 +749,8 @@ pub struct RegHints {
     /// (region name, arch VGPR cap, AGPR cap)
     pub caps: Vec<(String, Option<u32>, Option<u32>)>,
     pub rings: Vec<(String, Vec<VReg>)>,
+    /// register rotations: (name, buffers, fragments in issue order; fragment i in buffer i mod buffers)
+    pub rotations: Vec<(String, u32, Vec<VReg>)>,
     /// annotations whose target has no register (unused / folded value): kept for the report
     pub unresolved: Vec<String>,
     /// canonical vreg -> the DSL name of the value / variable it holds (`%v12`, `%r3`), for reports
@@ -760,7 +762,7 @@ pub struct RegHints {
 impl RegHints {
     /// Does the plan constrain the allocator at all?
     pub fn active(&self) -> bool {
-        !(self.pins_v.is_empty() && self.share.is_empty() && self.separate.is_empty() && self.caps.is_empty() && self.rings.is_empty())
+        !(self.pins_v.is_empty() && self.share.is_empty() && self.separate.is_empty() && self.caps.is_empty() && self.rings.is_empty() && self.rotations.is_empty())
     }
 }
 

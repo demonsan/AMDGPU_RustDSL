@@ -249,6 +249,8 @@ pub enum RegConstraint {
     Pin { value: RegRef, base: u32 },
     /// the register buffers of one fragment ring (today's `RegMark::Ring`): allocated as a group
     RegRing { name: String, bufs: Vec<RegRef> },
+    /// a register rotation (today's `RegMark::Rotate`): fragment i in buffer i mod `bufs`
+    Rotate { name: String, bufs: u32, frags: Vec<RegRef> },
 }
 
 /// Optional guidance.

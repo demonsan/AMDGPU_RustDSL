@@ -1351,6 +1351,10 @@ pub enum RegMark {
     Cap { region: String, vgprs: Option<u32>, agprs: Option<u32> },
     /// The `bufs.len()` register buffers of one fragment (double / triple buffering): pairwise separate, placement reported.
     Ring { name: String, bufs: Vec<RegRef> },
+    /// HARD: a register rotation through `bufs` buffers (the vendor FMHA's K / V fragments in one register block): fragment i (in issue
+    /// order) uses buffer i mod `bufs`, i.e. the fragments of one residue class share ONE register tuple (their lifetimes must be
+    /// disjoint) and the classes never share registers.
+    Rotate { name: String, bufs: u32, frags: Vec<RegRef> },
 }
 
 /// A node of the structured kernel body (region IR): straight-line statements and nested regions. Loops, ifs and tile / buffer
@@ -2296,6 +2300,12 @@ impl FnBuilder {
     #[track_caller]
     pub fn reg_ring(&mut self, name: &str, bufs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Ring { name: name.to_string(), bufs: bufs.to_vec() });
+    }
+    /// HARD: rotate `frags` (in issue order) through `bufs` register buffers: fragment i uses buffer i mod `bufs` (RegMark::Rotate).
+    #[track_caller]
+    pub fn reg_rotate(&mut self, name: &str, bufs: u32, frags: &[RegRef]) {
+        assert!(bufs > 0, "reg_rotate: at least one buffer");
+        self.f.reg_plan.push(RegMark::Rotate { name: name.to_string(), bufs, frags: frags.to_vec() });
     }
     /// The kernel plan under construction (docs/two-weavers.md), created on first use. Only the front end (the Weaver) writes it; a kernel that never weaves has no plan.
     pub fn plan_mut(&mut self) -> &mut plan::KernelPlan {

@@ -836,6 +836,7 @@ impl FromIr for RegMark {
             "Separate" => { v.expect_tuple("Separate", 1)?; Ok(RegMark::Separate(FromIr::from_ir(v.item(0)?)?)) }
             "Cap" => { v.expect_struct("Cap")?; Ok(RegMark::Cap { region: FromIr::from_ir(v.field("region")?)?, vgprs: FromIr::from_ir(v.field("vgprs")?)?, agprs: FromIr::from_ir(v.field("agprs")?)? }) }
             "Ring" => { v.expect_struct("Ring")?; Ok(RegMark::Ring { name: FromIr::from_ir(v.field("name")?)?, bufs: FromIr::from_ir(v.field("bufs")?)? }) }
+            "Rotate" => { v.expect_struct("Rotate")?; Ok(RegMark::Rotate { name: FromIr::from_ir(v.field("name")?)?, bufs: FromIr::from_ir(v.field("bufs")?)?, frags: FromIr::from_ir(v.field("frags")?)? }) }
             other => Err(v.err(format!("unknown RegMark variant `{other}`"))),
         }
     }
@@ -848,6 +849,7 @@ impl IrIds for RegMark {
             RegMark::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             RegMark::Cap { region, vgprs, agprs } => { IrIds::ids(&mut (*region), fv, fr); IrIds::ids(&mut (*vgprs), fv, fr); IrIds::ids(&mut (*agprs), fv, fr); }
             RegMark::Ring { name, bufs } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); }
+            RegMark::Rotate { name, bufs, frags } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); IrIds::ids(&mut (*frags), fv, fr); }
         }
     }
 }
@@ -1677,6 +1679,7 @@ impl FromIr for RegConstraint {
             "Separate" => { v.expect_tuple("Separate", 1)?; Ok(RegConstraint::Separate(FromIr::from_ir(v.item(0)?)?)) }
             "Pin" => { v.expect_struct("Pin")?; Ok(RegConstraint::Pin { value: FromIr::from_ir(v.field("value")?)?, base: FromIr::from_ir(v.field("base")?)? }) }
             "RegRing" => { v.expect_struct("RegRing")?; Ok(RegConstraint::RegRing { name: FromIr::from_ir(v.field("name")?)?, bufs: FromIr::from_ir(v.field("bufs")?)? }) }
+            "Rotate" => { v.expect_struct("Rotate")?; Ok(RegConstraint::Rotate { name: FromIr::from_ir(v.field("name")?)?, bufs: FromIr::from_ir(v.field("bufs")?)?, frags: FromIr::from_ir(v.field("frags")?)? }) }
             other => Err(v.err(format!("unknown RegConstraint variant `{other}`"))),
         }
     }
@@ -1688,6 +1691,7 @@ impl IrIds for RegConstraint {
             RegConstraint::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             RegConstraint::Pin { value, base } => { IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*base), fv, fr); }
             RegConstraint::RegRing { name, bufs } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); }
+            RegConstraint::Rotate { name, bufs, frags } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); IrIds::ids(&mut (*frags), fv, fr); }
         }
     }
 }

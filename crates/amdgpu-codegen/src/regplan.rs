@@ -208,6 +208,26 @@ pub fn report(m: &MFunction, a: &Alloc) -> Vec<String> {
 pub fn check(m: &MFunction, a: &Alloc) -> Result<(), String> {
     let h = &m.reg_hints;
     let name = |r: VReg| h.names.get(&m.canon(r)).cloned().unwrap_or_else(|| format!("r{r}"));
+    // rotations: one register tuple per residue class, the classes disjoint
+    for (rn, bufs, frags) in &h.rotations {
+        let bufs = (*bufs).max(1) as usize;
+        let ph = |r: VReg| a.phys[m.canon(r) as usize];
+        for (i, &x) in frags.iter().enumerate() {
+            for (j, &y) in frags.iter().enumerate().skip(i + 1) {
+                if x == u32::MAX || y == u32::MAX || ph(x) == u32::MAX || ph(y) == u32::MAX {
+                    continue;
+                }
+                let (wx, wy) = (m.vreg_class(m.canon(x)).dwords(), m.vreg_class(m.canon(y)).dwords());
+                let same = i % bufs == j % bufs;
+                if same && ph(x) != ph(y) {
+                    return Err(format!("register plan: rotation `{rn}`: fragments {i} ({}) and {j} ({}) share a buffer but sit at v{} / v{}", name(x), name(y), ph(x), ph(y)));
+                }
+                if !same && ph(x) < ph(y) + wy && ph(y) < ph(x) + wx {
+                    return Err(format!("register plan: rotation `{rn}`: fragments {i} ({}) and {j} ({}) are in different buffers but overlap (v{} / v{})", name(x), name(y), ph(x), ph(y)));
+                }
+            }
+        }
+    }
     for (r, b) in &h.pins_v {
         match place(m, a, *r) {
             Some((false, p, _)) if p == *b => {}

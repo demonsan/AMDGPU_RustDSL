@@ -274,10 +274,12 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let width = c.dwords() as usize;
             let lo = if width == 1 { V_RESERVED } else { width };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
+            // a rotation class shares one tuple: a member placed earlier fixes the registers
+            let forced = plan.rot_target(r, &phys);
             let mut found = None;
             let mut i = lo;
             while i + width <= VGPR_COUNT {
-                let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i);
+                let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i) && forced.as_ref().map_or(true, |f| f.0 as usize == i);
                 // tuple alignment: the allocator's own rule is width alignment; an explicit pin needs only the ISA's even alignment (gfx90a+:
                 // 64-bit aligned VGPR tuples; the vendor FMHA keeps its S tiles at v[52:67])
                 let aligned = i % width == 0 || (plan.pin(r).is_some() && i % 2 == 0);
@@ -288,6 +290,14 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 i += 1;
             }
             if found.is_none() {
+                if let Some((b, q, rn, pos)) = &forced {
+                    let overlap = segs[*q as usize].iter().any(|(qs, qe)| my.iter().any(|(ms, me)| !(*qe < *ms || *me < *qs)));
+                    return Err(if overlap {
+                        format!("register plan: rotation `{rn}`: {} (fragment {pos}, live {s}..{e}) and {} share a buffer but are live at the same time (a read ran ahead of the previous fragment's last use)", plan.name(r), plan.name(*q))
+                    } else {
+                        format!("register plan: rotation `{rn}`: the buffer of {} (fragment {pos}) at v{b} is taken by another value live at the same time", plan.name(r))
+                    });
+                }
                 if let Some(b) = plan.pin(r) {
                     let bi = b as usize;
                     let why = if (bi..bi + width).any(|k| forbid[k]) {
@@ -1055,13 +1065,15 @@ struct Plan {
     sep: HashMap<VReg, Vec<VReg>>,
     /// vreg -> the vregs it should share registers with (hint)
     share: HashMap<VReg, Vec<VReg>>,
+    /// vreg -> (rotation name, its residue-class partners, its position): the class shares ONE register tuple (hard)
+    rot: HashMap<VReg, (String, Vec<VReg>, usize)>,
     names: HashMap<VReg, String>,
 }
 
 impl Plan {
     fn new(m: &MFunction) -> Plan {
         let h = &m.reg_hints;
-        let mut p = Plan { active: h.active(), pins: HashMap::new(), sep: HashMap::new(), share: HashMap::new(), names: h.names.clone() };
+        let mut p = Plan { active: h.active(), pins: HashMap::new(), sep: HashMap::new(), share: HashMap::new(), rot: HashMap::new(), names: h.names.clone() };
         if !p.active {
             return p;
         }
@@ -1073,6 +1085,23 @@ impl Plan {
                 for b in g {
                     if m.canon(*a) != m.canon(*b) {
                         p.sep.entry(m.canon(*a)).or_default().push(m.canon(*b));
+                    }
+                }
+            }
+        }
+        for (name, bufs, frags) in &h.rotations {
+            let bufs = (*bufs).max(1) as usize;
+            for (i, &a) in frags.iter().enumerate() {
+                if a == u32::MAX {
+                    continue;
+                }
+                let a = m.canon(a);
+                let class: Vec<VReg> = frags.iter().enumerate().filter(|(j, x)| j % bufs == i % bufs && **x != u32::MAX && *j != i).map(|(_, x)| m.canon(*x)).collect();
+                p.rot.insert(a, (name.clone(), class, i));
+                // the classes never share registers
+                for (j, &b) in frags.iter().enumerate() {
+                    if b != u32::MAX && j % bufs != i % bufs && m.canon(b) != a {
+                        p.sep.entry(a).or_default().push(m.canon(b));
                     }
                 }
             }
@@ -1094,6 +1123,14 @@ impl Plan {
         } else {
             None
         }
+    }
+    /// The registers a rotation partner of `r` already holds (registers, partner, rotation name, r's fragment position).
+    fn rot_target(&self, r: VReg, phys: &[u32]) -> Option<(u32, VReg, String, usize)> {
+        if !self.active {
+            return None;
+        }
+        let (name, class, pos) = self.rot.get(&r)?;
+        class.iter().find(|q| phys[**q as usize] != u32::MAX).map(|q| (phys[*q as usize], *q, name.clone(), *pos))
     }
     fn name(&self, r: VReg) -> String {
         self.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"))
@@ -1140,6 +1177,28 @@ impl Plan {
                 return Ok(Some(b));
             }
             return Err(format!("register plan: pin of {} ({c:?}) at v{b} cannot be honoured: the registers are taken by a value live at the same time or by a separate partner", self.name(r)));
+        }
+        // a rotation class shares one register tuple: the first member placed decides, every later member must take it
+        if let Some((name, class, pos)) = self.rot.get(&r) {
+            for &q in class {
+                let pq = phys[q as usize];
+                if pq == u32::MAX {
+                    continue;
+                }
+                if m.vreg_class(q) != c {
+                    return Err(format!("register plan: rotation `{name}`: {} ({c:?}, fragment {pos}) and {} ({:?}) are in one buffer but have different register classes", self.name(r), self.name(q), m.vreg_class(q)));
+                }
+                if start[q as usize] <= e && s <= end[q as usize] {
+                    return Err(format!(
+                        "register plan: rotation `{name}`: {} (fragment {pos}, live {s}..{e}) and {} (live {}..{}) share a buffer but are live at the same time (a read ran ahead of the previous fragment's last use)",
+                        self.name(r), self.name(q), start[q as usize], end[q as usize]
+                    ));
+                }
+                if free(pq as usize) {
+                    return Ok(Some(pq as usize));
+                }
+                return Err(format!("register plan: rotation `{name}`: the buffer of {} (fragment {pos}) at v{pq} is taken by another value live at the same time", self.name(r)));
+            }
         }
         if let Some(ps) = self.share.get(&r) {
             for &q in ps {

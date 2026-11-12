@@ -628,6 +628,17 @@ impl Lowerer {
                     let g = group(self, bufs, &mut unresolved);
                     self.mir.reg_hints.rings.push((name.clone(), g));
                 }
+                RegMark::Rotate { name, bufs, frags } => {
+                    // keep the issue positions (an unresolved fragment leaves a hole, so the residues of the others stay right)
+                    let g: Vec<Option<VReg>> = frags.iter().map(|r| res(self, r)).collect();
+                    for (r, x) in frags.iter().zip(&g) {
+                        if x.is_none() {
+                            unresolved.push(format!("{r:?}"));
+                        }
+                    }
+                    let full: Vec<VReg> = g.iter().map(|x| x.unwrap_or(u32::MAX)).collect();
+                    self.mir.reg_hints.rotations.push((name.clone(), *bufs, full));
+                }
             }
         }
         self.mir.reg_hints.unresolved = unresolved;

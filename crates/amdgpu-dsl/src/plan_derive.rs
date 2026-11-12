@@ -139,6 +139,12 @@ pub fn derive(f: &mut Function) {
                     plan.reg_constraints.push(c);
                 }
             }
+            RegMark::Rotate { name, bufs, frags } => {
+                let c = RegConstraint::Rotate { name: name.clone(), bufs: *bufs, frags: frags.clone() };
+                if !plan.reg_constraints.contains(&c) {
+                    plan.reg_constraints.push(c);
+                }
+            }
         }
     }
 
