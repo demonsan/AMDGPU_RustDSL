@@ -284,7 +284,7 @@ def gemm():
                     emit.append(red)
                 tm, tn = _tile(kn)
                 return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
-            out.append(Case(id=f'gemm/{kind}/{m}x{n}x{k}', family='gemm', build=build, metric='tflops', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
+            out.append(Case(id=f'gemm/{kind}/{m}x{n}x{k}', family='gemm', build=build, metric='us' if m <= 128 else 'tflops', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))   # small M: the 1-decimal TF/s quantizes (see gemv)
     # the MXFP8 blockscale GEMM v4 against the aiter PR #6696 code object (gemm_ref_host runs both)
     for (m, n, k) in [(4096, 4096, 8192), (8192, 8192, 8192), (1024, 4096, 8192)]:
         def build(side, m=m, n=n, k=k):
@@ -311,7 +311,8 @@ def gemv():
                         emit.append(red)
                     tm, tn = _tile(kn)
                     return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
-                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='tflops', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
+                # the host prints TF/s with one decimal (4.3 vs 4.2 TF/s is 2.4 % at M = 1): the small-M cases are judged on the microseconds it prints with two
+                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
     return out
 
 
