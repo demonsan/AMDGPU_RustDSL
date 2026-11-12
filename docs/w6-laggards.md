@@ -295,3 +295,26 @@ The rocprofv3 per-kernel 4.4 µs of the reduce does not show up end-to-end, beca
 **Not dispatched.** The ABI addition, through the hosts, the JIT and the graph plans, is not worth +3–5 % at M ≤ 4. The kernels and the verifier extension stay as the fused-combine building block.
 
 **Next: (c) deeper weight streaming.** It is the larger lever: the 8-bit main kernel streams at 4.2 TB/s where bf16 reaches 5.4 TB/s.
+
+### 7.3 (c) deeper weight streaming — the stream is not the limit
+
+**Experiment.** I generalized `Pipeline` `RegStaged` to ring depth D ≥ 3: md5-identical for D = 3. A 4-slot form keeps three stages in flight (`gemm_*_64_splitk_d4`, experimental). Same session, back-to-back launches, every row checked: the 4-slot ring is 0 … 4 % **slower** everywhere (fp8 1 × 8192² 16.6 → 16.8 µs, bf16 24.0 → 24.7 µs, 64 × 8192² equal). Not kept.
+
+**Why.** Fit a fixed part F plus a per-tile part t to the two kinds at 1 × 8192² (S = 4, one CTA per CU):
+
+| | tiles per CTA | time |
+|---|--:|--:|
+| fp8 | 16 | 16.4 µs |
+| bf16 | 32 | 24.0 µs |
+
+This gives t ≈ 0.48 µs per 16 KB tile and F ≈ 8.8 µs.
+- 16 KB per 0.48 µs is about 34 GB/s per CU, i.e. **≈ 8.7 TB/s over 256 CUs**: the steady weight stream already runs at the HBM rate.
+- What separates the 8-bit kinds from bf16 is the fixed part (launches, the first DMA latency, the tail): fp8 has half the tiles to hide it behind.
+
+Neither a deeper ring nor more CTAs per CU (§7: two rounds −10 %) moves F. Only fusing the GEMV with its neighbours (one launch for several ops: the graph level) or larger problems amortize it.
+
+**Conclusion for small-M GEMM.**
+- Adopted: (b), partials only for real rows (+6 % gemv geomean).
+- Built and not dispatched: (a), the in-kernel reduce.
+- Measured negative, with the cause: (c), deeper streaming.
+- Proposed: the split-rule refit with the S = 8 data (sched).
