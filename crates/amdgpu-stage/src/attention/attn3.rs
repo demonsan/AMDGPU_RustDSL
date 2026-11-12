@@ -292,6 +292,9 @@ pub struct AttnBody3<'a> {
     /// the copy-distance-2 form (`Pipeline::ahead2`, `KvRing3::new_kv(.., 2, 4, ..)`): the matrix phase of tile t stages tile t + 2 (K into
     /// `TileIt::n2`, V into slot (t + 2) & 3) and PV reads V from slot t & 3
     pub ahead2: bool,
+    /// B6b: the K fragments of one QK and the V fragments of one PV as register rings (`FnBuilder::reg_ring`: pairwise separate buffers, the
+    /// vendor's rotation; a read for the next MFMA never waits on the previous MFMA's operands)
+    pub frag_ring: bool,
     pinned: std::cell::Cell<bool>,
 }
 
@@ -324,7 +327,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, frag_ring: false, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -443,6 +446,7 @@ impl<'a> AttnBody3<'a> {
             }
             parts
         });
+        let mut kfr: Vec<amdgpu_dsl::RegRef> = Vec::new();
         for blk in 0..4usize {
             let (_, (k0, k1, kw)) = u.capture(b, format!("qk.read{blk}"), |b| {
                 if self.bias_tile.get().is_none() {
@@ -450,7 +454,11 @@ impl<'a> AttnBody3<'a> {
                 }
                 (k.read(b, 2 * blk), k.read(b, 2 * blk + 1), self.kword(b, kd.as_ref(), blk))
             });
+            kfr.extend([amdgpu_dsl::RegRef::Val(k0), amdgpu_dsl::RegRef::Val(k1)]);
             u.capture(b, format!("qk.mma{blk}"), |b| self.qk_block_mma(b, &s, k0, k1, kw, blk));
+        }
+        if self.frag_ring {
+            b.reg_ring("qk.k", &kfr);
         }
         self.bias_tile.set(None);
         u
@@ -465,9 +473,11 @@ impl<'a> AttnBody3<'a> {
         });
         u.capture(b, "pv.rowsum", |b| self.sm.row_sum(b, p[0], p[1]));
         let o = self.o.expect("O");
+        let mut vfr: Vec<amdgpu_dsl::RegRef> = Vec::new();
         for hh in 0..2usize {
             for e in 0..4usize {
                 let (_, vf) = u.capture(b, format!("pv.read.h{hh}e{e}"), |b| v.read(b, hh + 2 * e));
+                vfr.push(amdgpu_dsl::RegRef::Val(vf));
                 if self.pv_unscaled {
                     let (x, y) = if r.mma.swap_ab { (p[hh], vf) } else { (vf, p[hh]) };
                     u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| b.var_mfma_fp8_32x32x64(o.accs[e].var, x, y));
@@ -475,6 +485,9 @@ impl<'a> AttnBody3<'a> {
                     u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0));
                 }
             }
+        }
+        if self.frag_ring {
+            b.reg_ring("pv.v", &vfr);
         }
         u
     }
