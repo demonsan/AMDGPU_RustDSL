@@ -458,7 +458,10 @@ impl<'a> AttnBody3<'a> {
             u.capture(b, format!("qk.mma{blk}"), |b| self.qk_block_mma(b, &s, k0, k1, kw, blk));
         }
         if self.frag_ring {
-            b.reg_ring("qk.k", &kfr);
+            // the vendor's rotation over 4 buffers: every 4 consecutive fragments pairwise separate (a sliding window of rings)
+            for (i, w) in kfr.windows(4).enumerate() {
+                b.reg_ring(&format!("qk.k{i}"), w);
+            }
         }
         self.bias_tile.set(None);
         u
@@ -487,7 +490,9 @@ impl<'a> AttnBody3<'a> {
             }
         }
         if self.frag_ring {
-            b.reg_ring("pv.v", &vfr);
+            for (i, w) in vfr.windows(4).enumerate() {
+                b.reg_ring(&format!("pv.v{i}"), w);
+            }
         }
         u
     }
