@@ -154,6 +154,9 @@ pub struct Body {
     /// depth3 + Block128: the per-tile fp32 scales go through the DMA stage into the SC ring (two dword DMAs per wave: A rows of the CTA,
     /// B block; only wave 0's are real, the others land in their own 512-byte part of the slot): (ring, A voffset, B voffset)
     pub sc_dma: Option<(Shared, ValueId, ValueId, ValueId, ValueId)>,
+    /// B straight from global into registers (W6 prototype): per B fragment of the wave its two 16-byte loads' voffsets (the preshuffled
+    /// B block is the LDS image byte for byte); the tile origin (b_org + 16 key0) is the soffset. No B LDS ring traffic.
+    pub bdir: Option<Vec<Vec<ValueId>>>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
@@ -320,6 +323,18 @@ impl Body {
     fn n_a(&self) -> usize {
         (self.params.wave_m / 16) as usize
     }
+    /// The B fragments of tile `it` straight from global (`bdir`).
+    fn b_global(&self, b: &mut FnBuilder, it: I32) -> Vec<ValueId> {
+        let vos = self.bdir.as_ref().expect("bdir");
+        let so = { let v = b.bind_i32((it << 11) + ev(self.b_org)); b.read_first_lane(v) };
+        vos.iter()
+            .map(|v| {
+                let lo = b.buffer_load_b128(self.rsrc_b, v[0], so, 0);
+                let hi = b.buffer_load_b128(self.rsrc_b, v[1], so, 0);
+                b.cat_frag4(lo, hi)
+            })
+            .collect()
+    }
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
         b.agpr(v)
@@ -331,8 +346,12 @@ impl Body {
         let sa: Vec<ValueId> = sa.into_iter().map(|v| self.scale_word(b, v)).collect();
         let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
-        let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
-        let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
+        let bf: Vec<ValueId> = if self.bdir.is_some() {
+            self.b_global(b, ox(t.it))
+        } else {
+            let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
+            (0..nn).map(|j| self.frag(b, &br, j)).collect()
+        };
         let mut af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         // mixed precision: the fragments of A image k right after those of image k - 1 (mma_blocks finds image k at lo + k nm)
         for part in &self.a_rd_x {
@@ -374,8 +393,11 @@ impl Body {
             // shuffled scales: t + 1 odd shares t's pair dword (already installed): no load
             let same_pair = self.mx32.as_ref().is_some_and(|m| m.shuf.is_some()) && Self::slot_of(t) == 0;
             let early = (t.staged && !same_pair).then(|| self.load_scales(b, ox(t.it) + 1, &t.next));
-            ((next, next_hi), early)
+            // B direct: the B fragments of t + 1 from global, issued first (the longest latency)
+            let bnext = (t.staged && self.bdir.is_some()).then(|| self.b_global(b, ox(t.it) + 1));
+            ((next, next_hi), (early, bnext))
         });
+        let (early, bnext) = early;
         let (next, next_hi) = next;
         // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
         let body = |b: &mut FnBuilder, u: &mut Units| {
@@ -419,7 +441,11 @@ impl Body {
                         }
                     }
                 }
-                if let Some((_, br)) = &next {
+                if let Some(bn) = &bnext {
+                    for j in lo..hi {
+                        u.capture(b, format!("reload.b{j}"), |b| b.set_var(bv[j], bn[j]));
+                    }
+                } else if let Some((_, br)) = &next {
                     for j in lo..hi {
                         u.capture(b, format!("reload.b{j}"), |b| {
                             let v = br.read(b, j);
@@ -503,6 +529,10 @@ impl Body {
         });
         // (A8W4: a third pass, the hi A image: LDS + a_hi, global + 128 bytes)
         let mut passes = vec![(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, 0usize, 0i32), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave, 1, 0)];
+        if self.bdir.is_some() {
+            // B direct: no B DMA
+            passes.truncate(1);
+        }
         for k in 1..self.params.elem.a_images() {
             passes.push((&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, k + 1, k as i32 * self.a_hi));
         }

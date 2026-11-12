@@ -74,6 +74,8 @@ pub struct GemmConfig {
     /// 3-slot LDS ring (`Pipeline::rs_depth` 3): tile t + 3 is staged while t + 2 is still in flight (counted top wait) - small CTAs whose
     /// per-tile compute is shorter than the memory latency. Unit-scale forms only (no other VMEM in the loop).
     pub depth3: bool,
+    /// B straight from global into registers (the preshuffled B block is MFMA register order): no B DMA / LDS reads (W6 MXFP4 prototype)
+    pub b_direct: bool,
     /// split-K with the reduce in the kernel (`_lc`): the last of the S split CTAs of an output tile (atomic ticket on `ptr_cnt[by NT + bx]`,
     /// kernarg 104, u32 [tiles][4 waves], zero before the first launch; the last CTA resets it) sums the S fp32 partials of the tile's real rows, applies the
     /// per-token x per-channel scales and stores bf16 C to `ptr_out` (kernarg 96): one launch instead of the main kernel + `gemm_splitk_reduce`
@@ -181,7 +183,7 @@ pub enum MoeStage {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false, lastc: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false, lastc: false, b_direct: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -364,6 +366,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_pertensor_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8_128", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
+        // W6 prototype: B straight from global into registers
+        "gemm_a4w4_mxfp4_bd" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_bd", GemmConfig { b_direct: true, ..GemmConfig::a4w4() })),
         "gemm_a8w4_mxfp_128" => Some(gemm_mxfp8_bs("gemm_a8w4_mxfp_128", GemmConfig::a8w4_128())),
         "gemm_a16w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a16w4_mxfp4", GemmConfig::a16w4_128())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
@@ -775,7 +779,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
 
     let mut pipe = Pipeline::new(Cadence::RegStaged, ks_v, k_v, 128, if cfg.split_k { Ext::ka(88) } else { Ext::ka(84) });
     // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
-    pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
+    pipe.late_tile1_vm = (a_dma.issues.len() + if cfg.b_direct { 0 } else { b_dma.issues.len() }) as u8;
     pipe.scalar_exit = true;
     if cfg.depth3 {
         pipe.rs_depth = 3;
@@ -789,6 +793,12 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);
     let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * a_blk));
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
+    // B direct: per fragment j of the wave and instruction, the global voffset = the byte inside the 2 KB block (the LDS image minus the
+    // slot base and the placement 2048 j) + the block's global origin 16 K (wave_n / 16 wn + j)
+    let bdir = cfg.b_direct.then(|| {
+        let wblk = b.bind_i32(ev(k_v) * 16 * (ev(wn) * (wave_n / 16) as i32));
+        b_rd.ops.iter().enumerate().map(|(j, op)| op.iter().map(|&(bi, imm)| b.bind_i32(b_rd.bases[bi].clone() - b_s.base as i32 + (imm - 2048 * j as i64) as i32 + ev(k_v) * (16 * j as i32) + ev(wblk))).collect()).collect::<Vec<Vec<ValueId>>>()
+    });
     a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
     b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
     let zero4 = b.frag_zero(DType::Frag4);
@@ -900,7 +910,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         a_rd_x: (1..nimg).map(|k| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (k * a_bytes) as i32)).collect(); h }).collect(),
         a_hi: a_bytes as i32,
         w4_shift: (cfg.elem == Elem::Bf16W4).then(|| b.bind_i32((lane.lane().lshr(5)) << 3)),
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt.map(|c| Box::new(c) as Box<dyn amdgpu_stage::gemm::body::ConvSource>), pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false), sc_dma,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt.map(|c| Box::new(c) as Box<dyn amdgpu_stage::gemm::body::ConvSource>), pending: Default::default(), zb, odd_by: std::cell::Cell::new(0), tail_shifted: std::cell::Cell::new(false), sc_dma, bdir,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {
