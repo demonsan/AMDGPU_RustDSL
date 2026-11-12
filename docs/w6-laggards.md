@@ -220,3 +220,41 @@ The vendor's in-wave kernel overlaps more of the head (two tiles per pass, 128-k
 - a head that overlaps: the row max of tile t+1 woven into PV(t).
 
 This is the replica's step 2 territory. The composition choice is recorded as a measured negative at 64-key tiles.
+
+## 7. Small-M GEMM / GEMV (weight streaming)
+
+**Survey** (perf_ab family `gemv`, Main `3b3237ad`). Every M ≤ 64 shape runs the 64 × 128 split-K form (S = 4) plus the separate reduce kernel. Time is flat in M: the shapes are weight-bandwidth-bound. Achieved bytes per second (weights + A + C):
+
+| kind | N = K = 4096 | 7168 | 8192 |
+|---|--:|--:|--:|
+| bf16 | 2.9–3.4 TB/s | 4.8–5.3 | 5.1–5.4 |
+| fp8 / int8 per-token × per-channel | 1.9–2.25 | 3.6–4.1 | 3.7–3.85 |
+| fp8 block-scale | 1.7–1.9 | 3.6–3.9 | 3.6–3.8 |
+
+**Kernel trace** (rocprofv3) at 1 × 8192 × 8192:
+- fp8 per-token × per-channel: main 15.8 µs + reduce 4.4 µs;
+- bf16: main 24.7 µs + reduce 4.5 µs.
+
+The reduce costs about 4.4 µs whatever M is. The main kernel wrote its fp32 partials for all 64 rows of the tile even when M = 1.
+
+**Split-K rule.**
+- S = 8 for the half-filled N = 4096 grids: +4 … +18 %.
+- But S = 8 / 16 at K = 14336: −4 %. The split model needs a refit, and the data went to sched, who owns it.
+- Two CTA rounds: −10 % geomean, so the one-round rule stays.
+
+### 7.1 (b) partials only for real rows — adopted
+
+The split-K epilogue stores a 16-row block only when it holds a real row: one wave-uniform branch per block. The reduce already reads rows < M only.
+
+**perf_ab** (old = Main `3b3237ad`, 5 reps):
+- **`gemv`** geomean **1.060**: fp8 / int8 1 … 16 rows +7 … +14 %, bf16 +2 … +10 %, block-scale +3 … +11 %.
+- **`gemm`**: small M +3 … +8 % (16 × 8192², 32 × 4096 × 14336). The rest is within noise; the one FAIL, block-scale 128 × 7168 × 8192 0.976, re-measured 0.990 OK with 9 reps.
+
+**Gates.**
+- Full-row checks of every split-K kind at M = 1 / 7 / 33 / 64 / 100 with N = K = 4096: 0 bad.
+- Strict verify 0 errors.
+- `run_all` OVERALL PASS (62 / 62 op checks, compile sweep, hazard oracle, strict gpu-verify of every reachable kernel).
+- `cargo test` 585 / 0.
+- md5: the 7 split-K kernels change.
+
+Next: (a) the reduce inside the main kernel (one launch: a last-arriver per output tile) and (c) deeper weight streaming per CU.

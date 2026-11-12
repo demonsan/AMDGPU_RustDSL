@@ -969,9 +969,19 @@ impl skeleton_v4::V4Slots for GemmSlots {
             let o = b.bind_i32(ctx.lower(e));
             b.ptr_add(cb, o)
         }).collect();
-        for (n, acc) in body.acc.iter().enumerate() {
-            let (bi, imm) = plan.issues[n];
-            b.store_f32x4(bases[bi], imm as u32, Opnd::Var(*acc));
+        // only the 16-row blocks that hold real rows (small M: a 64-row tile of an M = 1 GEMV writes one block, not four): a wave-uniform
+        // branch per block of the wave (the reduce reads rows < M only)
+        let nj = (wave_n / 16) as usize;
+        for i in 0..(wave_m / 16) as usize {
+            let r0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * wave_m as i32 + 16 * i as i32);
+            let live = b.bind_cond(ev(r0).lt(ev(m_v)));
+            b.begin_if(Opnd::Val(live));
+            for j in 0..nj {
+                let n = i * nj + j;
+                let (bi, imm) = plan.issues[n];
+                b.store_f32x4(bases[bi], imm as u32, Opnd::Var(body.acc[n]));
+            }
+            b.end_if();
         }
         return;
     }
