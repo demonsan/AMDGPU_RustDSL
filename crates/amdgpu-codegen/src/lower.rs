@@ -203,18 +203,21 @@ fn run_rotate(m: &mut MFunction) -> Result<(), String> {
     if m.reg_hints.rotations.is_empty() {
         return Ok(());
     }
-    // program-order positions of every def / use
-    let mut first: HashMap<VReg, usize> = HashMap::new();
-    let mut last: HashMap<VReg, usize> = HashMap::new();
-    let mut pos = 0usize;
-    for b in &m.blocks {
-        for i in &b.insts {
-            for r in i.dst.iter().copied().chain(i.uses()) {
-                let r = m.canon(r);
-                first.entry(r).or_insert(pos);
-                last.insert(r, pos);
+    // interference: for each def of a value, the values live right after it (backward scan from each block's live-out, so a value
+    // carried across a loop back edge counts too)
+    let lv = crate::sched::liveness::compute(m);
+    let mut live_at_def: HashMap<VReg, HashSet<VReg>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        let mut live: HashSet<VReg> = lv.live_out[bi].iter().map(|r| m.canon(*r)).collect();
+        for i in b.insts.iter().rev() {
+            if let Some(d) = i.dst {
+                let d = m.canon(d);
+                live_at_def.entry(d).or_default().extend(live.iter().copied().filter(|x| *x != d));
+                live.remove(&d);
             }
-            pos += 1;
+            for r in i.uses() {
+                live.insert(m.canon(r));
+            }
         }
     }
     let mut rename: HashMap<VReg, VReg> = HashMap::new();
@@ -228,11 +231,14 @@ fn run_rotate(m: &mut MFunction) -> Result<(), String> {
                 if m.vreg_class(a) != m.vreg_class(b) {
                     return Err(format!("register plan: rotation `{name}`: fragments {ia} and {ib} share a buffer but have different register classes ({:?} / {:?})", m.vreg_class(a), m.vreg_class(b)));
                 }
-                if let (Some(&la), Some(&fb)) = (last.get(&a), first.get(&b)) {
-                    if fb <= la {
+            }
+            for (x, &(ia, a)) in members.iter().enumerate() {
+                for &(ib, b) in &members[x + 1..] {
+                    let clash = live_at_def.get(&b).map_or(false, |s| s.contains(&a)) || live_at_def.get(&a).map_or(false, |s| s.contains(&b));
+                    if clash {
                         let nm = |r: VReg| m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"));
                         return Err(format!(
-                            "register plan: rotation `{name}`: {} (fragment {ib}) is defined before the last use of {} (fragment {ia}) in program order: they cannot share a buffer",
+                            "register plan: rotation `{name}`: {} (fragment {ib}) and {} (fragment {ia}) share a buffer but one is live where the other is defined (a read ahead of the previous fragment's last use, or a fragment carried across the loop back edge)",
                             nm(b), nm(a)
                         ));
                     }
