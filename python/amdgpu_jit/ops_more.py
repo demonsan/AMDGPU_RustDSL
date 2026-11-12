@@ -18,7 +18,8 @@ def mla_decode(q, kv_cache, block_table, context_lens, out, *, scale=None, strea
     NP, P = rk.shape[0], rk.shape[1]
     if Dq != 576 or rk.shape[2] != 576:
         raise ValueError("mla_decode: q / kv_cache rows of 576 (512 + 64)")
-    plan = dispatch("mla", B, H)
+    # the largest context the block table can address picks the form (short context at a small batch: head-parallel)
+    plan = dispatch("mla", B, H, "--ctx", rbt.shape[1] * P)
     hp, S = bool(plan["hp"]), int(plan["splits"])
     name = f"mla_decode_bf16_{'hp_' if hp else ''}p{P}"
     parts = S if hp else 4 * S

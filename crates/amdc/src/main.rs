@@ -391,6 +391,27 @@ fn main() -> ExitCode {
                     println!("{{\"kind\":\"{kind}\",\"m\":{m},\"n\":{n},\"k\":{k},\"cus\":{cus},\"rule\":{rule},\"candidates\":[{}]}}", rows.join(","));
                     ExitCode::SUCCESS
                 }
+                (Some(fam @ ("moe" | "mla")), _, _, _, _) => {
+                    // amdc compose-search moe <bf16|fp8|fp4> <M> <TOPK> <E> | mla <B> <H> <CTX> [--page P]
+                    let cus = opt("--cus", 256.0) as u64;
+                    let a = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let (cands, rule, shape) = if fam == "moe" {
+                        let dt = args.get(2).cloned().unwrap_or_default();
+                        let (m, topk, e) = (a(3), a(4), a(5));
+                        let bm = amdgpu_graph::dispatch::moe_block_m(m, topk, e, opt("--inter", 256.0) as u64, cus);
+                        let sfx = if bm == 64 { "_bm64" } else { "" };
+                        (cs::moe_candidates(&dt, m, topk, e, cus), format!("{{\"kernel\":\"gemm_moe1_{dt}_silu{sfx}\",\"splits\":1,\"reduce\":\"gemm_moe2_{dt}{sfx}\"}}"), format!("\"dt\":\"{dt}\",\"m\":{m},\"topk\":{topk},\"e\":{e}"))
+                    } else {
+                        let (b, h, ctx, page) = (a(2), a(3), a(4), opt("--page", 64.0) as u32);
+                        let (hp, s) = amdgpu_graph::dispatch::mla_config(b, h, ctx);
+                        let rk = format!("mla_decode_bf16_{}p{page}", if hp { "hp_" } else { "" });
+                        (cs::mla_candidates(b, h, ctx, page, cus), format!("{{\"kernel\":\"{rk}\",\"splits\":{s},\"reduce\":\"attn_combine_bf16_hd512\"}}"), format!("\"b\":{b},\"h\":{h},\"ctx\":{ctx},\"page\":{page}"))
+                    };
+                    let kept = cs::prune(&cands, opt("--margin", 1.5));
+                    let rows: Vec<String> = cands.iter().zip(&kept).map(|(c, k)| c.to_json(*k)).collect();
+                    println!("{{\"kind\":\"{fam}\",{shape},\"cus\":{cus},\"rule\":{rule},\"candidates\":[{}]}}", rows.join(","));
+                    ExitCode::SUCCESS
+                }
                 (Some(fam @ ("decode16" | "prefill_bf16")), _, _, _, _) => {
                     // amdc compose-search decode16 <B> <HK> <CTX> [--page P] | prefill_bf16 <B> <H> <SQ> <SK> <causal 0|1>
                     let cus = opt("--cus", 256.0) as u64;
@@ -427,14 +448,14 @@ fn main() -> ExitCode {
                 (Some("fp8pt"), Some(b), Some(h), Some(sq)) => Some(cp::fp8pt(b, h, sq, num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0, opt("--cus", 256))),
                 (Some("hd192"), Some(b), Some(h), Some(sq)) => Some(cp::hd192(b, h, sq, num(5).unwrap_or(sq), num(6).unwrap_or(0) != 0, opt("--cus", 256))),
                 (Some("mxfp8"), Some(b), Some(h), Some(sq)) => Some(cp::mxfp8(b, h, sq, num(5).unwrap_or(sq))),
-                (Some("mla"), Some(b), Some(h), _) => Some(cp::mla(b, h, opt("--page", 64) as u32)),
+                (Some("mla"), Some(b), Some(h), _) => Some(cp::mla(b, h, args.windows(2).find(|w| w[0] == "--ctx").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(u64::MAX), opt("--page", 64) as u32)),
                 (Some("bwd_causal"), _, _, _) => Some(cp::bwd_causal()),
                 (Some("gemm"), _, _, _) => match (args.get(2), num(3), num(4), num(5)) {
                     (Some(kind), Some(m), Some(n), Some(k)) => cp::gemm(kind, m, n, k, opt("--cus", 256)),
                     _ => None,
                 },
                 (Some("moe"), _, _, _) => match (args.get(2), num(3), num(4), num(5)) {
-                    (Some(dt), Some(m), Some(topk), Some(e)) => Some(cp::moe(dt, m, topk, e)),
+                    (Some(dt), Some(m), Some(topk), Some(e)) => Some(cp::moe(dt, m, topk, e, args.windows(2).find(|w| w[0] == "--inter").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(u64::MAX))),
                     _ => None,
                 },
                 _ => None,
@@ -512,8 +533,9 @@ fn main() -> ExitCode {
                         _ => { usage(); ExitCode::from(2) }
                     }
                 }                (Some("mla"), Some(b), Some(h), _) => {
-                    // amdc dispatch mla <B> <H>: (head-parallel form?, splits) of the MLA decode
-                    let (hp, s) = amdgpu_graph::dispatch::mla_config(b, h);
+                    // amdc dispatch mla <B> <H> [--ctx C]: (head-parallel form?, splits) of the MLA decode; C = the largest context (the block table's capacity); omitted = unknown
+                    let ctx = args.windows(2).find(|w| w[0] == "--ctx").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(u64::MAX);
+                    let (hp, s) = amdgpu_graph::dispatch::mla_config(b, h, ctx);
                     println!("{{\"hp\":{hp},\"splits\":{s}}}");
                     ExitCode::SUCCESS
                 }
@@ -524,8 +546,8 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 (Some("moe"), Some(m), Some(topk), Some(e)) => {
-                    // amdc dispatch moe <M> <TOPK> <E>: block_m of the routing sort and the gemm_moe kernels
-                    println!("{{\"block_m\":{}}}", amdgpu_graph::dispatch::moe_block_m(m, topk, e));
+                    // amdc dispatch moe <M> <TOPK> <E> [--inter I] [--cus N]: block_m of the routing sort and the gemm_moe kernels (I omitted = unknown: the measured band is off)
+                    println!("{{\"block_m\":{}}}", amdgpu_graph::dispatch::moe_block_m(m, topk, e, args.windows(2).find(|w| w[0] == "--inter").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(u64::MAX), args.windows(2).find(|w| w[0] == "--cus").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(256)));
                     ExitCode::SUCCESS
                 }
                 _ => {
