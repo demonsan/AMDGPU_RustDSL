@@ -161,3 +161,29 @@ Families:
 | gemm/i8_rowcol/192x4096x4096 | 403.10 | 535.30 | 1.328 | 2.0% | IMPROVED | - | - | - |
 | gemm/i8_rowcol/2048x7168x7168 | 1770 | 2202 | 1.244 | 2.3% | IMPROVED | - | - | - |
 ```
+
+## Split-K S = 8 at small M (node 53 / GPU 1, 2026-11-12, 7 interleaved repetitions, median us; N = 4096, 64-row form)
+
+`tools/compose_search.py check-gemm --kinds bf16,i8_rowcol,fp8_rowcol --ms 1,4,16,32,64,128 --ns 4096,7168,8192 --ks 4096,8192,14336` with the split candidates S = 2, 4, 8, 16. At N = 4096 the grid of the 64-row form is c = 32 CTAs, so S = 4 fills 128 of the 256 CUs and S = 8 fills them all:
+
+| kind | M | K | S4 | S8 | S16 |
+|---|--:|--:|--:|--:|--:|
+| bf16 | 1 | 4096 | 9.2 | 7.4 | 8.5 |
+| bf16 | 16 | 4096 | 9.4 | 8.0 | 9.8 |
+| bf16 | 32 | 4096 | 10.2 | 9.3 | 11.3 |
+| bf16 | 64 | 4096 | 11.8 | 12.4 | 15.4 |
+| bf16 | 1 | 8192 | 14.3 | 14.5 | 14.5 |
+| bf16 | 1 | 14336 | 20.8 | 20.3 | 20.8 |
+| fp8 per-token | 1 | 4096 | 6.7 | 6.0 | 6.9 |
+| fp8 per-token | 16 | 4096 | 7.0 | 6.6 | 7.9 |
+| fp8 per-token | 32 | 4096 | 7.7 | 7.8 | 9.8 |
+| fp8 per-token | 64 | 4096 | 9.2 | 10.5 | 14.6 |
+| fp8 per-token | 1 | 8192 | 8.8 | 7.2 | 8.4 |
+| fp8 per-token | 16 | 8192 | 9.1 | 7.9 | 9.7 |
+| fp8 per-token | 32 | 8192 | 10.1 | 9.2 | 11.2 |
+| fp8 per-token | 64 | 8192 | 11.6 | 12.3 | 15.3 |
+| fp8 per-token | 1 / 4 / 16 / 32 | 14336 | 12.8 / 13.0 / 13.2 / 13.9 | 12.7 / 12.8 / 13.1 / 13.9 | - |
+| int8 per-token | 1 | 8192 | 9.1 | 7.4 | 8.7 |
+| int8 per-token | 32 | 14336 | 13.8 | 13.9 | - |
+
+The refit of the time model on this wider data (K up to 14336, S up to 16) fits worse (12 % mean error) and alone would regress M = 64 and N >= 7168 shapes; the rule keeps the fitted model and adds the measured S8 override for M <= 16.

@@ -121,6 +121,12 @@ fn split64(p: (f64, f64, f64, f64), m: u64, n: u64, k: u64, cus: u64) -> u32 {
             }
         }
     }
+    // S = 8 where S = 4 leaves half of the CUs idle (N = 4096: c = 32, 8 x 32 = 256 CTAs): measured on node 53 / GPU 1, 7 interleaved repetitions, `compose_search check-gemm` M = 1 .. 64 x N 4096 x K 4096 / 8192 / 14336
+    // (docs/compose-gemm-sweeps.md): M <= 16 S8 beats S4 by 5 - 20 % at K <= 8192 (bf16 M1 K4096 7.4 vs 9.2 us, int8 M1 K8192 7.4 vs 9.1, fp8 M16 K8192 7.9 vs 9.1) and ties at K = 14336 (+-1.5 %); M = 32 only ties (K 4096
+    // int8 / fp8 S8 +1.3 % worse) and M = 64 loses (S8 5 - 9 % worse), so S4 stays there; the fitted model alone cannot see the fill effect.
+    if best.1 == 4 && m <= 16 && c * 8 <= cus && n % 1024 == 0 && k % 2048 == 0 {
+        return 8;
+    }
     best.1 as u32
 }
 
@@ -431,6 +437,12 @@ mod tests {
         assert_eq!(super::i8_gemm_config(128, 7168, 4096, 256), (64, 1));
         assert_eq!(super::i8_gemm_config(256, 4096, 8192, 256), (64, 2));
         assert_eq!(super::i8_gemm_config(64, 4096, 4096, 256), (64, 4));
+        // S8 for M <= 16 where S4 fills half of the CUs (N = 4096), S4 at M = 32 / 64, and where the grid or the K step does not allow it
+        assert_eq!(super::i8_gemm_config(1, 4096, 8192, 256), (64, 8));
+        assert_eq!(super::i8_gemm_config(16, 4096, 4096, 256), (64, 8));
+        assert_eq!(super::i8_gemm_config(32, 4096, 8192, 256), (64, 4));
+        assert_eq!(super::i8_gemm_config(1, 8192, 8192, 256), (64, 4));
+        assert_eq!(super::bf16_gemm_config(4, 4096, 4096, 256), (64, 8));
         // bf16: the 128 x 128 split form at a long K and a 0.625 .. 1 x CUs 128-row grid
         assert_eq!(super::bf16_gemm_config(768, 4096, 8192, 256), (128, 2));
         assert_eq!(super::bf16_gemm_config(512, 7168, 8192, 256), (128, 2));
