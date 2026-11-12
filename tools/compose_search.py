@@ -24,6 +24,9 @@ FAM = {'bf16': 'ours_v4_bf16', 'i8_rowcol': 'ours_v4_i8', 'fp8_rowcol': 'ours_v4
 # shapes the rules in dispatch.rs record their same-run evidence on
 EVIDENCE = [(4096, 4096, 4096), (2048, 4096, 4096), (1024, 4096, 8192), (512, 7168, 4096), (256, 7168, 4096), (128, 4096, 8192), (64, 8192, 8192), (512, 7168, 7168), (2048, 7168, 7168)]
 DECODE_EVIDENCE = [(b, 8, ctx) for b in (4, 8, 16, 32, 64) for ctx in (1024, 2048, 8192)]
+MOE_D, MOE_I = 4096, 256   # the host's hidden / intermediate sizes of the block_m search (the rule depends on the average rows per expert only)
+MOE_EVIDENCE = [(m, 8, 32) for m in (64, 128, 256, 384, 512, 768, 1024, 2048)]   # (M, topk, E): average rows per expert M topk / E = 16 .. 512
+MLA_EVIDENCE = [(b, h, ctx) for h in (16, 64, 128) for b in (1, 4, 16, 64) for ctx in (2048, 8192)]
 PREFILL_EVIDENCE = [(1, 8, 4096, 4096, 0), (1, 8, 4096, 4096, 1), (1, 8, 2048, 2048, 0), (1, 8, 2048, 2048, 1), (2, 8, 1000, 1300, 0), (2, 8, 1000, 1300, 1), (1, 32, 8192, 8192, 1), (4, 16, 2048, 2048, 0)]
 STAT = 'median'
 
@@ -109,6 +112,12 @@ def fam_amdc_args(fam, shape):
     if fam == 'decode16':
         b, hk, ctx, page = shape
         return ['decode16', b, hk, ctx, '--page', page]
+    if fam == 'moe':
+        dt, m, topk, e = shape
+        return ['moe', dt, m, topk, e, '--inter', MOE_I]
+    if fam == 'mla':
+        b, h, ctx, page = shape
+        return ['mla', b, h, ctx, '--page', page]
     b, h, sq, sk, c = shape
     return ['prefill_bf16', b, h, sq, sk, c]
 
@@ -129,6 +138,21 @@ def measure_once(work, fam, shape, cand):
         tm, tn = tile_args(cand['kernel'])
         cmd = [work.host('vendor_gemm_host'), FAM[kind], co, cand['kernel'], str(m), str(n), str(k), str(tm), str(tn)]
         ok_re, us_re = 'GEMM_OK', r'([0-9.]+) us\s+([0-9.]+) TF/s'
+    elif fam == 'moe':
+        dt, m, topk, e = shape
+        bm = cand['tile'][0]
+        for kk in [cand['kernel'], cand['reduce'], f'moe_sum_bf16_k{topk}'] + ([f'quant_token_bf16_fp8_n{MOE_I}'] if dt == 'fp8' else []):
+            work.kernel(kk)
+        cmd = [work.host('moe_host'), dt, os.path.join(work.out, 'co'), str(m), str(MOE_D), str(MOE_I), str(e), str(topk), 'silu']
+        env = dict(os.environ, BLOCK_M=str(bm), CHECK='2')
+        ok_re, us_re = 'MOE_OK', None
+    elif fam == 'mla':
+        b, h, ctx, page = shape
+        co, _ = work.kernel(cand['kernel'])
+        cco, _ = work.kernel('attn_combine_bf16_hd512')
+        env = dict(os.environ, MLAHP='1' if '_hp_' in cand['kernel'] else '0')
+        cmd = [work.host('mla_host'), co, cco, str(b), str(h), str(ctx), str(page), str(cand['splits'])]
+        ok_re, us_re = 'MLA_OK', r'([0-9.]+) us'
     elif fam == 'decode16':
         b, hk, ctx, page = shape
         co, _ = work.kernel(cand['kernel'])
@@ -152,6 +176,10 @@ def measure_once(work, fam, shape, cand):
         flops = 4.0 * b * h * sq * sk * 128 * (0.5 if c else 1.0)   # the host reports TF/s: convert to microseconds for one launch
     p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900, errors='replace')
     text = p.stdout + p.stderr
+    if fam == 'moe':
+        s1 = re.search(r'stage1 ([0-9.]+) us', text)
+        s2 = re.search(r'(?:stage2\+sum|requant\+stage2\+sum) ([0-9.]+) us', text)
+        return (float(s1.group(1)) + float(s2.group(1)) if s1 and s2 else None), (ok_re in text)
     mt = re.search(us_re, text, re.M)
     if mt and fam == 'prefill_bf16':
         return flops / (float(mt.group(1)) * 1e6), (ok_re in text)
@@ -239,7 +267,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('search')
-    s.add_argument('family', choices=['gemm', 'decode16', 'prefill_bf16'])
+    s.add_argument('family', choices=['gemm', 'decode16', 'prefill_bf16', 'moe', 'mla'])
     s.add_argument('args', nargs='+')
     s.add_argument('--page', type=int, default=16)
     cg = sub.add_parser('check-gemm')
@@ -250,15 +278,21 @@ def main():
     cd = sub.add_parser('check-decode16')
     cd.add_argument('--shapes', default='', help='"b,hk,ctx;..." (default: the evidence grid of dispatch::decode16_plan)')
     cd.add_argument('--page', type=int, default=16)
+    cm = sub.add_parser('check-moe')
+    cm.add_argument('--dt', default='fp8')
+    cm.add_argument('--shapes', default='', help='"m,topk,e;..." (default: the average-rows grid of dispatch::moe_block_m)')
+    cl = sub.add_parser('check-mla')
+    cl.add_argument('--shapes', default='', help='"b,h,ctx;..."')
+    cl.add_argument('--page', type=int, default=64)
     cpf = sub.add_parser('check-prefill')
     cpf.add_argument('--shapes', default='', help='"b,h,sq,sk,causal;..." (default: the evidence shapes of dispatch::bf16_prefill_kernel)')
-    for p in (s, cg, cd, cpf):
+    for p in (s, cg, cd, cpf, cm, cl):
         p.add_argument('--top', type=int, default=3)
         p.add_argument('--reps', type=int, default=5)
         p.add_argument('--margin', type=float, default=1.5)
         p.add_argument('--stat', choices=['median', 'min'], default='median', help='the per-candidate estimator over the repetitions (default median; min on a shared / noisy node: say so with the result)')
         p.add_argument('--out', default=os.path.join(ROOT, 'build', 'compose'))
-    for p in (cg, cd, cpf):
+    for p in (cg, cd, cpf, cm, cl):
         p.add_argument('--tol', type=float, default=0.03, help='the rule counts as confirmed when its measured time is within this fraction of the measured best')
         p.add_argument('--name', default='')
     a = ap.parse_args()
@@ -270,6 +304,10 @@ def main():
             shape = (a.args[0],) + tuple(int(x) for x in a.args[1:4])
         elif a.family == 'decode16':
             shape = tuple(int(x) for x in a.args[:3]) + (a.page,)
+        elif a.family == 'moe':
+            shape = (a.args[0],) + tuple(int(x) for x in a.args[1:4])
+        elif a.family == 'mla':
+            shape = tuple(int(x) for x in a.args[:3]) + (a.page if a.page != 16 else 64,)
         else:
             shape = tuple(int(x) for x in a.args[:5])
         res = search(work, a.family, shape, a.top, a.reps, a.margin)
@@ -290,6 +328,14 @@ def main():
         shapes = [tuple(int(x) for x in t.split(',')) + (a.page,) for t in a.shapes.split(';')] if a.shapes else [sh + (a.page,) for sh in DECODE_EVIDENCE]
         lines, results, dis = check(work, 'decode16', shapes, a, 'paged decode (decode16)')
         name = a.name or 'decode16'
+    elif a.cmd == 'check-moe':
+        shapes = [(a.dt,) + tuple(int(x) for x in t.split(',')) for t in a.shapes.split(';')] if a.shapes else [(a.dt,) + sh for sh in MOE_EVIDENCE]
+        lines, results, dis = check(work, 'moe', shapes, a, f'fused MoE block_m ({a.dt})')
+        name = a.name or 'moe_' + a.dt
+    elif a.cmd == 'check-mla':
+        shapes = [tuple(int(x) for x in t.split(',')) + (a.page,) for t in a.shapes.split(';')] if a.shapes else [sh + (a.page,) for sh in MLA_EVIDENCE]
+        lines, results, dis = check(work, 'mla', shapes, a, 'MLA decode (form + splits)')
+        name = a.name or 'mla'
     else:
         shapes = [tuple(int(x) for x in t.split(',')) for t in a.shapes.split(';')] if a.shapes else PREFILL_EVIDENCE
         lines, results, dis = check(work, 'prefill_bf16', shapes, a, 'bf16 hd128 prefill')

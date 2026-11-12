@@ -212,7 +212,7 @@ def fused_moe(x, w1, w2, topk_ids, topk_weights, out, *, dtype="bf16", act="silu
     if E is None or I is None:
         raise ValueError("fused_moe: num_experts and inter (I) are required (the weights are preshuffled bytes)")
     fp8 = dtype == "fp8"
-    BM = dispatch("moe", M, K, E)["block_m"] if block_m == "auto" else int(block_m)
+    BM = dispatch("moe", M, K, E, "--inter", int(inter))["block_m"] if block_m == "auto" else int(block_m)
     bms = "_bm64" if BM == 64 else ""
     # routing sort
     maxp = M * K + E * BM - K

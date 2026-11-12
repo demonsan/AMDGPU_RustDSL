@@ -182,9 +182,54 @@ pub fn prefill_bf16_candidates(b: u64, h: u64, sq: u64, sk: u64, causal: bool, c
     }
     out
 }
+
+/// Candidates of a fused MoE launch (stage 1 + stage 2 + sum, `moe_host`): the routing sort's block_m (the `gemm_moe{1,2}_*` tile rows) 64 (`_bm64` kernels) or 128. `reduce` names the stage-2 kernel (the launch also runs
+/// `moe_sum_bf16_k<topk>`). The model counts the padded rows per expert (ceil(rows / block_m) * block_m, rows = M topk / E): relative only.
+pub fn moe_candidates(dt: &str, m: u64, topk: u64, e: u64, cus: u64) -> Vec<Candidate> {
+    let rows = (m * topk) as f64 / e.max(1) as f64;
+    [64u32, 128]
+        .iter()
+        .map(|&bm| {
+            let sfx = if bm == 64 { "_bm64" } else { "" };
+            let blocks = (rows / bm as f64).ceil().max(1.0) as u64 * e;
+            let kernel = format!("gemm_moe1_{dt}_silu{sfx}");
+            let lds_bytes = crate::compose::facts(&kernel).map(|f| f.lds_bytes).unwrap_or(0);
+            let rounds = blocks.div_ceil(cus.max(1));
+            Candidate { kernel, reduce: Some(format!("gemm_moe2_{dt}{sfx}")), splits: 1, tile: (bm, 0), ctas: blocks, rounds, ring_slots: 2, lds_bytes, model_us: rounds as f64 * (bm as f64 * 0.12 + 4.0) }
+        })
+        .collect()
+}
+
+/// Candidates of an MLA decode launch: the per-wave form (16 heads per CTA) or the head-parallel form (64 heads per CTA) with S in {1, 2, 4, 8, 16} key splits (+ the combine kernel).
+pub fn mla_candidates(b: u64, h: u64, ctx: u64, page: u32, cus: u64) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for hp in [false, true] {
+        let per = if hp { h.div_ceil(64) } else { h.div_ceil(16) };
+        for s in [1u32, 2, 4, 8, 16] {
+            if ctx / (s as u64) < 64 {
+                continue;
+            }
+            let kernel = format!("mla_decode_bf16_{}p{page}", if hp { "hp_" } else { "" });
+            let ctas = b * per * s as u64;
+            let rounds = ctas.div_ceil(cus.max(1));
+            let lds_bytes = crate::compose::facts(&kernel).map(|f| f.lds_bytes).unwrap_or(0);
+            out.push(Candidate { kernel, reduce: Some("attn_combine_bf16_hd512".into()), splits: s, tile: (0, 0), ctas, rounds, ring_slots: 2, lds_bytes, model_us: rounds as f64 * (ctx as f64 / s as f64 * if hp { 0.02 } else { 0.05 }) + 0.5 * s as f64 });
+        }
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moe_and_mla_have_candidates() {
+        let m = moe_candidates("fp8", 256, 8, 64, 256);
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().any(|c| c.kernel.ends_with("_bm64")) && m.iter().any(|c| !c.kernel.ends_with("_bm64")));
+        let l = mla_candidates(4, 128, 8192, 64, 256);
+        assert!(l.iter().any(|c| c.kernel.contains("_hp_") && c.splits == 2) && l.iter().any(|c| !c.kernel.contains("_hp_") && c.splits == 16), "{l:?}");
+    }
 
     #[test]
     fn decode16_and_prefill_have_split_candidates() {

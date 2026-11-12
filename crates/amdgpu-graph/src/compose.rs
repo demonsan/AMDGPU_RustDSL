@@ -122,15 +122,15 @@ pub fn gemm(kind: &str, m: u64, n: u64, k: u64, cus: u64) -> Option<Composition>
 }
 
 /// MLA decode: per-wave or head-parallel form + the combine kernel, with the split count.
-pub fn mla(b: u64, h: u64, page: u32) -> Composition {
-    let (hp, s) = dispatch::mla_config(b, h);
+pub fn mla(b: u64, h: u64, ctx: u64, page: u32) -> Composition {
+    let (hp, s) = dispatch::mla_config(b, h, ctx);
     let k = format!("mla_decode_bf16_{}p{page}", if hp { "hp_" } else { "" });
     make("mla", "dispatch::mla_config", vec![k, "attn_combine_bf16_hd512".into()], s, None)
 }
 
 /// MoE: the routing-sort block size picks the `_bm64` stage kernels or the default ones. `dt`: `bf16` / `fp8` / `fp4`.
-pub fn moe(dt: &str, m: u64, topk: u64, e: u64) -> Composition {
-    let bm = dispatch::moe_block_m(m, topk, e);
+pub fn moe(dt: &str, m: u64, topk: u64, e: u64, inter: u64) -> Composition {
+    let bm = dispatch::moe_block_m(m, topk, e, inter, 256);
     let sfx = if bm == 64 { "_bm64" } else { "" };
     let ks = vec![format!("gemm_moe1_{dt}_silu{sfx}"), format!("gemm_moe2_{dt}{sfx}"), format!("moe_sum_bf16_k{topk}")];
     make("moe", "dispatch::moe_block_m", ks, 1, Some((bm, 0)))

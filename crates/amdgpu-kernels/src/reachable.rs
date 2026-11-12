@@ -55,9 +55,11 @@ pub fn dispatched_names() -> BTreeSet<String> {
     // MLA decode
     for b in [1u64, 64] {
         for h in [16u64, 128] {
-            let (hp, _) = mla_config(b, h);
-            for p in [1, 16] {
-                n.insert(format!("mla_decode_bf16_{}p{p}", if hp { "hp_" } else { "" }));
+            for ctx in [2048u64, u64::MAX] {
+                let (hp, _) = mla_config(b, h, ctx);
+                for p in [1, 16] {
+                    n.insert(format!("mla_decode_bf16_{}p{p}", if hp { "hp_" } else { "" }));
+                }
             }
         }
     }
@@ -69,13 +71,15 @@ pub fn dispatched_names() -> BTreeSet<String> {
     }
     // fused MoE: routing sort, the two stages, the top-k sum
     for (m, topk, e) in [(16u64, 2u64, 8u64), (4096, 8, 128), (256, 8, 64)] {
-        let bm = moe_block_m(m, topk, e);
-        let bms = if bm == 64 { "_bm64" } else { "" };
-        n.insert(format!("moe_sorting_e{e}_k{topk}_b{bm}"));
-        n.insert(format!("moe_sum_bf16_k{topk}"));
-        for dt in ["bf16", "fp8"] {
-            n.insert(format!("gemm_moe1_{dt}_silu{bms}"));
-            n.insert(format!("gemm_moe2_{dt}{bms}"));
+        for inter in [256u64, 2048] {
+            let bm = moe_block_m(m, topk, e, inter, 256);
+            let bms = if bm == 64 { "_bm64" } else { "" };
+            n.insert(format!("moe_sorting_e{e}_k{topk}_b{bm}"));
+            n.insert(format!("moe_sum_bf16_k{topk}"));
+            for dt in ["bf16", "fp8"] {
+                n.insert(format!("gemm_moe1_{dt}_silu{bms}"));
+                n.insert(format!("gemm_moe2_{dt}{bms}"));
+            }
         }
     }
     // the GEMM family (blockscale split-K by its rule; the Python tile rule picks the 256 or the _128 kernels)

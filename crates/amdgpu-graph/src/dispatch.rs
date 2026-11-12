@@ -156,11 +156,12 @@ pub fn bf16_gemm_config(m: u64, n: u64, k: u64, cus: u64) -> (u32, u32) {
     (64, split64(SPLIT64_BF16, m, n, k, cus))
 }
 
-/// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
-/// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
-/// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
-pub fn mla_config(b: u64, h: u64) -> (bool, u32) {
-    let hp = h >= 64;
+/// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S) of a launch with batch `b`, `h` heads and at most `ctx` context tokens (`u64::MAX` = unknown). The head-parallel form (64 heads per CTA share the KV
+/// tiles) for H >= 64 (H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form) and, measured on node 53 / GPU 1 (docs/compose-mla-moe-evidence.md), also for small batches at short context: B <= 16 and ctx <= 4096
+/// (H16: ctx 1024 18.0 vs 35.8 us, ctx 2048 23.9 vs 36.1, ctx 4096 29.4 vs 40.4 at B1; B4 / B16 +22 - 107 %; H32 ctx 2048 B1 +50 %, B16 +25 %; H48 B1 +44 %); the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
+/// 4 key parts per CTA) otherwise (H16 ctx >= 6144 at B1, every ctx at B64). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
+pub fn mla_config(b: u64, h: u64, ctx: u64) -> (bool, u32) {
+    let hp = h >= 64 || (b <= 16 && ctx <= 4096);
     let ctas = b * if hp { h.div_ceil(64) } else { h.div_ceil(16) };
     let mut s = 1u64;
     while s < 16 && ctas * s < 256 {
@@ -266,15 +267,32 @@ pub fn conv_cta(m: u64, n: u64, cus: u64) -> u32 {
     }
 }
 
-/// Fused MoE: block_m (the routing sort's block and the `gemm_moe{1,2}_*` tile rows): 64 (`_bm64` kernels) when the average rows per
-/// expert M topk / E is below 128, else 128. Measured (stage 1, silu): M256 D7168 I2048 E64 topk8 fp8 420 -> 381 us (aiter 392), fp8bs 530
-/// -> 417 us (aiter 418); M128 D4096 I1024 E8 topk2 fp8bs 53.8 -> 38.0 us; stage 2 + sum also faster (251 -> 222, 262 -> 213 us).
-pub fn moe_block_m(m: u64, topk: u64, experts: u64) -> u32 {
-    if m * topk < 128 * experts {
-        64
-    } else {
-        128
+/// Total token-expert pairs (M topk) up to which the 64-row MoE tile also wins for 128 - 192 rows per expert (the grid of the 128-row form is too small to fill the CUs).
+const MOE_BM64_PAIRS: u64 = 5120;
+/// Stage-1 output columns (2 I) per CTA tile in the grid model of the band below.
+const MOE_N_TILE: u64 = 128;
+
+/// Fused MoE: block_m (the routing sort's block and the `gemm_moe{1,2}_*` tile rows) of a launch with `m` tokens, `topk`, `experts`, intermediate size `inter` (`u64::MAX` = unknown) on `cus` CUs. 64 (`_bm64` kernels)
+/// when the average rows per expert r = M topk / E is below 128; also in the measured band r <= 192 with at most `MOE_BM64_PAIRS` pairs in total when the 128-row stage-1 grid (E x blocks per expert x ceil(2 I / 128) CTAs)
+/// fits the CUs (r = 128 exactly: half of them); else 128. Measured, stage 1 + stage 2 (docs/compose-mla-moe-evidence.md; node 53 / GPU 1, D 4096 I 256, 7 interleaved repetitions): the 64-row form wins E16 r 128 / 160 / 192
+/// (fp8 +24 / +25 / +12 %, bf16 +27 / +25 / +20 %) and E32 r 128 / 160 (fp8 +7.6 / +12.9 %, bf16 +8.6 / +4.4 %); the 128-row form wins E32 r >= 224 and every E64 shape from r = 128 (E64 r 128: fp8 +12.7 %, bf16 +19 %),
+/// E32 r 192 is mixed (pairs 6144 > the cap). With a larger intermediate size the grid of the 128-row form already fills the CUs and the 64-row form LOSES (perf_ab, E16 D2048 I768 M320 / M384 bf16: stage 1 -35 %, hence
+/// the grid test). Earlier (stage 1, silu): M256 D7168 I2048 E64 topk8 fp8 420 -> 381 us (aiter 392), fp8bs 530 -> 417 us (aiter 418); M128 D4096 I1024 E8 topk2 fp8bs 53.8 -> 38.0 us; stage 2 + sum also faster
+/// (251 -> 222, 262 -> 213 us).
+pub fn moe_block_m(m: u64, topk: u64, experts: u64, inter: u64, cus: u64) -> u32 {
+    let pairs = m * topk;
+    if pairs < 128 * experts {
+        return 64;
     }
+    if pairs <= 192 * experts && pairs <= MOE_BM64_PAIRS && inter != u64::MAX {
+        let blocks = pairs.div_ceil(128 * experts).max(1);
+        let grid128 = experts * blocks * (2 * inter).div_ceil(MOE_N_TILE);
+        let fits = if pairs > 128 * experts { grid128 <= cus } else { 2 * grid128 <= cus };
+        if fits {
+            return 64;
+        }
+    }
+    128
 }
 
 #[cfg(test)]
@@ -283,10 +301,23 @@ mod tests {
 
     #[test]
     fn moe_rule() {
-        assert_eq!(moe_block_m(256, 8, 64), 64);
-        assert_eq!(moe_block_m(128, 2, 8), 64);
-        assert_eq!(moe_block_m(1024, 2, 8), 128);
-        assert_eq!(moe_block_m(4096, 8, 32), 128);
+        assert_eq!(moe_block_m(256, 8, 64, 2048, 256), 64);
+        assert_eq!(moe_block_m(128, 2, 8, 1024, 256), 64);
+        assert_eq!(moe_block_m(1024, 2, 8, 1024, 256), 128);
+        assert_eq!(moe_block_m(4096, 8, 32, 2048, 256), 128);
+        // the measured band at I = 256 (stage-1 grid <= CUs): E16 r 128 / 192 and E32 r 128 / 160 take 64 rows; E32 r 192 / 224 and E64 r 128 / 192 keep 128
+        assert_eq!(moe_block_m(256, 8, 16, 256, 256), 64);
+        assert_eq!(moe_block_m(384, 8, 16, 256, 256), 64);
+        assert_eq!(moe_block_m(512, 8, 32, 256, 256), 64);
+        assert_eq!(moe_block_m(640, 8, 32, 256, 256), 64);
+        assert_eq!(moe_block_m(768, 8, 32, 256, 256), 128);
+        assert_eq!(moe_block_m(896, 8, 32, 256, 256), 128);
+        assert_eq!(moe_block_m(1024, 8, 64, 256, 256), 128);
+        assert_eq!(moe_block_m(1536, 8, 64, 256, 256), 128);
+        // a larger intermediate size fills the CUs at 128 rows: the band does not apply (E16 I768 measured -35 % with 64 rows); an unknown size keeps the old rule
+        assert_eq!(moe_block_m(320, 8, 16, 768, 256), 128);
+        assert_eq!(moe_block_m(384, 8, 16, 768, 256), 128);
+        assert_eq!(moe_block_m(384, 8, 16, u64::MAX, 256), 128);
     }
 
     #[test]
@@ -346,8 +377,14 @@ mod tests {
 
     #[test]
     fn mla_rule() {
-        assert_eq!(mla_config(64, 16), (false, 4));
-        assert_eq!(mla_config(64, 128), (true, 2));
+        assert_eq!(mla_config(64, 16, u64::MAX), (false, 4));
+        assert_eq!(mla_config(64, 128, u64::MAX), (true, 2));
+        // short context at a small batch: the head-parallel form (measured +22 - 107 % at H16 B1 / 4 / 16, ctx 1024 .. 4096); a long context or a large batch keeps the per-wave form
+        assert_eq!(mla_config(4, 16, 2048), (true, 16));
+        assert_eq!(mla_config(16, 16, 4096), (true, 16));
+        assert_eq!(mla_config(1, 16, 8192), (false, 16));
+        assert_eq!(mla_config(64, 16, 2048), (false, 4));
+        assert_eq!(mla_config(4, 16, u64::MAX), (false, 16));
     }
 
     #[test]

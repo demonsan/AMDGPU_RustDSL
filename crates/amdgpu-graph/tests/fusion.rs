@@ -85,7 +85,7 @@ fn negatives_fall_back_with_a_reason() {
 #[test]
 fn per_shape_choices_come_from_dispatch() {
     let p = plan_of("moe_topk");
-    let bm = amdgpu_graph::dispatch::moe_block_m(256, 8, 128);
+    let bm = amdgpu_graph::dispatch::moe_block_m(256, 8, 128, 2048, 256);
     let moe = p.launches.iter().find(|l| l.rule == "moe_experts").expect("moe launch");
     assert_eq!(moe.kernels[0], format!("moe_sorting_e128_k8_b{bm}"));
     let p = plan_of("attention_prefill");

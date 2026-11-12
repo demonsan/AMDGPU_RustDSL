@@ -394,7 +394,7 @@ fn moe(g: &ModelGraph, i: usize) -> R<Launch> {
     need(act == "silu" || act == "gelu", || format!("moe act `{act}` (silu | gelu)"))?;
     need(e >= 8 && e <= 512 && (1..=16).contains(&k) && d % 1024 == 0 && inter % 128 == 0, || format!("moe shape E {e}, k {k}, D {d}, I {inter} outside the kernels (E 8 ..= 512, k <= 16, D % 1024, I % 128)"))?;
     need(!fp8 || (m * k) % 4 == 0, || "fp8 moe: M k must be a multiple of 4".into())?;
-    let bm = dispatch::moe_block_m(m as u64, k as u64, e as u64) as i64;
+    let bm = dispatch::moe_block_m(m as u64, k as u64, e as u64, inter as u64, g.cus) as i64;
     let (dt_s, bms) = (if fp8 { "fp8" } else { "bf16" }, if bm == 64 { "_bm64" } else { "" });
     let mut kernels = vec![format!("moe_sorting_e{e}_k{k}_b{bm}"), format!("gemm_moe1_{dt_s}_{act}{bms}")];
     if fp8 {
@@ -494,7 +494,9 @@ fn mla(g: &ModelGraph, i: usize) -> R<Launch> {
     let (q, kv) = (g.shape(&o.ins[0])?, g.shape(&o.ins[1])?);
     need(q.len() == 3 && q[2] == 576 && kv.len() == 3 && kv[2] == 576, || "mla_attention: q [B, H, 576], kv_cache [NP, P, 576]".into())?;
     let (b, h, p) = (q[0], q[1], kv[1]);
-    let (hp, s) = dispatch::mla_config(b as u64, h as u64);
+    // the largest context the block table can address (max pages x page size): the context-dependent form choice
+    let ctx = g.shape(&o.ins[2]).ok().and_then(|bt| bt.get(1).copied()).map_or(u64::MAX, |pages| (pages * p) as u64);
+    let (hp, s) = dispatch::mla_config(b as u64, h as u64, ctx);
     let parts = if hp { s as i64 } else { 4 * s as i64 };
     let bind = vec![("q", o.ins[0].clone()), ("kv_cache", o.ins[1].clone()), ("block_table", o.ins[2].clone()), ("context_lens", o.ins[3].clone()), ("out", o.outs[0].clone())];
     let mut l = launch("mla_attention", g, &[i], vec![format!("mla_decode_bf16_{}p{p}", if hp { "hp_" } else { "" }), "attn_combine_bf16_hd512".into()], "mla_decode", bind, vec![("hp".into(), Json::Bool(hp)), p_int("splits", s as i64)]);

@@ -194,9 +194,9 @@ def decode():
 
 def mla():
     out = []
-    for (b, h, ctx) in [(1, 128, 8192), (8, 128, 4096), (32, 16, 2048), (4, 16, 16384)]:
+    for (b, h, ctx) in [(1, 128, 8192), (8, 128, 4096), (32, 16, 2048), (4, 16, 16384), (1, 16, 2048), (4, 16, 4096), (16, 16, 1024), (1, 32, 2048), (4, 16, 8192), (64, 16, 4096), (2, 16, 3072), (8, 32, 4096), (12, 48, 2048)]:
         def build(side, b=b, h=h, ctx=ctx):
-            p = side.dispatch('mla', b, h)
+            p = side.dispatch('mla', b, h, '--ctx', ctx)
             hp, s = p['hp'], p['splits']
             page = 64
             k = f'mla_decode_bf16_{"hp_" if hp else ""}p{page}'
@@ -213,9 +213,11 @@ def moe():
     parts = [dict(name='stage1', metric='us', line=r'stage1', vendor_line=None, better=None), dict(name='stage2', metric=r'(?:stage2\+sum|requant\+stage2\+sum) ([0-9.]+) us', line=r'stage', vendor_line=None, better='low')]
     parts[0]['metric'] = r'stage1 ([0-9.]+) us'
     parts[0]['better'] = 'low'
-    for dt, (m, d, i, e, topk) in [('bf16', (4096, 2048, 768, 64, 8)), ('bf16', (256, 2048, 768, 64, 8)), ('fp8', (2048, 4096, 256, 32, 8)), ('fp8', (512, 4096, 256, 32, 8))]:
+    for dt, (m, d, i, e, topk) in [('bf16', (4096, 2048, 768, 64, 8)), ('bf16', (256, 2048, 768, 64, 8)), ('fp8', (2048, 4096, 256, 32, 8)), ('fp8', (512, 4096, 256, 32, 8)),
+                                   # the block_m rule change (E16 / E32 band, measured) and shapes it was not fitted on (other D / I, E) + unchanged controls
+                                   ('fp8', (640, 4096, 256, 32, 8)), ('bf16', (320, 2048, 768, 16, 8)), ('bf16', (384, 2048, 768, 16, 8)), ('fp8', (1280, 4096, 256, 64, 8)), ('bf16', (1024, 2048, 768, 32, 8))]:
         def build(side, dt=dt, m=m, d=d, i=i, e=e, topk=topk):
-            bm = side.dispatch('moe', m, topk, e)['block_m']
+            bm = side.dispatch('moe', m, topk, e, '--inter', i)['block_m']
             bm = bm if bm in (64, 128) else 128
             sfx = '_bm64' if bm == 64 else ''
             ks = [f'gemm_moe1_{dt}_silu{sfx}', f'gemm_moe2_{dt}{sfx}', f'moe_sum_bf16_k{topk}']
@@ -223,9 +225,9 @@ def moe():
                 ks.append(f'quant_token_bf16_fp8_n{i}')   # the host re-quantizes the stage-1 output between the stages with it
             return Run(ks, ['{host:moe_host}', dt, '{codir}', str(m), str(d), str(i), str(e), str(topk), 'silu'], dict(BLOCK_M=bm, CHECK=2))
         out.append(Case(id=f'moe/{dt}/M{m}D{d}I{i}E{e}K{topk}', family='moe', build=build, metric='us', parts=parts, ok=r'MOE_OK', timeout=900))
-    for (m, d, i, e, topk) in [(2048, 7168, 256, 64, 8), (256, 7168, 256, 64, 8)]:
+    for (m, d, i, e, topk) in [(2048, 7168, 256, 64, 8), (256, 7168, 256, 64, 8), (512, 7168, 256, 32, 8), (384, 7168, 256, 16, 8)]:
         def build(side, m=m, d=d, i=i, e=e, topk=topk):
-            bm = side.dispatch('moe', m, topk, e)['block_m']
+            bm = side.dispatch('moe', m, topk, e, '--inter', i)['block_m']
             bm = bm if bm in (64, 128) else 128
             sfx = '_bm64' if bm == 64 else ''
             ks = [f'gemm_moe1_fp4_silu{sfx}', f'gemm_moe2_fp4{sfx}', f'moe_sum_bf16_k{topk}']
