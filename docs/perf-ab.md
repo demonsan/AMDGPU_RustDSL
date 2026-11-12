@@ -55,6 +55,7 @@ The vendor columns are `new/vendor` and `old/vendor` (performance, > 1 = ours is
 | `moe` | bf16 / fp8 / fp4 stages (stage 1, stage 2 + sum judged separately), the commit's `dispatch moe` block_m | `moe_host`, `moe_fp4_host` | - |
 | `conv` | 2-D 3x3, 1x1, 3-D 3x3x3 implicit GEMM | `conv_host` | - |
 | `gemm` | bf16 / int8 / fp8 per-token x per-channel / fp8 block-scale x 7 shapes incl. small M and split-K (+ the reduce kernel), the commit's `dispatch gemm`; MXFP8 v4 x 3 shapes | `vendor_gemm_host` (`ours_v4_*`), `gemm_ref_host` | - |
+| `gemv` | small-M GEMM (W6): M ∈ {1, 4, 16, 32, 64} x N = K ∈ {4096, 7168, 8192} for every dense kind (bf16 / int8 / fp8 per-token x per-channel / fp8 block-scale), the commit's dispatched kernel + split-K reduce; weight-bandwidth-bound (convert TF/s to bytes per second for the roofline) | 60 |
 
 Sampling / top-k are in `membound` (`sampling_host`, `topk_host`, `topk_per_row_host`). The `--quick` set takes the first and the last case of every group (the group is the first two id
 segments, a host for the memory-bound cases: the first only), the per-merge gate.

@@ -292,6 +292,27 @@ def gemm():
     return out
 
 
+def gemv():
+    """Small-M GEMM / GEMV (W6): M in {1, 4, 16, 32, 64} x square N = K in {4096, 7168, 8192}, the dispatched kernel of each kind (weight-streaming
+    bound: the report's TF/s converts to weight bytes per second as N K es / (2 M N K / TF/s))."""
+    out = []
+    for kind, fam in GEMM_KINDS:
+        for nk in (4096, 7168, 8192):
+            for m in (1, 4, 16, 32, 64):
+                def build(side, kind=kind, fam=fam, m=m, n=nk, k=nk):
+                    p = side.dispatch('gemm', kind, m, n, k)
+                    kn, s, red = p['kernel'], p['splits'], p['reduce']
+                    env = dict(SPLITK=s, ITERS=200, WARMUP=50, CHECK_ROWS=min(m, 8))
+                    emit = [kn]
+                    if red:
+                        env.update(REDUCE_CO='{co:%s}' % red, REDUCE_KN=red)
+                        emit.append(red)
+                    tm, tn = _tile(kn)
+                    return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
+                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='tflops', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
+    return out
+
+
 SLOW_FOR_QUICK = r'gated_rmsnorm bf16 n128|moe_reduce k8 d7168|conv1d_fwd w4 silu B=128 L=512 uniform|argmax v32000|moe/fp8/'
 
 
@@ -299,7 +320,7 @@ def cases(tree, args):
     out = []
     for f in (membound, ):
         out += f(tree)
-    for f in (attn_bf16, attn_hd192, attn_fp8pt, attn_mxfp8, attn_bwd, decode, mla, moe, conv, gemm):
+    for f in (attn_bf16, attn_hd192, attn_fp8pt, attn_mxfp8, attn_bwd, decode, mla, moe, conv, gemm, gemv):
         out += f()
     # the --quick set: per group (the first two id segments; a host for the memory-bound cases) the first case, and for the others also the last one
     groups = {}
