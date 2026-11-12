@@ -85,7 +85,7 @@ pub fn gemm_candidates(kind: &str, m: u64, n: u64, k: u64, cus: u64) -> Vec<Cand
             continue;
         }
         let ring_slots = if tm == 64 { 3 } else { 2 };
-        let split_options: &[u32] = if v.splitk { &[2, 4, 8] } else { &[1] };
+        let split_options: &[u32] = if !v.splitk { &[1] } else if tm == 64 { &[2, 4, 8, 16] } else { &[2, 4, 8] };
         for &s in split_options {
             if s > 1 && n % 1024 != 0 {
                 continue;
