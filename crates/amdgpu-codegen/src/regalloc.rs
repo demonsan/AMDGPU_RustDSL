@@ -270,7 +270,26 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         // pinned values first (their registers are fixed: placing them before the free values keeps the pin honourable), then wide tuples
         order.sort_by_key(|x| (plan.pin(x.2).is_none(), std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
         for (s, e, r, c) in order {
-            let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
+            if phys[r as usize] != u32::MAX {
+                // placed together with its rotation class
+                continue;
+            }
+            let own = |q: VReg| -> Vec<(usize, usize)> { if segs[q as usize].is_empty() { vec![(start[q as usize], end[q as usize])] } else { segs[q as usize].clone() } };
+            // a rotation class is placed as ONE value: the union of its members' live segments on one tuple (members must not overlap)
+            let class = plan.rot_class(r);
+            for (k, &a) in class.iter().enumerate() {
+                for &b in class.iter().skip(k + 1) {
+                    if own(a).iter().any(|(as_, ae)| own(b).iter().any(|(bs, be)| !(*ae < *bs || *be < *as_))) {
+                        let (rn, pa) = plan.rot_pos(a);
+                        let (_, pb) = plan.rot_pos(b);
+                        return Err(format!(
+                            "register plan: rotation `{rn}`: {} (fragment {pa}) and {} (fragment {pb}) share a buffer but are live at the same time (a read ran ahead of the previous fragment's last use)",
+                            plan.name(a), plan.name(b)
+                        ));
+                    }
+                }
+            }
+            let my: Vec<(usize, usize)> = if class.len() > 1 { class.iter().flat_map(|q| own(*q)).collect() } else if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
             let lo = if width == 1 { V_RESERVED } else { width };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
@@ -343,6 +362,9 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 occ[slot + k].extend(my.iter().copied());
             }
             phys[r as usize] = slot as u32;
+            for &q in &class {
+                phys[q as usize] = slot as u32;
+            }
             max_v = max_v.max(slot + width);
         }
         for (i, o) in occ.iter().enumerate() {
@@ -1123,6 +1145,17 @@ impl Plan {
         } else {
             None
         }
+    }
+    /// `r` and its rotation-class partners (just `r` outside a rotation).
+    fn rot_class(&self, r: VReg) -> Vec<VReg> {
+        match self.rot.get(&r) {
+            Some((_, class, _)) if self.active => std::iter::once(r).chain(class.iter().copied()).collect(),
+            _ => vec![r],
+        }
+    }
+    /// (rotation name, fragment position) of a rotation member.
+    fn rot_pos(&self, r: VReg) -> (String, usize) {
+        self.rot.get(&r).map(|(n, _, p)| (n.clone(), *p)).unwrap_or_default()
     }
     /// The registers a rotation partner of `r` already holds (registers, partner, rotation name, r's fragment position).
     fn rot_target(&self, r: VReg, phys: &[u32]) -> Option<(u32, VReg, String, usize)> {
