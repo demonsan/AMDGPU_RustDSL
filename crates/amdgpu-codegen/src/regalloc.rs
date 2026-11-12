@@ -1118,12 +1118,16 @@ impl Plan {
                     continue;
                 }
                 let a = m.canon(a);
-                let class: Vec<VReg> = frags.iter().enumerate().filter(|(j, x)| j % bufs == i % bufs && **x != u32::MAX && *j != i).map(|(_, x)| m.canon(*x)).collect();
-                p.rot.insert(a, (name.clone(), class, i));
+                let mut class: Vec<VReg> = frags.iter().enumerate().filter(|(j, x)| j % bufs == i % bufs && **x != u32::MAX && *j != i).map(|(_, x)| m.canon(*x)).filter(|x| *x != a).collect();
+                class.dedup();
+                p.rot.entry(a).or_insert((name.clone(), class, i));
                 // the classes never share registers
                 for (j, &b) in frags.iter().enumerate() {
                     if b != u32::MAX && j % bufs != i % bufs && m.canon(b) != a {
-                        p.sep.entry(a).or_default().push(m.canon(b));
+                        let e = p.sep.entry(a).or_default();
+                        if !e.contains(&m.canon(b)) {
+                            e.push(m.canon(b));
+                        }
                     }
                 }
             }

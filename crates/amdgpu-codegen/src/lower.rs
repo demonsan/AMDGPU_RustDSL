@@ -185,8 +185,92 @@ fn run_coalesce(m: &mut MFunction) -> Result<(), String> {
         for (r, _) in h.pins_v.iter_mut() {
             *r = rn(*r);
         }
-        for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)) {
+        for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)).chain(h.rotations.iter_mut().map(|x| &mut x.2)) {
             for r in g.iter_mut() {
+                if *r != u32::MAX {
+                    *r = rn(*r);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `reg_rotate` (W3 B6b): the fragments of one residue class become ONE register (the class's first member) before scheduling, so the
+/// scheduler sees the buffer reuse as real WAR / WAW dependences and never moves a read ahead of the previous fragment's last use. The
+/// members' program-order live ranges must be disjoint; the allocator keeps the classes apart (separate). Errors name the two fragments.
+fn run_rotate(m: &mut MFunction) -> Result<(), String> {
+    if m.reg_hints.rotations.is_empty() {
+        return Ok(());
+    }
+    // program-order positions of every def / use
+    let mut first: HashMap<VReg, usize> = HashMap::new();
+    let mut last: HashMap<VReg, usize> = HashMap::new();
+    let mut pos = 0usize;
+    for b in &m.blocks {
+        for i in &b.insts {
+            for r in i.dst.iter().copied().chain(i.uses()) {
+                let r = m.canon(r);
+                first.entry(r).or_insert(pos);
+                last.insert(r, pos);
+            }
+            pos += 1;
+        }
+    }
+    let mut rename: HashMap<VReg, VReg> = HashMap::new();
+    for (name, bufs, frags) in m.reg_hints.rotations.clone() {
+        let bufs = bufs.max(1) as usize;
+        for k in 0..bufs {
+            let members: Vec<(usize, VReg)> = frags.iter().enumerate().filter(|(i, r)| i % bufs == k && **r != u32::MAX).map(|(i, r)| (i, m.canon(*r))).collect();
+            let Some(&(_, rep_r)) = members.first() else { continue };
+            for w in members.windows(2) {
+                let ((ia, a), (ib, b)) = (w[0], w[1]);
+                if m.vreg_class(a) != m.vreg_class(b) {
+                    return Err(format!("register plan: rotation `{name}`: fragments {ia} and {ib} share a buffer but have different register classes ({:?} / {:?})", m.vreg_class(a), m.vreg_class(b)));
+                }
+                if let (Some(&la), Some(&fb)) = (last.get(&a), first.get(&b)) {
+                    if fb <= la {
+                        let nm = |r: VReg| m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"));
+                        return Err(format!(
+                            "register plan: rotation `{name}`: {} (fragment {ib}) is defined before the last use of {} (fragment {ia}) in program order: they cannot share a buffer",
+                            nm(b), nm(a)
+                        ));
+                    }
+                }
+            }
+            for &(_, r) in &members[1..] {
+                if r != rep_r {
+                    rename.insert(r, rep_r);
+                }
+            }
+        }
+    }
+    if rename.is_empty() {
+        return Ok(());
+    }
+    let rn = |r: VReg| *rename.get(&r).unwrap_or(&r);
+    for b in m.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if let Some(d) = i.dst.as_mut() {
+                *d = rn(*d);
+            }
+            for s in i.srcs.iter_mut() {
+                if let Src::Reg(r) = s {
+                    *r = rn(*r);
+                }
+            }
+        }
+    }
+    for v in m.alias.values_mut() {
+        v.0 = rn(v.0);
+    }
+    let h = &mut m.reg_hints;
+    for (r, _) in h.pins_v.iter_mut() {
+        *r = rn(*r);
+    }
+    for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)).chain(h.rotations.iter_mut().map(|x| &mut x.2)) {
+        for r in g.iter_mut() {
+            if *r != u32::MAX {
                 *r = rn(*r);
             }
         }
@@ -269,6 +353,7 @@ pub const CLEANUP: &[LowerPass] = {
         LowerPass { info: info("lower-remat", Lower, Generic, "ladder rungs remat1..4", &[Indirect("outer ladder; register_accounting.rs")]), run: run_remat },
         LowerPass { info: info("lower-lds-spill", Lower, Param, "ladder rungs ldsspill8..64 (re-inserts waits)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_lds_spill },
         LowerPass { info: info("lower-coalesce", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_coalesce },
+        LowerPass { info: info("lower-rotate", Lower, Generic, "reg_rotate marks (no-op without)", &[Test("crates/amdgpu-kernels/tests/reg_rotate.rs")]), run: run_rotate },
         LowerPass { info: info("lower-movb64", Lower, Only, "token movb64 (zero pairs -> v_mov_b64)", &[Test("crates/amdgpu-kernels/tests/mops_w5.rs")]), run: run_movb64 },
         LowerPass { info: info("lower-dce-final", Lower, Generic, "always", &[Indirect("every kernel compiles; md5 manifest")]), run: run_dce_final },
         LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },

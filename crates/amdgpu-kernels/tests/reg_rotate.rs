@@ -45,5 +45,5 @@ fn a_rotation_shares_one_tuple_per_class_and_keeps_the_classes_apart() {
 #[test]
 fn overlapping_members_of_one_buffer_are_an_error_naming_them() {
     let e = amdgpu_codegen::compile_mir_alloc(&frags(true)).err().expect("fragment 0 lives across fragment 4");
-    assert!(e.contains("rotation `kv`") && e.contains("live at the same time"), "{e}");
+    assert!(e.contains("rotation `kv`") && e.contains("fragment 0") && e.contains("fragment 4"), "{e}");
 }
