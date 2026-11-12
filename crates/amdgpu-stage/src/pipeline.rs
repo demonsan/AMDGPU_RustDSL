@@ -181,14 +181,14 @@ impl Pipeline {
             // tile 1 after the prologue stores; it lands behind the first tile and is published by the loop's first top barrier
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
-            if self.rs_depth == 3 {
-                // depth 3: tile 2 as well (clamped)
-                let key2 = b.let_i32(ev(self.nkv).gt(2).select_i32(2, ev(self.nkv) - 1) << self.lg());
-                body.stage(b, role, &key2, &SlotIdx::new(2, 2));
+            // depth D >= 3: tiles 2 .. D - 1 as well (clamped)
+            for k in 2..self.rs_depth.max(2) as i32 {
+                let key2 = b.let_i32(ev(self.nkv).gt(k).select_i32(k, ev(self.nkv) - 1) << self.lg());
+                body.stage(b, role, &key2, &SlotIdx::new(k, k));
             }
         }
         // RegStaged: tile 1 (depth 3: and tile 2) is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here
-        let rs_late = if self.rs_depth == 3 { 2 * self.late_tile1_vm } else { self.late_tile1_vm };
+        let rs_late = if self.rs_depth >= 3 { (self.rs_depth - 1) * self.late_tile1_vm } else { self.late_tile1_vm };
         b.wait_vm(if self.cadence == Cadence::RegStaged { rs_late } else { 0 });
         b.wait_lds(0);
         b.barrier();
@@ -231,27 +231,28 @@ impl Pipeline {
         };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
-        if self.cadence == Cadence::RegStaged && self.rs_depth == 3 {
-            // depth 3: tiles it, it + 1, it + 2 in slots 0, 1, 2; `idx` = the slot the loop left from
-            self.iter_rs(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true);
-            let one = b.c_i32(1);
-            b.set_var(idx, one);
-            let mid = b.bind_i32(varx(it) + 1);
-            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
-            b.break_if(stop1);
-            self.iter_rs(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true);
-            let two = b.c_i32(2);
-            b.set_var(idx, two);
-            let mid2 = b.bind_i32(varx(it) + 2);
-            let stop2 = b.bind_cond(!ev(mid2).lt(&nkv_m1));
-            b.break_if(stop2);
-            self.iter_rs(b, role, body, Opnd::Val(mid2), Opnd::I32(2), false, true);
-            let zero = b.c_i32(0);
-            b.set_var(idx, zero);
-            let it3 = b.bind_i32(varx(it) + 3);
-            b.set_var(it, it3);
-            let stop3 = b.bind_cond(!ev(it3).lt(&nkv_m1));
-            b.break_if(stop3);
+        if self.cadence == Cadence::RegStaged && self.rs_depth >= 3 {
+            // depth D >= 3: tiles it .. it + D - 1 in slots 0 .. D - 1; `idx` = the slot the loop left from
+            let d = self.rs_depth as i32;
+            let mut cur = Opnd::Var(it);
+            for k in 0..d {
+                self.iter_rs(b, role, body, cur.clone(), Opnd::I32(k), false, true);
+                if k + 1 < d {
+                    let kn = b.c_i32(k + 1);
+                    b.set_var(idx, kn);
+                    let mid = b.bind_i32(varx(it) + (k + 1));
+                    let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
+                    b.break_if(stop1);
+                    cur = Opnd::Val(mid);
+                } else {
+                    let zero = b.c_i32(0);
+                    b.set_var(idx, zero);
+                    let itd = b.bind_i32(varx(it) + d);
+                    b.set_var(it, itd);
+                    let stopd = b.bind_cond(!ev(itd).lt(&nkv_m1));
+                    b.break_if(stopd);
+                }
+            }
             b.end_loop();
             let it_t = b.bind_i32(varx(it) + varx(idx));
             let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
@@ -400,14 +401,15 @@ impl Pipeline {
     fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool) {
         let nkv = ev(self.nkv);
         let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
-        let d3 = self.rs_depth == 3;
+        let d3 = self.rs_depth >= 3;
+        let dd = self.rs_depth.max(2) as i32;
         // the tile staged in this iteration: t + depth, into the slot of t
-        let it_p2 = b.let_i32(amdgpu_dsl::ox(it) + if d3 { 3 } else { 2 });
+        let it_p2 = b.let_i32(amdgpu_dsl::ox(it) + if d3 { dd } else { 2 });
         let other = match (slot, d3) {
             (Opnd::I32(k), false) => Opnd::I32(1 - k),
-            (Opnd::I32(k), true) => Opnd::I32((k + 1) % 3),
+            (Opnd::I32(k), true) => Opnd::I32((k + 1) % dd),
             (o, false) => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
-            (o, true) => b.bind_opnd(&amdgpu_dsl::ox(o).lt(2).select_i32(amdgpu_dsl::ox(o) + 1, 0)),
+            (o, true) => b.bind_opnd(&amdgpu_dsl::ox(o).lt(dd - 1).select_i32(amdgpu_dsl::ox(o) + 1, 0)),
         };
         let t = TileIt {
             it,
@@ -429,7 +431,7 @@ impl Pipeline {
             1 => body.pre_sync(b, role, &t),
             2 => {
                 // (depth 3: the DMAs of t + 2, issued in the previous iteration, stay in flight)
-                b.wait_vm(if d3 { self.late_tile1_vm } else { 0 });
+                b.wait_vm(if d3 { (self.rs_depth - 2) * self.late_tile1_vm } else { 0 });
                 b.wait_lds(0);
                 body.post_wait(b, role, &t);
                 b.barrier();

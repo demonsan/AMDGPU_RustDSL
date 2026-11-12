@@ -74,6 +74,9 @@ pub struct GemmConfig {
     /// 3-slot LDS ring (`Pipeline::rs_depth` 3): tile t + 3 is staged while t + 2 is still in flight (counted top wait) - small CTAs whose
     /// per-tile compute is shorter than the memory latency. Unit-scale forms only (no other VMEM in the loop).
     pub depth3: bool,
+    /// a 4-slot ring (`Pipeline::rs_depth` 4; with `depth3`): three stages in flight behind the computed tile - small-M weight streaming
+    /// (W6: the per-CU bytes in flight bound the stream rate)
+    pub depth4: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -177,7 +180,7 @@ pub enum MoeStage {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false, depth3: false, depth4: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -270,6 +273,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         // (fp8 per-token: 256x7168x4096 22.98 (128) -> 13.60 us, 1024x4096x8192 51.6 -> 46.0)
         "gemm_a8w8_rowcol_fp8_64" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_rowcol_fp8_64_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64_splitk", GemmConfig { cta_m: 64, depth3: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
+        // W6 experiment: the 4-slot ring (three stages in flight) for small-M weight streaming
+        "gemm_a8w8_rowcol_fp8_64_splitk_d4" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_64_splitk_d4", GemmConfig { cta_m: 64, depth3: true, depth4: true, ..GemmConfig::a8w8_rowcol_128() }.splitk())),
+        "gemm_a16w16_bf16_64_splitk_d4" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_64_splitk_d4", GemmConfig { cta_m: 64, depth3: true, depth4: true, ..GemmConfig::a16w16_128() }.splitk())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
@@ -519,7 +525,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
 
     // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
-    let slots = if cfg.depth3 { 3 } else { 2 };
+    let slots = if cfg.depth4 { 4 } else if cfg.depth3 { 3 } else { 2 };
     assert!(!cfg.depth3 || (matches!(cfg.scales, Scales::RowCol | Scales::None) || (cfg.scales == Scales::Block128 && cfg.moe.is_none())) && cfg.conv.is_none(), "depth3: unit-scale plain GEMMs");
     let a_bytes = cta_m / 8 * 1056;
     // mixed precision: a_images padded A images per slot (the 128-byte pieces of the 256-element K tile)
@@ -752,7 +758,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
     if cfg.depth3 {
-        pipe.rs_depth = 3;
+        pipe.rs_depth = if cfg.depth4 { 4 } else { 3 };
         if cfg.scales == Scales::Block128 {
             // (the two scale DMAs per wave and stage)
             pipe.late_tile1_vm += 2;
