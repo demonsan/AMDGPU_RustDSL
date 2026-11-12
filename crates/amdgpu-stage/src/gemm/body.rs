@@ -331,7 +331,8 @@ impl Body {
             .map(|v| {
                 let lo = b.buffer_load_b128(self.rsrc_b, v[0], so, 0);
                 let hi = b.buffer_load_b128(self.rsrc_b, v[1], so, 0);
-                b.cat_frag4(lo, hi)
+                let f = b.cat_frag4(lo, hi);
+                b.agpr(f)
             })
             .collect()
     }
