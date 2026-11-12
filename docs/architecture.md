@@ -1,7 +1,7 @@
 # Architecture: four layers, as built
 
 The decision record is [refactor-4layer-plan.md](refactor-4layer-plan.md). This page describes what Main has now, and links to the detailed
-documents. Dependencies point **down only**; `crates/amdc/tests/layer_check.rs` checks the crate ranks, manifests, source references and that lower layers hold no kernel-name policy.
+documents; [design-to-kernel.md](design-to-kernel.md) traces three kernels end to end through the layers and both Weavers (real `amdc` outputs, what the author decides vs what the system decides, the add-a-kernel checklist). Dependencies point **down only**; `crates/amdc/tests/layer_check.rs` checks the crate ranks, manifests, source references and that lower layers hold no kernel-name policy.
 
 ## 1. Layers and crates
 

@@ -126,6 +126,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 | 文档 | 内容 |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | **四层架构（实际实现）**：crate 依赖图与各层内容、两个贯穿各层的例子、gfx950 pass 流水线与目标相关性、gfx1250 状态、不变量 |
+| [`docs/design-to-kernel.md`](docs/design-to-kernel.md) | **设计如何落到 kernel 上**：四层 + 两个 Weaver 各自对应的 crate / 函数、作者决定什么与系统决定什么；三个端到端例子（出厂 MXFP8 `_vs128`、MLA decode、小 M GEMM 经图 / 组合路径）附实跑的 `amdc` 输出与门禁；加新 kernel 的清单；默认与 opt-in、测得为负的方向 |
 | [`docs/l1-graph.md`](docs/l1-graph.md) | **L1 图层**：算子词表、融合规则（rmsnorm+quant、add+rmsnorm(+quant)、silu_mul+quant、qknorm+rope(+kvcache)…）、多 kernel 计划（attention split→combine、MoE、GEMM split-K）、`amdc graph plan`、golden 计划与数值检查 |
 | [`docs/python-jit.md`](docs/python-jit.md) | **Python JIT 入口**：amdc 子进程编译 + 磁盘缓存 + 形状特化（默认开）、kernarg 打包与主机合同校验、GEMM / FMHA 高层算子（含出厂路径选择） |
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
