@@ -54,3 +54,34 @@ Per-wave class cycles (ours vs vendor): MFMA 58.0 K vs 52.4 K; **DMA issue 22.8 
 Remaining gap 37.5 K per wave: DMA issue +19.5 K (52 %), s_nop +8.7 K (23 %), waitcnt(vm) +4.8 K (13 %), MFMA operand waits +5.6 K, VALU +1.0 K, barrier ~0. The B-operand DMA sites (`buffer_load_dwordx4 v16 / v14 ... s27 lds`) carry most of the issue stall.
 Reading: the DMA issue stall is still the largest item and tracks the LDS-DMA wavefront count (1.55x the vendor's), so removing the B tile's DMA-to-LDS (B direct to registers) targets it; a 256-byte K tile can only halve the
 s_nop + waitcnt(vm) + barrier share (16 K of the 37.5 K).
+
+## W6 (2026-11-12): B straight into registers, and where the bank conflicts are — closed at 0.85–0.90×
+
+**Baseline**, same session on node 53 GPU 0, against aiter's `f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256`:
+
+| shape | ours | aiter | ratio |
+|---|--:|--:|--:|
+| 8192³ | 274.5 µs | 246.4 µs | 0.90 |
+| 4096² × 8192 | 74.1 µs | 65.8 µs | 0.89 |
+| 4096 × 8192² | 146.7 µs | 128.6 µs | 0.88 |
+| 2048 × 7168² | 60.8 µs | 51.9 µs | 0.85 |
+
+Counters at 8192³ match the rerun above.
+
+**Scheduler options.** ldsink, wsink, ldahead32, hzfill and reorder were all noise to −6 %. M0 reuse is already on in the Gemm profile.
+
+**B-direct prototype** (`gemm_a4w4_mxfp4_bd`, branch `mxfp4-bdirect`, not merged).
+- **What it does:** the B fragments are loaded straight from global with two `buffer_load_dwordx4` per fragment. The preshuffled 2 KB block is byte-identical to the LDS image, so the voffsets come from the LDS read partition. The loads for tile t + 1 are issued at the start of tile t; no B DMA and no B LDS reads. Correct at every tested shape.
+- **Counters** (base → B-direct):
+  - TA address / command FIFO full: 4.6e6 → 1.8e6 and 7.4e6 → 4.0e6;
+  - LDS-DMA wavefronts: 2.16e6 → 1.08e6;
+  - waits: unchanged;
+  - LDS bank conflicts: unchanged.
+- **Time, same session (base → B-direct):** 8192³ 273.6 → 303.5 µs, 4096² × 8192 72.8 → 83.2 µs, 2048 × 7168² 59.8 → 69.5 µs, i.e. −10 … −15 %.
+  - With B in VGPRs the next tile's fragments need +64 VGPRs and the scheduler falls back to the unscheduled code. With B in AGPRs it schedules but stays slower: the extra per-tile VMEM latency and register traffic outweigh the TA relief at this tile and ring depth.
+
+**Bank-conflict attribution.** Since the conflicts stayed unchanged without the B reads, they do not come from B. Turning off the LDS epilogue (direct-C variant) takes them from 9.96e6 to 8.39e6. So about 16 % sit in the LDS epilogue and about 84 % in the main loop's A reads. That is our fp4 operand-read pattern over the padded A image: 8 rows at a 128-byte pitch, so rows r and r + 2 share banks. aiter uses the same image without conflicts. In the earlier ATT the ds_read class cost about the same cycles as aiter's (4.9 K vs 5.4 K per wave), so the conflicts are not a large time item.
+
+The fix would be an XOR swizzle of the A image's 16-byte chunks by row, with the swizzle on the DMA source and in the read view, for every GEMM using the v4 body. That is a layout change of moderate size for an expected small gain.
+
+**Closed** at 0.85–0.90×. The remaining gap is the vendor's composition — B in registers at its own tile and depth, with a register plan sized for that — not a single lever. This is the same finding as the FMHA replica (`fmha-replica.md` §4.10).
