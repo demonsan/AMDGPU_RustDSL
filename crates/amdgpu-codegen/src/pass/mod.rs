@@ -337,6 +337,10 @@ const HAZARD_VALUE: Pass = Pass {
 };
 const MIR_VERIFY: Pass = Pass { info: info("verify-mir-structure", Verify, Param, "always", &[Test("crates/amdgpu-kernels/tests/sched_kernels.rs"), Test("crates/amdgpu-codegen/tests/smfmac_hazards.rs")]), run: run_mir_verify };
 // W3 B2: the unscheduled path also recomputes its waits from the final order (lowering's program-order waits drained at control-flow edges)
+// The unscheduled path allocates with lowering's waits in place (the allocation, and so the code, stays exactly what it was), then
+// recomputes the waits on the allocated order and re-checks the value hazards the removed waits may have been padding.
+const U_HAZARD_VALUE: Pass = Pass { info: info("hazard-value", Mir, Only, "unscheduled path, after the wait recompute (W3 B2)", &[Test("crates/amdgpu-codegen/tests/hazard_oracle.rs")]), run: run_hazard_value };
+const U_VERIFY_WAITS: Pass = Pass { info: info("verify-waits", Verify, Only, "unscheduled path, after the wait recompute (W3 B2)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_verify_waits };
 const U_STRIP: Pass = Pass { info: info("waits-strip-auto", Sched, Generic, "unscheduled path (W3 B2)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs")]), run: run_strip_auto };
 const U_WAITS: Pass = Pass { info: info("waitcnt-recompute", Sched, Only, "unscheduled path (W3 B2)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Indirect("perf_ab all families")]), run: run_insert_waits };
 const VERIFY_WAITS: Pass = Pass { info: info("verify-waits", Verify, Only, "unscheduled path (after verify-mir-structure)", &[Test("crates/amdgpu-codegen/tests/wait_operands.rs"), Test("crates/amdgpu-kernels/tests/gpu_semantics.rs")]), run: run_verify_waits };
@@ -366,7 +370,7 @@ const VALU_SGPR: Pass = Pass {
 pub const SCHEDULED: &[Pass] = &[SCHED_CFG, SCHED_STRIP, BWEAVE_ORDER, SCHED_DSEL, SCHED_HOIST, SCHED_SLOT, SCHED_PHASE, SCHED_LIST, SCHED_WSINK, SCHED_LDAHEAD, SCHED_WAITS, SCHED_VERIFY, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, REGALLOC, BUDGET_RUNG, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
 
 /// The unscheduled body (no scheduler, or every inner rung failed).
-pub const UNSCHEDULED: &[Pass] = &[PHASE_STRIP, U_STRIP, BWEAVE_ORDER, U_WAITS, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, VERIFY_WAITS, REGALLOC, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
+pub const UNSCHEDULED: &[Pass] = &[BWEAVE_ORDER, PHASE_STRIP, M0_REUSE, M0_EXPLICIT, PIN_CHECK, HAZARD_VALUE, MIR_VERIFY, VERIFY_WAITS, REGALLOC, U_STRIP, U_WAITS, U_HAZARD_VALUE, U_VERIFY_WAITS, INFLIGHT_WAW, PHYS_WAR, HZFILL, M0_PAD, VALU_SGPR, SOFT_CLAUSE];
 
 /// The final checks and the tail (compile_with).
 pub const BACK: &[PassInfo] = &[
