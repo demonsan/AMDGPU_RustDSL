@@ -83,3 +83,7 @@ Add a case: append a `Case(...)` to a family function of `perf_ab_cases.py`: `bu
 - The vendor side exists only where the host runs the vendor kernel itself (attention families, backward); GEMM / decode / MLA vendor ratios are in their own tools
   (`tools/gemm_gate.sh`, `tools/pa_auto.sh`).
 - A full run is long (hours: the memory-bound hosts initialise and check on the CPU); the `--quick` set is the merge gate, the full table is for milestones.
+
+## Metric precision
+
+The metric of a case is read from the host's output line. `vendor_gemm_host` prints TF/s with one decimal and microseconds with two, so the **gemv family and the small-M GEMM cases (M <= 128) are judged on the microseconds** (a lower-is-better metric; the ratio is still new / old in performance terms): at M = 1 the weight-streaming kernels run at about 4 TF/s, where one decimal step (4.3 vs 4.2) is 2.4 % and would exceed the 2 % floor by itself. Large GEMMs keep TF/s.
