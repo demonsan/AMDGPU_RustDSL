@@ -292,6 +292,10 @@ pub struct AttnBody3<'a> {
     /// the copy-distance-2 form (`Pipeline::ahead2`, `KvRing3::new_kv(.., 2, 4, ..)`): the matrix phase of tile t stages tile t + 2 (K into
     /// `TileIt::n2`, V into slot (t + 2) & 3) and PV reads V from slot t & 3
     pub ahead2: bool,
+    /// B6b: the V fragments of PV(t) and the K fragments of QK(t + 1) rotate through 4 register buffers (`reg_rotate`: fragment i in buffer
+    /// i mod 4, the vendor's v[20:51]): a read for the next MFMA never waits on the previous MFMA's operands
+    pub frag_ring: bool,
+    frags: std::cell::RefCell<Vec<amdgpu_dsl::RegRef>>,
     pinned: std::cell::Cell<bool>,
 }
 
@@ -324,7 +328,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, ahead2: false, frag_ring: false, frags: Default::default(), setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false, causal: None, pv_unscaled: false, pin_roles: false, pinned: std::cell::Cell::new(false) }
     }
     /// The K-scale reader of `slot` (None without K scales).
     fn kd_at(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Option<LdsSlotPart> {
@@ -450,6 +454,7 @@ impl<'a> AttnBody3<'a> {
                 }
                 (k.read(b, 2 * blk), k.read(b, 2 * blk + 1), self.kword(b, kd.as_ref(), blk))
             });
+            self.frags.borrow_mut().extend([amdgpu_dsl::RegRef::Val(k0), amdgpu_dsl::RegRef::Val(k1)]);
             u.capture(b, format!("qk.mma{blk}"), |b| self.qk_block_mma(b, &s, k0, k1, kw, blk));
         }
         self.bias_tile.set(None);
@@ -468,6 +473,7 @@ impl<'a> AttnBody3<'a> {
         for hh in 0..2usize {
             for e in 0..4usize {
                 let (_, vf) = u.capture(b, format!("pv.read.h{hh}e{e}"), |b| v.read(b, hh + 2 * e));
+                self.frags.borrow_mut().push(amdgpu_dsl::RegRef::Val(vf));
                 if self.pv_unscaled {
                     let (x, y) = if r.mma.swap_ab { (p[hh], vf) } else { (vf, p[hh]) };
                     u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| b.var_mfma_fp8_32x32x64(o.accs[e].var, x, y));
@@ -656,6 +662,7 @@ impl PipeBody for AttnBody3<'_> {
         // the units' iteration offsets relative to the pass (B5 slot tokens: unit of ring R with iter d uses slot d mod S): PV(t) k, QK(t + 1)
         // k + 1, the copies of t + 2 k + 2, with k the half of the two-tile pass (the static slot of t)
         let half = if self.ahead2 { match t.cur.slot { Opnd::I32(k) => k, _ => 0 } } else { 0 };
+        self.frags.borrow_mut().clear();
         let mut pv_u = self.pv_units(b, &vcur, &w);
         if self.ahead2 {
             for x in pv_u.v.iter_mut() {
@@ -708,6 +715,11 @@ impl PipeBody for AttnBody3<'_> {
                 Some(hs) => hs.into_iter().fold(w.seq().free(), |w, (m, f)| w.interleave(m, f)),
                 None => w.seq(),
             });
+        let fr = std::mem::take(&mut *self.frags.borrow_mut());
+        if self.frag_ring {
+            // the matrix phase's fragments in issue order: V of PV(t), then K of QK(t + 1)
+            b.reg_rotate("kv", 4, &fr);
+        }
         if let (Some(pt), true) = (self.blk.pt, t.staged) {
             // per-tensor FP8: the next tile's S scaled by m at the end of the matrix phase, where it is produced. At the start of the softmax
             // phase (the first version) the 32 v_pk_mul lengthened the VALU phase that both ping-pong groups wait on (sched's ATT: VALU stall

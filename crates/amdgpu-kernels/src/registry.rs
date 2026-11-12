@@ -88,6 +88,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         "fmha_fwd_hd128_mxfp8_v3_replica" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_replica()),
         "fmha_fwd_hd128_mxfp8_v3_ring2" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_ring2()),
+        "fmha_fwd_hd128_mxfp8_v3_ring2r" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_ring2x("fmha_fwd_hd128_mxfp8_v3_ring2r", true, false)),
+        "fmha_fwd_hd128_mxfp8_v3_ring2rm" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_ring2x("fmha_fwd_hd128_mxfp8_v3_ring2rm", true, true)),
         "fmha_fwd_hd128_fp8pt_v3" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3()),
         "fmha_fwd_hd128_fp8pt_v3_causal" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3_causal()),
         "fmha_fwd_hd128_fp8pt_v3_kvsplit" => Some(crate::fmha::fp8pt::fmha_fwd_hd128_fp8pt_v3_kvsplit()),

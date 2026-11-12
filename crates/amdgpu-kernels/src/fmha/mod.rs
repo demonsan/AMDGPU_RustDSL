@@ -37,7 +37,7 @@ use amdgpu_stage::{Cadence, Pipeline};
 /// Since W5 (docs/fmha-replica.md §4.9) it is built with the replica configuration: unscaled PV, the two-tile pass with static slots and
 /// threaded exits, the out-of-line lazy rollback and the vendor's instruction forms (perf_ab +1.7 % geomean, port_gate PASS).
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: true, ring2: false });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots { replica: true, ring2: false, frag_ring: false, morder: false });
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
@@ -49,14 +49,20 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
 /// W5 / R3 (docs/fmha-replica.md §4): the `_vs128` structure moved step by step onto the vendor kernel's algorithm and schedule. Step 1: PV
 /// through the unscaled fp8 MFMA (the vendor's form). Experimental, not dispatched.
 pub fn fmha_fwd_hd128_mxfp8_v3_replica() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true, ring2: false });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_replica", &mut Vs128Slots { replica: true, ring2: false, frag_ring: false, morder: false });
     f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     f
 }
 /// R3 step 5 (docs/fmha-replica.md): the replica with the vendor's copy distance - tile t + 2 staged in the matrix phase of tile t, K in 2 slots,
 /// V in 4 (slot t & 3). Experimental, not dispatched.
 pub fn fmha_fwd_hd128_mxfp8_v3_ring2() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_ring2", &mut Vs128Slots { replica: true, ring2: true });
+    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_ring2", &mut Vs128Slots { replica: true, ring2: true, frag_ring: false, morder: false });
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+    f
+}
+/// B6b experiments on `_ring2`: + the K / V fragment rotation (`_ring2r`), + the authored vendor M-phase order (`_ring2rm`). Experimental.
+pub fn fmha_fwd_hd128_mxfp8_v3_ring2x(name: &str, frag_ring: bool, morder: bool) -> Function {
+    let mut f = skeleton_vs128::build_vs128(name, &mut Vs128Slots { replica: true, ring2: true, frag_ring, morder });
     f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     f
 }
@@ -76,6 +82,9 @@ pub(crate) struct Vs128Slots {
     pub(crate) replica: bool,
     /// R3 step 5: copy distance 2, K 2 / V 4 slots (`fmha_fwd_hd128_mxfp8_v3_ring2`)
     pub(crate) ring2: bool,
+    /// B6b experiment: the K / V fragment rotation (`reg_rotate`), + `morder`: the authored vendor M-phase order (§4.8)
+    pub(crate) frag_ring: bool,
+    pub(crate) morder: bool,
 }
 
 impl skeleton_vs128::Vs128Slots for Vs128Slots {
@@ -85,6 +94,10 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         if self.replica {
             // R3 step 4a: the vendor's instruction forms (v_cmp_nge_f32 rollback test, v_mov_b64 zeroing)
             b.lower_opts(&["cmpneg", "movb64", "jthread", "coldlayout"]);
+        }
+        if self.morder {
+            // §4.8: the merged matrix phase in its declaration order (the vendor's M-phase order)
+            b.declare_region("m_phase", true, "");
         }
         let io = declare_io(b, 256, false);
         let blk = block3_x(&io, b, 8, true);
@@ -126,6 +139,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
                 // R3 step 3 (pinned VGPR roles) measured -4 .. -7 % with our schedule: off (docs/fmha-replica.md §4.4)
                 body.pin_roles = false;
                 body.ahead2 = self.ring2;
+                body.frag_ring = self.frag_ring;
                 pipe.run(b, role, &mut body);
                 let fin = body.out_scale(b);
                 store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), fin);
