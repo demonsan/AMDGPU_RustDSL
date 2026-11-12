@@ -429,6 +429,20 @@ The §4 finding stands in a weaker form: copies landing during the M phase cost 
 - **The rotation itself** cannot be expressed with `reg_ring`. It means "pairwise separate at any time": the 8 K + 8 V fragments of a matrix phase (V8 each, 64 VGPRs per ring) then never reuse registers, and the allocation fails both with whole-phase rings and with sliding windows of 4.
 - **What is needed:** the vendor's rotation is a hard share per residue class (fragment i in buffer i mod 4) with the classes kept apart. backend-llvm-tail is adding `reg_rotate(name, 4, fragments)` (`RegMark::Rotate`). The ring2 + rotation + authored-order measurement waits for it.
 
+**B6b, measured with `reg_rotate`** (branch `b6-rot`). The V fragments of PV(t) and the K fragments of QK(t + 1) of each matrix phase go into a rotation of 3 register buffers. With 4 buffers the allocation does not fit: peak 263 > 256 live dwords next to our S / O / P layout. Same session, node 53 GPU 0, × vendor:
+
+| variant | per-CU | B4H8S2048 | B1H8S8192 | B2H8S2048 |
+|---|--:|--:|--:|--:|
+| ring2 + rotation (falls back to the unscheduled code) | 0.734 | 0.842 | 0.866 | 0.764 |
+| ring2 + rotation + authored M-phase order | 0.829 | 0.915 | 0.913 | 0.851 |
+| ring2 + B5 | 0.905 | 0.962 | 0.967 | 0.934 |
+| `_vs128` (shipped) | 0.982 | 1.001 | 0.992 | 0.980 |
+
+- The rotation removes part of the authored order's register WAR: 0.801 → 0.829.
+- The vendor composition (distance-2 ring + rotation + its M-phase order) stays 7–25 % behind our shipped kernel with our register plan. Its v[20:51] rotation needs a register plan as small as the vendor's: Q in v[4:19] and P inside S.
+
+**Not adopted.** The ring / rotation line is closed with the current register plan.
+
 ### 4.11 The W3 B2 tokens on the shipped configuration: `m0reuse`, `sgpr`, `sgpr2` — neutral
 
 `lower_opts` of `_vs128` / `_replica` + `m0reuse` (one M0 write per group of DMAs with the same LDS base) + `sgpr` + `sgpr2` (uniform SGPR operands of VALU).
@@ -460,7 +474,7 @@ The §4 finding stands in a weaker form: copies landing during the M phase cost 
 | M0 written per LDS-DMA issue | back-end Weaver: M0 planning | available as opt-in `m0reuse` (54 → 18 M0 writes); neutral on the replica (§4.11), not adopted |
 | Block-end MFMA padding | back-end Weaver: cross-block hazard distance | W3, before B4 |
 | Copy issue point (vendor: distance-2 ring, DMA issues inside the QK window) | DSL / pipeline extension + back-end Weaver B5 | built (`_ring2`, §4.10): correct (port_gate incl. STRESS), the B5 merge places the copies between the QK MFMAs; still −2.5 … −6.5 % vs `_vs128` (not adopted; next with B6b and the M-phase order) |
-| PV block before QK (the vendor's M-phase order) | expressible (authored region) | measured −4 … −8 % (§4.8), and −11 … −12 % on top of ring2 (§4.10): pays only with the fragment rotation (B6b `reg_rotate`, in progress at backend-llvm-tail) |
+| PV block before QK (the vendor's M-phase order) | expressible (authored region) | −4 … −8 % (§4.8), −11 … −12 % on top of ring2, and with the B6b rotation (`reg_rotate`, 3 buffers) still −7 … −15 % vs `_vs128` (§4.10): not adopted; needs the vendor's smaller register plan |
 | V-fragment prefetch before the barrier | expressible (weave order) | **blocked on W3 B4+** (pays only with the authored order + schedule-aware RA) |
 | The LUT-corrected copy for < 4 tiles (ours only) | accuracy choice: the vendor accepts the larger short-sequence error | kept |
 | Verifier blind spots for multi-exit loops (else-arm barriers, mid-loop exits) | verification: incomplete | fixed (§4.9) |
