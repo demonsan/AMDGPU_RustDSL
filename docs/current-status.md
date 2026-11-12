@@ -15,7 +15,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`，Main `a65de21a`）：`_vs128` `b7a3a2ac`、`_t128` `84269a3b`、`_kvsplit` `240ecbae`、`_kvsplit_combine8h` `24a95a51`（v11：`_vs128` 改为 W5 复刻配置，再经 SCC 修复重排，见 §1.0；其余三个与 v9.2 相同；`port_gate` 全部 PASS）。
+  asm md5（`--backend own`，Main `9cffb86f`）：`_vs128` `ff51fd09`、`_t128` `a1ee38ee`、`_kvsplit` `11e2b907`、`_kvsplit_combine8h` `24a95a51`（v11：`_vs128` 改为 W5 复刻配置，再经 SCC 修复重排，见 §1.0；v11.1：VCC 规则改为 1 个等待周期（用户决定接受 vs128 B4 S2048 −0.5..0.8%），57 个 kernel 变化，perf_ab 全族 PASS、`port_gate` PASS）。
 - **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-08，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**740 TF/s（1.025× 厂商）**；
   铺满网格 B4H8S2048 **1804（0.976×）** / B1H8S8192 **2416（0.988×）** / B2H8S2048 **1279（0.978×）**；`_vs128` 每 CU 64 blocks **694（0.959×）**；`_t128` B2H8S2048 layout 中位数 **1173（0.901×）**。
   25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.929–1.063×，几何平均 **0.992**（之前 0.980）。最近一步是厂商的 XCD 感知 block 顺序（K/V 的 L2 命中率 20 % → 77 %，[`fmha-wave-org.md`](fmha-wave-org.md)）。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
@@ -61,7 +61,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 
 | kernel | 变化 | 门禁 |
 |---|---|---|
-| `fmha_fwd_hd128_mxfp8_v3_vs128` | W5 复刻配置（无缩放 PV、两 tile 一趟、跳转线程化、冷回滚块、厂商指令形式），再经 SCC 修复（`b7a3a2ac`） | `port_gate` PASS；perf_ab fmha_mxfp8 1.017（[`fmha-replica.md`](fmha-replica.md) §4.9） |
+| `fmha_fwd_hd128_mxfp8_v3_vs128` | W5 复刻配置（无缩放 PV、两 tile 一趟、跳转线程化、冷回滚块、厂商指令形式），再经 SCC 修复（`b7a3a2ac`），v11.1 VCC 规则后 `ff51fd09` | `port_gate` PASS；perf_ab fmha_mxfp8 1.017（[`fmha-replica.md`](fmha-replica.md) §4.9） |
 | `mla_decode_bf16_p*` / `_hp_p*`、`attn_combine_bf16_hd512` | 每 kernel 打开带重排的 list 调度器（依赖 SCC 修复） | perf_ab mla 1.139，4/4 IMPROVED；正确性标记（[`w6-laggards.md`](w6-laggards.md) §6） |
 | `pa_decode16_bf16_hd128_p16_c` | 同上，仅 last-arriver 形式 | perf_ab decode 1.012–1.015（§6） |
 | 7 个 split-K GEMM（`*_64_splitk`、`*_128_splitk`、`gemm_a8w8_blockscale_splitk`） | fp32 部分和只写含真实行的 16 行块 | 全行检查 0 bad、严格验证、`run_all` PASS；perf_ab gemv 1.060（[`w6-laggards.md`](w6-laggards.md) §7.1） |
