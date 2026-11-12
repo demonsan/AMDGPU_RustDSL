@@ -367,6 +367,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         // W6 prototype: B straight from global into registers
+        "gemm_a4w4_mxfp4_ne" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_ne", GemmConfig { lds_epilogue: false, ..GemmConfig::a4w4() })),
         "gemm_a4w4_mxfp4_bd" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_bd", GemmConfig { b_direct: true, ..GemmConfig::a4w4() })),
         "gemm_a8w4_mxfp_128" => Some(gemm_mxfp8_bs("gemm_a8w4_mxfp_128", GemmConfig::a8w4_128())),
         "gemm_a16w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a16w4_mxfp4", GemmConfig::a16w4_128())),
