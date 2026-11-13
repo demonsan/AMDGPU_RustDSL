@@ -18,6 +18,8 @@ use crate::mir::*;
 /// Cycles that must separate a transcendental write from its first reader.
 /// VALU VGPR write -> v_readfirstlane read (target row `valu-readfirstlane`).
 const RFL_WAIT: usize = crate::target::T.hazard("valu-readfirstlane").n() as usize;
+/// Transcendental result -> a plain VALU reader (target row `trans-valu`; other readers keep `trans-result`).
+const TRANS_VALU: usize = crate::target::T.hazard("trans-valu").n() as usize;
 const TRANS_LATENCY: usize = crate::target::T.hazard("trans-result").n() as usize;
 
 /// How many instructions after the stalled consumer are examined as fill candidates.
@@ -140,6 +142,8 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         // or a permlane (a different, shorter hazard than the in-flight latencies above).
         // VALU writer -> hazard reader: (ready cycle, the writer's delay) - v_readfirstlane waits only the `valu-readfirstlane` row
         let mut vw: HashMap<VReg, (usize, usize)> = HashMap::new();
+        // transcendental results: the ready cycle for a plain (non-trans, non-matrix) VALU reader
+        let mut trv: HashMap<VReg, usize> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
         // v_accvgpr_read result -> v_add_co/v_addc pointer arithmetic needs 2 wait states (LLVM oracle, AGPR rows of the hazard matrix)
@@ -152,7 +156,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, (usize, usize)>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, hiw: &HashMap<VReg, usize>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, (usize, usize)>, trv: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, hiw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
             if inst.op == MOp::VPtrAdd {
                 for s in &inst.srcs {
@@ -213,9 +217,17 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
                 _ => None,
             };
+            let plain_valu = crate::op_attrs::attrs(inst.op).cost.pipe == crate::sched::model::Pipe::Valu && !is_transcendental(inst.op) && mfma_latency(inst.op).is_none();
             for s in &inst.srcs {
                 if let Src::Reg(r) = s {
                     let r = canon(*r);
+                    // a plain VALU reader of a transcendental result: tools/trans_hazard_probe.sh (stale at 0, correct at 1-3 wait states)
+                    if plain_valu {
+                        if let Some(short) = trv.get(&r) {
+                            earliest = earliest.max(*short);
+                            continue;
+                        }
+                    }
                     if let Some((rd, from_mfma)) = ready.get(&r) {
                         // Same-opcode dependent MFMA accumulating in place needs no extra wait.
                         if *from_mfma && c_reg == Some(r) {
@@ -238,7 +250,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
 
         let mut i = 0usize;
         while i < insts.len() {
-            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, &hiw, cycle);
+            let mut earliest = earliest_of(&insts[i], &ready, &vw, &trv, &pkw, &aw, &hiw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
             // (a vcc consumer may be filled too, with instructions that neither read nor write vcc: they cannot disturb the compare it waits for)
@@ -261,7 +273,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         && !(vcc_cons && touches_vcc(cand.op))
                         && movable(cand.op)
                         && cand.dst.is_some()
-                        && earliest_of(cand, &ready, &vw, &pkw, &aw, &hiw, cycle) <= cycle;
+                        && earliest_of(cand, &ready, &vw, &trv, &pkw, &aw, &hiw, cycle) <= cycle;
                     if ok {
                         let cd = canon(cand.dst.unwrap());
                         let cs: Vec<VReg> = cand.uses().into_iter().map(canon).collect();
@@ -293,6 +305,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                             }
                             ready.remove(&canon(d));
                             vw.remove(&canon(d));
+                            trv.remove(&canon(d));
                             if let Some(dly) = valu_writer_delay(x.op) {
                                 vw.insert(canon(d), (cycle + 1 + dly, dly));
                             }
@@ -304,12 +317,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         j += 1;
                     }
                     // The consumer may have become ready.
-                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, &hiw, cycle);
+                    earliest = earliest_of(&insts[i], &ready, &vw, &trv, &pkw, &aw, &hiw, cycle);
                 }
             }
 
             let inst = insts[i].clone();
-            let earliest = earliest_of(&inst, &ready, &vw, &pkw, &aw, &hiw, cycle);
+            let earliest = earliest_of(&inst, &ready, &vw, &trv, &pkw, &aw, &hiw, cycle);
             if earliest > cycle {
                 let mut missing = earliest - cycle;
                 while missing > 0 {
@@ -322,6 +335,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if let Some(d) = inst.dst {
                 ready.remove(&canon(d));
                 vw.remove(&canon(d));
+                trv.remove(&canon(d));
                 aw.remove(&canon(d));
                 hiw.remove(&canon(d));
                 if cvt_dst_sel_write(inst.op, inst.imm) {
@@ -351,6 +365,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
                     ready.insert(canon(d), (cycle + TRANS_LATENCY, false));
+                    trv.insert(canon(d), cycle + 1 + TRANS_VALU);
                 }
             }
             if let Some(latency) = mfma_latency(inst.op) {
