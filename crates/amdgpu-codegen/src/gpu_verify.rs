@@ -3813,7 +3813,8 @@ fn ring_facts(f: &Function) -> RingFacts {
         }
         let (Some(v), Some((ki, x))) = (ring, init) else { continue };
         // the ring's single constant set in the same straight-line block as w's init
-        let cs = &ring_const[&v];
+        // (a shadow of a ring with an expression start is not tracked)
+        let Some(cs) = ring_const.get(&v) else { continue };
         let [(kc, c)] = cs.as_slice() else { continue };
         if !straight(ki, *kc) {
             continue;
