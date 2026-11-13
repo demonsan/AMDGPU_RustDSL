@@ -37,7 +37,7 @@ def norm(s):
     op, _, rest = s.partition(' ')
     # printer aliases / defaults that are the same encoding
     op = {'v_mov_b64': 'v_mov_b64_e32'}.get(op, op)
-    rest = re.sub(r'\s*op_sel_hi:\[0,\s*0,\s*0\]', '', rest)
+    rest = re.sub(r'\s*op_sel(_hi)?:\[0,\s*0,\s*0\]', '', rest)
     if op.startswith(('s_cbranch', 's_branch')):
         return op
     toks = [t.strip() for t in re.split(r'(,\s*|\s+)', rest) if t.strip() and t.strip() != ',']
