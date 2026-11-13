@@ -138,3 +138,27 @@ the K / V rotation as explicit pins, and the loop-carried values.
 
 My side: the exact region tells which values lack one ("stmt N defines %v.. without a pin"), so the plan can be completed iteratively
 with `exact-report`.
+
+## 7. As built
+
+| Step | State | Where |
+|---|---|---|
+| E1 | live | `MInst::stmt`, `amdc exact-report`, `tests/exact_report.rs` |
+| E2 | live | `exact::verify_final` (the wait and hazard passes run in check mode on a copy; every insertion is a named violation), `exact::check_registers` (per-16-bit-half clobber check across the CFG; hardware-initialised values defined at entry); `tests/exact_verify.rs`: the compiler's own output passes for every reachable kernel, plus mutation tests |
+| E3 | live | `FnBuilder::exact()` / irv1 `exact`, `SNop`, `SetM0`, `PinS` (values and loop variables), `MovV` / `MovS`, `NegF32` (source-negate modifier), `MfmaBf16Wide`; `exact::finalize` |
+| E3 hardware | PASS | `tools/exact_probe.sh`: a fully pinned kernel with in-place register reuse runs verbatim |
+| E4 / E5 | in progress | exact straight-line sections in a structured shell (kernel-opt's lifter); E5 branch forms and scope variables (kernel-opt) |
+
+The exact lowering rules:
+- **Accumulator:** an MFMA reads C where it is (D and C may differ).
+- **Constants:** a pinned constant is an authored move at its statement.
+- **Scalar values:** a value is scalar exactly when it is pinned to an SGPR and provably wave-uniform; generic integer compares and selects take their SALU form.
+- **M0:** a DMA forms no M0 source (the author's `set_m0` is the M0).
+- **Free copies:** a copy between values pinned to the same register is no instruction (tuple assembly, views, bitcasts).
+- **Hardware registers:** a hardware register read into a value pinned at that register is no instruction; v0 / s0..s7 may be reused once their values are dead.
+
+Still open:
+- the combined `s_waitcnt vmcnt lgkmcnt` form;
+- 64-bit and EXEC moves;
+- the buffer descriptor from a kernarg pointer-add chain (kernel-opt's item n);
+- a check that an M0 write reaches every DMA.
