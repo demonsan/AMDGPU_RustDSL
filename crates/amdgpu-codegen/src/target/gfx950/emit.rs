@@ -399,7 +399,11 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
         MOp::VAndB32 => bin(a, inst, "v_and_b32_e32"),
         MOp::VMinI32 => bin(a, inst, "v_min_i32_e32"),
-        MOp::VPkFmaF32 => vec![format!("v_pk_fma_f32 {}, {}, {}, {}", pair(a, inst.dst.unwrap()), pair(a, reg_of(&inst.srcs[0])), pair(a, reg_of(&inst.srcs[1])), pair(a, reg_of(&inst.srcs[2])))],
+        MOp::VPkFmaF32 => {
+            // a source pair may be an SGPR pair (exact mode: the vendor's `v_pk_fma_f32 v[..], v[..], s[..], v[..]`)
+            let p = |r: VReg| if a.scalar.get(r as usize).copied().unwrap_or(false) { spair(a, r) } else { pair(a, r) };
+            vec![format!("v_pk_fma_f32 {}, {}, {}, {}", pair(a, inst.dst.unwrap()), p(reg_of(&inst.srcs[0])), p(reg_of(&inst.srcs[1])), p(reg_of(&inst.srcs[2])))]
+        }
         MOp::SMulHiU32 => vec![format!("s_mul_hi_u32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::VMadU64U32 => vec![format!("v_mad_u64_u32 {}, vcc, {}, {}, {}", pair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), pair(a, reg_of(&inst.srcs[2])))],
         MOp::VReadLane => vec![format!("v_readlane_b32 {}, {}, {}", sr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), inst.imm & 63)],
@@ -1014,6 +1018,14 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::SLoadDword => vec![format!("s_load_dword {}, s[0:1], {}", d_s(a, inst), inst.imm)],
+        MOp::SCmpG => {
+            let (p, t) = crate::mir::cmp_names(inst.imm, true);
+            vec![format!("s_cmp_{p}_{t} {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))]
+        }
+        MOp::VCmpMaskG => {
+            let (p, t) = crate::mir::cmp_names(inst.imm, false);
+            vec![format!("v_cmp_{p}_{t}_e64 {}, {}, {}", spair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
+        }
         MOp::SLoadDwordPtr => {
             let b = a.phys[reg_of(&inst.srcs[0]) as usize];
             vec![format!("s_load_dword {}, s[{}:{}], 0x{:x}", d_s(a, inst), b, b + 1, inst.imm)]
@@ -1158,7 +1170,9 @@ fn d_s(a: &Alloc, inst: &MInst) -> String {
 }
 
 fn bin(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
-    if inst.neg != 0 {
+    // an SGPR in src1 needs the VOP3 encoding (VOP2 src1 is a VGPR)
+    let s1_scalar = matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false));
+    if inst.neg != 0 || s1_scalar {
         // VOP3 form with source-negate modifiers
         let m = mnemonic.replace("_e32", "_e64");
         let s = |k: usize| format!("{}{}", if inst.neg & (1 << k) != 0 { "-" } else { "" }, src1(a, inst.srcs[k]));
@@ -1182,6 +1196,10 @@ fn cmp_mask(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
 }
 
 fn cmp(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
+    // an SGPR in src1: the VOP3 form with an explicit vcc destination
+    if matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false)) {
+        return vec![format!("{} vcc, {}, {}", mnemonic.replace("_e32", "_e64"), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))];
+    }
     vec![format!("{} vcc, {}, {}", mnemonic, src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
 }
 

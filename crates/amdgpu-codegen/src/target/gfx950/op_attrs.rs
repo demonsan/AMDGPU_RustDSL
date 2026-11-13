@@ -667,6 +667,8 @@ pub const ALL: &[MOp] = &[
     MOp::SMovB32,
     MOp::SMovM0,
     MOp::SSaveExec,
+    MOp::SCmpG,
+    MOp::VCmpMaskG,
     MOp::SLoadDwordPtr,
     MOp::SExecAll,
     MOp::SRestoreExec,
@@ -1161,6 +1163,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // dst = src0 + simm16 (`s_addk_i32` in place; a `s_mov_b32` first when the allocator gave dst another register); own tail only
         SAddkI32 => a("s_addk_i32", salu).scc(false, true).dce(Pure).backend(Backend::OwnOnly),
         SCmpLtI32 => a("s_cmp_lt_i32", salu).scc(false, true),
+        SCmpG => a("s_cmp", salu).scc(false, true).backend(Backend::OwnOnly),
+        VCmpMaskG => a("v_cmp", valu).wdelay(2).backend(Backend::OwnOnly),
         SCmpEqU32 => a("s_cmp_eq_u32", salu).scc(false, true),
         SCmpGeU32 => a("s_cmp_ge_u32", salu).scc(false, true),
         SCmpLeU32 => a("s_cmp_le_u32", salu).scc(false, true),

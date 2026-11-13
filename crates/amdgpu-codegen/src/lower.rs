@@ -108,8 +108,17 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
     } else {
         f
     };
+    EXACT_LOWERING.with(|e| e.set(f.exact));
     let mut lw = Lowerer::new(f);
     if f.exact {
+        // I1 values the author pinned to an SGPR pair: VOP3 lane masks (`v_cmp_*_e64 s[..]`, read by `v_cndmask_b32_e64 .., s[..]`)
+        for mk in &f.reg_plan {
+            if let amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), .. } = mk {
+                if f.value_tys.get(x.0 as usize) == Some(&DType::I1) {
+                    lw.mask_i1.insert(*x);
+                }
+            }
+        }
         // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
         let (u, v) = uniform_analysis(f);
         let mut sv: HashSet<ValueId> = HashSet::new();
@@ -155,7 +164,8 @@ pub struct LowerPass {
 }
 
 fn run_select_fold(m: &mut MFunction) -> Result<(), String> {
-    if opt_on("cmpfold") {
+    // exact mode: the author's compare + select stay as written (no min / max / med3 rewrite)
+    if opt_on("cmpfold") && !EXACT_LOWERING.with(|e| e.get()) {
         fold_select_cmp(m);
         // select(a < b, a, b) and friends become v_min / v_max (no vcc, no v_cmp -> v_cndmask hazard), clamp chains v_med3 / min3 / max3
         select_minmax(m);
@@ -389,6 +399,8 @@ struct Lowerer {
     exact: bool,
     /// `Permlane32SwapA` value -> the register of its second result (`Permlane32SwapB`)
     swap_second: HashMap<ValueId, VReg>,
+    /// exact mode: I1 values held as a lane mask in an SGPR pair
+    mask_i1: HashSet<ValueId>,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -539,6 +551,7 @@ impl Lowerer {
             cur_origin: u32::MAX,
             exact: f.exact,
             swap_second: HashMap::new(),
+            mask_i1: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
@@ -1452,7 +1465,11 @@ impl Lowerer {
             ops.push(self.s_operand(o)?);
         }
         for i in [0usize, 2] {
-            if let (Src::Imm(k), Src::Imm(_)) = (ops[i], ops[i + 1]) {
+            if let (Src::Imm(k), Src::Imm(k2)) = (ops[i], ops[i + 1]) {
+                // exact mode: two inline constants are legal SALU operands (`s_cselect_b32 s, 1, 0`)
+                if self.exact && is_inline_const(k) && is_inline_const(k2) {
+                    continue;
+                }
                 let r = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
                 ops[i] = Src::Reg(r);
@@ -2765,6 +2782,23 @@ impl Lowerer {
     fn lower_condition(&mut self, cond: Opnd, negate: bool) -> Result<(Pred, Vec<Src>), String> {
         if let Opnd::Val(v) = cond {
             if let Some(op) = self.defs.get(&v).cloned() {
+                // exact mode: an integer compare of two wave-uniform operands branches on SCC in the author's SALU form
+                if self.exact {
+                    if let Op::Cmp { pred, ty: ty @ (amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32), a, b } = op {
+                        if let (Some(sa), Some(sb)) = (self.scalar_src(a), self.scalar_src(b)) {
+                            let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                            self.touch(&regs);
+                            self.push(MInst::new(MOp::SCmpG).src(sa).src(sb).imm(cmp_code(pred, ty)));
+                            let on = if negate { Pred::Scc0 } else { Pred::Scc1 };
+                            return Ok((on, regs));
+                        }
+                    }
+                    if let Op::NotI1(inner) = op {
+                        if self.opnd_uniform(inner) {
+                            return self.lower_condition(inner, !negate);
+                        }
+                    }
+                }
                 // `scalarize2`: a signed compare of two wave-uniform integers (SGPR values / scalar loop variables / literals) branches on SCC:
                 // `s_cmp_lt_i32` + `s_cbranch_scc0/1` - no VGPR copies, no VALU compare, no vcc hazard padding
                 if opt_on("scalarize2") || opt_on("salubr") {
@@ -3000,6 +3034,26 @@ impl Lowerer {
             Op::Bin(amdgpu_dsl::BinOp::AshrI32, a, b) => self.v_plain(dst, MOp::VAshrI32, &[*b, *a])?,
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
+            // exact mode: a per-lane compare the author keeps as a lane mask in an SGPR pair (`v_cmp_*_e64 s[..], a, b`)
+            Op::Cmp { pred, ty, a, b } if self.exact && self.mask_i1.contains(&dst) => {
+                let mut opnd = |me: &mut Self, o: Opnd| -> Result<Src, String> {
+                    if let Some(k) = me.const_bits(o) {
+                        if is_inline_const(k) {
+                            return Ok(Src::Imm(k));
+                        }
+                    }
+                    if let Some(s) = me.sgpr_src(o) {
+                        return Ok(Src::Reg(s));
+                    }
+                    Ok(Src::Reg(me.as_v1(o)?))
+                };
+                let (sa, sb) = (opnd(self, *a)?, opnd(self, *b)?);
+                let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::S2);
+                self.push(MInst::new(MOp::VCmpMaskG).def(d).src(sa).src(sb).imm(cmp_code(*pred, *ty)));
+                self.val.insert(dst, d);
+            }
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
             // a returning atomic whose result is unused: the no-return form (a dead destination would be reused by the allocator while the
             // atomic is still in flight, and its late write would clobber the new value)
@@ -3112,7 +3166,16 @@ impl Lowerer {
                 }
             }
             Op::PkFmaF32(a, b, c) => {
-                let (ra, rb, rc) = (self.as_v2(*a)?, self.as_v2(*b)?, self.as_v2(*c)?);
+                // exact mode: one source may be a pair already in SGPRs (VOP3P reads it directly)
+                let mut pk = |me: &mut Self, o: Opnd| -> Result<VReg, String> {
+                    if me.exact {
+                        if let Some(r) = me.s2_of(o) {
+                            return Ok(r);
+                        }
+                    }
+                    me.as_v2(o)
+                };
+                let (ra, rb, rc) = (pk(self, *a)?, pk(self, *b)?, pk(self, *c)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
                 let d = self.new_vreg(RClass::V2);
                 self.push(MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
@@ -3645,6 +3708,28 @@ impl Lowerer {
                 self.touch(&[Src::Reg(r)]);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VXorB32).def(d).srcreg(r).srcreg(one));
+                self.val.insert(dst, d);
+            }
+            // exact mode: a select on an SGPR-pair lane mask is `v_cndmask_b32_e64 d, b, a, s[..]` (inline constants / one SGPR allowed)
+            Op::Select { cond: Opnd::Val(c), a, b, .. } if self.exact && self.mask_i1.contains(c) => {
+                let m = *self.val.get(c).ok_or("mask not lowered")?;
+                let mut opnd = |me: &mut Self, o: Opnd| -> Result<Src, String> {
+                    if let Some(k) = me.const_bits(o) {
+                        if is_inline_const(k) {
+                            return Ok(Src::Imm(k));
+                        }
+                    }
+                    if let Some(s) = me.sgpr_src(o) {
+                        return Ok(Src::Reg(s));
+                    }
+                    Ok(Src::Reg(me.as_v1(o)?))
+                };
+                let (sb, sa) = (opnd(self, *b)?, opnd(self, *a)?);
+                let mut regs: Vec<Src> = [sb, sa].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                regs.push(Src::Reg(m));
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCndmaskM).def(d).src(sb).src(sa).srcreg(m));
                 self.val.insert(dst, d);
             }
             Op::Select { ty, cond, a, b } => {
@@ -4249,6 +4334,13 @@ impl Lowerer {
                 if matches!(ty, DType::Frag16) {
                     return Ok(());
                 }
+                if self.exact && matches!(ty, DType::Frag2) {
+                    // the vendor's `v_mov_b64 v[..], 0`
+                    let d = self.new_vreg(RClass::V2);
+                    self.push(MInst::new(MOp::VZeroSub2).def(d).imm(0));
+                    self.val.insert(dst, d);
+                    return Ok(());
+                }
                 let class = match ty {
                     DType::Frag2 => RClass::V2,
                     DType::Frag4 => RClass::V4,
@@ -4347,16 +4439,19 @@ impl Lowerer {
                 // both scalar: one operand stays in its SGPR, the other is moved (one v_mov instead of two)
                 (Some(s), _) if self.const_bits(b).is_none() => Some((s, b, true)),
                 (None, Some(s)) if self.const_bits(a).is_none() && (commutative || vop3) => Some((s, a, false)),
+                // exact mode: an SGPR in src1 of a non-commutative op (the VOP3 form, emitted `_e64`)
+                (None, Some(s)) if self.exact && self.const_bits(a).is_none() => Some((s, a, false)),
                 _ => None,
             };
             if let Some((s, other, scalar_first)) = plan {
                 let r = self.as_v1(other)?;
                 self.touch(&[Src::Reg(r), Src::Reg(s)]);
                 let d = self.new_vreg(RClass::V1);
-                let inst = if scalar_first || !commutative {
+                // the scalar first where the op is commutative or it IS the first operand; else (exact mode) the scalar stays the second operand
+                let inst = if scalar_first || commutative {
                     MInst::new(op).def(d).srcreg(s).srcreg(r)
                 } else {
-                    MInst::new(op).def(d).srcreg(s).srcreg(r)
+                    MInst::new(op).def(d).srcreg(r).srcreg(s)
                 };
                 self.push(inst);
                 self.val.insert(dst, d);
@@ -5748,6 +5843,8 @@ thread_local! {
     static LAST_STMTS: std::cell::RefCell<Vec<Stmt>> = std::cell::RefCell::new(Vec::new());
     /// `TrustWait` statements of the last lowering (their `MInst::stmt` numbering): the next statement's waits check is waived
     static LAST_TRUSTS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+    /// the function being lowered is exact (read by the cleanup passes that rewrite instructions)
+    static EXACT_LOWERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
 }
 

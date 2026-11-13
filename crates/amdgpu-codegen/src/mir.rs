@@ -557,6 +557,10 @@ pub enum MOp {
     SMovM0,
     /// exact mode: `s_mov_b64 s[imm:imm+1], exec`
     SSaveExec,
+    /// exact mode: `s_cmp_<pred>_<ty> a, b` (imm = `cmp_code(pred, ty)`)
+    SCmpG,
+    /// exact mode: `v_cmp_<pred>_<ty>_e64 s[d:d+1], a, b`: the lane mask into an SGPR pair (imm = `cmp_code(pred, ty)`)
+    VCmpMaskG,
     /// `s_load_dword d, s[b:b+1], imm` from a pointer in an SGPR pair (srcs[0])
     SLoadDwordPtr,
     /// `s_waitcnt vmcnt(imm & 0xff) lgkmcnt(imm >> 8)` (exact mode's combined form)
@@ -639,6 +643,53 @@ pub struct MInst {
     pub stmt: u32,
     /// Source-negate modifiers (VOP3 `neg`): bit i negates source i (f32 add / sub / mul / max / fma; emitted in the e64 form).
     pub neg: u8,
+}
+
+/// Compare code of `SCmpG` / `VCmpMaskG`: predicate (low nibble) and type (bits 4..).
+pub fn cmp_code(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy) -> i64 {
+    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+    let p = match pred {
+        P::Lt => 0,
+        P::Le => 1,
+        P::Gt => 2,
+        P::Ge => 3,
+        P::Eq => 4,
+        P::Ne => 5,
+        P::Lg => 6,
+        P::Uno => 7,
+        P::Ord => 8,
+    };
+    let t = match ty {
+        T::F32 => 0,
+        T::I32 => 1,
+        T::U32 => 2,
+    };
+    p | (t << 4)
+}
+
+/// (predicate, type) mnemonic parts of a compare code; `scalar`: the SALU spelling (`lg` for not-equal).
+pub fn cmp_names(code: i64, scalar: bool) -> (&'static str, &'static str) {
+    let t = match code >> 4 {
+        0 => "f32",
+        1 => "i32",
+        _ => "u32",
+    };
+    let float = code >> 4 == 0;
+    let p = match code & 15 {
+        0 => "lt",
+        1 => "le",
+        2 => "gt",
+        3 => "ge",
+        4 => "eq",
+        5 if scalar => "lg",
+        5 if float => "neq",
+        5 => "ne",
+        6 if float => "lg",
+        6 => "ne",
+        7 => "u",
+        _ => "o",
+    };
+    (p, t)
 }
 
 impl MInst {
