@@ -114,7 +114,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         // I1 values the author pinned to an SGPR pair: VOP3 lane masks (`v_cmp_*_e64 s[..]`, read by `v_cndmask_b32_e64 .., s[..]`)
         for mk in &f.reg_plan {
             if let amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), .. } = mk {
-                if f.value_tys.get(x.0 as usize) == Some(&DType::I1) {
+                if f.value_tys.get(*x as usize) == Some(&DType::I1) {
                     lw.mask_i1.insert(*x);
                 }
             }
