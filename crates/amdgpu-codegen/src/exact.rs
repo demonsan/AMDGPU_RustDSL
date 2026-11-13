@@ -355,7 +355,14 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
                     by_phys.entry(p).or_default().push(*s);
                 }
             }
+            // a copy between two values in the same register writes the contents it reads: no clobber
+            let inst = &m.blocks[bi].insts[ii];
+            let same_copy = matches!(inst.op, MOp::VMovB32 | MOp::SMovB32)
+                && matches!((inst.dst, inst.srcs.first()), (Some(d), Some(Src::Reg(s))) if a.phys.get(d as usize) == a.phys.get(*s as usize) && a.phys.get(d as usize) != Some(&u32::MAX));
             for s in w {
+                if same_copy {
+                    break;
+                }
                 if let Some(p) = phys_of(*s) {
                     for o in by_phys.get(&p).map(|v| v.as_slice()).unwrap_or(&[]) {
                         let defined = def_in[bi].contains(o) || first_def[bi].get(o).map_or(false, |&d| d < ii);
@@ -519,6 +526,8 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
             scalar[v as usize] = scalar[t as usize];
         }
     }
+    // the clobber check runs on the function WITH those copies (they carry the variables' liveness across loop back edges / joins)
+    let m_with_copies = m.clone();
     // a copy between two values the author pinned to the same register is no instruction (tuple assembly from consecutively pinned
     // parts, a view or bitcast at the same register)
     {
@@ -598,7 +607,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                 errs.push(format!("exact: TrustWait at stmt {} waives nothing (the next statement's reads are covered by the waits)", t as i64 - 1));
             }
         }
-        for c in check_registers_with(&m, &a, &entry) {
+        for c in check_registers_with(&m_with_copies, &a, &entry) {
             errs.push(format!("exact: register clobber: {c}"));
         }
     }
