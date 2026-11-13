@@ -800,8 +800,25 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                 }
                 let mut ok_update = false;
                 let mut depth = 0i32;
-                for s in f.stmts() {
+                // the last constant set outside every loop (the counter's real initial value); an earlier top-level set with no loop in between
+                // is overwritten before any loop sees it (an author's register reused as a temporary first)
+                let stmts = f.stmts();
+                let mut init_at: Option<usize> = None;
+                {
+                    let mut d = 0i32;
+                    for (k, s) in stmts.iter().enumerate() {
+                        match s {
+                            Stmt::BeginLoop { .. } => d += 1,
+                            Stmt::EndLoop => d -= 1,
+                            Stmt::SetVar { var, value } if var == x && d == 0 && konst_mov(f, value).is_some() => init_at = Some(k),
+                            _ => {}
+                        }
+                    }
+                }
+                let dead_before = |k: usize| init_at.map_or(false, |ia| k < ia && !stmts[k..ia].iter().any(|s| matches!(s, Stmt::BeginLoop { .. })));
+                for (sk, s) in stmts.iter().enumerate() {
                     match s {
+                        Stmt::SetVar { var, .. } if var == x && depth == 0 && dead_before(sk) => {}
                         Stmt::BeginLoop { .. } if !matches!(s, Stmt::BeginLoop { vars, .. } if vars.contains(x)) => depth += 1,
                         Stmt::EndLoop => depth -= 1,
                         // an E5 scope variable (exact mode): set to a constant outside every loop = its initial value
