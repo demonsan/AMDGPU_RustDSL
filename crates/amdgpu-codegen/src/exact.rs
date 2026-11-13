@@ -197,22 +197,38 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
     use std::collections::{HashMap, HashSet};
     let nb = m.blocks.len();
     // physical key of a dword slot (vreg tuple * 16 + dword)
+    // physical key of a half slot: (scalar file, register, half)
     let phys_of = |s: Slot| -> Option<(bool, u32)> {
-        let (t, off) = (s / 16, s % 16);
+        let d = s / 2;
+        let (t, off) = (d / 16, d % 16);
         let p = *a.phys.get(t as usize)?;
         if p == u32::MAX {
             return None;
         }
-        Some((a.scalar.get(t as usize).copied().unwrap_or(false), p + off))
+        Some((a.scalar.get(t as usize).copied().unwrap_or(false), (p + off) * 2 + s % 2))
     };
     let succ = crate::sched::liveness::successors(m);
     let effs: Vec<Vec<(Vec<Slot>, Vec<Slot>)>> = m
         .blocks
         .iter()
         .map(|b| b.insts.iter().map(|i| {
+            // 16-bit halves: slot * 2 + half. A 16-bit half writer writes its half only; the dword read the effects model adds for the
+            // surviving half is not a use of the old value
             let e = effects(m, i);
-            let keep = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384)).collect::<Vec<_>>();
-            (keep(&e.reads), keep(&e.writes))
+            let at = crate::op_attrs::attrs(i.op);
+            let halves = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384)).flat_map(|s| [s * 2, s * 2 + 1]).collect::<Vec<_>>();
+            let mut reads = halves(&e.reads);
+            let mut writes = halves(&e.writes);
+            if at.regfx == crate::op_attrs::RegFx::PartialWrite {
+                if let Some(h) = at.half {
+                    let hb = if h == crate::op_attrs::Half::Lo { 0 } else { 1 };
+                    let dst: Vec<Slot> = i.dst.map(|d| crate::sched::effects::reg_slots(m, d)).unwrap_or_default();
+                    writes.retain(|x| !dst.contains(&(x / 2)) || x % 2 == hb);
+                    // the destination read is the preserved half, unless the destination is also a real source
+                    reads.retain(|x| !dst.contains(&(x / 2)));
+                }
+            }
+            (reads, writes)
         }).collect())
         .collect();
     // live-in per block by slot
@@ -278,9 +294,10 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
         })
         .collect();
     let name = |s: Slot| -> String {
-        let t = s / 16;
+        let d = s / 2;
+        let t = d / 16;
         let n = m.reg_hints.names.get(&t).cloned().unwrap_or_else(|| format!("r{t}"));
-        format!("{n}[{}]", s % 16)
+        format!("{n}[{}]{}", d % 16, if s % 2 == 0 { ".lo" } else { ".hi" })
     };
     let mut out = Vec::new();
     for bi in 0..nb {
@@ -301,7 +318,7 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
                             let inst = &m.blocks[bi].insts[ii];
                             out.push(format!(
                                 "block {} inst {ii} ({:?}) writes {}{} (as {}) while {} still lives there",
-                                m.blocks[bi].label, inst.op, if p.0 { "s" } else { "v" }, p.1 & !AGPR_TAG, name(*s), name(*o)
+                                m.blocks[bi].label, inst.op, if p.0 { "s" } else { "v" }, (p.1 / 2) & !AGPR_TAG, name(*s), name(*o)
                             ));
                         }
                     }
