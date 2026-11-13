@@ -1297,15 +1297,20 @@ impl<'a> An<'a> {
                 let mut kf: Option<Poly> = None;
                 let mut ok = true;
                 for (a, cl) in latoms {
-                    let Some(q) = cl.as_const() else {
-                        ok = false;
-                        break;
+                    // (a symbolic x coefficient equal to the offset's: k = 1)
+                    let kk = if *cl == atoms[a] && cx.nonneg(cl) && !cl.as_const().map_or(false, |q| q.n == 0) {
+                        Poly::int(1)
+                    } else {
+                        let Some(q) = cl.as_const() else {
+                            ok = false;
+                            break;
+                        };
+                        if q.n <= 0 {
+                            ok = false;
+                            break;
+                        }
+                        atoms[a].scale(Q::new(q.d, q.n))
                     };
-                    if q.n <= 0 {
-                        ok = false;
-                        break;
-                    }
-                    let kk = atoms[a].scale(Q::new(q.d, q.n));
                     match &kf {
                         None => kf = Some(kk),
                         Some(k0) if *k0 == kk => {}
@@ -1320,22 +1325,47 @@ impl<'a> An<'a> {
                     { if dbg { eprintln!("gw:   cap {ci} rejected at 3"); } continue; }
                 }
                 // x injective: its atoms sorted by coefficient form a radix with unit size
-                let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
-                xd.sort_by(|p, q| (p.0.n * q.0.d).cmp(&(q.0.n * p.0.d)));
-                let mut acc = Poly::int(1);
+                // (coefficients may be symbolic: sorted by provable order; an incomparable pair is not injective here)
+                let mut xd: Vec<(Poly, Poly)> = latoms.iter().map(|(a, cl)| (cl.clone(), ranges[a].1.sub(&ranges[a].0))).collect();
                 let mut inj = true;
+                for i in 1..xd.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        if cx.le(&xd[j - 1].0, &xd[j].0) {
+                            break;
+                        }
+                        if cx.le(&xd[j].0, &xd[j - 1].0) {
+                            xd.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            inj = false;
+                            break;
+                        }
+                    }
+                }
+                let mut acc = Poly::int(1);
                 for (c, m) in &xd {
-                    if !cx.le(&acc, &Poly::konst(*c)) {
+                    if !inj {
+                        break;
+                    }
+                    if !cx.le(&acc, c) {
                         inj = false;
                         break;
                     }
-                    acc = acc.add(&m.scale(*c));
+                    match m.mul(c) {
+                        Some(x) => acc = acc.add(&x),
+                        None => inj = false,
+                    }
                 }
                 if !inj {
                     { if dbg { eprintln!("gw:   cap {ci} rejected at 4"); } continue; }
                 }
                 // a clamp loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every x >= bound - 1 has u
                 // at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
+                // (a clamp needs constant x coefficients)
+                if *clamp && latoms.values().any(|c| c.as_const().is_none()) {
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 5 (symbolic clamp)"); } continue; }
+                }
                 if *clamp {
                     let wgs: Vec<&(bool, u64)> = latoms.keys().filter(|k| is_wg(k)).collect();
                     let top = latoms.iter().max_by(|p, q| {
@@ -1377,7 +1407,10 @@ impl<'a> An<'a> {
                     let lc = &caps_all[si][*p].0 .1;
                     let mut m = lc.clone();
                     for (a, cl) in latoms {
-                        m = m.add(&ranges[a].0.scale(cl.as_const().unwrap()));
+                        match ranges[a].0.mul(cl) {
+                            Some(x) => m = m.add(&x),
+                            None => ok = false,
+                        }
                     }
                     xmin = match xmin {
                         None => Some(m),
