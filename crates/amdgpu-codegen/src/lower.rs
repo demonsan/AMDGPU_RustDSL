@@ -487,7 +487,10 @@ impl Lowerer {
 
         Lowerer {
             cur_origin: u32::MAX,
-            cur_stmt: 0,
+            cur_stmt: {
+                LAST_STMTS.with(|s| s.borrow_mut().clear());
+                0
+            },
             mir,
             val: HashMap::new(),
             converted: HashMap::new(),
@@ -1832,6 +1835,7 @@ impl Lowerer {
     /// One statement (structure markers included: they open / close the CFG regions).
     fn lower_stmt(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         self.cur_stmt += 1;
+        LAST_STMTS.with(|s| s.borrow_mut().push(st.clone()));
         {
             match st {
                 Stmt::Let { dst, op } => {
@@ -5285,10 +5289,17 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
 }
 
 thread_local! {
+    /// the statements in lowering order (`MInst::stmt` - 1 indexes it): the exact-mode report of the last lowering on this thread
+    static LAST_STMTS: std::cell::RefCell<Vec<Stmt>> = std::cell::RefCell::new(Vec::new());
     static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
 }
 
 /// (virtual register, value) pairs of the most recent `lower` on this thread (diagnostics).
+/// The statements of the last lowering on this thread, in the order `MInst::stmt` counts them.
+pub fn last_stmts() -> Vec<Stmt> {
+    LAST_STMTS.with(|s| s.borrow().clone())
+}
+
 pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {
     LAST_ORIGINS.with(|o| o.borrow().clone())
 }

@@ -4,7 +4,7 @@
 use crate::mir::*;
 
 /// Why an instruction is not the author's (None = it is the statement's own instruction).
-pub fn synthetic_kind(m: &MFunction, f: &amdgpu_dsl::Function, i: &MInst) -> Option<&'static str> {
+pub fn synthetic_kind(m: &MFunction, stmts: &[amdgpu_dsl::Stmt], i: &MInst) -> Option<&'static str> {
     use amdgpu_dsl::{Op, Stmt};
     if i.stmt == 0 {
         return Some(match i.op {
@@ -13,7 +13,7 @@ pub fn synthetic_kind(m: &MFunction, f: &amdgpu_dsl::Function, i: &MInst) -> Opt
             _ => "added after lowering",
         });
     }
-    let st = f.stmts().get(i.stmt as usize - 1);
+    let st = stmts.get(i.stmt as usize - 1);
     let op = match st {
         Some(Stmt::Let { op, .. }) => Some(op),
         _ => None,
@@ -46,10 +46,10 @@ fn is_dma(op: MOp) -> bool {
 
 /// The report text: per statement, its instructions in final order (an instruction of an earlier statement emitted later, e.g. a hoisted
 /// or cached value, starts a new group).
-pub fn report(f: &amdgpu_dsl::Function, m: &MFunction, a: &crate::regalloc::Alloc, region: Option<&str>) -> String {
+pub fn report(f: &amdgpu_dsl::Function, stmts: &[amdgpu_dsl::Stmt], m: &MFunction, a: &crate::regalloc::Alloc, region: Option<&str>) -> String {
     let mut out = String::new();
-    let region_id = region.and_then(|r| m.reg_hints.regions.iter().position(|(n, _)| n == r).map(|i| i as u16 + 1));
-    if region.is_some() && region_id.is_none() {
+    let in_region = |id: u16| region.map_or(true, |r| id > 0 && m.reg_hints.regions.get(id as usize - 1).map_or(false, |(n, _)| n == r));
+    if region.is_some() && !m.reg_hints.regions.iter().any(|(n, _)| Some(n.as_str()) == region) {
         return format!("no region `{}` in {}\n", region.unwrap(), f.name);
     }
     let (mut total, mut synth) = (0usize, 0usize);
@@ -58,20 +58,18 @@ pub fn report(f: &amdgpu_dsl::Function, m: &MFunction, a: &crate::regalloc::Allo
     for b in &m.blocks {
         out.push_str(&format!("BB{}:\n", b.label));
         for i in &b.insts {
-            if let Some(r) = region_id {
-                if i.region != r {
-                    continue;
-                }
+            if !in_region(i.region) {
+                continue;
             }
             if i.stmt != last_stmt {
                 last_stmt = i.stmt;
-                let s = if i.stmt == 0 { "(added after lowering)".to_string() } else { f.stmts().get(i.stmt as usize - 1).map(|s| format!("{s:?}")).unwrap_or_default() };
+                let s = if i.stmt == 0 { "(added after lowering)".to_string() } else { stmts.get(i.stmt as usize - 1).map(|s| format!("{s:?}")).unwrap_or_default() };
                 let s: String = s.chars().take(140).collect();
                 out.push_str(&format!("  stmt {}: {}\n", if i.stmt == 0 { "-".to_string() } else { (i.stmt - 1).to_string() }, s));
             }
             let text = crate::emit::inst_lines(a, i).join(" ; ");
             total += 1;
-            match synthetic_kind(m, f, i) {
+            match synthetic_kind(m, stmts, i) {
                 Some(k) => {
                     synth += 1;
                     *kinds.entry(k).or_default() += 1;

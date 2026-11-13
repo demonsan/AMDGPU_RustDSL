@@ -676,7 +676,8 @@ fn main() -> ExitCode {
             let region = args.iter().position(|a| a == "--region").and_then(|i| args.get(i + 1)).map(|s| s.as_str());
             match amdgpu_codegen::compile_mir_alloc(&f) {
                 Ok((m, a)) => {
-                    print!("{}", amdgpu_codegen::exact::report(&f, &m, &a, region));
+                    let stmts = amdgpu_codegen::lower::last_stmts();
+                    print!("{}", amdgpu_codegen::exact::report(&f, &stmts, &m, &a, region));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
