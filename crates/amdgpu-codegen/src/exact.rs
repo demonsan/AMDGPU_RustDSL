@@ -133,6 +133,8 @@ fn same(a: &MInst, b: &MInst) -> bool {
 /// The instructions `after` has and `before` lacks (the insertions of a fixing pass), as violations of `rule`.
 fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::regalloc::Alloc, out: &mut Vec<Violation>) {
     let txt = |i: &MInst| crate::emit::inst_lines(a, i).join(" ; ");
+    // the same instruction: same op and the same emitted text (a pass may rewrite operands to equivalent registers)
+    let same = |x: &MInst, y: &MInst| x.op == y.op && txt(x) == txt(y);
     for (bb, ba) in before.blocks.iter().zip(after.blocks.iter()) {
         let (x, y) = (&bb.insts, &ba.insts);
         let (mut i, mut j) = (0usize, 0usize);
