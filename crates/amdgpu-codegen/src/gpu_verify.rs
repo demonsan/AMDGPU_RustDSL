@@ -1171,8 +1171,23 @@ impl<'a> An<'a> {
             }
         }
         let Opnd::Val(v) = nr else { return None };
-        let Some(Op::MulI32(a, b)) = self.defs.get(&v) else { return None };
-        let (m, f) = if let Some(k) = self.point_of(b) { (a, k) } else if let Some(k) = self.point_of(a) { (b, k) } else { return None };
+        let (m, f) = match self.defs.get(&v) {
+            Some(Op::MulI32(a, b)) => {
+                if let Some(k) = self.point_of(b) {
+                    (a, k)
+                } else if let Some(k) = self.point_of(a) {
+                    (b, k)
+                } else {
+                    return None;
+                }
+            }
+            // x << s = x * 2^s
+            Some(Op::ShlI32(a, b)) => match self.point_of(b).and_then(|p| p.as_const()) {
+                Some(s) if s.d == 1 && (0..31).contains(&s.n) => (a, Poly::int(1i128 << s.n)),
+                _ => return None,
+            },
+            _ => return None,
+        };
         if f.0.len() != 1 || !self.cx.nonneg(&f) || f.as_const().map_or(false, |q| q.n <= 0) {
             return None;
         }
