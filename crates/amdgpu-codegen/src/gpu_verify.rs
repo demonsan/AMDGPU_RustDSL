@@ -1130,7 +1130,9 @@ impl<'a> An<'a> {
             Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) => {
                 let Some(Op::Cmp { pred, a: ca, b: cb, .. }) = self.defs.get(c) else { return self.slin(o, depth) };
                 use amdgpu_dsl::CmpPred as P;
-                let is_min = matches!(pred, P::Le | P::Lt) && ((ca == a && cb == b) || (ca == b && cb == a && false));
+                // (the compare may read recomputed copies of the arms: structural equality)
+                let same = |x: &Opnd, y: &Opnd| x == y || matches!((x, y), (Opnd::Val(p), Opnd::Val(q)) if self.sig(*p, 0) == self.sig(*q, 0));
+                let is_min = matches!(pred, P::Le | P::Lt) && same(ca, a) && same(cb, b);
                 if !is_min {
                     return self.slin(o, depth);
                 }
@@ -1161,8 +1163,15 @@ impl<'a> An<'a> {
     /// row size, U a linear upper bound in rows) and x = F * R + rest where 0 <= rest + imm + size <= F: a written byte has R < U, i.e. the
     /// cap `R - U_digits < U_const` in row units (k = F).
     fn records_cap(&self, nr: &Opnd, x: &SLin, imm: i128, size: i128) -> Option<(SLin, Poly, bool)> {
+        let mut nr = *nr;
+        while let Opnd::Val(v) = nr {
+            match self.defs.get(&v) {
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => nr = *a,
+                _ => break,
+            }
+        }
         let Opnd::Val(v) = nr else { return None };
-        let Some(Op::MulI32(a, b)) = self.defs.get(v) else { return None };
+        let Some(Op::MulI32(a, b)) = self.defs.get(&v) else { return None };
         let (m, f) = if let Some(k) = self.point_of(b) { (a, k) } else if let Some(k) = self.point_of(a) { (b, k) } else { return None };
         if f.0.len() != 1 || !self.cx.nonneg(&f) || f.as_const().map_or(false, |q| q.n <= 0) {
             return None;
