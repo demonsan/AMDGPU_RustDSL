@@ -237,6 +237,10 @@ class Lifter:
                 self.vals[v] = (f, base, 4, 'Rsrc')
             self.pin(f, v, base)
             self.notes['sgpr words assembled (PtrCat / RsrcCat)'] += 1
+            if '--keep-tuples' in sys.argv and not any((f, base + i) in getattr(self, 'single', ()) for i in range(n)):
+                # the registers now hold that tuple value (so a block end hands it on as one Ptr / Rsrc variable)
+                for i in range(n):
+                    self.state[(f, base + i)] = (v, i)
             return f'Val({v})'
         # assembled from several values: FragCat of the parts (each part a view when needed)
         parts, i = [], 0
@@ -758,8 +762,12 @@ class Lifter:
             for i in range(2):
                 self.state.pop(('s', r[1] + i), None)
             return True
-        if t[0] == 'exec' and t[1] in ('-1', '0xffffffff', '0xffffffffffffffff'):
+        if t[0] == 'exec' and t[1] in ('-1', '0xffffffffffffffff'):
             self.stmt('ExecAll')
+            return True
+        if t[0] == 'exec' and imm(t[1]) is not None:
+            # a 32-bit literal is ZERO-extended for a 64-bit SALU move (0xffffffff = lanes 0..31)
+            self.stmt(f'ExecSet {{ mask: {imm(t[1]) & 0xffffffff} }}')
             return True
         if t[0] == 'exec':
             r = reg(t[1])
@@ -925,8 +933,9 @@ def cfg(ins):
         op, args = ins[e - 1][1], ins[e - 1][2]
         if (op.startswith('s_cbranch') or op == 's_branch') and target(args) is not None:
             succ[i].append(idx[target(args)])
-        elif op == 's_branch':
-            # a branch to a label without a symbol: assumed to be the kernel's end (the block with s_endpgm)
+        elif op.startswith('s_cbranch') or op == 's_branch':
+            # a branch (conditional too) to a label without a symbol: the kernel's end (the block with s_endpgm); checked by
+            # tools/isa_branch_targets.py against the reference
             succ[i].append(endblk)
         if op not in ('s_branch', 's_endpgm') and i + 1 < len(bl):
             succ[i].append(i + 1)
@@ -1223,12 +1232,33 @@ def emit_kernel(path, exact, plan=None):
     # a tuple a block hands on as one variable: some successor takes it so
     g_out = [set().union(*[g_in[x] for x in succ.get(b, [])]) if succ.get(b) else set() for b in range(nb)]
     groups = sorted(set().union(*g_in)) if g_in else []
+    # registers written exactly once, by an instruction of a TOP-LEVEL block (the prelude): carried by their value (visible to the
+    # whole function; gpu_verify sees the value itself, not a variable)
+    def_count = collections.Counter()
+    for (_, op, args) in ins:
+        for d in defs_uses(op, args)[0]:
+            def_count[d] += 1
+    top_blocks = {nd[1] for nd in tree if nd[0] == 'block'}
+    single = set()
+    if '--values-for-single-defs' in sys.argv:
+        # every definition in a top-level block: after the prelude the register holds one fixed value (its last top-level def)
+        top_defs = collections.Counter()
+        for b0 in top_blocks:
+            s0, e0, _ = bl[b0]
+            for k in range(s0, e0):
+                for d in defs_uses(ins[k][1], ins[k][2])[0]:
+                    top_defs[d] += 1
+        single = {d for d, n in top_defs.items() if n == def_count[d]}
+    globals_ = {}
+    wg_regs = [('s', int(x[1:])) for x in sys.argv[sys.argv.index('--wgmap') + 1].split(',')] if '--wgmap' in sys.argv else []
+    wg_vals = []
     L = Lifter()
+    L.single = single
     L.exact = exact
     L.fix_waits = '--fix-waits' in sys.argv
     L.fix_mask = '--fix-lanemask' in sys.argv
     L.fix_m0 = '--fix-m0' in sys.argv
-    carried = sorted(set().union(*[live_in[b] for b in range(nb)]))
+    carried = sorted(set().union(*[live_in[b] for b in range(nb)]) - single)
     var_tys = []
     var_slots = [(f, r, 1, 'I32') for (f, r) in carried] + [('s', a, n, ty) for (a, ty, n) in groups]
     undefs = {}
@@ -1260,8 +1290,18 @@ def emit_kernel(path, exact, plan=None):
         s, e, _ = bl[b]
         L.state = {}
         for (f, r) in live_in[b]:
-            if (f, r) in dword_k:
+            if (f, r) in globals_:
+                L.state[(f, r)] = globals_[(f, r)]
+            elif (f, r) in dword_k:
                 L.state[(f, r)] = (pv_of[dword_k[(f, r)]], 0)
+        # --wgmap: the workgroup-map registers, rebound at the first top-level block after their (branchy) definitions to zero-cost
+        # views, so the contract's WgMap can name them as values
+        if wg_regs and b in top_blocks and b != 0 and not wg_vals and all(r in live_in[b] for r in wg_regs):
+            for r in wg_regs:
+                k = dword_k[r]
+                v = L.new(r[0], r[1], 1, 'I32', f'BitcastI32(Var(VarId({k})))')
+                globals_[r] = (v, 0)
+                wg_vals.append(v)
         for g in g_in[b]:
             k = group_k[g]
             for i in range(g[2]):
@@ -1279,6 +1319,10 @@ def emit_kernel(path, exact, plan=None):
         last = body[-1][1]
         run = body[:-1] if last.startswith(('s_cbranch', 's_branch')) else body
         L.run([x for x in run if x[1] != 's_endpgm'])
+        # single-def registers defined here: their value is the register's content for the rest of the kernel
+        for d in single:
+            if d in L.state and L.state[d][0] not in L.varof:
+                globals_[d] = L.state[d]
         # pointer / descriptor tuples at the block end (the plan of the second pass)
         for (f, r), (v, o) in L.state.items():
             if f != 's' or o != 0 or v not in L.vals:
@@ -1369,9 +1413,15 @@ def emit_kernel(path, exact, plan=None):
     for a in anchors:
         if a.startswith('cold_if') and a not in placed:
             L.lines.append(f'LayoutAnchor {{ name: "{a}" }}')
-    if plan is None:
-        # first pass: re-run with the tuples seen at block ends
-        return emit_kernel(path, exact, seen_end)
+    # iterate the plan to a fixpoint: a tuple handed on unchanged through a block (a loop latch that never touches a descriptor) is seen
+    # at its end only once the tuple is carried INTO it, so the plan grows pass by pass
+    if plan is None or [set(x) for x in seen_end] != [set(x) for x in plan]:
+        rounds = getattr(emit_kernel, 'rounds', 0) + 1
+        emit_kernel.rounds = rounds
+        if rounds < 8:
+            merged = [set(seen_end[i]) | (set(plan[i]) if plan else set()) for i in range(nb)]
+            return emit_kernel(path, exact, merged)
+    L.wg_vals = wg_vals
     return L, var_tys, entry_hw
 
 
@@ -1416,19 +1466,73 @@ def main():
             opt = lambda k, d: int(sys.argv[sys.argv.index(k) + 1], 0) if k in sys.argv else d
             # the input kernel's interface (from its code-object metadata, passed by the caller): kernarg size, workgroup size, LDS bytes
             f.write(f'kernarg_size {opt("--kernarg-size", 8)}  workgroup {opt("--workgroup", 512)}  lds {opt("--lds", 163840)}  value_count {L.nv}\n')
+            if '--fp-mode' in sys.argv:
+                # the input kernel's FP mode (its descriptor's FLOAT_MODE denormal fields and IEEE bit): d32,d16_64,ieee
+                d32, d16, ie = sys.argv[sys.argv.index('--fp-mode') + 1].split(',')
+                f.write(f'fp_mode ({int(d32)}, {int(d16)}, {"true" if ie in ("1", "true") else "false"})\n')
             f.write('profile None  lower_opts []  sched_opts None\n')
             if '--exact' in sys.argv:
                 f.write('exact\n')
             f.write('var_tys [' + ', '.join(var_tys) + ']\n')
-            # one argument per kernarg word the code loads (I32 / Ptr at its offset)
+            # one argument per kernarg word the code loads (I32 / Ptr at its offset); with --contract-from, the named arguments and the
+            # argument-level contract (extents, kernarg ranges / definitions, grid definitions) of an IR of the SAME kernarg layout (our
+            # own replica's), so the verifier bounds the accesses through them
             body = '\n'.join(L.shell + L.lines)
             ka = {}
             for k, off in re.findall(r'Kernarg(I32|Ptr) \{ offset: (\d+) \}', body):
                 ka.setdefault(int(off), k)
             if not ka:
                 ka = {0: 'Ptr'}
-            for off, k in sorted(ka.items()):
-                f.write(f'arg Arg {{ name: "ka_{off:x}", ty: {k}, kernarg_offset: {off}, size: {8 if k == "Ptr" else 4} }}\n')
+            named, contract = {}, None
+            if '--contract-from' in sys.argv:
+                src = open(sys.argv[sys.argv.index('--contract-from') + 1]).read().split('\n')
+                for l in src:
+                    m = re.match(r'^arg Arg \{ name: "(\w+)", ty: (\w+), kernarg_offset: (\d+), size: (\d+) \}', l)
+                    if m:
+                        named[int(m.group(3))] = l
+                i0 = next(i for i, l in enumerate(src) if l.startswith('contract Contract {'))
+                keep = {}
+                i = i0 + 1
+                while src[i] != '}':
+                    m = re.match(r'^    (\w+): (.*)$', src[i])
+                    j = i
+                    if m and m.group(2).endswith(('[', '{', '(')):
+                        while not re.match(r'^    [\]\})],?$', src[j]):
+                            j += 1
+                    keep[m.group(1) if m else f'_{i}'] = src[i:j + 1]
+                    i = j + 1
+                use = ('extents', 'ka_ranges', 'grid_defs', 'ka_defs')
+                contract = ['contract Contract {']
+                for k, lines in keep.items():
+                    if k in use:
+                        contract += lines
+                    elif k.startswith('_'):
+                        continue
+                    elif k == 'sym_ranges' and '--sym-range' in sys.argv:
+                        # host-contract bounds of free size symbols (e.g. a head count bounding a 24-bit multiply), counted as contracts
+                        ents = []
+                        for spec in sys.argv[sys.argv.index('--sym-range') + 1].split(','):
+                            nm, lo, hi = spec.split(':')
+                            ents.append(f'("{nm}", {int(lo)}, {int(hi)})')
+                        contract.append(f'    sym_ranges: [{", ".join(ents)}],')
+                    elif k == 'wg_maps' and getattr(L, 'wg_vals', None):
+                        reason = sys.argv[sys.argv.index('--wgmap-reason') + 1] if '--wgmap-reason' in sys.argv else 'workgroup map'
+                        outs = ', '.join(str(v) for v in L.wg_vals)
+                        axes = ', '.join(str(i) for i in range(len(L.wg_vals)))
+                        contract.append(f'    wg_maps: [ WgMap {{ outs: [{outs}], axes: [{axes}], reason: {reason!r}, union: false, range: None }} ],'.replace("'", '"'))
+                    else:
+                        # facts about the other kernel's values / tiles do not carry over
+                        empty = {'tile_trust': 'None'}.get(k, '[]')
+                        contract.append(f'    {k}: {empty},')
+                contract.append('}')
+            for off in sorted(set(ka) | set(named)):
+                if off in named:
+                    f.write(named[off] + '\n')
+                else:
+                    k = ka[off]
+                    f.write(f'arg Arg {{ name: "ka_{off:x}", ty: {k}, kernarg_offset: {off}, size: {8 if k == "Ptr" else 4} }}\n')
+            if contract:
+                f.write('\n'.join(contract) + '\n')
             for p in L.shell_pins + L.pins:
                 f.write(p + '\n')
             defined = set(int(x) for x in re.findall(r'^%v(\d+):', '\n'.join(L.shell + L.lines), re.M))
