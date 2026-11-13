@@ -111,3 +111,37 @@ fn bf16_wide_mfma_is_its_own_kind() {
     let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
     assert!(c.asm.contains("v_mfma_f32_32x32x8_bf16"), "{}", c.asm);
 }
+
+/// The hardware probe's kernel (tools/exact_probe.sh): out[i] = 2 i + 7, exact, `t = i << 1` and `t + 7` share v2 (in-place reuse).
+pub fn exact_probe_kernel() -> Function {
+    let mut b = FnBuilder::new("probe_exact_hw", 64);
+    b.arg("in", DType::Ptr, 0x00, 8);
+    b.arg("out", DType::Ptr, 0x08, 8);
+    b.arg_tensor("out", Ext::c(64 * 4));
+    b.exact();
+    let po = b.let_(Op::KernargPtr { offset: 0x08 });
+    let tid = b.let_(Op::WorkitemId);
+    b.wait_lds(0);
+    let rs = b.buffer_rsrc_sized(po, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
+    let t = b.bind_i32(ev(tid) << 1);
+    let v = b.let_(Op::AddI32(Opnd::Val(t), Opnd::I32(7)));
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, v);
+    b.pin_sgpr_at(RegRef::Val(po), 8);
+    b.pin_sgpr_at(RegRef::Val(rs), 12);
+    b.pin_vgpr_at(RegRef::Val(tid), 0);
+    b.pin_vgpr_at(RegRef::Val(off), 1);
+    b.pin_vgpr_at(RegRef::Val(t), 2);
+    b.pin_vgpr_at(RegRef::Val(v), 2);
+    b.finish()
+}
+
+#[test]
+fn the_hardware_probe_kernel_compiles_exactly() {
+    let f = exact_probe_kernel();
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("v_add_u32_e32 v2, 7, v2"), "{}", c.asm);
+    if let Ok(dir) = std::env::var("EXACT_PROBE_OUT") {
+        std::fs::write(format!("{dir}/probe_exact_hw.ir"), amdgpu_dsl::ir_text::print(&f)).unwrap();
+    }
+}
