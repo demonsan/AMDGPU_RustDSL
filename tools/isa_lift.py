@@ -477,9 +477,11 @@ class Lifter:
     def h_v_cmp_nge_f32(self, t, m, op):
         if t[0] != 'vcc':
             return False
+        # nge = NOT (a >= b) (true for unordered): the negated compare, one v_cmp_nge (both values in VCC)
         a, b = self.src(t[1], 'F32'), self.src(t[2], 'F32')
         c = self.new('vcc', 0, 1, 'I1', f'Cmp {{ pred: Ge, ty: F32, a: {a}, b: {b} }}')
-        self.notes['cmp-vcc(nge as NotI1(Ge) + cmpneg)'] += 1
+        self.new('vcc', 0, 1, 'I1', f'NotI1(Val({c}))')
+        self.notes['cmp-vcc nge = NotI1(Cmp Ge)'] += 1
         return True
 
     def h_v_cmp_lt_i32(self, t, m, op):
@@ -524,9 +526,14 @@ class Lifter:
         if scaled:
             opsel = 0
             for x in m:
+                # the E8M0 byte of each scale dword: byte = op_sel[k] + 2 * op_sel_hi[k] (k = 0: scale_a, 1: scale_b); MmaScale.opsel holds
+                # the byte of scale_a in bits 0..1 and of scale_b in bits 4..5
                 if x.startswith('op_sel_hi:'):
-                    bits = [int(y) for y in x.split(':')[1].strip('[]').split(',')]
-                    opsel = sum(bit << i for i, bit in enumerate(bits))
+                    hi = [int(y) for y in x.split(':')[1].strip('[]').split(',')]
+                    opsel |= (hi[0] << 1) | (hi[1] << 5)
+                elif x.startswith('op_sel:'):
+                    lo = [int(y) for y in x.split(':')[1].strip('[]').split(',')]
+                    opsel |= lo[0] | (lo[1] << 4)
             sc = f'Some(MmaScale {{ sa: {self.src(t[4])}, sb: {self.src(t[5])}, opsel: {opsel} }})'
         kind = f'MmaKind {{ shape: {shape}, a: {ta}, b: {tb}, scaled: {"true" if scaled else "false"} }}'
         self.dst(t[0], 'Frag16', f'Mfma {{ kind: {kind}, a: {a}, b: {b}, c: {c}, scale: {sc} }}')
