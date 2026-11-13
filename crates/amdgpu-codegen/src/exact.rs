@@ -402,6 +402,17 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
 pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction, crate::regalloc::Alloc), String> {
     let mut errs: Vec<String> = Vec::new();
     let stmts = crate::lower::last_stmts();
+    // 0. branches as the layout makes them: no jump to the next block (fall through), a conditional whose taken target is the next block is
+    //    the inverted conditional to the other side; the lowering's empty loop-latch blocks go (they hold no instruction)
+    crate::sched::cfg::cleanup(&mut m);
+    for bi in 0..m.blocks.len() {
+        let next = m.blocks.get(bi + 1).map(|n| n.label);
+        if let Term::CondGoto { on, target, fall } = m.blocks[bi].term.clone() {
+            if Some(target) == next && Some(fall) != next {
+                m.blocks[bi].term = Term::CondGoto { on: crate::sched::cfg::invert(on), target: fall, fall: target };
+            }
+        }
+    }
     // 1. lowering's automatic waits are not the author's: the author places the waits, the check below verifies them
     crate::sched::waits::strip_auto_waits(&mut m);
     // 2. LDS-DMAs use the M0 the author set (`set_m0`); they never write it themselves

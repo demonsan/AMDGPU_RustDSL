@@ -4,7 +4,7 @@
 
 use crate::mir::*;
 
-fn invert(p: Pred) -> Pred {
+pub fn invert(p: Pred) -> Pred {
     match p {
         Pred::Scc0 => Pred::Scc1,
         Pred::Scc1 => Pred::Scc0,
