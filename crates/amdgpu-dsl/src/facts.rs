@@ -322,7 +322,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.barrier = true;
             (ResClass::Sync, vec![], false)
         }
-        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } => {
+        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } => {
             e.directive = true;
             (ResClass::Sync, vec![], false)
         }

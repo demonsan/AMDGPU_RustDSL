@@ -2770,7 +2770,8 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             continue;
         }
         if c.is_vector() {
-            if p < 1 {
+            // exact mode: the author may use v0 / s0..s7 once their hardware values are dead (the clobber check covers it)
+            if p < 1 && !f.exact {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to v{p}: v0 holds the workitem id"));
             }
             // ISA (measured with the gfx950 assembler, 2025-11: every multi-dword VGPR tuple - MFMA A/B/C/D of any width, global/ds/buffer data, packed ops -
@@ -2786,7 +2787,7 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at v{p}..v{}: exceeds the {VGPR_LIMIT}-VGPR per-wave limit", p + n - 1));
             }
         } else {
-            if p < 8 {
+            if p < 8 && !f.exact {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to s{p}: s0..s7 hold the kernarg pointer / workgroup ids"));
             }
             // measured: pairs at even registers; quads (buffer descriptors, s_load_dwordx4) and octets (s_load_dwordx8) at multiples of 4

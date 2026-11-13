@@ -686,6 +686,8 @@ impl FromIr for Stmt {
             "BeginIf" => { v.expect_struct("BeginIf")?; Ok(Stmt::BeginIf { cond: FromIr::from_ir(v.field("cond")?)? }) }
             "Else" => { v.expect_unit("Else")?; Ok(Stmt::Else) }
             "EndIf" => { v.expect_unit("EndIf")?; Ok(Stmt::EndIf) }
+            "SNop" => { v.expect_struct("SNop")?; Ok(Stmt::SNop { count: FromIr::from_ir(v.field("count")?)? }) }
+            "SetM0" => { v.expect_struct("SetM0")?; Ok(Stmt::SetM0 { value: FromIr::from_ir(v.field("value")?)? }) }
             other => Err(v.err(format!("unknown Stmt variant `{other}`"))),
         }
     }
@@ -752,6 +754,8 @@ impl IrIds for Stmt {
             Stmt::BeginIf { cond } => { IrIds::ids(&mut (*cond), fv, fr); }
             Stmt::Else => {}
             Stmt::EndIf => {}
+            Stmt::SNop { count } => { IrIds::ids(&mut (*count), fv, fr); }
+            Stmt::SetM0 { value } => { IrIds::ids(&mut (*value), fv, fr); }
         }
     }
 }
@@ -832,6 +836,7 @@ impl FromIr for RegMark {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
             "PinV" => { v.expect_struct("PinV")?; Ok(RegMark::PinV { r: FromIr::from_ir(v.field("r")?)?, base: FromIr::from_ir(v.field("base")?)? }) }
+            "PinS" => { v.expect_struct("PinS")?; Ok(RegMark::PinS { r: FromIr::from_ir(v.field("r")?)?, base: FromIr::from_ir(v.field("base")?)? }) }
             "Share" => { v.expect_tuple("Share", 1)?; Ok(RegMark::Share(FromIr::from_ir(v.item(0)?)?)) }
             "Separate" => { v.expect_tuple("Separate", 1)?; Ok(RegMark::Separate(FromIr::from_ir(v.item(0)?)?)) }
             "Cap" => { v.expect_struct("Cap")?; Ok(RegMark::Cap { region: FromIr::from_ir(v.field("region")?)?, vgprs: FromIr::from_ir(v.field("vgprs")?)?, agprs: FromIr::from_ir(v.field("agprs")?)? }) }
@@ -844,6 +849,7 @@ impl IrIds for RegMark {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
             RegMark::PinV { r, base } => { IrIds::ids(&mut (*r), fv, fr); IrIds::ids(&mut (*base), fv, fr); }
+            RegMark::PinS { r, base } => { IrIds::ids(&mut (*r), fv, fr); IrIds::ids(&mut (*base), fv, fr); }
             RegMark::Share(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             RegMark::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             RegMark::Cap { region, vgprs, agprs } => { IrIds::ids(&mut (*region), fv, fr); IrIds::ids(&mut (*vgprs), fv, fr); IrIds::ids(&mut (*agprs), fv, fr); }

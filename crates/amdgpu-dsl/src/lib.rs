@@ -1293,6 +1293,10 @@ pub enum Stmt {
     BeginIf { cond: Opnd },
     Else,
     EndIf,
+    /// Exact mode (docs/exact-mode.md): `s_nop count` placed by the author (count + 1 wait states). Never merged or moved.
+    SNop { count: u8 },
+    /// Exact mode: `s_mov_b32 m0, value` placed by the author; the LDS-DMAs of an exact kernel use the current M0 and never write it.
+    SetM0 { value: Opnd },
 }
 
 #[derive(Clone, Debug)]
@@ -1342,6 +1346,8 @@ pub enum RegRef {
 pub enum RegMark {
     /// HARD: the tuple of `r` sits at arch VGPR `base` (aligned to its width).
     PinV { r: RegRef, base: u32 },
+    /// HARD (exact mode): the value / variable sits at SGPR `base` (a tuple from there on).
+    PinS { r: RegRef, base: u32 },
     /// HINT: place the later-defined members in the registers of an earlier one when their lifetimes are disjoint (reported when not honoured).
     Share(Vec<RegRef>),
     /// HARD: the members never use the same physical registers, even with disjoint lifetimes.
@@ -1566,6 +1572,9 @@ pub struct Function {
     /// The kernel plan of the front-end Weaver (docs/two-weavers.md): constraints and hints for the back end. None for every kernel without one
     /// (nothing changes then).
     pub plan: Option<plan::KernelPlan>,
+    /// Exact authored mode (docs/exact-mode.md): the instruction order, every register, the wait states and waits are the author's; the
+    /// back end only verifies. false for every kernel that does not ask for it.
+    pub exact: bool,
 }
 
 /// Builder call sites of the values of a function (see `Function::src_locs`).
@@ -1744,7 +1753,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, exact: false };
         f.set_body(body);
         f
     }
@@ -1828,6 +1837,7 @@ impl FnBuilder {
             regions: Vec::new(),
             reg_plan: Vec::new(),
             plan: None,
+            exact: false,
             },
             expr_consts: Default::default(),
             captures: Vec::new(),
@@ -2227,6 +2237,26 @@ impl FnBuilder {
 
     /// `begin_if` whose then-branch is rarely taken (a rollback / overflow path): the hint lets the back end lay the branch out of the hot
     /// path (lowering token `coldlayout`); without the token it changes nothing.
+    /// Exact authored mode for the whole kernel (docs/exact-mode.md).
+    pub fn exact(&mut self) {
+        self.f.exact = true;
+    }
+    /// Exact mode: an authored `s_nop count`.
+    #[track_caller]
+    pub fn s_nop(&mut self, count: u8) {
+        self.push_stmt(Stmt::SNop { count });
+    }
+    /// Exact mode: an authored `s_mov_b32 m0, value`.
+    #[track_caller]
+    pub fn set_m0(&mut self, value: impl Into<Opnd>) {
+        self.push_stmt(Stmt::SetM0 { value: value.into() });
+    }
+    /// HARD (exact mode): `r` sits at SGPR `base`.
+    #[track_caller]
+    pub fn pin_sgpr_at(&mut self, r: RegRef, base: u32) {
+        self.f.reg_plan.push(RegMark::PinS { r, base });
+    }
+
     #[track_caller]
     pub fn begin_if_unlikely(&mut self, cond: impl Into<Opnd>) {
         self.push_stmt(Stmt::BranchHint { unlikely: true });
@@ -4261,7 +4291,14 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } => {}
+            Stmt::SetM0 { value } => {
+                if let Opnd::Val(v) = value {
+                    if !visible(&scopes, *v) {
+                        errs.push(here(format!("set_m0 reads v{v} before its definition")));
+                    }
+                }
+            }
             Stmt::StageBegin { name, contract } => {
                 for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
                     if let Err(e) = opnd_ty(f, Opnd::Val(*v)) {

@@ -621,6 +621,10 @@ impl Lowerer {
                     Some(x) => self.mir.reg_hints.pins_v.push((x, *base)),
                     None => unresolved.push(format!("{r:?}")),
                 },
+                RegMark::PinS { r, base } => match res(self, r) {
+                    Some(x) => self.mir.reg_hints.pins_s.push((x, *base)),
+                    None => unresolved.push(format!("{r:?}")),
+                },
                 RegMark::Share(rs) => {
                     let g = group(self, rs, &mut unresolved);
                     self.mir.reg_hints.share.push(g);
@@ -2468,6 +2472,14 @@ impl Lowerer {
                 }
                 Stmt::SchedGroup { mask, size, sync } => {
                     self.push(MInst::new(MOp::SchedGroup).imm((*mask as i64 & 0xffff) | ((*size as i64 & 0xffff) << 16) | ((*sync as i64) << 32)));
+                }
+                Stmt::SNop { count } => self.push(MInst::new(MOp::SNop).imm(*count as i64)),
+                Stmt::SetM0 { value } => {
+                    let s = self.s_operand(*value)?;
+                    if let Src::Reg(r) = s {
+                        self.touch(&[Src::Reg(r)]);
+                    }
+                    self.push(MInst::new(MOp::SMovM0).src(s));
                 }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
