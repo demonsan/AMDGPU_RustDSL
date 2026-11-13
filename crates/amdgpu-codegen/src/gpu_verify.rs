@@ -2592,14 +2592,34 @@ impl<'a> An<'a> {
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
         // the branch bound first (a constant bound from the branch beats a symbolic candidate the cap would keep), then the existing ones
-        // (the branch bound first: interval arithmetic favours the first candidates)
-        let merge = |old: &Vec<Poly>, new: &Vec<Poly>| -> Vec<Poly> {
-            let mut v: Vec<Poly> = new.clone();
-            v.extend(old.iter().cloned());
-            v
+        // a constant branch bound replaces the existing constant candidates (the tighter of them, in the first constant's place: the
+        // symbolic candidates keep their places under the cap); otherwise it goes after them
+        let merge = |old: &Vec<Poly>, new: &Vec<Poly>, upper: bool| -> Vec<Poly> {
+            let nc: Vec<i128> = new.iter().filter_map(|p| p.as_const()).filter(|q| q.d == 1).map(|q| q.n).collect();
+            let first_const = old.iter().position(|p| p.as_const().map_or(false, |q| q.d == 1));
+            match (nc.as_slice(), first_const) {
+                ([c], Some(i)) => {
+                    let olds = old.iter().filter_map(|p| p.as_const()).filter(|q| q.d == 1).map(|q| q.n);
+                    let best = olds.fold(*c, |a, b| if upper { a.min(b) } else { a.max(b) });
+                    let mut v: Vec<Poly> = Vec::new();
+                    for (k, p) in old.iter().enumerate() {
+                        if k == i {
+                            v.push(Poly::int(best));
+                        } else if !p.as_const().map_or(false, |q| q.d == 1) {
+                            v.push(p.clone());
+                        }
+                    }
+                    v
+                }
+                _ => {
+                    let mut v = old.clone();
+                    v.extend(new.iter().cloned());
+                    v
+                }
+            }
         };
-        let lo = merge(&xi.lo, &add.lo);
-        let hi = merge(&xi.hi, &add.hi);
+        let lo = merge(&xi.lo, &add.lo, false);
+        let hi = merge(&xi.hi, &add.hi, true);
         let refined = Itv { lo: cap(lo), hi: cap(hi) };
         match x {
             Opnd::Var(v) => {
