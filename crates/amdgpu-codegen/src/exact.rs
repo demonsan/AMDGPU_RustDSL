@@ -424,7 +424,15 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                     max_v = max_v.max(b + c.dwords());
                 }
             }
-            None if used.contains(&r) => missing.push(name_of(&m, r)),
+            None if used.contains(&r) => {
+                // name it by the statement that defines it (a lowering temporary has no DSL name)
+                let def = m.blocks.iter().flat_map(|b| b.insts.iter()).find(|i| i.dst.map_or(false, |d| m.canon(d) == r));
+                let at = def.map(|i| {
+                    let s = if i.stmt == 0 { "-".to_string() } else { format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(80).collect() };
+                    format!(" ({:?} at stmt {}: {s})", i.op, i.stmt as i64 - 1)
+                });
+                missing.push(format!("{}{}", name_of(&m, r), at.unwrap_or_default()));
+            }
             None => {}
         }
     }
@@ -484,7 +492,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         }
     }
     if !missing.is_empty() {
-        errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join(", ")));
+        errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join("\n    ")));
     }
     let a = crate::regalloc::Alloc { phys, max_v, max_s, scalar };
     if errs.is_empty() {

@@ -375,6 +375,8 @@ struct Lowerer {
     cur_origin: u32,
     /// diagnostics: the statement being lowered (MInst::stmt = index + 1), counted in program order like `Function::stmts()`
     cur_stmt: u32,
+    /// exact authored mode (docs/exact-mode.md): forms the author wrote (an MFMA reads its accumulator where it is, no copy into the result)
+    exact: bool,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -515,6 +517,7 @@ impl Lowerer {
 
         Lowerer {
             cur_origin: u32::MAX,
+            exact: f.exact,
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 0
@@ -3192,6 +3195,13 @@ impl Lowerer {
                 match c {
                     Some(c) if !self.is_zero_frag(c) => {
                         let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        if self.exact {
+                            // the author's registers: D and C may differ (no copy of C into D)
+                            let d = self.new_vreg(cls);
+                            self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(rc).srcreg(sa).srcreg(sb).imm(imm));
+                            self.val.insert(dst, d);
+                            return Ok(());
+                        }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
                         let d = if reusable {
                             rc
@@ -3225,6 +3235,13 @@ impl Lowerer {
                 match c {
                     Some(c) if !self.is_zero_frag(c) => {
                         let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        if self.exact {
+                            // the author's registers: D and C may differ (no copy of C into D)
+                            let d = self.new_vreg(cls);
+                            self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(rc).imm(imm));
+                            self.val.insert(dst, d);
+                            return Ok(());
+                        }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
                         let d = if reusable {
                             rc
