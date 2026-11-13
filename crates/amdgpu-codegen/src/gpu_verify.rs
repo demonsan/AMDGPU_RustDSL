@@ -2449,16 +2449,44 @@ impl<'a> An<'a> {
     /// constants / workgroup ids) are refined. Returns how to undo it.
     fn branch_fact(&mut self, cond: &Opnd, positive: bool) -> Option<(Opnd, Option<AV>, Option<Itv>)> {
         let Opnd::Val(c) = cond else { return None };
-        let (x, k, lt) = match self.defs.get(c)? {
-            Op::NotI1(n) => return self.branch_fact(&n.clone(), !positive),
-            Op::CmpLtI32(x, k) => (*x, *k, positive),
-            Op::CmpGeI32(x, k) => (*x, *k, !positive),
+        // (x, k, x < k holds on this arm, k is offset by +1: `x <= k` is `x < k + 1`)
+        let (x, k, lt, plus1) = match self.defs.get(c)?.clone() {
+            Op::NotI1(n) => return self.branch_fact(&n, !positive),
+            Op::CmpLtI32(x, k) => (x, k, positive, 0),
+            Op::CmpGeI32(x, k) => (x, k, !positive, 0),
+            // the generic integer compare (exact-mode / lifted IR): x OP k or k OP x; an unsigned compare only of a provably non-negative x
+            Op::Cmp { pred, ty: ty @ (amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32), a, b } => {
+                use amdgpu_dsl::CmpPred as P;
+                // normalise to `x pred k` with x the non-constant side
+                let (x, k, pred) = if self.int_of(&b).point_const().is_some() || matches!(b, Opnd::I32(_)) {
+                    (a, b, pred)
+                } else {
+                    let flip = match pred {
+                        P::Lt => P::Gt,
+                        P::Le => P::Ge,
+                        P::Gt => P::Lt,
+                        P::Ge => P::Le,
+                        other => other,
+                    };
+                    (b, a, flip)
+                };
+                if ty == amdgpu_dsl::CmpTy::U32 && !(self.int_of(&x).nonneg(&self.cx) && self.int_of(&k).nonneg(&self.cx)) {
+                    return None;
+                }
+                match pred {
+                    P::Lt => (x, k, positive, 0),
+                    P::Ge => (x, k, !positive, 0),
+                    P::Le => (x, k, positive, 1),
+                    P::Gt => (x, k, !positive, 1),
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         if !self.uniform_opnd(&x, 6, &mut Vec::new()) || !self.uniform_opnd(&k, 6, &mut Vec::new()) {
             return None;
         }
-        let ki = self.int_of(&k);
+        let ki = self.int_of(&k).add_const(plus1);
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
         // the existing candidates first (never displaced by the cap), then the branch bound
@@ -2771,9 +2799,26 @@ impl<'a> An<'a> {
         match st {
             Stmt::Let { dst, op } => {
                 self.check_op(op);
-                let v = self.eval(op);
+                let mut v = self.eval(op);
                 if matches!(op, Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. }) {
                     self.check_descriptor(&v);
+                }
+                // an output of a (non-union) workgroup map is a coordinate of a bijection onto the grid: it lies in [0, Grid(axis) - 1] (part of
+                // the map's fact, counted with its reason)
+                if let Some((m, k)) = self.f.contract.wg_maps.iter().filter(|m| !m.union).find_map(|m| m.outs.iter().position(|o| o == dst).map(|k| (m, k))) {
+                    if let Some(&ax) = m.axes.get(k) {
+                        let g = Itv::range(Poly::int(0), self.cx.sym_poly(Sym::Grid(ax)).sub(&Poly::int(1)));
+                        v = match v {
+                            AV::Int(i) => {
+                                let mut lo = i.lo.clone();
+                                lo.extend(g.lo);
+                                let mut hi = i.hi.clone();
+                                hi.extend(g.hi);
+                                AV::Int(Itv { lo: cap(lo), hi: cap(hi) })
+                            }
+                            _ => AV::Int(g),
+                        };
+                    }
                 }
                 self.env.insert(*dst, v);
             }
