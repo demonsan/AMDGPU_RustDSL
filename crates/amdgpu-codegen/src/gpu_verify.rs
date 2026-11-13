@@ -221,6 +221,12 @@ struct An<'a> {
     vars: HashMap<VarId, Itv>,
     /// pointer / descriptor variables: their provenance (the offset part lives in `vars`); `AV::Other` = conflicting provenances
     var_prov: HashMap<VarId, AV>,
+    /// proven ring counters (var -> [min, max] of the reachable values) and their shadows (var -> (init X, ring init c, min, max): the var
+    /// is X - c + ring at every point)
+    rings: (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Opnd, i128, i128, i128)>),
+    /// active lanes (highest active lane + 1) under the author's EXEC (exact mode `exec_set` / save / restore); 64 otherwise
+    exec_lanes: u32,
+    exec_saved: HashMap<u32, u32>,
     var_init: HashMap<VarId, Itv>,
     /// E5 scope variables (`DeclareVars`): tracked flow-sensitively (a `set_var` takes effect at once; `if` arms join; a loop that
     /// writes one runs it through its fixpoint). Absent from `vars` = not yet defined on any path (an `Undef` initial value).
@@ -278,6 +284,15 @@ impl<'a> An<'a> {
                 Some(AV::Int(i)) => i.clone(),
                 _ => Itv::top(),
             },
+            // a proven ring counter / shadow (ring_facts): its value set holds at every program point
+            Opnd::Var(v) if self.rings.0.contains_key(v) => {
+                let (lo, hi) = self.rings.0[v];
+                Itv::range(Poly::int(lo), Poly::int(hi))
+            }
+            Opnd::Var(v) if self.rings.1.contains_key(v) => {
+                let (x, c, lo, hi) = self.rings.1[v].clone();
+                self.int_of(&x).add(&Itv::range(Poly::int(lo - c), Poly::int(hi - c)))
+            }
             Opnd::Var(v) => self.vars.get(v).cloned().unwrap_or_default(),
             Opnd::F32(_) => Itv::top(),
         }
@@ -310,6 +325,46 @@ impl<'a> An<'a> {
         o
     }
     /// A word that is `PtrLo(p)` (false) or `PtrHi(p)` (true): the pointer operand and which half.
+    /// The pointer under a hi word `PtrHi(p) & 0xffff`.
+    fn masked_hi_of(&self, o: &Opnd) -> Option<Opnd> {
+        let Opnd::Val(v) = self.word_root(o) else { return None };
+        match self.defs.get(&v) {
+            Some(Op::AndI32(a, Opnd::I32(0xffff)) | Op::AndI32(Opnd::I32(0xffff), a)) => match self.word_of(a) {
+                Some((p, true)) => Some(p),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// A canonical spelling of a pointer value: through `PtrAdd` (base and offset) and `PtrCat` of a pointer's own words, so two SSA values
+    /// computing the same pointer compare equal.
+    fn ptr_key(&self, o: &Opnd, depth: usize) -> String {
+        if depth == 0 {
+            return format!("{o:?}");
+        }
+        let key_off = |me: &Self, x: &Opnd| match me.word_root(x) {
+            Opnd::Val(v) => match me.defs.get(&v) {
+                Some(Op::ConstI32(k)) => format!("#{k}"),
+                _ => format!("v{v}"),
+            },
+            Opnd::I32(k) => format!("#{k}"),
+            other => format!("{other:?}"),
+        };
+        match o {
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::PtrAdd { base, byte_off }) => format!("add({},{})", self.ptr_key(base, depth - 1), key_off(self, byte_off)),
+                Some(Op::PtrCat { lo, hi }) => match (self.word_of(lo), self.word_of(hi).or_else(|| self.masked_hi_of(hi).map(|p| (p, true)))) {
+                    (Some((pl, false)), Some((ph, true))) if self.ptr_key(&pl, depth - 1) == self.ptr_key(&ph, depth - 1) => self.ptr_key(&pl, depth - 1),
+                    _ => format!("v{v}"),
+                },
+                _ => format!("v{v}"),
+            },
+            other => format!("{other:?}"),
+        }
+    }
+    fn same_ptr(&self, a: &Opnd, b: &Opnd) -> bool {
+        a == b || self.ptr_key(a, 8) == self.ptr_key(b, 8)
+    }
     fn word_of(&self, o: &Opnd) -> Option<(Opnd, bool)> {
         let Opnd::Val(v) = self.word_root(o) else { return None };
         match self.defs.get(&v) {
@@ -334,7 +389,7 @@ impl<'a> An<'a> {
             _ => None,
         };
         match masked.and_then(|a| self.word_of(&a)) {
-            Some((p1, true)) if p1 == p => {}
+            Some((p1, true)) if self.same_ptr(&p1, &p) => {}
             _ => return Err("word 1 is not (high half of the same pointer) & 0xffff".into()),
         }
         let fmt = match self.word_root(&w[3]) {
@@ -1966,7 +2021,9 @@ impl<'a> An<'a> {
             // (s) descriptor / pointer words: a pointer re-assembled from its own two words is that pointer; a descriptor assembled as
             // [lo(p), hi(p) & 0xffff (| 0), num_records, 0x00020000] is BufferRsrc(p, num_records); anything else has unknown provenance
             Op::PtrCat { lo, hi } => match (self.word_of(lo), self.word_of(hi)) {
-                (Some((pl, false)), Some((ph, true))) if pl == ph => self.av_of(&pl),
+                (Some((pl, false)), Some((ph, true))) if self.same_ptr(&pl, &ph) => self.av_of(&pl),
+                // a hi word with its top 16 bits cleared: the same pointer (a canonical 48-bit address has them clear)
+                (Some((pl, false)), None) if self.masked_hi_of(hi).map_or(false, |ph| self.same_ptr(&pl, &ph)) => self.av_of(&pl),
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
             Op::RsrcCat { words } => match self.rsrc_words(words) {
@@ -2661,6 +2718,13 @@ impl<'a> An<'a> {
                 self.env.insert(*dst, v);
             }
             Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
+            // the author's EXEC: the lanes that execute (a DMA writes only theirs)
+            Stmt::ExecAll => self.exec_lanes = 64,
+            Stmt::ExecSet { mask } => self.exec_lanes = 64 - mask.leading_zeros(),
+            Stmt::ExecSave { sgpr } => {
+                self.exec_saved.insert(*sgpr, self.exec_lanes);
+            }
+            Stmt::ExecRestore { sgpr } => self.exec_lanes = self.exec_saved.get(sgpr).copied().unwrap_or(64),
             Stmt::TrustWait { reason } => {
                 let sev = if f.exact { Severity::Warn } else { Severity::Error };
                 self.rep.add("GV-TRUST-TIMING", sev, format!("stmt {}: TRUSTED timing (the next read is not guaranteed by the wait counters): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));
@@ -2700,7 +2764,8 @@ impl<'a> An<'a> {
                 self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
                 let a = self.int_of(lds_addr).add_const(*imm as i128);
                 self.cur_addr = Some((*lds_addr, *imm as i128));
-                self.check_lds("buffer load ... lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+                let lanes = self.exec_lanes as i128;
+                self.check_lds(&format!("buffer load ... lds (LDS side: M0 + imm + lane*size, {lanes} lanes)"), &a, lanes * 4 * *dwords as i128);
             }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                 let b = self.av_of(base);
@@ -2708,7 +2773,8 @@ impl<'a> An<'a> {
                 let a = self.int_of(lds_addr).add_const(*byte_off as i128);
                 self.cur_addr = Some((*lds_addr, *byte_off as i128));
                 let before = self.rep.findings.len();
-                self.check_lds("global_load_lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+                let lanes = self.exec_lanes as i128;
+                self.check_lds(&format!("global_load_lds (LDS side: M0 + imm + lane*size, {lanes} lanes)"), &a, lanes * 4 * *dwords as i128);
                 if self.rep.findings.len() > before {
                     let sh = self.shape(lds_addr, 5);
                     if let Some(last) = self.rep.findings.last_mut() {
@@ -2957,7 +3023,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
@@ -3440,4 +3506,163 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         },
         _ => (0, 0),
     }
+}
+
+/// Ring counters and their shadows, proven from the IR alone (gpu_verify uses the ranges as facts, nothing is trusted):
+/// * a ring `v`: every value it is set to (an init or a `set_var`) is a constant or `v + Select{Cmp(v, K), a, b}` with constants (through
+///   `MovS` / `MovV`), the compare reading `v` with no set of `v` in between; the reachable values are enumerated from the constants;
+/// * a shadow `w` of ring `v`: `w` is set once to some X in the straight-line block where `v` is set to a constant c, and otherwise only to
+///   `w + D` where the same `D` value updates `v` in the same block: then `w = X - c + v` at every point after both, so `w` lies in
+///   `X - c + [min, max]`.
+fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Opnd, i128, i128, i128)>) {
+    let stmts = f.stmts();
+    let defs: HashMap<ValueId, Op> = stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect();
+    let pos: HashMap<ValueId, usize> = stmts.iter().enumerate().filter_map(|(k, s)| if let Stmt::Let { dst, .. } = s { Some((*dst, k)) } else { None }).collect();
+    fn konst(defs: &HashMap<ValueId, Op>, o: &Opnd, depth: usize) -> Option<i128> {
+        match o {
+            Opnd::I32(k) => Some(*k as i128),
+            Opnd::Val(v) if depth > 0 => match defs.get(v) {
+                Some(Op::ConstI32(k)) => Some(*k as i128),
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => konst(defs, a, depth - 1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let control = |s: &Stmt| {
+        let d = format!("{s:?}");
+        ["BeginIf", "Else", "EndIf", "BeginLoop", "EndLoop", "Break", "Continue", "BranchPlace", "LayoutAnchor", "DeclareVars"].iter().any(|p| d.starts_with(p))
+    };
+    let straight = |a: usize, b: usize| {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        !stmts[lo + 1..hi].iter().any(|s| control(s))
+    };
+    // every (position, value) a variable is set to: set_vars, plus non-Undef inits of loops / scopes
+    let mut sets: HashMap<VarId, Vec<(usize, Opnd)>> = HashMap::new();
+    for (k, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::SetVar { var, value } => sets.entry(*var).or_default().push((k, *value)),
+            Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
+                for (v, i) in vars.iter().zip(init.iter()) {
+                    let undef = matches!(i, Opnd::Val(x) if matches!(defs.get(x), Some(Op::Undef { .. })));
+                    if !undef {
+                        sets.entry(*v).or_default().push((k, *i));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // `value` = Var(v) + D (either order): D
+    let step_of = |v: VarId, value: &Opnd| -> Option<ValueId> {
+        let Opnd::Val(x) = value else { return None };
+        match defs.get(x) {
+            Some(Op::AddI32(Opnd::Var(w), Opnd::Val(d)) | Op::AddI32(Opnd::Val(d), Opnd::Var(w))) if *w == v => Some(*d),
+            _ => None,
+        }
+    };
+    let mut rings: HashMap<VarId, (i128, i128)> = HashMap::new();
+    let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::new();
+    let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::new();
+    'var: for (v, list) in &sets {
+        let mut consts = Vec::new();
+        let mut steps = Vec::new();
+        let mut rule: Option<(amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = None;
+        for (k, value) in list {
+            if let Some(c) = konst(&defs, value, 4) {
+                consts.push((*k, c));
+                continue;
+            }
+            let Some(d) = step_of(*v, value) else { continue 'var };
+            let Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) = defs.get(&d) else { continue 'var };
+            let (Some(ka), Some(kb)) = (konst(&defs, a, 4), konst(&defs, b, 4)) else { continue 'var };
+            let Some(Op::Cmp { pred, ty, a: ca, b: cb }) = defs.get(c) else { continue 'var };
+            let (var_left, kk) = match (ca, cb) {
+                (Opnd::Var(w), o) if w == v => (true, konst(&defs, o, 4)),
+                (o, Opnd::Var(w)) if w == v => (false, konst(&defs, o, 4)),
+                _ => continue 'var,
+            };
+            let Some(kk) = kk else { continue 'var };
+            // no set of v between the compare and this set
+            let pc = pos[c];
+            if pc > *k || list.iter().any(|(j, _)| *j > pc && *j < *k) {
+                continue 'var;
+            }
+            let r = (*pred, *ty, var_left, kk, ka, kb);
+            if rule.map_or(false, |x| x != r) {
+                continue 'var;
+            }
+            rule = Some(r);
+            steps.push(d);
+        }
+        let Some((pred, ty, var_left, k, ka, kb)) = rule else { continue };
+        if consts.is_empty() {
+            continue;
+        }
+        let holds = |x: i128| -> bool {
+            let (l, r) = if var_left { (x, k) } else { (k, x) };
+            let (l, r) = match ty {
+                amdgpu_dsl::CmpTy::U32 => ((l as i64 as u32) as i128, (r as i64 as u32) as i128),
+                _ => ((l as i64 as i32) as i128, (r as i64 as i32) as i128),
+            };
+            use amdgpu_dsl::CmpPred as P;
+            match pred {
+                P::Lt => l < r,
+                P::Le => l <= r,
+                P::Gt => l > r,
+                P::Ge => l >= r,
+                P::Eq => l == r,
+                _ => l != r,
+            }
+        };
+        let mut seen: std::collections::BTreeSet<i128> = std::collections::BTreeSet::new();
+        let mut work: Vec<i128> = consts.iter().map(|x| x.1).collect();
+        while let Some(x) = work.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if seen.len() > 256 {
+                continue 'var;
+            }
+            let n = ((x + if holds(x) { ka } else { kb }) as i64 as i32) as i128;
+            work.push(n);
+        }
+        rings.insert(*v, (*seen.first().unwrap(), *seen.last().unwrap()));
+        ring_step.insert(*v, steps);
+        ring_const.insert(*v, consts);
+    }
+    let mut shadows: HashMap<VarId, (Opnd, i128, i128, i128)> = HashMap::new();
+    'w: for (w, list) in &sets {
+        if rings.contains_key(w) {
+            continue;
+        }
+        let mut init: Option<(usize, Opnd)> = None;
+        let mut ring: Option<VarId> = None;
+        for (k, value) in list {
+            if let Some(d) = step_of(*w, value) {
+                // the same D updates a ring in the same straight-line block
+                let Some((v, _)) = ring_step.iter().find(|(_, ds)| ds.contains(&d)) else { continue 'w };
+                let Some((kv, _)) = sets[v].iter().find(|(_, val)| step_of(*v, val) == Some(d)) else { continue 'w };
+                if !straight(*k, *kv) || ring.map_or(false, |r| r != *v) {
+                    continue 'w;
+                }
+                ring = Some(*v);
+            } else {
+                if init.is_some() {
+                    continue 'w;
+                }
+                init = Some((*k, *value));
+            }
+        }
+        let (Some(v), Some((ki, x))) = (ring, init) else { continue };
+        // the ring's single constant set in the same straight-line block as w's init
+        let cs = &ring_const[&v];
+        let [(kc, c)] = cs.as_slice() else { continue };
+        if !straight(ki, *kc) {
+            continue;
+        }
+        let (lo, hi) = rings[&v];
+        shadows.insert(*w, (x, *c, lo, hi));
+    }
+    (rings, shadows)
 }
