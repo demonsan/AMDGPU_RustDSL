@@ -601,6 +601,9 @@ pub fn print(f: &Function) -> String {
     if f.exact {
         let _ = writeln!(s, "exact");
     }
+    if let Some(m) = f.fp_mode {
+        let _ = writeln!(s, "fp_mode {m:?}");
+    }
     let _ = writeln!(s, "var_tys {:?}", f.var_tys);
     for a in &f.args {
         let _ = writeln!(s, "arg {a:?}");
@@ -749,6 +752,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     let mut contract = Contract::default();
     let mut extra_tys: Vec<(u32, DType)> = Vec::new();
     let mut exact = false;
+    let mut fp_mode: Option<(u8, u8, bool)> = None;
     loop {
         let k = lx.ident()?;
         match k.as_str() {
@@ -761,6 +765,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
             "sched_opts" => sched_opts = lx.typed()?,
             "var_tys" => var_tys = lx.typed()?,
             "exact" => exact = true,
+            "fp_mode" => fp_mode = Some(lx.typed()?),
             "arg" => args.push(lx.typed()?),
             "agpr" => agpr.push(lx.typed()?),
             "reg_plan" => reg_plan.push(lx.typed()?),
@@ -818,6 +823,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     let mut f = Function::from_parts(name, args, kernarg_size, workgroup, lds, contract, body, var_tys, value_tys, agpr, profile, lower_opts, sched_opts, reg_plan, regions);
     f.plan = plan;
     f.exact = exact;
+    f.fp_mode = fp_mode;
     Ok(f)
 }
 

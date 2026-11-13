@@ -83,9 +83,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str(&format!("    .amdhsa_next_free_vgpr {}\n", vgpr));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {}\n", sgpr));
     out.push_str(&format!("    .amdhsa_accum_offset {}\n", accum_offset));
-    out.push_str("    .amdhsa_float_denorm_mode_32 3\n");
-    out.push_str("    .amdhsa_float_denorm_mode_16_64 3\n");
-    out.push_str("    .amdhsa_ieee_mode 0\n");
+    let (d32, d64, ieee) = m.fp_mode.unwrap_or((3, 3, false));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {d32}\n"));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {d64}\n"));
+    out.push_str(&format!("    .amdhsa_ieee_mode {}\n", ieee as u8));
     out.push_str(".end_amdhsa_kernel\n");
 
     out.push_str("\n.amdgpu_metadata\n---\namdhsa.kernels:\n");
