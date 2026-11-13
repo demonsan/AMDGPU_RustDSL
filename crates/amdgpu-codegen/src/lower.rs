@@ -5310,6 +5310,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::BufferRsrcDyn { base, num_records } => is_u(base, &u, &uvars) && is_u(num_records, &u, &uvars),
                         // (s) SGPR words of uniform pointers / descriptors
                         Op::PtrLo(p) | Op::PtrHi(p) => is_u(p, &u, &uvars),
+                        Op::AddK { a, .. } => is_u(a, &u, &uvars),
                         Op::LoadScalar { .. } => true,
                         Op::PtrCat { lo, hi } => is_u(lo, &u, &uvars) && is_u(hi, &u, &uvars),
                         Op::RsrcCat { words } => words.iter().all(|w| is_u(w, &u, &uvars)),
