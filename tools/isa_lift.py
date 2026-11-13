@@ -1504,6 +1504,13 @@ def main():
                         contract += lines
                     elif k.startswith('_'):
                         continue
+                    elif k == 'sym_ranges' and '--sym-range' in sys.argv:
+                        # host-contract bounds of free size symbols (e.g. a head count bounding a 24-bit multiply), counted as contracts
+                        ents = []
+                        for spec in sys.argv[sys.argv.index('--sym-range') + 1].split(','):
+                            nm, lo, hi = spec.split(':')
+                            ents.append(f'("{nm}", {int(lo)}, {int(hi)})')
+                        contract.append(f'    sym_ranges: [{", ".join(ents)}],')
                     elif k == 'wg_maps' and getattr(L, 'wg_vals', None):
                         reason = sys.argv[sys.argv.index('--wgmap-reason') + 1] if '--wgmap-reason' in sys.argv else 'workgroup map'
                         outs = ', '.join(str(v) for v in L.wg_vals)
