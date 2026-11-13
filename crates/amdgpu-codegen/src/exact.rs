@@ -22,7 +22,9 @@ pub fn synthetic_kind(m: &MFunction, stmts: &[amdgpu_dsl::Stmt], i: &MInst) -> O
         return Some("automatic wait");
     }
     match i.op {
-        MOp::SNop if !matches!(op, Some(Op::Asm { .. })) => Some("s_nop"),
+        MOp::SNop if !matches!(op, Some(Op::Asm { .. })) && !matches!(st, Some(Stmt::SNop { .. })) => Some("s_nop"),
+        // an authored move (`mov_v` / `mov_s`) is the author's instruction
+        MOp::VMovB32 | MOp::SMovB32 | MOp::VMovFromS if matches!(op, Some(Op::MovV { .. } | Op::MovS { .. })) => None,
         MOp::VMovB32 | MOp::SMovB32 if i.srcs.iter().all(|s| matches!(s, Src::Imm(_))) && !matches!(op, Some(Op::ConstI32(_) | Op::ConstF32(_))) => {
             Some("constant materialization")
         }
@@ -122,7 +124,7 @@ impl std::fmt::Display for Violation {
 }
 
 fn same(a: &MInst, b: &MInst) -> bool {
-    a.op == b.op && a.dst == b.dst && a.imm == b.imm && format!("{:?}", a.srcs) == format!("{:?}", b.srcs) && a.skip_m0 == b.skip_m0
+    a.op == b.op && a.dst == b.dst && a.imm == b.imm && a.neg == b.neg && format!("{:?}", a.srcs) == format!("{:?}", b.srcs) && a.skip_m0 == b.skip_m0
 }
 
 /// The instructions `after` has and `before` lacks (the insertions of a fixing pass), as violations of `rule`.
@@ -427,9 +429,25 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         }
     }
     // aliases (views) sit inside their tuple
-    for (v, (t, off)) in m.alias.clone() {
-        if phys[t as usize] != u32::MAX {
-            phys[v as usize] = phys[t as usize] + off as u32;
+    // views (aliases, possibly of aliases) sit inside their tuple
+    fn resolve(m: &MFunction, phys: &[u32], r: VReg, depth: u32) -> u32 {
+        if depth > 16 {
+            return u32::MAX;
+        }
+        match m.alias.get(&r) {
+            Some(&(t, off)) => {
+                let b = resolve(m, phys, t, depth + 1);
+                if b == u32::MAX { u32::MAX } else { b + off as u32 }
+            }
+            None => phys[r as usize],
+        }
+    }
+    let aliases: Vec<VReg> = m.alias.keys().copied().collect();
+    for v in aliases {
+        let p = resolve(&m, &phys, v, 0);
+        if p != u32::MAX {
+            phys[v as usize] = p;
+            let t = m.canon(v);
             scalar[v as usize] = scalar[t as usize];
         }
     }

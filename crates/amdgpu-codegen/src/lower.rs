@@ -3317,6 +3317,42 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::RcpF32(a) => self.un_v1(dst, MOp::VRcpF32, *a)?,
+            Op::MovV { a, .. } => {
+                let d = self.new_vreg(RClass::V1);
+                match self.sgpr_src(*a) {
+                    Some(s) => {
+                        self.touch(&[Src::Reg(s)]);
+                        self.push(MInst::new(MOp::VMovFromS).def(d).srcreg(s));
+                    }
+                    None => match self.const_bits(*a) {
+                        Some(k) => self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(k as i64))),
+                        None => {
+                            let r = self.as_v1(*a)?;
+                            self.touch(&[Src::Reg(r)]);
+                            self.push(MInst::new(MOp::VMovB32).def(d).srcreg(r));
+                        }
+                    },
+                }
+                self.val.insert(dst, d);
+            }
+            Op::MovS { a, .. } => {
+                let s = self.s_operand(*a)?;
+                if let Src::Reg(r) = s {
+                    self.touch(&[Src::Reg(r)]);
+                }
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(d).src(s));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
+            Op::NegF32(a) => {
+                // standalone: flip the sign bit (unused when every reader folds it into a modifier: removed by dce)
+                let r = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VXorB32).def(d).src(Src::Imm(0x8000_0000u32 as i32 as i64)).srcreg(r));
+                self.val.insert(dst, d);
+            }
             Op::Exp2F32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
             Op::Log2F32(a) => self.un_v1(dst, MOp::VLogF32, *a)?,
             Op::CvtPkBf16F32(a, b) => {
@@ -3592,13 +3628,14 @@ impl Lowerer {
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::MfmaF16Wide { a, b, c } => {
+            Op::MfmaF16Wide { a, b, c } | Op::MfmaBf16Wide { a, b, c } => {
+                let bf16 = matches!(op, Op::MfmaBf16Wide { .. });
                 let ra = self.as_v2(*a)?;
                 let rb = self.as_v2(*b)?;
                 if self.is_zero_frag(c) {
                     // D = A x B: the accumulator is the inline constant 0 (no zero fragment, no copy)
                     let d = self.new_vreg(RClass::V16);
-                    self.push(MInst::new(MOp::VMfma32x32x8F16Z).def(d).srcreg(ra).srcreg(rb));
+                    self.push(MInst::new(if bf16 { MOp::VMfma32x32x8Bf16Z } else { MOp::VMfma32x32x8F16Z }).def(d).srcreg(ra).srcreg(rb));
                     self.val.insert(dst, d);
                     return Ok(());
                 }
@@ -3606,7 +3643,7 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V16);
                 self.copy_reg(d, rc)?;
                 self.push(
-                    MInst::new(MOp::VMfma32x32x8F16)
+                    MInst::new(if bf16 { MOp::VMfma32x32x8Bf16 } else { MOp::VMfma32x32x8F16 })
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
@@ -3950,6 +3987,35 @@ impl Lowerer {
     }
 
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        // an f32 operand defined by `NegF32(x)`: read x with the source-negate modifier (VOP3)
+        if matches!(op, MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32) {
+            let neg_of = |me: &Self, o: Opnd| -> Option<Opnd> {
+                if let Opnd::Val(v) = o {
+                    if let Some(Op::NegF32(x)) = me.defs.get(&v) {
+                        return Some(*x);
+                    }
+                }
+                None
+            };
+            let (na, nb) = (neg_of(self, a), neg_of(self, b));
+            if na.is_some() || nb.is_some() {
+                let (a2, b2) = (na.unwrap_or(a), nb.unwrap_or(b));
+                // VOP3 takes one scalar source (constant bus); the other operand in a VGPR
+                let sa = self.sgpr_src(a2);
+                let ra = match sa {
+                    Some(s) => s,
+                    None => self.as_v1(a2)?,
+                };
+                let rb = if sa.is_some() { self.as_v1(b2)? } else { self.sgpr_src(b2).map_or_else(|| self.as_v1(b2), Ok)? };
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V1);
+                let mut inst = MInst::new(op).def(d).srcreg(ra).srcreg(rb);
+                inst.neg = (na.is_some() as u8) | ((nb.is_some() as u8) << 1);
+                self.push(inst);
+                self.val.insert(dst, d);
+                return Ok(());
+            }
+        }
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
             let commutative = op != MOp::VSubF32;

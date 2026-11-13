@@ -66,3 +66,46 @@ fn exact_round_trips_through_irv1() {
     let g = amdgpu_dsl::ir_text::parse(&t).unwrap();
     assert!(g.exact);
 }
+
+/// (j) the source-negate modifier, (k) authored moves, (l) the bf16 32x32x8 MFMA kind.
+#[test]
+fn neg_modifier_moves_and_bf16_mfma_lower_to_one_instruction_each() {
+    let mut b = FnBuilder::new("probe_exact_forms", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(64 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    let x = b.let_(Op::Un(amdgpu_dsl::UnOp::CvtI32F32, Opnd::Val(tid)));
+    let k = b.let_(Op::KernargF32 { offset: 0x00 });
+    let n = b.neg_f32(k);
+    let y = b.let_(Op::MulF32(Opnd::Val(n), Opnd::Val(x)));
+    let z = b.mov_v(DType::F32, y);
+    let rs = b.buffer_rsrc_sized(po, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, z);
+    let f = b.finish();
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.lines().any(|l| l.trim().starts_with("v_mul_f32_e64") && l.contains(", -s")), "{}", c.asm);
+    assert!(!c.asm.contains("v_xor_b32"), "the negation folded into the modifier");
+}
+
+#[test]
+fn bf16_wide_mfma_is_its_own_kind() {
+    let mut b = FnBuilder::new("probe_bf16_wide", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(64 * 64));
+    let z = b.let_(Op::FragZero { ty: DType::Frag16 });
+    let one = b.c_i32(0x3f80_3f80);
+    let a = b.let_(Op::Frag2(Opnd::Val(one), Opnd::Val(one)));
+    let r = b.mfma_bf16_wide(a, a, z);
+    let r2 = b.mfma_bf16_wide(a, a, r);
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let rs = b.buffer_rsrc_sized(po, 64 * 64);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.bind_i32(ev(tid) << 6);
+    let l = b.let_(Op::Frag16Lane { frag: Opnd::Val(r2), index: 0 });
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, l);
+    let f = b.finish();
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("v_mfma_f32_32x32x8_bf16"), "{}", c.asm);
+}

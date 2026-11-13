@@ -284,6 +284,9 @@ pub fn render_text(tpl: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, St
 
 /// MIR lines for one instruction (empty for dropped ones such as `s_nop`).
 pub fn render_inst(t: &Table, inst: &MInst, cx: &RenderCtx) -> Result<Vec<String>, String> {
+    if inst.neg != 0 {
+        return Err(format!("{:?}: source-negate modifiers are not in the LLVM-tail table (use --backend own)", inst.op));
+    }
     let name = format!("{:?}", inst.op);
     // Op@a rows: the accumulator-register (acc_cd) form of an MFMA, chosen when the destination is an AGPR; other ops use their normal row
     // (a ds_read/global_load into an AGPR tuple is the same LLVM opcode).

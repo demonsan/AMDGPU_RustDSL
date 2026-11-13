@@ -495,6 +495,8 @@ pub enum Op {
     FmaF32(Opnd, Opnd, Opnd),
     ExpF32(Opnd),
     RcpF32(Opnd),
+    /// -a (f32). Folded into the source-negate modifier of an f32 add / sub / mul / max that reads it (`v_mul_f32_e64 d, -a, b`).
+    NegF32(Opnd),
 
     CvtF16ToF32(Opnd),
     CvtF32ToF16(Opnd),
@@ -542,6 +544,10 @@ pub enum Op {
     LoadLdsB128x2 { lo: Opnd, hi: Opnd },
     /// Broadcast lane 0 of a vector value into a scalar register.
     ReadFirstLane(Opnd),
+    /// Exact mode: an authored 32-bit move into a VGPR (`v_mov_b32`, from a VGPR, an SGPR or a constant). The value is `a`.
+    MovV { ty: DType, a: Opnd },
+    /// Exact mode: an authored 32-bit move into an SGPR (`s_mov_b32`; `a` wave-uniform). The value is `a`.
+    MovS { ty: DType, a: Opnd },
     /// Cross-lane quad permutation (`v_mov_b32_dpp quad_perm`): lane `l` receives lane `4 (l / 4) + perm[l % 4]` of `x` (all rows / banks written).
     DppQuadPerm { x: Opnd, perm: [u8; 4] },
 
@@ -565,6 +571,8 @@ pub enum Op {
     MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_mfma_f32_32x32x8_f16` with an existing accumulator.
     MfmaF16Wide { a: Opnd, b: Opnd, c: Opnd },
+    /// `v_mfma_f32_32x32x8_bf16` with an existing accumulator (operands as `MfmaF16Wide`).
+    MfmaBf16Wide { a: Opnd, b: Opnd, c: Opnd },
     /// Build an eight-dword fragment from eight 32-bit values.
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
     /// Concatenate two four-dword fragments into an eight-dword fragment.
@@ -726,7 +734,7 @@ impl Op {
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
             }
-            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
+            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::NegF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
             Op::AtomicAddU32 { .. } => DType::U32,
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
             Op::BufferLoadB128x2 { .. } => DType::Frag8,
@@ -747,7 +755,7 @@ impl Op {
             Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
-            Op::MfmaF16Wide { .. } => DType::Frag16,
+            Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
             Op::CvtPknormU16(..) | Op::CvtPkBf16F32(..) => DType::U32,
@@ -770,6 +778,7 @@ impl Op {
             Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
             Op::LoadGlobalB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
+            Op::MovV { ty, .. } | Op::MovS { ty, .. } => *ty,
             Op::DppQuadPerm { .. } => DType::U32,
         }
     }
@@ -833,7 +842,7 @@ impl Op {
                 v
             }
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
-            Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
+            Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::NegF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
             }
             Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
@@ -845,7 +854,7 @@ impl Op {
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
-            Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
+            Op::MfmaF16Wide { a, b, c } | Op::MfmaBf16Wide { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
             Op::CvtPknormU16(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
@@ -880,7 +889,7 @@ impl Op {
                 v.push(*soff);
                 v
             }
-            Op::ReadFirstLane(a) => vec![*a],
+            Op::ReadFirstLane(a) | Op::MovV { a, .. } | Op::MovS { a, .. } => vec![*a],
             Op::DppQuadPerm { x, .. } => vec![*x],
         }
     }
@@ -2865,6 +2874,11 @@ impl FnBuilder {
     pub fn rcp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::RcpF32(a.into()))
     }
+    /// -a (f32), folded into a source modifier where an f32 op reads it.
+    #[track_caller]
+    pub fn neg_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::NegF32(a.into()))
+    }
 
     #[track_caller]
     pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
@@ -2999,6 +3013,12 @@ impl FnBuilder {
         c: impl Into<Opnd>,
     ) -> ValueId {
         self.let_(Op::MfmaF16Wide { a: a.into(), b: b.into(), c: c.into() })
+    }
+
+    /// `v_mfma_f32_32x32x8_bf16`: Frag2 x Frag2 (bf16) + Frag16.
+    #[track_caller]
+    pub fn mfma_bf16_wide(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MfmaBf16Wide { a: a.into(), b: b.into(), c: c.into() })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3332,6 +3352,16 @@ impl FnBuilder {
     #[track_caller]
     pub fn read_first_lane(&mut self, v: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ReadFirstLane(v.into()))
+    }
+    /// Exact mode: an authored `v_mov_b32` (the result is `a`, in a VGPR).
+    #[track_caller]
+    pub fn mov_v(&mut self, ty: DType, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MovV { ty, a: a.into() })
+    }
+    /// Exact mode: an authored `s_mov_b32` (the result is the wave-uniform `a`, in an SGPR).
+    #[track_caller]
+    pub fn mov_s(&mut self, ty: DType, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MovS { ty, a: a.into() })
     }
 
     /// `v_mov_b32_dpp quad_perm:[p0,p1,p2,p3]`: lane `l` gets lane `4 (l / 4) + perm[l % 4]` of `x` (a 32-bit value; e.g. `[1,0,3,2]` swaps
@@ -3910,7 +3940,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) => {
+                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::NegF32(a) => {
                         if let Err(e) = expect_float(f, *a, "unary float") {
                             errs.push(here(e));
                         }
@@ -4041,7 +4071,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
-                    Op::MfmaF16Wide { a, b, c } => {
+                    Op::MfmaF16Wide { a, b, c } | Op::MfmaBf16Wide { a, b, c } => {
                         for (o, want, what) in [
                             (*a, DType::Frag2, "a"),
                             (*b, DType::Frag2, "b"),
@@ -4864,11 +4894,11 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                             Opnd::Val(v) => consts.get(v).map_or(false, |k| *k >= 6),
                             _ => false,
                         },
-                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) => true,
+                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) | Op::MovS { .. } => true,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
                         Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
-                        | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
+                        | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
                         | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } | Op::AtomicAddU32 { .. }
                         | Op::Asm { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsTrB16 { .. } => false,
                         _ => op.operands().iter().all(|o| is_u(o, &u, &uvars)),
