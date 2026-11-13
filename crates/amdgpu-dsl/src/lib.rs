@@ -1648,6 +1648,9 @@ pub struct Function {
     /// Exact authored mode (docs/exact-mode.md): the instruction order, every register, the wait states and waits are the author's; the
     /// back end only verifies. false for every kernel that does not ask for it.
     pub exact: bool,
+    /// Exact mode: the author's FP mode in the kernel descriptor (f32 denorm mode, f16/f64 denorm mode, IEEE mode); None = the defaults
+    /// (denormals kept, IEEE off).
+    pub fp_mode: Option<(u8, u8, bool)>,
 }
 
 /// Builder call sites of the values of a function (see `Function::src_locs`).
@@ -1826,7 +1829,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, exact: false };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, exact: false, fp_mode: None };
         f.set_body(body);
         f
     }
@@ -1911,6 +1914,7 @@ impl FnBuilder {
             reg_plan: Vec::new(),
             plan: None,
             exact: false,
+            fp_mode: None,
             },
             expr_consts: Default::default(),
             captures: Vec::new(),

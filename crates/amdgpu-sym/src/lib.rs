@@ -210,7 +210,73 @@ impl Ctx {
                 *e = e.add(coef);
             }
         }
-        out.values().all(|v| !v.is_neg()) || self.nonneg_box(p)
+        out.values().all(|v| !v.is_neg()) || self.nonneg_box(p) || self.nonneg_upper(p)
+    }
+    /// Third sufficient test: every bounded-above symbol that occurs in a negative monomial is written from its upper bound, s = ub(s) - u
+    /// (u >= 0 a fresh symbol), and the first test is applied to the result (e.g. `1024 k h - 4 k h r + 2` with r <= 255 is
+    /// `4 k h + 4 k h u + 2`).
+    pub fn nonneg_upper(&self, p: &Poly) -> bool {
+        let mut flip: Vec<Sym> = Vec::new();
+        for (mono, c) in &p.0 {
+            if c.is_neg() {
+                for s in mono {
+                    if self.ub.contains_key(s) && !flip.contains(s) && !matches!(s, Sym::Named(n) if n.starts_with('~')) {
+                        flip.push(s.clone());
+                    }
+                }
+            }
+        }
+        if flip.is_empty() || flip.len() > 4 {
+            return false;
+        }
+        // any non-empty subset of the candidates (flipping a symbol that also occurs positively can hurt)
+        (1u32..(1u32 << flip.len())).any(|m| {
+            let sub: Vec<Sym> = flip.iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|(_, s)| s.clone()).collect();
+            self.nonneg_flipped(p, &sub)
+        })
+    }
+    fn nonneg_flipped(&self, p: &Poly, flip: &[Sym]) -> bool {
+        let mut cx = self.clone();
+        let mut q = Poly::int(0);
+        for (mono, c) in &p.0 {
+            let mut term = Poly::konst(*c);
+            for s in mono {
+                let f = if flip.contains(s) {
+                    let u = Sym::Named(format!("~{}", s.name()));
+                    cx.lb.insert(u.clone(), 0);
+                    Poly::int(self.ub[s] as i128).sub(&Poly::sym(u))
+                } else {
+                    Poly::sym(s.clone())
+                };
+                match term.mul(&f) {
+                    Some(x) => term = x,
+                    None => return false,
+                }
+            }
+            q = q.add(&term);
+        }
+        // (the fresh symbols are not flipped again: no recursion into this test)
+        let mut out: BTreeMap<Vec<Sym>, Q> = BTreeMap::new();
+        for (mono, c) in &q.0 {
+            if mono.len() > 10 {
+                return false;
+            }
+            for mask in 0u32..(1u32 << mono.len()) {
+                let mut coef = *c;
+                let mut ts: Vec<Sym> = Vec::new();
+                for (i, s) in mono.iter().enumerate() {
+                    if mask >> i & 1 == 1 {
+                        ts.push(s.clone());
+                    } else {
+                        coef = coef.mul(Q::int(cx.lower_bound(s)));
+                    }
+                }
+                ts.sort();
+                let e = out.entry(ts).or_insert(Q::int(0));
+                *e = e.add(coef);
+            }
+        }
+        out.values().all(|v| !v.is_neg())
     }
     /// Second sufficient test: the minimum of every monomial over the box [lb, ub] of its (non-negative) symbols - `c * prod lb` for c >= 0, `c * prod ub`
     /// for c < 0 (needs every symbol of the monomial bounded above) - sums to >= 0. Uses the declared maxima (`ka_range`, `ka_set`, `sym_range`).

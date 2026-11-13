@@ -131,7 +131,10 @@ LLVM's hazard recognizer, or the ISA document. There are no silent allowances.
 
 | WAITS: LDS read consumed with no wait, older than two newer reads (`lgkmcnt(2)` needed; the vendor's A-loop bf16-init sequence, 6 sites) | counter-guaranteed wait required | none (relies on the reads completing within the issue time of a 32x32x64 MFMA + ~14 ALU + 2 newer reads) | `tools/timing_probe.sh` (generic pattern, not the vendor's exact code): 8 waves with LDS traffic. With the counter-guaranteed wait, 6 / 6 runs are exact. Without it, at a gap of 16 VALU instructions, 4 of 6 runs read stale data (80-384 of 512 threads), and gaps of 0 / 2 / 8 also fail | **refuted**: the replica adds the 6 waits ("1:1 except 6 added `s_waitcnt lgkmcnt(2)`, under full proof"). `TrustWait` stays available for a "1:1 with 6 trusted waits" variant; its reason must cite this probe as refuting |
 
-| VALU writes a lane mask (VOP3 `v_cmp_*_e64 s[..]`, VOP2 `v_cmp_*_e32 vcc`) -> `v_cndmask_b32` reads it as the mask (`hazard-value` / `hazard-valu-sgpr`) | 2 | 0 or 1 (~1100 sites in the lifted kernel) | `tools/lanemask_hazard_probe.sh` (node 53 GPU 2): all of e64 into an SGPR pair -> cndmask e64, e32 vcc -> cndmask e64, e32 vcc -> cndmask e32 are correct at 0, 1 and 2 wait states, in 3 / 3 runs (single wave, no contention). LLVM asks 2 | evidence collected; relaxation pending a decision (as for VCC) |
+| VALU writes a lane mask (VOP3 `v_cmp_*_e64 s[..]`, VOP2 `v_cmp_*_e32 vcc`) -> `v_cndmask_b32` reads it as the mask (`hazard-value` / `hazard-valu-sgpr`) | 2 | 0 or 1 (~1100 sites in the lifted kernel) | `tools/lanemask_hazard_probe.sh` (node 53 GPU 2): e64 into four SGPR pairs and e32 into vcc, read by cndmask e64 / e32, are correct at 0, 1 and 2 wait states (512 threads, 5 runs). LLVM asks 2 | relaxed to 1 (`valu-sgpr-mask`; lead decision: the margin is deliberate). The vendor's ~6 back-to-back sites are named deviations (`s_nop 0`) |
+| VALU VGPR write -> `v_readfirstlane` read (`valu-readfirstlane`) | 2 | 1 | `tools/readfirstlane_hazard_probe.sh`: stale at 0 wait states in every configuration, correct at 1 and 2 (512 threads, 4 VGPRs, 3 writer kinds, 5 runs) | relaxed to 1 (W4: 144 kernels' md5 changed, perf_ab all families OK, port_gate PASS) |
+| transcendental result -> plain VALU read (`trans-valu`; other readers keep `trans-result` = 5) | 5 | 1 / 2 | `tools/trans_hazard_probe.sh`: v_exp / v_rcp / v_log / v_sqrt read by v_mov / v_add_f32 / v_cndmask_e64: stale at 0, correct at 1-3 (512 threads, 5 runs); LLVM TransForwardingHazard: 1 | relaxed to 1 (same W4 gate) |
+| SALU M0 write -> LDS-DMA (`m0-pad`) | 1 | 0 (56 sites) | `tools/m0_hazard_probe.sh`: inconclusive (failures at every distance, so the probe's LDS layout is at fault, not M0 timing) | not relaxed; the replica's 56 sites are named deviations (`s_nop 0`) |
 
 The waits row is a finding about the vendor kernel itself: it relies on LDS read timing, and the probe shows that timing can fail under contention.
 
@@ -153,7 +156,8 @@ with `exact-report`.
 | E2 | live | `exact::verify_final` (the wait and hazard passes run in check mode on a copy; every insertion is a named violation), `exact::check_registers` (per-16-bit-half clobber check across the CFG; hardware-initialised values defined at entry); `tests/exact_verify.rs`: the compiler's own output passes for every reachable kernel, plus mutation tests |
 | E3 | live | `FnBuilder::exact()` / irv1 `exact`, `SNop`, `SetM0`, `PinS` (values and loop variables), `MovV` / `MovS`, `NegF32` (source-negate modifier), `MfmaBf16Wide`; `exact::finalize` |
 | E3 hardware | PASS | `tools/exact_probe.sh`: a fully pinned kernel with in-place register reuse runs verbatim |
-| E4 / E5 | in progress | exact straight-line sections in a structured shell (kernel-opt's lifter); E5 branch forms and scope variables (kernel-opt) |
+| E4 / E5 | live | the whole vendor kernel lifted into one structured exact IR (kernel-opt's lifter), E5 branch forms and scope variables |
+| replica | verified | `gpu-verify --strict` proves the lifted kernel (section 9); same output as the vendor, same-run performance 0.998-1.001x |
 
 The exact lowering rules:
 - **Accumulator:** an MFMA reads C where it is (D and C may differ).
@@ -163,11 +167,16 @@ The exact lowering rules:
 - **Free copies:** a copy between values pinned to the same register is no instruction (tuple assembly, views, bitcasts).
 - **Hardware registers:** a hardware register read into a value pinned at that register is no instruction; v0 / s0..s7 may be reused once their values are dead.
 
+Forms added for the whole-kernel lift: `WaitCnt`, `ExecSave` / `ExecAll` / `ExecSet { mask }` / `ExecRestore`, `TrustWait`, `Undef`,
+`Permlane32SwapA` / `B`, `PtrLo` / `PtrHi` / `PtrCat` / `RsrcCat`, `LoadScalar`, `KernargSegment`, `AddK`, `EncodeE64`, Ptr / Rsrc
+variables, lane masks pinned at an SGPR pair / VCC (PinS 106) / SCC (PinS 253), SADDR global loads, the `fp_mode` header. In exact mode the
+lowering keeps the author's operand order and encodings, never removes or folds an authored instruction (no DCE of loads, no coalescing,
+no retargeting, no address folding through a pinned value), lays branches out as the layout says (fall-through elided), and the waits are
+checked on the physical registers.
+
 Still open:
-- the combined `s_waitcnt vmcnt lgkmcnt` form;
-- 64-bit and EXEC moves;
-- the buffer descriptor from a kernarg pointer-add chain (kernel-opt's item n);
-- a check that an M0 write reaches every DMA.
+- a check that an M0 write reaches every DMA;
+- race freedom of the lifted kernel (bounds are proven; LDS / output-write races are not, section 9).
 
 ## 8. E5: structured exact branch forms and scope variables (implemented, kernel-opt)
 
@@ -205,3 +214,38 @@ Registers merge at joins that are not loop headers. E5 expresses all of this wit
   - irv1 round trip;
   - mutation tests: placement not before an `if`, unknown anchor, anchor declared twice — each rejected with its message.
 - Hardware probe `tools/e5_probe.sh`: the placed and the plain kernel, n = 1..8, every lane right (E5_PROBE_OK, node 53 GPU 0).
+
+## 9. The vendor FMHA replica: proof, trust and deviations
+
+The lifted vendor kernel (kernel-opt's `isa_lift.py --kernel --exact`, ~22k statements) compiles through the normal verified emit:
+`gpu-verify --strict` proves every global, buffer and LDS access in bounds, every descriptor's provenance and the barrier balance of the
+wave roles. Certificate: 1 trusted assume, 30 trusted contracts, 0 unproven.
+
+The analysis forms this needed (all proofs, nothing trusted):
+- **Ring counters** (`ring_facts`): a variable set only to constants or to `v + Select(Cmp(v, K), a, b)` is enumerated to its reachable
+  values; with an expression start (a per-wave base) the start interval's orbits are enumerated. A shadow (a variable updated by the same
+  step) is its init minus the ring's init plus the ring. A step computed ahead of its `set_var` is recognised by the ring's rule.
+- **EXEC lanes**: an LDS-DMA writes only the lanes of the author's EXEC (`ExecSet 0xffffffff` = 32 lanes).
+- **Pointer words**: descriptors and pointers assembled from words (`RsrcCat`, `PtrCat`) are recognised through PtrAdd chains and the
+  masked or unmasked hi word (a canonical 48-bit address).
+- **Branch facts** for the generic integer `Cmp` (either side constant, `NotI1` on the else arm).
+- **Interval rules** for the vendor's integer ops (`v_mul_i32_i24` with symbolic bounds, mbcnt, add3, or); a ceil-division grid is
+  `(P + r) / k` with a remainder symbol (exact kernels); a third non-negativity test in `amdgpu-sym` (bounded symbols written from their
+  upper bound).
+- **Barrier balance** over E5 loop exits with bodies (kernel-opt): each exit path is compared between the wave roles.
+
+Trust (each counted in the certificate):
+- 1 assume: the workgroup map `(query tile, head)` is a bijection of the workgroup `(x, y)` (the vendor's XCD remap computes it by an
+  8-step restoring division the intervals do not prove);
+- 30 contracts, the host / ABI facts of the replica's 656-byte kernarg layout: 7 argument extents, 9 kernarg ranges, 2 grid definitions,
+  11 kernarg definitions, and `HK` in [1, 65536] (the vendor's 24-bit address multiplies are exact only below that).
+
+Not proven: race freedom (LDS and output writes are bounds-checked, not race-checked; the lift has no tile / region protocol facts).
+
+Named deviations from the vendor's instruction stream (everything else is identical and in order):
+- 12 `s_waitcnt lgkmcnt(2)`: the 6 LDS timing-reliant sites (two copies each), refuted by `tools/timing_probe.sh`;
+- 56 `s_nop 0` between an M0 write and its LDS-DMA (`m0-pad`; no conclusive probe);
+- 6 `s_nop 0` at back-to-back lane-mask write -> v_cndmask (`valu-sgpr-mask` kept at 1);
+- 1 fall-through `s_branch` of the vendor elided by the layout.
+
+Hardware: output bit-identical to the vendor (B1 / B4 S2048, B1 S8192), same-run performance 0.998-1.001x.

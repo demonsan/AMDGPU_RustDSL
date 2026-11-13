@@ -190,6 +190,16 @@ fn contract_ctx(f: &Function) -> Ctx {
     for (axis, e) in &f.contract.grid_defs {
         if let Some(p) = e.to_poly(&c) {
             c.subst.insert(Sym::Grid(*axis), p);
+        } else if let (true, Ext::CeilDiv(inner, k)) = (f.exact, e) {
+            // exact (lifted) kernels: grid = ceil(P / k) = (P + r) / k with a fresh remainder symbol r in [0, k - 1] (the relation a lifted
+            // address needs: the last tile's rows end at most k - 1 past P). Shipped kernels keep the grid symbol (their proofs use it).
+            if let (Some(p), true) = (inner.to_poly(&c), *k > 0) {
+                let r = Sym::Named(format!("ceil_rem_grid{axis}"));
+                c.lb.insert(r.clone(), 0);
+                c.ub.insert(r.clone(), *k as i64 - 1);
+                let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
+                c.subst.insert(Sym::Grid(*axis), q);
+            }
         }
     }
     c
@@ -221,7 +231,16 @@ struct An<'a> {
     vars: HashMap<VarId, Itv>,
     /// pointer / descriptor variables: their provenance (the offset part lives in `vars`); `AV::Other` = conflicting provenances
     var_prov: HashMap<VarId, AV>,
+    /// proven ring counters (var -> [min, max] of the reachable values) and their shadows (var -> (init X, ring init c, min, max): the var
+    /// is X - c + ring at every point)
+    rings: RingFacts,
+    /// active lanes (highest active lane + 1) under the author's EXEC (exact mode `exec_set` / save / restore); 64 otherwise
+    exec_lanes: u32,
+    exec_saved: HashMap<u32, u32>,
     var_init: HashMap<VarId, Itv>,
+    /// E5 scope variables (`DeclareVars`): tracked flow-sensitively (a `set_var` takes effect at once; `if` arms join; a loop that
+    /// writes one runs it through its fixpoint). Absent from `vars` = not yet defined on any path (an `Undef` initial value).
+    scope: std::collections::HashSet<VarId>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
     tag: Option<(usize, Itv, Opnd)>,
@@ -275,6 +294,28 @@ impl<'a> An<'a> {
                 Some(AV::Int(i)) => i.clone(),
                 _ => Itv::top(),
             },
+            // a proven ring counter / shadow (ring_facts): its value set holds at every program point
+            Opnd::Var(v) if self.rings.rings.contains_key(v) => {
+                let (lo, hi) = self.rings.rings[v];
+                Itv::range(Poly::int(lo), Poly::int(hi))
+            }
+            Opnd::Var(v) if self.rings.sym.contains_key(v) => {
+                let x = self.int_of(&self.rings.sym[v]);
+                let lo_c = x.lo.iter().filter_map(|p| p.as_const()).map(|q| (q.n + q.d - 1).div_euclid(q.d)).max();
+                let hi_c = x.hi.iter().filter_map(|p| p.as_const()).map(|q| q.n.div_euclid(q.d)).min();
+                let r = match (lo_c, hi_c) {
+                    (Some(lo), Some(hi)) => self.rings.orbit_range(*v, lo, hi),
+                    _ => None,
+                };
+                match r {
+                    Some((lo, hi)) => Itv::range(Poly::int(lo), Poly::int(hi)),
+                    None => self.vars.get(v).cloned().unwrap_or_default(),
+                }
+            }
+            Opnd::Var(v) if self.rings.shadows.contains_key(v) => {
+                let (x, c, lo, hi, _) = self.rings.shadows[v].clone();
+                self.int_of(&x).add(&Itv::range(Poly::int(lo - c), Poly::int(hi - c)))
+            }
             Opnd::Var(v) => self.vars.get(v).cloned().unwrap_or_default(),
             Opnd::F32(_) => Itv::top(),
         }
@@ -307,6 +348,86 @@ impl<'a> An<'a> {
         o
     }
     /// A word that is `PtrLo(p)` (false) or `PtrHi(p)` (true): the pointer operand and which half.
+    /// The pointer under a hi word `PtrHi(p) & 0xffff`.
+    fn masked_hi_of(&self, o: &Opnd) -> Option<Opnd> {
+        let Opnd::Val(v) = self.word_root(o) else { return None };
+        match self.defs.get(&v) {
+            Some(Op::AndI32(a, Opnd::I32(0xffff)) | Op::AndI32(Opnd::I32(0xffff), a)) => match self.word_of(a) {
+                Some((p, true)) => Some(p),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// A canonical spelling of a pointer value: through `PtrAdd` (base and offset) and `PtrCat` of a pointer's own words, so two SSA values
+    /// computing the same pointer compare equal.
+    fn ptr_key(&self, o: &Opnd, depth: usize) -> String {
+        if depth == 0 {
+            return format!("{o:?}");
+        }
+        let key_off = |me: &Self, x: &Opnd| match me.word_root(x) {
+            Opnd::Val(v) => match me.defs.get(&v) {
+                Some(Op::ConstI32(k)) => format!("#{k}"),
+                _ => format!("v{v}"),
+            },
+            Opnd::I32(k) => format!("#{k}"),
+            other => format!("{other:?}"),
+        };
+        match o {
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::PtrAdd { base, byte_off }) => format!("add({},{})", self.ptr_key(base, depth - 1), key_off(self, byte_off)),
+                Some(Op::PtrCat { lo, hi }) => match (self.word_of(lo), self.word_of(hi).or_else(|| self.masked_hi_of(hi).map(|p| (p, true)))) {
+                    (Some((pl, false)), Some((ph, true))) if self.ptr_key(&pl, depth - 1) == self.ptr_key(&ph, depth - 1) => self.ptr_key(&pl, depth - 1),
+                    _ => format!("v{v}"),
+                },
+                _ => format!("v{v}"),
+            },
+            other => format!("{other:?}"),
+        }
+    }
+    /// `D + w` is the next value of ring / shadow `w`: D is a `Select` by the ring's own rule on the ring's current value (no set of the
+    /// ring or of `w` between D's compare and this statement).
+    fn ring_step_add(&self, d: ValueId, w: VarId) -> bool {
+        let ring = if self.rings.rings.contains_key(&w) || self.rings.sym.contains_key(&w) { w } else if let Some(r) = self.ring_of_shadow(w) { r } else { return false };
+        if self.rings.steps.get(&d) == Some(&ring) {
+            return true;
+        }
+        let Some(&(pred, ty, var_left, k, ka, kb)) = self.rings.rules.get(&ring) else { return false };
+        let konst = |o: &Opnd| -> Option<i128> {
+            match self.word_root(o) {
+                Opnd::I32(x) => Some(x as i128),
+                Opnd::Val(v) => match self.defs.get(&v) {
+                    Some(Op::ConstI32(x)) => Some(*x as i128),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) = self.defs.get(&d) else { return false };
+        if konst(a) != Some(ka) || konst(b) != Some(kb) {
+            return false;
+        }
+        let Some(Op::Cmp { pred: p2, ty: t2, a: ca, b: cb }) = self.defs.get(c) else { return false };
+        let side_ok = match (ca, cb) {
+            (Opnd::Var(x), o) if *x == ring && var_left => konst(o) == Some(k),
+            (o, Opnd::Var(x)) if *x == ring && !var_left => konst(o) == Some(k),
+            _ => false,
+        };
+        if !(side_ok && *p2 == pred && *t2 == ty) {
+            return false;
+        }
+        let Some(&pc) = self.rings.let_pos.get(c) else { return false };
+        let now = self.idx;
+        let moved = |v: VarId| self.rings.set_pos.get(&v).map_or(false, |l| l.iter().any(|&j| j > pc && j < now));
+        pc < now && !moved(ring) && !moved(w)
+    }
+    /// The ring a shadow follows (its range and init are recorded in `rings.1`; the ring is the one whose steps update it).
+    fn ring_of_shadow(&self, w: VarId) -> Option<VarId> {
+        self.rings.shadows.get(&w).map(|s| s.4)
+    }
+    fn same_ptr(&self, a: &Opnd, b: &Opnd) -> bool {
+        a == b || self.ptr_key(a, 8) == self.ptr_key(b, 8)
+    }
     fn word_of(&self, o: &Opnd) -> Option<(Opnd, bool)> {
         let Opnd::Val(v) = self.word_root(o) else { return None };
         match self.defs.get(&v) {
@@ -330,8 +451,9 @@ impl<'a> An<'a> {
             },
             _ => None,
         };
-        match masked.and_then(|a| self.word_of(&a)) {
-            Some((p1, true)) if p1 == p => {}
+        // (a valid pointer is a canonical 48-bit address: its hi word already has bits 16..31 clear, so the mask may be absent)
+        match masked.and_then(|a| self.word_of(&a)).or_else(|| self.word_of(&w1)) {
+            Some((p1, true)) if self.same_ptr(&p1, &p) => {}
             _ => return Err("word 1 is not (high half of the same pointer) & 0xffff".into()),
         }
         let fmt = match self.word_root(&w[3]) {
@@ -1801,6 +1923,12 @@ impl<'a> An<'a> {
                 };
                 AV::Int(Itv::range(Poly::int(0), cx.sym_poly(Sym::Grid(axis)).sub(&Poly::int(1))))
             }
+            // the next value of a ring (or of its shadow) computed ahead of its set_var: `D + var` with D a step of that ring lies in the
+            // ring's (shadow's) proven range, like the variable itself
+            Op::AddI32(Opnd::Val(d), Opnd::Var(w)) | Op::AddI32(Opnd::Var(w), Opnd::Val(d)) if self.ring_step_add(*d, *w) =>
+            {
+                AV::Int(self.int_of(&Opnd::Var(*w)))
+            }
             Op::AddI32(a, b) => AV::Int(self.int_of(a).add(&self.int_of(b))),
             Op::MulI32(a, b) => AV::Int(self.int_of(a).mul(&self.int_of(b), cx)),
             Op::ShlI32(a, b) => match self.int_of(b).point_const() {
@@ -1915,6 +2043,27 @@ impl<'a> An<'a> {
                     }
                     B::SubU32 => AV::Int(x.add(&y.scale(Q::int(-1)))),
                     B::MulU32U24 if x.nonneg(cx) && y.nonneg(cx) && hi_const(&x).map_or(false, |h| h < 1 << 24) && hi_const(&y).map_or(false, |h| h < 1 << 24) => AV::Int(x.mul(&y, cx)),
+                    // v_mul_i32_i24: exact product of two operands inside the signed 24-bit range
+                    B::MulI32I24 if {
+                        let lo_const = |i: &Itv| i.lo.iter().filter_map(|p| p.floor_const()).max();
+                        // (symbolic bounds too: kernarg / grid symbols within their contract ranges)
+                        let i24 = |i: &Itv| (lo_const(i).map_or(false, |l| l >= -(1 << 23)) && hi_const(i).map_or(false, |h| h < 1 << 23)) || i.within(&Itv::range(Poly::int(-(1 << 23)), Poly::int((1 << 23) - 1)), cx);
+                        i24(&x) && i24(&y)
+                    } => AV::Int(x.mul(&y, cx)),
+                    // v_mbcnt_lo / hi: the accumulator plus the count of set mask bits of 32 lanes
+                    B::MbcntLo | B::MbcntHi => AV::Int(y.add(&Itv::range(Poly::int(0), Poly::int(32)))),
+                    // or of two non-negative bounded values: below the next power of two of the larger bound
+                    B::OrB32 if x.nonneg(cx) && y.nonneg(cx) => match (hi_const(&x), hi_const(&y)) {
+                        (Some(p), Some(q)) if p.max(q) < 1 << 40 => {
+                            let m = p.max(q);
+                            let mut p2 = 1i128;
+                            while p2 <= m {
+                                p2 <<= 1;
+                            }
+                            AV::Int(Itv::range(Poly::int(0), Poly::int(p2 - 1)))
+                        }
+                        _ => AV::Int(Itv::top()),
+                    },
                     _ => AV::Int(Itv::top()),
                 }
             }
@@ -1943,7 +2092,9 @@ impl<'a> An<'a> {
             // (s) descriptor / pointer words: a pointer re-assembled from its own two words is that pointer; a descriptor assembled as
             // [lo(p), hi(p) & 0xffff (| 0), num_records, 0x00020000] is BufferRsrc(p, num_records); anything else has unknown provenance
             Op::PtrCat { lo, hi } => match (self.word_of(lo), self.word_of(hi)) {
-                (Some((pl, false)), Some((ph, true))) if pl == ph => self.av_of(&pl),
+                (Some((pl, false)), Some((ph, true))) if self.same_ptr(&pl, &ph) => self.av_of(&pl),
+                // a hi word with its top 16 bits cleared: the same pointer (a canonical 48-bit address has them clear)
+                (Some((pl, false)), None) if self.masked_hi_of(hi).map_or(false, |ph| self.same_ptr(&pl, &ph)) => self.av_of(&pl),
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
             Op::RsrcCat { words } => match self.rsrc_words(words) {
@@ -2246,9 +2397,12 @@ impl<'a> An<'a> {
                             self.winner_axes.extend(w.axes.iter().copied());
                         }
                     }
+                    let before = self.scope_state();
                     self.walk(then, idx);
                     self.winner_axes.truncate(wn);
                     self.undo_fact(undo);
+                    let after_then = self.scope_state();
+                    self.set_scope_state(&before);
                     if let Some(e) = els {
                         self.idx = *idx;
                         self.exec_stmt(&Stmt::Else);
@@ -2257,6 +2411,10 @@ impl<'a> An<'a> {
                         self.walk(e, idx);
                         self.undo_fact(undo);
                     }
+                    // the join of the two paths (an arm that leaves the loop contributes too: an over-approximation)
+                    let after_else = self.scope_state();
+                    let joined = self.join_scope(&after_then, &after_else);
+                    self.set_scope_state(&joined);
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::EndIf);
                     *idx += 1;
@@ -2302,16 +2460,44 @@ impl<'a> An<'a> {
     /// constants / workgroup ids) are refined. Returns how to undo it.
     fn branch_fact(&mut self, cond: &Opnd, positive: bool) -> Option<(Opnd, Option<AV>, Option<Itv>)> {
         let Opnd::Val(c) = cond else { return None };
-        let (x, k, lt) = match self.defs.get(c)? {
-            Op::NotI1(n) => return self.branch_fact(&n.clone(), !positive),
-            Op::CmpLtI32(x, k) => (*x, *k, positive),
-            Op::CmpGeI32(x, k) => (*x, *k, !positive),
+        // (x, k, x < k holds on this arm, k is offset by +1: `x <= k` is `x < k + 1`)
+        let (x, k, lt, plus1) = match self.defs.get(c)?.clone() {
+            Op::NotI1(n) => return self.branch_fact(&n, !positive),
+            Op::CmpLtI32(x, k) => (x, k, positive, 0),
+            Op::CmpGeI32(x, k) => (x, k, !positive, 0),
+            // the generic integer compare (exact-mode / lifted IR): x OP k or k OP x; an unsigned compare only of a provably non-negative x
+            Op::Cmp { pred, ty: ty @ (amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32), a, b } => {
+                use amdgpu_dsl::CmpPred as P;
+                // normalise to `x pred k` with x the non-constant side
+                let (x, k, pred) = if self.int_of(&b).point_const().is_some() || matches!(b, Opnd::I32(_)) {
+                    (a, b, pred)
+                } else {
+                    let flip = match pred {
+                        P::Lt => P::Gt,
+                        P::Le => P::Ge,
+                        P::Gt => P::Lt,
+                        P::Ge => P::Le,
+                        other => other,
+                    };
+                    (b, a, flip)
+                };
+                if ty == amdgpu_dsl::CmpTy::U32 && !(self.int_of(&x).nonneg(&self.cx) && self.int_of(&k).nonneg(&self.cx)) {
+                    return None;
+                }
+                match pred {
+                    P::Lt => (x, k, positive, 0),
+                    P::Ge => (x, k, !positive, 0),
+                    P::Le => (x, k, positive, 1),
+                    P::Gt => (x, k, !positive, 1),
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         if !self.uniform_opnd(&x, 6, &mut Vec::new()) || !self.uniform_opnd(&k, 6, &mut Vec::new()) {
             return None;
         }
-        let ki = self.int_of(&k);
+        let ki = self.int_of(&k).add_const(plus1);
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
         // the existing candidates first (never displaced by the cap), then the branch bound
@@ -2406,7 +2592,150 @@ impl<'a> An<'a> {
     }
 
     /// A loop: fixpoint of the loop variables over the body, then the reporting pass.
+    /// The E5 scope variables' current values (None = undefined on every path so far).
+    fn scope_state(&self) -> Vec<(VarId, Option<Itv>)> {
+        let mut v: Vec<(VarId, Option<Itv>)> = self.scope.iter().map(|x| (*x, self.vars.get(x).cloned())).collect();
+        v.sort_by_key(|(x, _)| x.0);
+        v
+    }
+    fn set_scope_state(&mut self, s: &[(VarId, Option<Itv>)]) {
+        for (x, it) in s {
+            match it {
+                Some(i) => {
+                    self.vars.insert(*x, i.clone());
+                }
+                None => {
+                    self.vars.remove(x);
+                }
+            }
+        }
+    }
+    fn join_scope(&self, a: &[(VarId, Option<Itv>)], b: &[(VarId, Option<Itv>)]) -> Vec<(VarId, Option<Itv>)> {
+        let bm: HashMap<VarId, Option<Itv>> = b.iter().cloned().collect();
+        a.iter()
+            .map(|(x, ia)| {
+                let ib = bm.get(x).cloned().flatten();
+                let j = match (ia, ib) {
+                    (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                    (Some(p), None) => Some(p.clone()),
+                    (None, q) => q,
+                };
+                (*x, j)
+            })
+            .collect()
+    }
+    /// E5 scope variables a loop body writes (`set_var`): they take part in the loop's fixpoint.
+    fn scope_written(&self, body: &[Node]) -> Vec<VarId> {
+        fn scan(nodes: &[Node], out: &mut Vec<VarId>) {
+            for n in nodes {
+                match n {
+                    Node::S(Stmt::SetVar { var, .. }) => out.push(*var),
+                    Node::S(_) => {}
+                    Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } => scan(body, out),
+                    Node::If { then, els, .. } => {
+                        scan(then, out);
+                        if let Some(e) = els {
+                            scan(e, out);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        scan(body, &mut out);
+        out.retain(|v| self.scope.contains(v));
+        out.sort_by_key(|v| v.0);
+        out.dedup();
+        out
+    }
+
     fn walk_loop(&mut self, vars: &[VarId], init: &[Opnd], body: &[Node], begin: usize) {
+        self.tag = None;
+        // E5 scope variables written in the body: their entry value joined with the body's end value, to a fixpoint (widened to
+        // unbounded after 5 rounds), before the reporting walk
+        let sw = self.scope_written(body);
+        if !sw.is_empty() {
+            let mut cur: Vec<Option<Itv>> = sw.iter().map(|v| self.vars.get(v).cloned()).collect();
+            let mut ok = false;
+            for round in 0..6 {
+                for (v, it) in sw.iter().zip(cur.iter()) {
+                    match it {
+                        Some(i) => {
+                            self.vars.insert(*v, i.clone());
+                        }
+                        None => {
+                            self.vars.remove(v);
+                        }
+                    }
+                }
+                // a quiet walk of the loop as a whole (its own loop variables included)
+                self.rep.quiet += 1;
+                let saved_sets = self.pending_sets.len();
+                self.walk_loop_inner(vars, init, body, begin);
+                self.pending_sets.truncate(saved_sets);
+                self.rep.quiet -= 1;
+                let mut changed = false;
+                for (k, v) in sw.iter().enumerate() {
+                    if self.assumed.contains_key(v) {
+                        continue;
+                    }
+                    let end = self.vars.get(v).cloned();
+                    let j = match (&cur[k], end) {
+                        (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                        (Some(p), None) => Some(p.clone()),
+                        (None, q) => q,
+                    };
+                    if j != cur[k] {
+                        changed = true;
+                        cur[k] = if round >= 4 { Some(Itv::top()) } else { j };
+                    }
+                }
+                if !changed {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                for (k, v) in sw.iter().enumerate() {
+                    if !self.assumed.contains_key(v) {
+                        cur[k] = Some(Itv::top());
+                    }
+                }
+            }
+            for (v, it) in sw.iter().zip(cur.iter()) {
+                match it {
+                    Some(i) => {
+                        self.vars.insert(*v, i.clone());
+                    }
+                    None => {
+                        self.vars.remove(v);
+                    }
+                }
+            }
+            // the reporting walk starts from the fixpoint; after the loop the variables hold the hull
+            self.walk_loop_inner(vars, init, body, begin);
+            for (v, it) in sw.iter().zip(cur.iter()) {
+                let end = self.vars.get(v).cloned();
+                let j = match (it, end) {
+                    (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                    (Some(p), None) => Some(p.clone()),
+                    (None, q) => q,
+                };
+                match j {
+                    Some(i) => {
+                        self.vars.insert(*v, i);
+                    }
+                    None => {
+                        self.vars.remove(v);
+                    }
+                }
+            }
+            return;
+        }
+        self.walk_loop_inner(vars, init, body, begin);
+    }
+
+    fn walk_loop_inner(&mut self, vars: &[VarId], init: &[Opnd], body: &[Node], begin: usize) {
         self.tag = None;
         let mut cur: Vec<Itv> = Vec::new();
         for (v, i0) in vars.iter().zip(init.iter()) {
@@ -2481,13 +2810,37 @@ impl<'a> An<'a> {
         match st {
             Stmt::Let { dst, op } => {
                 self.check_op(op);
-                let v = self.eval(op);
+                let mut v = self.eval(op);
                 if matches!(op, Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. }) {
                     self.check_descriptor(&v);
+                }
+                // an output of a (non-union) workgroup map is a coordinate of a bijection onto the grid: it lies in [0, Grid(axis) - 1] (part of
+                // the map's fact, counted with its reason)
+                if let Some((m, k)) = self.f.contract.wg_maps.iter().filter(|m| !m.union).find_map(|m| m.outs.iter().position(|o| o == dst).map(|k| (m, k))) {
+                    if let Some(&ax) = m.axes.get(k) {
+                        let g = Itv::range(Poly::int(0), self.cx.sym_poly(Sym::Grid(ax)).sub(&Poly::int(1)));
+                        v = match v {
+                            AV::Int(i) => {
+                                let mut lo = i.lo.clone();
+                                lo.extend(g.lo);
+                                let mut hi = i.hi.clone();
+                                hi.extend(g.hi);
+                                AV::Int(Itv { lo: cap(lo), hi: cap(hi) })
+                            }
+                            _ => AV::Int(g),
+                        };
+                    }
                 }
                 self.env.insert(*dst, v);
             }
             Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
+            // the author's EXEC: the lanes that execute (a DMA writes only theirs)
+            Stmt::ExecAll => self.exec_lanes = 64,
+            Stmt::ExecSet { mask } => self.exec_lanes = 64 - mask.leading_zeros(),
+            Stmt::ExecSave { sgpr } => {
+                self.exec_saved.insert(*sgpr, self.exec_lanes);
+            }
+            Stmt::ExecRestore { sgpr } => self.exec_lanes = self.exec_saved.get(sgpr).copied().unwrap_or(64),
             Stmt::TrustWait { reason } => {
                 let sev = if f.exact { Severity::Warn } else { Severity::Error };
                 self.rep.add("GV-TRUST-TIMING", sev, format!("stmt {}: TRUSTED timing (the next read is not guaranteed by the wait counters): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));
@@ -2527,7 +2880,15 @@ impl<'a> An<'a> {
                 self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
                 let a = self.int_of(lds_addr).add_const(*imm as i128);
                 self.cur_addr = Some((*lds_addr, *imm as i128));
-                self.check_lds("buffer load ... lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+                let lanes = self.exec_lanes as i128;
+                let before = self.rep.findings.len();
+                self.check_lds(&format!("buffer load ... lds (LDS side: M0 + imm + lane*size, {lanes} lanes)"), &a, lanes * 4 * *dwords as i128);
+                if self.rep.findings.len() > before {
+                    let sh = self.shape(lds_addr, 6);
+                    if let Some(last) = self.rep.findings.last_mut() {
+                        last.msg.push_str(&format!(" | M0 = {sh} ; imm {imm}"));
+                    }
+                }
             }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                 let b = self.av_of(base);
@@ -2535,7 +2896,8 @@ impl<'a> An<'a> {
                 let a = self.int_of(lds_addr).add_const(*byte_off as i128);
                 self.cur_addr = Some((*lds_addr, *byte_off as i128));
                 let before = self.rep.findings.len();
-                self.check_lds("global_load_lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+                let lanes = self.exec_lanes as i128;
+                self.check_lds(&format!("global_load_lds (LDS side: M0 + imm + lane*size, {lanes} lanes)"), &a, lanes * 4 * *dwords as i128);
                 if self.rep.findings.len() > before {
                     let sh = self.shape(lds_addr, 5);
                     if let Some(last) = self.rep.findings.last_mut() {
@@ -2572,14 +2934,28 @@ impl<'a> An<'a> {
                 // applied at the end of the enclosing statement list, so a later `break_if` of the same list refines the value (the back
                 // edge is reached only when the break was not taken)
                 self.pending_sets.push((i, *var, *value));
+                // an E5 scope variable holds the value from here on (flow-sensitive; `if` joins and loop fixpoints cover the paths)
+                if self.scope.contains(var) {
+                    let it = self.var_part(*var, value);
+                    let it = match self.assumed.get(var) {
+                        Some(a) => a.clone(),
+                        None => it,
+                    };
+                    self.vars.insert(*var, it);
+                }
             }
-            // E5 scope variables: set anywhere in their scope, along any path (if arms, loop exits): flow-insensitive, so unbounded unless
-            // an `assume` restricts them (each `set_var` is then checked against it, GV-ASSUME)
+            // E5 scope variables: defined by their init (absent = `Undef`: no value on any path yet)
             Stmt::DeclareVars { vars, init } => {
                 for (v, i0) in vars.iter().zip(init.iter()) {
+                    self.scope.insert(*v);
+                    let undef = matches!(i0, Opnd::Val(x) if matches!(self.defs.get(x), Some(Op::Undef { .. })));
+                    if undef {
+                        self.vars.remove(v);
+                        continue;
+                    }
                     let it = self.var_part(*v, i0);
-                    self.var_init.insert(*v, it);
-                    let cur = self.assumed.get(v).cloned().unwrap_or_else(Itv::top);
+                    self.var_init.insert(*v, it.clone());
+                    let cur = self.assumed.get(v).cloned().unwrap_or(it);
                     self.vars.insert(*v, cur);
                 }
             }
@@ -2639,10 +3015,80 @@ fn flat_len(nodes: &[Node]) -> usize {
 /// `deltas` collects, per nested if in order, the barrier difference (else arm - then arm; an if without else counts as an empty else arm): the
 /// totals follow the then-sides only and would not see a barrier missing from an else arm (a per-exit drain, the full-tile arm of a tail test). Two
 /// roles built alike must have equal totals AND equal deltas, i.e. the same barrier count on every combination of (uniform) branch outcomes.
+/// Does the then-arm of the `BeginIf` at `pos` end with a `break_if` (E5: a loop exit with its own body)?
+fn arm_exits(stmts: &[Stmt], pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = pos + 1;
+    while i < stmts.len() {
+        match &stmts[i] {
+            Stmt::BeginIf { .. } | Stmt::BeginLoop { .. } => depth += 1,
+            Stmt::EndIf | Stmt::EndLoop if depth > 0 => depth -= 1,
+            Stmt::Else | Stmt::EndIf if depth == 0 => return i > pos + 1 && matches!(stmts[i - 1], Stmt::BreakIf { .. }),
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does the loop body starting at `pos` (after `BeginLoop`) leave other than through E5 exit arms (a `break_if` that is not the last
+/// statement of an exit arm)?
+fn loop_has_plain_break(stmts: &[Stmt], pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = pos;
+    while i < stmts.len() {
+        match &stmts[i] {
+            Stmt::BeginLoop { .. } => depth += 1,
+            Stmt::EndLoop if depth == 0 => return false,
+            Stmt::EndLoop => depth -= 1,
+            Stmt::BreakIf { .. } if depth == 0 => {
+                let last_of_arm = matches!(stmts.get(i + 1), Some(Stmt::Else | Stmt::EndIf));
+                if !last_of_arm {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn add_poly(a: &mut Vec<i64>, b: &[i64]) {
+    if a.len() < b.len() {
+        a.resize(b.len(), 0);
+    }
+    for (d, c) in b.iter().enumerate() {
+        a[d] += c;
+    }
+}
+
+/// `bar_counts` with the E5 loop exits: an arm ending in `break_if` runs once, on its exit path - its barriers (with the iteration
+/// prefix before it) go to `exits`, one polynomial per exit path (the barriers before the loop + N iterations + the prefix + the arm +
+/// what follows the loop), in program order, instead of into the per-iteration count.
 fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, deltas: &mut Vec<Vec<i64>>) -> Vec<i64> {
+    let mut exits = Vec::new();
+    let mut dead = false;
+    bar_counts_x(stmts, pos, until, deltas, &mut exits, &mut dead)
+}
+
+/// `dead` is set when the range ends behind a loop that only leaves through exit arms (its fall-through count is no path).
+fn bar_counts_x(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, deltas: &mut Vec<Vec<i64>>, exits: &mut Vec<Vec<i64>>, dead: &mut bool) -> Vec<i64> {
     let mut out: Vec<i64> = vec![0];
+    // exits recorded at this level: (path count so far, `out` when recorded) - the barriers after the record are added at the end
+    let mut mine: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
+    let finish = |out: &Vec<i64>, mine: Vec<(Vec<i64>, Vec<i64>)>, exits: &mut Vec<Vec<i64>>| {
+        for (mut e, snap) in mine {
+            let mut tail = out.clone();
+            let neg: Vec<i64> = snap.iter().map(|c| -c).collect();
+            add_poly(&mut tail, &neg);
+            add_poly(&mut e, &tail);
+            exits.push(trim(e));
+        }
+    };
     while *pos < stmts.len() {
         if until(&stmts[*pos]) {
+            finish(&out, mine, exits);
             return out;
         }
         match &stmts[*pos] {
@@ -2652,14 +3098,51 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, de
             }
             Stmt::BeginLoop { .. } => {
                 *pos += 1;
-                let inner = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndLoop), deltas);
+                let plain = loop_has_plain_break(stmts, *pos);
+                let mut inner_exits = Vec::new();
+                let mut inner_dead = false;
+                let inner = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::EndLoop), deltas, &mut inner_exits, &mut inner_dead);
                 *pos += 1;
-                if out.len() < inner.len() + 1 {
-                    out.resize(inner.len() + 1, 0);
+                if !plain && !inner_exits.is_empty() {
+                    *dead = true;
                 }
+                let mut iter = vec![0];
                 for (d, c) in inner.iter().enumerate() {
-                    out[d + 1] += c;
+                    if iter.len() < d + 2 {
+                        iter.resize(d + 2, 0);
+                    }
+                    iter[d + 1] += c;
                 }
+                // an exit path: the barriers so far + N iterations + its own (prefix + arm)
+                for e in inner_exits {
+                    let mut p = out.clone();
+                    add_poly(&mut p, &iter);
+                    add_poly(&mut p, &e);
+                    mine.push((p, {
+                        let mut s = out.clone();
+                        add_poly(&mut s, &iter);
+                        s
+                    }));
+                }
+                add_poly(&mut out, &iter);
+            }
+            Stmt::BeginIf { .. } if arm_exits(stmts, *pos) => {
+                // E5 exit with its body: the iteration prefix + the arm, once (an else arm, if any, continues the iteration)
+                *pos += 1;
+                let mut arm_exits_inner = Vec::new();
+                let mut d2 = false;
+                let t = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::Else | Stmt::EndIf), deltas, &mut arm_exits_inner, &mut d2);
+                let mut e = out.clone();
+                add_poly(&mut e, &t);
+                exits.push(trim(e));
+                exits.extend(arm_exits_inner);
+                if matches!(stmts.get(*pos), Some(Stmt::Else)) {
+                    *pos += 1;
+                    let mut d3 = false;
+                    let el = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::EndIf), deltas, exits, &mut d3);
+                    add_poly(&mut out, &el);
+                }
+                *pos += 1;
             }
             Stmt::BeginIf { .. } => {
                 *pos += 1;
@@ -2683,6 +3166,7 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, de
             _ => *pos += 1,
         }
     }
+    finish(&out, mine, exits);
     out
 }
 
@@ -2738,11 +3222,25 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
             let divergent = tainted(cond, &tv, &tvars);
             let mut p = pos + 1;
             let (mut te, mut ee) = (Vec::new(), Vec::new());
-            let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf), &mut te));
+            let (mut tx, mut ex) = (Vec::new(), Vec::new());
+            let (mut tdead, mut edead) = (false, false);
+            let t = trim(bar_counts_x(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf), &mut te, &mut tx, &mut tdead));
             let mut e = vec![0];
             if matches!(f.stmts().get(p), Some(Stmt::Else)) {
                 p += 1;
-                e = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf), &mut ee));
+                e = trim(bar_counts_x(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf), &mut ee, &mut ex, &mut edead));
+            }
+            // both sides end in loops left only through exits: the fall-through counts are no path, the exit paths are compared below
+            let (t, e) = if tdead && edead && !tx.is_empty() { (vec![0], vec![0]) } else { (t, e) };
+            // E5 loop exits: the two sides must leave by the same exits in the same order, each with the same barrier count
+            if divergent && tx != ex {
+                rep.add(
+                    "GV-BAR",
+                    Severity::Error,
+                    format!("stmt {pos}: wave-divergent if/else (condition depends on the workitem id): the loop exit paths run different numbers of barriers: then {tx:?} vs else {ex:?} (per exit, coefficients of 1, N, ...) - waves that run fewer barriers deadlock the workgroup"),
+                );
+                pos += 1;
+                continue;
             }
             // nested ifs whose arms run the same barriers change nothing (and the two sides need not have the same nesting for them)
             te.retain(|d| d.iter().any(|&x| x != 0));
@@ -2770,7 +3268,11 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    if std::env::var("AMDC_GV_DEBUG").is_ok() {
+        eprintln!("rings {:?}", an.rings.rings);
+        eprintln!("shadows {:?}", an.rings.shadows.iter().map(|(w, s)| (w, s.1, s.2, s.3)).collect::<Vec<_>>());
+    }
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
@@ -3253,4 +3755,252 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         },
         _ => (0, 0),
     }
+}
+
+/// Ring counters and their shadows, proven from the IR alone (gpu_verify uses the ranges as facts, nothing is trusted):
+/// * a ring `v`: every value it is set to (an init or a `set_var`) is a constant or `v + Select{Cmp(v, K), a, b}` with constants (through
+///   `MovS` / `MovV`), the compare reading `v` with no set of `v` in between; the reachable values are enumerated from the constants;
+/// * a shadow `w` of ring `v`: `w` is set once to some X in the straight-line block where `v` is set to a constant c, and otherwise only to
+///   `w + D` where the same `D` value updates `v` in the same block: then `w = X - c + v` at every point after both, so `w` lies in
+///   `X - c + [min, max]`.
+/// Proven ring counters (see `ring_facts`).
+#[derive(Default)]
+struct RingFacts {
+    /// ring -> [min, max] of its reachable values
+    rings: HashMap<VarId, (i128, i128)>,
+    /// shadow -> (its init X, the ring's init c, min, max, the ring): the shadow is X - c + ring
+    shadows: HashMap<VarId, (Opnd, i128, i128, i128, VarId)>,
+    /// step values (the `Select`s the rings are updated with) -> their ring
+    steps: HashMap<ValueId, VarId>,
+    /// ring -> its step rule (pred, ty, var on the left, K, a, b)
+    rules: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)>,
+    /// statement positions of every set of a variable, and of every `Let`
+    set_pos: HashMap<VarId, Vec<usize>>,
+    let_pos: HashMap<ValueId, usize>,
+    /// rings whose single non-constant start value is an expression (e.g. a per-wave base): the start's interval is enumerated at use
+    sym: HashMap<VarId, Opnd>,
+    sym_cache: std::cell::RefCell<HashMap<(VarId, i128, i128), Option<(i128, i128)>>>,
+}
+
+impl RingFacts {
+    /// The reachable values of a ring started anywhere in [lo, hi] (None: too many starts or a run that does not cycle).
+    fn orbit_range(&self, v: VarId, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        if let Some(r) = self.sym_cache.borrow().get(&(v, lo, hi)) {
+            return *r;
+        }
+        let r = (|| {
+            let &(pred, ty, var_left, k, ka, kb) = self.rules.get(&v)?;
+            if hi < lo || hi - lo > 1 << 17 {
+                return None;
+            }
+            let (mut mn, mut mx) = (i128::MAX, i128::MIN);
+            for x0 in lo..=hi {
+                let mut x = x0;
+                let mut seen = std::collections::BTreeSet::new();
+                while seen.insert(x) {
+                    if seen.len() > 64 {
+                        return None;
+                    }
+                    mn = mn.min(x);
+                    mx = mx.max(x);
+                    x = ((x + if ring_cmp(pred, ty, var_left, k, x) { ka } else { kb }) as i64 as i32) as i128;
+                }
+            }
+            Some((mn, mx))
+        })();
+        self.sym_cache.borrow_mut().insert((v, lo, hi), r);
+        r
+    }
+}
+
+fn ring_cmp(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy, var_left: bool, k: i128, x: i128) -> bool {
+    let (l, r) = if var_left { (x, k) } else { (k, x) };
+    let (l, r) = match ty {
+        amdgpu_dsl::CmpTy::U32 => ((l as i64 as u32) as i128, (r as i64 as u32) as i128),
+        _ => ((l as i64 as i32) as i128, (r as i64 as i32) as i128),
+    };
+    use amdgpu_dsl::CmpPred as P;
+    match pred {
+        P::Lt => l < r,
+        P::Le => l <= r,
+        P::Gt => l > r,
+        P::Ge => l >= r,
+        P::Eq => l == r,
+        _ => l != r,
+    }
+}
+
+fn ring_facts(f: &Function) -> RingFacts {
+    let stmts = f.stmts();
+    let defs: HashMap<ValueId, Op> = stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect();
+    let pos: HashMap<ValueId, usize> = stmts.iter().enumerate().filter_map(|(k, s)| if let Stmt::Let { dst, .. } = s { Some((*dst, k)) } else { None }).collect();
+    fn konst(defs: &HashMap<ValueId, Op>, o: &Opnd, depth: usize) -> Option<i128> {
+        match o {
+            Opnd::I32(k) => Some(*k as i128),
+            Opnd::Val(v) if depth > 0 => match defs.get(v) {
+                Some(Op::ConstI32(k)) => Some(*k as i128),
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => konst(defs, a, depth - 1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let control = |s: &Stmt| {
+        let d = format!("{s:?}");
+        ["BeginIf", "Else", "EndIf", "BeginLoop", "EndLoop", "Break", "Continue", "BranchPlace", "LayoutAnchor", "DeclareVars"].iter().any(|p| d.starts_with(p))
+    };
+    let straight = |a: usize, b: usize| {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        hi <= lo + 1 || !stmts[lo + 1..hi].iter().any(|s| control(s))
+    };
+    // every (position, value) a variable is set to: set_vars, plus non-Undef inits of loops / scopes
+    let mut sets: HashMap<VarId, Vec<(usize, Opnd)>> = HashMap::new();
+    for (k, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::SetVar { var, value } => sets.entry(*var).or_default().push((k, *value)),
+            Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
+                for (v, i) in vars.iter().zip(init.iter()) {
+                    let undef = matches!(i, Opnd::Val(x) if matches!(defs.get(x), Some(Op::Undef { .. })));
+                    if !undef {
+                        sets.entry(*v).or_default().push((k, *i));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // `value` = Var(v) + D (either order): D
+    let step_of = |v: VarId, value: &Opnd| -> Option<ValueId> {
+        let Opnd::Val(x) = value else { return None };
+        match defs.get(x) {
+            Some(Op::AddI32(Opnd::Var(w), Opnd::Val(d)) | Op::AddI32(Opnd::Val(d), Opnd::Var(w))) if *w == v => Some(*d),
+            _ => None,
+        }
+    };
+    let mut rings: HashMap<VarId, (i128, i128)> = HashMap::new();
+    let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::new();
+    let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::new();
+    let mut ring_rule: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = HashMap::new();
+    let mut sym: HashMap<VarId, Opnd> = HashMap::new();
+    'var: for (v, list) in &sets {
+        let mut consts = Vec::new();
+        let mut steps = Vec::new();
+        let mut rule: Option<(amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = None;
+        let mut sym_init: Option<Opnd> = None;
+        for (k, value) in list {
+            if let Some(c) = konst(&defs, value, 4) {
+                consts.push((*k, c));
+                continue;
+            }
+            let Some(d) = step_of(*v, value) else {
+                if sym_init.is_some() {
+                    continue 'var;
+                }
+                sym_init = Some(*value);
+                continue;
+            };
+            let Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) = defs.get(&d) else { continue 'var };
+            let (Some(ka), Some(kb)) = (konst(&defs, a, 4), konst(&defs, b, 4)) else { continue 'var };
+            let Some(Op::Cmp { pred, ty, a: ca, b: cb }) = defs.get(c) else { continue 'var };
+            let (var_left, kk) = match (ca, cb) {
+                (Opnd::Var(w), o) if w == v => (true, konst(&defs, o, 4)),
+                (o, Opnd::Var(w)) if w == v => (false, konst(&defs, o, 4)),
+                _ => continue 'var,
+            };
+            let Some(kk) = kk else { continue 'var };
+            // no set of v between the compare and this set
+            let pc = pos[c];
+            if pc > *k || list.iter().any(|(j, _)| *j > pc && *j < *k) {
+                continue 'var;
+            }
+            let r = (*pred, *ty, var_left, kk, ka, kb);
+            if rule.map_or(false, |x| x != r) {
+                continue 'var;
+            }
+            rule = Some(r);
+            steps.push(d);
+        }
+        let Some((pred, ty, var_left, k, ka, kb)) = rule else { continue };
+        if let Some(x) = sym_init {
+            if !consts.is_empty() {
+                continue;
+            }
+            ring_rule.insert(*v, (pred, ty, var_left, k, ka, kb));
+            ring_step.insert(*v, steps);
+            sym.insert(*v, x);
+            continue;
+        }
+        if consts.is_empty() {
+            continue;
+        }
+        let holds = |x: i128| -> bool {
+            let (l, r) = if var_left { (x, k) } else { (k, x) };
+            let (l, r) = match ty {
+                amdgpu_dsl::CmpTy::U32 => ((l as i64 as u32) as i128, (r as i64 as u32) as i128),
+                _ => ((l as i64 as i32) as i128, (r as i64 as i32) as i128),
+            };
+            use amdgpu_dsl::CmpPred as P;
+            match pred {
+                P::Lt => l < r,
+                P::Le => l <= r,
+                P::Gt => l > r,
+                P::Ge => l >= r,
+                P::Eq => l == r,
+                _ => l != r,
+            }
+        };
+        let mut seen: std::collections::BTreeSet<i128> = std::collections::BTreeSet::new();
+        let mut work: Vec<i128> = consts.iter().map(|x| x.1).collect();
+        while let Some(x) = work.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if seen.len() > 256 {
+                continue 'var;
+            }
+            let n = ((x + if holds(x) { ka } else { kb }) as i64 as i32) as i128;
+            work.push(n);
+        }
+        rings.insert(*v, (*seen.first().unwrap(), *seen.last().unwrap()));
+        ring_rule.insert(*v, (pred, ty, var_left, k, ka, kb));
+        ring_step.insert(*v, steps);
+        ring_const.insert(*v, consts);
+    }
+    let mut shadows: HashMap<VarId, (Opnd, i128, i128, i128, VarId)> = HashMap::new();
+    'w: for (w, list) in &sets {
+        if rings.contains_key(w) {
+            continue;
+        }
+        let mut init: Option<(usize, Opnd)> = None;
+        let mut ring: Option<VarId> = None;
+        for (k, value) in list {
+            if let Some(d) = step_of(*w, value) {
+                // the same D updates a ring in the same straight-line block
+                let Some((v, _)) = ring_step.iter().find(|(_, ds)| ds.contains(&d)) else { continue 'w };
+                let Some((kv, _)) = sets[v].iter().find(|(_, val)| step_of(*v, val) == Some(d)) else { continue 'w };
+                if !straight(*k, *kv) || ring.map_or(false, |r| r != *v) {
+                    continue 'w;
+                }
+                ring = Some(*v);
+            } else {
+                if init.is_some() {
+                    continue 'w;
+                }
+                init = Some((*k, *value));
+            }
+        }
+        let (Some(v), Some((ki, x))) = (ring, init) else { continue };
+        // the ring's single constant set in the same straight-line block as w's init
+        // (a shadow of a ring with an expression start is not tracked)
+        let Some(cs) = ring_const.get(&v) else { continue };
+        let [(kc, c)] = cs.as_slice() else { continue };
+        if !straight(ki, *kc) {
+            continue;
+        }
+        let (lo, hi) = rings[&v];
+        shadows.insert(*w, (x, *c, lo, hi, v));
+    }
+    let steps: HashMap<ValueId, VarId> = ring_step.iter().flat_map(|(v, ds)| ds.iter().map(move |d| (*d, *v))).collect();
+    let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
+    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, sym_cache: Default::default() }
 }

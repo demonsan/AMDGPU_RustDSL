@@ -820,6 +820,10 @@ pub struct MFunction {
     pub workgroup_size: u32,
     /// Workgroup LDS bytes declared by the kernel.
     pub lds_bytes: u32,
+    /// the kernel descriptor's FP mode (f32 denorm, f16/f64 denorm, IEEE); None = (3, 3, false)
+    pub fp_mode: Option<(u8, u8, bool)>,
+    /// an exact (authored) kernel: the descriptor states the author's register counts as used, not rounded
+    pub exact: bool,
     pub blocks: Vec<Block>,
     pub vregs: Vec<RClass>,
     /// (header label, latch label) pairs, used to extend live ranges that cross

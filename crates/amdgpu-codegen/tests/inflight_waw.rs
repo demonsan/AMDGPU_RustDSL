@@ -16,7 +16,7 @@ fn func(blocks: Vec<Vec<MInst>>, classes: Vec<RClass>) -> MFunction {
         args: Vec::new(),
         kernarg_size: 0,
         workgroup_size: 64,
-        lds_bytes: 0,
+        lds_bytes: 0, fp_mode: None, exact: false,
         blocks: bs,
         vregs: classes,
         loops: Vec::new(),

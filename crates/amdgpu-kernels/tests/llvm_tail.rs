@@ -124,7 +124,7 @@ fn opcode_probe_every_row_assembles() {
             args: vec![],
             kernarg_size: 0,
             workgroup_size: 256,
-            lds_bytes: 0,
+            lds_bytes: 0, fp_mode: None, exact: false,
             blocks: vec![b],
             vregs,
             loops: vec![],

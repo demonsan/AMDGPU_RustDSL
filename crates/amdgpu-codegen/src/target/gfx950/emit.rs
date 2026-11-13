@@ -59,6 +59,8 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     // never uses more than 102 (s0..s101), so a kernel with 97..102 SGPRs declares 102 (rounding to 104 made the assembler reject it)
     let te = &crate::target::T.emit;
     let sgpr = round_up(a.max_s, te.sgpr_granule).max(te.sgpr_min).min(te.sgpr_cap);
+    // exact mode: the counts the author's registers use (the hardware granules encode them identically)
+    let (vgpr, sgpr) = if m.exact && agprs == 0 { (a.max_v.max(1), a.max_s.max(1)) } else { (vgpr, sgpr) };
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
     // it to be 64-byte aligned; without this the fields are read shifted and
@@ -83,9 +85,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str(&format!("    .amdhsa_next_free_vgpr {}\n", vgpr));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {}\n", sgpr));
     out.push_str(&format!("    .amdhsa_accum_offset {}\n", accum_offset));
-    out.push_str("    .amdhsa_float_denorm_mode_32 3\n");
-    out.push_str("    .amdhsa_float_denorm_mode_16_64 3\n");
-    out.push_str("    .amdhsa_ieee_mode 0\n");
+    let (d32, d64, ieee) = m.fp_mode.unwrap_or((3, 3, false));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {d32}\n"));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {d64}\n"));
+    out.push_str(&format!("    .amdhsa_ieee_mode {}\n", ieee as u8));
     out.push_str(".end_amdhsa_kernel\n");
 
     out.push_str("\n.amdgpu_metadata\n---\namdhsa.kernels:\n");

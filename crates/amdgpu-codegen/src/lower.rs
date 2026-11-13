@@ -136,6 +136,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                     _ => None,
                 })
                 .collect();
+            lw.exact_pinned = pinned.clone();
             let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
             let stmts = f.stmts();
             for (k, st) in stmts.iter().enumerate() {
@@ -510,6 +511,8 @@ struct Lowerer {
     scc_i1: HashSet<ValueId>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
+    /// exact mode: the values the author pinned
+    exact_pinned: HashSet<ValueId>,
     /// exact mode: unpinned `AddI32` values read only by `set_m0` (lowered there as `s_add_u32 m0, a, b`)
     m0_adds: HashSet<ValueId>,
     /// exact mode: compares read only by a `NotI1` held in the same lane-mask register (the author's negated compare, e.g. v_cmp_nge)
@@ -595,6 +598,8 @@ impl Lowerer {
             kernarg_size: f.kernarg_size,
             workgroup_size: f.workgroup_size,
             lds_bytes: f.lds_bytes,
+            fp_mode: f.fp_mode,
+            exact: f.exact,
             blocks: Vec::new(),
             vregs: Vec::new(),
             loops: Vec::new(),
@@ -669,6 +674,7 @@ impl Lowerer {
             scc_i1: HashSet::new(),
             m0_adds: HashSet::new(),
             e64_next: false,
+            exact_pinned: HashSet::new(),
             neg_folded: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
@@ -1755,6 +1761,11 @@ impl Lowerer {
         let mut off: i64 = 0;
         loop {
             if let Opnd::Val(v) = cur {
+                if self.exact && self.exact_pinned.contains(&v) {
+                    let r = self.as_v1(cur)?;
+                    self.touch(&[Src::Reg(r)]);
+                    return Ok((r, off));
+                }
                 if let Some(&(t, k)) = self.lazy.get(&v) {
                     if  (0..65536).contains(&(off + k)) {
                         self.touch(&[Src::Reg(t)]);
@@ -1857,6 +1868,10 @@ impl Lowerer {
         let mut k = 0i64;
         loop {
             if let Opnd::Val(v) = cur {
+                // exact mode: a value the author pinned is in its register (not folded into the user's offset)
+                if self.exact && self.exact_pinned.contains(&v) {
+                    return (cur, k);
+                }
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v) {
                     if let Some(c) = self.const_of(*y) {
                         k += c;
@@ -3249,7 +3264,8 @@ impl Lowerer {
                 let r = self.val[a];
                 self.val.insert(dst, r);
             }
-            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
+            // (exact mode: an add the author pinned is the author's instruction, even `x + 0`; unpinned address adds still fold into offsets)
+            Op::AddI32(a, b) if opt_on("addrfold") && !(self.exact && self.exact_pinned.contains(&dst)) && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,
