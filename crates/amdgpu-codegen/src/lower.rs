@@ -205,7 +205,8 @@ fn exact_dce(m: &mut MFunction) {
             let canon = |r: VReg| alias.get(&r).map(|x| x.0).unwrap_or(r);
             b.insts.retain(|i| {
                 let Some(d) = i.dst else { return true };
-                let removable = crate::op_attrs::attrs(i.op).dce != crate::op_attrs::Dce::Keep;
+                // pure ALU only: a load is the author's (issued even when its value is dead, e.g. a prefetch in a drain block)
+                let removable = crate::op_attrs::attrs(i.op).dce == crate::op_attrs::Dce::Pure;
                 !(removable && !pinned.contains(&d) && !pinned.contains(&canon(d)) && !used.contains(&canon(d)))
             });
             changed |= b.insts.len() != before;

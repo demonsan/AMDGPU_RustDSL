@@ -340,3 +340,48 @@ fn descriptor_words_are_recognised_by_the_verifier() {
     assert!(errs(&build(0x0002_0000, 0x10, false)).iter().any(|e| e.contains("stride")));
     assert!(errs(&build(0x0002_0000, 0, true)).iter().any(|e| e.contains("word 1")));
 }
+
+/// Waits on the PHYSICAL registers: two loads into the parts of a tuple assembled in place (pinned so the copies vanish), read as the
+/// tuple without a wait, is a waits violation (the value-level scoreboard lost the load -> tuple link once the copies vanished); with the
+/// author's wait it compiles. And an unused load stays (exact mode: no dead-load elimination).
+#[test]
+fn a_load_read_through_a_vanished_copy_needs_its_wait() {
+    let build = |wait: bool, dead_load: bool| {
+        let mut b = FnBuilder::new("probe_exact_phys_wait", 64);
+        b.arg("o", DType::Ptr, 0x00, 8);
+        b.arg_tensor("o", Ext::c(64 * 16));
+        b.exact();
+        let po = b.let_(Op::KernargPtr { offset: 0x00 });
+        let tid = b.let_(Op::WorkitemId);
+        b.wait_lds(0);
+        let rs = b.buffer_rsrc_sized(po, 64 * 16);
+        let off = b.bind_i32(ev(tid) << 3);
+        let ld = |b: &mut FnBuilder, imm: u32| b.let_(Op::BufferLoadN { rsrc: Opnd::Val(rs), voff: Some(Opnd::Val(off)), soff: Opnd::I32(0), imm, ty: amdgpu_dsl::MemTy::B32, cache: amdgpu_dsl::CachePolicy::NONE });
+        let p0 = ld(&mut b, 0);
+        let p1 = ld(&mut b, 4);
+        let cat = b.let_(Op::FragCat { parts: vec![Opnd::Val(p0), Opnd::Val(p1)], dwords: 2 });
+        let dead = if dead_load { Some(ld(&mut b, 8)) } else { None };
+        if wait {
+            b.wait_vm(if dead_load { 1 } else { 0 });
+        }
+        b.buffer_store_b64(rs, off, Opnd::I32(0), 512, cat);
+        b.wait_vm(0);
+        b.pin_sgpr_at(RegRef::Val(po), 8);
+        b.pin_sgpr_at(RegRef::Val(rs), 12);
+        b.pin_vgpr_at(RegRef::Val(tid), 0);
+        b.pin_vgpr_at(RegRef::Val(off), 1);
+        b.pin_vgpr_at(RegRef::Val(p0), 4);
+        b.pin_vgpr_at(RegRef::Val(p1), 5);
+        b.pin_vgpr_at(RegRef::Val(cat), 4);
+        if let Some(d) = dead {
+            b.pin_vgpr_at(RegRef::Val(d), 6);
+        }
+        b.finish()
+    };
+    let e = amdgpu_codegen::compile(&build(false, false)).err().expect("the missing wait must be a violation");
+    assert!(e.contains("[waits]"), "{e}");
+    let c = amdgpu_codegen::compile(&build(true, false)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!c.asm.contains("v_mov_b32"), "the tuple copies vanish: {}", c.asm);
+    let c = amdgpu_codegen::compile(&build(true, true)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(c.asm.matches("buffer_load_dword ").count(), 3, "the unused load stays: {}", c.asm);
+}
