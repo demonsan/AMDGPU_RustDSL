@@ -4254,8 +4254,12 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::BitcastF32(a) | Op::BitcastI32(a) => {
-                // Pure register reinterpretation: no instruction.
-                let r = self.as_v1(*a)?;
+                // Pure register reinterpretation: no instruction (an SGPR word stays in its SGPR when the value is uniform: exact mode)
+                let r = match (self.uniform.contains(&dst), *a) {
+                    (true, Opnd::Val(x)) if self.val.get(&x).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => self.val[&x],
+                    (true, Opnd::Var(x)) if self.vars.get(x.0 as usize).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => self.vars[x.0 as usize],
+                    _ => self.as_v1(*a)?,
+                };
                 self.val.insert(dst, r);
             }
         }
@@ -4821,6 +4825,8 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::PtrLo(p) | Op::PtrHi(p) => is_u(p, &u, &uvars),
                         Op::PtrCat { lo, hi } => is_u(lo, &u, &uvars) && is_u(hi, &u, &uvars),
                         Op::RsrcCat { words } => words.iter().all(|w| is_u(w, &u, &uvars)),
+                        // exact mode: a zero-instruction reinterpretation of a uniform (PinS'd) word stays uniform (and in its SGPR)
+                        Op::BitcastF32(a) | Op::BitcastI32(a) if f.exact => is_u(a, &u, &uvars),
                         // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
                         Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
                             Opnd::I32(k) => *k >= 6,
