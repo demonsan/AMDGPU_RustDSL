@@ -29,7 +29,7 @@ def body():
     o = ["s_load_dwordx2 s[8:9], s[0:1], 0", "s_load_dwordx2 s[4:5], s[0:1], 8",
          "v_lshrrev_b32 v10, 6, v0", "v_readfirstlane_b32 s12, v10",             # wave id
          "v_and_b32 v11, 63, v0", "v_lshlrev_b32 v12, 2, v11",                 # lane * 4
-         "s_lshl_b32 s13, s12, 13",                                            # wave base: 8 KiB per wave
+         "s_lshl_b32 s13, s12, 12", "s_add_u32 s13, s13, 32768",                  # wave base: 32 KiB + 4 KiB per wave
          "v_lshlrev_b32 v7, 2, v0",
          "s_waitcnt lgkmcnt(0)",
          "s_and_b32 s9, s9, 0xffff", f"s_mov_b32 s10, {IN_DWORDS * 4}", "s_mov_b32 s11, 0x20000",
@@ -41,11 +41,11 @@ def body():
         o.append("v_add_u32 v14, s13, v12")
         for k in range(d):
             o.append(f"ds_write_b32 v14, v13 offset:{k * 256}")
-            o.append(f"ds_write_b32 v14, v13 offset:{4096 + k * 256}")
+            o.append(f"ds_write_b32 v14, v13 offset:{2048 + k * 256}")
         o.append("s_waitcnt lgkmcnt(0)")
         o.append("s_mov_b32 m0, s13")                    # stale M0 = A
         o += ["s_nop 7"] * 3
-        o.append("s_add_u32 m0, s13, 4096")              # fresh M0 = B (the vendor's form)
+        o.append("s_add_u32 m0, s13, 2048")              # fresh M0 = B (the vendor's form)
         if n:
             o.append(f"s_nop {n - 1}")
         # source: dwords [t*256 + lane*d ..] (voffset = lane*4*d + t*1024)
@@ -56,7 +56,7 @@ def body():
         # read back the first dword each lane wrote into B: B + lane*4*d
         o.append(f"v_lshlrev_b32 v16, {2 + (d == 4) * 2}, v11")
         o.append("v_add_u32 v16, s13, v16")
-        o.append("ds_read_b32 v3, v16 offset:4096")
+        o.append("ds_read_b32 v3, v16 offset:2048")
         o.append("s_waitcnt lgkmcnt(0)")
         o.append(f"v_add_u32 v6, {t * THREADS * 4}, v7")
         o.append("global_store_dword v6, v3, s[4:5]")
