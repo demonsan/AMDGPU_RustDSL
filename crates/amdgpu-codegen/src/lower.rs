@@ -1339,6 +1339,12 @@ impl Lowerer {
     }
 
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
+    /// Is `base` a `PtrAdd { SGPR-pair pointer, offset }` (the SADDR form's address)?
+    fn saddr_base(&self, base: Opnd) -> bool {
+        let Opnd::Val(v) = base else { return false };
+        let Some(Op::PtrAdd { base: Opnd::Val(pv), .. }) = self.defs.get(&v) else { return false };
+        self.val.get(pv).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S2)
+    }
     fn saddr_parts_force(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
         self.saddr_parts_impl(base)
     }
@@ -3451,6 +3457,15 @@ impl Lowerer {
                 self.push(inst);
                 self.val.insert(dst, d);
             }
+            Op::LoadGlobalN { base, byte_off, ty, cache } if self.exact && self.saddr_base(*base) => {
+                // the SADDR form: `global_load_* vD, vOff, s[b:b+1] offset:k` (no 64-bit add)
+                let (cls, mop) = global_load_mop(*ty);
+                let (s, off) = self.saddr_parts_impl(*base)?.ok_or("saddr")?;
+                let d = self.new_vreg(cls);
+                self.push(MInst::new(mop).def(d).srcreg(off).srcreg(s).imm(*byte_off as i64).cpol(cache.bits()));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::LoadGlobalN { base, byte_off, ty, cache } => {
                 let (cls, mop) = global_load_mop(*ty);
                 let d = self.new_vreg(cls);
@@ -3794,6 +3809,12 @@ impl Lowerer {
             }
             Op::Exp2F32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
             Op::Log2F32(a) => self.un_v1(dst, MOp::VLogF32, *a)?,
+            Op::CvtPkBf16F32(a, b) if self.exact => {
+                let (sa, sb) = self.exact_srcs(*a, *b)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCvtPkBf16F32).def(d).src(sa).src(sb));
+                self.val.insert(dst, d);
+            }
             Op::CvtPkBf16F32(a, b) => {
                 let ra = self.as_v1(*a)?;
                 let rb = self.as_v1(*b)?;
@@ -3878,6 +3899,8 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SAddcU32).def(dhi).srcreg(bhi).src(Src::Imm(0)));
                 self.val.insert(dst, d);
             }
+            // exact mode: a per-lane address over an SGPR-pair pointer is formed by its loads (the SADDR form), not here
+            Op::PtrAdd { base: Opnd::Val(b), .. } if self.exact && self.val.get(b).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S2) => {}
             Op::PtrAdd { base, byte_off } => {
                 let rb = self.as_v2(*base)?;
                 let ro = self.as_v1(*byte_off)?;

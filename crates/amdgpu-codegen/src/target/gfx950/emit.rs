@@ -221,6 +221,18 @@ fn src1_s(a: &Alloc, s: Src) -> String {
     }
 }
 
+/// The address of a global access: `v[..], off` (64-bit VGPR address), or the SADDR form `vOff, s[b:b+1]` when source 1 is an SGPR pair
+/// (exact mode: the vendor's scalar-base addressing).
+fn gaddr(a: &Alloc, inst: &MInst) -> String {
+    if let (Some(Src::Reg(v)), Some(Src::Reg(s))) = (inst.srcs.first(), inst.srcs.get(1)) {
+        if a.scalar.get(*s as usize).copied().unwrap_or(false) {
+            let o = if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) };
+            return format!("{}, {}{o}", vr(a, *v), spair(a, *s));
+        }
+    }
+    mem_op(a, inst.srcs[0], inst.imm)
+}
+
 fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
     let p = match base {
         Src::Reg(r) => pair(a, r),
@@ -819,17 +831,17 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, c_reg, 4)
             )]
         }
-        MOp::GlobalLoadU8 => vec![format!("global_load_ubyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadI8 => vec![format!("global_load_sbyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadI16 => vec![format!("global_load_sshort {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadB64 => vec![format!("global_load_dwordx2 {}, {}", tuple(a, inst.dst.expect("dst"), 2), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadB96 => vec![format!("global_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16U8 => vec![format!("global_load_ubyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16U8Hi => vec![format!("global_load_ubyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16I8 => vec![format!("global_load_sbyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16I8Hi => vec![format!("global_load_sbyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16B16 => vec![format!("global_load_short_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadD16B16Hi => vec![format!("global_load_short_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadU8 => vec![format!("global_load_ubyte {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadI8 => vec![format!("global_load_sbyte {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadI16 => vec![format!("global_load_sshort {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadB64 => vec![format!("global_load_dwordx2 {}, {}", tuple(a, inst.dst.expect("dst"), 2), gaddr(a, inst))],
+        MOp::GlobalLoadB96 => vec![format!("global_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), gaddr(a, inst))],
+        MOp::GlobalLoadD16U8 => vec![format!("global_load_ubyte_d16 {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadD16U8Hi => vec![format!("global_load_ubyte_d16_hi {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadD16I8 => vec![format!("global_load_sbyte_d16 {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadD16I8Hi => vec![format!("global_load_sbyte_d16_hi {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadD16B16 => vec![format!("global_load_short_d16 {}, {}", d(a), gaddr(a, inst))],
+        MOp::GlobalLoadD16B16Hi => vec![format!("global_load_short_d16_hi {}, {}", d(a), gaddr(a, inst))],
         MOp::GlobalStoreB8 => vec![format!("global_store_byte {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
         MOp::GlobalStoreB8Hi => vec![format!("global_store_byte_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
         MOp::GlobalStoreB16Hi => vec![format!("global_store_short_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
@@ -872,17 +884,17 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::GlobalLoadU16 => vec![format!(
             "global_load_ushort {}, {}",
             d(a),
-            mem_op(a, inst.srcs[0], inst.imm)
+            gaddr(a, inst)
         )],
         MOp::GlobalLoadF32 => vec![format!(
             "global_load_dword {}, {}",
             d(a),
-            mem_op(a, inst.srcs[0], inst.imm)
+            gaddr(a, inst)
         )],
         MOp::GlobalLoadB128 => vec![format!(
             "global_load_dwordx4 {}, {}",
             tuple(a, inst.dst.expect("dst"), 4),
-            mem_op(a, inst.srcs[0], inst.imm)
+            gaddr(a, inst)
         )],
         MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 => {
             let (mn, dst) = match inst.op {
@@ -942,7 +954,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
             let m0 = sr(a, reg_of(&inst.srcs[1]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128 { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
-            let load = format!("{mn} {}", mem_op(a, inst.srcs[0], inst.imm));
+            let load = format!("{mn} {}", gaddr(a, inst));
             if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::GlobalStoreU16 => vec![format!(
@@ -957,7 +969,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             vr(a, reg_of(&inst.srcs[1])),
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
-        MOp::GlobalLoadF32Sc1 => vec![format!("global_load_dword {}, {} sc1", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadF32Sc1 => vec![format!("global_load_dword {}, {} sc1", d(a), gaddr(a, inst))],
         MOp::GlobalStoreF32Sc1 => vec![format!(
             "global_store_dword {}, {}, off{} sc1",
             pair(a, reg_of(&inst.srcs[0])),
