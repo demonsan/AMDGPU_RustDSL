@@ -37,6 +37,8 @@ pub enum Fence {
     WaitLgkm(i64),
     /// Explicit `s_waitcnt vmcnt(n)`.
     WaitVm(i64),
+    /// Explicit combined `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)`.
+    WaitBoth(i64, i64),
     Nop,
 }
 
@@ -80,6 +82,7 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         FenceAttr::Nop => Fence::Nop,
         FenceAttr::WaitVm => Fence::WaitVm(inst.imm),
         FenceAttr::WaitLgkm => Fence::WaitLgkm(inst.imm),
+        FenceAttr::WaitBoth => Fence::WaitBoth(inst.imm & 0xff, inst.imm >> 8),
         FenceAttr::Barrier => Fence::Barrier,
         FenceAttr::SetPrio => Fence::SetPrio,
     };

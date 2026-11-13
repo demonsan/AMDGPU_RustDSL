@@ -1091,6 +1091,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         )],
         MOp::SNop => vec![format!("s_nop {}", inst.imm)],
         MOp::SWaitVm => vec![format!("s_waitcnt vmcnt({})", inst.imm)],
+        MOp::SWaitCnt => vec![format!("s_waitcnt vmcnt({}) lgkmcnt({})", inst.imm & 0xff, inst.imm >> 8)],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
         MOp::LdsWriteB32 => vec![format!(
             "ds_write_b32 {}, {}{}",

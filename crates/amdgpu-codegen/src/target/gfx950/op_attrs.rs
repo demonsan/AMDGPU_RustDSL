@@ -23,6 +23,8 @@ pub enum FenceAttr {
     WaitVm,
     /// `s_waitcnt lgkmcnt(imm)`
     WaitLgkm,
+    /// `s_waitcnt vmcnt(imm & 0xff) lgkmcnt(imm >> 8)`
+    WaitBoth,
     Barrier,
     SetPrio,
 }
@@ -689,6 +691,7 @@ pub const ALL: &[MOp] = &[
     MOp::SNop,
     MOp::SWaitVm,
     MOp::SWaitLgkm,
+    MOp::SWaitCnt,
     MOp::SEndpgm,
 ];
 
@@ -1167,6 +1170,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SNop => a("s_nop", ctrl).fence_only(F::Nop),
         SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
+        SWaitCnt => a("s_waitcnt", ctrl).fence_only(F::WaitBoth).backend(Backend::OwnOnly),
         SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),
     }
 }

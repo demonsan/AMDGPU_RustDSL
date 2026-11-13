@@ -1308,6 +1308,8 @@ pub enum Stmt {
     SetM0 { value: Opnd },
     /// Exact mode: `s_mov_b64 s[sgpr:sgpr+1], exec` (the author saves the full EXEC mask; EXEC stays full in an exact kernel).
     ExecSave { sgpr: u32 },
+    /// Exact mode: `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)` (the combined form).
+    WaitCnt { vm: u8, lgkm: u8 },
     /// Exact mode: `s_mov_b64 exec, -1`.
     ExecAll,
     /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]` (restores a mask saved by `ExecSave` of the same pair, unchanged in between).
@@ -2270,6 +2272,11 @@ impl FnBuilder {
     #[track_caller]
     pub fn exec_save(&mut self, sgpr: u32) {
         self.push_stmt(Stmt::ExecSave { sgpr });
+    }
+    /// Exact mode: the combined `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)`.
+    #[track_caller]
+    pub fn waitcnt(&mut self, vm: u8, lgkm: u8) {
+        self.push_stmt(Stmt::WaitCnt { vm, lgkm });
     }
     /// Exact mode: `s_mov_b64 exec, -1`.
     #[track_caller]
@@ -4342,7 +4349,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {

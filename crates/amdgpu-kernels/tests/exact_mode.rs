@@ -218,3 +218,10 @@ fn tiny_with(extra: impl Fn(&mut FnBuilder)) -> Function {
     b.pin_vgpr_at(RegRef::Val(vf), 1);
     b.finish()
 }
+
+#[test]
+fn the_combined_waitcnt_is_one_instruction() {
+    let f = tiny_with(|b| b.waitcnt(0, 0));
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_waitcnt vmcnt(0) lgkmcnt(0)"), "{}", c.asm);
+}

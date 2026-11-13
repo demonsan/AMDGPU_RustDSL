@@ -320,6 +320,11 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.wait_vm = Some(*count);
             (ResClass::Sync, vec![], false)
         }
+        Stmt::WaitCnt { vm, lgkm } => {
+            e.wait_vm = Some(*vm);
+            e.wait_lds = Some(*lgkm);
+            (ResClass::Sync, vec![], false)
+        }
         Stmt::Barrier => {
             e.barrier = true;
             (ResClass::Sync, vec![], false)
