@@ -2914,6 +2914,15 @@ impl Lowerer {
                 let r = self.const_vreg((v.to_bits() as i32) as i64);
                 self.val.insert(dst, r);
             }
+            Op::LoadScalar { base, byte_off } => {
+                let b = self.s2_of(*base).ok_or("LoadScalar: the base must be a pointer held in an SGPR pair")?;
+                self.touch(&[Src::Reg(b)]);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SLoadDwordPtr).def(d).srcreg(b).imm(*byte_off as i64));
+                self.pending_smem.push(self.mir.canon(d));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::KernargI32 { offset } | Op::KernargF32 { offset } => {
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SLoadDword).def(d).imm(*offset as i64));
@@ -4823,6 +4832,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::BufferRsrcDyn { base, num_records } => is_u(base, &u, &uvars) && is_u(num_records, &u, &uvars),
                         // (s) SGPR words of uniform pointers / descriptors
                         Op::PtrLo(p) | Op::PtrHi(p) => is_u(p, &u, &uvars),
+                        Op::LoadScalar { .. } => true,
                         Op::PtrCat { lo, hi } => is_u(lo, &u, &uvars) && is_u(hi, &u, &uvars),
                         Op::RsrcCat { words } => words.iter().all(|w| is_u(w, &u, &uvars)),
                         // exact mode: a zero-instruction reinterpretation of a uniform (PinS'd) word stays uniform (and in its SGPR)

@@ -1014,6 +1014,10 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::SLoadDword => vec![format!("s_load_dword {}, s[0:1], {}", d_s(a, inst), inst.imm)],
+        MOp::SLoadDwordPtr => {
+            let b = a.phys[reg_of(&inst.srcs[0]) as usize];
+            vec![format!("s_load_dword {}, s[{}:{}], 0x{:x}", d_s(a, inst), b, b + 1, inst.imm)]
+        }
         MOp::SLoadDwordx2 => {
             vec![format!("s_load_dwordx2 {}, s[0:1], {}", spair(a, inst.dst.unwrap()), inst.imm)]
         }
