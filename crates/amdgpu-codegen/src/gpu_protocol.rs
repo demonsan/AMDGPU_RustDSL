@@ -269,6 +269,28 @@ impl<'a> Sim<'a> {
         };
         match op {
             Op::ConstI32(c) => K(*c as i64),
+            Op::MovS { a, .. } | Op::MovV { a, .. } | Op::BitcastI32(a) => self.cv(a),
+            Op::AddK { a, k } => match self.cv(a) {
+                K(x) => K((x + *k as i64) as i32 as i64),
+                U => U,
+            },
+            Op::Cmp { pred, ty, a, b } if matches!(ty, amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32) => {
+                let u = matches!(ty, amdgpu_dsl::CmpTy::U32);
+                bin(a, b, &|x, y| {
+                    let (x, y) = if u { ((x as i32 as u32) as i64, (y as i32 as u32) as i64) } else { (x as i32 as i64, y as i32 as i64) };
+                    use amdgpu_dsl::CmpPred::*;
+                    Some(match pred {
+                        Lt => x < y,
+                        Le => x <= y,
+                        Gt => x > y,
+                        Ge => x >= y,
+                        Eq => x == y,
+                        Ne => x != y,
+                        #[allow(unreachable_patterns)]
+                        _ => return None,
+                    } as i64)
+                })
+            }
             Op::AddI32(a, b) => bin(a, b, &|x, y| Some((x + y) as i32 as i64)),
             Op::MulI32(a, b) => bin(a, b, &|x, y| Some((x * y) as i32 as i64)),
             Op::ShlI32(a, b) => bin(a, b, &|x, y| if (0..32).contains(&y) { Some(((x as i32) << y) as i64) } else { None }),
@@ -422,6 +444,13 @@ impl<'a> Sim<'a> {
                 Stmt::SetVar { var, value } => {
                     let v = self.cv(value);
                     self.vars.insert(*var, v);
+                }
+                // E5 scope variables: their initial values (an Undef init is unknown until set)
+                Stmt::DeclareVars { vars, init } => {
+                    for (v, i0) in vars.iter().zip(init.iter()) {
+                        let k = self.cv(i0);
+                        self.vars.insert(*v, k);
+                    }
                 }
                 Stmt::Barrier => {
                     self.items.push(Item::Barrier { ord: self.ord });
@@ -685,6 +714,18 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
         f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
     }
+    // a constant through authored moves (exact mode: `s_mov_b32 sN, k`)
+    fn konst_mov(f: &Function, o: &Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(c) => Some(*c as i64),
+            Opnd::Val(v) => match def(f, *v) {
+                Some(Op::ConstI32(c)) => Some(*c as i64),
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => konst_mov(f, a),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     fn walk(f: &Function, o: &Opnd, seen: &mut HashSet<(bool, u32)>) -> Result<(), String> {
         match o {
             Opnd::I32(_) => Ok(()),
@@ -702,6 +743,9 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                         walk(f, a, seen)?;
                         walk(f, b, seen)
                     }
+                    // exact-mode views / moves / the author's s_addk: the operand's function
+                    Op::MovS { a, .. } | Op::MovV { a, .. } | Op::BitcastI32(a) => walk(f, a, seen),
+                    Op::AddK { a, .. } => walk(f, a, seen),
                     Op::MulI32(a, b) => {
                         if konst(f, a).is_none() && konst(f, b).is_none() {
                             return Err("a product of two counters".to_string());
@@ -729,8 +773,13 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                     return Ok(());
                 }
                 let mut ok_update = false;
+                let mut depth = 0i32;
                 for s in f.stmts() {
                     match s {
+                        Stmt::BeginLoop { .. } if !matches!(s, Stmt::BeginLoop { vars, .. } if vars.contains(x)) => depth += 1,
+                        Stmt::EndLoop => depth -= 1,
+                        // an E5 scope variable (exact mode): set to a constant outside every loop = its initial value
+                        Stmt::SetVar { var, value } if var == x && depth == 0 && konst_mov(f, value).is_some() => {}
                         Stmt::BeginLoop { vars, init } => {
                             if let Some(k) = vars.iter().position(|y| y == x) {
                                 if konst(f, &init[k]).is_none() {
@@ -742,6 +791,8 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                             let Opnd::Val(u) = value else { return Err(format!("loop counter var{} updated by a non-expression", x.0)) };
                             let good = match def(f, *u) {
                                 Some(Op::AddI32(a, b)) | Some(Op::XorI32(a, b)) => (matches!(a, Opnd::Var(y) if y == x) && konst(f, b).is_some()) || (matches!(b, Opnd::Var(y) if y == x) && konst(f, a).is_some()),
+                                // the author's s_addk_i32 (exact mode)
+                                Some(Op::AddK { a: Opnd::Var(y), .. }) => y == x,
                                 _ => false,
                             };
                             if !good {
