@@ -4760,6 +4760,21 @@ impl Lowerer {
     }
 
     fn un_v1(&mut self, dst: ValueId, op: MOp, a: Opnd) -> Result<(), String> {
+        // exact mode: a VOP1 source may be an SGPR or a constant (the author's operand)
+        if self.exact {
+            let s = match (self.const_bits(a), self.sgpr_src(a)) {
+                (Some(k), _) => Src::Imm(k),
+                (None, Some(s)) => Src::Reg(s),
+                _ => Src::Reg(self.as_v1(a)?),
+            };
+            if let Src::Reg(r) = s {
+                self.touch(&[Src::Reg(r)]);
+            }
+            let d = self.new_vreg(RClass::V1);
+            self.push(MInst::new(op).def(d).src(s));
+            self.val.insert(dst, d);
+            return Ok(());
+        }
         let ra = self.as_v1(a)?;
         self.touch(&[Src::Reg(ra)]);
         let d = self.new_vreg(RClass::V1);
