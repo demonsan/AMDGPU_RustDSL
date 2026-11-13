@@ -1228,9 +1228,11 @@ impl<'a> An<'a> {
         if !self.cx.le(&rest_hi, &f) || imm < 0 {
             return None;
         }
+        // (U is in rows already)
         for (k, c) in ua {
-            let q = div(&c).filter(|q| q.d == 1)?;
-            *rows.entry(k).or_insert(Poly::int(0)) = rows.get(&k).cloned().unwrap_or(Poly::int(0)).add(&Poly::int(-q.n));
+            let q = c.as_const().filter(|q| q.d == 1)?;
+            let cur = rows.get(&k).cloned().unwrap_or(Poly::int(0));
+            rows.insert(k, cur.add(&Poly::int(-q.n)));
         }
         rows.retain(|_, c| !c.0.is_empty());
         Some(((rows, crow), uc, false))
