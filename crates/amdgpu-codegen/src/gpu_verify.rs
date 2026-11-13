@@ -1918,6 +1918,26 @@ impl<'a> An<'a> {
                     }
                     B::SubU32 => AV::Int(x.add(&y.scale(Q::int(-1)))),
                     B::MulU32U24 if x.nonneg(cx) && y.nonneg(cx) && hi_const(&x).map_or(false, |h| h < 1 << 24) && hi_const(&y).map_or(false, |h| h < 1 << 24) => AV::Int(x.mul(&y, cx)),
+                    // v_mul_i32_i24: exact product of two operands inside the signed 24-bit range
+                    B::MulI32I24 if {
+                        let lo_const = |i: &Itv| i.lo.iter().filter_map(|p| p.floor_const()).max();
+                        let i24 = |i: &Itv| lo_const(i).map_or(false, |l| l >= -(1 << 23)) && hi_const(i).map_or(false, |h| h < 1 << 23);
+                        i24(&x) && i24(&y)
+                    } => AV::Int(x.mul(&y, cx)),
+                    // v_mbcnt_lo / hi: the accumulator plus the count of set mask bits of 32 lanes
+                    B::MbcntLo | B::MbcntHi => AV::Int(y.add(&Itv::range(Poly::int(0), Poly::int(32)))),
+                    // or of two non-negative bounded values: below the next power of two of the larger bound
+                    B::OrB32 if x.nonneg(cx) && y.nonneg(cx) => match (hi_const(&x), hi_const(&y)) {
+                        (Some(p), Some(q)) if p.max(q) < 1 << 40 => {
+                            let m = p.max(q);
+                            let mut p2 = 1i128;
+                            while p2 <= m {
+                                p2 <<= 1;
+                            }
+                            AV::Int(Itv::range(Poly::int(0), Poly::int(p2 - 1)))
+                        }
+                        _ => AV::Int(Itv::top()),
+                    },
                     _ => AV::Int(Itv::top()),
                 }
             }
