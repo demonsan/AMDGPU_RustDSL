@@ -867,7 +867,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     let mut l = 1usize;
     // (conservatively over every finite-state counter of the kernel: a longer claimed period only lengthens the simulated horizon, and the claim is verified)
     for s in f.stmts() {
-        if let Stmt::BeginLoop { vars, .. } = s {
+        if let Stmt::BeginLoop { vars, .. } | Stmt::DeclareVars { vars, .. } = s {
             for x in vars {
                 if let Some(p) = finite_state_period(f, *x) {
                     l = lcm(l, p);
