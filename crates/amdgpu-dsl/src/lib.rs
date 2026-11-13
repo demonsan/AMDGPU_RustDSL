@@ -1348,6 +1348,9 @@ pub enum Stmt {
     WaitCnt { vm: u8, lgkm: u8 },
     /// Exact mode: `s_mov_b64 exec, -1`.
     ExecAll,
+    /// Exact mode: `s_mov_b64 exec, <mask>` with the mask the author wrote: an inline constant (-16..64, sign-extended to 64 bits) or a
+    /// 32-bit literal (zero-extended: 0xffffffff = lanes 0-31). Other masks are not encodable (an IR error).
+    ExecSet { mask: u64 },
     /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]` (restores a mask saved by `ExecSave` of the same pair, unchanged in between).
     ExecRestore { sgpr: u32 },
     /// Exact mode, NON-DISPATCHED kernels only: the next statement's instruction may read a load result the lgkm / vm counter does not
@@ -2350,6 +2353,11 @@ impl FnBuilder {
     #[track_caller]
     pub fn exec_all(&mut self) {
         self.push_stmt(Stmt::ExecAll);
+    }
+    /// Exact mode: `s_mov_b64 exec, <mask>` (see `Stmt::ExecSet`).
+    #[track_caller]
+    pub fn exec_set(&mut self, mask: u64) {
+        self.push_stmt(Stmt::ExecSet { mask });
     }
     /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]`.
     #[track_caller]
@@ -4431,7 +4439,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {

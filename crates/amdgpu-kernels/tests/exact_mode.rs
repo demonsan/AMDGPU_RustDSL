@@ -386,3 +386,24 @@ fn a_load_read_through_a_vanished_copy_needs_its_wait() {
     let c = amdgpu_codegen::compile(&build(true, true)).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(c.asm.matches("buffer_load_dword ").count(), 3, "the unused load stays: {}", c.asm);
 }
+
+/// `exec_set(mask)`: the author's EXEC mask - 0xffffffff is the zero-extended 32-bit literal (lanes 0-31: the vendor's half-wave DMA), -1
+/// the inline all-lanes form; a mask that is neither encoding is an error.
+#[test]
+fn exec_set_keeps_the_authors_mask() {
+    let build = |mask: u64| {
+        let mut f = tiny_with(|b| {
+            b.exec_save(20);
+            b.exec_set(mask);
+            b.exec_restore(20);
+        });
+        f.exact = true;
+        f
+    };
+    let c = amdgpu_codegen::compile(&build(0xffff_ffff)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_mov_b64 exec, 0xffffffff"), "{}", c.asm);
+    let c = amdgpu_codegen::compile(&build(u64::MAX)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_mov_b64 exec, -1"), "{}", c.asm);
+    let e = amdgpu_codegen::compile(&build(0x1_0000_0001)).err().expect("not encodable");
+    assert!(e.contains("not encodable"), "{e}");
+}

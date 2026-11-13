@@ -567,6 +567,8 @@ pub enum MOp {
     SWaitCnt,
     /// exact mode: `s_mov_b64 exec, -1`
     SExecAll,
+    /// `s_mov_b64 exec, <mask>` (imm = the 64-bit mask; an inline constant or a zero-extended 32-bit literal)
+    SExecSet,
     /// exact mode: `s_mov_b64 exec, s[imm:imm+1]`
     SRestoreExec,
     /// `s_add_u32 m0, s0, s1`: the M0 write with the LDS base's add folded in (clobbers SCC)
