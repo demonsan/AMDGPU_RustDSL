@@ -12,11 +12,12 @@ fn tiny(wait: bool, pin_off: Option<u32>) -> Function {
     b.lower_opts(&["imm", "sgpr"]);
     let po = b.let_(Op::KernargPtr { offset: 0x00 });
     let tid = b.let_(Op::WorkitemId);
-    let rs = b.buffer_rsrc_sized(po, 64 * 4);
-    let off = b.bind_i32(ev(tid) << 2);
+    // the descriptor reads the kernarg pointer: the author waits for the scalar load first
     if wait {
         b.wait_lds(0);
     }
+    let rs = b.buffer_rsrc_sized(po, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
     b.buffer_store_f32(rs, off, Opnd::I32(0), 0, tid);
     b.pin_sgpr_at(RegRef::Val(po), 8);
     b.pin_sgpr_at(RegRef::Val(rs), 12);
