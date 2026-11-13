@@ -516,8 +516,8 @@ Lifter options that turn the input's facts into IR facts:
 | VGPR / SGPR, LDS, FP mode | 246 / 99, 84 224 B, denorm32 flush / IEEE | identical |
 | Kernel descriptor | — | identical except the `kernarg_size` field (656 vs 0; no effect, checked) |
 | Output vs the vendor | — | bit-identical (worst diff 0) on all outputs at B1 S2048, B4 S2048, B1 S8192, B8 S4096, B2 S16384 |
-| Same-run time vs the vendor (median of 9) | 1 | B4 S2048 1.003, B1 S8192 0.997, B8 S4096 1.001 |
-| gpu_verify | — | 0 unproven: LDS 1 167, buffer 97, global 3, barrier-balanced ifs 6 |
+| Same-run time vs the vendor (median of 9) | 1 | B4 S2048 1.003, B1 S8192 1.002, B8 S4096 1.001 |
+| gpu_verify | — | 0 unproven, bounds AND races: LDS 1 167 accesses in tiles, 120 880 LDS read events checked against their producers (period-3 ring verified), 18 / 18 global writes disjoint across workgroups, buffer 97, barrier-balanced ifs 6 |
 
 ### 6.3 Every remaining difference, with its reason
 
@@ -533,10 +533,15 @@ The deviations cost nothing measurable: the timing above includes them. The vend
 
 ### 6.4 What is trusted
 
-The certificate has 1 trusted assume and 30 trusted contracts:
+The certificate has 1 trusted assume and 31 trusted contracts:
 - **Assume:** the workgroup map `(query tile, head)` is a bijection of the workgroup `(x, y)`. The vendor computes it with an 8-step restoring division; it is the same fact our replica states.
-- **Contracts:** the argument-level host contract of our replica (7 extents, 9 kernarg ranges, 2 grid definitions, 11 kernarg identities), plus one size bound: heads ≤ 65 536 · 16. The vendor addresses the descale tensors with `v_mul_i32_i24`, which is exact only while 4 · heads < 2^23.
-- **Not proven:** race freedom. The report lists the accesses as bounds-checked, not race-checked (1 167 LDS, 18 global writes), because the lift carries no tile-protocol facts.
+- **Contracts:**
+  - the argument-level host contract of our replica (7 extents, 9 kernarg ranges, 2 grid definitions, 11 kernarg identities);
+  - a size bound, heads ≤ 2 047 · 16: the vendor addresses the descale tensors and the output rows with `v_mul_i32_i24`, which is exact only while the multiplied stride stays below 2^23;
+  - the LSE layout identity: head stride = 4 · S (fp32 [B][H][S]).
+- **Race freedom is proven, not trusted.** The lifter is given a runtime tile plan (`--tile-plan`, not committed; counts only here): 3 tiles, 8 DMA rules and 11 read rules with slot / version expressions over the vendor's loop key and its proven 3-slot ring counter. From that plan it marks every DMA and every LDS read. The protocol simulator then checks every read against its producers across the two wave roles, every path and the loop exits.
+  - Exact-mode additions this needed: counted `lgkmcnt(n)` retire reads, since the author's order is final; E5 exit bodies run once per path.
+  - The 18 global writes are proven disjoint across workgroups. The tail rows of the last q tile are clipped by each descriptor's num_records (output: min(S − 256·q, 256) rows; LSE: S rows).
 
 ### 6.5 What the replica found
 
