@@ -10,6 +10,8 @@
 //! `attrs_of` is an exhaustive `match` (no wildcard): a new `MOp` does not compile until it has a row. Identity checks for one
 //! specific instruction (`op == MOp::SNop`, the builders in `lower.rs`) are not classes and stay where they are.
 
+/// Wait states between a VALU lane-mask write and its v_cndmask reader (target row `valu-sgpr-mask`).
+const MASK_WAIT: usize = crate::target::T.hazard("valu-sgpr-mask").n() as usize;
 use crate::mir::MOp;
 use crate::sched::effects::Space;
 use crate::sched::model::{c, co, Grade, OpCost, Pipe};
@@ -893,7 +895,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VCmpLtI32 => a("v_cmp_lt_i32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpGeI32 => a("v_cmp_ge_i32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpGtI32 => a("v_cmp_gt_i32", valu).vcc(false, true).def_vcc().dce(Pure),
-        VCmpMaskLtI32 => a("v_cmp_lt_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
+        // a lane mask written into an SGPR pair: its v_cndmask reader waits the `valu-sgpr-mask` row (tools/lanemask_hazard_probe.sh)
+        VCmpMaskLtI32 => a("v_cmp_lt_i32_e64", valu).wdelay(MASK_WAIT).backend(Backend::NoRow),
         VCndmaskM => a("v_cndmask_b32_e64", valu).hz_reader().backend(Backend::NoRow),
         VCmpNeI32 => a("v_cmp_ne_u32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpLtF32 => a("v_cmp_lt_f32", valu).vcc(false, true).def_vcc().dce(Pure),
@@ -1164,7 +1167,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SAddkI32 => a("s_addk_i32", salu).scc(false, true).dce(Pure).backend(Backend::OwnOnly),
         SCmpLtI32 => a("s_cmp_lt_i32", salu).scc(false, true),
         SCmpG => a("s_cmp", salu).scc(false, true).backend(Backend::OwnOnly),
-        VCmpMaskG => a("v_cmp", valu).wdelay(2).backend(Backend::OwnOnly),
+        VCmpMaskG => a("v_cmp", valu).wdelay(MASK_WAIT).backend(Backend::OwnOnly),
         SCmpEqU32 => a("s_cmp_eq_u32", salu).scc(false, true),
         SCmpGeU32 => a("s_cmp_ge_u32", salu).scc(false, true),
         SCmpLeU32 => a("s_cmp_le_u32", salu).scc(false, true),

@@ -1025,6 +1025,8 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     }
     const VMEM_WAIT: usize = crate::target::T.hazard("valu-sgpr-vmem").n() as usize;
     const VALU_WAIT: usize = crate::target::T.hazard("valu-sgpr-valu").n() as usize;
+    // a lane-mask read (the v_cndmask mask operand) of a VALU-written SGPR pair: target row `valu-sgpr-mask`
+    const MASK_WAIT: usize = crate::target::T.hazard("valu-sgpr-mask").n() as usize;
     let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;
     let is_valu = |op: MOp| matches!(pipe(op), Pipe::Valu | Pipe::Trans | Pipe::Mfma);
     let srange = |m: &MFunction, r: VReg| -> Option<(u32, u32)> {
@@ -1090,12 +1092,13 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
             let need_win = if p == Pipe::Vmem { VMEM_WAIT } else if is_valu(inst.op) { VALU_WAIT } else { 0 };
             if need_win > 0 {
                 let mut need = 0usize;
-                for s in &inst.srcs {
+                for (k, s) in inst.srcs.iter().enumerate() {
+                    let win = if inst.op == MOp::VCndmaskM && k == 2 { MASK_WAIT } else { need_win };
                     if let Src::Reg(r) = s {
                         if let Some((lo, hi)) = srange(m, *r) {
                             for w in &pend {
-                                if w.0 < hi && lo < w.1 && w.2 < need_win {
-                                    need = need.max(need_win - w.2);
+                                if w.0 < hi && lo < w.1 && w.2 < win {
+                                    need = need.max(win - w.2);
                                 }
                             }
                         }

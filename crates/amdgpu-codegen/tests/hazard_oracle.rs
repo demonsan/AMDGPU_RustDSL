@@ -247,6 +247,12 @@ fn allowance(producer: &str, consumer: &str) -> (u32, Vec<&'static str>) {
         slack += 2;
         why.push(vcc_why);
     }
+    // VALU lane-mask write (VOP3 compare into an SGPR pair) -> v_cndmask_b32_e64 reading it as the mask (LLVM VALUWriteSGPRVALURead: 2; our
+    // target row `valu-sgpr-mask`: 1) - tools/lanemask_hazard_probe.sh: correct at 0 / 1 / 2 wait states, 512 threads, 5 runs
+    if (p == "VCmpMaskLtI32" || p == "VCmpMaskG") && c == "VCndmaskM" {
+        slack += 1;
+        why.push("VALU lane-mask write -> v_cndmask mask read: 1 wait state suffices on gfx950 (tools/lanemask_hazard_probe.sh); LLVM asks 2");
+    }
     // VOP3P producers: the pinned LLVM reads the packed instruction's op_sel_hi bit as the VOP3 destination op_sel (SISrcMods::DST_OP_SEL is the same
     // bit) and inserts the dst-sel forwarding nop; upstream GCNHazardRecognizer::getDstSelForwardingOperand excludes VOP3P ("VOP3P uses this bit for
     // source op_sel_hi"). A packed instruction writes the whole dword.
