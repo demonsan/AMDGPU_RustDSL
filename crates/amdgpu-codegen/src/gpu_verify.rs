@@ -1564,6 +1564,11 @@ impl<'a> An<'a> {
     }
 
     fn check_lds(&mut self, what: &str, addr: &Itv, size: i128) {
+        // AMDC_GV_LDS_TRACE=1: every LDS access (statement, kind, address interval, size, address shape) for deriving a lift's tile map
+        if std::env::var("AMDC_GV_LDS_TRACE").is_ok() && self.rep.quiet == 0 {
+            let sh = self.cur_addr.map(|(o, k)| format!("{} + {k}", self.shape(&o, 6))).unwrap_or_default();
+            eprintln!("LDS stmt {} | {what} | addr {} | size {size} | {sh}", self.idx, addr.show());
+        }
         if self.tag.is_none() {
             self.rep.unchecked_access("lds-untracked");
         }
@@ -3269,7 +3274,16 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
     let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
-    if std::env::var("AMDC_GV_DEBUG").is_ok() {
+    if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
+        for (v, r) in &an.rings.rings {
+            eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
+        }
+        for (v, x) in &an.rings.sym {
+            eprintln!("RING var{} start {:?} (expression; orbits enumerated at use) rule {:?}", v.0, x, an.rings.rules.get(v));
+        }
+        for (w, s) in &an.rings.shadows {
+            eprintln!("SHADOW var{} = {:?} - {} + ring var{}", w.0, s.0, s.1, s.4 .0);
+        }
         eprintln!("rings {:?}", an.rings.rings);
         eprintln!("shadows {:?}", an.rings.shadows.iter().map(|(w, s)| (w, s.1, s.2, s.3)).collect::<Vec<_>>());
     }
