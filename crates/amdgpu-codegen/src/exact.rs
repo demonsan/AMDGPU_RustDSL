@@ -594,7 +594,10 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         // a `TrustWait` waives the counter check of the next statement's instruction (and must waive something)
         let trusts = crate::lower::last_trusts();
         let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for v in verify_final(&m, &a, false) {
+        // waits and hazards on PHYSICAL registers: a value read through a vanished same-register copy (a tuple assembled from loaded parts)
+        // is the register its load wrote
+        let m_phys = physical_view(&m, &a);
+        for v in verify_final(&m_phys, &a, false) {
             let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
             if waived {
                 used.insert(v.before_stmt - 1);
@@ -621,4 +624,33 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
 
 fn name_of(m: &MFunction, r: VReg) -> String {
     m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"))
+}
+
+/// The function with every register a view of its PHYSICAL register: the scoreboard and the hazard passes key on (vreg, dword) slots, so
+/// after this rewrite two values in the same register are the same slots (what the hardware sees). One base register per 16 dwords of each
+/// file, consecutive, so a tuple crossing a 16-dword boundary still maps to consecutive slots.
+pub fn physical_view(m: &MFunction, a: &crate::regalloc::Alloc) -> MFunction {
+    let mut p = m.clone();
+    let base = p.vregs.len() as u32;
+    // files: VGPR 0..512 (32 bases), AGPR 0..256 (16), SGPR 0..256 (16)
+    for _ in 0..64 {
+        p.vregs.push(RClass::V16);
+    }
+    let n = m.vregs.len() as u32;
+    for r in 0..n {
+        let ph = match a.phys.get(r as usize) {
+            Some(&x) if x != u32::MAX => x,
+            _ => continue,
+        };
+        let scalar = a.scalar.get(r as usize).copied().unwrap_or(false);
+        let (file, idx) = if scalar {
+            (48u32, ph)
+        } else if is_agpr_phys(ph) {
+            (32, ph - AGPR_TAG)
+        } else {
+            (0, ph)
+        };
+        p.alias.insert(r, (base + file + idx / 16, (idx % 16) as u8));
+    }
+    p
 }
