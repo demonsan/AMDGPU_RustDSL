@@ -245,6 +245,9 @@ struct An<'a> {
     /// E5 scope variables (`DeclareVars`): tracked flow-sensitively (a `set_var` takes effect at once; `if` arms join; a loop that
     /// writes one runs it through its fixpoint). Absent from `vars` = not yet defined on any path (an `Undef` initial value).
     scope: std::collections::HashSet<VarId>,
+    /// E5 scope variables whose current value is one known IR value on every path here (flow-sensitive, like `vars`): the
+    /// linear-form analysis (cross-workgroup disjointness) reads through them
+    var_sym: std::cell::RefCell<HashMap<VarId, Opnd>>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
     tag: Option<(usize, Itv, Opnd)>,
@@ -638,7 +641,13 @@ impl<'a> An<'a> {
         match o {
             Opnd::I32(c) => Some((BTreeMap::new(), Poly::int(*c as i128))),
             Opnd::F32(_) => None,
-            Opnd::Var(v) => atom((true, v.0 as u64), *o),
+            Opnd::Var(v) => {
+                let s = self.var_sym.borrow().get(v).copied();
+                match s {
+                    Some(x) if depth < 24 => self.slin(&x, depth + 1),
+                    _ => atom((true, v.0 as u64), *o),
+                }
+            }
             Opnd::Val(v) => {
                 let def = self.defs.get(v);
                 if let Some(Op::ConstI32(c)) = def {
@@ -2455,7 +2464,10 @@ impl<'a> An<'a> {
                         }
                     }
                     let before = self.scope_state();
+                    let sym_before = self.var_sym.borrow().clone();
                     self.walk(then, idx);
+                    let sym_then = self.var_sym.borrow().clone();
+                    *self.var_sym.borrow_mut() = sym_before;
                     self.winner_axes.truncate(wn);
                     self.undo_fact(undo);
                     let after_then = self.scope_state();
@@ -2472,6 +2484,11 @@ impl<'a> An<'a> {
                     let after_else = self.scope_state();
                     let joined = self.join_scope(&after_then, &after_else);
                     self.set_scope_state(&joined);
+                    // a symbolic value survives the join only when both paths agree
+                    {
+                        let mut se = self.var_sym.borrow_mut();
+                        se.retain(|k, v| sym_then.get(k) == Some(v));
+                    }
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::EndIf);
                     *idx += 1;
@@ -2748,6 +2765,10 @@ impl<'a> An<'a> {
         // E5 scope variables written in the body: their entry value joined with the body's end value, to a fixpoint (widened to
         // unbounded after 5 rounds), before the reporting walk
         let sw = self.scope_written(body);
+        // a scope variable written in the loop has no single symbolic value in it or after it
+        for v in &sw {
+            self.var_sym.borrow_mut().remove(v);
+        }
         if !sw.is_empty() {
             let mut cur: Vec<Option<Itv>> = sw.iter().map(|v| self.vars.get(v).cloned()).collect();
             let mut ok = false;
@@ -2808,6 +2829,9 @@ impl<'a> An<'a> {
             }
             // the reporting walk starts from the fixpoint; after the loop the variables hold the hull
             self.walk_loop_inner(vars, init, body, begin);
+            for v in &sw {
+                self.var_sym.borrow_mut().remove(v);
+            }
             for (v, it) in sw.iter().zip(cur.iter()) {
                 let end = self.vars.get(v).cloned();
                 let j = match (it, end) {
@@ -3030,6 +3054,22 @@ impl<'a> An<'a> {
                 self.pending_sets.push((i, *var, *value));
                 // an E5 scope variable holds the value from here on (flow-sensitive; `if` joins and loop fixpoints cover the paths)
                 if self.scope.contains(var) {
+                    // the symbolic value (through authored moves)
+                    let mut r = *value;
+                    for _ in 0..8 {
+                        match r {
+                            Opnd::Val(v) => match self.defs.get(&v) {
+                                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => r = *a,
+                                _ => break,
+                            },
+                            _ => break,
+                        }
+                    }
+                    if r == Opnd::Var(*var) {
+                        // a copy of itself: unchanged
+                    } else {
+                        self.var_sym.borrow_mut().insert(*var, r);
+                    }
                     let it = self.var_part(*var, value);
                     let it = match self.assumed.get(var) {
                         Some(a) => a.clone(),
@@ -3043,10 +3083,12 @@ impl<'a> An<'a> {
                 for (v, i0) in vars.iter().zip(init.iter()) {
                     self.scope.insert(*v);
                     let undef = matches!(i0, Opnd::Val(x) if matches!(self.defs.get(x), Some(Op::Undef { .. })));
+                    self.var_sym.borrow_mut().remove(v);
                     if undef {
                         self.vars.remove(v);
                         continue;
                     }
+                    self.var_sym.borrow_mut().insert(*v, *i0);
                     let it = self.var_part(*v, i0);
                     self.var_init.insert(*v, it.clone());
                     let cur = self.assumed.get(v).cloned().unwrap_or(it);
@@ -3362,7 +3404,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
         for (v, r) in &an.rings.rings {
             eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
