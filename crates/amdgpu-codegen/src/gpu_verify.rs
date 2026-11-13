@@ -1182,8 +1182,9 @@ impl<'a> An<'a> {
             if let Some(Op::RsrcCat { words }) = self.defs.get(v).cloned() {
                 if let Some((ua, uc)) = self.upper_slin(&self.word_root(&words[2]), 0) {
                     let neg: BTreeMap<(bool, u64), Poly> = ua.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
-                    let l = slin_add(x.clone(), (neg, Poly::int(0)));
-                    self.caps_cur.borrow_mut().push((l, uc.add(&Poly::int(-imm)), false));
+                    // (the store's immediate is part of x: the per-store constants fold into the one digit)
+                    let l = slin_add(x.clone(), (neg, Poly::int(imm)));
+                    self.caps_cur.borrow_mut().push((l, uc, false));
                 }
             }
         }
