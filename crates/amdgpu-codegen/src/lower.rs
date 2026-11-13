@@ -3029,7 +3029,9 @@ impl Lowerer {
                 | Op::LoadLdsTr4B8 { .. } | Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } | Op::LoadLdsN { .. }
                 | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. }
         );
-        if pure_load && !self.read_values.contains(&dst) {
+        // (exact mode: the author's load is issued even when its value is dead, e.g. the prefetch of a drain block; the author's pins keep
+        // its registers apart and the clobber check proves it)
+        if pure_load && !self.read_values.contains(&dst) && !self.exact {
             return Ok(());
         }
         match op {
