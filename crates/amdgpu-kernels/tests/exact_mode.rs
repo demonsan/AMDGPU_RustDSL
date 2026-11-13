@@ -143,7 +143,9 @@ fn the_hardware_probe_kernel_compiles_exactly() {
     let f = exact_probe_kernel();
     let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
     assert!(c.asm.contains("v_add_u32_e32 v2, 7, v2"), "{}", c.asm);
-    if let Ok(dir) = std::env::var("EXACT_PROBE_OUT") {
+    // tools/exact_probe.sh creates build/exact and reads the kernel from there
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/exact");
+    if std::path::Path::new(dir).is_dir() {
         std::fs::write(format!("{dir}/probe_exact_hw.ir"), amdgpu_dsl::ir_text::print(&f)).unwrap();
     }
 }
