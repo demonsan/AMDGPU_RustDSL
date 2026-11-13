@@ -652,8 +652,14 @@ class Lifter:
     # SALU (uniform values; pinned to SGPRs by the exact mode)
     def h_s_add_u32(self, t, m, op):
         if t[0] == 'm0':
-            self.m0 = (self.src(t[1]), self.src(t[2]))
-            self.notes['m0 write (set_m0 in exact mode)'] += 1
+            # the author's M0 write: s_add_u32 m0, a, b = SetM0 of an unpinned add (no instruction for the add)
+            a, b = self.src(t[1], 'I32'), self.src(t[2], 'I32')
+            v = self.nv
+            self.nv += 1
+            self.lines.append(f'%v{v}: I32 = AddI32({a}, {b})')
+            self.stmt(f'SetM0 {{ value: Val({v}) }}')
+            self.m0val = f'Val({v})'
+            self.notes['m0 write -> SetM0'] += 1
             return True
         return self.bin(t, 'AddI32({a}, {b})', 'I32', 'I32')
 
@@ -666,7 +672,10 @@ class Lifter:
 
     def h_s_mov_b32(self, t, m, op):
         if t[0] == 'm0':
-            self.notes['m0 write (set_m0 in exact mode)'] += 1
+            x = self.src(t[1], 'I32')
+            self.stmt(f'SetM0 {{ value: {x} }}')
+            self.m0val = x
+            self.notes['m0 write -> SetM0'] += 1
             return True
         i = imm(t[1])
         if i is not None:
@@ -731,13 +740,8 @@ class Lifter:
         for x in m:
             if x.startswith('offset:'):
                 off = int(x.split(':')[1], 0)
-        m0 = getattr(self, 'm0', None)
-        lds = 'I32(0)'
-        if m0:
-            v = self.nv
-            self.nv += 1
-            self.lines.append(f'%v{v}: I32 = AddI32({m0[0]}, {m0[1]})')
-            lds = f'Val({v})'
+        # exact mode: the DMA uses the current M0 (SetM0); its LDS address operand (for the verifier) is the value last set
+        lds = getattr(self, 'm0val', 'I32(0)')
         self.stmt(f'BufferLoadLds {{ rsrc: {rsrc}, voff: Some({voff}), soff: {soff}, lds_addr: {lds}, imm: {off}, dwords: {dw} }}')
         return True
 
