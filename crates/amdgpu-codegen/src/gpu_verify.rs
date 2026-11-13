@@ -1399,6 +1399,9 @@ impl<'a> An<'a> {
             let (l, h) = &ranges[k];
             let m = h.sub(l);
             if !cx.nonneg(&m) {
+                if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+                    eprintln!("gw:   atom {:?}: range [{}, {}] (hi - lo not provably >= 0)", k, l.show(), h.show());
+                }
                 return Err("an atom range of unknown sign".into());
             }
             let c = if cx.nonneg(c) {
