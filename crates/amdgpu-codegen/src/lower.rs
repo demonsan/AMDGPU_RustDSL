@@ -1888,6 +1888,19 @@ impl Lowerer {
         Ok(r)
     }
 
+    /// (s) The words of an SGPR tuple `d`, one `s_mov_b32` each (an authored word: no instruction when pinned at its slot).
+    fn sgpr_words(&mut self, d: VReg, words: &[Opnd]) -> Result<(), String> {
+        for (i, w) in words.iter().enumerate() {
+            let s = self.s_operand(*w)?;
+            if let Src::Reg(x) = s {
+                self.touch(&[Src::Reg(x)]);
+            }
+            let slot = self.sub_alias(d, i as u8, RClass::S1);
+            self.push(MInst::new(MOp::SMovB32).def(slot).src(s));
+        }
+        Ok(())
+    }
+
     /// (r1) Copy of an SGPR tuple, one `s_mov_b32` per dword (none when both are the same register).
     fn copy_sreg(&mut self, dst: VReg, src: VReg) {
         if dst == src {
@@ -3566,6 +3579,25 @@ impl Lowerer {
             }
             // no instruction: only an initial value of a variable (alloc_vars skips it); any other read is an IR error
             Op::Undef { .. } => {}
+            // (s) SGPR words of a pointer: in-place views (no instruction)
+            Op::PtrLo(p) | Op::PtrHi(p) => {
+                let r = self.s_tuple(*p, RClass::S2)?;
+                let k = if matches!(op, Op::PtrHi(_)) { 1 } else { 0 };
+                let d = self.sub_alias(r, k, RClass::S1);
+                self.val.insert(dst, d);
+            }
+            // (s) a pointer / descriptor assembled from SGPR words: one s_mov per word, none when the author pinned the words at the
+            // tuple's registers (exact mode)
+            Op::PtrCat { lo, hi } => {
+                let d = self.new_vreg(RClass::S2);
+                self.sgpr_words(d, &[*lo, *hi])?;
+                self.val.insert(dst, d);
+            }
+            Op::RsrcCat { words } => {
+                let d = self.new_vreg(RClass::S4);
+                self.sgpr_words(d, words)?;
+                self.val.insert(dst, d);
+            }
             Op::MovS { a, .. } => {
                 let s = self.s_operand(*a)?;
                 if let Src::Reg(r) = s {
@@ -4785,6 +4817,10 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::PtrAdd { base, byte_off } => is_u(base, &u, &uvars) && is_u(byte_off, &u, &uvars),
                         Op::BufferRsrc { base, .. } => is_u(base, &u, &uvars),
                         Op::BufferRsrcDyn { base, num_records } => is_u(base, &u, &uvars) && is_u(num_records, &u, &uvars),
+                        // (s) SGPR words of uniform pointers / descriptors
+                        Op::PtrLo(p) | Op::PtrHi(p) => is_u(p, &u, &uvars),
+                        Op::PtrCat { lo, hi } => is_u(lo, &u, &uvars) && is_u(hi, &u, &uvars),
+                        Op::RsrcCat { words } => words.iter().all(|w| is_u(w, &u, &uvars)),
                         // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
                         Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
                             Opnd::I32(k) => *k >= 6,

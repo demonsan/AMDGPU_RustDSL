@@ -157,6 +157,8 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
         Op::MovV { .. } => ResClass::Valu,
         Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,
+        // (s) zero-instruction views / assemblies of SGPR words
+        Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } => ResClass::Marker,
         Op::MemTimeLo { .. } => {
             e.directive = true;
             ResClass::Sync

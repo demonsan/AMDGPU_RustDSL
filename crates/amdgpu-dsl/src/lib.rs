@@ -697,6 +697,16 @@ pub enum Op {
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
+    // ---- (s) SGPR words of pointers / buffer descriptors (exact mode; owner kernel-opt): zero-instruction views / assemblies ----
+    /// dword 0 (low address bits) of a pointer pair, read in place
+    PtrLo(Opnd),
+    /// dword 1 (high address bits) of a pointer pair, read in place
+    PtrHi(Opnd),
+    /// a pointer from two dwords pinned at consecutive SGPRs (lo first); no instruction when they are already there
+    PtrCat { lo: Opnd, hi: Opnd },
+    /// a buffer descriptor from four dwords pinned at consecutive SGPRs (base lo, base hi | stride, num_records, format); no instruction
+    /// when they are already there. gpu_verify recognises the raw-buffer pattern over a pointer (docs/exact-mode.md).
+    RsrcCat { words: [Opnd; 4] },
 }
 
 impl Op {
@@ -789,6 +799,9 @@ impl Op {
             Op::ReadFirstLane(..) => DType::U32,
             Op::MovV { ty, .. } | Op::MovS { ty, .. } | Op::Undef { ty } => *ty,
             Op::DppQuadPerm { .. } => DType::U32,
+            Op::PtrLo(_) | Op::PtrHi(_) => DType::I32,
+            Op::PtrCat { .. } => DType::Ptr,
+            Op::RsrcCat { .. } => DType::Rsrc,
         }
     }
 
@@ -861,6 +874,9 @@ impl Op {
             Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![Opnd::Var(*var)],
             Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } => vec![*a, *b],
             Op::Permlane32SwapB { swap } => vec![*swap],
+            Op::PtrLo(p) | Op::PtrHi(p) => vec![*p],
+            Op::PtrCat { lo, hi } => vec![*lo, *hi],
+            Op::RsrcCat { words } => words.to_vec(),
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
