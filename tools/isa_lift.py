@@ -1466,6 +1466,10 @@ def main():
             opt = lambda k, d: int(sys.argv[sys.argv.index(k) + 1], 0) if k in sys.argv else d
             # the input kernel's interface (from its code-object metadata, passed by the caller): kernarg size, workgroup size, LDS bytes
             f.write(f'kernarg_size {opt("--kernarg-size", 8)}  workgroup {opt("--workgroup", 512)}  lds {opt("--lds", 163840)}  value_count {L.nv}\n')
+            if '--fp-mode' in sys.argv:
+                # the input kernel's FP mode (its descriptor's FLOAT_MODE denormal fields and IEEE bit): d32,d16_64,ieee
+                d32, d16, ie = sys.argv[sys.argv.index('--fp-mode') + 1].split(',')
+                f.write(f'fp_mode ({int(d32)}, {int(d16)}, {"true" if ie in ("1", "true") else "false"})\n')
             f.write('profile None  lower_opts []  sched_opts None\n')
             if '--exact' in sys.argv:
                 f.write('exact\n')
