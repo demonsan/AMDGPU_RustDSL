@@ -300,6 +300,6 @@ fn permlane32_swap_in_place_on_two_registers() {
     b.pin_sgpr_at(RegRef::Val(po), 8);
     b.pin_sgpr_at(RegRef::Val(rs), 12);
     let c = amdgpu_codegen::compile(&b.finish()).unwrap_or_else(|e| panic!("{e}"));
-    assert!(c.asm.contains("v_permlane32_swap_b32 v2, v5"), "{}", c.asm);
+    assert!(c.asm.contains("v_permlane32_swap_b32_e32 v2, v5"), "{}", c.asm);
     assert_eq!(c.asm.matches("v_mov_b32").count(), 2, "only the two authored moves: {}", c.asm);
 }
