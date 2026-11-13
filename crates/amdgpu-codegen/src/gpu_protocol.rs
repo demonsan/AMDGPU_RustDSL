@@ -745,6 +745,8 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
             Opnd::Val(v) => match def(f, *v) {
                 Some(Op::ConstI32(c)) => Some(*c as i64),
                 Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => konst_mov(f, a),
+                Some(Op::AddK { a, k }) => konst_mov(f, a).map(|x| x + *k as i64),
+                Some(Op::AddI32(a, b)) => Some(konst_mov(f, a)? + konst_mov(f, b)?),
                 _ => None,
             },
             _ => None,
