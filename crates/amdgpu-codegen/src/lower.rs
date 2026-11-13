@@ -181,6 +181,41 @@ fn run_select_fold(m: &mut MFunction) -> Result<(), String> {
     }
     Ok(())
 }
+/// Exact mode: the author's instructions all stay; only dead values the author did not pin are removed (values the IR keeps for the
+/// verifier only, e.g. a DMA's LDS address next to the author's `set_m0`).
+fn exact_dce(m: &mut MFunction) {
+    let mut pinned: HashSet<VReg> = HashSet::new();
+    for (r, _) in m.reg_hints.pins_v.iter().chain(m.reg_hints.pins_s.iter()) {
+        pinned.insert(*r);
+        pinned.insert(m.canon(*r));
+    }
+    loop {
+        let mut used: HashSet<VReg> = HashSet::new();
+        for b in &m.blocks {
+            for i in &b.insts {
+                for u in i.uses() {
+                    used.insert(m.canon(u));
+                }
+            }
+        }
+        let mut changed = false;
+        for b in m.blocks.iter_mut() {
+            let before = b.insts.len();
+            let alias = &m.alias;
+            let canon = |r: VReg| alias.get(&r).map(|x| x.0).unwrap_or(r);
+            b.insts.retain(|i| {
+                let Some(d) = i.dst else { return true };
+                let removable = crate::op_attrs::attrs(i.op).dce != crate::op_attrs::Dce::Keep;
+                !(removable && !pinned.contains(&d) && !pinned.contains(&canon(d)) && !used.contains(&canon(d)))
+            });
+            changed |= b.insts.len() != before;
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 fn run_dce_loads(m: &mut MFunction) -> Result<(), String> {
     // exact mode: every instruction is the author's (an unused load stays; the clobber check covers its registers)
     if EXACT_LOWERING.with(|e| e.get()) {
@@ -309,6 +344,8 @@ fn merge_zero_pairs(m: &mut MFunction) {
 fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
     if !EXACT_LOWERING.with(|e| e.get()) {
         dce(m);
+    } else {
+        exact_dce(m);
     }
     Ok(())
 }
