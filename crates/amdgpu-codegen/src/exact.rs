@@ -361,11 +361,13 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         pin.insert(m.canon(*r), (true, *b));
     }
     // a copy of a hardware register into a value pinned at that same register is no instruction
+    let alias = m.alias.clone();
+    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     for b in m.blocks.iter_mut() {
         b.insts.retain(|i| {
             let same = match (i.op, i.dst) {
-                (MOp::VReadPhys, Some(d)) => pin.get(&m.canon(d)) == Some(&(false, i.imm as u32)),
-                (MOp::SReadPhys, Some(d)) => pin.get(&m.canon(d)) == Some(&(true, i.imm as u32)),
+                (MOp::VReadPhys, Some(d)) => pin.get(&canon(d)) == Some(&(false, i.imm as u32)),
+                (MOp::SReadPhys, Some(d)) => pin.get(&canon(d)) == Some(&(true, i.imm as u32)),
                 _ => false,
             };
             !same
