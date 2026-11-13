@@ -456,8 +456,9 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
     for b in m.blocks.iter_mut() {
         b.insts.retain(|i| {
             let same = match (i.op, i.dst) {
-                (MOp::VReadPhys, Some(d)) => pin.get(&canon(d)) == Some(&(false, i.imm as u32)),
-                (MOp::SReadPhys, Some(d)) => pin.get(&canon(d)) == Some(&(true, i.imm as u32)),
+                // (a view of a pinned tuple: the tuple's pin plus the view's offset)
+                (MOp::VReadPhys, Some(d)) => pin.get(&canon(d)).map(|&(s, b)| (s, b + alias.get(&d).map_or(0, |x| x.1 as u32))) == Some((false, i.imm as u32)),
+                (MOp::SReadPhys, Some(d)) => pin.get(&canon(d)).map(|&(s, b)| (s, b + alias.get(&d).map_or(0, |x| x.1 as u32))) == Some((true, i.imm as u32)),
                 _ => false,
             };
             if same {

@@ -327,6 +327,10 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
     if name != "auto" {
         return (name.to_string(), None);
     }
+    // exact mode: the author's instructions are printed by the own emitter (the LLVM tail has no rows for the exact-only forms)
+    if f.exact {
+        return ("own".to_string(), Some(format!("kernel {} is exact; emitting with --backend=own", f.name)));
+    }
     if uses_own_only_ops(f) {
         ("own".to_string(), Some(format!("kernel {} uses own-backend-only ops (DMA); emitting with --backend=own", f.name)))
     } else {

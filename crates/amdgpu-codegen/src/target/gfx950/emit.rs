@@ -537,18 +537,8 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCmpEqU32 => cmp(a, inst, "v_cmp_eq_u32_e32"),
         MOp::VOrB32 => bin(a, inst, "v_or_b32_e32"),
         MOp::VXorB32 => bin(a, inst, "v_xor_b32_e32"),
-        MOp::VLshlB32 => vec![format!(
-            "v_lshlrev_b32_e32 {}, {}, {}",
-            d(a),
-            src1(a, inst.srcs[0]),
-            src1(a, inst.srcs[1])
-        )],
-        MOp::VLshrB32 => vec![format!(
-            "v_lshrrev_b32_e32 {}, {}, {}",
-            d(a),
-            src1(a, inst.srcs[0]),
-            src1(a, inst.srcs[1])
-        )],
+        MOp::VLshlB32 => bin(a, inst, "v_lshlrev_b32_e32"),
+        MOp::VLshrB32 => bin(a, inst, "v_lshrrev_b32_e32"),
         MOp::VMulLoU32 => vec![format!(
             "v_mul_lo_u32 {}, {}, {}",
             d(a),
