@@ -153,7 +153,7 @@ pub fn dwords(t: DType) -> u32 {
 pub fn op_class(op: &Op) -> (ResClass, Effects) {
     let mut e = Effects::default();
     let c = match op {
-        Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
+        Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::KernargSegment | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
         Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
         Op::MovV { .. } => ResClass::Valu,
         Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,

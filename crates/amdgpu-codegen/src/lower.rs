@@ -3067,6 +3067,15 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SLoPart).def(lo).srcreg(t));
                 self.val.insert(dst, lo);
             }
+            Op::KernargSegment => {
+                // the hardware's s[0:1] at entry (the copies vanish when the author pins the value at s[0:1])
+                let d = self.new_vreg(RClass::S2);
+                for k in 0..2u8 {
+                    let w = self.sub_alias(d, k, RClass::S1);
+                    self.push(MInst::new(MOp::SReadPhys).def(w).imm(k as i64));
+                }
+                self.val.insert(dst, d);
+            }
             Op::KernargPtr { offset } => {
                 let d = self.new_vreg(RClass::S2);
                 self.push(MInst::new(MOp::SLoadDwordx2).def(d).imm(*offset as i64));
@@ -5149,7 +5158,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
                         // (r1) the uniform pointer / descriptor values a pointer / descriptor variable may hold, and the undefined initial value
-                        Op::Undef { .. } | Op::KernargPtr { .. } => true,
+                        Op::Undef { .. } | Op::KernargPtr { .. } | Op::KernargSegment => true,
                         Op::PtrAdd { base, byte_off } => is_u(base, &u, &uvars) && is_u(byte_off, &u, &uvars),
                         Op::BufferRsrc { base, .. } => is_u(base, &u, &uvars),
                         Op::BufferRsrcDyn { base, num_records } => is_u(base, &u, &uvars) && is_u(num_records, &u, &uvars),

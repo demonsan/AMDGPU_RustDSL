@@ -1790,6 +1790,8 @@ impl<'a> An<'a> {
                 let arg = self.f.args.iter().position(|a| a.kernarg_offset == *offset);
                 AV::Ptr { arg, off: Itv::konst(0) }
             }
+            // the kernarg segment pointer: no tensor provenance (an access through it is GV-GLB-PROV)
+            Op::KernargSegment => AV::Ptr { arg: None, off: Itv::konst(0) },
             Op::WorkitemId => AV::Int(Itv::range(Poly::int(0), Poly::int(self.f.workgroup_size as i128 - 1))),
             Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => {
                 let axis = match op {

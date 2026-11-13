@@ -699,6 +699,8 @@ pub enum Op {
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
     // ---- (s) SGPR words of pointers / buffer descriptors (exact mode; owner kernel-opt): zero-instruction views / assemblies ----
     /// dword 0 (low address bits) of a pointer pair, read in place
+    /// The kernarg segment pointer itself (hardware `s[0:1]` at entry; no instruction). `KernargPtr` loads a pointer stored in it.
+    KernargSegment,
     /// Exact mode: `s_load_dword` from a scalar (SGPR pair) pointer: the dword at `base + byte_off` (wave-uniform).
     LoadScalar { base: Opnd, byte_off: u32 },
     PtrLo(Opnd),
@@ -768,7 +770,7 @@ impl Op {
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
             Op::Max3F32(..) => DType::F32,
             Op::Select { ty, .. } => *ty,
-            Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
+            Op::PtrAdd { .. } | Op::KernargPtr { .. } | Op::KernargSegment => DType::Ptr,
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::VarSlice8 { .. } => DType::Frag8,
@@ -811,7 +813,7 @@ impl Op {
     pub fn operands(&self) -> Vec<Opnd> {
         match self {
             Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
-            | Op::KernargPtr { .. } | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
+            | Op::KernargPtr { .. } | Op::KernargSegment | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
             | Op::WorkgroupIdZ | Op::Undef { .. } => vec![],
             Op::AddI32(a, b)
             | Op::MulI32(a, b)

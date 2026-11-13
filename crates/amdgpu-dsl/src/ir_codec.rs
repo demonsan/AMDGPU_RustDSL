@@ -197,6 +197,7 @@ impl FromIr for Op {
             "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
+            "KernargSegment" => { v.expect_unit("KernargSegment")?; Ok(Op::KernargSegment) }
             "LoadScalar" => { v.expect_struct("LoadScalar")?; Ok(Op::LoadScalar { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)? }) }
             "PtrLo" => { v.expect_tuple("PtrLo", 1)?; Ok(Op::PtrLo(FromIr::from_ir(v.item(0)?)?)) }
             "PtrHi" => { v.expect_tuple("PtrHi", 1)?; Ok(Op::PtrHi(FromIr::from_ir(v.item(0)?)?)) }
@@ -329,6 +330,7 @@ impl IrIds for Op {
             Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
+            Op::KernargSegment => {}
             Op::LoadScalar { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
             Op::PtrLo(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::PtrHi(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
