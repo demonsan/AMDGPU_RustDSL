@@ -1288,6 +1288,8 @@ impl<'a> An<'a> {
         // differ): when the offset holds k * x, x's atoms become ONE digit (coefficient k, values [min x, bound - 1]) and each store's constant
         // loses its k * (x constant) - provided x is injective in its atoms
         let mut digits: Vec<(Poly, Poly)> = Vec::new();
+        // composite digits (k = 1) whose atoms are spaced by at least the access size: each footprint [x, x + size) is its own
+        let mut sized: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
         let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
         let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
@@ -1360,6 +1362,22 @@ impl<'a> An<'a> {
                             inj = false;
                             break;
                         }
+                    }
+                }
+                // (spaced by the access size too? then the composite's footprints are disjoint: `sized`)
+                let mut acc_s = Poly::int(size);
+                let mut spaced = inj;
+                for (c, m) in &xd {
+                    if !spaced {
+                        break;
+                    }
+                    if !cx.le(&acc_s, c) {
+                        spaced = false;
+                        break;
+                    }
+                    match m.mul(c) {
+                        Some(x) => acc_s = acc_s.add(&x),
+                        None => spaced = false,
                     }
                 }
                 let mut acc = Poly::int(1);
@@ -1465,6 +1483,9 @@ impl<'a> An<'a> {
                 for a in latoms.keys() {
                     atoms.remove(a);
                     covered.insert(*a);
+                }
+                if spaced && kf == Poly::int(1) {
+                    sized.push((kf.clone(), span.clone()));
                 }
                 digits.push((kf, span));
             }
@@ -1576,6 +1597,11 @@ impl<'a> An<'a> {
         for (c, m) in &digits {
             if m.0.is_empty() {
                 continue; // a single-valued digit
+            }
+            // the lowest digit a size-spaced composite: its footprints end below its span plus the size
+            if acc == Poly::int(size) && sized.contains(&(c.clone(), m.clone())) {
+                acc = m.add(&Poly::int(size));
+                continue;
             }
             if !cx.le(&acc, c) {
                 return Err(format!("digits overlap (radix): {} > {}", acc.show(), c.show()));
