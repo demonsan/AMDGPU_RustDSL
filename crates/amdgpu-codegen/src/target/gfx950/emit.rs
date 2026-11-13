@@ -547,7 +547,15 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCmpGeI32 => cmp(a, inst, "v_cmp_ge_i32_e32"),
         MOp::VCmpGtI32 => cmp(a, inst, "v_cmp_gt_i32_e32"),
         MOp::VCmpMaskLtI32 => cmp_mask(a, inst, "v_cmp_lt_i32_e64"),
-        MOp::VCndmaskM => vec![format!("v_cndmask_b32_e64 {}, {}, {}, {}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), spair(a, reg_of(&inst.srcs[2])))],
+        MOp::VCndmaskM => {
+            let m = reg_of(&inst.srcs[2]);
+            if a.phys[m as usize] == crate::mir::VCC_PIN {
+                let v1 = matches!(inst.srcs.get(1), Some(Src::Reg(r)) if !a.scalar.get(*r as usize).copied().unwrap_or(false));
+                vec![format!("v_cndmask_b32_{} {}, {}, {}, vcc", if v1 { "e32" } else { "e64" }, d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
+            } else {
+                vec![format!("v_cndmask_b32_e64 {}, {}, {}, {}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), spair(a, m))]
+            }
+        }
         MOp::VCmpNeI32 => cmp(a, inst, "v_cmp_ne_i32_e32"),
         MOp::VCmpLtF32 => cmp(a, inst, "v_cmp_lt_f32_e32"),
         MOp::VCndmask => vec![format!(
@@ -1021,7 +1029,13 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         }
         MOp::VCmpMaskG => {
             let (p, t) = crate::mir::cmp_names(inst.imm, false);
-            vec![format!("v_cmp_{p}_{t}_e64 {}, {}, {}", spair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
+            let dst = inst.dst.expect("dst");
+            if a.phys[dst as usize] == crate::mir::VCC_PIN {
+                // into VCC: the e32 form when src1 is a VGPR
+                let v1 = matches!(inst.srcs.get(1), Some(Src::Reg(r)) if !a.scalar.get(*r as usize).copied().unwrap_or(false));
+                return vec![format!("v_cmp_{p}_{t}_{} vcc, {}, {}", if v1 { "e32" } else { "e64" }, src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))];
+            }
+            vec![format!("v_cmp_{p}_{t}_e64 {}, {}, {}", spair(a, dst), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
         }
         MOp::SLoadDwordPtr => {
             let b = a.phys[reg_of(&inst.srcs[0]) as usize];

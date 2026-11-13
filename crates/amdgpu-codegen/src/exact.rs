@@ -225,6 +225,9 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
     // physical key of a dword slot (vreg tuple * 16 + dword)
     // physical key of a half slot: (scalar file, register, half)
     let phys_of = |s: Slot| -> Option<(bool, u32)> {
+        if s >= u32::MAX - 1 {
+            return Some((true, crate::mir::VCC_PIN * 2 + s % 2));
+        }
         let d = s / 2;
         let (t, off) = (d / 16, d % 16);
         let p = *a.phys.get(t as usize)?;
@@ -242,7 +245,9 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
             // surviving half is not a use of the old value
             let e = effects(m, i);
             let at = crate::op_attrs::attrs(i.op);
-            let halves = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384)).flat_map(|s| [s * 2, s * 2 + 1]).collect::<Vec<_>>();
+            // VCC is tracked as a register (exact mode pins lane masks there; its implicit writers clobber them); SCC and the other specials are not
+            let vcc = crate::sched::effects::VCC;
+            let halves = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384) || *s == vcc).flat_map(|s| if s == vcc { [u32::MAX - 1, u32::MAX] } else { [s * 2, s * 2 + 1] }).collect::<Vec<_>>();
             let mut reads = halves(&e.reads);
             let mut writes = halves(&e.writes);
             if at.regfx == crate::op_attrs::RegFx::PartialWrite {
@@ -466,7 +471,9 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                 }
                 phys[r as usize] = b;
                 if s {
-                    max_s = max_s.max(b + c.dwords());
+                    if b != crate::mir::VCC_PIN {
+                        max_s = max_s.max(b + c.dwords());
+                    }
                 } else {
                     max_v = max_v.max(b + c.dwords());
                 }

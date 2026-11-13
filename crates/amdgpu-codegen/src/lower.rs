@@ -113,9 +113,12 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
     if f.exact {
         // I1 values the author pinned to an SGPR pair: VOP3 lane masks (`v_cmp_*_e64 s[..]`, read by `v_cndmask_b32_e64 .., s[..]`)
         for mk in &f.reg_plan {
-            if let amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), .. } = mk {
+            if let amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), base } = mk {
                 if f.value_tys.get(*x as usize) == Some(&DType::I1) {
                     lw.mask_i1.insert(*x);
+                    if *base == crate::mir::VCC_PIN {
+                        lw.mask_vcc.insert(*x);
+                    }
                 }
             }
         }
@@ -401,6 +404,8 @@ struct Lowerer {
     swap_second: HashMap<ValueId, VReg>,
     /// exact mode: I1 values held as a lane mask in an SGPR pair
     mask_i1: HashSet<ValueId>,
+    /// ... of them, those pinned at VCC
+    mask_vcc: HashSet<ValueId>,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -552,6 +557,7 @@ impl Lowerer {
             exact: f.exact,
             swap_second: HashMap::new(),
             mask_i1: HashSet::new(),
+            mask_vcc: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
@@ -2782,6 +2788,13 @@ impl Lowerer {
     fn lower_condition(&mut self, cond: Opnd, negate: bool) -> Result<(Pred, Vec<Src>), String> {
         if let Opnd::Val(v) = cond {
             if let Some(op) = self.defs.get(&v).cloned() {
+                // exact mode: a lane mask the author keeps in VCC is branched on directly (`s_cbranch_vcc*`; no compare re-issued)
+                if self.exact && self.mask_i1.contains(&v) && self.mask_vcc.contains(&v) {
+                    let m = *self.val.get(&v).ok_or("mask not lowered")?;
+                    self.touch(&[Src::Reg(m)]);
+                    let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                    return Ok((on, vec![Src::Reg(m)]));
+                }
                 // exact mode: an integer compare of two wave-uniform operands branches on SCC in the author's SALU form
                 if self.exact {
                     if let Op::Cmp { pred, ty: ty @ (amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32), a, b } = op {
@@ -3731,6 +3744,8 @@ impl Lowerer {
                 self.uniform.insert(dst);
                 self.val.insert(dst, d);
             }
+            // exact mode: -x exists only as a source modifier of the instruction that reads it (no instruction of its own)
+            Op::NegF32(_) if self.exact => {}
             Op::NegF32(a) => {
                 // standalone: flip the sign bit (unused when every reader folds it into a modifier: removed by dce)
                 let r = self.as_v1(*a)?;
