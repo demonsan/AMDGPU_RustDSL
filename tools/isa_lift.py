@@ -81,7 +81,7 @@ def imm(tok):
 FRAG = {1: 'U32', 2: 'Frag2', 4: 'Frag4', 8: 'Frag8', 16: 'Frag16'}
 
 # result types of the DSL ops the lifter emits (Op::result_ty in amdgpu-dsl)
-RTY = {'AddK': 'I32', 'KernargSegment': 'Ptr', 'Permlane32SwapA': 'U32', 'Permlane32SwapB': 'U32', 'PtrLo': 'I32', 'PtrHi': 'I32', 'PtrCat': 'Ptr', 'RsrcCat': 'Rsrc', 'WorkitemId': 'U32', 'WorkgroupIdX': 'U32', 'WorkgroupIdY': 'U32', 'WorkgroupIdZ': 'U32', 'Undef': None, 'ConstI32': 'I32', 'ConstF32': 'F32', 'KernargI32': 'I32', 'KernargPtr': 'Ptr', 'BufferRsrc': 'Rsrc', 'MovV': None, 'MovS': None, 'NegF32': 'F32', 'MfmaBf16Wide': 'Frag16', 'BufferRsrcDyn': 'Rsrc', 'AddI32': 'I32', 'MulI32': 'I32', 'ShlI32': 'I32', 'LshrI32': 'I32',
+RTY = {'LoadScalar': 'U32', 'AddK': 'I32', 'KernargSegment': 'Ptr', 'Permlane32SwapA': 'U32', 'Permlane32SwapB': 'U32', 'PtrLo': 'I32', 'PtrHi': 'I32', 'PtrCat': 'Ptr', 'RsrcCat': 'Rsrc', 'WorkitemId': 'U32', 'WorkgroupIdX': 'U32', 'WorkgroupIdY': 'U32', 'WorkgroupIdZ': 'U32', 'Undef': None, 'ConstI32': 'I32', 'ConstF32': 'F32', 'KernargI32': 'I32', 'KernargPtr': 'Ptr', 'BufferRsrc': 'Rsrc', 'MovV': None, 'MovS': None, 'NegF32': 'F32', 'MfmaBf16Wide': 'Frag16', 'BufferRsrcDyn': 'Rsrc', 'AddI32': 'I32', 'MulI32': 'I32', 'ShlI32': 'I32', 'LshrI32': 'I32',
        'AndI32': 'I32', 'MinI32': 'I32', 'XorI32': 'I32', 'AddF32': 'F32', 'SubF32': 'F32', 'MulF32': 'F32', 'MaxF32': 'F32', 'FmaF32': 'F32', 'Max3F32': 'F32',
        'Exp2F32': 'F32', 'Log2F32': 'F32', 'RcpF32': 'F32', 'Cmp': 'I1', 'NotI1': 'I1', 'ReadFirstLane': 'U32', 'Frag2Lane': 'U32', 'Frag4Lane': 'U32',
        'Frag16Lane': 'U32', 'CvtPknormPair': 'I32', 'CvtP8x4FromU16': 'U32', 'CvtPkBf16F32': 'U32', 'PkMulF32': 'Frag2', 'PkFmaF32': 'Frag2',
@@ -607,7 +607,11 @@ class Lifter:
     # kernel arguments (s_load from the kernarg segment s[0:1])
     def h_s_load_dword(self, t, m, op):
         if t[1] != 's[0:1]':
-            return False
+            # a scalar load through a pointer the code holds in an SGPR pair
+            r = reg(t[1])
+            base = self.read('s', r[1], 2)
+            self.dst(t[0], 'I32', f'LoadScalar {{ base: {base}, byte_off: {imm(t[2])} }}')
+            return True
         self.dst(t[0], 'I32', f'KernargI32 {{ offset: {imm(t[2])} }}')
         return True
 
