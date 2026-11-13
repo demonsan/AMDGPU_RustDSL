@@ -4295,7 +4295,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {
-                        errs.push(here(format!("set_m0 reads v{} before its definition", v.0)));
+                        errs.push(here(format!("set_m0 reads v{v} before its definition")));
                     }
                 }
             }
