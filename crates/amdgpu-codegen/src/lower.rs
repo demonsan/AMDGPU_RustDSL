@@ -132,6 +132,10 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         let (u, v) = uniform_analysis(f);
         lw.uniform = u;
         lw.uvars = v;
+    } else if f.var_tys.iter().any(|t| matches!(t, DType::Ptr | DType::Rsrc)) {
+        // (r1) pointer / descriptor variables are SGPR tuples in every mode: only they take the uniformity result here
+        let (_, v) = uniform_analysis(f);
+        lw.uvars = v.into_iter().filter(|x| matches!(f.var_tys.get(x.0 as usize), Some(DType::Ptr | DType::Rsrc))).collect();
     }
     let res = lw.run(f);
     // diagnostics: which value each virtual register was lowered from (read by `diag::from_compile_error` for allocation failures)
@@ -804,7 +808,10 @@ impl Lowerer {
         for (i, var) in vars.iter().enumerate() {
             let ty = f.var_ty(*var).ok_or("loop var has no type")?;
             let class = match ty {
-                DType::Ptr => return Err("pointer loop variables are not supported".to_string()),
+                // (r1) pointers / buffer descriptors carried by a loop or scope variable: SGPR pair / quad, wave-uniform
+                DType::Ptr if self.uvars.contains(var) => RClass::S2,
+                DType::Rsrc if self.uvars.contains(var) => RClass::S4,
+                DType::Ptr | DType::Rsrc => return Err(format!("var{}: pointer / descriptor variables must be wave-uniform", var.0)),
                 DType::Frag2 => RClass::V2,
                 DType::Frag4 => RClass::V4,
                 DType::Frag8 => RClass::V8,
@@ -827,6 +834,11 @@ impl Lowerer {
                     self.touch(&[Src::Reg(x)]);
                 }
                 self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                continue;
+            }
+            if matches!(class, RClass::S2 | RClass::S4) {
+                let src = self.s_tuple(init[i], class)?;
+                self.copy_sreg(r, src);
                 continue;
             }
             if class == RClass::V16 && opt_on("zeroinit") && matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 }))) {
@@ -1859,6 +1871,32 @@ impl Lowerer {
                 }
             }
             _ => Err("eight-dword fragment operand must be an SSA value or a loop variable".to_string()),
+        }
+    }
+
+    /// (r1) The SGPR pair / quad of a pointer / descriptor operand (a value or a variable) of class `class`.
+    fn s_tuple(&mut self, o: Opnd, class: RClass) -> Result<VReg, String> {
+        let r = match o {
+            Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
+            Opnd::Var(v) => *self.vars.get(v.0 as usize).ok_or("var not lowered")?,
+            _ => return Err("a pointer / descriptor variable needs a value or variable".to_string()),
+        };
+        if self.mir.vreg_class(r) != class {
+            return Err(format!("pointer / descriptor variable: operand is {:?}, expected {class:?}", self.mir.vreg_class(r)));
+        }
+        self.touch(&[Src::Reg(r)]);
+        Ok(r)
+    }
+
+    /// (r1) Copy of an SGPR tuple, one `s_mov_b32` per dword (none when both are the same register).
+    fn copy_sreg(&mut self, dst: VReg, src: VReg) {
+        if dst == src {
+            return;
+        }
+        for i in 0..self.mir.vreg_class(src).dwords() as u8 {
+            let s = self.sub_alias(src, i, RClass::S1);
+            let d = self.sub_alias(dst, i, RClass::S1);
+            self.push(MInst::new(MOp::SMovB32).def(d).srcreg(s));
         }
     }
 
@@ -4712,7 +4750,8 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
 fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarId>) {
     let mut uvars: HashSet<amdgpu_dsl::VarId> = HashSet::new();
     for (i, t) in f.var_tys.iter().enumerate() {
-        if *t == DType::I32 {
+        // (r1) pointer / descriptor variables are candidates too (they must turn out uniform: SGPR pair / quad)
+        if matches!(*t, DType::I32 | DType::Ptr | DType::Rsrc) {
             uvars.insert(amdgpu_dsl::VarId(i as u32));
         }
     }
@@ -4741,6 +4780,11 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                     }
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        // (r1) the uniform pointer / descriptor values a pointer / descriptor variable may hold, and the undefined initial value
+                        Op::Undef { .. } | Op::KernargPtr { .. } => true,
+                        Op::PtrAdd { base, byte_off } => is_u(base, &u, &uvars) && is_u(byte_off, &u, &uvars),
+                        Op::BufferRsrc { base, .. } => is_u(base, &u, &uvars),
+                        Op::BufferRsrcDyn { base, num_records } => is_u(base, &u, &uvars) && is_u(num_records, &u, &uvars),
                         // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
                         Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
                             Opnd::I32(k) => *k >= 6,
@@ -4788,7 +4832,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         changed = true;
                     }
                 }
-                Stmt::BeginLoop { vars, init } => {
+                Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
                     for (v, i) in vars.iter().zip(init.iter()) {
                         if uvars.contains(v) && !is_u(i, &u, &uvars) {
                             uvars.remove(v);
