@@ -126,6 +126,48 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                 }
             }
         }
+        // readers of every value: (count, the reading statements)
+        {
+            let pinned: HashSet<ValueId> = f
+                .reg_plan
+                .iter()
+                .filter_map(|mk| match mk {
+                    amdgpu_dsl::RegMark::PinV { r: amdgpu_dsl::RegRef::Val(x), .. } | amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), .. } => Some(*x),
+                    _ => None,
+                })
+                .collect();
+            let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
+            let stmts = f.stmts();
+            for (k, st) in stmts.iter().enumerate() {
+                let ops = match st {
+                    Stmt::Let { op, .. } => op.operands(),
+                    _ => amdgpu_dsl::stmt_operands(st),
+                };
+                for o in ops {
+                    if let Opnd::Val(v) = o {
+                        readers.entry(v).or_default().push(k);
+                    }
+                }
+            }
+            for (k, st) in stmts.iter().enumerate() {
+                let Stmt::Let { dst, op } = st else { continue };
+                let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
+                match op {
+                    Op::AddI32(..) if !pinned.contains(dst) && !rd.is_empty() && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) => {
+                        lw.m0_adds.insert(*dst);
+                    }
+                    Op::Cmp { .. } if rd.len() == 1 => {
+                        if let Stmt::Let { dst: n, op: Op::NotI1(Opnd::Val(c)) } = &stmts[rd[0]] {
+                            if c == dst && lw.mask_i1.contains(n) {
+                                lw.neg_folded.insert(*dst);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = k;
+            }
+        }
         // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
         let (u, v) = uniform_analysis(f);
         let mut sv: HashSet<ValueId> = HashSet::new();
@@ -460,6 +502,10 @@ struct Lowerer {
     mask_vcc: HashSet<ValueId>,
     /// exact mode: I1 values held in SCC (scalar compares read by s_cselect / s_cbranch_scc*)
     scc_i1: HashSet<ValueId>,
+    /// exact mode: unpinned `AddI32` values read only by `set_m0` (lowered there as `s_add_u32 m0, a, b`)
+    m0_adds: HashSet<ValueId>,
+    /// exact mode: compares read only by a `NotI1` held in the same lane-mask register (the author's negated compare, e.g. v_cmp_nge)
+    neg_folded: HashSet<ValueId>,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -613,6 +659,8 @@ impl Lowerer {
             mask_i1: HashSet::new(),
             mask_vcc: HashSet::new(),
             scc_i1: HashSet::new(),
+            m0_adds: HashSet::new(),
+            neg_folded: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
@@ -1642,6 +1690,15 @@ impl Lowerer {
     fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
         let commutative = matches!(op, MOp::SAddU32 | MOp::SMulI32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SOrB32);
+        // exact mode: the author's operand order; SOP2 takes a constant in either source
+        if self.exact {
+            let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+            self.touch(&regs);
+            let d = self.new_vreg(RClass::S1);
+            self.push(MInst::new(op).def(d).src(sa).src(sb));
+            self.val.insert(dst, d);
+            return Ok(());
+        }
         if matches!(sa, Src::Imm(_)) && matches!(sb, Src::Reg(_)) && commutative {
             std::mem::swap(&mut sa, &mut sb);
         }
@@ -2786,6 +2843,16 @@ impl Lowerer {
                 Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),
                 Stmt::ExecRestore { sgpr } => self.push(MInst::new(MOp::SRestoreExec).imm(*sgpr as i64)),
                 Stmt::SetM0 { value } => {
+                    if let Opnd::Val(v) = value {
+                        if self.m0_adds.contains(v) {
+                            let Some(Op::AddI32(a, b)) = self.defs.get(v).cloned() else { unreachable!() };
+                            let (sa, sb) = (self.s_operand(a)?, self.s_operand(b)?);
+                            let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                            self.touch(&regs);
+                            self.push(MInst::new(MOp::SAddM0).src(sa).src(sb));
+                            return Ok(());
+                        }
+                    }
                     let s = self.s_operand(*value)?;
                     if let Src::Reg(r) = s {
                         self.touch(&[Src::Reg(r)]);
@@ -3098,7 +3165,9 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             // `salu32`: a uniform `x + simm16` is `s_addk_i32`
-            Op::AddI32(a, b) if self.uniform.contains(&dst) && opt_on("salu32") && self.addk(dst, *a, *b)? => {}
+            // exact mode: an M0 address the author writes with `set_m0(a + k)` is `s_add_u32 m0, a, k` (formed at the set_m0)
+            Op::AddI32(..) if self.exact && self.m0_adds.contains(&dst) => {}
+            Op::AddI32(a, b) if self.uniform.contains(&dst) && opt_on("salu32") && !self.exact && self.addk(dst, *a, *b)? => {}
             Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
             Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SSubU32, *a, *b)?,
             Op::Bin(amdgpu_dsl::BinOp::OrB32, a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SOrB32, *a, *b)?,
@@ -3157,6 +3226,17 @@ impl Lowerer {
                 self.touch(&regs);
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SCmpG).def(d).src(sa).src(sb).imm(cmp_code(*pred, *ty)));
+                self.val.insert(dst, d);
+            }
+            // the compare folded into its NotI1 reader (emitted there with the negated predicate)
+            Op::Cmp { .. } if self.exact && self.neg_folded.contains(&dst) => {}
+            Op::NotI1(Opnd::Val(c)) if self.exact && self.mask_i1.contains(&dst) && self.neg_folded.contains(c) => {
+                let Some(Op::Cmp { pred, ty, a, b }) = self.defs.get(c).cloned() else { unreachable!() };
+                let (sa, sb) = (self.cmp_src(a)?, self.cmp_src(b)?);
+                let regs: Vec<Src> = [sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::S2);
+                self.push(MInst::new(MOp::VCmpMaskG).def(d).src(sa).src(sb).imm(cmp_code(pred, ty) | crate::mir::CMP_NEG));
                 self.val.insert(dst, d);
             }
             Op::Cmp { pred, ty, a, b } if self.exact && self.mask_i1.contains(&dst) => {
@@ -4606,6 +4686,15 @@ impl Lowerer {
                 None
             };
             let (na, nb) = (neg_of(self, a), neg_of(self, b));
+            if self.exact {
+                let (s0, s1) = self.exact_srcs(na.unwrap_or(a), nb.unwrap_or(b))?;
+                let d = self.new_vreg(RClass::V1);
+                let mut inst = MInst::new(op).def(d).src(s0).src(s1);
+                inst.neg = (na.is_some() as u8) | ((nb.is_some() as u8) << 1);
+                self.push(inst);
+                self.val.insert(dst, d);
+                return Ok(());
+            }
             if na.is_some() || nb.is_some() {
                 let (a2, b2) = (na.unwrap_or(a), nb.unwrap_or(b));
                 // VOP3 takes one scalar source (constant bus); the other operand in a VGPR
@@ -4623,6 +4712,14 @@ impl Lowerer {
                 self.val.insert(dst, d);
                 return Ok(());
             }
+        }
+        // exact mode: the author's operand order (e32 when encodable, else e64 - the emitter decides)
+        if self.exact {
+            let (s0, s1) = self.exact_srcs(a, b)?;
+            let d = self.new_vreg(RClass::V1);
+            self.push(MInst::new(op).def(d).src(s0).src(s1));
+            self.val.insert(dst, d);
+            return Ok(());
         }
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
@@ -4716,6 +4813,19 @@ impl Lowerer {
     /// A VALU op with plain V1 operands (constants materialised; e32 / VOP3 forms both accept them).
     /// Exact mode: the two sources of a VALU op in the form the author wrote: src0 a constant (inline or literal), an SGPR or a VGPR;
     /// src1 an inline constant or an SGPR (both make the VOP3 `_e64` encoding) or a VGPR; at most one SGPR / literal (constant bus).
+    /// A compare source in the VOP3 form: an inline constant, an SGPR or a VGPR.
+    fn cmp_src(&mut self, o: Opnd) -> Result<Src, String> {
+        if let Some(k) = self.const_bits(o) {
+            if is_inline_const(k) {
+                return Ok(Src::Imm(k));
+            }
+        }
+        if let Some(s) = self.sgpr_src(o) {
+            return Ok(Src::Reg(s));
+        }
+        Ok(Src::Reg(self.as_v1(o)?))
+    }
+
     fn exact_srcs(&mut self, a: Opnd, b: Opnd) -> Result<(Src, Src), String> {
         let s0 = match (self.const_bits(a), self.sgpr_src(a)) {
             (Some(k), _) => Src::Imm(k),

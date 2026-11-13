@@ -650,6 +650,8 @@ pub const VCC_PIN: u32 = 106;
 /// Exact mode: an SGPR pin at this base (the ISA's operand encoding of SCC) is SCC: a scalar compare's result read by `s_cselect` /
 /// `s_cbranch_scc*`.
 pub const SCC_PIN: u32 = 253;
+/// `cmp_code` flag: the negated compare (`v_cmp_n<p>_f32`, or the inverse integer predicate).
+pub const CMP_NEG: i64 = 0x100;
 
 /// Compare code of `SCmpG` / `VCmpMaskG`: predicate (low nibble) and type (bits 4..).
 pub fn cmp_code(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy) -> i64 {
@@ -675,12 +677,32 @@ pub fn cmp_code(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy) -> i64 {
 
 /// (predicate, type) mnemonic parts of a compare code; `scalar`: the SALU spelling (`lg` for not-equal).
 pub fn cmp_names(code: i64, scalar: bool) -> (&'static str, &'static str) {
-    let t = match code >> 4 {
+    let t = match (code >> 4) & 15 {
         0 => "f32",
         1 => "i32",
         _ => "u32",
     };
-    let float = code >> 4 == 0;
+    let float = (code >> 4) & 15 == 0;
+    if code & CMP_NEG != 0 {
+        let p = match (code & 15, float) {
+            (0, true) => "nlt",
+            (1, true) => "nle",
+            (2, true) => "ngt",
+            (3, true) => "nge",
+            (4, true) => "neq",
+            (5, true) => "eq",
+            (6, true) => "nlg",
+            (7, true) => "o",
+            (8, true) => "u",
+            (0, false) => "ge",
+            (1, false) => "gt",
+            (2, false) => "le",
+            (3, false) => "lt",
+            (4, false) => if scalar { "lg" } else { "ne" },
+            _ => "eq",
+        };
+        return (p, t);
+    }
     let p = match code & 15 {
         0 => "lt",
         1 => "le",
