@@ -219,6 +219,8 @@ struct An<'a> {
     cx: Ctx,
     env: HashMap<ValueId, AV>,
     vars: HashMap<VarId, Itv>,
+    /// pointer / descriptor variables: their provenance (the offset part lives in `vars`); `AV::Other` = conflicting provenances
+    var_prov: HashMap<VarId, AV>,
     var_init: HashMap<VarId, Itv>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
@@ -280,8 +282,41 @@ impl<'a> An<'a> {
     fn av_of(&self, o: &Opnd) -> AV {
         match o {
             Opnd::Val(v) => self.env.get(v).cloned().unwrap_or(AV::Other),
+            // a pointer / descriptor variable: its provenance (fixed over the variable's life) with the offset tracked like an integer variable
+            Opnd::Var(v) => match self.var_prov.get(v) {
+                Some(AV::Ptr { arg, .. }) => AV::Ptr { arg: *arg, off: self.vars.get(v).cloned().unwrap_or_else(Itv::top) },
+                Some(AV::Rsrc { arg, num, .. }) => AV::Rsrc { arg: *arg, num: num.clone(), base: self.vars.get(v).cloned().unwrap_or_else(Itv::top) },
+                Some(_) => AV::Rsrc { arg: None, num: None, base: Itv::top() },
+                None => AV::Other,
+            },
             _ => AV::Other,
         }
+    }
+    /// The integer part a variable carries for a value: the value itself, or the byte offset of a pointer / the base offset of a descriptor
+    /// (whose provenance is recorded; two different provenances for one variable make it unknown, GV-GLB-PROV at its use).
+    fn var_part(&mut self, v: VarId, o: &Opnd) -> Itv {
+        let (prov, part) = match self.av_of(o) {
+            AV::Ptr { arg, off } => (Some(AV::Ptr { arg, off: Itv::konst(0) }), off),
+            AV::Rsrc { arg, num, base } => (Some(AV::Rsrc { arg, num, base: Itv::konst(0) }), base),
+            _ => (None, self.int_of(o)),
+        };
+        if let Some(p) = prov {
+            let same = |a: &AV, b: &AV| match (a, b) {
+                (AV::Ptr { arg: x, .. }, AV::Ptr { arg: y, .. }) => x == y,
+                (AV::Rsrc { arg: x, num: n1, .. }, AV::Rsrc { arg: y, num: n2, .. }) => x == y && n1 == n2,
+                _ => false,
+            };
+            match self.var_prov.get(&v) {
+                Some(old) if !same(old, &p) => {
+                    self.var_prov.insert(v, AV::Other);
+                }
+                Some(_) => {}
+                None => {
+                    self.var_prov.insert(v, p);
+                }
+            }
+        }
+        part
     }
     fn arg_extent(&self, arg: usize) -> Option<&amdgpu_dsl::ArgExtent> {
         let name = &self.f.args.get(arg)?.name;
@@ -2295,7 +2330,7 @@ impl<'a> An<'a> {
         self.tag = None;
         let mut cur: Vec<Itv> = Vec::new();
         for (v, i0) in vars.iter().zip(init.iter()) {
-            let it = self.int_of(i0);
+            let it = self.var_part(*v, i0);
             self.var_init.insert(*v, it.clone());
             self.assumed.remove(v);
             cur.push(it.norm(&self.cx));
@@ -2462,7 +2497,7 @@ impl<'a> An<'a> {
             // an `assume` restricts them (each `set_var` is then checked against it, GV-ASSUME)
             Stmt::DeclareVars { vars, init } => {
                 for (v, i0) in vars.iter().zip(init.iter()) {
-                    let it = self.int_of(i0);
+                    let it = self.var_part(*v, i0);
                     self.var_init.insert(*v, it);
                     let cur = self.assumed.get(v).cloned().unwrap_or_else(Itv::top);
                     self.vars.insert(*v, cur);
@@ -2477,7 +2512,7 @@ impl<'a> An<'a> {
     fn apply_set(&mut self, i: usize, var: &VarId, value: &Opnd) {
         {
             {
-                let nv = self.int_of(value);
+                let nv = self.var_part(*var, value);
                 if self.rep.quiet > 0 {
                     let e = match self.acc.get(var) {
                         Some(x) => x.join(&nv, &self.cx),
@@ -2655,7 +2690,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

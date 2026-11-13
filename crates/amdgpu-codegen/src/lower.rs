@@ -383,6 +383,8 @@ struct Lowerer {
     cur_stmt: u32,
     /// exact authored mode (docs/exact-mode.md): forms the author wrote (an MFMA reads its accumulator where it is, no copy into the result)
     exact: bool,
+    /// `Permlane32SwapA` value -> the register of its second result (`Permlane32SwapB`)
+    swap_second: HashMap<ValueId, VReg>,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -532,6 +534,7 @@ impl Lowerer {
         Lowerer {
             cur_origin: u32::MAX,
             exact: f.exact,
+            swap_second: HashMap::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
@@ -1316,10 +1319,22 @@ impl Lowerer {
 
     /// MUBUF operands: (descriptor S4 register, voffset source, soffset source). `voffset` None = the `off` form (encoded as `Src::Imm(0)`); `soffset` is an
     /// SGPR value (wave-uniform integer, loop variable allowed) or a small constant (0..64, an inline constant of the encoding).
+    /// The SGPR pair of a pointer value or pointer variable (None when it is not held in SGPRs).
+    fn s2_of(&self, o: Opnd) -> Option<VReg> {
+        let r = match o {
+            Opnd::Val(v) => *self.val.get(&v)?,
+            Opnd::Var(v) => *self.vars.get(v.0 as usize)?,
+            _ => return None,
+        };
+        (self.mir.vreg_class(r) == RClass::S2).then_some(r)
+    }
+
     fn buffer_operands(&mut self, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd) -> Result<(VReg, Src, Src), String> {
         let rr = match rsrc {
             Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("descriptor v{v} not lowered"))?,
-            _ => return Err("buffer descriptor operand must be a value".to_string()),
+            // a descriptor carried in a loop / scope variable (an S4 variable)
+            Opnd::Var(v) => *self.vars.get(v.0 as usize).ok_or("descriptor variable not lowered")?,
+            _ => return Err("buffer descriptor operand must be a value or a variable".to_string()),
         };
         if self.mir.vreg_class(rr) != RClass::S4 {
             return Err("buffer access: the descriptor operand is not an S4 register".to_string());
@@ -2093,6 +2108,23 @@ impl Lowerer {
                 Stmt::SetVar { var, value } => {
                     let dst = self.vars[var.0 as usize];
                     let class = self.mir.vreg_class(dst);
+                    // a pointer (S2) / descriptor (S4) variable: dword moves (none when the value is pinned at the variable's registers)
+                    if matches!(class, RClass::S2 | RClass::S4) {
+                        let src = match value {
+                            Opnd::Val(v) => *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?,
+                            Opnd::Var(w) => *self.vars.get(w.0 as usize).ok_or("variable not lowered")?,
+                            _ => return Err("a pointer / descriptor variable is set from a value".to_string()),
+                        };
+                        if self.mir.vreg_class(src) != class {
+                            return Err(format!("set_var: a {class:?} variable set from a {:?} value", self.mir.vreg_class(src)));
+                        }
+                        self.touch(&[Src::Reg(src)]);
+                        for k in 0..class.dwords() as u8 {
+                            let (d, s) = (self.sub_alias(dst, k, RClass::S1), self.sub_alias(src, k, RClass::S1));
+                            self.push(MInst::new(MOp::SMovB32).def(d).srcreg(s));
+                        }
+                        return Ok(());
+                    }
                     if class == RClass::S1 {
                         let s = self.s_operand(*value)?;
                         if let Src::Reg(x) = s {
@@ -3556,12 +3588,12 @@ impl Lowerer {
             }
             // exact mode: a wave-uniform pointer add on an SGPR pair stays scalar (`s_add_u32` + `s_addc_u32`), e.g. a buffer descriptor base
             // built from a kernarg pointer plus a uniform offset (the vendor's form)
-            Op::PtrAdd { base: Opnd::Val(bv), byte_off }
+            Op::PtrAdd { base: base @ (Opnd::Val(_) | Opnd::Var(_)), byte_off }
                 if self.exact
-                    && self.val.get(bv).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S2)
+                    && self.s2_of(*base).is_some()
                     && (self.sgpr_src(*byte_off).is_some() || self.const_bits(*byte_off).is_some()) =>
             {
-                let rb = self.val[bv];
+                let rb = self.s2_of(*base).unwrap();
                 let off = match self.sgpr_src(*byte_off) {
                     Some(s) => Src::Reg(s),
                     None => Src::Imm(self.const_bits(*byte_off).unwrap()),
@@ -3610,8 +3642,11 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::BufferRsrc { base, num_records } => {
-                let Opnd::Val(bv) = *base else { return Err("buffer descriptor base must be a kernarg pointer value".to_string()) };
-                let br = *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?;
+                let br = match *base {
+                    Opnd::Val(bv) => *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?,
+                    Opnd::Var(w) if self.exact => *self.vars.get(w.0 as usize).ok_or("variable not lowered")?,
+                    _ => return Err("buffer descriptor base must be a kernarg pointer value".to_string()),
+                };
                 if self.mir.vreg_class(br) != RClass::S2 {
                     return Err("buffer descriptor base must be a scalar (kernarg) pointer: a per-lane pointer cannot form a descriptor".to_string());
                 }
@@ -3621,8 +3656,11 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::BufferRsrcDyn { base, num_records } => {
-                let Opnd::Val(bv) = *base else { return Err("buffer descriptor base must be a kernarg pointer value".to_string()) };
-                let br = *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?;
+                let br = match *base {
+                    Opnd::Val(bv) => *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?,
+                    Opnd::Var(w) if self.exact => *self.vars.get(w.0 as usize).ok_or("variable not lowered")?,
+                    _ => return Err("buffer descriptor base must be a kernarg pointer value".to_string()),
+                };
                 if self.mir.vreg_class(br) != RClass::S2 {
                     return Err("buffer descriptor base must be a scalar (kernarg) pointer".to_string());
                 }
@@ -3686,6 +3724,23 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
+            Op::Permlane32SwapA { a, b } => {
+                // in place on two registers: copies into the two result registers (no instruction when the author pinned them at the
+                // operands' registers), then the swap writes both
+                let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                self.push(MInst::new(MOp::VPermlane32Swap).def(la).srcreg(la).srcreg(lb));
+                self.val.insert(dst, la);
+                self.swap_second.insert(dst, lb);
+            }
+            Op::Permlane32SwapB { swap: Opnd::Val(s) } => {
+                let r = *self.swap_second.get(s).ok_or("Permlane32SwapB: the operand is not a Permlane32SwapA")?;
+                self.val.insert(dst, r);
+            }
+            Op::Permlane32SwapB { .. } => return Err("Permlane32SwapB: the operand must be a Permlane32SwapA value".into()),
             Op::Permlane32Swap { a, b } => {
                 let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb)]);

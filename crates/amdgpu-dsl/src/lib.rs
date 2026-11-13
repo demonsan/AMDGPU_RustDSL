@@ -566,6 +566,11 @@ pub enum Op {
     /// `v_permlane32_swap`: exchanges lanes 32..63 of `a` with lanes 0..31 of `b`. Result: a Frag2 whose dword 0 is the new `a` and dword 1
     /// the new `b` (use `permlane32_swap`, which returns the two values).
     Permlane32Swap { a: Opnd, b: Opnd },
+    /// `v_permlane32_swap_b32 vA, vB` in place on two separate registers (exact mode): the value is the new content of a's register;
+    /// `Permlane32SwapB` names the new content of b's register (the same instruction).
+    Permlane32SwapA { a: Opnd, b: Opnd },
+    /// The second result of a `Permlane32SwapA` (no instruction of its own).
+    Permlane32SwapB { swap: Opnd },
     /// Build a four-dword fragment from four 32-bit values.
     Frag4(Opnd, Opnd, Opnd, Opnd),
     /// Read dword `index` (0..3) of a four-dword fragment.
@@ -757,6 +762,7 @@ impl Op {
             Op::VarSlice8 { .. } => DType::Frag8,
             Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
+            Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } => DType::U32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
@@ -853,7 +859,8 @@ impl Op {
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
             Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![Opnd::Var(*var)],
-            Op::Permlane32Swap { a, b } => vec![*a, *b],
+            Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } => vec![*a, *b],
+            Op::Permlane32SwapB { swap } => vec![*swap],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
@@ -5010,7 +5017,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                         },
                         Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) | Op::MovS { .. } => true,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
-                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
+                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
                         | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
                         | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } | Op::AtomicAddU32 { .. }

@@ -23,6 +23,7 @@ pub fn synthetic_kind(m: &MFunction, stmts: &[amdgpu_dsl::Stmt], i: &MInst) -> O
     }
     match i.op {
         MOp::SNop if !matches!(op, Some(Op::Asm { .. })) && !matches!(st, Some(Stmt::SNop { .. })) => Some("s_nop"),
+        // the swap's operand copies are the two-address form: they vanish when pinned in place; otherwise they are copies
         // an authored move (`mov_v` / `mov_s`) is the author's instruction
         MOp::VMovB32 | MOp::SMovB32 | MOp::VMovFromS if matches!(op, Some(Op::MovV { .. } | Op::MovS { .. })) => None,
         MOp::VMovB32 | MOp::SMovB32 if i.srcs.iter().all(|s| matches!(s, Src::Imm(_))) && !matches!(op, Some(Op::ConstI32(_) | Op::ConstF32(_))) => {
