@@ -222,6 +222,9 @@ struct An<'a> {
     /// pointer / descriptor variables: their provenance (the offset part lives in `vars`); `AV::Other` = conflicting provenances
     var_prov: HashMap<VarId, AV>,
     var_init: HashMap<VarId, Itv>,
+    /// E5 scope variables (`DeclareVars`): tracked flow-sensitively (a `set_var` takes effect at once; `if` arms join; a loop that
+    /// writes one runs it through its fixpoint). Absent from `vars` = not yet defined on any path (an `Undef` initial value).
+    scope: std::collections::HashSet<VarId>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
     tag: Option<(usize, Itv, Opnd)>,
@@ -2246,9 +2249,12 @@ impl<'a> An<'a> {
                             self.winner_axes.extend(w.axes.iter().copied());
                         }
                     }
+                    let before = self.scope_state();
                     self.walk(then, idx);
                     self.winner_axes.truncate(wn);
                     self.undo_fact(undo);
+                    let after_then = self.scope_state();
+                    self.set_scope_state(&before);
                     if let Some(e) = els {
                         self.idx = *idx;
                         self.exec_stmt(&Stmt::Else);
@@ -2257,6 +2263,10 @@ impl<'a> An<'a> {
                         self.walk(e, idx);
                         self.undo_fact(undo);
                     }
+                    // the join of the two paths (an arm that leaves the loop contributes too: an over-approximation)
+                    let after_else = self.scope_state();
+                    let joined = self.join_scope(&after_then, &after_else);
+                    self.set_scope_state(&joined);
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::EndIf);
                     *idx += 1;
@@ -2406,7 +2416,150 @@ impl<'a> An<'a> {
     }
 
     /// A loop: fixpoint of the loop variables over the body, then the reporting pass.
+    /// The E5 scope variables' current values (None = undefined on every path so far).
+    fn scope_state(&self) -> Vec<(VarId, Option<Itv>)> {
+        let mut v: Vec<(VarId, Option<Itv>)> = self.scope.iter().map(|x| (*x, self.vars.get(x).cloned())).collect();
+        v.sort_by_key(|(x, _)| x.0);
+        v
+    }
+    fn set_scope_state(&mut self, s: &[(VarId, Option<Itv>)]) {
+        for (x, it) in s {
+            match it {
+                Some(i) => {
+                    self.vars.insert(*x, i.clone());
+                }
+                None => {
+                    self.vars.remove(x);
+                }
+            }
+        }
+    }
+    fn join_scope(&self, a: &[(VarId, Option<Itv>)], b: &[(VarId, Option<Itv>)]) -> Vec<(VarId, Option<Itv>)> {
+        let bm: HashMap<VarId, Option<Itv>> = b.iter().cloned().collect();
+        a.iter()
+            .map(|(x, ia)| {
+                let ib = bm.get(x).cloned().flatten();
+                let j = match (ia, ib) {
+                    (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                    (Some(p), None) => Some(p.clone()),
+                    (None, q) => q,
+                };
+                (*x, j)
+            })
+            .collect()
+    }
+    /// E5 scope variables a loop body writes (`set_var`): they take part in the loop's fixpoint.
+    fn scope_written(&self, body: &[Node]) -> Vec<VarId> {
+        fn scan(nodes: &[Node], out: &mut Vec<VarId>) {
+            for n in nodes {
+                match n {
+                    Node::S(Stmt::SetVar { var, .. }) => out.push(*var),
+                    Node::S(_) => {}
+                    Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } => scan(body, out),
+                    Node::If { then, els, .. } => {
+                        scan(then, out);
+                        if let Some(e) = els {
+                            scan(e, out);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        scan(body, &mut out);
+        out.retain(|v| self.scope.contains(v));
+        out.sort_by_key(|v| v.0);
+        out.dedup();
+        out
+    }
+
     fn walk_loop(&mut self, vars: &[VarId], init: &[Opnd], body: &[Node], begin: usize) {
+        self.tag = None;
+        // E5 scope variables written in the body: their entry value joined with the body's end value, to a fixpoint (widened to
+        // unbounded after 5 rounds), before the reporting walk
+        let sw = self.scope_written(body);
+        if !sw.is_empty() {
+            let mut cur: Vec<Option<Itv>> = sw.iter().map(|v| self.vars.get(v).cloned()).collect();
+            let mut ok = false;
+            for round in 0..6 {
+                for (v, it) in sw.iter().zip(cur.iter()) {
+                    match it {
+                        Some(i) => {
+                            self.vars.insert(*v, i.clone());
+                        }
+                        None => {
+                            self.vars.remove(v);
+                        }
+                    }
+                }
+                // a quiet walk of the loop as a whole (its own loop variables included)
+                self.rep.quiet += 1;
+                let saved_sets = self.pending_sets.len();
+                self.walk_loop_inner(vars, init, body, begin);
+                self.pending_sets.truncate(saved_sets);
+                self.rep.quiet -= 1;
+                let mut changed = false;
+                for (k, v) in sw.iter().enumerate() {
+                    if self.assumed.contains_key(v) {
+                        continue;
+                    }
+                    let end = self.vars.get(v).cloned();
+                    let j = match (&cur[k], end) {
+                        (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                        (Some(p), None) => Some(p.clone()),
+                        (None, q) => q,
+                    };
+                    if j != cur[k] {
+                        changed = true;
+                        cur[k] = if round >= 4 { Some(Itv::top()) } else { j };
+                    }
+                }
+                if !changed {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                for (k, v) in sw.iter().enumerate() {
+                    if !self.assumed.contains_key(v) {
+                        cur[k] = Some(Itv::top());
+                    }
+                }
+            }
+            for (v, it) in sw.iter().zip(cur.iter()) {
+                match it {
+                    Some(i) => {
+                        self.vars.insert(*v, i.clone());
+                    }
+                    None => {
+                        self.vars.remove(v);
+                    }
+                }
+            }
+            // the reporting walk starts from the fixpoint; after the loop the variables hold the hull
+            self.walk_loop_inner(vars, init, body, begin);
+            for (v, it) in sw.iter().zip(cur.iter()) {
+                let end = self.vars.get(v).cloned();
+                let j = match (it, end) {
+                    (Some(p), Some(q)) => Some(p.join(&q, &self.cx).norm(&self.cx)),
+                    (Some(p), None) => Some(p.clone()),
+                    (None, q) => q,
+                };
+                match j {
+                    Some(i) => {
+                        self.vars.insert(*v, i);
+                    }
+                    None => {
+                        self.vars.remove(v);
+                    }
+                }
+            }
+            return;
+        }
+        self.walk_loop_inner(vars, init, body, begin);
+    }
+
+    fn walk_loop_inner(&mut self, vars: &[VarId], init: &[Opnd], body: &[Node], begin: usize) {
         self.tag = None;
         let mut cur: Vec<Itv> = Vec::new();
         for (v, i0) in vars.iter().zip(init.iter()) {
@@ -2572,14 +2725,28 @@ impl<'a> An<'a> {
                 // applied at the end of the enclosing statement list, so a later `break_if` of the same list refines the value (the back
                 // edge is reached only when the break was not taken)
                 self.pending_sets.push((i, *var, *value));
+                // an E5 scope variable holds the value from here on (flow-sensitive; `if` joins and loop fixpoints cover the paths)
+                if self.scope.contains(var) {
+                    let it = self.var_part(*var, value);
+                    let it = match self.assumed.get(var) {
+                        Some(a) => a.clone(),
+                        None => it,
+                    };
+                    self.vars.insert(*var, it);
+                }
             }
-            // E5 scope variables: set anywhere in their scope, along any path (if arms, loop exits): flow-insensitive, so unbounded unless
-            // an `assume` restricts them (each `set_var` is then checked against it, GV-ASSUME)
+            // E5 scope variables: defined by their init (absent = `Undef`: no value on any path yet)
             Stmt::DeclareVars { vars, init } => {
                 for (v, i0) in vars.iter().zip(init.iter()) {
+                    self.scope.insert(*v);
+                    let undef = matches!(i0, Opnd::Val(x) if matches!(self.defs.get(x), Some(Op::Undef { .. })));
+                    if undef {
+                        self.vars.remove(v);
+                        continue;
+                    }
                     let it = self.var_part(*v, i0);
-                    self.var_init.insert(*v, it);
-                    let cur = self.assumed.get(v).cloned().unwrap_or_else(Itv::top);
+                    self.var_init.insert(*v, it.clone());
+                    let cur = self.assumed.get(v).cloned().unwrap_or(it);
                     self.vars.insert(*v, cur);
                 }
             }
@@ -2770,7 +2937,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
