@@ -1958,7 +1958,7 @@ impl<'a> An<'a> {
                 }
             },
             Op::MovV { a, .. } | Op::MovS { a, .. } => self.av_of(a),
-            Op::AddK { a, k } => AV::Int(self.int_of(a).add(&Itv::konst(*k as i128), &self.cx)),
+            Op::AddK { a, k } => AV::Int(self.int_of(a).add(&Itv::konst(*k as i128))),
             // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
             Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),
             // a clock reading: any 32-bit value
