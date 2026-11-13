@@ -919,6 +919,16 @@ impl<'a> An<'a> {
                 let (arg, l) = self.ptr_slin(base, depth + 1)?;
                 Some((arg, slin_add(l, self.slin(byte_off, depth + 1)?)))
             }
+            // a pointer reassembled from its own words (exact mode: the author's SGPR pair, the high word possibly masked to 48 bits)
+            Op::PtrCat { lo, .. } => {
+                let p = self.ptr_of_word(lo)?;
+                if self.ptr_equiv_words(o) {
+                    self.ptr_slin(&p, depth + 1)
+                } else {
+                    None
+                }
+            }
+            Op::MovS { a, .. } => self.ptr_slin(a, depth + 1),
             Op::PtrMadU32 { base, a, b } => {
                 let (arg, l) = self.ptr_slin(base, depth + 1)?;
                 let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
@@ -1029,11 +1039,40 @@ impl<'a> An<'a> {
         self.record_store(b, e, byte_off, size);
     }
 
+    /// The pointer whose low word `w` is (through authored moves): `PtrLo(p)` -> p.
+    fn ptr_of_word(&self, w: &Opnd) -> Option<Opnd> {
+        let r = self.word_root(w);
+        let Opnd::Val(v) = r else { return None };
+        match self.defs.get(&v) {
+            Some(Op::PtrLo(p)) => Some(*p),
+            _ => None,
+        }
+    }
+    /// A PtrCat whose high word is the same pointer's high word (or that word masked to its low 16 bits, the identity on a canonical
+    /// 48-bit address).
+    fn ptr_equiv_words(&self, cat: &Opnd) -> bool {
+        let Opnd::Val(v) = cat else { return false };
+        let Some(Op::PtrCat { lo, hi }) = self.defs.get(v) else { return false };
+        let Some(p) = self.ptr_of_word(lo) else { return false };
+        let h = self.word_root(hi);
+        let Opnd::Val(hv) = h else { return false };
+        match self.defs.get(&hv) {
+            Some(Op::PtrHi(q)) => *q == p,
+            Some(Op::AndI32(a, Opnd::I32(0xffff))) | Some(Op::AndI32(Opnd::I32(0xffff), a)) => {
+                matches!(self.word_root(a), Opnd::Val(x) if matches!(self.defs.get(&x), Some(Op::PtrHi(q)) if *q == p))
+            }
+            _ => false,
+        }
+    }
+
     fn record_buffer_store(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
         self.caps_cur.borrow_mut().clear();
         let base = match rsrc {
             Opnd::Val(v) => match self.defs.get(v) {
                 Some(Op::BufferRsrc { base, .. } | Op::BufferRsrcDyn { base, .. }) => self.ptr_slin(base, 0),
+                // exact mode: a descriptor assembled from words - its base is the pointer of word 0 (word 1 its high half, checked by the
+                // descriptor recognition)
+                Some(Op::RsrcCat { words }) => self.ptr_of_word(&words[0]).and_then(|p| self.ptr_slin(&p, 0)),
                 _ => None,
             },
             _ => None,
