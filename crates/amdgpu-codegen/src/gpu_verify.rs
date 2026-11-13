@@ -234,6 +234,10 @@ struct An<'a> {
     /// proven ring counters (var -> [min, max] of the reachable values) and their shadows (var -> (init X, ring init c, min, max): the var
     /// is X - c + ring at every point)
     rings: RingFacts,
+    /// value -> the values whose definitions read it (for re-evaluation under branch facts)
+    users: HashMap<ValueId, Vec<ValueId>>,
+    /// per active branch fact on a value: the dependents it re-evaluated and their previous values
+    dep_undo: Vec<Vec<(ValueId, Option<AV>)>>,
     /// active lanes (highest active lane + 1) under the author's EXEC (exact mode `exec_set` / save / restore); 64 otherwise
     exec_lanes: u32,
     exec_saved: HashMap<u32, u32>,
@@ -2519,6 +2523,30 @@ impl<'a> An<'a> {
             Opnd::Val(v) => match self.env.get(&v) {
                 Some(AV::Int(_)) => {
                     let old = self.env.insert(v, AV::Int(refined));
+                    // values computed EARLIER from v (e.g. a prelude address) are re-evaluated under the fact (undone with it)
+                    let mut saved: Vec<(ValueId, Option<AV>)> = Vec::new();
+                    let mut work = vec![v];
+                    let mut deps: Vec<(usize, ValueId)> = Vec::new();
+                    let mut seen: HashSet<ValueId> = HashSet::new();
+                    while let Some(u) = work.pop() {
+                        for &d in self.users.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
+                            let Some(&pd) = self.rings.let_pos.get(&d) else { continue };
+                            if pd < self.idx && self.env.contains_key(&d) && seen.insert(d) && seen.len() <= 4096 {
+                                deps.push((pd, d));
+                                work.push(d);
+                            }
+                        }
+                    }
+                    deps.sort();
+                    self.rep.quiet += 1;
+                    for (_, d) in deps {
+                        if let Some(op) = self.defs.get(&d).cloned() {
+                            let nv = self.eval(&op);
+                            saved.push((d, self.env.insert(d, nv)));
+                        }
+                    }
+                    self.rep.quiet -= 1;
+                    self.dep_undo.push(saved);
                     Some((x, old, None))
                 }
                 _ => None,
@@ -2537,14 +2565,26 @@ impl<'a> An<'a> {
                     self.vars.remove(&v);
                 }
             },
-            Some((Opnd::Val(v), old, _)) => match old {
-                Some(a) => {
-                    self.env.insert(v, a);
+            Some((Opnd::Val(v), old, _)) => {
+                for (d, o) in self.dep_undo.pop().unwrap_or_default().into_iter().rev() {
+                    match o {
+                        Some(a) => {
+                            self.env.insert(d, a);
+                        }
+                        None => {
+                            self.env.remove(&d);
+                        }
+                    }
                 }
-                None => {
-                    self.env.remove(&v);
+                match old {
+                    Some(a) => {
+                        self.env.insert(v, a);
+                    }
+                    None => {
+                        self.env.remove(&v);
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -3273,7 +3313,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
         for (v, r) in &an.rings.rings {
             eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
@@ -4048,4 +4088,19 @@ fn ring_facts(f: &Function) -> RingFacts {
     let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
     let starts: HashMap<VarId, Vec<i128>> = ring_const.iter().map(|(v, l)| (*v, l.iter().map(|x| x.1).collect())).collect();
     RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, starts, sym_cache: Default::default() }
+}
+
+/// value -> the `Let` values whose operations read it.
+fn value_users(f: &Function) -> HashMap<ValueId, Vec<ValueId>> {
+    let mut m: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for s in f.stmts() {
+        if let Stmt::Let { dst, op } = s {
+            for o in op.operands() {
+                if let Opnd::Val(v) = o {
+                    m.entry(v).or_default().push(*dst);
+                }
+            }
+        }
+    }
+    m
 }
