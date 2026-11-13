@@ -274,3 +274,32 @@ fn an_undef_value_is_only_an_initial_value() {
     let errs = amdgpu_dsl::verify(&b.finish());
     assert!(errs.iter().any(|e| e.contains("undefined value")), "{errs:?}");
 }
+
+/// `v_permlane32_swap_b32 vA, vB` in place on two separately pinned registers (the two-result form), no copies.
+#[test]
+fn permlane32_swap_in_place_on_two_registers() {
+    let mut b = FnBuilder::new("probe_exact_swap", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(64 * 4));
+    b.exact();
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    b.wait_lds(0);
+    let rs = b.buffer_rsrc_sized(po, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
+    let x = b.mov_v(DType::I32, Opnd::I32(5));
+    let y = b.mov_v(DType::I32, Opnd::I32(7));
+    let sa = b.let_(Op::Permlane32SwapA { a: Opnd::Val(x), b: Opnd::Val(y) });
+    let sb = b.let_(Op::Permlane32SwapB { swap: Opnd::Val(sa) });
+    let s = b.let_(Op::AddI32(Opnd::Val(sa), Opnd::Val(sb)));
+    let vf = b.let_(Op::BitcastF32(Opnd::Val(s)));
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
+    for (v, r) in [(tid, 0), (off, 1), (x, 2), (sa, 2), (y, 5), (sb, 5), (s, 6), (vf, 6)] {
+        b.pin_vgpr_at(RegRef::Val(v), r);
+    }
+    b.pin_sgpr_at(RegRef::Val(po), 8);
+    b.pin_sgpr_at(RegRef::Val(rs), 12);
+    let c = amdgpu_codegen::compile(&b.finish()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("v_permlane32_swap_b32 v2, v5"), "{}", c.asm);
+    assert_eq!(c.asm.matches("v_mov_b32").count(), 2, "only the two authored moves: {}", c.asm);
+}
