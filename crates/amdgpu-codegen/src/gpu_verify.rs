@@ -2374,7 +2374,7 @@ impl<'a> An<'a> {
             }
             Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
             Stmt::TrustWait { reason } => {
-                let sev = if f.exact { Severity::Warning } else { Severity::Error };
+                let sev = if f.exact { Severity::Warn } else { Severity::Error };
                 self.rep.add("GV-TRUST-TIMING", sev, format!("stmt {}: TRUSTED timing (the next read is not guaranteed by the wait counters): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));
             }
             Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
