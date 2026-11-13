@@ -1,0 +1,110 @@
+# Exact authored mode (design note)
+
+**Goal:** 1:1 replication of a vendor kernel's asm. For a kernel or a region declared **exact**, the author fixes the complete instruction
+order and every physical register, including the explicit `s_nop` / `s_waitcnt` they place. The back end does NOT schedule, allocate
+registers, or insert waits / nops / copies. It only VERIFIES, and any violation is a compile error that names the instruction pair, the
+register or the rule.
+
+Item (2), the DSL register plan for the replica, is kernel-opt's; this note is item (1).
+
+Context:
+- the pass list: [pass-catalog.md](pass-catalog.md) section 9;
+- authored regions and pins: [weaver-regs.md](weaver-regs.md);
+- safe-asm windows: [safe-asm-design.md](safe-asm-design.md);
+- the replica findings: [fmha-replica.md](fmha-replica.md) sections 4.4 and 4.8.
+
+Opt-in only. A kernel without an exact declaration compiles exactly as today (md5 manifest unchanged).
+
+## 1. Scope: region first, then kernel
+
+**`declare_region(name, exact)`** (extending today's `authored`). Inside the region every instruction and register is the author's. Outside
+it, the normal pipeline runs.
+- Values crossing the boundary must be pinned: they are the region's hand-offs.
+- The rest of the kernel is allocated around the pinned ranges. This uses the existing pins-first allocation (`regalloc` TwoPhase, pins
+  first).
+- The replica's matrix phase is the first target. A whole kernel is "one exact region around the body" plus an exact prologue and
+  epilogue.
+
+## 2. What the author must be able to express
+
+| Need | Today | Exact mode |
+|---|---|---|
+| physical VGPR of a value | `pin_vgpr_at(r, base)` (HARD) | required for EVERY value defined in the region, temporaries included; a missing pin is an error |
+| physical SGPR / AGPR | no SGPR pin; AGPR via `pin_agpr` (file, not number) | `pin_sgpr_at`, `pin_agpr_at` (new) |
+| register reuse (P in S, the K / V rotation) | `reg_share` (hint), `reg_rotate` (branch) | the pins themselves: two values with the same pin and disjoint lives are the reuse, checked (section 4) |
+| wait states | hazard passes insert `s_nop` | `b.s_nop(n)` statement (new; lowers to `SNop`, never merged or moved) |
+| counter waits | `wait_vm(n)`, `wait_lds(n)` (explicit, kept) | the same, plus `b.waitcnt(vm, lgkm)` for the combined form the vendor uses; lowering emits no automatic waits |
+| M0 | written by lowering / `m0-explicit` per DMA (or `m0reuse` groups) | `b.set_m0(v)` statement (new); an LDS-DMA in the region uses the current M0 and never writes it itself |
+| instruction choice | DSL op -> lowering pattern (+ tokens) | every DSL op in the region must have a FIXED expansion (table below); patterns that pick forms by context (`sgpr`, `imm`, `addrfold`, `cmpfold`) are on inside exact regions, and the result is checked, not chosen |
+| exact instruction text | safe-asm `Seq` windows (`Op::Asm`, pinned) | allowed inside exact regions; their own register / hazard rules are verified as today |
+| block layout | structured `if` / `loop`; `jthread`, `coldlayout` transform the CFG | the CFG passes are off inside exact regions; the author writes the exits (multi-exit loops via `break_if`) and the layout is the statement order |
+| VCC / SCC | implicit | implicit, verified (section 4 item 5) |
+
+## 3. Lowering in exact mode: no hidden instructions
+
+Every machine instruction gets an origin when lowering emits it: the statement index that produced it, plus `synthetic` when lowering
+added it on its own. In an exact region a synthetic instruction is an error. The error names the statement and the instruction, and says
+which DSL form avoids it.
+
+| Lowering source of extra instructions | Exact-mode behaviour |
+|---|---|
+| constant materialization and its cache (`consts`, hoisted `v_mov` / `s_mov` of immediates) | a constant is an instruction at its own statement (no cache, no hoist), pinned like any value; inline / literal operands where the form allows, checked |
+| SGPR -> VGPR copies (`VMovFromS`), readfirstlane for a uniform operand | allowed only where the author wrote the op; an operand class mismatch is an error ("operand 1 of stmt N needs a VGPR: the value is in s12") |
+| `set_var` copies (loop variables), `coalesce` | a loop variable and the values written to it must share the pin, so no copy is needed; otherwise error |
+| descriptor pseudos (`SBufferRsrc`: 4 SALU), `VPtrAdd` (2 VALU), other fixed multi-instruction expansions | allowed: the expansion is fixed, and its registers come from the pins; listed by `amdc exact-report` |
+| M0 writes per DMA, `m0-reuse`, `m0-explicit`, `m0-pad` | off inside exact regions; M0 must be set by `set_m0`; a missing / wrong M0 at a DMA is an error |
+| automatic waits (`MInst::auto`), `waitcnt-recompute` | none emitted; verified (section 4) |
+| hazard `s_nop`s (`hazard-value`, post-RA hazards, `hz-fill`) | none inserted; verified |
+| remat / LDS spill / retry ladders | off: an exact region that does not fit is an error, not a retry |
+| scheduler, `bweave-order` merges, `ldshoist`, `slotfill`, `wsink`, `ldahead` | off inside exact regions (today's `authored` already turns the scheduler off per region) |
+
+`amdc exact-report <kernel>` lists per statement the instructions it produced, synthetic ones marked. Authors use it while converting a
+region; it is the step-1 deliverable that needs no hardware.
+
+## 4. Verification list (all errors, none fixes)
+
+The idea: run each fixing pass on a COPY of the MIR in "check mode". Any instruction it would insert, or any register it would change, is
+a violation, reported with its position and the rule. This reuses today's passes, so their rules are checked, not re-implemented.
+
+1. **Hazards:**
+   - `hazard-value`, `hazard-inflight-waw`, `hazard-phys-war`, `hazard-valu-sgpr`, `hazard-soft-clause` and the M0 hazard
+     (`m0-lds-dma`), all against the target hazard table (`amdgpu-target`);
+   - error format: "stmt 812 v_mfma … -> stmt 815 v_add_f32 reads v[52:55]: needs 18 wait states (mfma-dst-write), has 11";
+   - the test-time hazard oracle (`tools/hazard_oracle.sh`, LLVM's recognizer) runs on exact kernels like on every other.
+2. **Waits:**
+   - `verify_waits` over the given order (vm / lgkm scoreboard, operand waits incl. DMA operands, the ring-slot tokens of a plan with
+     rings);
+   - error: "stmt 640 ds_read_b128 v[20:23] overwrites a register the load at stmt 601 is still writing (vmcnt needs <= 3, last wait
+     vmcnt(5))".
+3. **Registers:**
+   - every value in the region is pinned, and the class / width / alignment rules apply (even tuple alignment for MFMA operands, the ISA
+     rule);
+   - liveness: two values whose live ranges overlap may not overlap in registers. Error names both values, their defining statements and
+     the register;
+   - pins outside the file limits (VGPR count, AGPR offset, SGPR budget) are errors;
+   - the launch budget is checked as today.
+4. **Implicit effects:** each instruction's emitted text against its table row (`tests/emit_effects.rs` as a per-kernel check). Between a
+   producer of SCC / VCC / M0 / EXEC and its consumer, no other writer of that state may sit. Error names the three instructions.
+5. **Semantics:** `gpu_verify --strict` on the IR (LDS bounds, tile protocol, barriers, global regions, GV-PLAN-RING), as for every kernel.
+6. **Fixed expansions:** emission of every MIR instruction succeeds, and the region's instruction count equals what `exact-report` listed
+   (no pass added or dropped anything).
+
+Mutation tests (one per rule): remove an authored `s_nop`, a `waitcnt`, a `set_m0`; give two live values one pin; put an SCC writer
+between an `s_cmp` and its `s_cselect`. Each must fail with the named rule.
+
+## 5. Steps
+
+| Step | Content | Gate |
+|---|---|---|
+| E1 | instruction origins + `synthetic` flag in lowering; `amdc exact-report` | md5 identical (analysis only) |
+| E2 | check-mode runs of the hazard / wait / M0 passes (copy + compare); the register legality check of a fully pinned region | md5 identical; mutation tests |
+| E3 | DSL: `declare_region(.., exact)`, `pin_sgpr_at`, `pin_agpr_at`, `s_nop`, `waitcnt(vm, lgkm)`, `set_m0`; the exact pass body for marked regions (scheduler, auto waits, nops, M0 passes, CFG passes, ladders off; checks on) | md5 identical for every existing kernel; unit tests on a small exact kernel; hardware probe (a pinned window that runs) |
+| E4 | the replica's matrix phase in exact mode with kernel-opt's register plan (2) | port_gate (correctness), then perf vs the vendor in-session |
+
+## 6. Coordination with kernel-opt (item 2)
+
+The register plan must give a pin to every value of the exact region. That includes temporaries: read results, scale words, P inside S,
+the K / V rotation as explicit pins, and the loop-carried values.
+
+My side: the exact region tells which values lack one ("stmt N defines %v.. without a pin"), so the plan can be completed iteratively
+with `exact-report`.
