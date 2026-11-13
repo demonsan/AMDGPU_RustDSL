@@ -149,3 +149,30 @@ fn the_hardware_probe_kernel_compiles_exactly() {
         std::fs::write(format!("{dir}/probe_exact_hw.ir"), amdgpu_dsl::ir_text::print(&f)).unwrap();
     }
 }
+
+/// (n) a buffer descriptor over a kernarg pointer plus a uniform offset: scalar `s_add_u32` + `s_addc_u32` in exact mode.
+#[test]
+fn a_descriptor_base_from_a_scalar_pointer_add() {
+    let mut b = FnBuilder::new("probe_exact_ptradd", 64);
+    b.arg("out", DType::Ptr, 0x00, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.exact();
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    b.wait_lds(0);
+    let pb = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::I32(256) });
+    let rs = b.buffer_rsrc_sized(pb, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
+    let vf = b.let_(Op::BitcastF32(Opnd::Val(off)));
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
+    b.pin_sgpr_at(RegRef::Val(po), 8);
+    b.pin_sgpr_at(RegRef::Val(pb), 10);
+    b.pin_sgpr_at(RegRef::Val(rs), 12);
+    b.pin_vgpr_at(RegRef::Val(tid), 0);
+    b.pin_vgpr_at(RegRef::Val(off), 1);
+    b.pin_vgpr_at(RegRef::Val(vf), 1);
+    let f = b.finish();
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_add_u32 s10, s8, 0x100") || c.asm.contains("s_add_u32 s10, s8, 256"), "{}", c.asm);
+    assert!(c.asm.contains("s_addc_u32 s11, s9, 0"), "{}", c.asm);
+}

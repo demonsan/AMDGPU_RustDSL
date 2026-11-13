@@ -3468,6 +3468,30 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VCndmask).def(d).src(b_src).srcreg(ra));
                 self.val.insert(dst, d);
             }
+            // exact mode: a wave-uniform pointer add on an SGPR pair stays scalar (`s_add_u32` + `s_addc_u32`), e.g. a buffer descriptor base
+            // built from a kernarg pointer plus a uniform offset (the vendor's form)
+            Op::PtrAdd { base: Opnd::Val(bv), byte_off }
+                if self.exact
+                    && self.val.get(bv).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S2)
+                    && (self.sgpr_src(*byte_off).is_some() || self.const_bits(*byte_off).is_some()) =>
+            {
+                let rb = self.val[bv];
+                let off = match self.sgpr_src(*byte_off) {
+                    Some(s) => Src::Reg(s),
+                    None => Src::Imm(self.const_bits(*byte_off).unwrap()),
+                };
+                let mut regs = vec![Src::Reg(rb)];
+                if let Src::Reg(_) = off {
+                    regs.push(off);
+                }
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::S2);
+                let (dlo, dhi) = (self.sub_alias(d, 0, RClass::S1), self.sub_alias(d, 1, RClass::S1));
+                let (blo, bhi) = (self.sub_alias(rb, 0, RClass::S1), self.sub_alias(rb, 1, RClass::S1));
+                self.push(MInst::new(MOp::SAddU32).def(dlo).srcreg(blo).src(off));
+                self.push(MInst::new(MOp::SAddcU32).def(dhi).srcreg(bhi).src(Src::Imm(0)));
+                self.val.insert(dst, d);
+            }
             Op::PtrAdd { base, byte_off } => {
                 let rb = self.as_v2(*base)?;
                 let ro = self.as_v1(*byte_off)?;
