@@ -1299,6 +1299,7 @@ impl Lowerer {
     fn scalar_select(&mut self, dst: ValueId, cond: Opnd, a: Opnd, b: Opnd) -> Result<(), String> {
         let mut neg = false;
         let mut c = cond;
+        let mut cmp = MOp::SCmpLtI32;
         let (x, y) = loop {
             let Opnd::Val(v) = c else { return Err("scalar select: the condition is not a value".into()) };
             match self.defs.get(&v).cloned() {
@@ -1309,6 +1310,22 @@ impl Lowerer {
                 Some(Op::CmpLtI32(x, y)) => break (x, y),
                 Some(Op::CmpGeI32(x, y)) => {
                     neg = !neg;
+                    break (x, y);
+                }
+                // exact mode: the generic compare in the SALU form the author used
+                Some(Op::Cmp { pred, ty, a: x, b: y }) if self.exact => {
+                    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+                    cmp = match (pred, ty) {
+                        (P::Lt, T::I32) => MOp::SCmpLtI32,
+                        (P::Ge, T::I32) => {
+                            neg = !neg;
+                            MOp::SCmpLtI32
+                        }
+                        (P::Eq, _) => MOp::SCmpEqU32,
+                        (P::Ge, T::U32) => MOp::SCmpGeU32,
+                        (P::Le, T::U32) => MOp::SCmpLeU32,
+                        other => return Err(format!("scalar select: no SALU compare for {other:?}")),
+                    };
                     break (x, y);
                 }
                 other => return Err(format!("scalar select: condition {other:?} is not a uniform integer compare")),
@@ -1329,7 +1346,7 @@ impl Lowerer {
         }
         let regs: Vec<Src> = ops.iter().copied().filter(|s| matches!(s, Src::Reg(_))).collect();
         self.touch(&regs);
-        self.push(MInst::new(MOp::SCmpLtI32).src(ops[0]).src(ops[1]));
+        self.push(MInst::new(cmp).src(ops[0]).src(ops[1]));
         let d = self.new_vreg(RClass::S1);
         self.push(MInst::new(MOp::SCselectB32).def(d).src(ops[2]).src(ops[3]));
         self.val.insert(dst, d);
@@ -4539,7 +4556,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
         let mut cst: HashMap<ValueId, i64> = HashMap::new();
         // `scalarize2`: uniform integer compares (only consumed by uniform selects: the select re-emits them as s_cmp + s_cselect)
-        let ext = opt_on("scalarize2");
+        let ext = opt_on("scalarize2") || f.exact;
         let mut ucond: HashSet<ValueId> = HashSet::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
@@ -4571,6 +4588,14 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::MinI32(a, b) if ext => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
                         // `salu32`: uniform u32 subtract / or in SALU
                         Op::Bin(amdgpu_dsl::BinOp::SubU32 | amdgpu_dsl::BinOp::OrB32, a, b) if opt_on("salu32") => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        // exact mode: an authored scalar move is scalar; a generic integer compare of uniform operands is a uniform condition
+                        Op::MovS { .. } if f.exact => true,
+                        Op::Cmp { ty: amdgpu_dsl::CmpTy::U32 | amdgpu_dsl::CmpTy::I32, a, b, .. } if f.exact => {
+                            if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
                         Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) if ext => {
                             if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
                                 ucond.insert(*dst);
