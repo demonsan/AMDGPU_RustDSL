@@ -81,7 +81,7 @@ def imm(tok):
 FRAG = {1: 'U32', 2: 'Frag2', 4: 'Frag4', 8: 'Frag8', 16: 'Frag16'}
 
 # result types of the DSL ops the lifter emits (Op::result_ty in amdgpu-dsl)
-RTY = {'KernargSegment': 'Ptr', 'Permlane32SwapA': 'U32', 'Permlane32SwapB': 'U32', 'PtrLo': 'I32', 'PtrHi': 'I32', 'PtrCat': 'Ptr', 'RsrcCat': 'Rsrc', 'WorkitemId': 'U32', 'WorkgroupIdX': 'U32', 'WorkgroupIdY': 'U32', 'WorkgroupIdZ': 'U32', 'Undef': None, 'ConstI32': 'I32', 'ConstF32': 'F32', 'KernargI32': 'I32', 'KernargPtr': 'Ptr', 'BufferRsrc': 'Rsrc', 'MovV': None, 'MovS': None, 'NegF32': 'F32', 'MfmaBf16Wide': 'Frag16', 'BufferRsrcDyn': 'Rsrc', 'AddI32': 'I32', 'MulI32': 'I32', 'ShlI32': 'I32', 'LshrI32': 'I32',
+RTY = {'AddK': 'I32', 'KernargSegment': 'Ptr', 'Permlane32SwapA': 'U32', 'Permlane32SwapB': 'U32', 'PtrLo': 'I32', 'PtrHi': 'I32', 'PtrCat': 'Ptr', 'RsrcCat': 'Rsrc', 'WorkitemId': 'U32', 'WorkgroupIdX': 'U32', 'WorkgroupIdY': 'U32', 'WorkgroupIdZ': 'U32', 'Undef': None, 'ConstI32': 'I32', 'ConstF32': 'F32', 'KernargI32': 'I32', 'KernargPtr': 'Ptr', 'BufferRsrc': 'Rsrc', 'MovV': None, 'MovS': None, 'NegF32': 'F32', 'MfmaBf16Wide': 'Frag16', 'BufferRsrcDyn': 'Rsrc', 'AddI32': 'I32', 'MulI32': 'I32', 'ShlI32': 'I32', 'LshrI32': 'I32',
        'AndI32': 'I32', 'MinI32': 'I32', 'XorI32': 'I32', 'AddF32': 'F32', 'SubF32': 'F32', 'MulF32': 'F32', 'MaxF32': 'F32', 'FmaF32': 'F32', 'Max3F32': 'F32',
        'Exp2F32': 'F32', 'Log2F32': 'F32', 'RcpF32': 'F32', 'Cmp': 'I1', 'NotI1': 'I1', 'ReadFirstLane': 'U32', 'Frag2Lane': 'U32', 'Frag4Lane': 'U32',
        'Frag16Lane': 'U32', 'CvtPknormPair': 'I32', 'CvtP8x4FromU16': 'U32', 'CvtPkBf16F32': 'U32', 'PkMulF32': 'Frag2', 'PkFmaF32': 'Frag2',
@@ -383,6 +383,9 @@ class Lifter:
 
     def dst(self, tok, ty, rhs):
         f, a, n, _ = reg(tok)
+        if getattr(self, 'cur_e64', False):
+            self.stmt('EncodeE64')
+            self.cur_e64 = False
         return self.new(f, a, n, ty, rhs)
 
 
@@ -696,10 +699,7 @@ class Lifter:
         s = self.src(t[0], 'I32')
         k = imm(t[1])
         k = k - 0x10000 if k is not None and k >= 0x8000 else k
-        if '--addk' in sys.argv:
-            self.dst(t[0], 'I32', f'Bin(AddK, {s}, I32({k}))')
-        else:
-            self.dst(t[0], 'I32', f'AddI32({s}, I32({k}))')
+        self.dst(t[0], 'I32', f'AddK {{ a: {s}, k: {k} }}')
         return True
 
     def h_s_cmp_ge_u32(self, t, m, op):
@@ -881,7 +881,16 @@ class Lifter:
                 continue
             self.lgkm_fix(op, args)
             self.mask_fix(op, args)
+            # M0 written right before the LDS-DMA that reads it: one wait state (named deviation, --fix-m0)
+            if getattr(self, 'fix_m0', False) and 'lds' in args and op.startswith('buffer_load') and getattr(self, 'prev_m0', False):
+                self.stmt('SNop { count: 0 }')
+                self.notes['added s_nop 0 (M0 write right before its LDS-DMA)'] += 1
+                self.added_nops.append(f'{op} {args}')
+            self.prev_m0 = args.startswith('m0,') and op in ('s_add_u32', 's_mov_b32')
+            # the author's VOP3 encoding of a VALU instruction (also where VOP2 would encode)
+            self.cur_e64 = op.startswith('v_') and op.endswith('_e64')
             self.lift(op, args)
+            self.cur_e64 = False
             i += 1
 
 # ---- control flow: basic blocks and the structured form (exact mode E5: exit_if, cold_at, begin_if_br; scope variables) ----
@@ -1214,6 +1223,7 @@ def emit_kernel(path, exact, plan=None):
     L.exact = exact
     L.fix_waits = '--fix-waits' in sys.argv
     L.fix_mask = '--fix-lanemask' in sys.argv
+    L.fix_m0 = '--fix-m0' in sys.argv
     carried = sorted(set().union(*[live_in[b] for b in range(nb)]))
     var_tys = []
     var_slots = [(f, r, 1, 'I32') for (f, r) in carried] + [('s', a, n, ty) for (a, ty, n) in groups]
