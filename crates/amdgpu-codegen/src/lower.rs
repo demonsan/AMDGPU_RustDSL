@@ -182,13 +182,17 @@ fn run_select_fold(m: &mut MFunction) -> Result<(), String> {
     Ok(())
 }
 fn run_dce_loads(m: &mut MFunction) -> Result<(), String> {
+    // exact mode: every instruction is the author's (an unused load stays; the clobber check covers its registers)
+    if EXACT_LOWERING.with(|e| e.get()) {
+        return Ok(());
+    }
     // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
     // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
     dce_full(m, true);
     Ok(())
 }
 fn run_dce_full(m: &mut MFunction) -> Result<(), String> {
-    if opt_on("dce") {
+    if opt_on("dce") && !EXACT_LOWERING.with(|e| e.get()) {
         dce_full(m, false);
     }
     Ok(())
@@ -303,7 +307,9 @@ fn merge_zero_pairs(m: &mut MFunction) {
     }
 }
 fn run_dce_final(m: &mut MFunction) -> Result<(), String> {
-    dce(m);
+    if !EXACT_LOWERING.with(|e| e.get()) {
+        dce(m);
+    }
     Ok(())
 }
 fn run_kabatch(m: &mut MFunction) -> Result<(), String> {

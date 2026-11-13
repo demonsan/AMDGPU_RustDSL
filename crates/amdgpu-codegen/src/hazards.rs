@@ -187,7 +187,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
             }
             if reads_valu_hazard_operands(inst.op) {
-                for s in &inst.srcs {
+                // v_cndmask_b32_e64: only its lane-mask operand is a hazard read (its data operands are plain VALU reads)
+                let skip = if inst.op == MOp::VCndmaskM { 2 } else { 0 };
+                for s in inst.srcs.iter().skip(skip) {
                     if let Src::Reg(r) = s {
                         if let Some(rd) = vw.get(&canon(*r)) {
                             earliest = earliest.max(*rd);
