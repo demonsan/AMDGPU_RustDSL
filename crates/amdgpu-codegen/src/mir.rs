@@ -557,6 +557,8 @@ pub enum MOp {
     SMovM0,
     /// exact mode: `s_mov_b64 s[imm:imm+1], exec`
     SSaveExec,
+    /// `s_load_dword d, s[b:b+1], imm` from a pointer in an SGPR pair (srcs[0])
+    SLoadDwordPtr,
     /// `s_waitcnt vmcnt(imm & 0xff) lgkmcnt(imm >> 8)` (exact mode's combined form)
     SWaitCnt,
     /// exact mode: `s_mov_b64 exec, -1`

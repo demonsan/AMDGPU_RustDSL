@@ -699,6 +699,8 @@ pub enum Op {
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
     // ---- (s) SGPR words of pointers / buffer descriptors (exact mode; owner kernel-opt): zero-instruction views / assemblies ----
     /// dword 0 (low address bits) of a pointer pair, read in place
+    /// Exact mode: `s_load_dword` from a scalar (SGPR pair) pointer: the dword at `base + byte_off` (wave-uniform).
+    LoadScalar { base: Opnd, byte_off: u32 },
     PtrLo(Opnd),
     /// dword 1 (high address bits) of a pointer pair, read in place
     PtrHi(Opnd),
@@ -800,6 +802,7 @@ impl Op {
             Op::MovV { ty, .. } | Op::MovS { ty, .. } | Op::Undef { ty } => *ty,
             Op::DppQuadPerm { .. } => DType::U32,
             Op::PtrLo(_) | Op::PtrHi(_) => DType::I32,
+            Op::LoadScalar { .. } => DType::U32,
             Op::PtrCat { .. } => DType::Ptr,
             Op::RsrcCat { .. } => DType::Rsrc,
         }
@@ -875,6 +878,7 @@ impl Op {
             Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } => vec![*a, *b],
             Op::Permlane32SwapB { swap } => vec![*swap],
             Op::PtrLo(p) | Op::PtrHi(p) => vec![*p],
+            Op::LoadScalar { base, .. } => vec![*base],
             Op::PtrCat { lo, hi } => vec![*lo, *hi],
             Op::RsrcCat { words } => words.to_vec(),
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],

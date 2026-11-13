@@ -292,6 +292,61 @@ impl<'a> An<'a> {
             _ => AV::Other,
         }
     }
+    /// Strip authored moves / `+ 0` / `| 0` from a word operand.
+    fn word_root(&self, o: &Opnd) -> Opnd {
+        let mut o = *o;
+        for _ in 0..8 {
+            let Opnd::Val(v) = o else { return o };
+            match self.defs.get(&v) {
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => o = *a,
+                Some(Op::AddI32(a, Opnd::I32(0))) => o = *a,
+                Some(Op::Bin(amdgpu_dsl::BinOp::OrB32, a, Opnd::I32(0))) => o = *a,
+                _ => return o,
+            }
+        }
+        o
+    }
+    /// A word that is `PtrLo(p)` (false) or `PtrHi(p)` (true): the pointer operand and which half.
+    fn word_of(&self, o: &Opnd) -> Option<(Opnd, bool)> {
+        let Opnd::Val(v) = self.word_root(o) else { return None };
+        match self.defs.get(&v) {
+            Some(Op::PtrLo(p)) => Some((*p, false)),
+            Some(Op::PtrHi(p)) => Some((*p, true)),
+            _ => None,
+        }
+    }
+    /// [lo(p), hi(p) & 0xffff, nr, 0x00020000] -> (p, nr); else what does not match.
+    fn rsrc_words(&self, w: &[Opnd; 4]) -> Result<(Opnd, Opnd), String> {
+        let (p, hi) = self.word_of(&w[0]).ok_or("word 0 is not the low half of a pointer")?;
+        if hi {
+            return Err("word 0 is the HIGH half of a pointer".into());
+        }
+        let w1 = self.word_root(&w[1]);
+        let masked = match w1 {
+            Opnd::Val(v) => match self.defs.get(&v) {
+                Some(Op::AndI32(a, Opnd::I32(0xffff)) | Op::AndI32(Opnd::I32(0xffff), a)) => Some(*a),
+                Some(Op::Bin(amdgpu_dsl::BinOp::OrB32, _, Opnd::I32(k))) if *k != 0 => return Err(format!("word 1 sets a stride ({k:#x}): not supported")),
+                _ => None,
+            },
+            _ => None,
+        };
+        match masked.and_then(|a| self.word_of(&a)) {
+            Some((p1, true)) if p1 == p => {}
+            _ => return Err("word 1 is not (high half of the same pointer) & 0xffff".into()),
+        }
+        let fmt = match self.word_root(&w[3]) {
+            Opnd::I32(k) => Some(k),
+            Opnd::Val(v) => match self.defs.get(&v) {
+                Some(Op::ConstI32(k)) => Some(*k),
+                _ => None,
+            },
+            _ => None,
+        };
+        if fmt != Some(0x0002_0000) {
+            return Err(format!("word 3 is not the raw-buffer format constant 0x00020000 ({fmt:?})"));
+        }
+        Ok((p, self.word_root(&w[2])))
+    }
     /// The integer part a variable carries for a value: the value itself, or the byte offset of a pointer / the base offset of a descriptor
     /// (whose provenance is recorded; two different provenances for one variable make it unknown, GV-GLB-PROV at its use).
     fn var_part(&mut self, v: VarId, o: &Opnd) -> Itv {
@@ -1883,6 +1938,23 @@ impl<'a> An<'a> {
                 }
             }
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
+            // (s) descriptor / pointer words: a pointer re-assembled from its own two words is that pointer; a descriptor assembled as
+            // [lo(p), hi(p) & 0xffff (| 0), num_records, 0x00020000] is BufferRsrc(p, num_records); anything else has unknown provenance
+            Op::PtrCat { lo, hi } => match (self.word_of(lo), self.word_of(hi)) {
+                (Some((pl, false)), Some((ph, true))) if pl == ph => self.av_of(&pl),
+                _ => AV::Ptr { arg: None, off: Itv::top() },
+            },
+            Op::RsrcCat { words } => match self.rsrc_words(words) {
+                Ok((p, nr)) => match self.av_of(&p) {
+                    AV::Ptr { arg, off } => AV::Rsrc { arg, num: Some(self.int_of(&nr)), base: off },
+                    _ => AV::Rsrc { arg: None, num: None, base: Itv::top() },
+                },
+                Err(why) => {
+                    let m = format!("stmt {}: descriptor words not recognised ({why})", self.idx);
+                    self.rep.add("GV-GLB-PROV", Severity::Error, m);
+                    AV::Rsrc { arg: None, num: None, base: Itv::top() }
+                }
+            },
             Op::MovV { a, .. } | Op::MovS { a, .. } => self.av_of(a),
             // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
             Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),
@@ -1965,6 +2037,10 @@ impl<'a> An<'a> {
             return;
         }
         match op {
+            Op::LoadScalar { base, byte_off } => {
+                let b = self.av_of(base);
+                self.check_global("s_load_dword", &b, *byte_off as i128, 4, false);
+            }
             Op::AtomicAddU32 { base, byte_off, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global atomic add", &b, *byte_off as i128, 4, true);

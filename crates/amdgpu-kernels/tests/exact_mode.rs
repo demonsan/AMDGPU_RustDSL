@@ -303,3 +303,40 @@ fn permlane32_swap_in_place_on_two_registers() {
     assert!(c.asm.contains("v_permlane32_swap_b32_e32 v2, v5"), "{}", c.asm);
     assert_eq!(c.asm.matches("v_mov_b32").count(), 2, "only the two authored moves: {}", c.asm);
 }
+
+/// (s) descriptor words: gpu_verify recognises [lo(p), hi(p) & 0xffff (| 0), num_records, 0x00020000] as BufferRsrc(p, num_records), and
+/// names the word that breaks the pattern; `LoadScalar` reads from a scalar pointer, bounds-checked.
+#[test]
+fn descriptor_words_are_recognised_by_the_verifier() {
+    let build = |fmt: i32, stride: i32, other_hi: bool| {
+        let mut b = FnBuilder::new("probe_rsrc_words", 64);
+        b.arg("a", DType::Ptr, 0x00, 8);
+        b.arg("b", DType::Ptr, 0x08, 8);
+        b.arg_tensor("a", Ext::c(64 * 4));
+        b.arg_tensor("b", Ext::c(64 * 4));
+        b.exact();
+        let pa = b.let_(Op::KernargPtr { offset: 0x00 });
+        let pb = b.let_(Op::KernargPtr { offset: 0x08 });
+        b.wait_lds(0);
+        let lo = b.let_(Op::PtrLo(Opnd::Val(pa)));
+        let hi = b.let_(Op::PtrHi(Opnd::Val(if other_hi { pb } else { pa })));
+        let m = b.let_(Op::AndI32(Opnd::Val(hi), Opnd::I32(0xffff)));
+        let w1 = b.let_(Op::Bin(amdgpu_dsl::BinOp::OrB32, Opnd::Val(m), Opnd::I32(stride)));
+        let nr = b.mov_s(DType::I32, Opnd::I32(64 * 4));
+        let w3 = b.mov_s(DType::I32, Opnd::I32(fmt));
+        let rs = b.let_(Op::RsrcCat { words: [Opnd::Val(lo), Opnd::Val(w1), Opnd::Val(nr), Opnd::Val(w3)] });
+        let n = b.let_(Op::LoadScalar { base: Opnd::Val(pb), byte_off: 4 });
+        let tid = b.let_(Op::WorkitemId);
+        let off = b.bind_i32(ev(tid) << 2);
+        b.wait_lds(0);
+        let vf = b.let_(Op::BitcastF32(Opnd::Val(n)));
+        b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
+        let _ = (pb, tid);
+        b.finish()
+    };
+    let errs = |f: &Function| amdgpu_codegen::gpu_verify::verify_ir(f).errors().iter().map(|e| e.msg.clone()).collect::<Vec<_>>();
+    assert!(errs(&build(0x0002_0000, 0, false)).is_empty(), "{:?}", errs(&build(0x0002_0000, 0, false)));
+    assert!(errs(&build(0x0003_0000, 0, false)).iter().any(|e| e.contains("word 3")));
+    assert!(errs(&build(0x0002_0000, 0x10, false)).iter().any(|e| e.contains("stride")));
+    assert!(errs(&build(0x0002_0000, 0, true)).iter().any(|e| e.contains("word 1")));
+}

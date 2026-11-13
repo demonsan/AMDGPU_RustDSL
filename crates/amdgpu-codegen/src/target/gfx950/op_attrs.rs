@@ -667,6 +667,7 @@ pub const ALL: &[MOp] = &[
     MOp::SMovB32,
     MOp::SMovM0,
     MOp::SSaveExec,
+    MOp::SLoadDwordPtr,
     MOp::SExecAll,
     MOp::SRestoreExec,
     MOp::SAddM0,
@@ -1136,6 +1137,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         BufferInv => a("buffer_inv", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier),
         // ---- scalar ALU / memory
         SLoadDword => a("s_load_dword", smem).smem().dce(Load),
+        SLoadDwordPtr => a("s_load_dword", smem).smem().dce(Load).backend(Backend::OwnOnly),
         SLoadDwordx2 => a("s_load_dwordx2", smem).smem().dce(Load),
         SLoadDwordx4 => a("s_load_dwordx4", smem).smem().dce(Load).backend(Backend::OwnOnly),
         // a timing stamp: SMEM result, pinned in program order against every other memory op
