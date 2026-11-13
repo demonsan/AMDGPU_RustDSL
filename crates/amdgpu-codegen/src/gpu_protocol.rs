@@ -779,7 +779,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                         walk(f, b, seen)
                     }
                     // a finite-state function (compare / select / not) of finite-state ring counters and constants only: periodic with their period
-                    Op::Select { .. } | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) if fs_cone(f, &Opnd::Val(*v)) => Ok(()),
+                    Op::Select { .. } | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Cmp { .. } if fs_cone(f, &Opnd::Val(*v)) => Ok(()),
                     _ => Err(name),
                 }
             }
@@ -907,7 +907,7 @@ fn fs_cone(f: &Function, o: &Opnd) -> bool {
         Opnd::Var(x) => finite_state_period(f, *x).is_some(),
         Opnd::Val(v) => match f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) {
             Some(Op::ConstI32(_)) => true,
-            Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. })) => op.operands().iter().all(|u| fs_cone(f, u)),
+            Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. } | Op::Cmp { .. } | Op::MovS { .. } | Op::BitcastI32(..))) => op.operands().iter().all(|u| fs_cone(f, u)),
             _ => false,
         },
     }
@@ -931,6 +931,21 @@ fn fs_eval(f: &Function, o: &Opnd, x: VarId, xv: i64) -> Option<i64> {
                 Op::ShlI32(a, b) => w(((e(a)? as u32).wrapping_shl(e(b)? as u32)) as i64),
                 Op::LshrI32(a, b) => w(((e(a)? as u32).wrapping_shr(e(b)? as u32)) as i64),
                 Op::CmpLtI32(a, b) => (e(a)? < e(b)?) as i64,
+                Op::MovS { a, .. } | Op::BitcastI32(a) => e(a)?,
+                Op::Cmp { pred, ty, a, b } if matches!(ty, amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32) => {
+                    let (x, y) = (e(a)?, e(b)?);
+                    let (x, y) = if matches!(ty, amdgpu_dsl::CmpTy::U32) { ((x as i32 as u32) as i64, (y as i32 as u32) as i64) } else { (x, y) };
+                    use amdgpu_dsl::CmpPred::*;
+                    (match pred {
+                        Lt => x < y,
+                        Le => x <= y,
+                        Gt => x > y,
+                        Ge => x >= y,
+                        Eq => x == y,
+                        Ne => x != y,
+                        _ => return None,
+                    }) as i64
+                }
                 Op::CmpGeI32(a, b) => (e(a)? >= e(b)?) as i64,
                 Op::NotI1(a) => (e(a)? == 0) as i64,
                 Op::Select { cond, a, b, .. } => {
