@@ -185,3 +185,93 @@ pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> 
     }, &mut out);
     out
 }
+
+// ------------------------------------------------------------------------------------------------ E2: register legality of an allocation
+
+/// No value is clobbered: for every instruction, each physical register dword it writes is not holding another value that is still live
+/// (read later on some path). Per dword (tuple parts, in-place sub-register writes), across the CFG (loop back edges included). Works on
+/// any allocation: the compiler's, or the author's pins in exact mode. Returns one message per clobber (instruction, register, the
+/// value whose live range it cuts).
+pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String> {
+    use crate::sched::effects::{effects, Slot};
+    use std::collections::{HashMap, HashSet};
+    let nb = m.blocks.len();
+    // physical key of a dword slot (vreg tuple * 16 + dword)
+    let phys_of = |s: Slot| -> Option<(bool, u32)> {
+        let (t, off) = (s / 16, s % 16);
+        let p = *a.phys.get(t as usize)?;
+        if p == u32::MAX {
+            return None;
+        }
+        Some((a.scalar.get(t as usize).copied().unwrap_or(false), p + off))
+    };
+    let succ = crate::sched::liveness::successors(m);
+    let effs: Vec<Vec<(Vec<Slot>, Vec<Slot>)>> = m
+        .blocks
+        .iter()
+        .map(|b| b.insts.iter().map(|i| {
+            let e = effects(m, i);
+            let keep = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384)).collect::<Vec<_>>();
+            (keep(&e.reads), keep(&e.writes))
+        }).collect())
+        .collect();
+    // live-in per block by slot
+    let mut live_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for bi in (0..nb).rev() {
+            let mut live: HashSet<Slot> = succ[bi].iter().flat_map(|&s| live_in[s].iter().copied()).collect();
+            for (r, w) in effs[bi].iter().rev() {
+                for s in w {
+                    live.remove(s);
+                }
+                live.extend(r.iter().copied());
+            }
+            if live != live_in[bi] {
+                live_in[bi] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let name = |s: Slot| -> String {
+        let t = s / 16;
+        let n = m.reg_hints.names.get(&t).cloned().unwrap_or_else(|| format!("r{t}"));
+        format!("{n}[{}]", s % 16)
+    };
+    let mut out = Vec::new();
+    for bi in 0..nb {
+        let mut live: HashSet<Slot> = succ[bi].iter().flat_map(|&s| live_in[s].iter().copied()).collect();
+        for (ii, (r, w)) in effs[bi].iter().enumerate().rev() {
+            // after this instruction: `live`; a written dword may not hold another live value
+            let mut by_phys: HashMap<(bool, u32), Slot> = HashMap::new();
+            for s in &live {
+                if let Some(p) = phys_of(*s) {
+                    by_phys.insert(p, *s);
+                }
+            }
+            for s in w {
+                if let Some(p) = phys_of(*s) {
+                    if let Some(o) = by_phys.get(&p) {
+                        if o != s && !w.contains(o) {
+                            let inst = &m.blocks[bi].insts[ii];
+                            out.push(format!(
+                                "block {} inst {ii} ({:?}) writes {}{} (as {}) while {} still lives there",
+                                m.blocks[bi].label, inst.op, if p.0 { "s" } else { "v" }, p.1 & !AGPR_TAG, name(*s), name(*o)
+                            ));
+                        }
+                    }
+                }
+            }
+            for s in w {
+                live.remove(s);
+            }
+            live.extend(r.iter().copied());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
