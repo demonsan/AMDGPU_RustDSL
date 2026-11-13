@@ -193,7 +193,7 @@ pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> 
     run("waits", &|c| {
         crate::sched::waits::insert_waits(c);
     }, &mut out);
-    run("hazard-value", &|c| crate::hazards::fix_value_hazards_opts(c, strict), &mut out);
+    run("hazard-value", &|c| crate::hazards::without_fill(|| crate::hazards::fix_value_hazards_opts(c, strict)), &mut out);
     run("hazard-inflight-waw", &|c| {
         crate::hazards::pad_inflight_waw(c, a);
     }, &mut out);

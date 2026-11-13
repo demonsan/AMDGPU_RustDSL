@@ -22,6 +22,19 @@ const TRANS_LATENCY: usize = crate::target::T.hazard("trans-result").n() as usiz
 const FILL_WINDOW: usize = 48;
 
 /// `AMDC_NO_FILL_VCC=1`: the old behaviour (no filling in front of a vcc consumer) for A/B measurements
+thread_local! {
+    /// check mode (exact mode's verification): pad with `s_nop` only, never move instructions, so every insertion is a needed wait state
+    static NO_FILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with instruction filling off (the hazard passes only pad).
+pub fn without_fill<R>(f: impl FnOnce() -> R) -> R {
+    NO_FILL.with(|c| c.set(true));
+    let r = f();
+    NO_FILL.with(|c| c.set(false));
+    r
+}
+
 fn opt_fill_vcc() -> bool {
     std::env::var("AMDC_NO_FILL_VCC").map_or(true, |v| v.is_empty())
 }
@@ -223,7 +236,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             // Fill the stall with independent ALU work from further down the block.
             // (a vcc consumer may be filled too, with instructions that neither read nor write vcc: they cannot disturb the compare it waits for)
             let vcc_cons = insts[i].op.consumes_vcc();
-            if earliest > cycle && (!vcc_cons || opt_fill_vcc()) {
+            if earliest > cycle && (!vcc_cons || opt_fill_vcc()) && !NO_FILL.with(|c| c.get()) {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
