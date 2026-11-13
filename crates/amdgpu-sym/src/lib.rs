@@ -229,6 +229,13 @@ impl Ctx {
         if flip.is_empty() || flip.len() > 4 {
             return false;
         }
+        // any non-empty subset of the candidates (flipping a symbol that also occurs positively can hurt)
+        (1u32..(1u32 << flip.len())).any(|m| {
+            let sub: Vec<Sym> = flip.iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|(_, s)| s.clone()).collect();
+            self.nonneg_flipped(p, &sub)
+        })
+    }
+    fn nonneg_flipped(&self, p: &Poly, flip: &[Sym]) -> bool {
         let mut cx = self.clone();
         let mut q = Poly::int(0);
         for (mono, c) in &p.0 {
