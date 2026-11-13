@@ -1250,6 +1250,8 @@ def emit_kernel(path, exact, plan=None):
                     top_defs[d] += 1
         single = {d for d, n in top_defs.items() if n == def_count[d]}
     globals_ = {}
+    wg_regs = [('s', int(x[1:])) for x in sys.argv[sys.argv.index('--wgmap') + 1].split(',')] if '--wgmap' in sys.argv else []
+    wg_vals = []
     L = Lifter()
     L.single = single
     L.exact = exact
@@ -1288,10 +1290,18 @@ def emit_kernel(path, exact, plan=None):
         s, e, _ = bl[b]
         L.state = {}
         for (f, r) in live_in[b]:
-            if (f, r) in dword_k:
-                L.state[(f, r)] = (pv_of[dword_k[(f, r)]], 0)
-            elif (f, r) in globals_:
+            if (f, r) in globals_:
                 L.state[(f, r)] = globals_[(f, r)]
+            elif (f, r) in dword_k:
+                L.state[(f, r)] = (pv_of[dword_k[(f, r)]], 0)
+        # --wgmap: the workgroup-map registers, rebound at the first top-level block after their (branchy) definitions to zero-cost
+        # views, so the contract's WgMap can name them as values
+        if wg_regs and b in top_blocks and b != 0 and not wg_vals and all(r in live_in[b] for r in wg_regs):
+            for r in wg_regs:
+                k = dword_k[r]
+                v = L.new(r[0], r[1], 1, 'I32', f'BitcastI32(Var(VarId({k})))')
+                globals_[r] = (v, 0)
+                wg_vals.append(v)
         for g in g_in[b]:
             k = group_k[g]
             for i in range(g[2]):
@@ -1411,6 +1421,7 @@ def emit_kernel(path, exact, plan=None):
         if rounds < 8:
             merged = [set(seen_end[i]) | (set(plan[i]) if plan else set()) for i in range(nb)]
             return emit_kernel(path, exact, merged)
+    L.wg_vals = wg_vals
     return L, var_tys, entry_hw
 
 
@@ -1493,6 +1504,11 @@ def main():
                         contract += lines
                     elif k.startswith('_'):
                         continue
+                    elif k == 'wg_maps' and getattr(L, 'wg_vals', None):
+                        reason = sys.argv[sys.argv.index('--wgmap-reason') + 1] if '--wgmap-reason' in sys.argv else 'workgroup map'
+                        outs = ', '.join(str(v) for v in L.wg_vals)
+                        axes = ', '.join(str(i) for i in range(len(L.wg_vals)))
+                        contract.append(f'    wg_maps: [ WgMap {{ outs: [{outs}], axes: [{axes}], reason: {reason!r}, union: false, range: None }} ],'.replace("'", '"'))
                     else:
                         # facts about the other kernel's values / tiles do not carry over
                         empty = {'tile_trust': 'None'}.get(k, '[]')
