@@ -99,6 +99,15 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
     } else {
         f
     };
+    // exact mode: a constant the author pinned is an instruction at its statement (`v_mov` / `s_mov` into the pinned register), not a
+    // value folded or cached per use
+    let pinned_consts;
+    let f = if f.exact {
+        pinned_consts = exact_pinned_consts(f);
+        &pinned_consts
+    } else {
+        f
+    };
     let mut lw = Lowerer::new(f);
     if f.exact {
         // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
@@ -5337,6 +5346,39 @@ fn plain_f8f6f4_mop(k: amdgpu_dsl::MmaKind) -> Option<(MOp, MOp, i64)> {
 }
 
 /// `f` with every branch / select / not operand that is an `AnyLane(c)` value replaced by `c`.
+fn exact_pinned_consts(f: &Function) -> Function {
+    let mut file: HashMap<ValueId, bool> = HashMap::new();
+    for mk in &f.reg_plan {
+        match mk {
+            amdgpu_dsl::RegMark::PinV { r: amdgpu_dsl::RegRef::Val(v), .. } => {
+                file.insert(*v, false);
+            }
+            amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(v), .. } => {
+                file.insert(*v, true);
+            }
+            _ => {}
+        }
+    }
+    let mut g = f.clone();
+    g.edit_stmts(|stmts| {
+        for s in stmts.iter_mut() {
+            if let Stmt::Let { dst, op } = s {
+                let (ty, a) = match op {
+                    Op::ConstI32(k) => (DType::I32, Opnd::I32(*k)),
+                    Op::ConstF32(x) => (DType::F32, Opnd::F32(*x)),
+                    _ => continue,
+                };
+                match file.get(dst) {
+                    Some(false) => *op = Op::MovV { ty, a },
+                    Some(true) => *op = Op::MovS { ty, a },
+                    None => {}
+                }
+            }
+        }
+    });
+    g
+}
+
 fn strip_any_lane(f: &Function) -> Function {
     use amdgpu_dsl::ir_text::IrIds;
     let mut map: HashMap<ValueId, Opnd> = HashMap::new();

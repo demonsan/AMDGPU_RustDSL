@@ -85,7 +85,7 @@ fn neg_modifier_moves_and_bf16_mfma_lower_to_one_instruction_each() {
     b.buffer_store_f32(rs, off, Opnd::I32(0), 0, z);
     let f = b.finish();
     let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
-    assert!(c.asm.lines().any(|l| l.trim().starts_with("v_mul_f32_e64") && l.contains(", -s")), "{}", c.asm);
+    assert!(c.asm.lines().any(|l| l.trim().starts_with("v_mul_f32_e64") && l.contains(", -")), "{}", c.asm);
     assert!(!c.asm.contains("v_xor_b32"), "the negation folded into the modifier");
 }
 
