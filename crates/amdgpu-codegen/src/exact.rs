@@ -176,7 +176,7 @@ pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> 
         crate::hazards::pad_inflight_waw(c, a);
     }, &mut out);
     run("hazard-phys-war", &|c| crate::hazards::pad_physical_war(c, a), &mut out);
-    run("m0-pad", &|c| crate::sched::m0::pad(c), &mut out);
+    run("m0-pad", &|c| { crate::sched::m0::pad(c); }, &mut out);
     run("hazard-valu-sgpr", &|c| {
         crate::hazards::pad_valu_sgpr(c, a);
     }, &mut out);
