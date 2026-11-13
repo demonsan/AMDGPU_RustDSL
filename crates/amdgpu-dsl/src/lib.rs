@@ -1068,8 +1068,8 @@ pub struct TileDecl {
     /// A marker whose every access is proven to lie in the issuing thread's own words is an OWNER event: owner events of different waves never
     /// touch the same bytes, and a thread's own write -> read is ordered by program order (no barrier needed between them).
     pub owned: Option<(i64, i64)>,
-    /// The markers' slot operand is a BYTE offset of the slot (`base + slot * slot_size`), e.g. a lifted ring register; the simulator divides
-    /// (an offset that is not a slot start is an error).
+    /// The markers' slot operand is the slot's BYTE offset from `base` (`slot * slot_size`), e.g. a lifted ring register; the simulator divides
+    /// (an offset that is not a multiple of the slot size is an error).
     pub slot_by_offset: bool,
 }
 

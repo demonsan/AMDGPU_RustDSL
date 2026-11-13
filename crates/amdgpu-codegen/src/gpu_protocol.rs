@@ -329,9 +329,9 @@ impl<'a> Sim<'a> {
                 // a slot given as its byte offset (`slot_by_offset`): base + slot * slot_size
                 let t = &self.f.contract.tiles[ti];
                 let s = if t.slot_by_offset && !private {
-                    let d = s - t.base;
+                    let d = s;
                     if t.slot_size <= 0 || d.rem_euclid(t.slot_size) != 0 {
-                        self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}`: the slot offset {s} is not a slot start (base {}, slot size {})", t.base, t.slot_size));
+                        self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}`: the slot offset {s} (from the base) is not a multiple of the slot size {}", t.slot_size));
                         self.open = None;
                         return;
                     }
