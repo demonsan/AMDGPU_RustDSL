@@ -259,6 +259,10 @@ fn run_lds_spill(m: &mut MFunction) -> Result<(), String> {
     Ok(())
 }
 fn run_coalesce(m: &mut MFunction) -> Result<(), String> {
+    // exact mode: values keep their own registers (the author's pins); copies between equal pins vanish in exact::finalize
+    if EXACT_LOWERING.with(|e| e.get()) {
+        return Ok(());
+    }
     let renames = coalesce(m);
     if m.reg_hints.active() {
         // a planned value whose producer was coalesced into another register (e.g. a loop variable) is planned as that register
