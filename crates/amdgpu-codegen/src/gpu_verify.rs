@@ -2592,10 +2592,15 @@ impl<'a> An<'a> {
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
         // the branch bound first (a constant bound from the branch beats a symbolic candidate the cap would keep), then the existing ones
-        let mut lo = add.lo.clone();
-        lo.extend(xi.lo.iter().cloned());
-        let mut hi = add.hi.clone();
-        hi.extend(xi.hi.iter().cloned());
+        // (the strongest existing candidate first, then the branch bound, then the rest: the cap never drops either)
+        let merge = |old: &Vec<Poly>, new: &Vec<Poly>| -> Vec<Poly> {
+            let mut v: Vec<Poly> = old.iter().take(1).cloned().collect();
+            v.extend(new.iter().cloned());
+            v.extend(old.iter().skip(1).cloned());
+            v
+        };
+        let lo = merge(&xi.lo, &add.lo);
+        let hi = merge(&xi.hi, &add.hi);
         let refined = Itv { lo: cap(lo), hi: cap(hi) };
         match x {
             Opnd::Var(v) => {
@@ -2614,7 +2619,9 @@ impl<'a> An<'a> {
                     while let Some(u) = work.pop_front() {
                         for &d in self.users.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
                             let Some(&pd) = self.rings.let_pos.get(&d) else { continue };
-                            if pd < self.idx && self.env.contains_key(&d) && seen.len() < 65536 && seen.insert(d) {
+                            // (only pure functions of values: a definition that reads a variable read it at ITS point, not now)
+                            let reads_var = self.defs.get(&d).map_or(true, |op| op.operands().iter().any(|o| matches!(o, Opnd::Var(_))));
+                            if pd < self.idx && !reads_var && self.env.contains_key(&d) && seen.len() < 65536 && seen.insert(d) {
                                 deps.push((pd, d));
                                 work.push_back(d);
                             }
@@ -2625,6 +2632,17 @@ impl<'a> An<'a> {
                     for (_, d) in deps {
                         if let Some(op) = self.defs.get(&d).cloned() {
                             let nv = self.eval(&op);
+                            // both the old and the re-evaluated interval hold: keep the candidates of both (the new first)
+                            let nv = match (nv, self.env.get(&d)) {
+                                (AV::Int(n), Some(AV::Int(o))) => {
+                                    let mut lo = n.lo.clone();
+                                    lo.extend(o.lo.iter().cloned());
+                                    let mut hi = n.hi.clone();
+                                    hi.extend(o.hi.iter().cloned());
+                                    AV::Int(Itv { lo: cap(lo), hi: cap(hi) })
+                                }
+                                (n, _) => n,
+                            };
                             saved.push((d, self.env.insert(d, nv)));
                         }
                     }
