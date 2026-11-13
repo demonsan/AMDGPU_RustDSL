@@ -190,6 +190,16 @@ fn contract_ctx(f: &Function) -> Ctx {
     for (axis, e) in &f.contract.grid_defs {
         if let Some(p) = e.to_poly(&c) {
             c.subst.insert(Sym::Grid(*axis), p);
+        } else if let (true, Ext::CeilDiv(inner, k)) = (f.exact, e) {
+            // exact (lifted) kernels: grid = ceil(P / k) = (P + r) / k with a fresh remainder symbol r in [0, k - 1] (the relation a lifted
+            // address needs: the last tile's rows end at most k - 1 past P). Shipped kernels keep the grid symbol (their proofs use it).
+            if let (Some(p), true) = (inner.to_poly(&c), *k > 0) {
+                let r = Sym::Named(format!("ceil_rem_grid{axis}"));
+                c.lb.insert(r.clone(), 0);
+                c.ub.insert(r.clone(), *k as i64 - 1);
+                let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
+                c.subst.insert(Sym::Grid(*axis), q);
+            }
         }
     }
     c
