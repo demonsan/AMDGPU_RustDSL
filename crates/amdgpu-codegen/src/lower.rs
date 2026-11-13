@@ -162,7 +162,8 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                 let mut ghost: HashSet<ValueId> = stmts
                     .iter()
                     .filter_map(|s| match s {
-                        Stmt::Let { dst, op } if !pinned.contains(dst) && readers.get(dst).map_or(false, |r| !r.is_empty()) && !op_has_effect(op) => Some(*dst),
+                        // (also a value no statement reads: region markers of the structure tree carry their operands outside the flat list)
+                        Stmt::Let { dst, op } if !pinned.contains(dst) && !op_has_effect(op) => Some(*dst),
                         _ => None,
                     })
                     .collect();
@@ -171,7 +172,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                         .iter()
                         .copied()
                         .filter(|v| {
-                            readers[v].iter().any(|&r| match &stmts[r] {
+                            readers.get(v).map_or(&[][..], |x| x.as_slice()).iter().any(|&r| match &stmts[r] {
                                 s if marker(s) => false,
                                 Stmt::Let { dst, .. } => !ghost.contains(dst),
                                 _ => true,
