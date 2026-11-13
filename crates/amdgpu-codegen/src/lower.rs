@@ -115,6 +115,10 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         for mk in &f.reg_plan {
             if let amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(x), base } = mk {
                 if f.value_tys.get(*x as usize) == Some(&DType::I1) {
+                    if *base == crate::mir::SCC_PIN {
+                        lw.scc_i1.insert(*x);
+                        continue;
+                    }
                     lw.mask_i1.insert(*x);
                     if *base == crate::mir::VCC_PIN {
                         lw.mask_vcc.insert(*x);
@@ -406,6 +410,8 @@ struct Lowerer {
     mask_i1: HashSet<ValueId>,
     /// ... of them, those pinned at VCC
     mask_vcc: HashSet<ValueId>,
+    /// exact mode: I1 values held in SCC (scalar compares read by s_cselect / s_cbranch_scc*)
+    scc_i1: HashSet<ValueId>,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -558,6 +564,7 @@ impl Lowerer {
             swap_second: HashMap::new(),
             mask_i1: HashSet::new(),
             mask_vcc: HashSet::new(),
+            scc_i1: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
@@ -2789,6 +2796,12 @@ impl Lowerer {
         if let Opnd::Val(v) = cond {
             if let Some(op) = self.defs.get(&v).cloned() {
                 // exact mode: a lane mask the author keeps in VCC is branched on directly (`s_cbranch_vcc*`; no compare re-issued)
+                if self.exact && self.scc_i1.contains(&v) {
+                    let s = *self.val.get(&v).ok_or("scc value not lowered")?;
+                    self.touch(&[Src::Reg(s)]);
+                    let on = if negate { Pred::Scc0 } else { Pred::Scc1 };
+                    return Ok((on, vec![Src::Reg(s)]));
+                }
                 if self.exact && self.mask_i1.contains(&v) && self.mask_vcc.contains(&v) {
                     let m = *self.val.get(&v).ok_or("mask not lowered")?;
                     self.touch(&[Src::Reg(m)]);
@@ -3034,6 +3047,17 @@ impl Lowerer {
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
             Op::MinI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMinI32, *a, *b)?,
+            // exact mode: a select on an SCC value = `s_cselect_b32` reading the compare the author placed (not re-issued)
+            Op::Select { cond: Opnd::Val(c), a, b, .. } if self.exact && self.scc_i1.contains(c) => {
+                let s = *self.val.get(c).ok_or("scc value not lowered")?;
+                let (sa, sb) = (self.s_operand(*a)?, self.s_operand(*b)?);
+                let mut regs: Vec<Src> = [sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
+                regs.push(Src::Reg(s));
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SCselectB32).def(d).src(sa).src(sb).srcreg(s));
+                self.val.insert(dst, d);
+            }
             Op::Select { ty: DType::I32, cond, a, b } if self.uniform.contains(&dst) => self.scalar_select(dst, *cond, *a, *b)?,
             Op::Select { ty: ty @ (DType::Ptr | DType::Rsrc), cond, a, b } => self.scalar_select_wide(dst, *ty, *cond, *a, *b)?,
             Op::ReadFirstLane(Opnd::Val(a)) if self.uniform.contains(a) && self.val.get(a).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => {
@@ -3054,6 +3078,15 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             // exact mode: a per-lane compare the author keeps as a lane mask in an SGPR pair (`v_cmp_*_e64 s[..], a, b`)
+            // exact mode: a scalar compare into SCC (`s_cmp_<p>_<t> a, b`), its value pinned at SCC
+            Op::Cmp { pred, ty, a, b } if self.exact && self.scc_i1.contains(&dst) => {
+                let (sa, sb) = (self.s_operand(*a)?, self.s_operand(*b)?);
+                let regs: Vec<Src> = [sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SCmpG).def(d).src(sa).src(sb).imm(cmp_code(*pred, *ty)));
+                self.val.insert(dst, d);
+            }
             Op::Cmp { pred, ty, a, b } if self.exact && self.mask_i1.contains(&dst) => {
                 let mut opnd = |me: &mut Self, o: Opnd| -> Result<Src, String> {
                     if let Some(k) = me.const_bits(o) {
@@ -3199,6 +3232,11 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V2);
                 self.push(MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
                 self.val.insert(dst, d);
+            }
+            // a lane mask (VCC / an SGPR pair) or an SCC value: `any lane` is the branch on it (no instruction)
+            Op::AnyLane(Opnd::Val(c)) if self.exact && (self.mask_i1.contains(c) || self.scc_i1.contains(c)) => {
+                let r = *self.val.get(c).ok_or("mask not lowered")?;
+                self.val.insert(dst, r);
             }
             Op::AnyLane(c) => {
                 let r = self.as_v1(*c)?;

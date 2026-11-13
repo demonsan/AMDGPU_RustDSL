@@ -2930,7 +2930,7 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if n >= 2 && p % need != 0 {
                 rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors / wider multiple of 4; assembler-measured)", if n == 4 { "descriptor quad" } else { "tuple" }));
             }
-            if p + n > SGPR_LIMIT && !(f.exact && p == crate::mir::VCC_PIN && n == 2) {
+            if p + n > SGPR_LIMIT && !(f.exact && ((p == crate::mir::VCC_PIN && n == 2) || (p == crate::mir::SCC_PIN && n == 1))) {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));
             }
         }

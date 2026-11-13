@@ -228,6 +228,9 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
         if s >= u32::MAX - 1 {
             return Some((true, crate::mir::VCC_PIN * 2 + s % 2));
         }
+        if s >= u32::MAX - 3 {
+            return Some((true, crate::mir::SCC_PIN * 2 + s % 2));
+        }
         let d = s / 2;
         let (t, off) = (d / 16, d % 16);
         let p = *a.phys.get(t as usize)?;
@@ -247,7 +250,8 @@ pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[
             let at = crate::op_attrs::attrs(i.op);
             // VCC is tracked as a register (exact mode pins lane masks there; its implicit writers clobber them); SCC and the other specials are not
             let vcc = crate::sched::effects::VCC;
-            let halves = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384) || *s == vcc).flat_map(|s| if s == vcc { [u32::MAX - 1, u32::MAX] } else { [s * 2, s * 2 + 1] }).collect::<Vec<_>>();
+            let scc = crate::sched::effects::SCC;
+            let halves = |v: &Vec<Slot>| v.iter().copied().filter(|s| *s < (u32::MAX - 16_384) || *s == vcc || *s == scc).flat_map(|s| if s == vcc { [u32::MAX - 1, u32::MAX] } else if s == scc { [u32::MAX - 3, u32::MAX - 2] } else { [s * 2, s * 2 + 1] }).collect::<Vec<_>>();
             let mut reads = halves(&e.reads);
             let mut writes = halves(&e.writes);
             if at.regfx == crate::op_attrs::RegFx::PartialWrite {
@@ -471,7 +475,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                 }
                 phys[r as usize] = b;
                 if s {
-                    if b != crate::mir::VCC_PIN {
+                    if b != crate::mir::VCC_PIN && b != crate::mir::SCC_PIN {
                         max_s = max_s.max(b + c.dwords());
                     }
                 } else {

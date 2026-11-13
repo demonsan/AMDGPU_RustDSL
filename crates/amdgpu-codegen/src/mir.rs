@@ -647,6 +647,9 @@ pub struct MInst {
 
 /// Exact mode: an SGPR pin at this base is VCC (the lane-mask register `v_cmp_*_e32` writes and `v_cndmask_b32_e32` / `s_cbranch_vcc*` read).
 pub const VCC_PIN: u32 = 106;
+/// Exact mode: an SGPR pin at this base (the ISA's operand encoding of SCC) is SCC: a scalar compare's result read by `s_cselect` /
+/// `s_cbranch_scc*`.
+pub const SCC_PIN: u32 = 253;
 
 /// Compare code of `SCmpG` / `VCmpMaskG`: predicate (low nibble) and type (bits 4..).
 pub fn cmp_code(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy) -> i64 {
