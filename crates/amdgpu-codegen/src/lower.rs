@@ -139,10 +139,15 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
             let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
             let stmts = f.stmts();
             for (k, st) in stmts.iter().enumerate() {
-                let ops = match st {
+                let mut ops = match st {
                     Stmt::Let { op, .. } => op.operands(),
                     _ => amdgpu_dsl::stmt_operands(st),
                 };
+                if let Stmt::SetM0 { value } = st {
+                    if !ops.contains(value) {
+                        ops.push(*value);
+                    }
+                }
                 for o in ops {
                     if let Opnd::Val(v) = o {
                         readers.entry(v).or_default().push(k);
