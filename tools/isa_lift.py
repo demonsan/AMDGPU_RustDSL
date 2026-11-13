@@ -683,8 +683,14 @@ class Lifter:
         return True
 
     def h_s_addk_i32(self, t, m, op):
-        s = self.src(t[0])
-        self.dst(t[0], 'U32', f'AddI32({s}, {self.src(t[1])})')
+        # the author's two-address SALU add of a 16-bit constant (s_addk_i32)
+        s = self.src(t[0], 'I32')
+        k = imm(t[1])
+        k = k - 0x10000 if k is not None and k >= 0x8000 else k
+        if '--addk' in sys.argv:
+            self.dst(t[0], 'I32', f'Bin(AddK, {s}, I32({k}))')
+        else:
+            self.dst(t[0], 'I32', f'AddI32({s}, I32({k}))')
         return True
 
     def h_s_cmp_ge_u32(self, t, m, op):
