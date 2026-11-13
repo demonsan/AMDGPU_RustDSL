@@ -1760,6 +1760,11 @@ impl Lowerer {
         let mut off: i64 = 0;
         loop {
             if let Opnd::Val(v) = cur {
+                if self.exact && self.exact_pinned.contains(&v) {
+                    let r = self.as_v1(cur)?;
+                    self.touch(&[Src::Reg(r)]);
+                    return Ok((r, off));
+                }
                 if let Some(&(t, k)) = self.lazy.get(&v) {
                     if  (0..65536).contains(&(off + k)) {
                         self.touch(&[Src::Reg(t)]);
@@ -1862,6 +1867,10 @@ impl Lowerer {
         let mut k = 0i64;
         loop {
             if let Opnd::Val(v) = cur {
+                // exact mode: a value the author pinned is in its register (not folded into the user's offset)
+                if self.exact && self.exact_pinned.contains(&v) {
+                    return (cur, k);
+                }
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v) {
                     if let Some(c) = self.const_of(*y) {
                         k += c;
