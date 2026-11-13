@@ -304,15 +304,15 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
         let mut live: HashSet<Slot> = succ[bi].iter().flat_map(|&s| live_in[s].iter().copied()).collect();
         for (ii, (r, w)) in effs[bi].iter().enumerate().rev() {
             // after this instruction: `live`; a written dword may not hold another live value
-            let mut by_phys: HashMap<(bool, u32), Slot> = HashMap::new();
+            let mut by_phys: HashMap<(bool, u32), Vec<Slot>> = HashMap::new();
             for s in &live {
                 if let Some(p) = phys_of(*s) {
-                    by_phys.insert(p, *s);
+                    by_phys.entry(p).or_default().push(*s);
                 }
             }
             for s in w {
                 if let Some(p) = phys_of(*s) {
-                    if let Some(o) = by_phys.get(&p) {
+                    for o in by_phys.get(&p).map(|v| v.as_slice()).unwrap_or(&[]) {
                         let defined = def_in[bi].contains(o) || first_def[bi].get(o).map_or(false, |&d| d < ii);
                         if o != s && !w.contains(o) && defined {
                             let inst = &m.blocks[bi].insts[ii];
