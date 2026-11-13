@@ -2883,7 +2883,11 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
                 }
             }
         }
-    }    if let Err(e) = crate::sched::waits::verify_waits(m) {
+    }    // an exact kernel with `TrustWait` waivers: exact::finalize verified every wait site itself (the waived ones counted as GV-TRUST-TIMING)
+    let waived = f.exact && f.stmts().iter().any(|s| matches!(s, Stmt::TrustWait { .. }));
+    if waived {
+        rep.ok("waits(exact, per site)");
+    } else if let Err(e) = crate::sched::waits::verify_waits(m) {
         rep.add("GV-WAIT", Severity::Error, format!("{e} (on at least one control-flow path, including loop back edges)"));
     } else {
         rep.ok("wait-paths");
