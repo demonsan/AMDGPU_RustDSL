@@ -223,7 +223,7 @@ struct An<'a> {
     var_prov: HashMap<VarId, AV>,
     /// proven ring counters (var -> [min, max] of the reachable values) and their shadows (var -> (init X, ring init c, min, max): the var
     /// is X - c + ring at every point)
-    rings: (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Opnd, i128, i128, i128, VarId)>, HashMap<ValueId, VarId>),
+    rings: RingFacts,
     /// active lanes (highest active lane + 1) under the author's EXEC (exact mode `exec_set` / save / restore); 64 otherwise
     exec_lanes: u32,
     exec_saved: HashMap<u32, u32>,
@@ -285,12 +285,12 @@ impl<'a> An<'a> {
                 _ => Itv::top(),
             },
             // a proven ring counter / shadow (ring_facts): its value set holds at every program point
-            Opnd::Var(v) if self.rings.0.contains_key(v) => {
-                let (lo, hi) = self.rings.0[v];
+            Opnd::Var(v) if self.rings.rings.contains_key(v) => {
+                let (lo, hi) = self.rings.rings[v];
                 Itv::range(Poly::int(lo), Poly::int(hi))
             }
-            Opnd::Var(v) if self.rings.1.contains_key(v) => {
-                let (x, c, lo, hi, _) = self.rings.1[v].clone();
+            Opnd::Var(v) if self.rings.shadows.contains_key(v) => {
+                let (x, c, lo, hi, _) = self.rings.shadows[v].clone();
                 self.int_of(&x).add(&Itv::range(Poly::int(lo - c), Poly::int(hi - c)))
             }
             Opnd::Var(v) => self.vars.get(v).cloned().unwrap_or_default(),
@@ -362,9 +362,45 @@ impl<'a> An<'a> {
             other => format!("{other:?}"),
         }
     }
+    /// `D + w` is the next value of ring / shadow `w`: D is a `Select` by the ring's own rule on the ring's current value (no set of the
+    /// ring or of `w` between D's compare and this statement).
+    fn ring_step_add(&self, d: ValueId, w: VarId) -> bool {
+        let ring = if self.rings.rings.contains_key(&w) { w } else if let Some(r) = self.ring_of_shadow(w) { r } else { return false };
+        if self.rings.steps.get(&d) == Some(&ring) {
+            return true;
+        }
+        let Some(&(pred, ty, var_left, k, ka, kb)) = self.rings.rules.get(&ring) else { return false };
+        let konst = |o: &Opnd| -> Option<i128> {
+            match self.word_root(o) {
+                Opnd::I32(x) => Some(x as i128),
+                Opnd::Val(v) => match self.defs.get(&v) {
+                    Some(Op::ConstI32(x)) => Some(*x as i128),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) = self.defs.get(&d) else { return false };
+        if konst(a) != Some(ka) || konst(b) != Some(kb) {
+            return false;
+        }
+        let Some(Op::Cmp { pred: p2, ty: t2, a: ca, b: cb }) = self.defs.get(c) else { return false };
+        let side_ok = match (ca, cb) {
+            (Opnd::Var(x), o) if *x == ring && var_left => konst(o) == Some(k),
+            (o, Opnd::Var(x)) if *x == ring && !var_left => konst(o) == Some(k),
+            _ => false,
+        };
+        if !(side_ok && *p2 == pred && *t2 == ty) {
+            return false;
+        }
+        let Some(&pc) = self.rings.let_pos.get(c) else { return false };
+        let now = self.idx;
+        let moved = |v: VarId| self.rings.set_pos.get(&v).map_or(false, |l| l.iter().any(|&j| j > pc && j < now));
+        pc < now && !moved(ring) && !moved(w)
+    }
     /// The ring a shadow follows (its range and init are recorded in `rings.1`; the ring is the one whose steps update it).
     fn ring_of_shadow(&self, w: VarId) -> Option<VarId> {
-        self.rings.1.get(&w).map(|s| s.4)
+        self.rings.shadows.get(&w).map(|s| s.4)
     }
     fn same_ptr(&self, a: &Opnd, b: &Opnd) -> bool {
         a == b || self.ptr_key(a, 8) == self.ptr_key(b, 8)
@@ -1866,8 +1902,7 @@ impl<'a> An<'a> {
             }
             // the next value of a ring (or of its shadow) computed ahead of its set_var: `D + var` with D a step of that ring lies in the
             // ring's (shadow's) proven range, like the variable itself
-            Op::AddI32(Opnd::Val(d), Opnd::Var(w)) | Op::AddI32(Opnd::Var(w), Opnd::Val(d))
-                if self.rings.2.get(d).map_or(false, |v| v == w || self.rings.1.contains_key(w) && self.ring_of_shadow(*w) == Some(*v)) =>
+            Op::AddI32(Opnd::Val(d), Opnd::Var(w)) | Op::AddI32(Opnd::Var(w), Opnd::Val(d)) if self.ring_step_add(*d, *w) =>
             {
                 AV::Int(self.int_of(&Opnd::Var(*w)))
             }
@@ -3037,8 +3072,8 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 pub fn verify_ir(f: &Function) -> Report {
     let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() {
-        eprintln!("rings {:?}", an.rings.0);
-        eprintln!("shadows {:?}", an.rings.1.iter().map(|(w, s)| (w, s.1, s.2, s.3)).collect::<Vec<_>>());
+        eprintln!("rings {:?}", an.rings.rings);
+        eprintln!("shadows {:?}", an.rings.shadows.iter().map(|(w, s)| (w, s.1, s.2, s.3)).collect::<Vec<_>>());
     }
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
@@ -3530,7 +3565,23 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
 /// * a shadow `w` of ring `v`: `w` is set once to some X in the straight-line block where `v` is set to a constant c, and otherwise only to
 ///   `w + D` where the same `D` value updates `v` in the same block: then `w = X - c + v` at every point after both, so `w` lies in
 ///   `X - c + [min, max]`.
-fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Opnd, i128, i128, i128, VarId)>, HashMap<ValueId, VarId>) {
+/// Proven ring counters (see `ring_facts`).
+#[derive(Default)]
+struct RingFacts {
+    /// ring -> [min, max] of its reachable values
+    rings: HashMap<VarId, (i128, i128)>,
+    /// shadow -> (its init X, the ring's init c, min, max, the ring): the shadow is X - c + ring
+    shadows: HashMap<VarId, (Opnd, i128, i128, i128, VarId)>,
+    /// step values (the `Select`s the rings are updated with) -> their ring
+    steps: HashMap<ValueId, VarId>,
+    /// ring -> its step rule (pred, ty, var on the left, K, a, b)
+    rules: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)>,
+    /// statement positions of every set of a variable, and of every `Let`
+    set_pos: HashMap<VarId, Vec<usize>>,
+    let_pos: HashMap<ValueId, usize>,
+}
+
+fn ring_facts(f: &Function) -> RingFacts {
     let stmts = f.stmts();
     let defs: HashMap<ValueId, Op> = stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect();
     let pos: HashMap<ValueId, usize> = stmts.iter().enumerate().filter_map(|(k, s)| if let Stmt::Let { dst, .. } = s { Some((*dst, k)) } else { None }).collect();
@@ -3580,6 +3631,7 @@ fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Op
     let mut rings: HashMap<VarId, (i128, i128)> = HashMap::new();
     let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::new();
     let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::new();
+    let mut ring_rule: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = HashMap::new();
     'var: for (v, list) in &sets {
         let mut consts = Vec::new();
         let mut steps = Vec::new();
@@ -3644,6 +3696,7 @@ fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Op
             work.push(n);
         }
         rings.insert(*v, (*seen.first().unwrap(), *seen.last().unwrap()));
+        ring_rule.insert(*v, (pred, ty, var_left, k, ka, kb));
         ring_step.insert(*v, steps);
         ring_const.insert(*v, consts);
     }
@@ -3681,5 +3734,6 @@ fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Op
         shadows.insert(*w, (x, *c, lo, hi, v));
     }
     let steps: HashMap<ValueId, VarId> = ring_step.iter().flat_map(|(v, ds)| ds.iter().map(move |d| (*d, *v))).collect();
-    (rings, shadows, steps)
+    let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
+    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos }
 }
