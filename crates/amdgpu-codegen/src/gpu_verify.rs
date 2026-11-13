@@ -2509,11 +2509,11 @@ impl<'a> An<'a> {
         let ki = self.int_of(&k).add_const(plus1);
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
-        // the existing candidates first (never displaced by the cap), then the branch bound
-        let mut lo = xi.lo.clone();
-        lo.extend(add.lo);
-        let mut hi = xi.hi.clone();
-        hi.extend(add.hi);
+        // the branch bound first (a constant bound from the branch beats a symbolic candidate the cap would keep), then the existing ones
+        let mut lo = add.lo.clone();
+        lo.extend(xi.lo.iter().cloned());
+        let mut hi = add.hi.clone();
+        hi.extend(xi.hi.iter().cloned());
         let refined = Itv { lo: cap(lo), hi: cap(hi) };
         match x {
             Opnd::Var(v) => {
