@@ -153,7 +153,8 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                 let Stmt::Let { dst, op } = st else { continue };
                 let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
                 match op {
-                    Op::AddI32(..) if !pinned.contains(dst) && !rd.is_empty() && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) => {
+                    // read by set_m0 (and otherwise only by the DMAs' LDS-address operand, which is the verifier's view of M0)
+                    Op::AddI32(..) if !pinned.contains(dst) && rd.iter().any(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. } | Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. })) => {
                         lw.m0_adds.insert(*dst);
                     }
                     Op::Cmp { .. } if rd.len() == 1 => {
@@ -502,6 +503,8 @@ struct Lowerer {
     mask_vcc: HashSet<ValueId>,
     /// exact mode: I1 values held in SCC (scalar compares read by s_cselect / s_cbranch_scc*)
     scc_i1: HashSet<ValueId>,
+    /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
+    e64_next: bool,
     /// exact mode: unpinned `AddI32` values read only by `set_m0` (lowered there as `s_add_u32 m0, a, b`)
     m0_adds: HashSet<ValueId>,
     /// exact mode: compares read only by a `NotI1` held in the same lane-mask register (the author's negated compare, e.g. v_cmp_nge)
@@ -660,6 +663,7 @@ impl Lowerer {
             mask_vcc: HashSet::new(),
             scc_i1: HashSet::new(),
             m0_adds: HashSet::new(),
+            e64_next: false,
             neg_folded: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
@@ -2187,6 +2191,23 @@ impl Lowerer {
 
     /// One statement (structure markers included: they open / close the CFG regions).
     fn lower_stmt(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
+        // `encode_e64` marks the VALU instructions of the statement after it
+        if std::mem::take(&mut self.e64_next) && !matches!(st, Stmt::EncodeE64) {
+            let (b, n) = (self.cur, self.mir.blocks[self.cur].insts.len());
+            self.lower_stmt_inner(f, st)?;
+            let blk = if self.cur == b { b } else { self.cur };
+            let from = if blk == b { n } else { 0 };
+            for i in self.mir.blocks[blk].insts[from..].iter_mut() {
+                if matches!(crate::op_attrs::attrs(i.op).cost.pipe, crate::sched::model::Pipe::Valu | crate::sched::model::Pipe::Trans) {
+                    i.e64 = true;
+                }
+            }
+            return Ok(());
+        }
+        self.lower_stmt_inner(f, st)
+    }
+
+    fn lower_stmt_inner(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         self.cur_stmt += 1;
         LAST_STMTS.with(|s| s.borrow_mut().push(st.clone()));
         {
@@ -2840,6 +2861,7 @@ impl Lowerer {
                 Stmt::ExecSave { sgpr } => self.push(MInst::new(MOp::SSaveExec).imm(*sgpr as i64)),
                 Stmt::ExecAll => self.push(MInst::new(MOp::SExecAll)),
                 Stmt::TrustWait { .. } => LAST_TRUSTS.with(|t| t.borrow_mut().push(self.cur_stmt)),
+                Stmt::EncodeE64 => self.e64_next = true,
                 Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),
                 Stmt::ExecRestore { sgpr } => self.push(MInst::new(MOp::SRestoreExec).imm(*sgpr as i64)),
                 Stmt::SetM0 { value } => {
@@ -3109,6 +3131,15 @@ impl Lowerer {
             Op::ConstF32(v) => {
                 let r = self.const_vreg((v.to_bits() as i32) as i64);
                 self.val.insert(dst, r);
+            }
+            Op::AddK { a, k } => {
+                // s_addk_i32: in place (no copy when the author pins the result at a's register)
+                let Src::Reg(r) = self.s_operand(*a)? else { return Err("AddK: the operand must be an SGPR value".into()) };
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SAddkI32).def(d).srcreg(r).imm(*k as i64));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
             }
             Op::LoadScalar { base, byte_off } => {
                 let b = self.s2_of(*base).ok_or("LoadScalar: the base must be a pointer held in an SGPR pair")?;

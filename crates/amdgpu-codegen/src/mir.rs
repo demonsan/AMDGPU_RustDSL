@@ -643,6 +643,8 @@ pub struct MInst {
     pub stmt: u32,
     /// Source-negate modifiers (VOP3 `neg`): bit i negates source i (f32 add / sub / mul / max / fma; emitted in the e64 form).
     pub neg: u8,
+    /// exact mode: emit the VOP3 (`_e64`) encoding (the author's `encode_e64`)
+    pub e64: bool,
 }
 
 /// Exact mode: an SGPR pin at this base is VCC (the lane-mask register `v_cmp_*_e32` writes and `v_cndmask_b32_e32` / `s_cbranch_vcc*` read).
@@ -722,7 +724,7 @@ pub fn cmp_names(code: i64, scalar: bool) -> (&'static str, &'static str) {
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0, neg: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0, neg: 0, e64: false }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

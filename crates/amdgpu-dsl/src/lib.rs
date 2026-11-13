@@ -701,6 +701,8 @@ pub enum Op {
     /// dword 0 (low address bits) of a pointer pair, read in place
     /// The kernarg segment pointer itself (hardware `s[0:1]` at entry; no instruction). `KernargPtr` loads a pointer stored in it.
     KernargSegment,
+    /// Exact mode: `s_addk_i32 d, k` (d = a + k in a's register; the author's SALU form).
+    AddK { a: Opnd, k: i32 },
     /// Exact mode: `s_load_dword` from a scalar (SGPR pair) pointer: the dword at `base + byte_off` (wave-uniform).
     LoadScalar { base: Opnd, byte_off: u32 },
     PtrLo(Opnd),
@@ -805,6 +807,7 @@ impl Op {
             Op::DppQuadPerm { .. } => DType::U32,
             Op::PtrLo(_) | Op::PtrHi(_) => DType::I32,
             Op::LoadScalar { .. } => DType::U32,
+            Op::AddK { .. } => DType::I32,
             Op::PtrCat { .. } => DType::Ptr,
             Op::RsrcCat { .. } => DType::Rsrc,
         }
@@ -881,6 +884,7 @@ impl Op {
             Op::Permlane32SwapB { swap } => vec![*swap],
             Op::PtrLo(p) | Op::PtrHi(p) => vec![*p],
             Op::LoadScalar { base, .. } => vec![*base],
+            Op::AddK { a, .. } => vec![*a],
             Op::PtrCat { lo, hi } => vec![*lo, *hi],
             Op::RsrcCat { words } => words.to_vec(),
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
@@ -1350,6 +1354,9 @@ pub enum Stmt {
     /// guarantee complete (a vendor timing reliance, docs/exact-mode.md section 5.2). Counted in the certificate (GV-TRUST-TIMING); rejected
     /// in every dispatch-reachable kernel; a waiver that waives nothing is an error.
     TrustWait { reason: String },
+    /// Exact mode: the next statement's VALU instruction(s) use the VOP3 (`_e64`) encoding even where the VOP2 / VOPC one would encode
+    /// (the author's encoding).
+    EncodeE64,
     // ---- E5: exact branch forms (docs/exact-mode.md section 5; owner kernel-opt). Layout and scope only: no instruction of their own. ----
     /// The then-branch of the NEXT `BeginIf` is laid out out of line, at the `LayoutAnchor` named `anchor`: its blocks move there, the branch
     /// into it is the taken edge of the condition, and its end jumps to the if's join (a cold path that jumps back, or a loop exit body whose
@@ -2323,6 +2330,11 @@ impl FnBuilder {
     #[track_caller]
     pub fn trust_wait(&mut self, reason: &str) {
         self.push_stmt(Stmt::TrustWait { reason: reason.to_string() });
+    }
+
+    /// Exact mode: the next statement is encoded `_e64` (see `Stmt::EncodeE64`).
+    pub fn encode_e64(&mut self) {
+        self.push_stmt(Stmt::EncodeE64);
     }
     /// A value with no instruction: the initial value of a variable that is written before it is read (exact mode).
     #[track_caller]
@@ -4419,7 +4431,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {

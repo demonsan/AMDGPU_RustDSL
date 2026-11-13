@@ -154,7 +154,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
     let mut e = Effects::default();
     let c = match op {
         Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::KernargSegment | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
-        Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
+        Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } | Op::AddK { .. } => ResClass::Salu,
         Op::MovV { .. } => ResClass::Valu,
         Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,
         // (s) zero-instruction views / assemblies of SGPR words
@@ -339,7 +339,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.barrier = true;
             (ResClass::Sync, vec![], false)
         }
-        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::TrustWait { .. } => {
+        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {
             e.directive = true;
             (ResClass::Sync, vec![], false)
         }

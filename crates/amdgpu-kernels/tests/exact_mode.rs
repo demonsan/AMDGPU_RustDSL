@@ -142,7 +142,8 @@ pub fn exact_probe_kernel() -> Function {
 fn the_hardware_probe_kernel_compiles_exactly() {
     let f = exact_probe_kernel();
     let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
-    assert!(c.asm.contains("v_add_u32_e32 v2, 7, v2"), "{}", c.asm);
+    // the author wrote (t, 7): an inline constant in src1 is the VOP3 form
+    assert!(c.asm.contains("v_add_u32_e64 v2, v2, 7"), "{}", c.asm);
     // tools/exact_probe.sh creates build/exact and reads the kernel from there
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/exact");
     if std::path::Path::new(dir).is_dir() {
