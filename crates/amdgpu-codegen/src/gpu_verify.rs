@@ -197,8 +197,22 @@ fn contract_ctx(f: &Function) -> Ctx {
                 let r = Sym::Named(format!("ceil_rem_grid{axis}"));
                 c.lb.insert(r.clone(), 0);
                 c.ub.insert(r.clone(), *k as i64 - 1);
-                let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
-                c.subst.insert(Sym::Grid(*axis), q);
+                // P a single kernarg symbol: keep the grid symbol (>= 1) and write the kernarg as k * grid - r (both facts survive: grid >= 1
+                // and k * grid <= P + k - 1); otherwise substitute the grid as (P + r) / k
+                let single = p.0.len() == 1 && p.0.iter().next().map_or(false, |(m, q)| m.len() == 1 && matches!(m[0], Sym::Ka(_)) && *q == Q::int(1));
+                if single {
+                    let s = p.0.keys().next().unwrap()[0].clone();
+                    let q = Poly::sym(Sym::Grid(*axis)).scale(Q::int(*k as i128)).sub(&Poly::sym(r));
+                    for v in c.subst.values_mut() {
+                        if let Some(n) = subst_sym(v, &s, &q) {
+                            *v = n;
+                        }
+                    }
+                    c.subst.insert(s, q);
+                } else {
+                    let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
+                    c.subst.insert(Sym::Grid(*axis), q);
+                }
             }
         }
     }
@@ -4197,4 +4211,18 @@ fn value_users(f: &Function) -> HashMap<ValueId, Vec<ValueId>> {
         }
     }
     m
+}
+
+/// `p` with the symbol `s` replaced by `q` (None: a product overflowed the polynomial representation).
+fn subst_sym(p: &Poly, s: &Sym, q: &Poly) -> Option<Poly> {
+    let mut out = Poly::int(0);
+    for (mono, c) in &p.0 {
+        let mut term = Poly::konst(*c);
+        for x in mono {
+            let f = if x == s { q.clone() } else { Poly::sym(x.clone()) };
+            term = term.mul(&f)?;
+        }
+        out = out.add(&term);
+    }
+    Some(out)
 }
