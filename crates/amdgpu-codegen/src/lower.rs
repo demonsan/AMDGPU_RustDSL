@@ -534,6 +534,7 @@ impl Lowerer {
             exact: f.exact,
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
+                LAST_TRUSTS.with(|s| s.borrow_mut().clear());
                 0
             },
             mir,
@@ -813,6 +814,10 @@ impl Lowerer {
                 self.vars.resize(var.0 as usize + 1, u32::MAX);
             }
             self.vars[var.0 as usize] = r;
+            // an `Undef` initial value: the variable's registers are written before they are read (no instruction)
+            if matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::Undef { .. }))) {
+                continue;
+            }
             if class == RClass::S1 {
                 let s = self.s_operand(init[i])?;
                 if let Src::Reg(x) = s {
@@ -2603,6 +2608,7 @@ impl Lowerer {
                 Stmt::SNop { count } => self.push(MInst::new(MOp::SNop).imm(*count as i64)),
                 Stmt::ExecSave { sgpr } => self.push(MInst::new(MOp::SSaveExec).imm(*sgpr as i64)),
                 Stmt::ExecAll => self.push(MInst::new(MOp::SExecAll)),
+                Stmt::TrustWait { .. } => LAST_TRUSTS.with(|t| t.borrow_mut().push(self.cur_stmt)),
                 Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),
                 Stmt::ExecRestore { sgpr } => self.push(MInst::new(MOp::SRestoreExec).imm(*sgpr as i64)),
                 Stmt::SetM0 { value } => {
@@ -3488,6 +3494,8 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
+            // no instruction: only an initial value of a variable (alloc_vars skips it); any other read is an IR error
+            Op::Undef { .. } => {}
             Op::MovS { a, .. } => {
                 let s = self.s_operand(*a)?;
                 if let Src::Reg(r) = s {
@@ -5587,6 +5595,8 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
 thread_local! {
     /// the statements in lowering order (`MInst::stmt` - 1 indexes it): the exact-mode report of the last lowering on this thread
     static LAST_STMTS: std::cell::RefCell<Vec<Stmt>> = std::cell::RefCell::new(Vec::new());
+    /// `TrustWait` statements of the last lowering (their `MInst::stmt` numbering): the next statement's waits check is waived
+    static LAST_TRUSTS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
     static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
 }
 
@@ -5594,6 +5604,11 @@ thread_local! {
 /// The statements of the last lowering on this thread, in the order `MInst::stmt` counts them.
 pub fn last_stmts() -> Vec<Stmt> {
     LAST_STMTS.with(|s| s.borrow().clone())
+}
+
+/// The `TrustWait` statements of the last lowering on this thread (`MInst::stmt` numbering).
+pub fn last_trusts() -> Vec<u32> {
+    LAST_TRUSTS.with(|s| s.borrow().clone())
 }
 
 pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {

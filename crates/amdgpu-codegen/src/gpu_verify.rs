@@ -36,11 +36,13 @@ pub struct Ledger {
     pub region_trust: usize,
     /// safe-asm blocks (`b.asm`, var asm): their internal memory accesses are not modelled (GV-ASM)
     pub asm_opaque: usize,
+    /// exact mode `TrustWait`: a read the wait counters do not guarantee complete (a stated timing reliance, GV-TRUST-TIMING)
+    pub timing_trust: usize,
 }
 
 impl Ledger {
     pub fn total(&self) -> usize {
-        self.assume_trusted + self.tile_trust + self.region_trust + self.asm_opaque
+        self.assume_trusted + self.tile_trust + self.region_trust + self.asm_opaque + self.timing_trust
     }
 }
 
@@ -101,6 +103,10 @@ impl Report {
         for f in &self.findings {
             if f.code == "GV-ASM" {
                 l.asm_opaque += 1;
+                continue;
+            }
+            if f.code == "GV-TRUST-TIMING" {
+                l.timing_trust += 1;
                 continue;
             }
             if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") {
@@ -2367,6 +2373,10 @@ impl<'a> An<'a> {
                 self.env.insert(*dst, v);
             }
             Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
+            Stmt::TrustWait { reason } => {
+                let sev = if f.exact { Severity::Warning } else { Severity::Error };
+                self.rep.add("GV-TRUST-TIMING", sev, format!("stmt {}: TRUSTED timing (the next read is not guaranteed by the wait counters): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));
+            }
             Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
                 self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot), *slot));
                 self.tag_stmt = self.idx;

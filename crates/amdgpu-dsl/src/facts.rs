@@ -156,6 +156,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
         Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
         Op::MovV { .. } => ResClass::Valu,
+        Op::Undef { .. } => ResClass::Marker,
         Op::MemTimeLo { .. } => {
             e.directive = true;
             ResClass::Sync
@@ -334,7 +335,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.barrier = true;
             (ResClass::Sync, vec![], false)
         }
-        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } => {
+        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::TrustWait { .. } => {
             e.directive = true;
             (ResClass::Sync, vec![], false)
         }

@@ -548,6 +548,9 @@ pub enum Op {
     MovV { ty: DType, a: Opnd },
     /// Exact mode: an authored 32-bit move into an SGPR (`s_mov_b32`; `a` wave-uniform). The value is `a`.
     MovS { ty: DType, a: Opnd },
+    /// A value with no instruction (exact mode): the initial value of a loop / scope variable the code writes before it reads it. Legal only
+    /// as such an `init`; any other read is an IR error.
+    Undef { ty: DType },
     /// Cross-lane quad permutation (`v_mov_b32_dpp quad_perm`): lane `l` receives lane `4 (l / 4) + perm[l % 4]` of `x` (all rows / banks written).
     DppQuadPerm { x: Opnd, perm: [u8; 4] },
 
@@ -778,7 +781,7 @@ impl Op {
             Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
             Op::LoadGlobalB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
-            Op::MovV { ty, .. } | Op::MovS { ty, .. } => *ty,
+            Op::MovV { ty, .. } | Op::MovS { ty, .. } | Op::Undef { ty } => *ty,
             Op::DppQuadPerm { .. } => DType::U32,
         }
     }
@@ -787,7 +790,7 @@ impl Op {
         match self {
             Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
             | Op::KernargPtr { .. } | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
-            | Op::WorkgroupIdZ => vec![],
+            | Op::WorkgroupIdZ | Op::Undef { .. } => vec![],
             Op::AddI32(a, b)
             | Op::MulI32(a, b)
             | Op::ShlI32(a, b)
@@ -1314,6 +1317,10 @@ pub enum Stmt {
     ExecAll,
     /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]` (restores a mask saved by `ExecSave` of the same pair, unchanged in between).
     ExecRestore { sgpr: u32 },
+    /// Exact mode, NON-DISPATCHED kernels only: the next statement's instruction may read a load result the lgkm / vm counter does not
+    /// guarantee complete (a vendor timing reliance, docs/exact-mode.md section 5.2). Counted in the certificate (GV-TRUST-TIMING); rejected
+    /// in every dispatch-reachable kernel; a waiver that waives nothing is an error.
+    TrustWait { reason: String },
     // ---- E5: exact branch forms (docs/exact-mode.md section 5; owner kernel-opt). Layout and scope only: no instruction of their own. ----
     /// The then-branch of the NEXT `BeginIf` is laid out out of line, at the `LayoutAnchor` named `anchor`: its blocks move there, the branch
     /// into it is the taken edge of the condition, and its end jumps to the if's join (a cold path that jumps back, or a loop exit body whose
@@ -2282,6 +2289,16 @@ impl FnBuilder {
     #[track_caller]
     pub fn exec_save(&mut self, sgpr: u32) {
         self.push_stmt(Stmt::ExecSave { sgpr });
+    }
+    /// Exact mode, non-dispatched kernels only: waive the counter check of the next statement's reads (a stated timing reliance).
+    #[track_caller]
+    pub fn trust_wait(&mut self, reason: &str) {
+        self.push_stmt(Stmt::TrustWait { reason: reason.to_string() });
+    }
+    /// A value with no instruction: the initial value of a variable that is written before it is read (exact mode).
+    #[track_caller]
+    pub fn undef(&mut self, ty: DType) -> ValueId {
+        self.let_(Op::Undef { ty })
     }
     /// Exact mode: the combined `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)`.
     #[track_caller]
@@ -3852,6 +3869,7 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
     check_var_slices(f, &mut errs);
+    check_undef_reads(f, &mut errs);
     check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
     if let Some(p) = &f.plan {
@@ -4372,7 +4390,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {
@@ -4774,6 +4792,29 @@ pub use expr::{Cond, Ptr, F32, I32};
 
 /// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).
 /// The value / variable operands a statement reads (structure and contract markers: none).
+/// `Undef` values are only the initial values of loop / scope variables: any other read is an error.
+fn check_undef_reads(f: &Function, errs: &mut Vec<String>) {
+    let undef: std::collections::HashSet<ValueId> = f.stmts().iter().filter_map(|s| match s {
+        Stmt::Let { dst, op: Op::Undef { .. } } => Some(*dst),
+        _ => None,
+    }).collect();
+    if undef.is_empty() {
+        return;
+    }
+    for (idx, st) in f.stmts().iter().enumerate() {
+        if matches!(st, Stmt::BeginLoop { .. }) || format!("{st:?}").starts_with("DeclareVars") {
+            continue;
+        }
+        for o in stmt_operands(st) {
+            if let Opnd::Val(v) = o {
+                if undef.contains(&v) {
+                    errs.push(format!("stmt {idx}: reads the undefined value v{v} (Undef is only a variable's initial value)"));
+                }
+            }
+        }
+    }
+}
+
 pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),

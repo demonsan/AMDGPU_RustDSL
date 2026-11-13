@@ -225,3 +225,52 @@ fn the_combined_waitcnt_is_one_instruction() {
     let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
     assert!(c.asm.contains("s_waitcnt vmcnt(0) lgkmcnt(0)"), "{}", c.asm);
 }
+
+/// `TrustWait`: waives the counter check of the next statement only (counted as GV-TRUST-TIMING); a waiver that waives nothing is an error.
+#[test]
+fn a_trusted_wait_is_counted_and_must_waive_something() {
+    let build = |trust: bool, wait: bool| {
+        let mut b = FnBuilder::new("probe_exact_trust", 64);
+        b.arg("o", DType::Ptr, 0x00, 8);
+        b.arg_tensor("o", Ext::c(64 * 4));
+        b.exact();
+        let po = b.let_(Op::KernargPtr { offset: 0x00 });
+        let tid = b.let_(Op::WorkitemId);
+        if wait {
+            b.wait_lds(0);
+        }
+        if trust {
+            b.trust_wait("test: the kernarg load is assumed complete");
+        }
+        let rs = b.buffer_rsrc_sized(po, 64 * 4);
+        b.wait_lds(0);
+        let off = b.bind_i32(ev(tid) << 2);
+        let vf = b.let_(Op::BitcastF32(Opnd::Val(off)));
+        b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
+        b.pin_sgpr_at(RegRef::Val(po), 8);
+        b.pin_sgpr_at(RegRef::Val(rs), 12);
+        b.pin_vgpr_at(RegRef::Val(tid), 0);
+        b.pin_vgpr_at(RegRef::Val(off), 1);
+        b.pin_vgpr_at(RegRef::Val(vf), 1);
+        b.finish()
+    };
+    // without the waiver: the missing wait is an error; with it: compiles, and the certificate counts it
+    assert!(amdgpu_codegen::compile(&build(false, false)).is_err());
+    let f = build(true, false);
+    amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(amdgpu_codegen::gpu_verify::verify_ir(&f).ledger().timing_trust, 1);
+    // a waiver where the wait is present waives nothing: error
+    let e = amdgpu_codegen::compile(&build(true, true)).err().expect("an unused waiver");
+    assert!(e.contains("waives nothing"), "{e}");
+}
+
+#[test]
+fn an_undef_value_is_only_an_initial_value() {
+    let mut b = FnBuilder::new("probe_undef", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    let u = b.undef(DType::F32);
+    let k = b.let_(Op::KernargF32 { offset: 0x00 });
+    let _ = b.let_(Op::AddF32(Opnd::Val(u), Opnd::Val(k)));
+    let errs = amdgpu_dsl::verify(&b.finish());
+    assert!(errs.iter().any(|e| e.contains("undefined value")), "{errs:?}");
+}

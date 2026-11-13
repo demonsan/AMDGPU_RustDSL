@@ -107,6 +107,8 @@ pub struct Violation {
     pub before: Option<String>,
     pub after: Option<String>,
     pub needs: String,
+    /// `MInst::stmt` of the instruction the insertion would precede (0 = none)
+    pub before_stmt: u32,
 }
 
 impl std::fmt::Display for Violation {
@@ -146,6 +148,7 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
                 before: x.get(i).map(txt),
                 after: if i > 0 { x.get(i - 1).map(txt) } else { None },
                 needs: txt(&y[j]),
+                before_stmt: x.get(i).map_or(0, |b| b.stmt),
             });
             // the next original instruction further on: everything before it was inserted (passes insert runs of nops / waits)
             match (j + 1..y.len().min(j + 24)).find(|&k| i < x.len() && same(&x[i], &y[k])) {
@@ -157,6 +160,7 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
                             before: x.get(i).map(txt),
                             after: if i > 0 { x.get(i - 1).map(txt) } else { None },
                             needs: txt(&y[q]),
+                            before_stmt: x.get(i).map_or(0, |b| b.stmt),
                         });
                     }
                     j = k;
@@ -170,7 +174,7 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
         }
     }
     if before.blocks.len() != after.blocks.len() {
-        out.push(Violation { rule, block: 0, before: None, after: None, needs: format!("{} blocks added", after.blocks.len() as i64 - before.blocks.len() as i64) });
+        out.push(Violation { rule, block: 0, before: None, after: None, before_stmt: 0, needs: format!("{} blocks added", after.blocks.len() as i64 - before.blocks.len() as i64) });
     }
 }
 
@@ -564,8 +568,21 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
     let a = crate::regalloc::Alloc { phys, max_v, max_s, scalar };
     if errs.is_empty() {
         // 5. verification: waits, hazards, registers (only meaningful once every value has a register)
+        // a `TrustWait` waives the counter check of the next statement's instruction (and must waive something)
+        let trusts = crate::lower::last_trusts();
+        let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for v in verify_final(&m, &a, false) {
+            let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
+            if waived {
+                used.insert(v.before_stmt - 1);
+                continue;
+            }
             errs.push(format!("exact: {v}"));
+        }
+        for t in trusts {
+            if !used.contains(&t) {
+                errs.push(format!("exact: TrustWait at stmt {} waives nothing (the next statement's reads are covered by the waits)", t as i64 - 1));
+            }
         }
         for c in check_registers_with(&m, &a, &entry) {
             errs.push(format!("exact: register clobber: {c}"));

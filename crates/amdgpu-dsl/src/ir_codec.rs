@@ -129,6 +129,7 @@ impl FromIr for Op {
             "ReadFirstLane" => { v.expect_tuple("ReadFirstLane", 1)?; Ok(Op::ReadFirstLane(FromIr::from_ir(v.item(0)?)?)) }
             "MovV" => { v.expect_struct("MovV")?; Ok(Op::MovV { ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)? }) }
             "MovS" => { v.expect_struct("MovS")?; Ok(Op::MovS { ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)? }) }
+            "Undef" => { v.expect_struct("Undef")?; Ok(Op::Undef { ty: FromIr::from_ir(v.field("ty")?)? }) }
             "DppQuadPerm" => { v.expect_struct("DppQuadPerm")?; Ok(Op::DppQuadPerm { x: FromIr::from_ir(v.field("x")?)?, perm: FromIr::from_ir(v.field("perm")?)? }) }
             "Frag2" => { v.expect_tuple("Frag2", 2)?; Ok(Op::Frag2(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "Frag2Lane" => { v.expect_struct("Frag2Lane")?; Ok(Op::Frag2Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
@@ -253,6 +254,7 @@ impl IrIds for Op {
             Op::ReadFirstLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::MovV { ty, a } => { IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); }
             Op::MovS { ty, a } => { IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); }
+            Op::Undef { ty } => { IrIds::ids(&mut (*ty), fv, fr); }
             Op::DppQuadPerm { x, perm } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*perm), fv, fr); }
             Op::Frag2(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::Frag2Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
@@ -700,6 +702,7 @@ impl FromIr for Stmt {
             "WaitCnt" => { v.expect_struct("WaitCnt")?; Ok(Stmt::WaitCnt { vm: FromIr::from_ir(v.field("vm")?)?, lgkm: FromIr::from_ir(v.field("lgkm")?)? }) }
             "ExecAll" => { v.expect_unit("ExecAll")?; Ok(Stmt::ExecAll) }
             "ExecRestore" => { v.expect_struct("ExecRestore")?; Ok(Stmt::ExecRestore { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
+            "TrustWait" => { v.expect_struct("TrustWait")?; Ok(Stmt::TrustWait { reason: FromIr::from_ir(v.field("reason")?)? }) }
             "BranchPlace" => { v.expect_struct("BranchPlace")?; Ok(Stmt::BranchPlace { anchor: FromIr::from_ir(v.field("anchor")?)? }) }
             "LayoutAnchor" => { v.expect_struct("LayoutAnchor")?; Ok(Stmt::LayoutAnchor { name: FromIr::from_ir(v.field("name")?)? }) }
             "DeclareVars" => { v.expect_struct("DeclareVars")?; Ok(Stmt::DeclareVars { vars: FromIr::from_ir(v.field("vars")?)?, init: FromIr::from_ir(v.field("init")?)? }) }
@@ -775,6 +778,7 @@ impl IrIds for Stmt {
             Stmt::WaitCnt { vm, lgkm } => { IrIds::ids(&mut (*vm), fv, fr); IrIds::ids(&mut (*lgkm), fv, fr); }
             Stmt::ExecAll => {}
             Stmt::ExecRestore { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
+            Stmt::TrustWait { reason } => { IrIds::ids(&mut (*reason), fv, fr); }
             Stmt::BranchPlace { anchor } => { IrIds::ids(&mut (*anchor), fv, fr); }
             Stmt::LayoutAnchor { name } => { IrIds::ids(&mut (*name), fv, fr); }
             Stmt::DeclareVars { vars, init } => { for x in (*vars).iter_mut() { fr(x); } IrIds::ids(&mut (*init), fv, fr); }

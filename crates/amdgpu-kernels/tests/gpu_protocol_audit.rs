@@ -245,7 +245,7 @@ fn different_generation_overlapping_writes_are_a_race() {
 fn region_trust_escape_is_listed_and_counted_but_can_hide_a_violation() {
     let r = verify_ir(&region_trust_escape());
     println!("region trust: {}", r.render());
-    assert_eq!(r.ledger(), Ledger { assume_trusted: 0, tile_trust: 0, region_trust: 1, asm_opaque: 0 }, "{}", r.render());
+    assert_eq!(r.ledger(), Ledger { assume_trusted: 0, tile_trust: 0, region_trust: 1, asm_opaque: 0, timing_trust: 0 }, "{}", r.render());
     assert_eq!(r.errors().len(), 0, "the escape must be a trust boundary, not silently rejected: {}", errors(&r));
     assert!(r.findings.iter().any(|f| f.alias == "GV-PROTO-TRUST" && f.msg.contains("buf_trust")), "{}", r.render());
 }
