@@ -184,15 +184,23 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
 /// Verifies a final (allocated) function without changing it: every fixing pass runs on a copy, and whatever it would insert is a
 /// violation (docs/exact-mode.md section 4). `strict` = the scheduled path's block-end MFMA padding.
 pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> Vec<Violation> {
+    verify_final_with(m, m, a, strict)
+}
+
+/// `verify_final` with the waits checked on `waits_view` (exact mode: the physical-register view, `physical_view`) and the hazards on `m`
+/// (the hazard passes key their value-level rules on the values).
+pub fn verify_final_with(m: &MFunction, waits_view: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> Vec<Violation> {
     let mut out = Vec::new();
+    {
+        let mut c = waits_view.clone();
+        crate::sched::waits::insert_waits(&mut c);
+        diff("waits", waits_view, &c, a, &mut out);
+    }
     let run = |rule: &'static str, f: &dyn Fn(&mut MFunction), out: &mut Vec<Violation>| {
         let mut c = m.clone();
         f(&mut c);
         diff(rule, m, &c, a, out);
     };
-    run("waits", &|c| {
-        crate::sched::waits::insert_waits(c);
-    }, &mut out);
     run("hazard-value", &|c| crate::hazards::without_fill(|| crate::hazards::fix_value_hazards_opts(c, strict)), &mut out);
     run("hazard-inflight-waw", &|c| {
         crate::hazards::pad_inflight_waw(c, a);
@@ -597,7 +605,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         // waits and hazards on PHYSICAL registers: a value read through a vanished same-register copy (a tuple assembled from loaded parts)
         // is the register its load wrote
         let m_phys = physical_view(&m, &a);
-        for v in verify_final(&m_phys, &a, false) {
+        for v in verify_final_with(&m, &m_phys, &a, false) {
             let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
             if waived {
                 used.insert(v.before_stmt - 1);
