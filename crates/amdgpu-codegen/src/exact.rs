@@ -334,3 +334,115 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
     out.dedup();
     out
 }
+
+// ------------------------------------------------------------------------------------------------ E3: the exact pass body
+
+/// The exact back end: the lowered function as the author wrote it, registers from the pins, then verification only. Every problem is
+/// collected and reported together (an `Err` with one line per violation).
+pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction, crate::regalloc::Alloc), String> {
+    let mut errs: Vec<String> = Vec::new();
+    let stmts = crate::lower::last_stmts();
+    // 1. lowering's automatic waits are not the author's: the author places the waits, the check below verifies them
+    crate::sched::waits::strip_auto_waits(&mut m);
+    // 2. LDS-DMAs use the M0 the author set (`set_m0`); they never write it themselves
+    for b in m.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if is_dma(i.op) {
+                i.skip_m0 = true;
+            }
+        }
+    }
+    // 3. registers: every value from its pin
+    let mut pin: std::collections::HashMap<VReg, (bool, u32)> = std::collections::HashMap::new();
+    for (r, b) in &m.reg_hints.pins_v {
+        pin.insert(m.canon(*r), (false, *b));
+    }
+    for (r, b) in &m.reg_hints.pins_s {
+        pin.insert(m.canon(*r), (true, *b));
+    }
+    // a copy of a hardware register into a value pinned at that same register is no instruction
+    for b in m.blocks.iter_mut() {
+        b.insts.retain(|i| {
+            let same = match (i.op, i.dst) {
+                (MOp::VReadPhys, Some(d)) => pin.get(&m.canon(d)) == Some(&(false, i.imm as u32)),
+                (MOp::SReadPhys, Some(d)) => pin.get(&m.canon(d)) == Some(&(true, i.imm as u32)),
+                _ => false,
+            };
+            !same
+        });
+    }
+    // 4. no instruction the author did not write
+    for b in &m.blocks {
+        for i in &b.insts {
+            if let Some(k) = synthetic_kind(&m, &stmts, i) {
+                let st = if i.stmt == 0 { "-".to_string() } else { format!("{} ({})", i.stmt - 1, format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(90).collect::<String>()) };
+                errs.push(format!("exact: block {} {:?}: {k}, at stmt {st}", b.label, i.op));
+            }
+        }
+    }
+    let n = m.vregs.len();
+    let mut phys = vec![u32::MAX; n];
+    let mut scalar = vec![false; n];
+    let mut used: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    for b in &m.blocks {
+        for i in &b.insts {
+            for r in i.dst.iter().copied().chain(i.uses()) {
+                used.insert(m.canon(r));
+            }
+        }
+    }
+    let (mut max_v, mut max_s) = (0u32, 0u32);
+    let mut missing: Vec<String> = Vec::new();
+    for r in 0..n as u32 {
+        if m.canon(r) != r {
+            continue;
+        }
+        let c = m.vreg_class(r);
+        scalar[r as usize] = !c.is_vector();
+        match pin.get(&r) {
+            Some(&(s, b)) => {
+                if s == c.is_vector() {
+                    errs.push(format!("exact: {} ({c:?}) is pinned to the {} file", name_of(&m, r), if s { "SGPR" } else { "VGPR" }));
+                }
+                phys[r as usize] = b;
+                if s {
+                    max_s = max_s.max(b + c.dwords());
+                } else {
+                    max_v = max_v.max(b + c.dwords());
+                }
+            }
+            None if used.contains(&r) => missing.push(name_of(&m, r)),
+            None => {}
+        }
+    }
+    // aliases (views) sit inside their tuple
+    for (v, (t, off)) in m.alias.clone() {
+        if phys[t as usize] != u32::MAX {
+            phys[v as usize] = phys[t as usize] + off as u32;
+            scalar[v as usize] = scalar[t as usize];
+        }
+    }
+    if !missing.is_empty() {
+        errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    let a = crate::regalloc::Alloc { phys, max_v, max_s, scalar };
+    if errs.is_empty() {
+        // 5. verification: waits, hazards, registers (only meaningful once every value has a register)
+        for v in verify_final(&m, &a, false) {
+            errs.push(format!("exact: {v}"));
+        }
+        for c in check_registers(&m, &a) {
+            errs.push(format!("exact: register clobber: {c}"));
+        }
+    }
+    let _ = f;
+    if errs.is_empty() {
+        Ok((m, a))
+    } else {
+        Err(format!("exact mode: {} violation(s)\n{}", errs.len(), errs.join("\n")))
+    }
+}
+
+fn name_of(m: &MFunction, r: VReg) -> String {
+    m.reg_hints.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"))
+}

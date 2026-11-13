@@ -105,6 +105,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         agpr::assign(&mut b)?;
         b
     };
+    // exact authored mode: no scheduling, no allocation, no inserted waits / nops; the author's code is verified (docs/exact-mode.md)
+    if f.exact {
+        return exact::finalize(f, base);
+    }
     let sched_opts = scheduler_options(f).map(|mut o| {
         // weave regions: the strategies declared by name, mapped onto the region ids lowering stamped (one id per scope instance; an undeclared region inherits its parent's strategy)
         if !declared_regions(f).is_empty() {

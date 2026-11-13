@@ -133,6 +133,7 @@ pub fn derive(f: &mut Function) {
                     plan.reg_constraints.push(c);
                 }
             }
+            RegMark::PinS { .. } => {}
             RegMark::Ring { name, bufs } => {
                 let c = RegConstraint::RegRing { name: name.clone(), bufs: bufs.clone() };
                 if !plan.reg_constraints.contains(&c) {

@@ -598,6 +598,9 @@ pub fn print(f: &Function) -> String {
     let _ = writeln!(s, "dsl {:?}", f.name);
     let _ = writeln!(s, "kernarg_size {}  workgroup {}  lds {}  value_count {}", f.kernarg_size, f.workgroup_size, f.lds_bytes, f.value_tys.len());
     let _ = writeln!(s, "profile {:?}  lower_opts {:?}  sched_opts {:?}", f.compile_profile, f.lower_opts, f.sched_opts);
+    if f.exact {
+        let _ = writeln!(s, "exact");
+    }
     let _ = writeln!(s, "var_tys {:?}", f.var_tys);
     for a in &f.args {
         let _ = writeln!(s, "arg {a:?}");
@@ -745,6 +748,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     let mut plan: Option<crate::plan::KernelPlan> = None;
     let mut contract = Contract::default();
     let mut extra_tys: Vec<(u32, DType)> = Vec::new();
+    let mut exact = false;
     loop {
         let k = lx.ident()?;
         match k.as_str() {
@@ -756,6 +760,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
             "lower_opts" => lower_opts = lx.typed()?,
             "sched_opts" => sched_opts = lx.typed()?,
             "var_tys" => var_tys = lx.typed()?,
+            "exact" => exact = true,
             "arg" => args.push(lx.typed()?),
             "agpr" => agpr.push(lx.typed()?),
             "reg_plan" => reg_plan.push(lx.typed()?),
@@ -812,6 +817,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     }
     let mut f = Function::from_parts(name, args, kernarg_size, workgroup, lds, contract, body, var_tys, value_tys, agpr, profile, lower_opts, sched_opts, reg_plan, regions);
     f.plan = plan;
+    f.exact = exact;
     Ok(f)
 }
 

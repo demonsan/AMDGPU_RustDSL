@@ -747,6 +747,8 @@ pub struct RegHints {
     pub regions: Vec<(String, u16)>,
     /// exact arch-VGPR placements (canonical vreg, base)
     pub pins_v: Vec<(VReg, u32)>,
+    /// exact mode: SGPR placements (canonical vreg, base)
+    pub pins_s: Vec<(VReg, u32)>,
     pub share: Vec<Vec<VReg>>,
     pub separate: Vec<Vec<VReg>>,
     /// (region name, arch VGPR cap, AGPR cap)
