@@ -1951,7 +1951,16 @@ impl Lowerer {
                 }
                 Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
                     let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
-                    let m0 = self.m0_source(*lds_addr)?;
+                    // exact mode: the DMA uses the M0 the author set (`set_m0`); `lds_addr` stays for the verifier only, so no readfirstlane /
+                    // copy is formed for it (the operand slot keeps an SGPR the instruction already reads; it is never printed)
+                    let m0 = if self.exact {
+                        match self.sgpr_src(*lds_addr) {
+                            Some(s) => s,
+                            None => rr,
+                        }
+                    } else {
+                        self.m0_source(*lds_addr)?
+                    };
                     let mop = if *dwords == 4 { MOp::BufferLoadDwordX4Lds } else { MOp::BufferLoadDwordX1Lds };
                     self.push(MInst::new(mop).srcreg(rr).src(vs).src(ss).srcreg(m0).imm(*imm as i64));
                 }
@@ -3323,7 +3332,11 @@ impl Lowerer {
             Op::CvtP8x4FromU16(u0, u1, sc) => {
                 let r0 = self.as_v1(*u0)?;
                 let r1 = self.as_v1(*u1)?;
-                let rs = self.as_v1(*sc)?;
+                // exact mode: a scale in an SGPR is read there (VOP3 takes one scalar source)
+                let rs = match (self.exact, self.sgpr_src(*sc)) {
+                    (true, Some(s)) => s,
+                    _ => self.as_v1(*sc)?,
+                };
                 self.touch(&[Src::Reg(r0), Src::Reg(r1), Src::Reg(rs)]);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VCvtPkFp8Lo).def(d).srcreg(r0).srcreg(rs));
