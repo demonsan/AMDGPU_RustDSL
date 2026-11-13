@@ -75,7 +75,7 @@ fn neg_modifier_moves_and_bf16_mfma_lower_to_one_instruction_each() {
     b.arg_tensor("o", Ext::c(64 * 4));
     let po = b.let_(Op::KernargPtr { offset: 0x00 });
     let tid = b.let_(Op::WorkitemId);
-    let x = b.let_(Op::Un(amdgpu_dsl::UnOp::CvtI32F32, Opnd::Val(tid)));
+    let x = b.let_(Op::KernargF32 { offset: 0x04 });
     let k = b.let_(Op::KernargF32 { offset: 0x00 });
     let n = b.neg_f32(k);
     let y = b.let_(Op::MulF32(Opnd::Val(n), Opnd::Val(x)));
@@ -97,8 +97,10 @@ fn bf16_wide_mfma_is_its_own_kind() {
     let z = b.let_(Op::FragZero { ty: DType::Frag16 });
     let one = b.c_i32(0x3f80_3f80);
     let a = b.let_(Op::Frag2(Opnd::Val(one), Opnd::Val(one)));
-    let r = b.mfma_bf16_wide(a, a, z);
-    let r2 = b.mfma_bf16_wide(a, a, r);
+    let two = b.c_i32(0x4000_4000);
+    let bb = b.let_(Op::Frag2(Opnd::Val(two), Opnd::Val(two)));
+    let r = b.mfma_bf16_wide(a, bb, z);
+    let r2 = b.mfma_bf16_wide(a, bb, r);
     let po = b.let_(Op::KernargPtr { offset: 0x00 });
     let rs = b.buffer_rsrc_sized(po, 64 * 64);
     let tid = b.let_(Op::WorkitemId);

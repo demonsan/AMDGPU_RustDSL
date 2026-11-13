@@ -100,7 +100,26 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         f
     };
     let mut lw = Lowerer::new(f);
-    if opt_on("scalarize") {
+    if f.exact {
+        // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
+        let (u, v) = uniform_analysis(f);
+        let mut sv: HashSet<ValueId> = HashSet::new();
+        let mut svars: HashSet<u32> = HashSet::new();
+        for mk in &f.reg_plan {
+            if let amdgpu_dsl::RegMark::PinS { r, .. } = mk {
+                match r {
+                    amdgpu_dsl::RegRef::Val(x) => {
+                        sv.insert(*x);
+                    }
+                    amdgpu_dsl::RegRef::Var(x) => {
+                        svars.insert(x.0);
+                    }
+                }
+            }
+        }
+        lw.uniform = u.into_iter().filter(|x| sv.contains(x)).collect();
+        lw.uvars = v.into_iter().filter(|x| svars.contains(&x.0)).collect();
+    } else if opt_on("scalarize") {
         let (u, v) = uniform_analysis(f);
         lw.uniform = u;
         lw.uvars = v;

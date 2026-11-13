@@ -473,7 +473,13 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         for i in &b.insts {
             if let Some(k) = synthetic_kind(&m, &stmts, i) {
                 let st = if i.stmt == 0 { "-".to_string() } else { format!("{} ({})", i.stmt - 1, format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(90).collect::<String>()) };
-                errs.push(format!("exact: block {} {:?}: {k}, at stmt {st}", b.label, i.op));
+                let text = if i.dst.map_or(true, |d| phys[d as usize] != u32::MAX) && i.srcs.iter().all(|s| !matches!(s, Src::Reg(r) if phys[*r as usize] == u32::MAX)) {
+                    let a0 = crate::regalloc::Alloc { phys: phys.clone(), max_v: 0, max_s: 0, scalar: scalar.clone() };
+                    crate::emit::inst_lines(&a0, i).join(" ; ")
+                } else {
+                    format!("{:?} (unpinned operands)", i.op)
+                };
+                errs.push(format!("exact: block {} `{text}`: {k}, at stmt {st}", b.label));
             }
         }
     }
