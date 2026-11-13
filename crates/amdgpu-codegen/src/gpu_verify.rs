@@ -1128,7 +1128,8 @@ impl<'a> An<'a> {
                 let m2: Option<BTreeMap<(bool, u64), Poly>> = m.into_iter().map(|(kk, p)| p.mul(&k).map(|q| (kk, q))).collect();
                 Some((m2?, c.mul(&k)?))
             }
-            Some(Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b)) if self.int_of(o).nonneg(&self.cx) && self.int_of(a).nonneg(&self.cx) => {
+            // (no wrap: b <= a proven from their intervals)
+            Some(Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b)) if { let (ia, ib) = (self.int_of(a), self.int_of(b)); ia.lo.iter().any(|l| ib.hi.iter().any(|h| self.cx.le(h, l))) } => {
                 let (ma, ca) = self.upper_slin(a, depth + 1)?;
                 let (mb, cb) = self.slin(b, depth + 1)?;
                 let neg: BTreeMap<(bool, u64), Poly> = mb.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
