@@ -20,7 +20,7 @@ fn tid(b: &mut FnBuilder) -> amdgpu_dsl::ValueId {
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // LDS budget
 
-fn lds_kernel(lds_bytes: u32, fp_mode: None, exact: false, offset: i32) -> Function {
+fn lds_kernel(lds_bytes: u32, offset: i32) -> Function {
     let mut b = FnBuilder::new("lds_probe", 64);
     b.lds(lds_bytes);
     let t = tid(&mut b);
