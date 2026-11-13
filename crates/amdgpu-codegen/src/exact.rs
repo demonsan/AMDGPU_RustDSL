@@ -147,12 +147,25 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
                 after: if i > 0 { x.get(i - 1).map(txt) } else { None },
                 needs: txt(&y[j]),
             });
-            if i < x.len() && j + 1 < y.len() && same(&x[i], &y[j + 1]) {
-                j += 1;
-            } else {
-                // changed in place: skip both
-                i += 1;
-                j += 1;
+            // the next original instruction further on: everything before it was inserted (passes insert runs of nops / waits)
+            match (j + 1..y.len().min(j + 24)).find(|&k| i < x.len() && same(&x[i], &y[k])) {
+                Some(k) => {
+                    for q in j + 1..k {
+                        out.push(Violation {
+                            rule,
+                            block: ba.label,
+                            before: x.get(i).map(txt),
+                            after: if i > 0 { x.get(i - 1).map(txt) } else { None },
+                            needs: txt(&y[q]),
+                        });
+                    }
+                    j = k;
+                }
+                None => {
+                    // changed in place: skip both
+                    i += 1;
+                    j += 1;
+                }
             }
         }
     }
@@ -369,12 +382,41 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         }
     }
     // 3. registers: every value from its pin
+    // a pin of a view (an alias at dword offset k, possibly of another alias) pins its tuple at base - k; two pins of one tuple must agree
     let mut pin: std::collections::HashMap<VReg, (bool, u32)> = std::collections::HashMap::new();
-    for (r, b) in &m.reg_hints.pins_v {
-        pin.insert(m.canon(*r), (false, *b));
-    }
-    for (r, b) in &m.reg_hints.pins_s {
-        pin.insert(m.canon(*r), (true, *b));
+    let mut pin_by: std::collections::HashMap<VReg, VReg> = std::collections::HashMap::new();
+    let view_of = |m: &MFunction, r: VReg| -> (VReg, u32) {
+        let (mut t, mut off) = (r, 0u32);
+        for _ in 0..16 {
+            match m.alias.get(&t) {
+                Some(&(u, k)) => {
+                    off += k as u32;
+                    t = u;
+                }
+                None => break,
+            }
+        }
+        (t, off)
+    };
+    for (s, list) in [(false, m.reg_hints.pins_v.clone()), (true, m.reg_hints.pins_s.clone())] {
+        for (r, b) in list {
+            let (t, off) = view_of(&m, r);
+            if b < off {
+                errs.push(format!("exact: {} pinned at {}{b} lies at dword {off} of its tuple: the tuple would start below register 0", name_of(&m, r), if s { "s" } else { "v" }));
+                continue;
+            }
+            let base = (s, b - off);
+            match pin.get(&t) {
+                Some(&old) if old != base => errs.push(format!(
+                    "exact: the pins of {} and {} disagree: they are views of one register tuple ({}{} vs {}{} for its start)",
+                    name_of(&m, r), name_of(&m, pin_by[&t]), if old.0 { "s" } else { "v" }, old.1, if s { "s" } else { "v" }, base.1
+                )),
+                _ => {
+                    pin.insert(t, base);
+                    pin_by.insert(t, r);
+                }
+            }
+        }
     }
     // a copy of a hardware register into a value pinned at that same register is no instruction
     let alias = m.alias.clone();

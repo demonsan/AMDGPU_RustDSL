@@ -634,6 +634,12 @@ impl Lowerer {
                 RegRef::Var(v) => s.vars.get(v.0 as usize).map(|x| s.mir.canon(*x)),
             }
         };
+        let raw = |s: &Self, r: &RegRef| -> Option<VReg> {
+            match r {
+                RegRef::Val(v) => s.val.get(v).copied(),
+                RegRef::Var(v) => s.vars.get(v.0 as usize).copied(),
+            }
+        };
         let mut unresolved = Vec::new();
         let group = |s: &Self, rs: &[RegRef], unresolved: &mut Vec<String>| -> Vec<VReg> {
             rs.iter()
@@ -648,11 +654,12 @@ impl Lowerer {
         };
         for mk in &plan {
             match mk {
-                RegMark::PinV { r, base } => match res(self, r) {
+                RegMark::PinV { r, base } => match if self.exact { raw(self, r) } else { res(self, r) } {
                     Some(x) => self.mir.reg_hints.pins_v.push((x, *base)),
                     None => unresolved.push(format!("{r:?}")),
                 },
-                RegMark::PinS { r, base } => match res(self, r) {
+                // exact mode resolves views itself (a pin of a view at offset k pins its tuple at base - k): keep the view's own register
+                RegMark::PinS { r, base } => match raw(self, r) {
                     Some(x) => self.mir.reg_hints.pins_s.push((x, *base)),
                     None => unresolved.push(format!("{r:?}")),
                 },
