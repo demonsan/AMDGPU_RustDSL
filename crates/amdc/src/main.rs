@@ -662,6 +662,29 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "exact-report" => {
+            // amdc exact-report <kernel> [--region <name>]: per IR statement, the final instructions it produced, with the ones the back end
+            // added on its own marked (docs/exact-mode.md, step E1)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            let region = args.iter().position(|a| a == "--region").and_then(|i| args.get(i + 1)).map(|s| s.as_str());
+            match amdgpu_codegen::compile_mir_alloc(&f) {
+                Ok((m, a)) => {
+                    print!("{}", amdgpu_codegen::exact::report(&f, &m, &a, region));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("compile error: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "weave-report" => {
             // amdc weave-report <kernel>|--from-ir <file>: the back-end Weaver's unit graph of the final MIR (docs/two-weavers.md, step B1)
             let Some(name) = args.get(1) else {

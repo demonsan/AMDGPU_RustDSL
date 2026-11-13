@@ -624,11 +624,14 @@ pub struct MInst {
     /// Diagnostics: the IR value (`ValueId`) whose lowering emitted this instruction (the last value-defining statement for the others);
     /// `u32::MAX` for instructions added by later passes (waits, nops, copies). Not used by any pass.
     pub origin: u32,
+    /// Diagnostics (exact mode, docs/exact-mode.md): the IR statement (index in `Function::stmts()` + 1) whose lowering emitted this
+    /// instruction; 0 for instructions added after lowering (waits, nops, copies, M0 writes of later passes). Not used by any pass.
+    pub stmt: u32,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

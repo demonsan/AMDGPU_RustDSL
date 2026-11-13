@@ -345,6 +345,8 @@ fn batch_kernarg_loads(m: &mut MFunction) {
 struct Lowerer {
     /// diagnostics: the value being lowered (MInst::origin)
     cur_origin: u32,
+    /// diagnostics: the statement being lowered (MInst::stmt = index + 1), counted in program order like `Function::stmts()`
+    cur_stmt: u32,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -485,6 +487,7 @@ impl Lowerer {
 
         Lowerer {
             cur_origin: u32::MAX,
+            cur_stmt: 0,
             mir,
             val: HashMap::new(),
             converted: HashMap::new(),
@@ -706,6 +709,9 @@ impl Lowerer {
         inst.unit = self.unit_stack.last().map_or(0, |u| u + 1);
         if inst.origin == u32::MAX {
             inst.origin = self.cur_origin;
+        }
+        if inst.stmt == 0 {
+            inst.stmt = self.cur_stmt;
         }
         self.mir.blocks[self.cur].insts.push(inst);
     }
@@ -1825,6 +1831,7 @@ impl Lowerer {
 
     /// One statement (structure markers included: they open / close the CFG regions).
     fn lower_stmt(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
+        self.cur_stmt += 1;
         {
             match st {
                 Stmt::Let { dst, op } => {
