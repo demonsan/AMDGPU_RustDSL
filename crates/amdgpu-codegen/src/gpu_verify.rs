@@ -1157,6 +1157,84 @@ impl<'a> An<'a> {
         }
     }
 
+    /// The cap a clipping num_records puts on a store at offset x + imm (bytes at offset >= nr are dropped). With nr = U * F (F a uniform
+    /// row size, U a linear upper bound in rows) and x = F * R + rest where 0 <= rest + imm + size <= F: a written byte has R < U, i.e. the
+    /// cap `R - U_digits < U_const` in row units (k = F).
+    fn records_cap(&self, nr: &Opnd, x: &SLin, imm: i128, size: i128) -> Option<(SLin, Poly, bool)> {
+        let Opnd::Val(v) = nr else { return None };
+        let Some(Op::MulI32(a, b)) = self.defs.get(v) else { return None };
+        let (m, f) = if let Some(k) = self.point_of(b) { (a, k) } else if let Some(k) = self.point_of(a) { (b, k) } else { return None };
+        if f.0.len() != 1 || !self.cx.nonneg(&f) || f.as_const().map_or(false, |q| q.n <= 0) {
+            return None;
+        }
+        let (ua, uc) = self.upper_slin(m, 0)?;
+        // split x by divisibility of its coefficients by the single-monomial F
+        let div = |c: &Poly| -> Option<Q> {
+            let (fm, fq) = f.0.iter().next()?;
+            let mut r: Option<Q> = None;
+            for (mono, q) in &c.0 {
+                let mut rest = mono.clone();
+                for s in fm {
+                    let i = rest.iter().position(|y| y == s)?;
+                    rest.remove(i);
+                }
+                if !rest.is_empty() {
+                    return None;
+                }
+                let qq = q.mul(Q::new(fq.d, fq.n));
+                if r.map_or(false, |r0| r0 != qq) {
+                    return None;
+                }
+                r = Some(qq);
+            }
+            r
+        };
+        let mut rows: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
+        let mut rest_hi = Poly::int(imm + size);
+        for (k, c) in &x.0 {
+            match div(c) {
+                Some(q) if q.d == 1 && q.n > 0 => {
+                    rows.insert(*k, Poly::int(q.n));
+                }
+                _ => {
+                    // a non-row digit: its contribution must stay inside one row (lower bound >= 0, upper bound summed)
+                    let it = self.atom_hi_range(k)?;
+                    if !self.cx.nonneg(c) || !self.cx.nonneg(&it.0) {
+                        return None;
+                    }
+                    rest_hi = rest_hi.add(&it.1.mul(c)?);
+                }
+            }
+        }
+        // x's constant: row part (divisible) and in-row part
+        let (crow, cin) = match div(&x.1) {
+            Some(q) if q.d == 1 => (Poly::int(q.n), Poly::int(0)),
+            _ if x.1.0.is_empty() => (Poly::int(0), Poly::int(0)),
+            _ => match x.1.as_const() {
+                Some(q) => (Poly::int(0), Poly::konst(q)),
+                None => return None,
+            },
+        };
+        rest_hi = rest_hi.add(&cin);
+        if !self.cx.le(&rest_hi, &f) || imm < 0 {
+            return None;
+        }
+        for (k, c) in ua {
+            let q = div(&c).filter(|q| q.d == 1)?;
+            *rows.entry(k).or_insert(Poly::int(0)) = rows.get(&k).cloned().unwrap_or(Poly::int(0)).add(&Poly::int(-q.n));
+        }
+        rows.retain(|_, c| !c.0.is_empty());
+        Some(((rows, crow), uc, false))
+    }
+
+    /// An atom's range from its recorded instances (the current store's): (lo, hi).
+    fn atom_hi_range(&self, k: &(bool, u64)) -> Option<(Poly, Poly)> {
+        let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
+        let o = insts.last()?;
+        let it = self.int_of(o);
+        Some((it.lo.first()?.clone(), it.hi.first()?.clone()))
+    }
+
     fn record_buffer_store(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
         self.caps_cur.borrow_mut().clear();
         let base = match rsrc {
@@ -1180,11 +1258,8 @@ impl<'a> An<'a> {
         // offset + imm < nr <= U (a linear upper bound of nr) is a cap `offset - U_digits < U_const - imm` on the live bytes
         if let (Opnd::Val(v), Some(x)) = (rsrc, extra.as_ref()) {
             if let Some(Op::RsrcCat { words }) = self.defs.get(v).cloned() {
-                if let Some((ua, uc)) = self.upper_slin(&self.word_root(&words[2]), 0) {
-                    let neg: BTreeMap<(bool, u64), Poly> = ua.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
-                    // (the store's immediate is part of x: the per-store constants fold into the one digit)
-                    let l = slin_add(x.clone(), (neg, Poly::int(imm)));
-                    self.caps_cur.borrow_mut().push((l, uc, false));
+                if let Some(cap) = self.records_cap(&self.word_root(&words[2]), x, imm, size) {
+                    self.caps_cur.borrow_mut().push(cap);
                 }
             }
         }
