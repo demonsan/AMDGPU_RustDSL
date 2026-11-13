@@ -1258,8 +1258,13 @@ impl<'a> An<'a> {
         // offset + imm < nr <= U (a linear upper bound of nr) is a cap `offset - U_digits < U_const - imm` on the live bytes
         if let (Opnd::Val(v), Some(x)) = (rsrc, extra.as_ref()) {
             if let Some(Op::RsrcCat { words }) = self.defs.get(v).cloned() {
-                if let Some(cap) = self.records_cap(&self.word_root(&words[2]), x, imm, size) {
-                    self.caps_cur.borrow_mut().push(cap);
+                match self.records_cap(&self.word_root(&words[2]), x, imm, size) {
+                    Some(cap) => self.caps_cur.borrow_mut().push(cap),
+                    None => {
+                        if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+                            eprintln!("gw:   stmt {}: no num_records cap from {} (x = {:?})", self.idx, self.shape(&words[2], 5), x);
+                        }
+                    }
                 }
             }
         }
