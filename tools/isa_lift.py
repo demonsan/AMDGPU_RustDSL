@@ -1459,15 +1459,53 @@ def main():
             if '--exact' in sys.argv:
                 f.write('exact\n')
             f.write('var_tys [' + ', '.join(var_tys) + ']\n')
-            # one argument per kernarg word the code loads (I32 / Ptr at its offset)
+            # one argument per kernarg word the code loads (I32 / Ptr at its offset); with --contract-from, the named arguments and the
+            # argument-level contract (extents, kernarg ranges / definitions, grid definitions) of an IR of the SAME kernarg layout (our
+            # own replica's), so the verifier bounds the accesses through them
             body = '\n'.join(L.shell + L.lines)
             ka = {}
             for k, off in re.findall(r'Kernarg(I32|Ptr) \{ offset: (\d+) \}', body):
                 ka.setdefault(int(off), k)
             if not ka:
                 ka = {0: 'Ptr'}
-            for off, k in sorted(ka.items()):
-                f.write(f'arg Arg {{ name: "ka_{off:x}", ty: {k}, kernarg_offset: {off}, size: {8 if k == "Ptr" else 4} }}\n')
+            named, contract = {}, None
+            if '--contract-from' in sys.argv:
+                src = open(sys.argv[sys.argv.index('--contract-from') + 1]).read().split('\n')
+                for l in src:
+                    m = re.match(r'^arg Arg \{ name: "(\w+)", ty: (\w+), kernarg_offset: (\d+), size: (\d+) \}', l)
+                    if m:
+                        named[int(m.group(3))] = l
+                i0 = next(i for i, l in enumerate(src) if l.startswith('contract Contract {'))
+                keep = {}
+                i = i0 + 1
+                while src[i] != '}':
+                    m = re.match(r'^    (\w+): (.*)$', src[i])
+                    j = i
+                    if m and m.group(2).endswith(('[', '{', '(')):
+                        while not re.match(r'^    [\]\})],?$', src[j]):
+                            j += 1
+                    keep[m.group(1) if m else f'_{i}'] = src[i:j + 1]
+                    i = j + 1
+                use = ('extents', 'ka_ranges', 'grid_defs', 'ka_defs')
+                contract = ['contract Contract {']
+                for k, lines in keep.items():
+                    if k in use:
+                        contract += lines
+                    elif k.startswith('_'):
+                        continue
+                    else:
+                        # facts about the other kernel's values / tiles do not carry over
+                        empty = {'tile_trust': 'None'}.get(k, '[]')
+                        contract.append(f'    {k}: {empty},')
+                contract.append('}')
+            for off in sorted(set(ka) | set(named)):
+                if off in named:
+                    f.write(named[off] + '\n')
+                else:
+                    k = ka[off]
+                    f.write(f'arg Arg {{ name: "ka_{off:x}", ty: {k}, kernarg_offset: {off}, size: {8 if k == "Ptr" else 4} }}\n')
+            if contract:
+                f.write('\n'.join(contract) + '\n')
             for p in L.shell_pins + L.pins:
                 f.write(p + '\n')
             defined = set(int(x) for x in re.findall(r'^%v(\d+):', '\n'.join(L.shell + L.lines), re.M))
