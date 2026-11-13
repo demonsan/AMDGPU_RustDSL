@@ -41,6 +41,7 @@ pub const GFX950: Target = Target {
         alu_wait: None,
     },
     hazards: &[
+        HazardRule { kind: Kind::Software, name: "trans-valu", count: Count::N(1), unit: Unit::WaitStates, scope: Scope::Value, source: "tools/trans_hazard_probe.sh: a v_exp / v_rcp / v_log / v_sqrt result read by v_mov / v_add_f32 / v_cndmask_e64 is stale at 0 wait states and correct at 1 / 2 / 3 (512 threads, 3 VGPRs, 5 runs); LLVM TransForwardingHazard: 1" },
         HazardRule { kind: Kind::Software, name: "trans-result", count: Count::N(5), unit: Unit::WaitStates, scope: Scope::Value, source: "LLVM TransForwardingHazard (1; 5 kept, conservative)" },
         HazardRule { kind: Kind::Software, name: "mfma-dst-write", count: Count::ByMfmaLatency(&[(20, 21)], 19), unit: Unit::WaitStates, scope: Scope::Physical, source: "CDNA4 ISA 7.6 XDL write VGPR -> VALU write; LLVM GFX940_XDL_N_PassWriteVgprVALUWawWaitStates" },
         HazardRule { kind: Kind::Software, name: "mfma-srcc-war", count: Count::ByMfmaLatency(&[(20, 21)], 12), unit: Unit::WaitStates, scope: Scope::Physical, source: "LLVM checkMAIVALUHazards SrcC WAR (conservative)" },
