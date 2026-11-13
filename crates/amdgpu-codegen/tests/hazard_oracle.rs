@@ -253,6 +253,12 @@ fn allowance(producer: &str, consumer: &str) -> (u32, Vec<&'static str>) {
         slack += 1;
         why.push("VALU lane-mask write -> v_cndmask mask read: 1 wait state suffices on gfx950 (tools/lanemask_hazard_probe.sh); LLVM asks 2");
     }
+    // VALU VGPR write -> v_readfirstlane (LLVM: 2; our row `valu-readfirstlane`: 1) - tools/readfirstlane_hazard_probe.sh: stale at 0, correct
+    // at 1 and 2 wait states (512 threads, 4 VGPRs, 3 writer kinds, 5 runs)
+    if c == "VReadFirstLane" {
+        slack += 1;
+        why.push("VALU VGPR write -> v_readfirstlane: 1 wait state suffices on gfx950 (tools/readfirstlane_hazard_probe.sh); LLVM asks 2");
+    }
     // VOP3P producers: the pinned LLVM reads the packed instruction's op_sel_hi bit as the VOP3 destination op_sel (SISrcMods::DST_OP_SEL is the same
     // bit) and inserts the dst-sel forwarding nop; upstream GCNHazardRecognizer::getDstSelForwardingOperand excludes VOP3P ("VOP3P uses this bit for
     // source op_sel_hi"). A packed instruction writes the whole dword.
