@@ -277,7 +277,7 @@ impl CachePolicy {
 /// * `PkF32Fp8` / `PkF32Bf8`: srcs[0] packed bytes, `sel` = word (0 / 1) -> the two values as a Frag2 of f32.
 /// * `F32Fp8` / `F32Bf8`: srcs[0], `sel` = byte (0..3) -> F32.
 /// * `PkBf8F32`: srcs[0], srcs[1] f32, srcs[2] old dword; the two bf8 bytes replace word `sel` of the old dword -> I32.
-/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale (exponent only); word `sel` -> two 16-bit values in a U32 (value · 2^e).
+/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale (exponent only); word `sel` -> two 16-bit values in a U32 (value Â· 2^e).
 /// * `ScalePkF32{Fp8,Bf8}`: as above -> Frag2 of f32.
 /// * `ScalePk{F32,Bf16,F16}Fp4`: srcs[0] packed fp4, srcs[1] scale; byte `sel` (two fp4 values) -> Frag2 f32 / U32.
 /// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale (exponent only), srcs[3] old; word `sel` replaced -> I32 (value / 2^e).
@@ -325,7 +325,7 @@ impl CvtOp {
 /// DPP lane control (gfx9). Rows are 16 lanes. `QuadPerm(p)`: lane i reads lane 4 (i / 4) + p[i % 4]; `RowShl(n)` / `RowShr(n)` / `RowRor(n)`
 /// (1..=15): within the row, read lane + n / lane - n / (lane - n) mod 16; `WaveShl1` / `WaveShr1` / `WaveRol1` / `WaveRor1`: whole-wave shift /
 /// rotate by one; `RowMirror` (15 - i), `RowHalfMirror` (7 - i within 8); `RowBcast15` (lane 15 of the previous row), `RowBcast31` (lane 31, for
-/// lanes 32..63; the rows a broadcast does not target read their own lane — measured). Out-of-range sources are INVALID: with `bound_zero` they\n/// read 0, else the lane keeps `old`.
+/// lanes 32..63; the rows a broadcast does not target read their own lane â€” measured). Out-of-range sources are INVALID: with `bound_zero` they\n/// read 0, else the lane keeps `old`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DppCtrl {
     QuadPerm([u8; 4]),
@@ -653,7 +653,7 @@ pub enum Op {
     PtrMadU32 { base: Opnd, a: Opnd, b: Opnd },
     /// `v_pk_fma_f32`: a * b + c on two f32 lanes (Frag2 each)
     PkFmaF32(Opnd, Opnd, Opnd),
-    /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
+    /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) â€” the explicit marker
     /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
     AnyLane(Opnd),
     /// Dwords `start .. start + n` of a fragment value as a value of its own WITHOUT a copy (a register view; n = 1 -> I32, 2 / 4 / 8 -> FragN)
@@ -1153,7 +1153,7 @@ pub struct StageResources {
     pub barriers: Option<u32>,
 }
 
-/// The resource contract of a pipeline STAGE (fusion hand-off, docs/fusion-layout-handoff.md §3): what it consumes from earlier stages and
+/// The resource contract of a pipeline STAGE (fusion hand-off, docs/fusion-layout-handoff.md Â§3): what it consumes from earlier stages and
 /// hands to later ones, the LDS tiles it frees / reuses, the barrier phase at its entry (barriers before it in program order) and the wave
 /// roles. Checked by `gpu_verify` at the region edge (GV-STAGE); emits no code and is not a scheduling barrier.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -1306,6 +1306,16 @@ pub enum Stmt {
     SNop { count: u8 },
     /// Exact mode: `s_mov_b32 m0, value` placed by the author; the LDS-DMAs of an exact kernel use the current M0 and never write it.
     SetM0 { value: Opnd },
+    // ---- E5: exact branch forms (docs/exact-mode.md section 5; owner kernel-opt). Layout and scope only: no instruction of their own. ----
+    /// The then-branch of the NEXT `BeginIf` is laid out out of line, at the `LayoutAnchor` named `anchor`: its blocks move there, the branch
+    /// into it is the taken edge of the condition, and its end jumps to the if's join (a cold path that jumps back, or a loop exit body whose
+    /// `break` leaves the loop). The structure (and so every analysis) is that of the plain `if`.
+    BranchPlace { anchor: String },
+    /// Where the out-of-line branches placed at `name` are laid out (their blocks follow the code before this point, in statement order).
+    LayoutAnchor { name: String },
+    /// Variables without a loop: declared and initialised like loop variables (`init`), visible to the rest of the enclosing structural
+    /// block and to nested ones; written with `set_var`. Merge points of `if` / exits carry them without copies.
+    DeclareVars { vars: Vec<VarId>, init: Vec<Opnd> },
 }
 
 #[derive(Clone, Debug)]
@@ -3781,6 +3791,19 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
                 None => errs.push(format!("stmt {idx}: weave_region_end without an open region")),
             },
             Stmt::BranchHint { .. } if !matches!(f.stmts().get(idx + 1), Some(Stmt::BeginIf { .. })) => errs.push(format!("stmt {idx}: a branch hint must be followed by an `if`")),
+            Stmt::BranchPlace { anchor } => {
+                if !matches!(f.stmts().get(idx + 1), Some(Stmt::BeginIf { .. })) {
+                    errs.push(format!("stmt {idx}: an out-of-line placement must be followed by an `if`"));
+                }
+                if !f.stmts().iter().any(|s| matches!(s, Stmt::LayoutAnchor { name } if name == anchor)) {
+                    errs.push(format!("stmt {idx}: out-of-line placement at `{anchor}`: no layout anchor of that name"));
+                }
+            }
+            Stmt::LayoutAnchor { name } => {
+                if f.stmts().iter().filter(|s| matches!(s, Stmt::LayoutAnchor { name: n } if n == name)).count() > 1 {
+                    errs.push(format!("stmt {idx}: layout anchor `{name}` declared more than once"));
+                }
+            }
             Stmt::UnitMark { id, begin: true } => units.push((*id, depth, idx)),
             Stmt::UnitMark { id, begin: false } => match units.pop() {
                 Some((u, d, at)) if u != *id || d != depth => errs.push(format!("stmt {idx}: unit {id} end does not close unit {u} (opened at stmt {at}) in the same structural block")),
@@ -4321,13 +4344,35 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {
                         errs.push(here(format!("set_m0 reads v{v} before its definition")));
                     }
                 }
+            }
+            Stmt::DeclareVars { vars, init } => {
+                if vars.len() != init.len() {
+                    errs.push(here("declare_vars: vars/init length mismatch".into()));
+                }
+                for (i, var) in vars.iter().enumerate() {
+                    if let Some(Opnd::Val(v)) = init.get(i) {
+                        if !visible(&scopes, *v) {
+                            errs.push(here(format!("var init v{v} is not visible")));
+                        }
+                    }
+                    if let (Some(vt), Some(e)) = (f.var_ty(*var), init.get(i)) {
+                        if let Ok(t) = opnd_ty(f, *e) {
+                            if vt != t && !(vt.is_int() && t.is_int()) {
+                                errs.push(here(format!("var{var} type {} != init {}", vt.name(), t.name())));
+                            }
+                        }
+                    }
+                }
+                vars_defined.extend(vars.iter().copied());
+                // assignable in the rest of the function (set_var), like the variables of a finished loop
+                done_vars.extend(vars.iter().copied());
             }
             Stmt::StageBegin { name, contract } => {
                 for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
@@ -4764,7 +4809,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
         Stmt::VarMfmaScale16 { a, b, scale_a, scale_b, .. } => vec![*a, *b, *scale_a, *scale_b],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
-        Stmt::BeginLoop { init, .. } => init.clone(),
+        Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
         _ => Vec::new(),
     }
@@ -4815,7 +4860,7 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarSmfmac { var, .. }
         | Stmt::VarMfma { var, .. }
         | Stmt::VarAsm { var, .. } => vec![*var],
-        Stmt::VarAsmN { vars, .. } | Stmt::BeginLoop { vars, .. } => vars.clone(),
+        Stmt::VarAsmN { vars, .. } | Stmt::BeginLoop { vars, .. } | Stmt::DeclareVars { vars, .. } => vars.clone(),
         _ => Vec::new(),
     }
 }
@@ -4907,7 +4952,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                         u.insert(*dst);
                     }
                 }
-                Stmt::BeginLoop { vars, init } => {
+                Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
                     for (v, i) in vars.iter().zip(init.iter()) {
                         if uvars.contains(v) && !is_u(i, &u, &uvars) {
                             uvars.remove(v);
@@ -4959,5 +5004,35 @@ fn check_uniform_branches(f: &Function, errs: &mut Vec<String>) {
                  masked buffer offsets)"
             ));
         }
+    }
+}
+
+/// E5: exact branch forms and scope variables (docs/exact-mode.md section 5; layout / scope only, no instruction of their own).
+impl FnBuilder {
+    /// `begin_if` whose then-branch is laid out out of line at the layout anchor `anchor` (`layout_anchor`): the condition's taken edge
+    /// enters it, its end jumps to the join (a cold path), or `break`s out of the enclosing loop (a loop exit with its own body).
+    #[track_caller]
+    pub fn begin_if_at(&mut self, cond: impl Into<Opnd>, anchor: &str) {
+        self.push_stmt(Stmt::BranchPlace { anchor: anchor.to_string() });
+        self.push_stmt(Stmt::BeginIf { cond: cond.into() });
+    }
+    /// The place where the out-of-line branches anchored at `name` are laid out.
+    #[track_caller]
+    pub fn layout_anchor(&mut self, name: &str) {
+        self.push_stmt(Stmt::LayoutAnchor { name: name.to_string() });
+    }
+    /// Variables without a loop, initialised from `inits` (like `begin_loop`'s): visible to the rest of the enclosing structural block.
+    #[track_caller]
+    pub fn declare_vars(&mut self, inits: &[(DType, Opnd)]) -> Vec<VarId> {
+        let mut vars = Vec::with_capacity(inits.len());
+        let mut init = Vec::with_capacity(inits.len());
+        for (ty, val) in inits {
+            let id = VarId(self.f.var_tys.len() as u32);
+            self.f.var_tys.push(*ty);
+            vars.push(id);
+            init.push(*val);
+        }
+        self.push_stmt(Stmt::DeclareVars { vars: vars.clone(), init });
+        vars
     }
 }

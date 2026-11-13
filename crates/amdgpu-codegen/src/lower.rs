@@ -235,6 +235,11 @@ fn run_coldlayout(m: &mut MFunction) -> Result<(), String> {
     Ok(())
 }
 
+fn run_place(m: &mut MFunction) -> Result<(), String> {
+    crate::lower_cf::place_layout(m);
+    Ok(())
+}
+
 fn run_movb64(m: &mut MFunction) -> Result<(), String> {
     if opt_on("movb64") {
         merge_zero_pairs(m);
@@ -302,6 +307,7 @@ pub const CLEANUP: &[LowerPass] = {
         LowerPass { info: info("lower-kabatch", Lower, Only, "token kabatch", &[Indirect("GEMM profile; md5 manifest")]), run: run_kabatch },
         LowerPass { info: info("lower-jthread", Lower, Generic, "token jthread (branches on flags known per incoming edge)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_jthread },
         LowerPass { info: info("lower-coldlayout", Lower, Generic, "token coldlayout (blocks of `begin_if_unlikely` branches after the hot code)", &[Test("crates/amdgpu-kernels/tests/jthread.rs")]), run: run_coldlayout },
+        LowerPass { info: info("lower-place", Lower, Generic, "always (E5: out-of-line `if` branches at their layout anchors; no-op without anchors)", &[Test("crates/amdgpu-kernels/tests/e5_branches.rs")]), run: run_place },
     ]
 };
 
@@ -426,6 +432,14 @@ struct Lowerer {
     next_if_cold: bool,
     cold_ifs: Vec<bool>,
     cold_depth: u32,
+    /// E5 (`Stmt::BranchPlace`): the anchor of the next `BeginIf`; per open if: the anchor of its then-branch while it is open; the anchors of
+    /// the open out-of-line then-branches (innermost last); anchor ids by name
+    next_if_place: Option<u32>,
+    place_ifs: Vec<Option<u32>>,
+    place_active: Vec<u32>,
+    anchor_ids: HashMap<String, u32>,
+    /// E5: the conditions of the open out-of-line then-branches (a `break_if` on one of them inside its branch always leaves the loop)
+    place_conds: Vec<Opnd>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -572,6 +586,11 @@ impl Lowerer {
             next_if_cold: false,
             cold_ifs: Vec::new(),
             cold_depth: 0,
+            next_if_place: None,
+            place_ifs: Vec::new(),
+            place_active: Vec::new(),
+            anchor_ids: HashMap::new(),
+            place_conds: Vec::new(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
@@ -776,10 +795,66 @@ impl Lowerer {
         }
     }
 
+    /// Registers of loop / scope variables (BeginLoop, E5 DeclareVars) and their initialisation.
+    fn alloc_vars(&mut self, f: &Function, vars: &[amdgpu_dsl::VarId], init: &[Opnd]) -> Result<(), String> {
+        for (i, var) in vars.iter().enumerate() {
+            let ty = f.var_ty(*var).ok_or("loop var has no type")?;
+            let class = match ty {
+                DType::Ptr => return Err("pointer loop variables are not supported".to_string()),
+                DType::Frag2 => RClass::V2,
+                DType::Frag4 => RClass::V4,
+                DType::Frag8 => RClass::V8,
+                DType::Frag16 => RClass::V16,
+                _ if self.uvars.contains(var) => RClass::S1,
+                _ => RClass::V1,
+            };
+            let r = self.new_vreg(class);
+            if self.vars.len() <= var.0 as usize {
+                self.vars.resize(var.0 as usize + 1, u32::MAX);
+            }
+            self.vars[var.0 as usize] = r;
+            if class == RClass::S1 {
+                let s = self.s_operand(init[i])?;
+                if let Src::Reg(x) = s {
+                    self.touch(&[Src::Reg(x)]);
+                }
+                self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                continue;
+            }
+            if class == RClass::V16 && opt_on("zeroinit") && matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 }))) {
+                let zero = self.const_vreg(0);
+                for k in 0..16 {
+                    self.push(MInst::new(MOp::VWriteSub).def(r).srcreg(zero).imm(k as i64));
+                }
+                continue;
+            }
+            // loop-entry in-place load: init = load_lds(..) (single use) writes the variable's own registers instead of a second fragment + copy
+            if matches!(class, RClass::V4 | RClass::V8) {
+                if let Opnd::Val(v) = init[i] {
+                    if self.use_counts.get(&v).copied() == Some(1) && self.try_coalesce_lds_reload(v, r) {
+                        continue;
+                    }
+                }
+            }
+            let src = match class {
+                RClass::V1 => self.as_v1(init[i])?,
+                RClass::V2 => self.as_v2(init[i])?,
+                RClass::V4 => self.as_v4(init[i])?,
+                RClass::V8 => self.as_v8(init[i])?,
+                RClass::V16 => self.as_v16(init[i])?,
+                _ => return Err("unsupported loop variable class".to_string()),
+            };
+            self.touch(&[Src::Reg(src)]);
+            self.copy_reg(r, src)?;
+        }
+        Ok(())
+    }
+
     fn start_block(&mut self, label: u32) {
         self.rfl_cache.clear();
         let mut b = Block::new(label);
         b.cold = self.cold_depth > 0;
+        b.place = self.place_active.last().copied();
         self.mir.blocks.push(b);
         self.cur = self.mir.blocks.len() - 1;
     }
@@ -2217,56 +2292,7 @@ impl Lowerer {
                     self.lower_asm(None, block, inputs, &regs)?;
                 }
                 Stmt::BeginLoop { vars, init } => {
-                    for (i, var) in vars.iter().enumerate() {
-                        let ty = f.var_ty(*var).ok_or("loop var has no type")?;
-                        let class = match ty {
-                            DType::Ptr => return Err("pointer loop variables are not supported".to_string()),
-                            DType::Frag2 => RClass::V2,
-                            DType::Frag4 => RClass::V4,
-                            DType::Frag8 => RClass::V8,
-                            DType::Frag16 => RClass::V16,
-                            _ if self.uvars.contains(var) => RClass::S1,
-                            _ => RClass::V1,
-                        };
-                        let r = self.new_vreg(class);
-                        if self.vars.len() <= var.0 as usize {
-                            self.vars.resize(var.0 as usize + 1, u32::MAX);
-                        }
-                        self.vars[var.0 as usize] = r;
-                        if class == RClass::S1 {
-                            let s = self.s_operand(init[i])?;
-                            if let Src::Reg(x) = s {
-                                self.touch(&[Src::Reg(x)]);
-                            }
-                            self.push(MInst::new(MOp::SMovB32).def(r).src(s));
-                            continue;
-                        }
-                        if class == RClass::V16 && opt_on("zeroinit") && matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 }))) {
-                            let zero = self.const_vreg(0);
-                            for k in 0..16 {
-                                self.push(MInst::new(MOp::VWriteSub).def(r).srcreg(zero).imm(k as i64));
-                            }
-                            continue;
-                        }
-                        // loop-entry in-place load: init = load_lds(..) (single use) writes the variable's own registers instead of a second fragment + copy
-                        if matches!(class, RClass::V4 | RClass::V8) {
-                            if let Opnd::Val(v) = init[i] {
-                                if self.use_counts.get(&v).copied() == Some(1) && self.try_coalesce_lds_reload(v, r) {
-                                    continue;
-                                }
-                            }
-                        }
-                        let src = match class {
-                            RClass::V1 => self.as_v1(init[i])?,
-                            RClass::V2 => self.as_v2(init[i])?,
-                            RClass::V4 => self.as_v4(init[i])?,
-                            RClass::V8 => self.as_v8(init[i])?,
-                            RClass::V16 => self.as_v16(init[i])?,
-                            _ => return Err("unsupported loop variable class".to_string()),
-                        };
-                        self.touch(&[Src::Reg(src)]);
-                        self.copy_reg(r, src)?;
-                    }
+                    self.alloc_vars(f, vars, init)?;
                     self.flush_pending();
                     self.scope_snaps.push((self.consts.clone(), self.converted.clone()));
                     self.consts.clear();
@@ -2276,6 +2302,15 @@ impl Lowerer {
                     self.set_term(Term::Goto(header));
                     self.start_block(header);
                     self.break_stack.push((exit, header));
+                }
+                Stmt::BreakIf { cond } if self.place_conds.contains(cond) => {
+                    // E5: a loop exit with its own body: inside `if c` (placed out of line) `break_if(c)` always leaves the loop, so the
+                    // body ends in one jump to the loop exit (no second conditional branch)
+                    let (exit, _) = *self.break_stack.last().ok_or("break outside loop")?;
+                    self.flush_pending();
+                    self.set_term(Term::Goto(exit));
+                    let dead = self.fresh_label();
+                    self.start_block(dead);
                 }
                 Stmt::BreakIf { cond } => {
                     let (exit, _) = *self.break_stack.last().ok_or("break outside loop")?;
@@ -2315,6 +2350,12 @@ impl Lowerer {
                     if cold {
                         self.cold_depth += 1;
                     }
+                    let place = self.next_if_place.take();
+                    self.place_ifs.push(place);
+                    if let Some(p) = place {
+                        self.place_active.push(p);
+                        self.place_conds.push(*cond);
+                    }
                     self.start_block(then_l);
                     self.if_stack.push((else_l, end_l));
                 }
@@ -2349,6 +2390,13 @@ impl Lowerer {
                     if let Some(c) = self.cold_ifs.last_mut() {
                         if std::mem::take(c) {
                             self.cold_depth -= 1;
+                        }
+                    }
+                    // so is the out-of-line part of a placed if
+                    if let Some(p) = self.place_ifs.last_mut() {
+                        if p.take().is_some() {
+                            self.place_active.pop();
+                            self.place_conds.pop();
                         }
                     }
                     self.start_block(else_l);
@@ -2471,6 +2519,21 @@ impl Lowerer {
                     self.region_stack.pop();
                 }
                 Stmt::BranchHint { unlikely } => self.next_if_cold = *unlikely,
+            Stmt::BranchPlace { anchor } => {
+                let n = self.anchor_ids.len() as u32;
+                let id = *self.anchor_ids.entry(anchor.clone()).or_insert(n);
+                self.next_if_place = Some(id);
+            }
+            Stmt::LayoutAnchor { name } => {
+                // a block boundary (no instruction: the edge falls through) where the anchored out-of-line branches are laid out
+                let n = self.anchor_ids.len() as u32;
+                let id = *self.anchor_ids.entry(name.clone()).or_insert(n);
+                let l = self.fresh_label();
+                self.set_term(Term::Goto(l));
+                self.start_block(l);
+                self.mir.blocks[self.cur].anchor = Some(id);
+            }
+            Stmt::DeclareVars { vars, init } => self.alloc_vars(f, vars, init)?,
                 Stmt::UnitMark { id, begin } => {
                     if *begin {
                         self.unit_stack.push(*id);
@@ -2559,6 +2622,10 @@ impl Lowerer {
                     let (else_l, end_l) = self.if_stack.pop().ok_or("endif without if")?;
                     if self.cold_ifs.pop() == Some(true) {
                         self.cold_depth -= 1;
+                    }
+                    if let Some(Some(_)) = self.place_ifs.pop() {
+                        self.place_active.pop();
+                        self.place_conds.pop();
                     }
                     if self.else_started.remove(&else_l) {
                         // current block ends the else branch

@@ -699,11 +699,15 @@ pub struct Block {
     pub pred: Option<Pred>,
     /// a block of a branch hinted unlikely (`Stmt::BranchHint`): laid out after the hot code by `coldlayout`
     pub cold: bool,
+    /// E5: the layout anchor this block belongs to (an out-of-line `if` branch placed with `Stmt::BranchPlace`), laid out by `lower-place`
+    pub place: Option<u32>,
+    /// E5: this block starts at the layout anchor with this id (`Stmt::LayoutAnchor`)
+    pub anchor: Option<u32>,
 }
 
 impl Block {
     pub fn new(label: u32) -> Self {
-        Block { label, insts: Vec::new(), term: Term::Endpgm, pred: None, cold: false }
+        Block { label, insts: Vec::new(), term: Term::Endpgm, pred: None, cold: false, place: None, anchor: None }
     }
 }
 

@@ -270,9 +270,14 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e = oe;
             (c, vec![], false)
         }
-        Stmt::StageBegin { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {
+        Stmt::StageBegin { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } => {
             e.marker = true;
             (ResClass::Marker, vec![], false)
+        }
+        // scope variables: their initialisation writes them (like a loop entry)
+        Stmt::DeclareVars { vars, .. } => {
+            e.marker = true;
+            (ResClass::Marker, vars.clone(), false)
         }
         Stmt::Assume { .. } => (ResClass::Marker, vec![], false),
         Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x4 { .. } | Stmt::StoreF32x2 { .. } | Stmt::BufferStore { .. } | Stmt::StoreF32Wt { .. } => {

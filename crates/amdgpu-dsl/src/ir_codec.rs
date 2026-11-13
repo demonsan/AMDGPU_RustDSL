@@ -696,6 +696,9 @@ impl FromIr for Stmt {
             "EndIf" => { v.expect_unit("EndIf")?; Ok(Stmt::EndIf) }
             "SNop" => { v.expect_struct("SNop")?; Ok(Stmt::SNop { count: FromIr::from_ir(v.field("count")?)? }) }
             "SetM0" => { v.expect_struct("SetM0")?; Ok(Stmt::SetM0 { value: FromIr::from_ir(v.field("value")?)? }) }
+            "BranchPlace" => { v.expect_struct("BranchPlace")?; Ok(Stmt::BranchPlace { anchor: FromIr::from_ir(v.field("anchor")?)? }) }
+            "LayoutAnchor" => { v.expect_struct("LayoutAnchor")?; Ok(Stmt::LayoutAnchor { name: FromIr::from_ir(v.field("name")?)? }) }
+            "DeclareVars" => { v.expect_struct("DeclareVars")?; Ok(Stmt::DeclareVars { vars: FromIr::from_ir(v.field("vars")?)?, init: FromIr::from_ir(v.field("init")?)? }) }
             other => Err(v.err(format!("unknown Stmt variant `{other}`"))),
         }
     }
@@ -764,6 +767,9 @@ impl IrIds for Stmt {
             Stmt::EndIf => {}
             Stmt::SNop { count } => { IrIds::ids(&mut (*count), fv, fr); }
             Stmt::SetM0 { value } => { IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::BranchPlace { anchor } => { IrIds::ids(&mut (*anchor), fv, fr); }
+            Stmt::LayoutAnchor { name } => { IrIds::ids(&mut (*name), fv, fr); }
+            Stmt::DeclareVars { vars, init } => { for x in (*vars).iter_mut() { fr(x); } IrIds::ids(&mut (*init), fv, fr); }
         }
     }
 }

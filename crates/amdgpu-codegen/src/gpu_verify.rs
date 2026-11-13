@@ -312,7 +312,7 @@ impl<'a> An<'a> {
         match o {
             Opnd::Var(v) => {
                 let upd: Vec<String> = self.f.stmts().iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if var == v { Some(self.shape(value, 3)) } else { None } } else { None }).take(2).collect();
-                let init: Vec<String> = self.f.stmts().iter().filter_map(|s| if let Stmt::BeginLoop { vars, init } = s { vars.iter().position(|x| x == v).map(|k| self.shape(&init[k], 3)) } else { None }).take(1).collect();
+                let init: Vec<String> = self.f.stmts().iter().filter_map(|s| if let Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } = s { vars.iter().position(|x| x == v).map(|k| self.shape(&init[k], 3)) } else { None }).take(1).collect();
                 format!("loop variable var{} = {} (not bounded by the fixpoint; initial {} = {}; updated by {}; add b.assume(var, lo, hi) at the top of the loop body)", v.0, self.vars.get(v).map(|i| i.show()).unwrap_or_default(), init.join(""), self.var_init.get(v).map(|i| i.show()).unwrap_or_default(), upd.join(" / "))
             }
             Opnd::Val(v) => {
@@ -579,7 +579,7 @@ impl<'a> An<'a> {
     fn persistent_axis(&self, v: VarId) -> Option<u8> {
         let stmts = self.f.stmts();
         let init = stmts.iter().find_map(|s| match s {
-            Stmt::BeginLoop { vars, init } => vars.iter().position(|x| *x == v).map(|k| init[k]),
+            Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => vars.iter().position(|x| *x == v).map(|k| init[k]),
             _ => None,
         })?;
         let ax = match init {
@@ -2258,7 +2258,7 @@ impl<'a> An<'a> {
                     _ => None,
                 });
                 let inits = f.stmts().iter().filter_map(|s| match s {
-                    Stmt::BeginLoop { vars, init } => vars.iter().position(|x| x == v).map(|k| init[k]),
+                    Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => vars.iter().position(|x| x == v).map(|k| init[k]),
                     _ => None,
                 });
                 let all: Vec<Opnd> = inits.chain(&mut sets).collect();
@@ -2448,6 +2448,16 @@ impl<'a> An<'a> {
                 // edge is reached only when the break was not taken)
                 self.pending_sets.push((i, *var, *value));
             }
+            // E5 scope variables: set anywhere in their scope, along any path (if arms, loop exits): flow-insensitive, so unbounded unless
+            // an `assume` restricts them (each `set_var` is then checked against it, GV-ASSUME)
+            Stmt::DeclareVars { vars, init } => {
+                for (v, i0) in vars.iter().zip(init.iter()) {
+                    let it = self.int_of(i0);
+                    self.var_init.insert(*v, it);
+                    let cur = self.assumed.get(v).cloned().unwrap_or_else(Itv::top);
+                    self.vars.insert(*v, cur);
+                }
+            }
             Stmt::BeginIf { .. } => self.tag = None,
             Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
             _ => {}
@@ -2581,7 +2591,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
                         changed = true;
                     }
                 }
-                Stmt::BeginLoop { vars, init } => {
+                Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
                     for (v, i0) in vars.iter().zip(init.iter()) {
                         if tainted(i0, &tv, &tvars) && tvars.insert(*v) {
                             changed = true;

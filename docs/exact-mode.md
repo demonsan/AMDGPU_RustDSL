@@ -162,3 +162,40 @@ Still open:
 - 64-bit and EXEC moves;
 - the buffer descriptor from a kernarg pointer-add chain (kernel-opt's item n);
 - a check that an M0 write reaches every DMA.
+
+## 8. E5: structured exact branch forms and scope variables (implemented, kernel-opt)
+
+The vendor's control flow, lifted by `tools/isa_lift.py --structure`, has three shapes:
+- ifs whose then-branch falls through;
+- loops whose exits carry their own bodies (the drains);
+- branches into out-of-line blocks that jump back (the rollback-overflow paths).
+
+Registers merge at joins that are not loop headers. E5 expresses all of this without gotos. The statements are layout and scope only: the structure, and with it every analysis, stays the plain `if` / `loop`.
+
+| Statement (`FnBuilder`) | Meaning | Lowering |
+|---|---|---|
+| `begin_if_at(cond, anchor)` (`Stmt::BranchPlace` + `BeginIf`) | the then-branch is laid out out of line at the layout anchor `anchor` | its blocks are tagged with the anchor; the condition's taken edge enters them; the end jumps to the join |
+| `layout_anchor(name)` (`Stmt::LayoutAnchor`) | where the branches placed at `name` go | a block boundary, no instruction; pass `lower-place` moves the tagged blocks in front of it |
+| `break_if(c)` inside `begin_if_at(c, ..)` | a loop exit with its own body | one jump to the loop exit, with no second conditional branch |
+| `declare_vars(&[(ty, init)])` (`Stmt::DeclareVars`) | variables without a loop, assignable with `set_var` in the rest of the function | registers allocated and initialised like loop variables (shared helper `alloc_vars`) |
+
+**Lowering and layout.**
+- `crates/amdgpu-codegen/src/lower_cf.rs` (`lower-place`, a no-op without anchors) does the layout.
+- After it, jumps to blocks that only jump on are retargeted, and blocks no edge reaches are dropped.
+- So a loop exit reaches its join in one branch.
+- The fall-through `s_branch` of the unscheduled emitter is the exact pipeline's to elide (`MFunction::elide_fallthrough`).
+
+**Verification.**
+- `verify` (IR): a placement must precede an `if` and name an existing anchor; an anchor is declared once; scope variables follow the loop-variable init / type rules.
+- `gpu_verify`: scope variables are flow-insensitive. They are unbounded unless an `assume` restricts them, and each `set_var` is then checked against the assumption (GV-ASSUME). The variable-init, uniformity and taint scans treat them like loop variables.
+- `gpu_protocol`: their initialisation is part of the taint / cone scans.
+
+**Gates.**
+- md5 manifest identical: 240 kernels, 0 differences. `cargo test` and `run_all` pass.
+- `crates/amdgpu-kernels/tests/e5_branches.rs`:
+  - the layout test: exits after the back edge, the cold path at its anchor, one conditional branch per placed if, no forwarding block;
+  - the plain form for comparison;
+  - strict `gpu_verify` 0 errors;
+  - irv1 round trip;
+  - mutation tests: placement not before an `if`, unknown anchor, anchor declared twice — each rejected with its message.
+- Hardware probe `tools/e5_probe.sh`: the placed and the plain kernel, n = 1..8, every lane right (E5_PROBE_OK, node 53 GPU 0).

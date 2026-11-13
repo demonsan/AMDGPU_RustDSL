@@ -17,6 +17,7 @@ pub mod diag;
 pub mod hazards;
 pub mod hzfill;
 pub mod bweave;
+pub mod lower_cf;
 pub mod cfg_thread;
 pub mod exact;
 pub mod pass;

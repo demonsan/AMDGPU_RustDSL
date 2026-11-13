@@ -125,7 +125,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
                         changed = true;
                     }
                 }
-                Stmt::BeginLoop { vars, init } => {
+                Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => {
                     for (v, i0) in vars.iter().zip(init.iter()) {
                         if tainted(i0, &tv, &tvars) && tvars.insert(*v) {
                             changed = true;
@@ -1445,7 +1445,7 @@ fn cone_has(f: &Function, o: &Opnd, pred: &dyn Fn(&Op) -> bool, seen: &mut HashS
             }
             f.stmts().iter().any(|s| match s {
                 Stmt::SetVar { var, value } if var == x => cone_has(f, value, pred, seen),
-                Stmt::BeginLoop { vars, init } => vars.iter().position(|y| y == x).map_or(false, |k| cone_has(f, &init[k], pred, seen)),
+                Stmt::BeginLoop { vars, init } | Stmt::DeclareVars { vars, init } => vars.iter().position(|y| y == x).map_or(false, |k| cone_has(f, &init[k], pred, seen)),
                 _ => false,
             })
         }
