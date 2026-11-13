@@ -2812,7 +2812,14 @@ impl<'a> An<'a> {
                 let a = self.int_of(lds_addr).add_const(*imm as i128);
                 self.cur_addr = Some((*lds_addr, *imm as i128));
                 let lanes = self.exec_lanes as i128;
+                let before = self.rep.findings.len();
                 self.check_lds(&format!("buffer load ... lds (LDS side: M0 + imm + lane*size, {lanes} lanes)"), &a, lanes * 4 * *dwords as i128);
+                if self.rep.findings.len() > before {
+                    let sh = self.shape(lds_addr, 6);
+                    if let Some(last) = self.rep.findings.last_mut() {
+                        last.msg.push_str(&format!(" | M0 = {sh} ; imm {imm}"));
+                    }
+                }
             }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                 let b = self.av_of(base);
