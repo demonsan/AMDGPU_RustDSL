@@ -481,3 +481,76 @@ The §4 finding stands in a weaker form: copies landing during the M phase cost 
 | gpu_verify on lifted vendor code | proofs only for what the DSL expresses; lifted asm is opaque | — |
 
 **Shipped result of W5:** the replica configuration (steps 1, 2, 4a, 4b) is the shipped `_vs128` (§4.9): perf_ab +1.7 % geomean, per-CU 0.971× the vendor.
+
+## 6. R4 — the 1:1 exact replica (route B)
+
+The vendor kernel, rebuilt instruction by instruction, compiled by our compiler and verified by gpu_verify. Route B (user decision): the repository holds only generic mechanisms. These are the lifter, exact mode ([`exact-mode.md`](exact-mode.md)), the E5 structured branch forms and the verifier forms. The vendor's instruction order, registers and the lifted IR are generated on the node at run time from `REF_CO` and are never committed. This section records counts and classes only.
+
+### 6.1 Pipeline
+
+1. `llvm-objdump -d` of `REF_CO` → [`tools/isa_lift.py`](../tools/isa_lift.py) `--kernel --exact`. Every instruction becomes a real DSL op or statement; the blocks become the structured tree:
+   - ifs, the two natural loops with their exits as E5 exit-with-body arms;
+   - the four rollback blocks as placed `if/else` with layout anchors.
+   - Registers live across blocks are E5 scope variables; pointer and descriptor tuples become `Ptr` / `Rsrc` variables.
+   - Registers whose every definition is in the prelude are carried by value, so descriptors keep their provenance.
+   - Exact-mode pins (`reg_plan`) give every value the author's register.
+2. `amdc emit --from-ir` with the normal verification:
+   - exact mode keeps the author's order, registers, waits, nops, operand order and encodings, and only checks them (waits, hazards, clobbers);
+   - gpu_verify proves the memory accesses.
+3. Comparison: [`exact_isa_diff.py`](../tools/exact_isa_diff.py) (aligned instruction stream), [`isa_bytes_diff.py`](../tools/isa_bytes_diff.py) (encodings), [`isa_branch_targets.py`](../tools/isa_branch_targets.py) (each branch reaches the aligned target) and [`kd_fields.py`](../tools/kd_fields.py) (kernel descriptor). Then `ref_host` compares the outputs and timing against the vendor code object, in the same run.
+
+Lifter options that turn the input's facts into IR facts:
+- `--kernarg-size`, `--workgroup`, `--lds`, `--fp-mode`: the descriptor / metadata.
+- `--contract-from <ir>`: the named arguments and the argument-level contract of OUR replica, which has the same 656-byte kernarg layout.
+- `--wgmap`: the workgroup map.
+- `--sym-range`: bounds of free size symbols.
+- `--fix-waits` / `--fix-lanemask` / `--fix-m0`: the named deviations below.
+
+### 6.2 Result
+
+| | vendor | exact replica |
+|---|---|---|
+| Instructions | 9 189 | 9 264 (9 188 identical in order, 99.99 %) |
+| Encodings of the aligned instructions | — | byte-identical except branch offsets |
+| Branch targets | — | all identical by aligned position |
+| VGPR / SGPR, LDS, FP mode | 246 / 99, 84 224 B, denorm32 flush / IEEE | identical |
+| Kernel descriptor | — | identical except the `kernarg_size` field (656 vs 0; no effect, checked) |
+| Output vs the vendor | — | bit-identical (worst diff 0) on all outputs at B1 S2048, B4 S2048, B1 S8192, B8 S4096, B2 S16384 |
+| Same-run time vs the vendor (median of 9) | 1 | B4 S2048 1.003, B1 S8192 0.997, B8 S4096 1.001 |
+| gpu_verify | — | 0 unproven: LDS 1 167, buffer 97, global 3, barrier-balanced ifs 6 |
+
+### 6.3 Every remaining difference, with its reason
+
+| Difference | Count | Reason |
+|---|---|---|
+| `s_waitcnt lgkmcnt(2)` added | 12 (6 sites × 2 copies) | The vendor reads LDS data the counter does not yet guarantee and relies on timing. The contention probe failed, so it is not accepted as a timing waiver. |
+| `s_nop 0` between an M0 write and its LDS-DMA | 56 | Our hazard rule wants 1 wait state; the M0 probe is inconclusive, so it is a deviation until a probe settles it. |
+| `s_nop 0` between a VALU lane-mask write and the next VALU's mask read | 6 | Our rule is 1 wait state (lead decision); the vendor uses 0. |
+| A fall-through `s_branch` | 1 removed | The vendor jumps to the next block; exact mode lays out fall-throughs. |
+| `s_nop` after `s_endpgm` | 2 | Code-end padding, never executed. |
+
+The deviations cost nothing measurable: the timing above includes them. The vendor's own transcendental-result and `v_readfirstlane` distances are 1 wait state each. They are proven by hardware probes (`tools/trans_hazard_probe.sh`, `tools/readfirstlane_hazard_probe.sh`) and are target rows now, not deviations.
+
+### 6.4 What is trusted
+
+The certificate has 1 trusted assume and 30 trusted contracts:
+- **Assume:** the workgroup map `(query tile, head)` is a bijection of the workgroup `(x, y)`. The vendor computes it with an 8-step restoring division; it is the same fact our replica states.
+- **Contracts:** the argument-level host contract of our replica (7 extents, 9 kernarg ranges, 2 grid definitions, 11 kernarg identities), plus one size bound: heads ≤ 65 536 · 16. The vendor addresses the descale tensors with `v_mul_i32_i24`, which is exact only while 4 · heads < 2^23.
+- **Not proven:** race freedom. The report lists the accesses as bounds-checked, not race-checked (1 167 LDS, 18 global writes), because the lift carries no tile-protocol facts.
+
+### 6.5 What the replica found
+
+Compiler and verifier gaps found by running the vendor's code through them, all fixed generically:
+- **Exact-mode lowering:**
+  - `s_mov_b64 exec, 0xffffffff` is a zero-extended 32-bit literal, i.e. half a wave issues the LDS-DMA (`ExecSet`). As `exec, -1` it corrupted 40 % of the rows of half the blocks and cost 2 %.
+  - Authored operand order and encodings, `s_addk_i32`, `set_m0` of an add, negated compares.
+  - Branches laid out as authored; author-pinned adds kept; the author's register counts and FP mode.
+- **gpu_verify:**
+  - E5 scope variables tracked flow-sensitively;
+  - interval rules for the vendor's integer ops;
+  - ring counters and their shadows;
+  - the EXEC lane count of an LDS-DMA;
+  - generic compare branch facts;
+  - pointer equivalence through masked high words;
+  - barrier balance per loop-exit path (E5 exits with bodies).
+- **The lifter itself:** a conditional branch to an unnamed label, the MFMA scale-byte select, the accumulator read of `v_smfmac`, and the layout of the cold blocks.
