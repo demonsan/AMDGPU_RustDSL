@@ -156,7 +156,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
         Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
         Op::MovV { .. } => ResClass::Valu,
-        Op::Undef { .. } => ResClass::Marker,
+        Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,
         Op::MemTimeLo { .. } => {
             e.directive = true;
             ResClass::Sync
