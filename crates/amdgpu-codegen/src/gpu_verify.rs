@@ -289,6 +289,19 @@ impl<'a> An<'a> {
                 let (lo, hi) = self.rings.rings[v];
                 Itv::range(Poly::int(lo), Poly::int(hi))
             }
+            Opnd::Var(v) if self.rings.sym.contains_key(v) => {
+                let x = self.int_of(&self.rings.sym[v]);
+                let lo_c = x.lo.iter().filter_map(|p| p.as_const()).map(|q| (q.n + q.d - 1).div_euclid(q.d)).max();
+                let hi_c = x.hi.iter().filter_map(|p| p.as_const()).map(|q| q.n.div_euclid(q.d)).min();
+                let r = match (lo_c, hi_c) {
+                    (Some(lo), Some(hi)) => self.rings.orbit_range(*v, lo, hi),
+                    _ => None,
+                };
+                match r {
+                    Some((lo, hi)) => Itv::range(Poly::int(lo), Poly::int(hi)),
+                    None => self.vars.get(v).cloned().unwrap_or_default(),
+                }
+            }
             Opnd::Var(v) if self.rings.shadows.contains_key(v) => {
                 let (x, c, lo, hi, _) = self.rings.shadows[v].clone();
                 self.int_of(&x).add(&Itv::range(Poly::int(lo - c), Poly::int(hi - c)))
@@ -365,7 +378,7 @@ impl<'a> An<'a> {
     /// `D + w` is the next value of ring / shadow `w`: D is a `Select` by the ring's own rule on the ring's current value (no set of the
     /// ring or of `w` between D's compare and this statement).
     fn ring_step_add(&self, d: ValueId, w: VarId) -> bool {
-        let ring = if self.rings.rings.contains_key(&w) { w } else if let Some(r) = self.ring_of_shadow(w) { r } else { return false };
+        let ring = if self.rings.rings.contains_key(&w) || self.rings.sym.contains_key(&w) { w } else if let Some(r) = self.ring_of_shadow(w) { r } else { return false };
         if self.rings.steps.get(&d) == Some(&ring) {
             return true;
         }
@@ -3586,6 +3599,57 @@ struct RingFacts {
     /// statement positions of every set of a variable, and of every `Let`
     set_pos: HashMap<VarId, Vec<usize>>,
     let_pos: HashMap<ValueId, usize>,
+    /// rings whose single non-constant start value is an expression (e.g. a per-wave base): the start's interval is enumerated at use
+    sym: HashMap<VarId, Opnd>,
+    sym_cache: std::cell::RefCell<HashMap<(VarId, i128, i128), Option<(i128, i128)>>>,
+}
+
+impl RingFacts {
+    /// The reachable values of a ring started anywhere in [lo, hi] (None: too many starts or a run that does not cycle).
+    fn orbit_range(&self, v: VarId, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        if let Some(r) = self.sym_cache.borrow().get(&(v, lo, hi)) {
+            return *r;
+        }
+        let r = (|| {
+            let &(pred, ty, var_left, k, ka, kb) = self.rules.get(&v)?;
+            if hi < lo || hi - lo > 1 << 17 {
+                return None;
+            }
+            let (mut mn, mut mx) = (i128::MAX, i128::MIN);
+            for x0 in lo..=hi {
+                let mut x = x0;
+                let mut seen = std::collections::BTreeSet::new();
+                while seen.insert(x) {
+                    if seen.len() > 64 {
+                        return None;
+                    }
+                    mn = mn.min(x);
+                    mx = mx.max(x);
+                    x = ((x + if ring_cmp(pred, ty, var_left, k, x) { ka } else { kb }) as i64 as i32) as i128;
+                }
+            }
+            Some((mn, mx))
+        })();
+        self.sym_cache.borrow_mut().insert((v, lo, hi), r);
+        r
+    }
+}
+
+fn ring_cmp(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy, var_left: bool, k: i128, x: i128) -> bool {
+    let (l, r) = if var_left { (x, k) } else { (k, x) };
+    let (l, r) = match ty {
+        amdgpu_dsl::CmpTy::U32 => ((l as i64 as u32) as i128, (r as i64 as u32) as i128),
+        _ => ((l as i64 as i32) as i128, (r as i64 as i32) as i128),
+    };
+    use amdgpu_dsl::CmpPred as P;
+    match pred {
+        P::Lt => l < r,
+        P::Le => l <= r,
+        P::Gt => l > r,
+        P::Ge => l >= r,
+        P::Eq => l == r,
+        _ => l != r,
+    }
 }
 
 fn ring_facts(f: &Function) -> RingFacts {
@@ -3639,16 +3703,24 @@ fn ring_facts(f: &Function) -> RingFacts {
     let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::new();
     let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::new();
     let mut ring_rule: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = HashMap::new();
+    let mut sym: HashMap<VarId, Opnd> = HashMap::new();
     'var: for (v, list) in &sets {
         let mut consts = Vec::new();
         let mut steps = Vec::new();
         let mut rule: Option<(amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = None;
+        let mut sym_init: Option<Opnd> = None;
         for (k, value) in list {
             if let Some(c) = konst(&defs, value, 4) {
                 consts.push((*k, c));
                 continue;
             }
-            let Some(d) = step_of(*v, value) else { continue 'var };
+            let Some(d) = step_of(*v, value) else {
+                if sym_init.is_some() {
+                    continue 'var;
+                }
+                sym_init = Some(*value);
+                continue;
+            };
             let Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) = defs.get(&d) else { continue 'var };
             let (Some(ka), Some(kb)) = (konst(&defs, a, 4), konst(&defs, b, 4)) else { continue 'var };
             let Some(Op::Cmp { pred, ty, a: ca, b: cb }) = defs.get(c) else { continue 'var };
@@ -3671,6 +3743,15 @@ fn ring_facts(f: &Function) -> RingFacts {
             steps.push(d);
         }
         let Some((pred, ty, var_left, k, ka, kb)) = rule else { continue };
+        if let Some(x) = sym_init {
+            if !consts.is_empty() {
+                continue;
+            }
+            ring_rule.insert(*v, (pred, ty, var_left, k, ka, kb));
+            ring_step.insert(*v, steps);
+            sym.insert(*v, x);
+            continue;
+        }
         if consts.is_empty() {
             continue;
         }
@@ -3742,5 +3823,5 @@ fn ring_facts(f: &Function) -> RingFacts {
     }
     let steps: HashMap<ValueId, VarId> = ring_step.iter().flat_map(|(v, ds)| ds.iter().map(move |d| (*d, *v))).collect();
     let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
-    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos }
+    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, sym_cache: Default::default() }
 }
