@@ -599,6 +599,7 @@ impl Lowerer {
             workgroup_size: f.workgroup_size,
             lds_bytes: f.lds_bytes,
             fp_mode: f.fp_mode,
+            exact: f.exact,
             blocks: Vec::new(),
             vregs: Vec::new(),
             loops: Vec::new(),

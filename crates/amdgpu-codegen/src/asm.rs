@@ -59,7 +59,7 @@ pub fn block_to_mfunction(b: &AsmBlock, name: &str) -> Result<MFunction, String>
         args: Vec::new(),
         kernarg_size: 0,
         workgroup_size: 64,
-        lds_bytes: 0, fp_mode: None,
+        lds_bytes: 0, fp_mode: None, exact: false,
         blocks: vec![blk],
         vregs: b.regs().iter().map(|c| rclass(*c)).collect(),
         loops: Vec::new(),

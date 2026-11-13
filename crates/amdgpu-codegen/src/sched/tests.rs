@@ -9,7 +9,7 @@ fn func(vregs: &[RClass], insts: Vec<MInst>) -> MFunction {
         args: vec![],
         kernarg_size: 0,
         workgroup_size: 64,
-        lds_bytes: 4096, fp_mode: None,
+        lds_bytes: 4096, fp_mode: None, exact: false,
         blocks: vec![b],
         vregs: vregs.to_vec(),
         loops: vec![],

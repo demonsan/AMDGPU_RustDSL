@@ -59,6 +59,8 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     // never uses more than 102 (s0..s101), so a kernel with 97..102 SGPRs declares 102 (rounding to 104 made the assembler reject it)
     let te = &crate::target::T.emit;
     let sgpr = round_up(a.max_s, te.sgpr_granule).max(te.sgpr_min).min(te.sgpr_cap);
+    // exact mode: the counts the author's registers use (the hardware granules encode them identically)
+    let (vgpr, sgpr) = if m.exact && agprs == 0 { (a.max_v.max(1), a.max_s.max(1)) } else { (vgpr, sgpr) };
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
     // it to be 64-byte aligned; without this the fields are read shifted and
