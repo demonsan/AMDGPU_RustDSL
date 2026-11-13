@@ -55,10 +55,17 @@ pub fn report(f: &amdgpu_dsl::Function, stmts: &[amdgpu_dsl::Stmt], m: &MFunctio
     let (mut total, mut synth) = (0usize, 0usize);
     let mut kinds: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
     let mut last_stmt = u32::MAX;
+    let mut inside = region.is_none();
     for b in &m.blocks {
         out.push_str(&format!("BB{}:\n", b.label));
         for i in &b.insts {
-            if !in_region(i.region) {
+            // an instruction added after lowering (region 0) belongs to the region it sits in
+            if i.stmt != 0 {
+                inside = in_region(i.region);
+            } else if region.is_none() {
+                inside = true;
+            }
+            if !inside {
                 continue;
             }
             if i.stmt != last_stmt {
