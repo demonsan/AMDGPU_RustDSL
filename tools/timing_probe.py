@@ -19,6 +19,9 @@ MUL, ADD = 0x9E3779B1, 0x1234567
 M32 = (1 << 32) - 1
 
 def body(gap, iters):
+    # gap < 0: the SAFE control (the counter-guaranteed wait before the consumer, |gap| instructions of gap)
+    safe = gap < 0
+    gap = abs(gap)
     o = []
     o.append("s_load_dwordx2 s[4:5], s[0:1], 8")
     o.append(f"s_mov_b32 s6, 0x{MUL:08x}")
@@ -51,6 +54,8 @@ def body(gap, iters):
         o.append(f"v_add_u32_e32 v31, v31, v{40 + k}")     # the rest of the extras, AFTER the consumer (keeps the sums equal)
     o.append("ds_read_b128 v[18:21], v6")
     o.append("ds_read_b128 v[22:25], v6 offset:16")
+    if safe:
+        o.append("s_waitcnt lgkmcnt(2)")
     for k in range(8):
         o.append(f"v_add_u32_e32 v30, v30, v{10 + k}")      # X consumed with NO wait (the timing reliance)
     o.append("s_waitcnt lgkmcnt(0)")
