@@ -236,6 +236,47 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
             break;
         }
     }
+    // a dword only holds a value once something wrote it: reads of never-written dwords (unused lanes of a tuple, an accumulator read
+    // before its first write on the first iteration) do not make the register busy. Forward "may be defined" sets per block entry.
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (b, ss) in succ.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(b);
+        }
+    }
+    let mut def_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for bi in 0..nb {
+            let mut d: HashSet<Slot> = preds[bi].iter().flat_map(|&p| {
+                let mut x = def_in[p].clone();
+                for (_, w) in &effs[p] {
+                    x.extend(w.iter().copied());
+                }
+                x
+            }).collect();
+            d.extend(def_in[bi].iter().copied());
+            if d.len() != def_in[bi].len() {
+                def_in[bi] = d;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let first_def: Vec<HashMap<Slot, usize>> = effs
+        .iter()
+        .map(|b| {
+            let mut fd = HashMap::new();
+            for (ii, (_, w)) in b.iter().enumerate() {
+                for s in w {
+                    fd.entry(*s).or_insert(ii);
+                }
+            }
+            fd
+        })
+        .collect();
     let name = |s: Slot| -> String {
         let t = s / 16;
         let n = m.reg_hints.names.get(&t).cloned().unwrap_or_else(|| format!("r{t}"));
@@ -255,7 +296,8 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
             for s in w {
                 if let Some(p) = phys_of(*s) {
                     if let Some(o) = by_phys.get(&p) {
-                        if o != s && !w.contains(o) {
+                        let defined = def_in[bi].contains(o) || first_def[bi].get(o).map_or(false, |&d| d < ii);
+                        if o != s && !w.contains(o) && defined {
                             let inst = &m.blocks[bi].insts[ii];
                             out.push(format!(
                                 "block {} inst {ii} ({:?}) writes {}{} (as {}) while {} still lives there",
