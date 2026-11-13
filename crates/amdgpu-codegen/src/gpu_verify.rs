@@ -3779,6 +3779,8 @@ struct RingFacts {
     let_pos: HashMap<ValueId, usize>,
     /// rings whose single non-constant start value is an expression (e.g. a per-wave base): the start's interval is enumerated at use
     sym: HashMap<VarId, Opnd>,
+    /// constant-start rings: their constant starts
+    starts: HashMap<VarId, Vec<i128>>,
     sym_cache: std::cell::RefCell<HashMap<(VarId, i128, i128), Option<(i128, i128)>>>,
 }
 
@@ -3811,6 +3813,34 @@ impl RingFacts {
         self.sym_cache.borrow_mut().insert((v, lo, hi), r);
         r
     }
+}
+
+/// The period of a proven ring counter (or of a shadow: its ring's) when every constant start lies on one pure cycle; for the tile simulator.
+pub(crate) fn ring_period(f: &Function, x: VarId) -> Option<usize> {
+    let rf = ring_facts(f);
+    let v = if rf.rings.contains_key(&x) { x } else { rf.shadows.get(&x)?.4 };
+    let &(pred, ty, var_left, k, ka, kb) = rf.rules.get(&v)?;
+    let starts = rf.starts.get(&v)?;
+    let mut period = 0usize;
+    for &x0 in starts {
+        let mut cur = x0;
+        let mut p = 0usize;
+        loop {
+            cur = ((cur + if ring_cmp(pred, ty, var_left, k, cur) { ka } else { kb }) as i64 as i32) as i128;
+            p += 1;
+            if cur == x0 {
+                break;
+            }
+            if p > 64 {
+                return None;
+            }
+        }
+        if period != 0 && period != p {
+            return None;
+        }
+        period = p;
+    }
+    (period > 0).then_some(period)
 }
 
 fn ring_cmp(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy, var_left: bool, k: i128, x: i128) -> bool {
@@ -4002,5 +4032,6 @@ fn ring_facts(f: &Function) -> RingFacts {
     }
     let steps: HashMap<ValueId, VarId> = ring_step.iter().flat_map(|(v, ds)| ds.iter().map(move |d| (*d, *v))).collect();
     let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
-    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, sym_cache: Default::default() }
+    let starts: HashMap<VarId, Vec<i128>> = ring_const.iter().map(|(v, l)| (*v, l.iter().map(|x| x.1).collect())).collect();
+    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, starts, sym_cache: Default::default() }
 }

@@ -326,6 +326,19 @@ impl<'a> Sim<'a> {
         let slot_cv = if private { CV::K(0) } else { self.cv(slot) };
         match (slot_cv, self.cv(ver)) {
             (CV::K(s), CV::K(v)) => {
+                // a slot given as its byte offset (`slot_by_offset`): base + slot * slot_size
+                let t = &self.f.contract.tiles[ti];
+                let s = if t.slot_by_offset && !private {
+                    let d = s - t.base;
+                    if t.slot_size <= 0 || d.rem_euclid(t.slot_size) != 0 {
+                        self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}`: the slot offset {s} is not a slot start (base {}, slot size {})", t.base, t.slot_size));
+                        self.open = None;
+                        return;
+                    }
+                    d.div_euclid(t.slot_size)
+                } else {
+                    s
+                };
                 let slots = self.f.contract.tiles[ti].slots as i64;
                 if !private && (s < 0 || s >= slots) {
                     self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}` slot {s} is outside the declared ring of {slots} slot(s)"));
@@ -788,7 +801,8 @@ fn finite_state_period(f: &Function, x: VarId) -> Option<usize> {
             }
         }
     }
-    let x0 = init?;
+    // an E5 scope variable proven a ring counter / shadow by gpu_verify's ring pre-pass (no loop init): its orbit's period
+    let Some(x0) = init else { return crate::gpu_verify::ring_period(f, x) };
     let ups: Vec<&Opnd> = f.stmts().iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if *var == x { Some(value) } else { None } } else { None }).collect();
     if ups.len() != 1 {
         return None;
