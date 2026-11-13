@@ -1627,7 +1627,15 @@ def main():
                 use = ('extents', 'ka_ranges', 'grid_defs', 'ka_defs')
                 contract = ['contract Contract {']
                 for k, lines in keep.items():
-                    if k in use:
+                    if k == 'ka_defs' and '--ka-def' in sys.argv:
+                        # extra host-contract layout identities: OFF=K*ka(OFF2) (e.g. an LSE head stride = 4 * the sequence length)
+                        extra = []
+                        for spec in sys.argv[sys.argv.index('--ka-def') + 1].split(','):
+                            off, rhs = spec.split('=')
+                            kk, src = rhs.split('*ka')
+                            extra.append(f'        ({int(off)}, Mul(Ka({int(src)}), Const({int(kk)}))),')
+                        contract += lines[:-1] + extra + lines[-1:]
+                    elif k in use:
                         contract += lines
                     elif k.startswith('_'):
                         continue
