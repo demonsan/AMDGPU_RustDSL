@@ -432,6 +432,13 @@ impl<'a> Sim<'a> {
                 Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
                 Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
+                // the combined s_waitcnt (exact mode): both counters
+                Stmt::WaitCnt { vm, lgkm } => {
+                    self.items.push(Item::WaitVm { ord: self.ord, count: *vm });
+                    if *lgkm == 0 {
+                        self.items.push(Item::WaitLds { ord: self.ord });
+                    }
+                }
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
                 Stmt::TileConsume { tile, slot, version } => self.open_marker(i, false, tile, slot, version),
                 Stmt::TileEnd => self.close(),
