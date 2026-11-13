@@ -3539,7 +3539,7 @@ fn ring_facts(f: &Function) -> (HashMap<VarId, (i128, i128)>, HashMap<VarId, (Op
     };
     let straight = |a: usize, b: usize| {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        !stmts[lo + 1..hi].iter().any(|s| control(s))
+        hi <= lo + 1 || !stmts[lo + 1..hi].iter().any(|s| control(s))
     };
     // every (position, value) a variable is set to: set_vars, plus non-Undef inits of loops / scopes
     let mut sets: HashMap<VarId, Vec<(usize, Opnd)>> = HashMap::new();
