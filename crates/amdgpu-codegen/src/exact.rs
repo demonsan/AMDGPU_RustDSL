@@ -605,6 +605,16 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         // waits and hazards on PHYSICAL registers: a value read through a vanished same-register copy (a tuple assembled from loaded parts)
         // is the register its load wrote
         let m_phys = physical_view(&m, &a);
+        // AMDC_EXACT_DUMP=<label,label,..|all>: the final instruction text of those blocks (with the IR statement of each), for diffing a lift
+        if let Ok(want) = std::env::var("AMDC_EXACT_DUMP") {
+            for b in &m.blocks {
+                if want == "all" || want.split(',').any(|x| x == b.label.to_string()) {
+                    for (ii, i) in b.insts.iter().enumerate() {
+                        eprintln!("DUMP BB{} {ii} stmt{} {}", b.label, i.stmt as i64 - 1, crate::emit::inst_lines(&a, i).join(" ; "));
+                    }
+                }
+            }
+        }
         for v in verify_final_with(&m, &m_phys, &a, false) {
             let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
             if waived {
