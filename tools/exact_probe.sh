@@ -7,7 +7,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p bu
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"; CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 [ -x build/tileop_probe_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/tileop_probe_host.cpp -o build/tileop_probe_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
 bash tools/container/cargo.sh test -q --release -p amdgpu-kernels --test exact_mode the_hardware_probe_kernel_compiles_exactly > build/exact/test.log 2>&1 || { tail -20 build/exact/test.log; exit 1; }
-${AMDC:-bash tools/container/cargo.sh run -q --release --bin amdc --} emit --from-ir /work/build/exact/probe_exact_hw.ir --backend own --out /work/build/exact/probe.s > build/exact/emit.log 2>&1 || { tail -5 build/exact/emit.log; exit 1; }
+if [ -n "${AMDC:-}" ]; then W="$REPO"; else W=/work; fi
+${AMDC:-bash tools/container/cargo.sh run -q --release --bin amdc --} emit --from-ir "$W/build/exact/probe_exact_hw.ir" --backend own --out "$W/build/exact/probe.s" > build/exact/emit.log 2>&1 || { tail -5 build/exact/emit.log; exit 1; }
 grep -E "^\s+(s_|v_|buffer_)" build/exact/probe.s
 "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/exact/probe.co build/exact/probe.s || exit 1
 head -c 256 /dev/zero > build/exact/in.bin
