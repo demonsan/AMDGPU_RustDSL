@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use crate::mir::*;
 
 /// Cycles that must separate a transcendental write from its first reader.
+/// VALU VGPR write -> v_readfirstlane read (target row `valu-readfirstlane`).
+const RFL_WAIT: usize = crate::target::T.hazard("valu-readfirstlane").n() as usize;
 const TRANS_LATENCY: usize = crate::target::T.hazard("trans-result").n() as usize;
 
 /// How many instructions after the stalled consumer are examined as fill candidates.
@@ -136,7 +138,8 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut ready: HashMap<VReg, (usize, bool)> = HashMap::new();
         // Virtual register -> earliest cycle at which a plain VALU result may feed an MFMA operand
         // or a permlane (a different, shorter hazard than the in-flight latencies above).
-        let mut vw: HashMap<VReg, usize> = HashMap::new();
+        // VALU writer -> hazard reader: (ready cycle, the writer's delay) - v_readfirstlane waits only the `valu-readfirstlane` row
+        let mut vw: HashMap<VReg, (usize, usize)> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
         // v_accvgpr_read result -> v_add_co/v_addc pointer arithmetic needs 2 wait states (LLVM oracle, AGPR rows of the hazard matrix)
@@ -149,7 +152,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, hiw: &HashMap<VReg, usize>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, (usize, usize)>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, hiw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
             if inst.op == MOp::VPtrAdd {
                 for s in &inst.srcs {
@@ -191,8 +194,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 let skip = if inst.op == MOp::VCndmaskM { 2 } else { 0 };
                 for s in inst.srcs.iter().skip(skip) {
                     if let Src::Reg(r) = s {
-                        if let Some(rd) = vw.get(&canon(*r)) {
-                            earliest = earliest.max(*rd);
+                        if let Some(&(rd, dly)) = vw.get(&canon(*r)) {
+                            // v_readfirstlane: tools/readfirstlane_hazard_probe.sh (stale at 0, correct at 1 / 2 wait states)
+                            let rd = if inst.op == MOp::VReadFirstLane { rd - dly + dly.min(RFL_WAIT) } else { rd };
+                            earliest = earliest.max(rd);
                         }
                     }
                 }
@@ -289,7 +294,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                             ready.remove(&canon(d));
                             vw.remove(&canon(d));
                             if let Some(dly) = valu_writer_delay(x.op) {
-                                vw.insert(canon(d), cycle + 1 + dly);
+                                vw.insert(canon(d), (cycle + 1 + dly, dly));
                             }
                         }
                         out.push(x);
@@ -326,12 +331,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     aw.insert(canon(d), cycle + 3);
                 }
                 if let Some(dly) = valu_writer_delay(inst.op) {
-                    vw.insert(canon(d), cycle + 1 + dly);
+                    vw.insert(canon(d), (cycle + 1 + dly, dly));
                 }
                 if matches!(inst.op, MOp::VPermlane32Swap | MOp::VPermlane16Swap) {
                     // the swap rewrites its second operand too
                     if let Some(Src::Reg(r2)) = inst.srcs.get(1) {
-                        vw.insert(canon(*r2), cycle + 1 + 2);
+                        vw.insert(canon(*r2), (cycle + 1 + 2, 2));
                     }
                 }
             }
