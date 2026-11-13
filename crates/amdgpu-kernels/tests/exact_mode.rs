@@ -126,13 +126,15 @@ pub fn exact_probe_kernel() -> Function {
     let off = b.bind_i32(ev(tid) << 2);
     let t = b.bind_i32(ev(tid) << 1);
     let v = b.let_(Op::AddI32(Opnd::Val(t), Opnd::I32(7)));
-    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, v);
+    let vf = b.let_(Op::BitcastF32(Opnd::Val(v)));
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
     b.pin_sgpr_at(RegRef::Val(po), 8);
     b.pin_sgpr_at(RegRef::Val(rs), 12);
     b.pin_vgpr_at(RegRef::Val(tid), 0);
     b.pin_vgpr_at(RegRef::Val(off), 1);
     b.pin_vgpr_at(RegRef::Val(t), 2);
     b.pin_vgpr_at(RegRef::Val(v), 2);
+    b.pin_vgpr_at(RegRef::Val(vf), 2);
     b.finish()
 }
 
