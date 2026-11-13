@@ -362,7 +362,7 @@ fn a_load_read_through_a_vanished_copy_needs_its_wait() {
         let cat = b.let_(Op::FragCat { parts: vec![Opnd::Val(p0), Opnd::Val(p1)], dwords: 2 });
         let dead = if dead_load { Some(ld(&mut b, 8)) } else { None };
         if wait {
-            b.wait_vm(if dead_load { 1 } else { 0 });
+            b.wait_vm(0);
         }
         b.buffer_store_b64(rs, off, Opnd::I32(0), 512, cat);
         b.wait_vm(0);
