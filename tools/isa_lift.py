@@ -1222,6 +1222,7 @@ def emit_kernel(path, exact, plan=None):
     group_k = {(f_r[1], f_r[3], f_r[2]): k for k, f_r in enumerate(var_slots) if f_r[2] > 1}
     entry_hw = sorted(live_in[0])
     anchors = []
+    placed = set()
     seen_end = [set() for _ in range(nb)]
 
     def block(b):
@@ -1292,12 +1293,20 @@ def emit_kernel(path, exact, plan=None):
                 nxt = nodes[i + 1] if i + 1 < len(nodes) else None
                 if nxt and nxt[0] == 'if':
                     c = cond_for(L, body, False)
+                    n_anchor = len(anchors)
                     L.lines.append(f'if {c} {{')
                     emit(nxt[2], loopname)
                     if nxt[3]:
                         L.lines.append('} else {')
                         emit(nxt[3], loopname)
                     L.lines.append('}')
+                    # out-of-line cold blocks of the loops inside this if / else: laid out where the if's arms end (before its join),
+                    # the hand-scheduled layout
+                    if nxt[3]:
+                        for a_ in anchors[n_anchor:]:
+                            if a_.startswith('cold_if') and a_ not in placed:
+                                L.lines.append(f'LayoutAnchor {{ name: "{a_}" }}')
+                                placed.add(a_)
                     i += 2
                     continue
                 if nxt and nxt[0] in ('exit_if', 'cold_if'):
@@ -1327,7 +1336,7 @@ def emit_kernel(path, exact, plan=None):
     emit(tree)
     # out-of-line cold blocks: at the end of the kernel's hot code
     for a in anchors:
-        if a.startswith('cold_if'):
+        if a.startswith('cold_if') and a not in placed:
             L.lines.append(f'LayoutAnchor {{ name: "{a}" }}')
     if plan is None:
         # first pass: re-run with the tuples seen at block ends
