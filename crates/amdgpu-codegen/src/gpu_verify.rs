@@ -2036,7 +2036,8 @@ impl<'a> An<'a> {
                     // v_mul_i32_i24: exact product of two operands inside the signed 24-bit range
                     B::MulI32I24 if {
                         let lo_const = |i: &Itv| i.lo.iter().filter_map(|p| p.floor_const()).max();
-                        let i24 = |i: &Itv| lo_const(i).map_or(false, |l| l >= -(1 << 23)) && hi_const(i).map_or(false, |h| h < 1 << 23);
+                        // (symbolic bounds too: kernarg / grid symbols within their contract ranges)
+                        let i24 = |i: &Itv| (lo_const(i).map_or(false, |l| l >= -(1 << 23)) && hi_const(i).map_or(false, |h| h < 1 << 23)) || i.within(&Itv::range(Poly::int(-(1 << 23)), Poly::int((1 << 23) - 1)), cx);
                         i24(&x) && i24(&y)
                     } => AV::Int(x.mul(&y, cx)),
                     // v_mbcnt_lo / hi: the accumulator plus the count of set mask bits of 32 lanes
