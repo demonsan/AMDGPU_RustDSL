@@ -2592,11 +2592,10 @@ impl<'a> An<'a> {
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
         // the branch bound first (a constant bound from the branch beats a symbolic candidate the cap would keep), then the existing ones
-        // (the strongest existing candidate first, then the branch bound, then the rest: the cap never drops either)
+        // (the branch bound first: interval arithmetic favours the first candidates)
         let merge = |old: &Vec<Poly>, new: &Vec<Poly>| -> Vec<Poly> {
-            let mut v: Vec<Poly> = old.iter().take(1).cloned().collect();
-            v.extend(new.iter().cloned());
-            v.extend(old.iter().skip(1).cloned());
+            let mut v: Vec<Poly> = new.clone();
+            v.extend(old.iter().cloned());
             v
         };
         let lo = merge(&xi.lo, &add.lo);
