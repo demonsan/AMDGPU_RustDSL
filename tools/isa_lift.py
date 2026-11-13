@@ -665,6 +665,7 @@ class Lifter:
         if t[0] == 'm0':
             # the author's M0 write: s_add_u32 m0, a, b = SetM0 of an unpinned add (no instruction for the add)
             a, b = self.src(t[1], 'I32'), self.src(t[2], 'I32')
+            self.last_m0 = (t[1], imm(t[2]))
             v = self.nv
             self.nv += 1
             self.lines.append(f'%v{v}: I32 = AddI32({a}, {b})')
@@ -836,6 +837,91 @@ class Lifter:
         if op.startswith('v_cmp'):
             self.prev_mask_write = t[0]
 
+    # --tile-plan: tile-protocol markers (contract only, no code) around LDS accesses, by rules of a runtime plan file
+    def plan_expr(self, e):
+        e = str(e).replace(' ', '')
+        # next(reg, step, last): the ring position after reg (finite-state: reg >= last ? 0 : reg + step)
+        m = re.fullmatch(r'next\(([sv])(\d+),(\d+),(\d+)\)', e)
+        if m:
+            x = self.read(m.group(1), int(m.group(2)), 1)
+            c, s_, n_ = self.nv, self.nv + 1, self.nv + 2
+            self.nv += 3
+            self.lines.append(f'%v{c}: I1 = Cmp {{ pred: Ge, ty: U32, a: {x}, b: I32({int(m.group(4))}) }}')
+            self.lines.append(f'%v{s_}: I32 = AddI32({x}, I32({int(m.group(3))}))')
+            self.lines.append(f'%v{n_}: I32 = Select {{ ty: I32, cond: Val({c}), a: I32(0), b: Val({s_}) }}')
+            return f'Val({n_})'
+        m = re.fullmatch(r'(-?\d+)', e)
+        if m:
+            return f'I32({int(m.group(1))})'
+        m = re.fullmatch(r'([sv])(\d+)(?:>>(\d+))?(?:([+-]\d+))?', e)
+        if not m:
+            raise ValueError(f'tile plan: bad expression {e!r}')
+        x = self.read(m.group(1), int(m.group(2)), 1)
+        x = self.coerce(x, 'I32') if hasattr(self, 'coerce') else x
+        if m.group(3):
+            v = self.nv
+            self.nv += 1
+            self.lines.append(f'%v{v}: I32 = LshrI32({x}, I32({int(m.group(3))}))')
+            x = f'Val({v})'
+        if m.group(4):
+            v = self.nv
+            self.nv += 1
+            self.lines.append(f'%v{v}: I32 = AddI32({x}, I32({int(m.group(4))}))')
+            x = f'Val({v})'
+        return x
+
+    def plan_rule(self, op, args):
+        plan = getattr(self, 'tplan', None)
+        if not plan:
+            return None
+        tk, mods = toks(args)
+        if op.startswith('buffer_load') and 'lds' in args:
+            m0 = getattr(self, 'last_m0', None)
+            for k, r in enumerate(plan.get('dma', [])):
+                if m0 is None:
+                    break
+                if 'm0_base' in r and r['m0_base'] != m0[0]:
+                    continue
+                if 'm0_consts' in r and m0[1] not in r['m0_consts']:
+                    continue
+                seen = self.plan_seen.setdefault(('dma', k), 0)
+                if 'occurrences' in r and seen not in r['occurrences']:
+                    continue
+                if 'blocks' in r and getattr(self, 'cur_block', None) not in r['blocks']:
+                    continue
+                if 'blocks' in r and getattr(self, 'cur_block', None) not in r['blocks']:
+                    continue
+                if 'first_in_block' in r:
+                    nb_ = self.plan_seen.get(('dmab', k, self.cur_block), 0)
+                    if nb_ >= r['first_in_block']:
+                        continue
+                    self.plan_seen[('dmab', k, self.cur_block)] = nb_ + 1
+                self.plan_seen[('dma', k)] = seen + 1
+                return ('TileProduce', r)
+        if op.startswith('ds_read'):
+            base = tk[1] if len(tk) > 1 else None
+            off = 0
+            for x in mods:
+                if x.startswith('offset:'):
+                    off = int(x.split(':')[1], 0)
+            for r in plan.get('reads', []):
+                if 'op' in r and r['op'] != op:
+                    continue
+                if 'base' in r and r['base'] != base:
+                    continue
+                if 'off' in r and not (r['off'][0] <= off < r['off'][1]):
+                    continue
+                if 'blocks' in r and getattr(self, 'cur_block', None) not in r['blocks']:
+                    continue
+                kc = self.plan_seen.get(('key', self.cur_block), 0)
+                rc = self.plan_seen.get(('ring', self.cur_block), 0)
+                if 'key_in_block' in r and kc not in r['key_in_block']:
+                    continue
+                if 'ring_in_block' in r and rc not in r['ring_in_block']:
+                    continue
+                return ('TileConsume', r)
+        return None
+
     def lgkm_fix(self, op, args):
         # in-order LDS returns: a read of a register whose ds_read is still counted needs lgkmcnt(newer entries)
         if not getattr(self, 'fix_waits', False):
@@ -901,7 +987,24 @@ class Lifter:
             self.prev_m0 = args.startswith('m0,') and op in ('s_add_u32', 's_mov_b32')
             # the author's VOP3 encoding of a VALU instruction (also where VOP2 would encode)
             self.cur_e64 = op.startswith('v_') and op.endswith('_e64')
+            if getattr(self, 'tplan', None):
+                # per-block positions: how many key steps / ring advances this block has issued so far (plan filters)
+                kreg, rreg = self.tplan.get('key_reg'), self.tplan.get('ring_reg')
+                tk_ = args.split(',')[0].strip()
+                if kreg and tk_ == kreg and op in ('s_addk_i32', 's_add_u32'):
+                    self.plan_seen[('key', self.cur_block)] = self.plan_seen.get(('key', self.cur_block), 0) + 1
+                if rreg and tk_ == rreg and op == 's_add_u32':
+                    self.plan_seen[('ring', self.cur_block)] = self.plan_seen.get(('ring', self.cur_block), 0) + 1
+            mk = self.plan_rule(op, args)
+            if mk:
+                kind, r = mk
+                slot, ver = self.plan_expr(r['slot']), self.plan_expr(r['version'])
+                self.lines.append(f'region {"Produce" if kind == "TileProduce" else "Consume"} tile "{r["tile"]}" slot {slot} version {ver} {{')
+                self.marker_info.append((len(self.lines) - 1, self.cur_block, op, r['tile'], str(r['slot']), str(r['version'])))
+                self.notes[f'tile marker {kind} {r["tile"]}'] += 1
             self.lift(op, args)
+            if mk:
+                self.lines.append('}')
             self.cur_e64 = False
             i += 1
 
@@ -1125,6 +1228,9 @@ def print_tree(nodes, bl, ind=0):
 
 # ---- whole kernel: register liveness across blocks, scope variables, the structured shell (E5) ----
 
+PLAN_REGS = set()
+
+
 def defs_uses(op, args):
     """(defs, uses) as sets of (file, register) for v / s registers (exec / vcc / scc / m0 are handled by the forms)."""
     t, m = toks(args)
@@ -1154,6 +1260,9 @@ def defs_uses(op, args):
         u |= d
     if op.startswith('v_permlane'):
         d |= set(rr(t[1]))
+    if PLAN_REGS and (op.startswith('ds_read') or (op.startswith('buffer_load') and 'lds' in args)):
+        # the registers a tile plan's slot / version expressions read (ghost uses: keep them live there)
+        u |= PLAN_REGS
     return d, u
 
 
@@ -1214,6 +1323,14 @@ def emit_kernel(path, exact, plan=None):
     ins = parse(path)
     bl, succ = cfg(ins)
     tree, loops, cold = structure(bl, succ)
+    if '--tile-plan' in sys.argv:
+        import json
+        tp = json.load(open(sys.argv[sys.argv.index('--tile-plan') + 1]))
+        for r in tp.get('dma', []) + tp.get('reads', []):
+            for e in (r['slot'], r['version']):
+                mm = re.match(r'([sv])(\d+)', str(e))
+                if mm:
+                    PLAN_REGS.add((mm.group(1), int(mm.group(2))))
     live_in, live_out = liveness(ins, bl, succ)
     nb = len(bl)
     pred = collections.defaultdict(list)
@@ -1258,6 +1375,11 @@ def emit_kernel(path, exact, plan=None):
     L.fix_waits = '--fix-waits' in sys.argv
     L.fix_mask = '--fix-lanemask' in sys.argv
     L.fix_m0 = '--fix-m0' in sys.argv
+    if '--tile-plan' in sys.argv:
+        import json
+        L.tplan = json.load(open(sys.argv[sys.argv.index('--tile-plan') + 1]))
+        L.marker_info = []
+        L.plan_seen = {}
     carried = sorted(set().union(*[live_in[b] for b in range(nb)]) - single)
     var_tys = []
     var_slots = [(f, r, 1, 'I32') for (f, r) in carried] + [('s', a, n, ty) for (a, ty, n) in groups]
@@ -1288,6 +1410,7 @@ def emit_kernel(path, exact, plan=None):
 
     def block(b):
         s, e, _ = bl[b]
+        L.cur_block = b
         L.state = {}
         for (f, r) in live_in[b]:
             if (f, r) in globals_:
@@ -1504,10 +1627,27 @@ def main():
                 use = ('extents', 'ka_ranges', 'grid_defs', 'ka_defs')
                 contract = ['contract Contract {']
                 for k, lines in keep.items():
-                    if k in use:
+                    if k == 'ka_defs' and '--ka-def' in sys.argv:
+                        # extra host-contract layout identities: OFF=K*ka(OFF2) (e.g. an LSE head stride = 4 * the sequence length)
+                        extra = []
+                        for spec in sys.argv[sys.argv.index('--ka-def') + 1].split(','):
+                            off, rhs = spec.split('=')
+                            kk, src = rhs.split('*ka')
+                            extra.append(f'        ({int(off)}, Mul(Ka({int(src)}), Const({int(kk)}))),')
+                        contract += lines[:-1] + extra + lines[-1:]
+                    elif k in use:
                         contract += lines
                     elif k.startswith('_'):
                         continue
+                    elif k in ('tiles', 'tile_aliases') and getattr(L, 'tplan', None):
+                        if k == 'tiles':
+                            ds = []
+                            for tl in L.tplan['tiles']:
+                                ds.append(f'TileDecl {{ name: "{tl["name"]}", base: {tl["base"]}, slot_size: {tl["slot_size"]}, slots: {tl["slots"]}, private: false, global: false, owned: None, slot_by_offset: {"true" if tl.get("slot_by_offset") else "false"} }}')
+                            contract.append(f'    tiles: [{", ".join(ds)}],')
+                        else:
+                            al = ', '.join(f'("{a}", "{b}")' for a, b in L.tplan.get('aliases', []))
+                            contract.append(f'    tile_aliases: [{al}],')
                     elif k == 'sym_ranges' and '--sym-range' in sys.argv:
                         # host-contract bounds of free size symbols (e.g. a head count bounding a 24-bit multiply), counted as contracts
                         ents = []
@@ -1542,13 +1682,25 @@ def main():
             f.write('body {\n')
             # the live-in shell's scalar loads complete before the lifted code (an authored wait)
             ind = 1
-            for s in L.shell + (['WaitLds { count: 0 }'] if '--kernel' not in sys.argv else []) + L.lines:
+            pre = L.shell + (['WaitLds { count: 0 }'] if '--kernel' not in sys.argv else [])
+            body_lines = []
+            for s in pre + L.lines:
                 if s.startswith('}'):
                     ind -= 1
-                f.write('  ' * ind + s + '\n')
+                body_lines.append('  ' * ind + s)
                 if s.endswith('{') and not s.startswith('%'):
                     ind += 1
+            f.write('\n'.join(body_lines) + '\n')
             f.write('}\n')
+            if getattr(L, 'marker_info', None):
+                # sidecar: each tile marker's IR line -> the input block / instruction / rule (for reading verifier findings back)
+                f.flush()
+                with open(out) as g:
+                    txt = g.read().split('\n')
+                bstart = next(i for i, l in enumerate(txt) if l.strip() == 'body {') + 1
+                with open(out + '.markers', 'w') as g:
+                    for (k, blk, op_, tile, slot, ver) in L.marker_info:
+                        g.write(f'{bstart + len(pre) + k + 1}\t{blk}\t{op_}\t{tile}\t{slot}\t{ver}\n')
 
 
 if __name__ == '__main__':

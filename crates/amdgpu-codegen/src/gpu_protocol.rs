@@ -32,6 +32,9 @@ enum Item {
     /// `s_waitcnt lgkmcnt(0)`: completes every LDS operation this wave issued before it. (A counted `wait_lds(n > 0)` is not a completion
     /// point for the protocol: the scheduler may reorder independent DS reads, so "n later operations" is not stable through compilation.)
     WaitLds { ord: u32 },
+    /// `s_waitcnt lgkmcnt(n > 0)` of an EXACT kernel (the author's order is final, so the in-order DS returns make it a completion point for every
+    /// DS operation followed by at least n later DS operations)
+    WaitLdsN { ord: u32, count: u8 },
     /// a tile marker opened an event here (the event's `start`)
     Open,
     Access { dma: bool },
@@ -249,6 +252,8 @@ struct Sim<'a> {
     /// runtime `break_if`s met in the current iteration of the outermost loop (their ordinal keys the exit decision, so that the two roles' loops,
     /// built alike, pair exit for exit)
     brk_ord: usize,
+    /// inside the body of an E5 exit taken on this path (runs once: its runtime ifs are decisions)
+    exit_body: bool,
 }
 
 impl<'a> Sim<'a> {
@@ -269,6 +274,28 @@ impl<'a> Sim<'a> {
         };
         match op {
             Op::ConstI32(c) => K(*c as i64),
+            Op::MovS { a, .. } | Op::MovV { a, .. } | Op::BitcastI32(a) => self.cv(a),
+            Op::AddK { a, k } => match self.cv(a) {
+                K(x) => K((x + *k as i64) as i32 as i64),
+                U => U,
+            },
+            Op::Cmp { pred, ty, a, b } if matches!(ty, amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32) => {
+                let u = matches!(ty, amdgpu_dsl::CmpTy::U32);
+                bin(a, b, &|x, y| {
+                    let (x, y) = if u { ((x as i32 as u32) as i64, (y as i32 as u32) as i64) } else { (x as i32 as i64, y as i32 as i64) };
+                    use amdgpu_dsl::CmpPred::*;
+                    Some(match pred {
+                        Lt => x < y,
+                        Le => x <= y,
+                        Gt => x > y,
+                        Ge => x >= y,
+                        Eq => x == y,
+                        Ne => x != y,
+                        #[allow(unreachable_patterns)]
+                        _ => return None,
+                    } as i64)
+                })
+            }
             Op::AddI32(a, b) => bin(a, b, &|x, y| Some((x + y) as i32 as i64)),
             Op::MulI32(a, b) => bin(a, b, &|x, y| Some((x * y) as i32 as i64)),
             Op::ShlI32(a, b) => bin(a, b, &|x, y| if (0..32).contains(&y) { Some(((x as i32) << y) as i64) } else { None }),
@@ -326,6 +353,19 @@ impl<'a> Sim<'a> {
         let slot_cv = if private { CV::K(0) } else { self.cv(slot) };
         match (slot_cv, self.cv(ver)) {
             (CV::K(s), CV::K(v)) => {
+                // a slot given as its byte offset (`slot_by_offset`): base + slot * slot_size
+                let t = &self.f.contract.tiles[ti];
+                let s = if t.slot_by_offset && !private {
+                    let d = s;
+                    if t.slot_size <= 0 || d.rem_euclid(t.slot_size) != 0 {
+                        self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}`: the slot offset {s} (from the base) is not a multiple of the slot size {}", t.slot_size));
+                        self.open = None;
+                        return;
+                    }
+                    d.div_euclid(t.slot_size)
+                } else {
+                    s
+                };
                 let slots = self.f.contract.tiles[ti].slots as i64;
                 if !private && (s < 0 || s >= slots) {
                     self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}` slot {s} is outside the declared ring of {slots} slot(s)"));
@@ -410,6 +450,13 @@ impl<'a> Sim<'a> {
                     let v = self.cv(value);
                     self.vars.insert(*var, v);
                 }
+                // E5 scope variables: their initial values (an Undef init is unknown until set)
+                Stmt::DeclareVars { vars, init } => {
+                    for (v, i0) in vars.iter().zip(init.iter()) {
+                        let k = self.cv(i0);
+                        self.vars.insert(*v, k);
+                    }
+                }
                 Stmt::Barrier => {
                     self.items.push(Item::Barrier { ord: self.ord });
                     self.ord += 1;
@@ -419,6 +466,16 @@ impl<'a> Sim<'a> {
                 Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
                 Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
+                // the combined s_waitcnt (exact mode): both counters
+                Stmt::WaitCnt { vm, lgkm } => {
+                    self.items.push(Item::WaitVm { ord: self.ord, count: *vm });
+                    if *lgkm == 0 {
+                        self.items.push(Item::WaitLds { ord: self.ord });
+                    } else if f.exact {
+                        self.items.push(Item::WaitLdsN { ord: self.ord, count: *lgkm });
+                    }
+                }
+                Stmt::WaitLds { count } if *count > 0 && f.exact => self.items.push(Item::WaitLdsN { ord: self.ord, count: *count }),
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
                 Stmt::TileConsume { tile, slot, version } => self.open_marker(i, false, tile, slot, version),
                 Stmt::TileEnd => self.close(),
@@ -491,6 +548,36 @@ impl<'a> Sim<'a> {
                             s.exec(r.0, r.1);
                         }
                     };
+                    // an E5 loop exit with its own body (`if c { drain..; break_if(c) }`): like a runtime `break_if` - in the LAST simulated iteration of the
+                    // outermost loop it is a decision (taken: the arm runs and leaves; keyed by the exit's ordinal, workgroup-uniform), otherwise it is
+                    // not taken (the iteration continues)
+                    let exit_arm = else_range.is_none()
+                        && then_range.1 > then_range.0
+                        && matches!(&f.stmts()[then_range.1 - 1], Stmt::BreakIf { cond: c2 } if c2 == cond)
+                        && matches!(self.cv(cond), CV::U);
+                    if exit_arm && self.loop_depth >= 1 && !(self.div.contains(&i) && !self.in_role) {
+                        let take = if self.loop_depth == 1 && self.outer == self.n as i64 - 1 {
+                            let key = usize::MAX - self.brk_ord;
+                            self.brk_ord += 1;
+                            self.choose(key, true)
+                        } else {
+                            false
+                        };
+                        if take {
+                            // the arm body; its final break_if is a runtime condition, so leave explicitly. It runs ONCE on this path, so a
+                            // runtime if inside it (e.g. a drain's tail test) is a decision like one outside the loop
+                            let was = self.exit_body;
+                            self.exit_body = true;
+                            self.exec(then_range.0, then_range.1 - 1);
+                            self.exit_body = was;
+                            self.close();
+                            self.break_taken = true;
+                            return;
+                        }
+                        self.close();
+                        i = endif + 1;
+                        continue;
+                    }
                     if self.div.contains(&i) && !self.in_role && has_proto {
                         // the wave ROLE split: role 0 takes the then arm, role 1 the else arm
                         self.in_role = true;
@@ -501,7 +588,7 @@ impl<'a> Sim<'a> {
                             CV::K(c) => run_arm(self, c != 0),
                             CV::U => {
                                 if has_any {
-                                    if self.loop_depth > 0 {
+                                    if self.loop_depth > 0 && !self.exit_body {
                                         self.unsupported.push((i, format!("stmt {i}: a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses: its two outcomes are not explored per iteration (a 2^iterations path set); hoist it out of the loop, make both arms identical, or restructure")));
                                     } else {
                                         let uniform = !self.div.contains(&i);
@@ -562,12 +649,24 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
     let ord_of = |it: &Item, dflt: u32| match it {
-        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
+        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
         _ => dflt,
     };
     // the event's DS accesses are complete at the first wait_lds(0) after its last access. Barriers in between do not matter for completion (the access
     // window then spans them; the race check uses it). The scheduler never moves an LDS access below a later lgkmcnt wait (sched/order.rs).
-    let ds_done = || -> Option<usize> { find(&|it| matches!(it, Item::WaitLds { .. })) };
+    let ds_done = || -> Option<usize> {
+        // lgkmcnt(0); in an exact kernel also lgkmcnt(n) once n later DS operations of this wave were issued (in-order DS returns)
+        let mut later = 0usize;
+        for (k, it) in items.iter().enumerate().skip(after) {
+            match it {
+                Item::WaitLds { .. } => return Some(k),
+                Item::Access { dma: false } => later += 1,
+                Item::WaitLdsN { count, .. } if later >= *count as usize => return Some(k),
+                _ => {}
+            }
+        }
+        None
+    };
     if ev.produce {
         let done = if ev.global {
             // COMPLETION of global writes: wait_vm(0) or a fence_release (which waits vmcnt(0) itself)
@@ -639,6 +738,20 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
         f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
     }
+    // a constant through authored moves (exact mode: `s_mov_b32 sN, k`)
+    fn konst_mov(f: &Function, o: &Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(c) => Some(*c as i64),
+            Opnd::Val(v) => match def(f, *v) {
+                Some(Op::ConstI32(c)) => Some(*c as i64),
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => konst_mov(f, a),
+                Some(Op::AddK { a, k }) => konst_mov(f, a).map(|x| x + *k as i64),
+                Some(Op::AddI32(a, b)) => Some(konst_mov(f, a)? + konst_mov(f, b)?),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     fn walk(f: &Function, o: &Opnd, seen: &mut HashSet<(bool, u32)>) -> Result<(), String> {
         match o {
             Opnd::I32(_) => Ok(()),
@@ -656,6 +769,9 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                         walk(f, a, seen)?;
                         walk(f, b, seen)
                     }
+                    // exact-mode views / moves / the author's s_addk: the operand's function
+                    Op::MovS { a, .. } | Op::MovV { a, .. } | Op::BitcastI32(a) => walk(f, a, seen),
+                    Op::AddK { a, .. } => walk(f, a, seen),
                     Op::MulI32(a, b) => {
                         if konst(f, a).is_none() && konst(f, b).is_none() {
                             return Err("a product of two counters".to_string());
@@ -671,7 +787,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                         walk(f, b, seen)
                     }
                     // a finite-state function (compare / select / not) of finite-state ring counters and constants only: periodic with their period
-                    Op::Select { .. } | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) if fs_cone(f, &Opnd::Val(*v)) => Ok(()),
+                    Op::Select { .. } | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Cmp { .. } if fs_cone(f, &Opnd::Val(*v)) => Ok(()),
                     _ => Err(name),
                 }
             }
@@ -683,8 +799,30 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                     return Ok(());
                 }
                 let mut ok_update = false;
-                for s in f.stmts() {
+                let mut depth = 0i32;
+                // the last constant set outside every loop (the counter's real initial value); an earlier top-level set with no loop in between
+                // is overwritten before any loop sees it (an author's register reused as a temporary first)
+                let stmts = f.stmts();
+                let mut init_at: Option<usize> = None;
+                {
+                    let mut d = 0i32;
+                    for (k, s) in stmts.iter().enumerate() {
+                        match s {
+                            Stmt::BeginLoop { .. } => d += 1,
+                            Stmt::EndLoop => d -= 1,
+                            Stmt::SetVar { var, value } if var == x && d == 0 && konst_mov(f, value).is_some() => init_at = Some(k),
+                            _ => {}
+                        }
+                    }
+                }
+                let dead_before = |k: usize| init_at.map_or(false, |ia| k < ia && !stmts[k..ia].iter().any(|s| matches!(s, Stmt::BeginLoop { .. })));
+                for (sk, s) in stmts.iter().enumerate() {
                     match s {
+                        Stmt::SetVar { var, .. } if var == x && depth == 0 && dead_before(sk) => {}
+                        Stmt::BeginLoop { .. } if !matches!(s, Stmt::BeginLoop { vars, .. } if vars.contains(x)) => depth += 1,
+                        Stmt::EndLoop => depth -= 1,
+                        // an E5 scope variable (exact mode): set to a constant outside every loop = its initial value
+                        Stmt::SetVar { var, value } if var == x && depth == 0 && konst_mov(f, value).is_some() => {}
                         Stmt::BeginLoop { vars, init } => {
                             if let Some(k) = vars.iter().position(|y| y == x) {
                                 if konst(f, &init[k]).is_none() {
@@ -696,6 +834,8 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                             let Opnd::Val(u) = value else { return Err(format!("loop counter var{} updated by a non-expression", x.0)) };
                             let good = match def(f, *u) {
                                 Some(Op::AddI32(a, b)) | Some(Op::XorI32(a, b)) => (matches!(a, Opnd::Var(y) if y == x) && konst(f, b).is_some()) || (matches!(b, Opnd::Var(y) if y == x) && konst(f, a).is_some()),
+                                // the author's s_addk_i32 (exact mode)
+                                Some(Op::AddK { a: Opnd::Var(y), .. }) => y == x,
                                 _ => false,
                             };
                             if !good {
@@ -727,7 +867,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     let mut l = 1usize;
     // (conservatively over every finite-state counter of the kernel: a longer claimed period only lengthens the simulated horizon, and the claim is verified)
     for s in f.stmts() {
-        if let Stmt::BeginLoop { vars, .. } = s {
+        if let Stmt::BeginLoop { vars, .. } | Stmt::DeclareVars { vars, .. } = s {
             for x in vars {
                 if let Some(p) = finite_state_period(f, *x) {
                     l = lcm(l, p);
@@ -762,7 +902,8 @@ fn finite_state_period(f: &Function, x: VarId) -> Option<usize> {
             }
         }
     }
-    let x0 = init?;
+    // an E5 scope variable proven a ring counter / shadow by gpu_verify's ring pre-pass (no loop init): its orbit's period
+    let Some(x0) = init else { return crate::gpu_verify::ring_period(f, x) };
     let ups: Vec<&Opnd> = f.stmts().iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if *var == x { Some(value) } else { None } } else { None }).collect();
     if ups.len() != 1 {
         return None;
@@ -791,7 +932,7 @@ fn fs_cone(f: &Function, o: &Opnd) -> bool {
         Opnd::Var(x) => finite_state_period(f, *x).is_some(),
         Opnd::Val(v) => match f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) {
             Some(Op::ConstI32(_)) => true,
-            Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. })) => op.operands().iter().all(|u| fs_cone(f, u)),
+            Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. } | Op::Cmp { .. } | Op::MovS { .. } | Op::BitcastI32(..))) => op.operands().iter().all(|u| fs_cone(f, u)),
             _ => false,
         },
     }
@@ -815,6 +956,21 @@ fn fs_eval(f: &Function, o: &Opnd, x: VarId, xv: i64) -> Option<i64> {
                 Op::ShlI32(a, b) => w(((e(a)? as u32).wrapping_shl(e(b)? as u32)) as i64),
                 Op::LshrI32(a, b) => w(((e(a)? as u32).wrapping_shr(e(b)? as u32)) as i64),
                 Op::CmpLtI32(a, b) => (e(a)? < e(b)?) as i64,
+                Op::MovS { a, .. } | Op::BitcastI32(a) => e(a)?,
+                Op::Cmp { pred, ty, a, b } if matches!(ty, amdgpu_dsl::CmpTy::I32 | amdgpu_dsl::CmpTy::U32) => {
+                    let (x, y) = (e(a)?, e(b)?);
+                    let (x, y) = if matches!(ty, amdgpu_dsl::CmpTy::U32) { ((x as i32 as u32) as i64, (y as i32 as u32) as i64) } else { (x, y) };
+                    use amdgpu_dsl::CmpPred::*;
+                    (match pred {
+                        Lt => x < y,
+                        Le => x <= y,
+                        Gt => x > y,
+                        Ge => x >= y,
+                        Eq => x == y,
+                        Ne => x != y,
+                        _ => return None,
+                    }) as i64
+                }
                 Op::CmpGeI32(a, b) => (e(a)? >= e(b)?) as i64,
                 Op::NotI1(a) => (e(a)? == 0) as i64,
                 Op::Select { cond, a, b, .. } => {
@@ -989,7 +1145,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0 };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));

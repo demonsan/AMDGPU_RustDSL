@@ -176,7 +176,6 @@ checked on the physical registers.
 
 Still open:
 - a check that an M0 write reaches every DMA;
-- race freedom of the lifted kernel (bounds are proven; LDS / output-write races are not, section 9).
 
 ## 8. E5: structured exact branch forms and scope variables (implemented, kernel-opt)
 
@@ -240,7 +239,13 @@ Trust (each counted in the certificate):
 - 30 contracts, the host / ABI facts of the replica's 656-byte kernarg layout: 7 argument extents, 9 kernarg ranges, 2 grid definitions,
   11 kernarg definitions, and `HK` in [1, 65536] (the vendor's 24-bit address multiplies are exact only below that).
 
-Not proven: race freedom (LDS and output writes are bounds-checked, not race-checked; the lift has no tile / region protocol facts).
+Race freedom is proven too (kernel-opt's tile plan for the lift: K 2 x 16640 at 0, V 3 x 16640 at 33280 by ring offset, S 2 x 512 at
+83200): every LDS access lies in its tile (1167 / 1167), the protocol simulation proves 120880 tile reads (period 3, no stale / race /
+unpublished read), and all 18 global stores are disjoint across workgroups. The output and LSE stores are clipped by their descriptors'
+`num_records` (the tail tile's rows >= S are dropped by the hardware): `records_cap` turns that clip into a row cap. The lift adds 1 contract
+for this: the LSE head stride `ka464 = 4 ka96`. Analysis forms added for it: `slot_by_offset` tiles, ring periods for the periodicity gate,
+branch facts that re-evaluate earlier pure values, exact-mode ghost values (marker-only values are no instruction), the ceil grid kept as a
+symbol (`ka96 = 256 grid_x - r`), linear `v_mul_i32_i24`, and caps with symbolic coefficients.
 
 Named deviations from the vendor's instruction stream (everything else is identical and in order):
 - 12 `s_waitcnt lgkmcnt(2)`: the 6 LDS timing-reliant sites (two copies each), refuted by `tools/timing_probe.sh`;

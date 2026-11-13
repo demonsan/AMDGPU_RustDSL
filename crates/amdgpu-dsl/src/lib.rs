@@ -1068,6 +1068,9 @@ pub struct TileDecl {
     /// A marker whose every access is proven to lie in the issuing thread's own words is an OWNER event: owner events of different waves never
     /// touch the same bytes, and a thread's own write -> read is ordered by program order (no barrier needed between them).
     pub owned: Option<(i64, i64)>,
+    /// The markers' slot operand is the slot's BYTE offset from `base` (`slot * slot_size`), e.g. a lifted ring register; the simulator divides
+    /// (an offset that is not a multiple of the slot size is an error).
+    pub slot_by_offset: bool,
 }
 
 /// A global-memory region of a pointer kernarg: bytes `[base, base + size)` of `arg` (v4 protocol model, intra-workgroup + the opt-in last-arriver pattern).
@@ -1994,12 +1997,12 @@ impl FnBuilder {
     /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
     #[track_caller]
     pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false, owned: None });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false, owned: None, slot_by_offset: false });
     }
     /// Declares a ring of `slots` equal slots starting at `base`.
     #[track_caller]
     pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false, owned: None });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false, owned: None, slot_by_offset: false });
     }
     /// Declares a tile of thread-OWNED columns: `bytes` at `base`, thread t owning the bytes `base + t col_stride + r row_stride + [0, col_stride)`
     /// for every row r (e.g. a [rows][threads] u32 table: col_stride 4, row_stride 4 x threads). Mark accesses with the usual tile markers; a
@@ -2007,14 +2010,14 @@ impl FnBuilder {
     /// other owner accesses and never races with other threads' owner accesses (accesses to other threads' words are ordinary shared events).
     #[track_caller]
     pub fn lds_owned(&mut self, name: &str, base: i64, bytes: i64, col_stride: i64, row_stride: i64) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: bytes, slots: 1, private: false, global: false, owned: Some((col_stride, row_stride)) });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: bytes, slots: 1, private: false, global: false, owned: Some((col_stride, row_stride)), slot_by_offset: false });
     }
     /// Declares a per-WAVE private LDS region: `waves` slices of `size_per_wave` bytes at `base + wave * size_per_wave`. Mark accesses with `tile_produce/tile_consume(name,
     /// wave_key, version)` where `wave_key` is THE value the address is computed from (e.g. `base + wave_key * size + lane * 16`): the verifier proves the access lies in the
     /// slice of that very key (own wave) and that the wave reads only versions it produced and completed itself (no cross-wave publish is needed or assumed).
     #[track_caller]
     pub fn lds_private(&mut self, name: &str, base: i64, size_per_wave: i64, waves: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false, owned: None });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false, owned: None, slot_by_offset: false });
     }
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
     #[track_caller]
@@ -2038,7 +2041,7 @@ impl FnBuilder {
     /// release -> barrier -> acquire inside the workgroup; read before overwrite; generation consistency). `gen` follows the same affine/periodic rules as tile versions.
     #[track_caller]
     pub fn buf_region(&mut self, name: &str, arg: &str, base: Ext, size: Ext) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true, owned: None });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true, owned: None, slot_by_offset: false });
         self.f.contract.buf_regions.push(BufRegion { name: name.to_string(), arg: arg.to_string(), base, size });
     }
     /// The global writes issued from here (until `tile_end` / the next marker / barrier / control boundary) produce generation `gen` of the region.

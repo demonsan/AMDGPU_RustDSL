@@ -155,6 +155,39 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                     }
                 }
             }
+            // ghost values: unpinned pure values read only by contract markers (tile / region markers, assumes) or by other ghosts - the
+            // verifier evaluates them from the IR; they are no instruction
+            {
+                let marker = |s: &Stmt| matches!(s, Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::Assume { .. });
+                let mut ghost: HashSet<ValueId> = stmts
+                    .iter()
+                    .filter_map(|s| match s {
+                        // (also a value no statement reads: region markers of the structure tree carry their operands outside the flat list)
+                        Stmt::Let { dst, op } if !pinned.contains(dst) && !op_has_effect(op) => Some(*dst),
+                        _ => None,
+                    })
+                    .collect();
+                loop {
+                    let drop: Vec<ValueId> = ghost
+                        .iter()
+                        .copied()
+                        .filter(|v| {
+                            readers.get(v).map_or(&[][..], |x| x.as_slice()).iter().any(|&r| match &stmts[r] {
+                                s if marker(s) => false,
+                                Stmt::Let { dst, .. } => !ghost.contains(dst),
+                                _ => true,
+                            })
+                        })
+                        .collect();
+                    if drop.is_empty() {
+                        break;
+                    }
+                    for v in drop {
+                        ghost.remove(&v);
+                    }
+                }
+                lw.ghosts = ghost;
+            }
             for (k, st) in stmts.iter().enumerate() {
                 let Stmt::Let { dst, op } = st else { continue };
                 let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -513,6 +546,8 @@ struct Lowerer {
     e64_next: bool,
     /// exact mode: the values the author pinned
     exact_pinned: HashSet<ValueId>,
+    /// exact mode: values only contract markers read (no instruction)
+    ghosts: HashSet<ValueId>,
     /// exact mode: unpinned `AddI32` values read only by `set_m0` (lowered there as `s_add_u32 m0, a, b`)
     m0_adds: HashSet<ValueId>,
     /// exact mode: compares read only by a `NotI1` held in the same lane-mask register (the author's negated compare, e.g. v_cmp_nge)
@@ -675,6 +710,7 @@ impl Lowerer {
             m0_adds: HashSet::new(),
             e64_next: false,
             exact_pinned: HashSet::new(),
+            ghosts: HashSet::new(),
             neg_folded: HashSet::new(),
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
@@ -2232,6 +2268,7 @@ impl Lowerer {
         LAST_STMTS.with(|s| s.borrow_mut().push(st.clone()));
         {
             match st {
+                Stmt::Let { dst, .. } if self.exact && self.ghosts.contains(dst) => {}
                 Stmt::Let { dst, op } => {
                     self.cur_origin = *dst;
                     self.lower_op(*dst, op)?;
@@ -6473,4 +6510,10 @@ fn fuse_minmax3(m: &mut MFunction) {
             keep
         });
     }
+}
+
+/// Ops with an effect beyond their value (memory, counters, lane state): never ghosts.
+fn op_has_effect(op: &Op) -> bool {
+    let d = format!("{op:?}");
+    ["Load", "Atomic", "Store", "MemTime", "Mfma", "Smfmac", "ReadFirstLane", "Permlane", "Dpp", "Swizzle", "Bpermute"].iter().any(|k| d.starts_with(k))
 }

@@ -197,8 +197,22 @@ fn contract_ctx(f: &Function) -> Ctx {
                 let r = Sym::Named(format!("ceil_rem_grid{axis}"));
                 c.lb.insert(r.clone(), 0);
                 c.ub.insert(r.clone(), *k as i64 - 1);
-                let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
-                c.subst.insert(Sym::Grid(*axis), q);
+                // P a single kernarg symbol: keep the grid symbol (>= 1) and write the kernarg as k * grid - r (both facts survive: grid >= 1
+                // and k * grid <= P + k - 1); otherwise substitute the grid as (P + r) / k
+                let single = p.0.len() == 1 && p.0.iter().next().map_or(false, |(m, q)| m.len() == 1 && matches!(m[0], Sym::Ka(_)) && *q == Q::int(1));
+                if single {
+                    let s = p.0.keys().next().unwrap()[0].clone();
+                    let q = Poly::sym(Sym::Grid(*axis)).scale(Q::int(*k as i128)).sub(&Poly::sym(r));
+                    for v in c.subst.values_mut() {
+                        if let Some(n) = subst_sym(v, &s, &q) {
+                            *v = n;
+                        }
+                    }
+                    c.subst.insert(s, q);
+                } else {
+                    let q = p.add(&Poly::sym(r)).scale(Q::new(1, *k as i128));
+                    c.subst.insert(Sym::Grid(*axis), q);
+                }
             }
         }
     }
@@ -234,6 +248,10 @@ struct An<'a> {
     /// proven ring counters (var -> [min, max] of the reachable values) and their shadows (var -> (init X, ring init c, min, max): the var
     /// is X - c + ring at every point)
     rings: RingFacts,
+    /// value -> the values whose definitions read it (for re-evaluation under branch facts)
+    users: HashMap<ValueId, Vec<ValueId>>,
+    /// per active branch fact on a value: the dependents it re-evaluated and their previous values
+    dep_undo: Vec<Vec<(ValueId, Option<AV>)>>,
     /// active lanes (highest active lane + 1) under the author's EXEC (exact mode `exec_set` / save / restore); 64 otherwise
     exec_lanes: u32,
     exec_saved: HashMap<u32, u32>,
@@ -241,6 +259,9 @@ struct An<'a> {
     /// E5 scope variables (`DeclareVars`): tracked flow-sensitively (a `set_var` takes effect at once; `if` arms join; a loop that
     /// writes one runs it through its fixpoint). Absent from `vars` = not yet defined on any path (an `Undef` initial value).
     scope: std::collections::HashSet<VarId>,
+    /// E5 scope variables whose current value is one known IR value on every path here (flow-sensitive, like `vars`): the
+    /// linear-form analysis (cross-workgroup disjointness) reads through them
+    var_sym: std::cell::RefCell<HashMap<VarId, Opnd>>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
     tag: Option<(usize, Itv, Opnd)>,
@@ -634,7 +655,13 @@ impl<'a> An<'a> {
         match o {
             Opnd::I32(c) => Some((BTreeMap::new(), Poly::int(*c as i128))),
             Opnd::F32(_) => None,
-            Opnd::Var(v) => atom((true, v.0 as u64), *o),
+            Opnd::Var(v) => {
+                let s = self.var_sym.borrow().get(v).copied();
+                match s {
+                    Some(x) if depth < 24 => self.slin(&x, depth + 1),
+                    _ => atom((true, v.0 as u64), *o),
+                }
+            }
             Opnd::Val(v) => {
                 let def = self.defs.get(v);
                 if let Some(Op::ConstI32(c)) = def {
@@ -673,6 +700,24 @@ impl<'a> An<'a> {
                         }
                         _ => atom(self.atom_key(*v), *o),
                     },
+                    // v_mul_i32_i24 is the product when both operands are 24-bit (their intervals): linear like MulI32
+                    Some(Op::Bin(amdgpu_dsl::BinOp::MulI32I24, a, b))
+                        if [a, b].iter().all(|x| self.int_of(x).within(&Itv::range(Poly::int(-(1 << 23)), Poly::int((1 << 23) - 1)), &self.cx)) =>
+                    {
+                        let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
+                        let (k, (atoms, c)) = if x.0.is_empty() {
+                            (x.1, y)
+                        } else if y.0.is_empty() {
+                            (y.1, x)
+                        } else {
+                            return atom(self.atom_key(*v), *o);
+                        };
+                        let mut m = BTreeMap::new();
+                        for (a, p) in atoms {
+                            m.insert(a, p.mul(&k)?);
+                        }
+                        Some((m, c.mul(&k)?))
+                    }
                     Some(Op::MulI32(a, b)) => {
                         let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
                         let (k, (atoms, c)) = if x.0.is_empty() {
@@ -908,6 +953,15 @@ impl<'a> An<'a> {
         if depth > 32 {
             return None;
         }
+        // a pointer scope variable (exact mode): its recorded provenance, when its offset is one known constant on every path
+        if let Opnd::Var(x) = o {
+            if let Some(AV::Ptr { arg: Some(a), .. }) = self.var_prov.get(x) {
+                let c = self.vars.get(x)?.point_const().filter(|q| q.d == 1)?;
+                let off = self.f.args.get(*a)?.kernarg_offset;
+                return Some((off, (BTreeMap::new(), Poly::int(c.n))));
+            }
+            return None;
+        }
         let Opnd::Val(v) = o else { return None };
         match self.defs.get(v)? {
             Op::KernargPtr { offset } => Some((*offset, (BTreeMap::new(), Poly::int(0)))),
@@ -915,6 +969,16 @@ impl<'a> An<'a> {
                 let (arg, l) = self.ptr_slin(base, depth + 1)?;
                 Some((arg, slin_add(l, self.slin(byte_off, depth + 1)?)))
             }
+            // a pointer reassembled from its own words (exact mode: the author's SGPR pair, the high word possibly masked to 48 bits)
+            Op::PtrCat { lo, .. } => {
+                let p = self.ptr_of_word(lo)?;
+                if self.ptr_equiv_words(o) {
+                    self.ptr_slin(&p, depth + 1)
+                } else {
+                    None
+                }
+            }
+            Op::MovS { a, .. } => self.ptr_slin(a, depth + 1),
             Op::PtrMadU32 { base, a, b } => {
                 let (arg, l) = self.ptr_slin(base, depth + 1)?;
                 let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
@@ -1025,11 +1089,186 @@ impl<'a> An<'a> {
         self.record_store(b, e, byte_off, size);
     }
 
+    /// The pointer whose low word `w` is (through authored moves): `PtrLo(p)` -> p.
+    fn ptr_of_word(&self, w: &Opnd) -> Option<Opnd> {
+        let r = self.word_root(w);
+        let Opnd::Val(v) = r else { return None };
+        match self.defs.get(&v) {
+            Some(Op::PtrLo(p)) => Some(*p),
+            _ => None,
+        }
+    }
+    /// A PtrCat whose high word is the same pointer's high word (or that word masked to its low 16 bits, the identity on a canonical
+    /// 48-bit address).
+    fn ptr_equiv_words(&self, cat: &Opnd) -> bool {
+        let Opnd::Val(v) = cat else { return false };
+        let Some(Op::PtrCat { lo, hi }) = self.defs.get(v) else { return false };
+        let Some(p) = self.ptr_of_word(lo) else { return false };
+        let h = self.word_root(hi);
+        let Opnd::Val(hv) = h else { return false };
+        match self.defs.get(&hv) {
+            Some(Op::PtrHi(q)) => *q == p,
+            Some(Op::AndI32(a, Opnd::I32(0xffff))) | Some(Op::AndI32(Opnd::I32(0xffff), a)) => {
+                matches!(self.word_root(a), Opnd::Val(x) if matches!(self.defs.get(&x), Some(Op::PtrHi(q)) if *q == p))
+            }
+            _ => false,
+        }
+    }
+
+    /// A linear form that bounds `o` from above (digits as in `slin`): through unsigned min (a select of a compare of its two arms), a
+    /// product by a uniform point, and a subtraction proven not to wrap.
+    fn upper_slin(&self, o: &Opnd, depth: usize) -> Option<SLin> {
+        if depth > 12 {
+            return None;
+        }
+        if let Some(p) = self.point_of(o) {
+            return Some((BTreeMap::new(), p));
+        }
+        let Opnd::Val(v) = o else { return self.slin(o, depth) };
+        match self.defs.get(v) {
+            // min(a, b) <= the non-constant arm (the one that carries the digits)
+            Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) => {
+                let Some(Op::Cmp { pred, a: ca, b: cb, .. }) = self.defs.get(c) else { return self.slin(o, depth) };
+                use amdgpu_dsl::CmpPred as P;
+                // (the compare may read recomputed copies of the arms: structural equality)
+                let same = |x: &Opnd, y: &Opnd| x == y || matches!((x, y), (Opnd::Val(p), Opnd::Val(q)) if self.sig(*p, 0) == self.sig(*q, 0));
+                let is_min = matches!(pred, P::Le | P::Lt) && same(ca, a) && same(cb, b);
+                if !is_min {
+                    return self.slin(o, depth);
+                }
+                let arm = if self.point_of(a).is_some() { b } else { a };
+                self.upper_slin(arm, depth + 1)
+            }
+            Some(Op::MulI32(a, b)) => {
+                let (x, k) = if let Some(k) = self.point_of(b) { (a, k) } else if let Some(k) = self.point_of(a) { (b, k) } else { return self.slin(o, depth) };
+                if !self.cx.nonneg(&k) {
+                    return None;
+                }
+                let (m, c) = self.upper_slin(x, depth + 1)?;
+                let m2: Option<BTreeMap<(bool, u64), Poly>> = m.into_iter().map(|(kk, p)| p.mul(&k).map(|q| (kk, q))).collect();
+                Some((m2?, c.mul(&k)?))
+            }
+            // (no wrap: b <= a proven from their intervals)
+            Some(Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b)) if { let (ia, ib) = (self.int_of(a), self.int_of(b)); ia.lo.iter().any(|l| ib.hi.iter().any(|h| self.cx.le(h, l))) } => {
+                let (ma, ca) = self.upper_slin(a, depth + 1)?;
+                let (mb, cb) = self.slin(b, depth + 1)?;
+                let neg: BTreeMap<(bool, u64), Poly> = mb.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
+                Some(slin_add((ma, ca), (neg, cb.scale(Q::int(-1)))))
+            }
+            _ => self.slin(o, depth),
+        }
+    }
+
+    /// The cap a clipping num_records puts on a store at offset x + imm (bytes at offset >= nr are dropped). With nr = U * F (F a uniform
+    /// row size, U a linear upper bound in rows) and x = F * R + rest where 0 <= rest + imm + size <= F: a written byte has R < U, i.e. the
+    /// cap `R - U_digits < U_const` in row units (k = F).
+    fn records_cap(&self, nr: &Opnd, x: &SLin, imm: i128, size: i128) -> Option<(SLin, Poly, bool)> {
+        let mut nr = *nr;
+        while let Opnd::Val(v) = nr {
+            match self.defs.get(&v) {
+                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => nr = *a,
+                _ => break,
+            }
+        }
+        let Opnd::Val(v) = nr else { return None };
+        let (m, f) = match self.defs.get(&v) {
+            Some(Op::MulI32(a, b)) => {
+                if let Some(k) = self.point_of(b) {
+                    (a, k)
+                } else if let Some(k) = self.point_of(a) {
+                    (b, k)
+                } else {
+                    return None;
+                }
+            }
+            // x << s = x * 2^s
+            Some(Op::ShlI32(a, b)) => match self.point_of(b).and_then(|p| p.as_const()) {
+                Some(s) if s.d == 1 && (0..31).contains(&s.n) => (a, Poly::int(1i128 << s.n)),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if f.0.len() != 1 || !self.cx.nonneg(&f) || f.as_const().map_or(false, |q| q.n <= 0) {
+            return None;
+        }
+        let (ua, uc) = self.upper_slin(m, 0)?;
+        // split x by divisibility of its coefficients by the single-monomial F
+        let div = |c: &Poly| -> Option<Q> {
+            let (fm, fq) = f.0.iter().next()?;
+            let mut r: Option<Q> = None;
+            for (mono, q) in &c.0 {
+                let mut rest = mono.clone();
+                for s in fm {
+                    let i = rest.iter().position(|y| y == s)?;
+                    rest.remove(i);
+                }
+                if !rest.is_empty() {
+                    return None;
+                }
+                let qq = q.mul(Q::new(fq.d, fq.n));
+                if r.map_or(false, |r0| r0 != qq) {
+                    return None;
+                }
+                r = Some(qq);
+            }
+            r
+        };
+        let mut rows: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
+        let mut rest_hi = Poly::int(imm + size);
+        for (k, c) in &x.0 {
+            match div(c) {
+                Some(q) if q.d == 1 && q.n > 0 => {
+                    rows.insert(*k, Poly::int(q.n));
+                }
+                _ => {
+                    // a non-row digit: its contribution must stay inside one row (lower bound >= 0, upper bound summed)
+                    let it = self.atom_hi_range(k)?;
+                    if !self.cx.nonneg(c) || !self.cx.nonneg(&it.0) {
+                        return None;
+                    }
+                    rest_hi = rest_hi.add(&it.1.mul(c)?);
+                }
+            }
+        }
+        // x's constant: row part (divisible) and in-row part
+        let (crow, cin) = match div(&x.1) {
+            Some(q) if q.d == 1 => (Poly::int(q.n), Poly::int(0)),
+            _ if x.1.0.is_empty() => (Poly::int(0), Poly::int(0)),
+            _ => match x.1.as_const() {
+                Some(q) => (Poly::int(0), Poly::konst(q)),
+                None => return None,
+            },
+        };
+        rest_hi = rest_hi.add(&cin);
+        if !self.cx.le(&rest_hi, &f) || imm < 0 {
+            return None;
+        }
+        // (U is in rows already)
+        for (k, c) in ua {
+            let q = c.as_const().filter(|q| q.d == 1)?;
+            let cur = rows.get(&k).cloned().unwrap_or(Poly::int(0));
+            rows.insert(k, cur.add(&Poly::int(-q.n)));
+        }
+        rows.retain(|_, c| !c.0.is_empty());
+        Some(((rows, crow), uc, false))
+    }
+
+    /// An atom's range from its recorded instances (the current store's): (lo, hi).
+    fn atom_hi_range(&self, k: &(bool, u64)) -> Option<(Poly, Poly)> {
+        let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
+        let o = insts.last()?;
+        let it = self.int_of(o);
+        Some((it.lo.first()?.clone(), it.hi.first()?.clone()))
+    }
+
     fn record_buffer_store(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
         self.caps_cur.borrow_mut().clear();
         let base = match rsrc {
             Opnd::Val(v) => match self.defs.get(v) {
                 Some(Op::BufferRsrc { base, .. } | Op::BufferRsrcDyn { base, .. }) => self.ptr_slin(base, 0),
+                // exact mode: a descriptor assembled from words - its base is the pointer of word 0 (word 1 its high half, checked by the
+                // descriptor recognition)
+                Some(Op::RsrcCat { words }) => self.ptr_of_word(&words[0]).and_then(|p| self.ptr_slin(&p, 0)),
                 _ => None,
             },
             _ => None,
@@ -1041,6 +1280,20 @@ impl<'a> An<'a> {
             };
             Some(slin_add(a, self.slin(soff, 0)?))
         })();
+        // a descriptor assembled from words clips the store at its num_records (the hardware drops every byte at an offset >= num_records):
+        // offset + imm < nr <= U (a linear upper bound of nr) is a cap `offset - U_digits < U_const - imm` on the live bytes
+        if let (Opnd::Val(v), Some(x)) = (rsrc, extra.as_ref()) {
+            if let Some(Op::RsrcCat { words }) = self.defs.get(v).cloned() {
+                match self.records_cap(&self.word_root(&words[2]), x, imm, size) {
+                    Some(cap) => self.caps_cur.borrow_mut().push(cap),
+                    None => {
+                        if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+                            eprintln!("gw:   stmt {}: no num_records cap from {} (x = {:?})", self.idx, self.shape(&words[2], 5), x);
+                        }
+                    }
+                }
+            }
+        }
         self.record_store(base, extra, imm, size);
     }
 
@@ -1141,6 +1394,8 @@ impl<'a> An<'a> {
         // differ): when the offset holds k * x, x's atoms become ONE digit (coefficient k, values [min x, bound - 1]) and each store's constant
         // loses its k * (x constant) - provided x is injective in its atoms
         let mut digits: Vec<(Poly, Poly)> = Vec::new();
+        // composite digits (k = 1) whose atoms are spaced by at least the access size: each footprint [x, x + size) is its own
+        let mut sized: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
         let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
         let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
@@ -1169,15 +1424,20 @@ impl<'a> An<'a> {
                 let mut kf: Option<Poly> = None;
                 let mut ok = true;
                 for (a, cl) in latoms {
-                    let Some(q) = cl.as_const() else {
-                        ok = false;
-                        break;
+                    // (a symbolic x coefficient equal to the offset's: k = 1)
+                    let kk = if *cl == atoms[a] && cx.nonneg(cl) && !cl.as_const().map_or(false, |q| q.n == 0) {
+                        Poly::int(1)
+                    } else {
+                        let Some(q) = cl.as_const() else {
+                            ok = false;
+                            break;
+                        };
+                        if q.n <= 0 {
+                            ok = false;
+                            break;
+                        }
+                        atoms[a].scale(Q::new(q.d, q.n))
                     };
-                    if q.n <= 0 {
-                        ok = false;
-                        break;
-                    }
-                    let kk = atoms[a].scale(Q::new(q.d, q.n));
                     match &kf {
                         None => kf = Some(kk),
                         Some(k0) if *k0 == kk => {}
@@ -1192,22 +1452,63 @@ impl<'a> An<'a> {
                     { if dbg { eprintln!("gw:   cap {ci} rejected at 3"); } continue; }
                 }
                 // x injective: its atoms sorted by coefficient form a radix with unit size
-                let mut xd: Vec<(Q, Poly)> = latoms.iter().map(|(a, cl)| (cl.as_const().unwrap(), ranges[a].1.sub(&ranges[a].0))).collect();
-                xd.sort_by(|p, q| (p.0.n * q.0.d).cmp(&(q.0.n * p.0.d)));
-                let mut acc = Poly::int(1);
+                // (coefficients may be symbolic: sorted by provable order; an incomparable pair is not injective here)
+                let mut xd: Vec<(Poly, Poly)> = latoms.iter().map(|(a, cl)| (cl.clone(), ranges[a].1.sub(&ranges[a].0))).collect();
                 let mut inj = true;
+                for i in 1..xd.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        if cx.le(&xd[j - 1].0, &xd[j].0) {
+                            break;
+                        }
+                        if cx.le(&xd[j].0, &xd[j - 1].0) {
+                            xd.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            inj = false;
+                            break;
+                        }
+                    }
+                }
+                // (spaced by the access size too? then the composite's footprints are disjoint: `sized`)
+                let mut acc_s = Poly::int(size);
+                let mut spaced = inj;
                 for (c, m) in &xd {
-                    if !cx.le(&acc, &Poly::konst(*c)) {
+                    if !spaced {
+                        break;
+                    }
+                    if !cx.le(&acc_s, c) {
+                        spaced = false;
+                        break;
+                    }
+                    match m.mul(c) {
+                        Some(x) => acc_s = acc_s.add(&x),
+                        None => spaced = false,
+                    }
+                }
+                let mut acc = Poly::int(1);
+                for (c, m) in &xd {
+                    if !inj {
+                        break;
+                    }
+                    if !cx.le(&acc, c) {
                         inj = false;
                         break;
                     }
-                    acc = acc.add(&m.scale(*c));
+                    match m.mul(c) {
+                        Some(x) => acc = acc.add(&x),
+                        None => inj = false,
+                    }
                 }
                 if !inj {
                     { if dbg { eprintln!("gw:   cap {ci} rejected at 4"); } continue; }
                 }
                 // a clamp loses the clamped lanes' x: sound when x's only workgroup digit u is its top digit and every x >= bound - 1 has u
                 // at its maximum (c_u hi_u <= bound - 1): the clamped value then stays in that same workgroup's range
+                // (a clamp needs constant x coefficients)
+                if *clamp && latoms.values().any(|c| c.as_const().is_none()) {
+                    { if dbg { eprintln!("gw:   cap {ci} rejected at 5 (symbolic clamp)"); } continue; }
+                }
                 if *clamp {
                     let wgs: Vec<&(bool, u64)> = latoms.keys().filter(|k| is_wg(k)).collect();
                     let top = latoms.iter().max_by(|p, q| {
@@ -1249,7 +1550,10 @@ impl<'a> An<'a> {
                     let lc = &caps_all[si][*p].0 .1;
                     let mut m = lc.clone();
                     for (a, cl) in latoms {
-                        m = m.add(&ranges[a].0.scale(cl.as_const().unwrap()));
+                        match ranges[a].0.mul(cl) {
+                            Some(x) => m = m.add(&x),
+                            None => ok = false,
+                        }
                     }
                     xmin = match xmin {
                         None => Some(m),
@@ -1285,6 +1589,9 @@ impl<'a> An<'a> {
                 for a in latoms.keys() {
                     atoms.remove(a);
                     covered.insert(*a);
+                }
+                if spaced && kf == Poly::int(1) {
+                    sized.push((kf.clone(), span.clone()));
                 }
                 digits.push((kf, span));
             }
@@ -1338,6 +1645,9 @@ impl<'a> An<'a> {
             let (l, h) = &ranges[k];
             let m = h.sub(l);
             if !cx.nonneg(&m) {
+                if std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty()) {
+                    eprintln!("gw:   atom {:?}: range [{}, {}] (hi - lo not provably >= 0)", k, l.show(), h.show());
+                }
                 return Err("an atom range of unknown sign".into());
             }
             let c = if cx.nonneg(c) {
@@ -1393,6 +1703,11 @@ impl<'a> An<'a> {
         for (c, m) in &digits {
             if m.0.is_empty() {
                 continue; // a single-valued digit
+            }
+            // the lowest digit a size-spaced composite: its footprints end below its span plus the size
+            if acc == Poly::int(size) && sized.contains(&(c.clone(), m.clone())) {
+                acc = m.add(&Poly::int(size));
+                continue;
             }
             if !cx.le(&acc, c) {
                 return Err(format!("digits overlap (radix): {} > {}", acc.show(), c.show()));
@@ -1564,6 +1879,11 @@ impl<'a> An<'a> {
     }
 
     fn check_lds(&mut self, what: &str, addr: &Itv, size: i128) {
+        // AMDC_GV_LDS_TRACE=1: every LDS access (statement, kind, address interval, size, address shape) for deriving a lift's tile map
+        if std::env::var("AMDC_GV_LDS_TRACE").is_ok() && self.rep.quiet == 0 {
+            let sh = self.cur_addr.map(|(o, k)| format!("{} + {k}", self.shape(&o, 6))).unwrap_or_default();
+            eprintln!("LDS stmt {} | {what} | addr {} | size {size} | {sh}", self.idx, addr.show());
+        }
         if self.tag.is_none() {
             self.rep.unchecked_access("lds-untracked");
         }
@@ -2398,7 +2718,10 @@ impl<'a> An<'a> {
                         }
                     }
                     let before = self.scope_state();
+                    let sym_before = self.var_sym.borrow().clone();
                     self.walk(then, idx);
+                    let sym_then = self.var_sym.borrow().clone();
+                    *self.var_sym.borrow_mut() = sym_before;
                     self.winner_axes.truncate(wn);
                     self.undo_fact(undo);
                     let after_then = self.scope_state();
@@ -2415,6 +2738,11 @@ impl<'a> An<'a> {
                     let after_else = self.scope_state();
                     let joined = self.join_scope(&after_then, &after_else);
                     self.set_scope_state(&joined);
+                    // a symbolic value survives the join only when both paths agree
+                    {
+                        let mut se = self.var_sym.borrow_mut();
+                        se.retain(|k, v| sym_then.get(k) == Some(v));
+                    }
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::EndIf);
                     *idx += 1;
@@ -2500,11 +2828,35 @@ impl<'a> An<'a> {
         let ki = self.int_of(&k).add_const(plus1);
         let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
         let xi = self.int_of(&x);
-        // the existing candidates first (never displaced by the cap), then the branch bound
-        let mut lo = xi.lo.clone();
-        lo.extend(add.lo);
-        let mut hi = xi.hi.clone();
-        hi.extend(add.hi);
+        // the branch bound first (a constant bound from the branch beats a symbolic candidate the cap would keep), then the existing ones
+        // a constant branch bound replaces the existing constant candidates (the tighter of them, in the first constant's place: the
+        // symbolic candidates keep their places under the cap); otherwise it goes after them
+        let merge = |old: &Vec<Poly>, new: &Vec<Poly>, upper: bool| -> Vec<Poly> {
+            let nc: Vec<i128> = new.iter().filter_map(|p| p.as_const()).filter(|q| q.d == 1).map(|q| q.n).collect();
+            let first_const = old.iter().position(|p| p.as_const().map_or(false, |q| q.d == 1));
+            match (nc.as_slice(), first_const) {
+                ([c], Some(i)) => {
+                    let olds = old.iter().filter_map(|p| p.as_const()).filter(|q| q.d == 1).map(|q| q.n);
+                    let best = olds.fold(*c, |a, b| if upper { a.min(b) } else { a.max(b) });
+                    let mut v: Vec<Poly> = Vec::new();
+                    for (k, p) in old.iter().enumerate() {
+                        if k == i {
+                            v.push(Poly::int(best));
+                        } else if !p.as_const().map_or(false, |q| q.d == 1) {
+                            v.push(p.clone());
+                        }
+                    }
+                    v
+                }
+                _ => {
+                    let mut v = old.clone();
+                    v.extend(new.iter().cloned());
+                    v
+                }
+            }
+        };
+        let lo = merge(&xi.lo, &add.lo, false);
+        let hi = merge(&xi.hi, &add.hi, true);
         let refined = Itv { lo: cap(lo), hi: cap(hi) };
         match x {
             Opnd::Var(v) => {
@@ -2514,6 +2866,44 @@ impl<'a> An<'a> {
             Opnd::Val(v) => match self.env.get(&v) {
                 Some(AV::Int(_)) => {
                     let old = self.env.insert(v, AV::Int(refined));
+                    // values computed EARLIER from v (e.g. a prelude address) are re-evaluated under the fact (undone with it)
+                    let mut saved: Vec<(ValueId, Option<AV>)> = Vec::new();
+                    // (breadth first: the nearest dependents first, within a generous bound)
+                    let mut work: std::collections::VecDeque<ValueId> = std::collections::VecDeque::from(vec![v]);
+                    let mut deps: Vec<(usize, ValueId)> = Vec::new();
+                    let mut seen: HashSet<ValueId> = HashSet::new();
+                    while let Some(u) = work.pop_front() {
+                        for &d in self.users.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
+                            let Some(&pd) = self.rings.let_pos.get(&d) else { continue };
+                            // (only pure functions of values: a definition that reads a variable read it at ITS point, not now)
+                            let reads_var = self.defs.get(&d).map_or(true, |op| op.operands().iter().any(|o| matches!(o, Opnd::Var(_))));
+                            if pd < self.idx && !reads_var && self.env.contains_key(&d) && seen.len() < 65536 && seen.insert(d) {
+                                deps.push((pd, d));
+                                work.push_back(d);
+                            }
+                        }
+                    }
+                    deps.sort();
+                    self.rep.quiet += 1;
+                    for (_, d) in deps {
+                        if let Some(op) = self.defs.get(&d).cloned() {
+                            let nv = self.eval(&op);
+                            // both the old and the re-evaluated interval hold: keep the candidates of both (the new first)
+                            let nv = match (nv, self.env.get(&d)) {
+                                (AV::Int(n), Some(AV::Int(o))) => {
+                                    let mut lo = n.lo.clone();
+                                    lo.extend(o.lo.iter().cloned());
+                                    let mut hi = n.hi.clone();
+                                    hi.extend(o.hi.iter().cloned());
+                                    AV::Int(Itv { lo: cap(lo), hi: cap(hi) })
+                                }
+                                (n, _) => n,
+                            };
+                            saved.push((d, self.env.insert(d, nv)));
+                        }
+                    }
+                    self.rep.quiet -= 1;
+                    self.dep_undo.push(saved);
                     Some((x, old, None))
                 }
                 _ => None,
@@ -2532,14 +2922,26 @@ impl<'a> An<'a> {
                     self.vars.remove(&v);
                 }
             },
-            Some((Opnd::Val(v), old, _)) => match old {
-                Some(a) => {
-                    self.env.insert(v, a);
+            Some((Opnd::Val(v), old, _)) => {
+                for (d, o) in self.dep_undo.pop().unwrap_or_default().into_iter().rev() {
+                    match o {
+                        Some(a) => {
+                            self.env.insert(d, a);
+                        }
+                        None => {
+                            self.env.remove(&d);
+                        }
+                    }
                 }
-                None => {
-                    self.env.remove(&v);
+                match old {
+                    Some(a) => {
+                        self.env.insert(v, a);
+                    }
+                    None => {
+                        self.env.remove(&v);
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -2654,6 +3056,10 @@ impl<'a> An<'a> {
         // E5 scope variables written in the body: their entry value joined with the body's end value, to a fixpoint (widened to
         // unbounded after 5 rounds), before the reporting walk
         let sw = self.scope_written(body);
+        // a scope variable written in the loop has no single symbolic value in it or after it
+        for v in &sw {
+            self.var_sym.borrow_mut().remove(v);
+        }
         if !sw.is_empty() {
             let mut cur: Vec<Option<Itv>> = sw.iter().map(|v| self.vars.get(v).cloned()).collect();
             let mut ok = false;
@@ -2714,6 +3120,9 @@ impl<'a> An<'a> {
             }
             // the reporting walk starts from the fixpoint; after the loop the variables hold the hull
             self.walk_loop_inner(vars, init, body, begin);
+            for v in &sw {
+                self.var_sym.borrow_mut().remove(v);
+            }
             for (v, it) in sw.iter().zip(cur.iter()) {
                 let end = self.vars.get(v).cloned();
                 let j = match (it, end) {
@@ -2936,6 +3345,22 @@ impl<'a> An<'a> {
                 self.pending_sets.push((i, *var, *value));
                 // an E5 scope variable holds the value from here on (flow-sensitive; `if` joins and loop fixpoints cover the paths)
                 if self.scope.contains(var) {
+                    // the symbolic value (through authored moves)
+                    let mut r = *value;
+                    for _ in 0..8 {
+                        match r {
+                            Opnd::Val(v) => match self.defs.get(&v) {
+                                Some(Op::MovS { a, .. } | Op::MovV { a, .. }) => r = *a,
+                                _ => break,
+                            },
+                            _ => break,
+                        }
+                    }
+                    if r == Opnd::Var(*var) {
+                        // a copy of itself: unchanged
+                    } else {
+                        self.var_sym.borrow_mut().insert(*var, r);
+                    }
                     let it = self.var_part(*var, value);
                     let it = match self.assumed.get(var) {
                         Some(a) => a.clone(),
@@ -2949,10 +3374,12 @@ impl<'a> An<'a> {
                 for (v, i0) in vars.iter().zip(init.iter()) {
                     self.scope.insert(*v);
                     let undef = matches!(i0, Opnd::Val(x) if matches!(self.defs.get(x), Some(Op::Undef { .. })));
+                    self.var_sym.borrow_mut().remove(v);
                     if undef {
                         self.vars.remove(v);
                         continue;
                     }
+                    self.var_sym.borrow_mut().insert(*v, *i0);
                     let it = self.var_part(*v, i0);
                     self.var_init.insert(*v, it.clone());
                     let cur = self.assumed.get(v).cloned().unwrap_or(it);
@@ -3268,8 +3695,17 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
-    if std::env::var("AMDC_GV_DEBUG").is_ok() {
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
+        for (v, r) in &an.rings.rings {
+            eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
+        }
+        for (v, x) in &an.rings.sym {
+            eprintln!("RING var{} start {:?} (expression; orbits enumerated at use) rule {:?}", v.0, x, an.rings.rules.get(v));
+        }
+        for (w, s) in &an.rings.shadows {
+            eprintln!("SHADOW var{} = {:?} - {} + ring var{}", w.0, s.0, s.1, s.4 .0);
+        }
         eprintln!("rings {:?}", an.rings.rings);
         eprintln!("shadows {:?}", an.rings.shadows.iter().map(|(w, s)| (w, s.1, s.2, s.3)).collect::<Vec<_>>());
     }
@@ -3779,6 +4215,8 @@ struct RingFacts {
     let_pos: HashMap<ValueId, usize>,
     /// rings whose single non-constant start value is an expression (e.g. a per-wave base): the start's interval is enumerated at use
     sym: HashMap<VarId, Opnd>,
+    /// constant-start rings: their constant starts
+    starts: HashMap<VarId, Vec<i128>>,
     sym_cache: std::cell::RefCell<HashMap<(VarId, i128, i128), Option<(i128, i128)>>>,
 }
 
@@ -3811,6 +4249,34 @@ impl RingFacts {
         self.sym_cache.borrow_mut().insert((v, lo, hi), r);
         r
     }
+}
+
+/// The period of a proven ring counter (or of a shadow: its ring's) when every constant start lies on one pure cycle; for the tile simulator.
+pub(crate) fn ring_period(f: &Function, x: VarId) -> Option<usize> {
+    let rf = ring_facts(f);
+    let v = if rf.rings.contains_key(&x) { x } else { rf.shadows.get(&x)?.4 };
+    let &(pred, ty, var_left, k, ka, kb) = rf.rules.get(&v)?;
+    let starts = rf.starts.get(&v)?;
+    let mut period = 0usize;
+    for &x0 in starts {
+        let mut cur = x0;
+        let mut p = 0usize;
+        loop {
+            cur = ((cur + if ring_cmp(pred, ty, var_left, k, cur) { ka } else { kb }) as i64 as i32) as i128;
+            p += 1;
+            if cur == x0 {
+                break;
+            }
+            if p > 64 {
+                return None;
+            }
+        }
+        if period != 0 && period != p {
+            return None;
+        }
+        period = p;
+    }
+    (period > 0).then_some(period)
 }
 
 fn ring_cmp(pred: amdgpu_dsl::CmpPred, ty: amdgpu_dsl::CmpTy, var_left: bool, k: i128, x: i128) -> bool {
@@ -4002,5 +4468,35 @@ fn ring_facts(f: &Function) -> RingFacts {
     }
     let steps: HashMap<ValueId, VarId> = ring_step.iter().flat_map(|(v, ds)| ds.iter().map(move |d| (*d, *v))).collect();
     let set_pos: HashMap<VarId, Vec<usize>> = sets.iter().map(|(v, l)| (*v, l.iter().map(|x| x.0).collect())).collect();
-    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, sym_cache: Default::default() }
+    let starts: HashMap<VarId, Vec<i128>> = ring_const.iter().map(|(v, l)| (*v, l.iter().map(|x| x.1).collect())).collect();
+    RingFacts { rings, shadows, steps, rules: ring_rule, set_pos, let_pos: pos, sym, starts, sym_cache: Default::default() }
+}
+
+/// value -> the `Let` values whose operations read it.
+fn value_users(f: &Function) -> HashMap<ValueId, Vec<ValueId>> {
+    let mut m: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for s in f.stmts() {
+        if let Stmt::Let { dst, op } = s {
+            for o in op.operands() {
+                if let Opnd::Val(v) = o {
+                    m.entry(v).or_default().push(*dst);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// `p` with the symbol `s` replaced by `q` (None: a product overflowed the polynomial representation).
+fn subst_sym(p: &Poly, s: &Sym, q: &Poly) -> Option<Poly> {
+    let mut out = Poly::int(0);
+    for (mono, c) in &p.0 {
+        let mut term = Poly::konst(*c);
+        for x in mono {
+            let f = if x == s { q.clone() } else { Poly::sym(x.clone()) };
+            term = term.mul(&f)?;
+        }
+        out = out.add(&term);
+    }
+    Some(out)
 }
