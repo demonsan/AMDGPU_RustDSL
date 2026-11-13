@@ -555,6 +555,12 @@ pub enum MOp {
     SMovB32,
     /// `s_mov_b32 m0, src`: the explicit M0 write of the LDS-DMA loads that follow (sched::m0::explicit; own-only)
     SMovM0,
+    /// exact mode: `s_mov_b64 s[imm:imm+1], exec`
+    SSaveExec,
+    /// exact mode: `s_mov_b64 exec, -1`
+    SExecAll,
+    /// exact mode: `s_mov_b64 exec, s[imm:imm+1]`
+    SRestoreExec,
     /// `s_add_u32 m0, s0, s1`: the M0 write with the LDS base's add folded in (clobbers SCC)
     SAddM0,
     SAddU32,

@@ -696,6 +696,9 @@ impl FromIr for Stmt {
             "EndIf" => { v.expect_unit("EndIf")?; Ok(Stmt::EndIf) }
             "SNop" => { v.expect_struct("SNop")?; Ok(Stmt::SNop { count: FromIr::from_ir(v.field("count")?)? }) }
             "SetM0" => { v.expect_struct("SetM0")?; Ok(Stmt::SetM0 { value: FromIr::from_ir(v.field("value")?)? }) }
+            "ExecSave" => { v.expect_struct("ExecSave")?; Ok(Stmt::ExecSave { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
+            "ExecAll" => { v.expect_unit("ExecAll")?; Ok(Stmt::ExecAll) }
+            "ExecRestore" => { v.expect_struct("ExecRestore")?; Ok(Stmt::ExecRestore { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
             other => Err(v.err(format!("unknown Stmt variant `{other}`"))),
         }
     }
@@ -764,6 +767,9 @@ impl IrIds for Stmt {
             Stmt::EndIf => {}
             Stmt::SNop { count } => { IrIds::ids(&mut (*count), fv, fr); }
             Stmt::SetM0 { value } => { IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::ExecSave { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
+            Stmt::ExecAll => {}
+            Stmt::ExecRestore { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
         }
     }
 }
