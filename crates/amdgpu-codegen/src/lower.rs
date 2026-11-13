@@ -802,6 +802,10 @@ impl Lowerer {
     /// is a plain (non-alias) vreg of class `cls`, defined exactly once in the block by an instruction that fully writes it (not a tied partial
     /// write) and read by no instruction so far. In-flight bookkeeping (pending loads) follows the new register.
     fn retarget_def(&mut self, r: VReg, tuple: VReg, off: u8, cls: RClass) -> bool {
+        // exact mode: a value keeps the instruction and the registers the author gave it (pinned copies vanish instead)
+        if self.exact {
+            return false;
+        }
         if self.mir.alias.contains_key(&r) || self.mir.vreg_class(r) != cls || cls.dwords() == 0 {
             return false;
         }
@@ -1040,6 +1044,9 @@ impl Lowerer {
     /// Rewrite the `ds_read_b128`s that produced `v` (`LoadLdsB128` / `LoadLdsB128x2`, current block) to write the register of loop variable
     /// `dst` directly. Legal only when no instruction after the first of those reads issues a read of `dst` (the old value) or writes it.
     fn try_coalesce_lds_reload(&mut self, v: ValueId, dst: VReg) -> bool {
+        if self.exact {
+            return false;
+        }
         let want = match self.defs.get(&v) {
             Some(Op::LoadLdsB128 { .. }) => (RClass::V4, 1usize),
             Some(Op::LoadLdsB128x2 { .. }) => (RClass::V8, 2usize),
