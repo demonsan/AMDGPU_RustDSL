@@ -86,7 +86,7 @@ pub fn func(name: &str, blocks: Vec<Block>, vregs: Vec<RClass>) -> MFunction {
         args: vec![],
         kernarg_size: 0,
         workgroup_size: 256,
-        lds_bytes: 0,
+        lds_bytes: 0, fp_mode: None, exact: false,
         blocks,
         vregs,
         loops: vec![],

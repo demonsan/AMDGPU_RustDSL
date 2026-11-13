@@ -20,7 +20,7 @@ fn tid(b: &mut FnBuilder) -> amdgpu_dsl::ValueId {
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // LDS budget
 
-fn lds_kernel(lds_bytes: u32, offset: i32) -> Function {
+fn lds_kernel(lds_bytes: u32, fp_mode: None, exact: false, offset: i32) -> Function {
     let mut b = FnBuilder::new("lds_probe", 64);
     b.lds(lds_bytes);
     let t = tid(&mut b);
@@ -278,7 +278,7 @@ fn mfunc(blocks: Vec<(Vec<MInst>, Term)>, classes: Vec<RClass>) -> MFunction {
         b.term = term;
         bs.push(b);
     }
-    MFunction { name: "gv".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: bs, vregs: classes, loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default(), reg_hints: Default::default() }
+    MFunction { name: "gv".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, fp_mode: None, exact: false, blocks: bs, vregs: classes, loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default(), reg_hints: Default::default() }
 }
 
 fn alloc(phys: Vec<u32>, classes: &[RClass]) -> Alloc {

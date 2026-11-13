@@ -12,7 +12,7 @@ fn func(blocks: Vec<(Vec<MInst>, Term)>, nv: usize) -> MFunction {
         b.term = term;
         bs.push(b);
     }
-    MFunction { name: "r".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: bs, vregs: vec![RClass::V1; nv], loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default(), reg_hints: Default::default() }
+    MFunction { name: "r".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, fp_mode: None, exact: false, blocks: bs, vregs: vec![RClass::V1; nv], loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default(), reg_hints: Default::default() }
 }
 
 fn alloc(phys: Vec<u32>) -> Alloc {

@@ -36,7 +36,7 @@ fn block(pin_middle: bool) -> MFunction {
         args: Vec::new(),
         kernarg_size: 0,
         workgroup_size: 64,
-        lds_bytes: 0,
+        lds_bytes: 0, fp_mode: None, exact: false,
         blocks: vec![b],
         vregs,
         loops: Vec::new(),
