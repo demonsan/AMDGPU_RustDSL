@@ -912,6 +912,15 @@ impl<'a> An<'a> {
         if depth > 32 {
             return None;
         }
+        // a pointer scope variable (exact mode): its recorded provenance, when its offset is one known constant on every path
+        if let Opnd::Var(x) = o {
+            if let Some(AV::Ptr { arg: Some(a), .. }) = self.var_prov.get(x) {
+                let c = self.vars.get(x)?.point_const().filter(|q| q.d == 1)?;
+                let off = self.f.args.get(*a)?.kernarg_offset;
+                return Some((off, (BTreeMap::new(), Poly::int(c.n))));
+            }
+            return None;
+        }
         let Opnd::Val(v) = o else { return None };
         match self.defs.get(v)? {
             Op::KernargPtr { offset } => Some((*offset, (BTreeMap::new(), Poly::int(0)))),
