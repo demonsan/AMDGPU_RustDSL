@@ -700,6 +700,24 @@ impl<'a> An<'a> {
                         }
                         _ => atom(self.atom_key(*v), *o),
                     },
+                    // v_mul_i32_i24 is the product when both operands are 24-bit (their intervals): linear like MulI32
+                    Some(Op::Bin(amdgpu_dsl::BinOp::MulI32I24, a, b))
+                        if [a, b].iter().all(|x| self.int_of(x).within(&Itv::range(Poly::int(-(1 << 23)), Poly::int((1 << 23) - 1)), &self.cx)) =>
+                    {
+                        let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
+                        let (k, (atoms, c)) = if x.0.is_empty() {
+                            (x.1, y)
+                        } else if y.0.is_empty() {
+                            (y.1, x)
+                        } else {
+                            return atom(self.atom_key(*v), *o);
+                        };
+                        let mut m = BTreeMap::new();
+                        for (a, p) in atoms {
+                            m.insert(a, p.mul(&k)?);
+                        }
+                        Some((m, c.mul(&k)?))
+                    }
                     Some(Op::MulI32(a, b)) => {
                         let (x, y) = (self.slin(a, depth + 1)?, self.slin(b, depth + 1)?);
                         let (k, (atoms, c)) = if x.0.is_empty() {
