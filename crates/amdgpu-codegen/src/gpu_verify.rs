@@ -3004,10 +3004,80 @@ fn flat_len(nodes: &[Node]) -> usize {
 /// `deltas` collects, per nested if in order, the barrier difference (else arm - then arm; an if without else counts as an empty else arm): the
 /// totals follow the then-sides only and would not see a barrier missing from an else arm (a per-exit drain, the full-tile arm of a tail test). Two
 /// roles built alike must have equal totals AND equal deltas, i.e. the same barrier count on every combination of (uniform) branch outcomes.
+/// Does the then-arm of the `BeginIf` at `pos` end with a `break_if` (E5: a loop exit with its own body)?
+fn arm_exits(stmts: &[Stmt], pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = pos + 1;
+    while i < stmts.len() {
+        match &stmts[i] {
+            Stmt::BeginIf { .. } | Stmt::BeginLoop { .. } => depth += 1,
+            Stmt::EndIf | Stmt::EndLoop if depth > 0 => depth -= 1,
+            Stmt::Else | Stmt::EndIf if depth == 0 => return i > pos + 1 && matches!(stmts[i - 1], Stmt::BreakIf { .. }),
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does the loop body starting at `pos` (after `BeginLoop`) leave other than through E5 exit arms (a `break_if` that is not the last
+/// statement of an exit arm)?
+fn loop_has_plain_break(stmts: &[Stmt], pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = pos;
+    while i < stmts.len() {
+        match &stmts[i] {
+            Stmt::BeginLoop { .. } => depth += 1,
+            Stmt::EndLoop if depth == 0 => return false,
+            Stmt::EndLoop => depth -= 1,
+            Stmt::BreakIf { .. } if depth == 0 => {
+                let last_of_arm = matches!(stmts.get(i + 1), Some(Stmt::Else | Stmt::EndIf));
+                if !last_of_arm {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn add_poly(a: &mut Vec<i64>, b: &[i64]) {
+    if a.len() < b.len() {
+        a.resize(b.len(), 0);
+    }
+    for (d, c) in b.iter().enumerate() {
+        a[d] += c;
+    }
+}
+
+/// `bar_counts` with the E5 loop exits: an arm ending in `break_if` runs once, on its exit path - its barriers (with the iteration
+/// prefix before it) go to `exits`, one polynomial per exit path (the barriers before the loop + N iterations + the prefix + the arm +
+/// what follows the loop), in program order, instead of into the per-iteration count.
 fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, deltas: &mut Vec<Vec<i64>>) -> Vec<i64> {
+    let mut exits = Vec::new();
+    let mut dead = false;
+    bar_counts_x(stmts, pos, until, deltas, &mut exits, &mut dead)
+}
+
+/// `dead` is set when the range ends behind a loop that only leaves through exit arms (its fall-through count is no path).
+fn bar_counts_x(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, deltas: &mut Vec<Vec<i64>>, exits: &mut Vec<Vec<i64>>, dead: &mut bool) -> Vec<i64> {
     let mut out: Vec<i64> = vec![0];
+    // exits recorded at this level: (path count so far, `out` when recorded) - the barriers after the record are added at the end
+    let mut mine: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
+    let finish = |out: &Vec<i64>, mine: Vec<(Vec<i64>, Vec<i64>)>, exits: &mut Vec<Vec<i64>>| {
+        for (mut e, snap) in mine {
+            let mut tail = out.clone();
+            let neg: Vec<i64> = snap.iter().map(|c| -c).collect();
+            add_poly(&mut tail, &neg);
+            add_poly(&mut e, &tail);
+            exits.push(trim(e));
+        }
+    };
     while *pos < stmts.len() {
         if until(&stmts[*pos]) {
+            finish(&out, mine, exits);
             return out;
         }
         match &stmts[*pos] {
@@ -3017,14 +3087,51 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, de
             }
             Stmt::BeginLoop { .. } => {
                 *pos += 1;
-                let inner = bar_counts(stmts, pos, &|s| matches!(s, Stmt::EndLoop), deltas);
+                let plain = loop_has_plain_break(stmts, *pos);
+                let mut inner_exits = Vec::new();
+                let mut inner_dead = false;
+                let inner = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::EndLoop), deltas, &mut inner_exits, &mut inner_dead);
                 *pos += 1;
-                if out.len() < inner.len() + 1 {
-                    out.resize(inner.len() + 1, 0);
+                if !plain && !inner_exits.is_empty() {
+                    *dead = true;
                 }
+                let mut iter = vec![0];
                 for (d, c) in inner.iter().enumerate() {
-                    out[d + 1] += c;
+                    if iter.len() < d + 2 {
+                        iter.resize(d + 2, 0);
+                    }
+                    iter[d + 1] += c;
                 }
+                // an exit path: the barriers so far + N iterations + its own (prefix + arm)
+                for e in inner_exits {
+                    let mut p = out.clone();
+                    add_poly(&mut p, &iter);
+                    add_poly(&mut p, &e);
+                    mine.push((p, {
+                        let mut s = out.clone();
+                        add_poly(&mut s, &iter);
+                        s
+                    }));
+                }
+                add_poly(&mut out, &iter);
+            }
+            Stmt::BeginIf { .. } if arm_exits(stmts, *pos) => {
+                // E5 exit with its body: the iteration prefix + the arm, once (an else arm, if any, continues the iteration)
+                *pos += 1;
+                let mut arm_exits_inner = Vec::new();
+                let mut d2 = false;
+                let t = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::Else | Stmt::EndIf), deltas, &mut arm_exits_inner, &mut d2);
+                let mut e = out.clone();
+                add_poly(&mut e, &t);
+                exits.push(trim(e));
+                exits.extend(arm_exits_inner);
+                if matches!(stmts.get(*pos), Some(Stmt::Else)) {
+                    *pos += 1;
+                    let mut d3 = false;
+                    let el = bar_counts_x(stmts, pos, &|s| matches!(s, Stmt::EndIf), deltas, exits, &mut d3);
+                    add_poly(&mut out, &el);
+                }
+                *pos += 1;
             }
             Stmt::BeginIf { .. } => {
                 *pos += 1;
@@ -3048,6 +3155,7 @@ fn bar_counts(stmts: &[Stmt], pos: &mut usize, until: &dyn Fn(&Stmt) -> bool, de
             _ => *pos += 1,
         }
     }
+    finish(&out, mine, exits);
     out
 }
 
@@ -3103,11 +3211,25 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
             let divergent = tainted(cond, &tv, &tvars);
             let mut p = pos + 1;
             let (mut te, mut ee) = (Vec::new(), Vec::new());
-            let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf), &mut te));
+            let (mut tx, mut ex) = (Vec::new(), Vec::new());
+            let (mut tdead, mut edead) = (false, false);
+            let t = trim(bar_counts_x(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf), &mut te, &mut tx, &mut tdead));
             let mut e = vec![0];
             if matches!(f.stmts().get(p), Some(Stmt::Else)) {
                 p += 1;
-                e = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf), &mut ee));
+                e = trim(bar_counts_x(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf), &mut ee, &mut ex, &mut edead));
+            }
+            // both sides end in loops left only through exits: the fall-through counts are no path, the exit paths are compared below
+            let (t, e) = if tdead && edead && !tx.is_empty() { (vec![0], vec![0]) } else { (t, e) };
+            // E5 loop exits: the two sides must leave by the same exits in the same order, each with the same barrier count
+            if divergent && tx != ex {
+                rep.add(
+                    "GV-BAR",
+                    Severity::Error,
+                    format!("stmt {pos}: wave-divergent if/else (condition depends on the workitem id): the loop exit paths run different numbers of barriers: then {tx:?} vs else {ex:?} (per exit, coefficients of 1, N, ...) - waves that run fewer barriers deadlock the workgroup"),
+                );
+                pos += 1;
+                continue;
             }
             // nested ifs whose arms run the same barriers change nothing (and the two sides need not have the same nesting for them)
             te.retain(|d| d.iter().any(|&x| x != 0));

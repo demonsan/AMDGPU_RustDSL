@@ -169,3 +169,67 @@ fn write_asm() {
         std::fs::write(dir.join(format!("{name}.s")), asm(&e5_kernel(place))).unwrap();
     }
 }
+
+/// Two wave roles (waves 0-3 / 4-7) each running a loop that is left only through an E5 exit with its own body. Role A: per iteration
+/// one barrier before the exit test and one after, the exit body one: exit path 2N + 2. Role B: one barrier before the loop, the exit
+/// test first, two barriers after it, the exit body `b_exit` barriers: exit path 1 + 2N + b_exit. Balanced for b_exit = 1.
+fn two_role_exits(b_exit: usize) -> Function {
+    let mut b = FnBuilder::new("e5_bar_roles", 512);
+    b.arg("n", DType::I32, 0x00, 4);
+    b.ka_range(0x00, 1, 64);
+    let n = b.let_(Op::KernargI32 { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    let six = b.c_i32(6);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(six)));
+    let four = b.c_i32(4);
+    let role_a = b.cmp(CmpPred::Lt, CmpTy::I32, wave, four);
+    b.begin_if(role_a);
+    {
+        let it = b.begin_loop(&[(DType::I32, Opnd::I32(0))])[0];
+        b.barrier();
+        let i1 = b.bind_i32(amdgpu_dsl::varx(it) + 1);
+        let c = b.cmp(CmpPred::Ge, CmpTy::I32, i1, n);
+        b.begin_if_at(c, "exits_a");
+        b.barrier();
+        b.break_if(c);
+        b.end_if();
+        b.barrier();
+        b.set_var(it, i1);
+        b.end_loop();
+        b.layout_anchor("exits_a");
+    }
+    b.else_();
+    {
+        b.barrier();
+        let it = b.begin_loop(&[(DType::I32, Opnd::I32(0))])[0];
+        let i1 = b.bind_i32(amdgpu_dsl::varx(it) + 1);
+        let c = b.cmp(CmpPred::Ge, CmpTy::I32, i1, n);
+        b.begin_if_at(c, "exits_b");
+        for _ in 0..b_exit {
+            b.barrier();
+        }
+        b.break_if(c);
+        b.end_if();
+        b.barrier();
+        b.barrier();
+        b.set_var(it, i1);
+        b.end_loop();
+        b.layout_anchor("exits_b");
+    }
+    b.end_if();
+    b.finish()
+}
+
+fn bar_errors(f: &Function) -> Vec<String> {
+    let rep = amdgpu_codegen::gpu_verify::analyse(f).unwrap_or_else(|e| panic!("{e}"));
+    rep.errors().iter().map(|e| format!("{e:?}")).filter(|m| m.contains("GV-BAR")).collect()
+}
+
+/// GV-BAR follows the exit paths: balanced roles verify although their fall-through counts (no path) differ; an exit body with one
+/// barrier too many is named.
+#[test]
+fn exit_paths_are_barrier_balanced() {
+    assert!(bar_errors(&two_role_exits(1)).is_empty(), "{:?}", bar_errors(&two_role_exits(1)));
+    let e = bar_errors(&two_role_exits(2));
+    assert!(e.iter().any(|m| m.contains("exit paths")), "{e:?}");
+}
