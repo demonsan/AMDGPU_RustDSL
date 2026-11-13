@@ -2525,15 +2525,16 @@ impl<'a> An<'a> {
                     let old = self.env.insert(v, AV::Int(refined));
                     // values computed EARLIER from v (e.g. a prelude address) are re-evaluated under the fact (undone with it)
                     let mut saved: Vec<(ValueId, Option<AV>)> = Vec::new();
-                    let mut work = vec![v];
+                    // (breadth first: the nearest dependents first, within a generous bound)
+                    let mut work: std::collections::VecDeque<ValueId> = std::collections::VecDeque::from(vec![v]);
                     let mut deps: Vec<(usize, ValueId)> = Vec::new();
                     let mut seen: HashSet<ValueId> = HashSet::new();
-                    while let Some(u) = work.pop() {
+                    while let Some(u) = work.pop_front() {
                         for &d in self.users.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
                             let Some(&pd) = self.rings.let_pos.get(&d) else { continue };
-                            if pd < self.idx && self.env.contains_key(&d) && seen.insert(d) && seen.len() <= 4096 {
+                            if pd < self.idx && self.env.contains_key(&d) && seen.len() < 65536 && seen.insert(d) {
                                 deps.push((pd, d));
-                                work.push(d);
+                                work.push_back(d);
                             }
                         }
                     }
