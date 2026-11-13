@@ -39,7 +39,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **64 位寻址**：`ptr_mad` 把描述符基址移到 tile / expert / slot（> 4 GiB 张量），验证器证明移动后的描述符仍在 extent 内。
 - **结构化诊断**：`--json`、`amdc summary`、`amdc srcmap`（[`diagnostics.md`](diagnostics.md)）。
 - `cargo test` **144 个测试目标 / 586 项全绿**（Main `a65de21a`）；md5 清单 **240 个 kernel**、0 差异；Python 节点检查 `python/tests/run_all.sh` OVERALL PASS：62 / 62 算子检查 + 可达 kernel 编译 / 汇编扫描 + hazard oracle + **每个可达 kernel 的严格 gpu-verify**（v11 新增的守卫，`crates/amdgpu-kernels/tests/verify_reachable.rs`）。
-- 严格 GPU 语义证书（Main `a65de21a`）：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**（与 v9.2 相同）。
+- 严格 GPU 语义证书（Main `a65de21a`）：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **1 / 19 / 0**（v11.1 后 amdgpu-sym 非负性检验证明了原先 2 个信任假设）；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**（与 v9.2 相同）。
   信任清单与每一项的去留见 [`trust-inventory.md`](trust-inventory.md)。
 
 ### 1.0 v11 本轮（2026-11-11 / 12）：四层 + 两个 Weaver
@@ -189,7 +189,7 @@ amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发�
 
 区间分析的位级规则（`x ^ y`、`x & m` 的可能置位位）与盒子检验都有攻击测试（`crates/amdgpu-codegen/tests/gv_bits.rs`、`sym_branch.rs`）。
 
-**信任预算（证书逐条列出）**：`--shipped`（v3 四个）21 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0（逐项清单 [`trust-inventory.md`](trust-inventory.md)）。
+**信任预算（证书逐条列出）**：`--shipped`（v3 四个）21 / 100 / 0；`gemm_mxfp8_bs_v4` 1 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0（逐项清单 [`trust-inventory.md`](trust-inventory.md)）。
 每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
 
 **跨工作组写**：普通全局 / buffer 写的跨工作组不相交由符号线性偏移 + 混合进制检查证明（出厂 kernel 全部写已证明；未证明的写计为 `global-write-untracked`，见 [`trust-inventory.md`](trust-inventory.md) §4）。
