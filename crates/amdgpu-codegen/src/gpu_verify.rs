@@ -1097,6 +1097,47 @@ impl<'a> An<'a> {
         }
     }
 
+    /// A linear form that bounds `o` from above (digits as in `slin`): through unsigned min (a select of a compare of its two arms), a
+    /// product by a uniform point, and a subtraction proven not to wrap.
+    fn upper_slin(&self, o: &Opnd, depth: usize) -> Option<SLin> {
+        if depth > 12 {
+            return None;
+        }
+        if let Some(p) = self.point_of(o) {
+            return Some((BTreeMap::new(), p));
+        }
+        let Opnd::Val(v) = o else { return self.slin(o, depth) };
+        match self.defs.get(v) {
+            // min(a, b) <= the non-constant arm (the one that carries the digits)
+            Some(Op::Select { cond: Opnd::Val(c), a, b, .. }) => {
+                let Some(Op::Cmp { pred, a: ca, b: cb, .. }) = self.defs.get(c) else { return self.slin(o, depth) };
+                use amdgpu_dsl::CmpPred as P;
+                let is_min = matches!(pred, P::Le | P::Lt) && ((ca == a && cb == b) || (ca == b && cb == a && false));
+                if !is_min {
+                    return self.slin(o, depth);
+                }
+                let arm = if self.point_of(a).is_some() { b } else { a };
+                self.upper_slin(arm, depth + 1)
+            }
+            Some(Op::MulI32(a, b)) => {
+                let (x, k) = if let Some(k) = self.point_of(b) { (a, k) } else if let Some(k) = self.point_of(a) { (b, k) } else { return self.slin(o, depth) };
+                if !self.cx.nonneg(&k) {
+                    return None;
+                }
+                let (m, c) = self.upper_slin(x, depth + 1)?;
+                let m2: Option<BTreeMap<(bool, u64), Poly>> = m.into_iter().map(|(kk, p)| p.mul(&k).map(|q| (kk, q))).collect();
+                Some((m2?, c.mul(&k)?))
+            }
+            Some(Op::Bin(amdgpu_dsl::BinOp::SubU32, a, b)) if self.int_of(o).nonneg(&self.cx) && self.int_of(a).nonneg(&self.cx) => {
+                let (ma, ca) = self.upper_slin(a, depth + 1)?;
+                let (mb, cb) = self.slin(b, depth + 1)?;
+                let neg: BTreeMap<(bool, u64), Poly> = mb.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
+                Some(slin_add((ma, ca), (neg, cb.scale(Q::int(-1)))))
+            }
+            _ => self.slin(o, depth),
+        }
+    }
+
     fn record_buffer_store(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
         self.caps_cur.borrow_mut().clear();
         let base = match rsrc {
@@ -1116,6 +1157,17 @@ impl<'a> An<'a> {
             };
             Some(slin_add(a, self.slin(soff, 0)?))
         })();
+        // a descriptor assembled from words clips the store at its num_records (the hardware drops every byte at an offset >= num_records):
+        // offset + imm < nr <= U (a linear upper bound of nr) is a cap `offset - U_digits < U_const - imm` on the live bytes
+        if let (Opnd::Val(v), Some(x)) = (rsrc, extra.as_ref()) {
+            if let Some(Op::RsrcCat { words }) = self.defs.get(v).cloned() {
+                if let Some((ua, uc)) = self.upper_slin(&self.word_root(&words[2]), 0) {
+                    let neg: BTreeMap<(bool, u64), Poly> = ua.into_iter().map(|(k, c)| (k, c.scale(Q::int(-1)))).collect();
+                    let l = slin_add(x.clone(), (neg, Poly::int(0)));
+                    self.caps_cur.borrow_mut().push((l, uc.add(&Poly::int(-imm)), false));
+                }
+            }
+        }
         self.record_store(base, extra, imm, size);
     }
 
