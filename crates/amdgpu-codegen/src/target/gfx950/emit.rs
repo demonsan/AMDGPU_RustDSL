@@ -1150,6 +1150,12 @@ fn d_s(a: &Alloc, inst: &MInst) -> String {
 }
 
 fn bin(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
+    if inst.neg != 0 {
+        // VOP3 form with source-negate modifiers
+        let m = mnemonic.replace("_e32", "_e64");
+        let s = |k: usize| format!("{}{}", if inst.neg & (1 << k) != 0 { "-" } else { "" }, src1(a, inst.srcs[k]));
+        return vec![format!("{} {}, {}, {}", m, vr(a, inst.dst.unwrap()), s(0), s(1))];
+    }
     vec![format!(
         "{} {}, {}, {}",
         mnemonic,

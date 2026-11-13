@@ -102,6 +102,7 @@ impl FromIr for Op {
             "FmaF32" => { v.expect_tuple("FmaF32", 3)?; Ok(Op::FmaF32(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
             "ExpF32" => { v.expect_tuple("ExpF32", 1)?; Ok(Op::ExpF32(FromIr::from_ir(v.item(0)?)?)) }
             "RcpF32" => { v.expect_tuple("RcpF32", 1)?; Ok(Op::RcpF32(FromIr::from_ir(v.item(0)?)?)) }
+            "NegF32" => { v.expect_tuple("NegF32", 1)?; Ok(Op::NegF32(FromIr::from_ir(v.item(0)?)?)) }
             "CvtF16ToF32" => { v.expect_tuple("CvtF16ToF32", 1)?; Ok(Op::CvtF16ToF32(FromIr::from_ir(v.item(0)?)?)) }
             "CvtF32ToF16" => { v.expect_tuple("CvtF32ToF16", 1)?; Ok(Op::CvtF32ToF16(FromIr::from_ir(v.item(0)?)?)) }
             "CmpLtI32" => { v.expect_tuple("CmpLtI32", 2)?; Ok(Op::CmpLtI32(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
@@ -126,6 +127,8 @@ impl FromIr for Op {
             "LoadLdsTr4B8" => { v.expect_struct("LoadLdsTr4B8")?; Ok(Op::LoadLdsTr4B8 { addrs: FromIr::from_ir(v.field("addrs")?)? }) }
             "LoadLdsB128x2" => { v.expect_struct("LoadLdsB128x2")?; Ok(Op::LoadLdsB128x2 { lo: FromIr::from_ir(v.field("lo")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "ReadFirstLane" => { v.expect_tuple("ReadFirstLane", 1)?; Ok(Op::ReadFirstLane(FromIr::from_ir(v.item(0)?)?)) }
+            "MovV" => { v.expect_struct("MovV")?; Ok(Op::MovV { ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)? }) }
+            "MovS" => { v.expect_struct("MovS")?; Ok(Op::MovS { ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)? }) }
             "DppQuadPerm" => { v.expect_struct("DppQuadPerm")?; Ok(Op::DppQuadPerm { x: FromIr::from_ir(v.field("x")?)?, perm: FromIr::from_ir(v.field("perm")?)? }) }
             "Frag2" => { v.expect_tuple("Frag2", 2)?; Ok(Op::Frag2(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "Frag2Lane" => { v.expect_struct("Frag2Lane")?; Ok(Op::Frag2Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
@@ -136,6 +139,7 @@ impl FromIr for Op {
             "Frag4Lane" => { v.expect_struct("Frag4Lane")?; Ok(Op::Frag4Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
             "MfmaF16" => { v.expect_struct("MfmaF16")?; Ok(Op::MfmaF16 { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)? }) }
             "MfmaF16Wide" => { v.expect_struct("MfmaF16Wide")?; Ok(Op::MfmaF16Wide { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)? }) }
+            "MfmaBf16Wide" => { v.expect_struct("MfmaBf16Wide")?; Ok(Op::MfmaBf16Wide { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)? }) }
             "Frag8" => { v.expect_tuple("Frag8", 8)?; Ok(Op::Frag8(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?, FromIr::from_ir(v.item(4)?)?, FromIr::from_ir(v.item(5)?)?, FromIr::from_ir(v.item(6)?)?, FromIr::from_ir(v.item(7)?)?)) }
             "CatFrag8" => { v.expect_tuple("CatFrag8", 2)?; Ok(Op::CatFrag8(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "CvtPknormU16" => { v.expect_tuple("CvtPknormU16", 2)?; Ok(Op::CvtPknormU16(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
@@ -222,6 +226,7 @@ impl IrIds for Op {
             Op::FmaF32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
             Op::ExpF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::RcpF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::NegF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::CvtF16ToF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::CvtF32ToF16(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::CmpLtI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
@@ -246,6 +251,8 @@ impl IrIds for Op {
             Op::LoadLdsTr4B8 { addrs } => { IrIds::ids(&mut (*addrs), fv, fr); }
             Op::LoadLdsB128x2 { lo, hi } => { IrIds::ids(&mut (*lo), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::ReadFirstLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::MovV { ty, a } => { IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); }
+            Op::MovS { ty, a } => { IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); }
             Op::DppQuadPerm { x, perm } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*perm), fv, fr); }
             Op::Frag2(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::Frag2Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
@@ -256,6 +263,7 @@ impl IrIds for Op {
             Op::Frag4Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
             Op::MfmaF16 { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
             Op::MfmaF16Wide { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Op::MfmaBf16Wide { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
             Op::Frag8(x0, x1, x2, x3, x4, x5, x6, x7) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); IrIds::ids(&mut (*x4), fv, fr); IrIds::ids(&mut (*x5), fv, fr); IrIds::ids(&mut (*x6), fv, fr); IrIds::ids(&mut (*x7), fv, fr); }
             Op::CatFrag8(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::CvtPknormU16(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }

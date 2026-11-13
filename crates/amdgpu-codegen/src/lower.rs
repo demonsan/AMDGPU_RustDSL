@@ -99,8 +99,36 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
     } else {
         f
     };
+    // exact mode: a constant the author pinned is an instruction at its statement (`v_mov` / `s_mov` into the pinned register), not a
+    // value folded or cached per use
+    let pinned_consts;
+    let f = if f.exact {
+        pinned_consts = exact_pinned_consts(f);
+        &pinned_consts
+    } else {
+        f
+    };
     let mut lw = Lowerer::new(f);
-    if opt_on("scalarize") {
+    if f.exact {
+        // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
+        let (u, v) = uniform_analysis(f);
+        let mut sv: HashSet<ValueId> = HashSet::new();
+        let mut svars: HashSet<u32> = HashSet::new();
+        for mk in &f.reg_plan {
+            if let amdgpu_dsl::RegMark::PinS { r, .. } = mk {
+                match r {
+                    amdgpu_dsl::RegRef::Val(x) => {
+                        sv.insert(*x);
+                    }
+                    amdgpu_dsl::RegRef::Var(x) => {
+                        svars.insert(x.0);
+                    }
+                }
+            }
+        }
+        lw.uniform = u.into_iter().filter(|x| sv.contains(x)).collect();
+        lw.uvars = v.into_iter().filter(|x| svars.contains(&x.0)).collect();
+    } else if opt_on("scalarize") {
         let (u, v) = uniform_analysis(f);
         lw.uniform = u;
         lw.uvars = v;
@@ -347,6 +375,8 @@ struct Lowerer {
     cur_origin: u32,
     /// diagnostics: the statement being lowered (MInst::stmt = index + 1), counted in program order like `Function::stmts()`
     cur_stmt: u32,
+    /// exact authored mode (docs/exact-mode.md): forms the author wrote (an MFMA reads its accumulator where it is, no copy into the result)
+    exact: bool,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -487,6 +517,7 @@ impl Lowerer {
 
         Lowerer {
             cur_origin: u32::MAX,
+            exact: f.exact,
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 0
@@ -1268,6 +1299,7 @@ impl Lowerer {
     fn scalar_select(&mut self, dst: ValueId, cond: Opnd, a: Opnd, b: Opnd) -> Result<(), String> {
         let mut neg = false;
         let mut c = cond;
+        let mut cmp = MOp::SCmpLtI32;
         let (x, y) = loop {
             let Opnd::Val(v) = c else { return Err("scalar select: the condition is not a value".into()) };
             match self.defs.get(&v).cloned() {
@@ -1278,6 +1310,22 @@ impl Lowerer {
                 Some(Op::CmpLtI32(x, y)) => break (x, y),
                 Some(Op::CmpGeI32(x, y)) => {
                     neg = !neg;
+                    break (x, y);
+                }
+                // exact mode: the generic compare in the SALU form the author used
+                Some(Op::Cmp { pred, ty, a: x, b: y }) if self.exact => {
+                    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+                    cmp = match (pred, ty) {
+                        (P::Lt, T::I32) => MOp::SCmpLtI32,
+                        (P::Ge, T::I32) => {
+                            neg = !neg;
+                            MOp::SCmpLtI32
+                        }
+                        (P::Eq, _) => MOp::SCmpEqU32,
+                        (P::Ge, T::U32) => MOp::SCmpGeU32,
+                        (P::Le, T::U32) => MOp::SCmpLeU32,
+                        other => return Err(format!("scalar select: no SALU compare for {other:?}")),
+                    };
                     break (x, y);
                 }
                 other => return Err(format!("scalar select: condition {other:?} is not a uniform integer compare")),
@@ -1298,7 +1346,7 @@ impl Lowerer {
         }
         let regs: Vec<Src> = ops.iter().copied().filter(|s| matches!(s, Src::Reg(_))).collect();
         self.touch(&regs);
-        self.push(MInst::new(MOp::SCmpLtI32).src(ops[0]).src(ops[1]));
+        self.push(MInst::new(cmp).src(ops[0]).src(ops[1]));
         let d = self.new_vreg(RClass::S1);
         self.push(MInst::new(MOp::SCselectB32).def(d).src(ops[2]).src(ops[3]));
         self.val.insert(dst, d);
@@ -1920,7 +1968,16 @@ impl Lowerer {
                 }
                 Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
                     let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
-                    let m0 = self.m0_source(*lds_addr)?;
+                    // exact mode: the DMA uses the M0 the author set (`set_m0`); `lds_addr` stays for the verifier only, so no readfirstlane /
+                    // copy is formed for it (the operand slot keeps an SGPR the instruction already reads; it is never printed)
+                    let m0 = if self.exact {
+                        match self.sgpr_src(*lds_addr) {
+                            Some(s) => s,
+                            None => rr,
+                        }
+                    } else {
+                        self.m0_source(*lds_addr)?
+                    };
                     let mop = if *dwords == 4 { MOp::BufferLoadDwordX4Lds } else { MOp::BufferLoadDwordX1Lds };
                     self.push(MInst::new(mop).srcreg(rr).src(vs).src(ss).srcreg(m0).imm(*imm as i64));
                 }
@@ -3164,6 +3221,13 @@ impl Lowerer {
                 match c {
                     Some(c) if !self.is_zero_frag(c) => {
                         let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        if self.exact {
+                            // the author's registers: D and C may differ (no copy of C into D)
+                            let d = self.new_vreg(cls);
+                            self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(rc).srcreg(sa).srcreg(sb).imm(imm));
+                            self.val.insert(dst, d);
+                            return Ok(());
+                        }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
                         let d = if reusable {
                             rc
@@ -3197,6 +3261,13 @@ impl Lowerer {
                 match c {
                     Some(c) if !self.is_zero_frag(c) => {
                         let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        if self.exact {
+                            // the author's registers: D and C may differ (no copy of C into D)
+                            let d = self.new_vreg(cls);
+                            self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(rc).imm(imm));
+                            self.val.insert(dst, d);
+                            return Ok(());
+                        }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
                         let d = if reusable {
                             rc
@@ -3278,7 +3349,11 @@ impl Lowerer {
             Op::CvtP8x4FromU16(u0, u1, sc) => {
                 let r0 = self.as_v1(*u0)?;
                 let r1 = self.as_v1(*u1)?;
-                let rs = self.as_v1(*sc)?;
+                // exact mode: a scale in an SGPR is read there (VOP3 takes one scalar source)
+                let rs = match (self.exact, self.sgpr_src(*sc)) {
+                    (true, Some(s)) => s,
+                    _ => self.as_v1(*sc)?,
+                };
                 self.touch(&[Src::Reg(r0), Src::Reg(r1), Src::Reg(rs)]);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VCvtPkFp8Lo).def(d).srcreg(r0).srcreg(rs));
@@ -3317,6 +3392,42 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::RcpF32(a) => self.un_v1(dst, MOp::VRcpF32, *a)?,
+            Op::MovV { a, .. } => {
+                let d = self.new_vreg(RClass::V1);
+                match self.sgpr_src(*a) {
+                    Some(s) => {
+                        self.touch(&[Src::Reg(s)]);
+                        self.push(MInst::new(MOp::VMovFromS).def(d).srcreg(s));
+                    }
+                    None => match self.const_bits(*a) {
+                        Some(k) => self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(k as i64))),
+                        None => {
+                            let r = self.as_v1(*a)?;
+                            self.touch(&[Src::Reg(r)]);
+                            self.push(MInst::new(MOp::VMovB32).def(d).srcreg(r));
+                        }
+                    },
+                }
+                self.val.insert(dst, d);
+            }
+            Op::MovS { a, .. } => {
+                let s = self.s_operand(*a)?;
+                if let Src::Reg(r) = s {
+                    self.touch(&[Src::Reg(r)]);
+                }
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(d).src(s));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
+            Op::NegF32(a) => {
+                // standalone: flip the sign bit (unused when every reader folds it into a modifier: removed by dce)
+                let r = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VXorB32).def(d).src(Src::Imm(0x8000_0000u32 as i32 as i64)).srcreg(r));
+                self.val.insert(dst, d);
+            }
             Op::Exp2F32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
             Op::Log2F32(a) => self.un_v1(dst, MOp::VLogF32, *a)?,
             Op::CvtPkBf16F32(a, b) => {
@@ -3592,13 +3703,14 @@ impl Lowerer {
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::MfmaF16Wide { a, b, c } => {
+            Op::MfmaF16Wide { a, b, c } | Op::MfmaBf16Wide { a, b, c } => {
+                let bf16 = matches!(op, Op::MfmaBf16Wide { .. });
                 let ra = self.as_v2(*a)?;
                 let rb = self.as_v2(*b)?;
                 if self.is_zero_frag(c) {
                     // D = A x B: the accumulator is the inline constant 0 (no zero fragment, no copy)
                     let d = self.new_vreg(RClass::V16);
-                    self.push(MInst::new(MOp::VMfma32x32x8F16Z).def(d).srcreg(ra).srcreg(rb));
+                    self.push(MInst::new(if bf16 { MOp::VMfma32x32x8Bf16Z } else { MOp::VMfma32x32x8F16Z }).def(d).srcreg(ra).srcreg(rb));
                     self.val.insert(dst, d);
                     return Ok(());
                 }
@@ -3606,7 +3718,7 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V16);
                 self.copy_reg(d, rc)?;
                 self.push(
-                    MInst::new(MOp::VMfma32x32x8F16)
+                    MInst::new(if bf16 { MOp::VMfma32x32x8Bf16 } else { MOp::VMfma32x32x8F16 })
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
@@ -3950,6 +4062,35 @@ impl Lowerer {
     }
 
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        // an f32 operand defined by `NegF32(x)`: read x with the source-negate modifier (VOP3)
+        if matches!(op, MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32) {
+            let neg_of = |me: &Self, o: Opnd| -> Option<Opnd> {
+                if let Opnd::Val(v) = o {
+                    if let Some(Op::NegF32(x)) = me.defs.get(&v) {
+                        return Some(*x);
+                    }
+                }
+                None
+            };
+            let (na, nb) = (neg_of(self, a), neg_of(self, b));
+            if na.is_some() || nb.is_some() {
+                let (a2, b2) = (na.unwrap_or(a), nb.unwrap_or(b));
+                // VOP3 takes one scalar source (constant bus); the other operand in a VGPR
+                let sa = self.sgpr_src(a2);
+                let ra = match sa {
+                    Some(s) => s,
+                    None => self.as_v1(a2)?,
+                };
+                let rb = if sa.is_some() { self.as_v1(b2)? } else { self.sgpr_src(b2).map_or_else(|| self.as_v1(b2), Ok)? };
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V1);
+                let mut inst = MInst::new(op).def(d).srcreg(ra).srcreg(rb);
+                inst.neg = (na.is_some() as u8) | ((nb.is_some() as u8) << 1);
+                self.push(inst);
+                self.val.insert(dst, d);
+                return Ok(());
+            }
+        }
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
             let commutative = op != MOp::VSubF32;
@@ -4415,7 +4556,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
         let mut cst: HashMap<ValueId, i64> = HashMap::new();
         // `scalarize2`: uniform integer compares (only consumed by uniform selects: the select re-emits them as s_cmp + s_cselect)
-        let ext = opt_on("scalarize2");
+        let ext = opt_on("scalarize2") || f.exact;
         let mut ucond: HashSet<ValueId> = HashSet::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
@@ -4447,6 +4588,14 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::MinI32(a, b) if ext => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
                         // `salu32`: uniform u32 subtract / or in SALU
                         Op::Bin(amdgpu_dsl::BinOp::SubU32 | amdgpu_dsl::BinOp::OrB32, a, b) if opt_on("salu32") => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        // exact mode: an authored scalar move is scalar; a generic integer compare of uniform operands is a uniform condition
+                        Op::MovS { .. } if f.exact => true,
+                        Op::Cmp { ty: amdgpu_dsl::CmpTy::U32 | amdgpu_dsl::CmpTy::I32, a, b, .. } if f.exact => {
+                            if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
                         Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) if ext => {
                             if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
                                 ucond.insert(*dst);
@@ -5252,6 +5401,39 @@ fn plain_f8f6f4_mop(k: amdgpu_dsl::MmaKind) -> Option<(MOp, MOp, i64)> {
 }
 
 /// `f` with every branch / select / not operand that is an `AnyLane(c)` value replaced by `c`.
+fn exact_pinned_consts(f: &Function) -> Function {
+    let mut file: HashMap<ValueId, bool> = HashMap::new();
+    for mk in &f.reg_plan {
+        match mk {
+            amdgpu_dsl::RegMark::PinV { r: amdgpu_dsl::RegRef::Val(v), .. } => {
+                file.insert(*v, false);
+            }
+            amdgpu_dsl::RegMark::PinS { r: amdgpu_dsl::RegRef::Val(v), .. } => {
+                file.insert(*v, true);
+            }
+            _ => {}
+        }
+    }
+    let mut g = f.clone();
+    g.edit_stmts(|stmts| {
+        for s in stmts.iter_mut() {
+            if let Stmt::Let { dst, op } = s {
+                let (ty, a) = match op {
+                    Op::ConstI32(k) => (DType::I32, Opnd::I32(*k)),
+                    Op::ConstF32(x) => (DType::F32, Opnd::F32(*x)),
+                    _ => continue,
+                };
+                match file.get(dst) {
+                    Some(false) => *op = Op::MovV { ty, a },
+                    Some(true) => *op = Op::MovS { ty, a },
+                    None => {}
+                }
+            }
+        }
+    });
+    g
+}
+
 fn strip_any_lane(f: &Function) -> Function {
     use amdgpu_dsl::ir_text::IrIds;
     let mut map: HashMap<ValueId, Opnd> = HashMap::new();

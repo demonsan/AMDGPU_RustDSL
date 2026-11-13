@@ -443,6 +443,7 @@ impl<'a> An<'a> {
                     }
                     // readfirstlane of a wave-uniform value is that value
                     Some(Op::ReadFirstLane(a)) if self.uniform(a, 0) => self.slin(a, depth + 1),
+                    Some(Op::MovV { a, .. } | Op::MovS { a, .. }) => self.slin(a, depth + 1),
                     Some(Op::Tri(amdgpu_dsl::TriOp::Add3U32, a, b, c)) => {
                         Some(slin_add(slin_add(self.slin(a, depth + 1)?, self.slin(b, depth + 1)?), self.slin(c, depth + 1)?))
                     }
@@ -674,7 +675,8 @@ impl<'a> An<'a> {
             Opnd::Var(_) => false,
             Opnd::Val(v) => match self.defs.get(v) {
                 None | Some(Op::WorkitemId) => false,
-                Some(Op::ReadFirstLane(_) | Op::KernargI32 { .. } | Op::ConstI32(_) | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ) => true,
+                Some(Op::ReadFirstLane(_) | Op::MovS { .. } | Op::KernargI32 { .. } | Op::ConstI32(_) | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ) => true,
+                Some(Op::MovV { a, .. }) => self.uniform(a, depth + 1),
                 Some(op @ (Op::AddI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::XorI32(..) | Op::MinI32(..) | Op::Select { .. } | Op::Bin(..) | Op::Tri(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..))) => {
                     op.operands().iter().all(|x| self.uniform(x, depth + 1))
                 }
@@ -1840,6 +1842,7 @@ impl<'a> An<'a> {
                 }
             }
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
+            Op::MovV { a, .. } | Op::MovS { a, .. } => self.av_of(a),
             // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
             Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),
             // a clock reading: any 32-bit value
@@ -2273,7 +2276,8 @@ impl<'a> An<'a> {
                     Some(Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) | Op::MinI32(a, b)) => {
                         self.uniform_opnd(a, depth - 1, visiting) && self.uniform_opnd(b, depth - 1, visiting)
                     }
-                    Some(Op::ReadFirstLane(_)) => true,
+                    Some(Op::ReadFirstLane(_) | Op::MovS { .. }) => true,
+                    Some(Op::MovV { a, .. }) => self.uniform_opnd(a, depth - 1, visiting),
                     _ => false,
                 }
             }

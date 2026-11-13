@@ -627,11 +627,13 @@ pub struct MInst {
     /// Diagnostics (exact mode, docs/exact-mode.md): the IR statement (index in `Function::stmts()` + 1) whose lowering emitted this
     /// instruction; 0 for instructions added after lowering (waits, nops, copies, M0 writes of later passes). Not used by any pass.
     pub stmt: u32,
+    /// Source-negate modifiers (VOP3 `neg`): bit i negates source i (f32 add / sub / mul / max / fma; emitted in the e64 form).
+    pub neg: u8,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0, neg: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

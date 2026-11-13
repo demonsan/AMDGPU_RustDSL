@@ -154,7 +154,8 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
     let mut e = Effects::default();
     let c = match op {
         Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. } | Op::KernargPtr { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => ResClass::Salu,
-        Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) => ResClass::Salu,
+        Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } | Op::ReadFirstLane(..) | Op::MovS { .. } => ResClass::Salu,
+        Op::MovV { .. } => ResClass::Valu,
         Op::MemTimeLo { .. } => {
             e.directive = true;
             ResClass::Sync
@@ -208,6 +209,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::CvtPknormPair(..)
         | Op::CvtP8x4FromU16(..) => ResClass::Valu,
         Op::ExpF32(..) | Op::RcpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) => ResClass::Trans,
+        Op::NegF32(..) => ResClass::Valu,
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
@@ -246,7 +248,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
             ResClass::LdsRead
         }
         Op::MfmaF16 { .. } => ResClass::Mfma { passes: 4 },
-        Op::MfmaF16Wide { .. } => ResClass::Mfma { passes: 8 },
+        Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } => ResClass::Mfma { passes: 8 },
         Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. } => ResClass::Mfma { passes: 16 },
         Op::SmfmacFp8_16x16x128 { .. } => ResClass::Mfma { passes: 8 },
         Op::Asm { .. } => {

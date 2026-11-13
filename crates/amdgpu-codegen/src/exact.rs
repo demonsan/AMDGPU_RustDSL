@@ -22,7 +22,9 @@ pub fn synthetic_kind(m: &MFunction, stmts: &[amdgpu_dsl::Stmt], i: &MInst) -> O
         return Some("automatic wait");
     }
     match i.op {
-        MOp::SNop if !matches!(op, Some(Op::Asm { .. })) => Some("s_nop"),
+        MOp::SNop if !matches!(op, Some(Op::Asm { .. })) && !matches!(st, Some(Stmt::SNop { .. })) => Some("s_nop"),
+        // an authored move (`mov_v` / `mov_s`) is the author's instruction
+        MOp::VMovB32 | MOp::SMovB32 | MOp::VMovFromS if matches!(op, Some(Op::MovV { .. } | Op::MovS { .. })) => None,
         MOp::VMovB32 | MOp::SMovB32 if i.srcs.iter().all(|s| matches!(s, Src::Imm(_))) && !matches!(op, Some(Op::ConstI32(_) | Op::ConstF32(_))) => {
             Some("constant materialization")
         }
@@ -122,7 +124,7 @@ impl std::fmt::Display for Violation {
 }
 
 fn same(a: &MInst, b: &MInst) -> bool {
-    a.op == b.op && a.dst == b.dst && a.imm == b.imm && format!("{:?}", a.srcs) == format!("{:?}", b.srcs) && a.skip_m0 == b.skip_m0
+    a.op == b.op && a.dst == b.dst && a.imm == b.imm && a.neg == b.neg && format!("{:?}", a.srcs) == format!("{:?}", b.srcs) && a.skip_m0 == b.skip_m0
 }
 
 /// The instructions `after` has and `before` lacks (the insertions of a fixing pass), as violations of `rule`.
@@ -422,14 +424,38 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                     max_v = max_v.max(b + c.dwords());
                 }
             }
-            None if used.contains(&r) => missing.push(name_of(&m, r)),
+            None if used.contains(&r) => {
+                // name it by the statement that defines it (a lowering temporary has no DSL name)
+                let def = m.blocks.iter().flat_map(|b| b.insts.iter()).find(|i| i.dst.map_or(false, |d| m.canon(d) == r));
+                let at = def.map(|i| {
+                    let s = if i.stmt == 0 { "-".to_string() } else { format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(80).collect() };
+                    format!(" ({:?} at stmt {}: {s})", i.op, i.stmt as i64 - 1)
+                });
+                missing.push(format!("{}{}", name_of(&m, r), at.unwrap_or_default()));
+            }
             None => {}
         }
     }
     // aliases (views) sit inside their tuple
-    for (v, (t, off)) in m.alias.clone() {
-        if phys[t as usize] != u32::MAX {
-            phys[v as usize] = phys[t as usize] + off as u32;
+    // views (aliases, possibly of aliases) sit inside their tuple
+    fn resolve(m: &MFunction, phys: &[u32], r: VReg, depth: u32) -> u32 {
+        if depth > 16 {
+            return u32::MAX;
+        }
+        match m.alias.get(&r) {
+            Some(&(t, off)) => {
+                let b = resolve(m, phys, t, depth + 1);
+                if b == u32::MAX { u32::MAX } else { b + off as u32 }
+            }
+            None => phys[r as usize],
+        }
+    }
+    let aliases: Vec<VReg> = m.alias.keys().copied().collect();
+    for v in aliases {
+        let p = resolve(&m, &phys, v, 0);
+        if p != u32::MAX {
+            phys[v as usize] = p;
+            let t = m.canon(v);
             scalar[v as usize] = scalar[t as usize];
         }
     }
@@ -455,12 +481,18 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         for i in &b.insts {
             if let Some(k) = synthetic_kind(&m, &stmts, i) {
                 let st = if i.stmt == 0 { "-".to_string() } else { format!("{} ({})", i.stmt - 1, format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(90).collect::<String>()) };
-                errs.push(format!("exact: block {} {:?}: {k}, at stmt {st}", b.label, i.op));
+                let text = if i.dst.map_or(true, |d| phys[d as usize] != u32::MAX) && i.srcs.iter().all(|s| !matches!(s, Src::Reg(r) if phys[*r as usize] == u32::MAX)) {
+                    let a0 = crate::regalloc::Alloc { phys: phys.clone(), max_v: 0, max_s: 0, scalar: scalar.clone() };
+                    crate::emit::inst_lines(&a0, i).join(" ; ")
+                } else {
+                    format!("{:?} (unpinned operands)", i.op)
+                };
+                errs.push(format!("exact: block {} `{text}`: {k}, at stmt {st}", b.label));
             }
         }
     }
     if !missing.is_empty() {
-        errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join(", ")));
+        errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join("\n    ")));
     }
     let a = crate::regalloc::Alloc { phys, max_v, max_s, scalar };
     if errs.is_empty() {
