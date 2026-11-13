@@ -131,6 +131,8 @@ LLVM's hazard recognizer, or the ISA document. There are no silent allowances.
 
 | WAITS: LDS read consumed with no wait, older than two newer reads (`lgkmcnt(2)` needed; the vendor's A-loop bf16-init sequence, 6 sites) | counter-guaranteed wait required | none (relies on the reads completing within the issue time of a 32x32x64 MFMA + ~14 ALU + 2 newer reads) | `tools/timing_probe.sh` (generic pattern, not the vendor's exact code): 8 waves with LDS traffic. With the counter-guaranteed wait, 6 / 6 runs are exact. Without it, at a gap of 16 VALU instructions, 4 of 6 runs read stale data (80-384 of 512 threads), and gaps of 0 / 2 / 8 also fail | **refuted**: the replica adds the 6 waits ("1:1 except 6 added `s_waitcnt lgkmcnt(2)`, under full proof"). `TrustWait` stays available for a "1:1 with 6 trusted waits" variant; its reason must cite this probe as refuting |
 
+| VALU writes a lane mask (VOP3 `v_cmp_*_e64 s[..]`, VOP2 `v_cmp_*_e32 vcc`) -> `v_cndmask_b32` reads it as the mask (`hazard-value` / `hazard-valu-sgpr`) | 2 | 0 or 1 (~1100 sites in the lifted kernel) | `tools/lanemask_hazard_probe.sh` (node 53 GPU 2): all of e64 into an SGPR pair -> cndmask e64, e32 vcc -> cndmask e64, e32 vcc -> cndmask e32 are correct at 0, 1 and 2 wait states, in 3 / 3 runs (single wave, no contention). LLVM asks 2 | evidence collected; relaxation pending a decision (as for VCC) |
+
 The waits row is a finding about the vendor kernel itself: it relies on LDS read timing, and the probe shows that timing can fail under contention.
 
 (More rows as exact-mode checks on the replica name them.)
