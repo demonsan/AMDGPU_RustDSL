@@ -1,4 +1,4 @@
-﻿//! Exact mode E2 (docs/exact-mode.md section 4): verification by check-mode passes. On a final function every fixing pass is run on a
+//! Exact mode E2 (docs/exact-mode.md section 4): verification by check-mode passes. On a final function every fixing pass is run on a
 //! copy; anything it would insert is a named violation. Mutation tests: drop an authored wait state / wait and the check names it.
 
 use amdgpu_codegen::mir::MOp;
@@ -64,23 +64,28 @@ fn a_dropped_wait_is_named() {
     assert!(v.iter().any(|x| x.rule == "waits"), "{k}: {:?}", v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
 }
 
-/// Mutation: move one value onto the registers of another value live at the same time -> a named clobber.
+/// Mutation: two loaded values both read by one add; put the second on the first one's register -> a named clobber.
 #[test]
 fn a_clobbering_assignment_is_named() {
-    let f = amdgpu_kernels::kernel_by_name("rmsnorm_n4096").or_else(|| amdgpu_kernels::reachable::manifest_names().into_iter().find_map(|k| amdgpu_kernels::kernel_by_name(&k))).unwrap();
+    use amdgpu_dsl::{ev, DType, Ext, FnBuilder, Op};
+    let mut b = FnBuilder::new("probe_clobber", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(128 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.bind_i32(ev(tid) << 2);
+    let q = b.ptr_add(po, off);
+    let x = b.load_f32(q, 0);
+    let y = b.load_f32(q, 256);
+    let s = b.let_(Op::AddF32(x.into(), y.into()));
+    b.store_f32(q, 0, s);
+    let f = b.finish();
     let (m, mut a) = amdgpu_codegen::compile_mir_alloc(&f).unwrap();
     assert!(amdgpu_codegen::exact::check_registers(&m, &a).is_empty());
-    // two V1 vregs with different registers that are both read by one instruction (so live together)
-    let pair = m.blocks.iter().flat_map(|b| b.insts.iter()).find_map(|i| {
-        let regs: Vec<u32> = i.srcs.iter().filter_map(|s| if let amdgpu_codegen::mir::Src::Reg(r) = s { Some(m.canon(*r)) } else { None }).collect();
-        if regs.len() >= 2 && m.vreg_class(regs[0]) == amdgpu_codegen::mir::RClass::V1 && m.vreg_class(regs[1]) == amdgpu_codegen::mir::RClass::V1 && a.phys[regs[0] as usize] != a.phys[regs[1] as usize] {
-            Some((regs[0], regs[1]))
-        } else {
-            None
-        }
-    });
-    let (x, y) = pair.expect("an instruction reading two VGPR values");
-    a.phys[y as usize] = a.phys[x as usize];
+    let add = m.blocks.iter().flat_map(|b| b.insts.iter()).find(|i| i.op == amdgpu_codegen::mir::MOp::VAddF32).expect("the add");
+    let regs: Vec<u32> = add.srcs.iter().filter_map(|s| if let amdgpu_codegen::mir::Src::Reg(r) = s { Some(m.canon(*r)) } else { None }).collect();
+    assert_eq!(regs.len(), 2);
+    a.phys[regs[1] as usize] = a.phys[regs[0] as usize];
     let r = amdgpu_codegen::exact::check_registers(&m, &a);
-    assert!(!r.is_empty(), "putting two live values on one register must be reported");
+    assert!(!r.is_empty(), "two live loaded values on one register must be reported");
 }
