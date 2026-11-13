@@ -252,6 +252,8 @@ struct Sim<'a> {
     /// runtime `break_if`s met in the current iteration of the outermost loop (their ordinal keys the exit decision, so that the two roles' loops,
     /// built alike, pair exit for exit)
     brk_ord: usize,
+    /// inside the body of an E5 exit taken on this path (runs once: its runtime ifs are decisions)
+    exit_body: bool,
 }
 
 impl<'a> Sim<'a> {
@@ -562,8 +564,12 @@ impl<'a> Sim<'a> {
                             false
                         };
                         if take {
-                            // the arm body; its final break_if is a runtime condition, so leave explicitly
+                            // the arm body; its final break_if is a runtime condition, so leave explicitly. It runs ONCE on this path, so a
+                            // runtime if inside it (e.g. a drain's tail test) is a decision like one outside the loop
+                            let was = self.exit_body;
+                            self.exit_body = true;
                             self.exec(then_range.0, then_range.1 - 1);
+                            self.exit_body = was;
                             self.close();
                             self.break_taken = true;
                             return;
@@ -582,7 +588,7 @@ impl<'a> Sim<'a> {
                             CV::K(c) => run_arm(self, c != 0),
                             CV::U => {
                                 if has_any {
-                                    if self.loop_depth > 0 {
+                                    if self.loop_depth > 0 && !self.exit_body {
                                         self.unsupported.push((i, format!("stmt {i}: a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses: its two outcomes are not explored per iteration (a 2^iterations path set); hoist it out of the loop, make both arms identical, or restructure")));
                                     } else {
                                         let uniform = !self.div.contains(&i);
@@ -1120,7 +1126,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0 };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
