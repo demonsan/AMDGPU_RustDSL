@@ -23,6 +23,8 @@ pub enum FenceAttr {
     WaitVm,
     /// `s_waitcnt lgkmcnt(imm)`
     WaitLgkm,
+    /// `s_waitcnt vmcnt(imm & 0xff) lgkmcnt(imm >> 8)`
+    WaitBoth,
     Barrier,
     SetPrio,
 }
@@ -664,6 +666,9 @@ pub const ALL: &[MOp] = &[
     MOp::SReadPhys,
     MOp::SMovB32,
     MOp::SMovM0,
+    MOp::SSaveExec,
+    MOp::SExecAll,
+    MOp::SRestoreExec,
     MOp::SAddM0,
     MOp::SAddU32,
     MOp::SAddcU32,
@@ -686,6 +691,7 @@ pub const ALL: &[MOp] = &[
     MOp::SNop,
     MOp::SWaitVm,
     MOp::SWaitLgkm,
+    MOp::SWaitCnt,
     MOp::SEndpgm,
 ];
 
@@ -1138,6 +1144,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SReadPhys => a("s_mov_b32", salu).dce(Pure),
         SMovB32 => a("s_mov_b32", salu).dce(Pure),
         SMovM0 => a("s_mov_b32", salu).backend(Backend::OwnOnly),
+        SSaveExec | SExecAll | SRestoreExec => a("s_mov_b64", salu).backend(Backend::OwnOnly),
         SAddM0 => a("s_add_u32", salu).scc(false, true).backend(Backend::OwnOnly),
         SAddU32 => a("s_add_u32", salu).scc(false, true).dce(Pure),
         SAddcU32 => a("s_addc_u32", salu).scc(true, true).dce(Pure),
@@ -1163,6 +1170,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SNop => a("s_nop", ctrl).fence_only(F::Nop),
         SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
+        SWaitCnt => a("s_waitcnt", ctrl).fence_only(F::WaitBoth).backend(Backend::OwnOnly),
         SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),
     }
 }

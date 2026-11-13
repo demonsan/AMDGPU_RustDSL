@@ -22,7 +22,7 @@ fn fence_then(f: Fence, x: &Effects, alu_across: bool) -> bool {
         Fence::SetPrio => true,
         Fence::Barrier | Fence::Nop => !alu_across || x.mem.is_some(),
         // An explicit wait only constrains what was issued before it.
-        Fence::WaitLgkm(_) | Fence::WaitVm(_) => false,
+        Fence::WaitLgkm(_) | Fence::WaitVm(_) | Fence::WaitBoth(..) => false,
         Fence::None => false,
     }
 }
@@ -33,6 +33,7 @@ fn then_fence(x: &Effects, f: Fence, alu_across: bool) -> bool {
         Fence::Barrier | Fence::Nop => !alu_across || x.mem.is_some(),
         Fence::WaitLgkm(_) => x.smem || matches!(&x.mem, Some(m) if m.space == Space::Lds),
         Fence::WaitVm(_) => matches!(&x.mem, Some(m) if m.space == Space::Global),
+        Fence::WaitBoth(..) => x.smem || x.mem.is_some(),
         Fence::None => false,
     }
 }

@@ -533,6 +533,31 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
             }
         }
     }
+    // an EXEC save / restore pair: the restore reads the pair the save wrote, in the same block, with no write to those SGPRs between
+    for b in &m.blocks {
+        let mut saved: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for (ii, i) in b.insts.iter().enumerate() {
+            match i.op {
+                MOp::SSaveExec => {
+                    saved.insert(i.imm, ii);
+                }
+                MOp::SRestoreExec => match saved.get(&i.imm) {
+                    None => errs.push(format!("exact: block {}: `s_mov_b64 exec, s[{}:{}]` without an EXEC save of that pair earlier in the block", b.label, i.imm, i.imm + 1)),
+                    Some(&from) => {
+                        for j in &b.insts[from + 1..ii] {
+                            if let Some(d) = j.dst {
+                                let (p, n) = (phys[d as usize], m.vreg_class(d).dwords());
+                                if scalar[d as usize] && p != u32::MAX && (p as i64) < i.imm + 2 && i.imm < (p + n) as i64 {
+                                    errs.push(format!("exact: block {}: {:?} writes s{p} between the EXEC save to s[{}:{}] and its restore", b.label, j.op, i.imm, i.imm + 1));
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
     if !missing.is_empty() {
         errs.push(format!("exact: {} value(s) without a pin: {}", missing.len(), missing.iter().take(40).cloned().collect::<Vec<_>>().join("\n    ")));
     }

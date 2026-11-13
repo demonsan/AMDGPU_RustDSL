@@ -93,7 +93,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
     // exact mode: operands in the form the instruction takes (inline / literal constants, SGPR sources), never via a copy
     if f.exact {
-        extra_all.extend(["imm", "sgpr", "sgpr2", "salu32", "cmpneg"]);
+        // edgepad: MFMA windows still open at a block end are carried into the successors (checked there), not padded at every block end
+        extra_all.extend(["imm", "sgpr", "sgpr2", "salu32", "cmpneg", "edgepad"]);
     }
     let extra: &[&str] = &extra_all;
     // the kernel's declared compile policy (amdgpu_dsl::CompileProfile::policy): its lowering tokens, then the retry ladder's and the kernel's own

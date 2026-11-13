@@ -71,7 +71,7 @@ fn reads_valu_hazard_operands(op: MOp) -> bool {
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
 fn is_fence(op: MOp) -> bool {
-    matches!(op, MOp::SWaitVm | MOp::SWaitLgkm | MOp::SBarrier | MOp::SNop | MOp::SEndpgm)
+    matches!(op, MOp::SWaitVm | MOp::SWaitLgkm | MOp::SWaitCnt | MOp::SBarrier | MOp::SNop | MOp::SEndpgm)
 }
 
 /// Wait states from the start of block `s` (plus `d0`) to the first touch of `reg` (usize::MAX: an in-place accumulation of the same MFMA,
@@ -793,6 +793,11 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
             let at = crate::op_attrs::attrs(inst.op);
             match inst.op {
                 MOp::SWaitVm => st.retain(|f| !(f.vm && !f.smem && f.after >= inst.imm as u32)),
+                MOp::SWaitCnt => {
+                    let (v, l) = ((inst.imm & 0xff) as u32, (inst.imm >> 8) as u32);
+                    st.retain(|f| !(f.vm && !f.smem && f.after >= v));
+                    st.retain(|f| !(!f.vm && (if f.smem { l == 0 } else { f.after >= l })));
+                }
                 MOp::SWaitLgkm => {
                     let k = inst.imm as u32;
                     // lgkmcnt(k) retires the LDS entries with >= k younger operations, and every scalar load only at k = 0

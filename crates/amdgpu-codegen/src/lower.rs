@@ -2601,6 +2601,10 @@ impl Lowerer {
                     self.push(MInst::new(MOp::SchedGroup).imm((*mask as i64 & 0xffff) | ((*size as i64 & 0xffff) << 16) | ((*sync as i64) << 32)));
                 }
                 Stmt::SNop { count } => self.push(MInst::new(MOp::SNop).imm(*count as i64)),
+                Stmt::ExecSave { sgpr } => self.push(MInst::new(MOp::SSaveExec).imm(*sgpr as i64)),
+                Stmt::ExecAll => self.push(MInst::new(MOp::SExecAll)),
+                Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),
+                Stmt::ExecRestore { sgpr } => self.push(MInst::new(MOp::SRestoreExec).imm(*sgpr as i64)),
                 Stmt::SetM0 { value } => {
                     let s = self.s_operand(*value)?;
                     if let Src::Reg(r) = s {

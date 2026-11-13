@@ -388,6 +388,19 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         }
     }
     match e.fence {
+        Fence::WaitBoth(v, n) => {
+            st.vm.complete(v.max(0) as u32);
+            let any_smem = st.lg.e.values().any(|x| x.smem);
+            if n <= 0 {
+                st.lg.e.clear();
+            } else if !any_smem {
+                st.lg.complete(n as u32);
+            }
+            if let Some(o) = out {
+                o.push(inst.clone());
+            }
+            return 0;
+        }
         Fence::WaitVm(n) => {
             st.vm.complete(n.max(0) as u32);
             if let Some(o) = out {
@@ -556,7 +569,7 @@ pub fn verify_waits(m: &MFunction) -> Result<(), String> {
                 let e = effects(m, inst);
                 let mut touched: Vec<Slot> = e.reads.clone();
                 touched.extend(e.writes.iter().copied());
-                if !matches!(e.fence, Fence::WaitVm(_) | Fence::WaitLgkm(_)) {
+                if !matches!(e.fence, Fence::WaitVm(_) | Fence::WaitLgkm(_) | Fence::WaitBoth(..)) {
                     if st.vm.need(&touched).is_some() || st.lg.need(&touched).is_some() {
                         return Err(format!("block {b} inst {ii} ({:?}) touches a register with a load in flight", inst.op));
                     }

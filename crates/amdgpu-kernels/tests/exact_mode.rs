@@ -176,3 +176,52 @@ fn a_descriptor_base_from_a_scalar_pointer_add() {
     assert!(c.asm.contains("s_add_u32 s10, s8, 0x100") || c.asm.contains("s_add_u32 s10, s8, 256"), "{}", c.asm);
     assert!(c.asm.contains("s_addc_u32 s11, s9, 0"), "{}", c.asm);
 }
+
+/// EXEC save / all / restore as authored statements (EXEC stays full); a restore without its save is named.
+#[test]
+fn exec_save_and_restore() {
+    let build = |save: bool| {
+        let mut f = tiny_with(|b| {
+            if save {
+                b.exec_save(20);
+            }
+            b.exec_all();
+            b.exec_restore(20);
+        });
+        f.exact = true;
+        f
+    };
+    let c = amdgpu_codegen::compile(&build(true)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_mov_b64 s[20:21], exec") && c.asm.contains("s_mov_b64 exec, -1") && c.asm.contains("s_mov_b64 exec, s[20:21]"), "{}", c.asm);
+    let e = amdgpu_codegen::compile(&build(false)).err().expect("restore without a save");
+    assert!(e.contains("without an EXEC save"), "{e}");
+}
+
+/// `tiny` with extra statements before the store.
+fn tiny_with(extra: impl Fn(&mut FnBuilder)) -> Function {
+    let mut b = FnBuilder::new("probe_exact_exec", 64);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(64 * 4));
+    b.exact();
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    b.wait_lds(0);
+    let rs = b.buffer_rsrc_sized(po, 64 * 4);
+    let off = b.bind_i32(ev(tid) << 2);
+    extra(&mut b);
+    let vf = b.let_(Op::BitcastF32(Opnd::Val(off)));
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, vf);
+    b.pin_sgpr_at(RegRef::Val(po), 8);
+    b.pin_sgpr_at(RegRef::Val(rs), 12);
+    b.pin_vgpr_at(RegRef::Val(tid), 0);
+    b.pin_vgpr_at(RegRef::Val(off), 1);
+    b.pin_vgpr_at(RegRef::Val(vf), 1);
+    b.finish()
+}
+
+#[test]
+fn the_combined_waitcnt_is_one_instruction() {
+    let f = tiny_with(|b| b.waitcnt(0, 0));
+    let c = amdgpu_codegen::compile(&f).unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("s_waitcnt vmcnt(0) lgkmcnt(0)"), "{}", c.asm);
+}

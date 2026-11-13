@@ -1306,6 +1306,14 @@ pub enum Stmt {
     SNop { count: u8 },
     /// Exact mode: `s_mov_b32 m0, value` placed by the author; the LDS-DMAs of an exact kernel use the current M0 and never write it.
     SetM0 { value: Opnd },
+    /// Exact mode: `s_mov_b64 s[sgpr:sgpr+1], exec` (the author saves the full EXEC mask; EXEC stays full in an exact kernel).
+    ExecSave { sgpr: u32 },
+    /// Exact mode: `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)` (the combined form).
+    WaitCnt { vm: u8, lgkm: u8 },
+    /// Exact mode: `s_mov_b64 exec, -1`.
+    ExecAll,
+    /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]` (restores a mask saved by `ExecSave` of the same pair, unchanged in between).
+    ExecRestore { sgpr: u32 },
     // ---- E5: exact branch forms (docs/exact-mode.md section 5; owner kernel-opt). Layout and scope only: no instruction of their own. ----
     /// The then-branch of the NEXT `BeginIf` is laid out out of line, at the `LayoutAnchor` named `anchor`: its blocks move there, the branch
     /// into it is the taken edge of the condition, and its end jumps to the if's join (a cold path that jumps back, or a loop exit body whose
@@ -2269,6 +2277,26 @@ impl FnBuilder {
     #[track_caller]
     pub fn set_m0(&mut self, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::SetM0 { value: value.into() });
+    }
+    /// Exact mode: `s_mov_b64 s[sgpr:sgpr+1], exec`.
+    #[track_caller]
+    pub fn exec_save(&mut self, sgpr: u32) {
+        self.push_stmt(Stmt::ExecSave { sgpr });
+    }
+    /// Exact mode: the combined `s_waitcnt vmcnt(vm) lgkmcnt(lgkm)`.
+    #[track_caller]
+    pub fn waitcnt(&mut self, vm: u8, lgkm: u8) {
+        self.push_stmt(Stmt::WaitCnt { vm, lgkm });
+    }
+    /// Exact mode: `s_mov_b64 exec, -1`.
+    #[track_caller]
+    pub fn exec_all(&mut self) {
+        self.push_stmt(Stmt::ExecAll);
+    }
+    /// Exact mode: `s_mov_b64 exec, s[sgpr:sgpr+1]`.
+    #[track_caller]
+    pub fn exec_restore(&mut self, sgpr: u32) {
+        self.push_stmt(Stmt::ExecRestore { sgpr });
     }
     /// HARD (exact mode): `r` sits at SGPR `base`.
     #[track_caller]
@@ -4344,7 +4372,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {

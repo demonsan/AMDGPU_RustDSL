@@ -696,6 +696,10 @@ impl FromIr for Stmt {
             "EndIf" => { v.expect_unit("EndIf")?; Ok(Stmt::EndIf) }
             "SNop" => { v.expect_struct("SNop")?; Ok(Stmt::SNop { count: FromIr::from_ir(v.field("count")?)? }) }
             "SetM0" => { v.expect_struct("SetM0")?; Ok(Stmt::SetM0 { value: FromIr::from_ir(v.field("value")?)? }) }
+            "ExecSave" => { v.expect_struct("ExecSave")?; Ok(Stmt::ExecSave { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
+            "WaitCnt" => { v.expect_struct("WaitCnt")?; Ok(Stmt::WaitCnt { vm: FromIr::from_ir(v.field("vm")?)?, lgkm: FromIr::from_ir(v.field("lgkm")?)? }) }
+            "ExecAll" => { v.expect_unit("ExecAll")?; Ok(Stmt::ExecAll) }
+            "ExecRestore" => { v.expect_struct("ExecRestore")?; Ok(Stmt::ExecRestore { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
             "BranchPlace" => { v.expect_struct("BranchPlace")?; Ok(Stmt::BranchPlace { anchor: FromIr::from_ir(v.field("anchor")?)? }) }
             "LayoutAnchor" => { v.expect_struct("LayoutAnchor")?; Ok(Stmt::LayoutAnchor { name: FromIr::from_ir(v.field("name")?)? }) }
             "DeclareVars" => { v.expect_struct("DeclareVars")?; Ok(Stmt::DeclareVars { vars: FromIr::from_ir(v.field("vars")?)?, init: FromIr::from_ir(v.field("init")?)? }) }
@@ -767,6 +771,10 @@ impl IrIds for Stmt {
             Stmt::EndIf => {}
             Stmt::SNop { count } => { IrIds::ids(&mut (*count), fv, fr); }
             Stmt::SetM0 { value } => { IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::ExecSave { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
+            Stmt::WaitCnt { vm, lgkm } => { IrIds::ids(&mut (*vm), fv, fr); IrIds::ids(&mut (*lgkm), fv, fr); }
+            Stmt::ExecAll => {}
+            Stmt::ExecRestore { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
             Stmt::BranchPlace { anchor } => { IrIds::ids(&mut (*anchor), fv, fr); }
             Stmt::LayoutAnchor { name } => { IrIds::ids(&mut (*name), fv, fr); }
             Stmt::DeclareVars { vars, init } => { for x in (*vars).iter_mut() { fr(x); } IrIds::ids(&mut (*init), fv, fr); }
