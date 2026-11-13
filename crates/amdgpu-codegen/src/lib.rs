@@ -90,6 +90,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
+    // exact mode: operands in the form the instruction takes (inline / literal constants, SGPR sources), never via a copy
+    if f.exact {
+        extra_all.extend(["imm", "sgpr", "sgpr2"]);
+    }
     let extra: &[&str] = &extra_all;
     // the kernel's declared compile policy (amdgpu_dsl::CompileProfile::policy): its lowering tokens, then the retry ladder's and the kernel's own
     let pol = f.compile_policy();

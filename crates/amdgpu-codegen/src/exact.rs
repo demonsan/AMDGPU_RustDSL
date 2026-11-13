@@ -391,15 +391,6 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
             !same
         });
     }
-    // 4. no instruction the author did not write
-    for b in &m.blocks {
-        for i in &b.insts {
-            if let Some(k) = synthetic_kind(&m, &stmts, i) {
-                let st = if i.stmt == 0 { "-".to_string() } else { format!("{} ({})", i.stmt - 1, format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(90).collect::<String>()) };
-                errs.push(format!("exact: block {} {:?}: {k}, at stmt {st}", b.label, i.op));
-            }
-        }
-    }
     let n = m.vregs.len();
     let mut phys = vec![u32::MAX; n];
     let mut scalar = vec![false; n];
@@ -440,6 +431,32 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         if phys[t as usize] != u32::MAX {
             phys[v as usize] = phys[t as usize] + off as u32;
             scalar[v as usize] = scalar[t as usize];
+        }
+    }
+    // a copy between two values the author pinned to the same register is no instruction (tuple assembly from consecutively pinned
+    // parts, a view or bitcast at the same register)
+    {
+        let ph = |r: VReg, phys: &Vec<u32>| -> Option<u32> {
+            let p = phys[r as usize];
+            (p != u32::MAX).then_some(p)
+        };
+        for b in m.blocks.iter_mut() {
+            b.insts.retain(|i| {
+                let copy = matches!(i.op, MOp::VMovB32 | MOp::SMovB32) && i.srcs.len() == 1;
+                match (copy, i.dst, i.srcs.first()) {
+                    (true, Some(d), Some(Src::Reg(s))) => !(ph(d, &phys).is_some() && ph(d, &phys) == ph(*s, &phys) && scalar[d as usize] == scalar[*s as usize]),
+                    _ => true,
+                }
+            });
+        }
+    }
+    // 4. no instruction the author did not write
+    for b in &m.blocks {
+        for i in &b.insts {
+            if let Some(k) = synthetic_kind(&m, &stmts, i) {
+                let st = if i.stmt == 0 { "-".to_string() } else { format!("{} ({})", i.stmt - 1, format!("{:?}", stmts.get(i.stmt as usize - 1)).chars().take(90).collect::<String>()) };
+                errs.push(format!("exact: block {} {:?}: {k}, at stmt {st}", b.label, i.op));
+            }
         }
     }
     if !missing.is_empty() {
