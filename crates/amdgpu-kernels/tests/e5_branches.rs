@@ -233,3 +233,96 @@ fn exit_paths_are_barrier_balanced() {
     let e = bar_errors(&two_role_exits(2));
     assert!(e.iter().any(|m| m.contains("exit paths")), "{e:?}");
 }
+
+/// A two-role ring (wave 0 produces, wave 1 consumes) whose loops are left only through E5 exits with bodies: the consumer's exit body
+/// drains the last tile. `drain_version_off` = 0 is the correct protocol; 1 makes the drain expect a version nobody produced.
+fn ring_with_exit_drain(drain_version_off: i32) -> Function {
+    let mut b = FnBuilder::new("e5_ring_exit", 128);
+    b.lds(8192);
+    b.arg("n", DType::I32, 0, 4);
+    b.ka_range(0x00, 1, 64);
+    b.lds_ring("buf", 0, 1024, 2);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let six = b.c_i32(6);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(six)));
+    let one = b.c_i32(1);
+    let is_p = b.cmp(CmpPred::Lt, CmpTy::I32, wave, one);
+    let c63 = b.c_i32(63);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let c16 = b.c_i32(16);
+    let lane16 = b.mul_i32(lane, c16);
+    let z = b.c_i32(0);
+    let v = b.frag4(z, z, z, z);
+    let c1024 = b.c_i32(1024);
+    b.begin_if(is_p);
+    {
+        b.tile_produce("buf", Opnd::I32(0), Opnd::I32(0));
+        b.store_lds_b128(lane16, v);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+        let it = b.begin_loop(&[(DType::I32, Opnd::I32(0))])[0];
+        let nxt = b.add_i32(it, Opnd::I32(1));
+        let c = b.cmp(CmpPred::Ge, CmpTy::I32, nxt, n);
+        b.begin_if_at(c, "p_exit");
+        b.barrier();
+        b.break_if(c);
+        b.end_if();
+        let slot = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::I32(1)));
+        b.tile_produce("buf", slot, nxt);
+        let base = b.mul_i32(slot, c1024);
+        let wa = b.add_i32(base, lane16);
+        b.store_lds_b128(wa, v);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+        b.set_var(it, nxt);
+        b.end_loop();
+        b.layout_anchor("p_exit");
+    }
+    b.else_();
+    {
+        b.barrier();
+        let it = b.begin_loop(&[(DType::I32, Opnd::I32(0))])[0];
+        let nxt = b.add_i32(it, Opnd::I32(1));
+        let c = b.cmp(CmpPred::Ge, CmpTy::I32, nxt, n);
+        let slot = b.let_(Op::AndI32(Opnd::Var(it), Opnd::I32(1)));
+        let base = b.mul_i32(slot, c1024);
+        let ra = b.add_i32(base, lane16);
+        b.begin_if_at(c, "c_exit");
+        let dver = b.add_i32(it, Opnd::I32(drain_version_off));
+        b.tile_consume("buf", slot, dver);
+        let _ = b.load_lds_b128(ra);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+        b.break_if(c);
+        b.end_if();
+        b.tile_consume("buf", slot, Opnd::Var(it));
+        let _ = b.load_lds_b128(ra);
+        b.tile_end();
+        b.wait_lds(0);
+        b.barrier();
+        b.set_var(it, nxt);
+        b.end_loop();
+        b.layout_anchor("c_exit");
+    }
+    b.end_if();
+    b.finish()
+}
+
+fn tile_errors(f: &Function) -> Vec<String> {
+    let rep = amdgpu_codegen::gpu_verify::analyse(f).unwrap_or_else(|e| panic!("{e}"));
+    rep.errors().iter().map(|e| format!("{e:?}")).filter(|m| m.contains("GV-TILE") || m.contains("GV-PROTO") || m.contains("GV-BAR")).collect()
+}
+
+/// The tile protocol simulator follows E5 exits with bodies: the drain of a correct ring verifies (no GV-TILE-UNSUPPORTED), and a
+/// drain expecting a version that was never produced is caught.
+#[test]
+fn exit_drains_are_protocol_checked() {
+    let ok = tile_errors(&ring_with_exit_drain(0));
+    assert!(ok.is_empty(), "{ok:?}");
+    let bad = tile_errors(&ring_with_exit_drain(1));
+    assert!(bad.iter().any(|m| m.contains("STALE")), "{bad:?}");
+}

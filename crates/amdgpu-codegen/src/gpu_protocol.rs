@@ -491,6 +491,32 @@ impl<'a> Sim<'a> {
                             s.exec(r.0, r.1);
                         }
                     };
+                    // an E5 loop exit with its own body (`if c { drain..; break_if(c) }`): like a runtime `break_if` - in the LAST simulated iteration of the
+                    // outermost loop it is a decision (taken: the arm runs and leaves; keyed by the exit's ordinal, workgroup-uniform), otherwise it is
+                    // not taken (the iteration continues)
+                    let exit_arm = else_range.is_none()
+                        && then_range.1 > then_range.0
+                        && matches!(&f.stmts()[then_range.1 - 1], Stmt::BreakIf { cond: c2 } if c2 == cond)
+                        && matches!(self.cv(cond), CV::U);
+                    if exit_arm && self.loop_depth >= 1 && !(self.div.contains(&i) && !self.in_role) {
+                        let take = if self.loop_depth == 1 && self.outer == self.n as i64 - 1 {
+                            let key = usize::MAX - self.brk_ord;
+                            self.brk_ord += 1;
+                            self.choose(key, true)
+                        } else {
+                            false
+                        };
+                        if take {
+                            // the arm body; its final break_if is a runtime condition, so leave explicitly
+                            self.exec(then_range.0, then_range.1 - 1);
+                            self.close();
+                            self.break_taken = true;
+                            return;
+                        }
+                        self.close();
+                        i = endif + 1;
+                        continue;
+                    }
                     if self.div.contains(&i) && !self.in_role && has_proto {
                         // the wave ROLE split: role 0 takes the then arm, role 1 the else arm
                         self.in_role = true;
