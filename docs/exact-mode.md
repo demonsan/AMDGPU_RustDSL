@@ -101,6 +101,36 @@ between an `s_cmp` and its `s_cselect`. Each must fail with the named rule.
 | E3 | DSL: `declare_region(.., exact)`, `pin_sgpr_at`, `pin_agpr_at`, `s_nop`, `waitcnt(vm, lgkm)`, `set_m0`; the exact pass body for marked regions (scheduler, auto waits, nops, M0 passes, CFG passes, ladders off; checks on) | md5 identical for every existing kernel; unit tests on a small exact kernel; hardware probe (a pinned window that runs) |
 | E4 | the replica's matrix phase in exact mode with kernel-opt's register plan (2) | port_gate (correctness), then perf vs the vendor in-session |
 
+## 5.1 Forms the replica needs (kernel-opt, from the vendor disassembly)
+
+1. **Per-dword liveness inside tuples, in-place sub-register writes.** The vendor's P is written into S dword by dword while the rest of S is
+   live (`v_cvt_pknorm_u16_f32 v52, v52, v53`, `v_cvt_scalef32_pk_fp8_bf16 v52, v52, s89 op_sel:[0,0,1]`).
+   - The register check is per dword: a dword may be redefined after its last reader, while other dwords of the tuple are still live.
+   - A 16-bit half write (`op_sel` dst hi) is a read-modify-write of its dword.
+   - The scheduler's effects model already tracks dwords (`RegFx::SubWrite`, the precise segments of the two-phase allocator); the exact
+     check uses the same model.
+2. **Tuple assembly from pinned parts without copies.** `frag_cat` / pack of values pinned at consecutive registers lowers to nothing; a
+   gap or a misaligned base is an error.
+3. **Loop-variable pins.** `pin_vgpr_at(RegRef::Var)` exists; `pin_sgpr_at` accepts variables too (the vendor's s68 loop key with
+   `s_addk_i32 s68, 0x80`, s89 / s90 / s92 softmax scale and threshold).
+4. **VCC.** `break_if` / `begin_if_unlikely` on a compare lowers to exactly `v_cmp_*_e32` + `s_cbranch_vccnz` (no extra `s_and` / `s_cmp`);
+   the author's `s_nop` between them is checked against the VCC distance.
+5. **`s_setprio n`** as a statement.
+
+Not needed for the replica: AGPRs, EXEC masking (EXEC stays full in the hot path).
+
+## 5.2 Hazard rules the vendor's code undercuts (running list)
+
+In exact mode a vendor distance below our table surfaces as a named violation. A rule is relaxed only with evidence: a hardware probe,
+LLVM's hazard recognizer, or the ISA document. There are no silent allowances.
+
+| Rule (target row) | Our distance | Vendor | Evidence | Status |
+|---|---|---|---|---|
+| `valu-vcc-valu` (VALU VCC write -> VALU VCC read) | 2 -> 1 | 1 | hardware probe correct at 0 / 1 / 2 (`tools/vcc_hazard_probe.sh`); LLVM asks 2 | relaxed to 1 (user decision) |
+| FP4 / FP6 16x16x128 MFMA -> VALU / VMEM read | 8 / 20 | - | `tools/mfma_lat_probe.sh`: 7 / 1 measured | not relaxed (oracle allowance documents LLVM's) |
+
+(More rows as exact-mode checks on the replica name them.)
+
 ## 6. Coordination with kernel-opt (item 2)
 
 The register plan must give a pin to every value of the exact region. That includes temporaries: read results, scale words, P inside S,
