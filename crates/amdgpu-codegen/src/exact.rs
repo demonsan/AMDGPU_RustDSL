@@ -193,6 +193,12 @@ pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> 
 /// any allocation: the compiler's, or the author's pins in exact mode. Returns one message per clobber (instruction, register, the
 /// value whose live range it cuts).
 pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String> {
+    check_registers_with(m, a, &[])
+}
+
+/// `check_registers` with values that hold a hardware-initialised register at entry (the workitem id in v0, the kernarg pointer, the
+/// workgroup ids): they count as written from the start.
+pub fn check_registers_with(m: &MFunction, a: &crate::regalloc::Alloc, entry: &[VReg]) -> Vec<String> {
     use crate::sched::effects::{effects, Slot};
     use std::collections::{HashMap, HashSet};
     let nb = m.blocks.len();
@@ -261,6 +267,14 @@ pub fn check_registers(m: &MFunction, a: &crate::regalloc::Alloc) -> Vec<String>
         }
     }
     let mut def_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    if nb > 0 {
+        for &r in entry {
+            for s in crate::sched::effects::reg_slots(m, r) {
+                def_in[0].insert(s * 2);
+                def_in[0].insert(s * 2 + 1);
+            }
+        }
+    }
     loop {
         let mut changed = false;
         for bi in 0..nb {
@@ -363,6 +377,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
     // a copy of a hardware register into a value pinned at that same register is no instruction
     let alias = m.alias.clone();
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
+    let mut entry: Vec<VReg> = Vec::new();
     for b in m.blocks.iter_mut() {
         b.insts.retain(|i| {
             let same = match (i.op, i.dst) {
@@ -370,6 +385,9 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                 (MOp::SReadPhys, Some(d)) => pin.get(&canon(d)) == Some(&(true, i.imm as u32)),
                 _ => false,
             };
+            if same {
+                entry.push(canon(i.dst.unwrap()));
+            }
             !same
         });
     }
@@ -433,7 +451,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         for v in verify_final(&m, &a, false) {
             errs.push(format!("exact: {v}"));
         }
-        for c in check_registers(&m, &a) {
+        for c in check_registers_with(&m, &a, &entry) {
             errs.push(format!("exact: register clobber: {c}"));
         }
     }
