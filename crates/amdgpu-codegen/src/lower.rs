@@ -2894,6 +2894,12 @@ impl Lowerer {
                         return Ok((on, regs));
                     }
                     // `cmpneg`: a generic compare branches on vcc directly (no 0/1 materialisation)
+                    Op::Cmp { pred, ty, a, b } if self.exact => {
+                        let (sa, sb) = self.exact_srcs(a, b)?;
+                        self.push(MInst::new(cmp_mop(pred, ty)).src(sa).src(sb));
+                        let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                        return Ok((on, [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect()));
+                    }
                     Op::Cmp { pred, ty, a, b } if opt_on("cmpneg") => {
                         let ra = self.as_v1(a)?;
                         let rb = self.as_v1(b)?;
@@ -3534,6 +3540,18 @@ impl Lowerer {
             }
             Op::XorI32(a, b) => self.bin_v1(dst, MOp::VXorB32, *a, *b)?,
             Op::MulI32(a, b) => self.bin_v1(dst, MOp::VMulLoU32, *a, *b)?,
+            Op::ShlI32(a, b) if self.exact => {
+                let (shift, value) = self.exact_srcs(*b, *a)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VLshlB32).def(d).src(shift).src(value));
+                self.val.insert(dst, d);
+            }
+            Op::LshrI32(a, b) if self.exact => {
+                let (shift, value) = self.exact_srcs(*b, *a)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VLshrB32).def(d).src(shift).src(value));
+                self.val.insert(dst, d);
+            }
             Op::ShlI32(a, b) => {
                 // lshlrev encodes the shift in src0, where a literal is legal.
                 let shift = self.shift_operand(*b)?;
@@ -3549,6 +3567,39 @@ impl Lowerer {
                 self.touch(&[Src::Reg(value)]);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VLshrB32).def(d).src(shift).srcreg(value));
+                self.val.insert(dst, d);
+            }
+            Op::FmaF32(a, b, c) if self.exact => {
+                // VOP3: inline constants anywhere, one SGPR; a `NegF32` operand folds into the source-negate modifier
+                let mut neg = 0u8;
+                let mut ops = [*a, *b, *c];
+                for (k, o) in ops.iter_mut().enumerate() {
+                    if let Opnd::Val(v) = *o {
+                        if let Some(Op::NegF32(x)) = self.defs.get(&v) {
+                            *o = *x;
+                            neg |= 1 << k;
+                        }
+                    }
+                }
+                let mut bus = false;
+                let mut srcs = Vec::new();
+                for o in ops {
+                    let s = match (self.const_bits(o), self.sgpr_src(o)) {
+                        (Some(k), _) if is_inline_const(k) => Src::Imm(k),
+                        (None, Some(s)) if !bus => {
+                            bus = true;
+                            Src::Reg(s)
+                        }
+                        _ => Src::Reg(self.as_v1(o)?),
+                    };
+                    srcs.push(s);
+                }
+                let regs: Vec<Src> = srcs.iter().copied().filter(|s| matches!(s, Src::Reg(_))).collect();
+                self.touch(&regs);
+                let d = self.new_vreg(RClass::V1);
+                let mut inst = MInst::new(MOp::VFmaF32).def(d).src(srcs[0]).src(srcs[1]).src(srcs[2]);
+                inst.neg = neg;
+                self.push(inst);
                 self.val.insert(dst, d);
             }
             Op::FmaF32(a, b, c) => {
@@ -4521,7 +4572,36 @@ impl Lowerer {
     }
 
     /// A VALU op with plain V1 operands (constants materialised; e32 / VOP3 forms both accept them).
+    /// Exact mode: the two sources of a VALU op in the form the author wrote: src0 a constant (inline or literal), an SGPR or a VGPR;
+    /// src1 an inline constant or an SGPR (both make the VOP3 `_e64` encoding) or a VGPR; at most one SGPR / literal (constant bus).
+    fn exact_srcs(&mut self, a: Opnd, b: Opnd) -> Result<(Src, Src), String> {
+        let s0 = match (self.const_bits(a), self.sgpr_src(a)) {
+            (Some(k), _) => Src::Imm(k),
+            (None, Some(s)) => Src::Reg(s),
+            _ => Src::Reg(self.as_v1(a)?),
+        };
+        let bus0 = match s0 {
+            Src::Imm(k) => !is_inline_const(k),
+            Src::Reg(r) => !self.mir.vreg_class(r).is_vector(),
+        };
+        let s1 = match (self.const_bits(b), self.sgpr_src(b)) {
+            (Some(k), _) if is_inline_const(k) => Src::Imm(k),
+            (None, Some(s)) if !bus0 => Src::Reg(s),
+            _ => Src::Reg(self.as_v1(b)?),
+        };
+        let regs: Vec<Src> = [s0, s1].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        Ok((s0, s1))
+    }
+
     fn v_plain(&mut self, dst: ValueId, op: MOp, srcs: &[Opnd]) -> Result<(), String> {
+        if self.exact && srcs.len() == 2 {
+            let (s0, s1) = self.exact_srcs(srcs[0], srcs[1])?;
+            let d = self.new_vreg(RClass::V1);
+            self.push(MInst::new(op).def(d).src(s0).src(s1));
+            self.val.insert(dst, d);
+            return Ok(());
+        }
         // `sgpr2` (W3 B2, the vendor's uniform operands): a wave-uniform value already in an SGPR is src0 of the e32 form of the
         // commutative VOP2 ops (and of v_sub when it is the minuend); constant bus limit 1, so the other operand stays a VGPR
         if opt_on("sgpr2") && srcs.len() == 2 {

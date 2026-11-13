@@ -385,13 +385,10 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[1]),
             src1(a, inst.srcs[2])
         )],
-        MOp::VFmaF32 => vec![format!(
-            "v_fma_f32 {}, {}, {}, {}",
-            d(a),
-            src1(a, inst.srcs[0]),
-            src1(a, inst.srcs[1]),
-            src1(a, inst.srcs[2])
-        )],
+        MOp::VFmaF32 => {
+            let s = |k: usize| format!("{}{}", if inst.neg & (1 << k) != 0 { "-" } else { "" }, src1(a, inst.srcs[k]));
+            vec![format!("v_fma_f32 {}, {}, {}, {}", d(a), s(0), s(1), s(2))]
+        }
         MOp::VExpF32 => un(a, inst, "v_exp_f32_e32"),
         MOp::VLogF32 => un(a, inst, "v_log_f32_e32"),
         MOp::VRcpF32 => un(a, inst, "v_rcp_f32_e32"),
@@ -1171,7 +1168,7 @@ fn d_s(a: &Alloc, inst: &MInst) -> String {
 
 fn bin(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     // an SGPR in src1 needs the VOP3 encoding (VOP2 src1 is a VGPR)
-    let s1_scalar = matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false));
+    let s1_scalar = matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false)) || matches!(inst.srcs.get(1), Some(Src::Imm(_)));
     if inst.neg != 0 || s1_scalar {
         // VOP3 form with source-negate modifiers
         let m = mnemonic.replace("_e32", "_e64");
@@ -1197,7 +1194,7 @@ fn cmp_mask(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
 
 fn cmp(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     // an SGPR in src1: the VOP3 form with an explicit vcc destination
-    if matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false)) {
+    if matches!(inst.srcs.get(1), Some(Src::Reg(r)) if a.scalar.get(*r as usize).copied().unwrap_or(false)) || matches!(inst.srcs.get(1), Some(Src::Imm(_))) {
         return vec![format!("{} vcc, {}, {}", mnemonic.replace("_e32", "_e64"), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))];
     }
     vec![format!("{} vcc, {}, {}", mnemonic, src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
