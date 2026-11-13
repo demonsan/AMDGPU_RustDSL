@@ -2865,6 +2865,13 @@ impl Lowerer {
                 Stmt::SNop { count } => self.push(MInst::new(MOp::SNop).imm(*count as i64)),
                 Stmt::ExecSave { sgpr } => self.push(MInst::new(MOp::SSaveExec).imm(*sgpr as i64)),
                 Stmt::ExecAll => self.push(MInst::new(MOp::SExecAll)),
+                Stmt::ExecSet { mask } => {
+                    let k = *mask as i64;
+                    if !((-16..=64).contains(&k) || *mask <= u32::MAX as u64) {
+                        return Err(format!("exec_set({mask:#x}): not encodable (an inline constant -16..64, or a 32-bit literal zero-extended)"));
+                    }
+                    self.push(MInst::new(MOp::SExecSet).imm(k));
+                }
                 Stmt::TrustWait { .. } => LAST_TRUSTS.with(|t| t.borrow_mut().push(self.cur_stmt)),
                 Stmt::EncodeE64 => self.e64_next = true,
                 Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),

@@ -1057,6 +1057,13 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SMovM0 => vec![format!("s_mov_b32 m0, {}", src1_s(a, inst.srcs[0]))],
         MOp::SSaveExec => vec![format!("s_mov_b64 s[{}:{}], exec", inst.imm, inst.imm + 1)],
         MOp::SExecAll => vec!["s_mov_b64 exec, -1".to_string()],
+        MOp::SExecSet => {
+            let m = inst.imm as u64;
+            let k = m as i64;
+            // an inline constant is sign-extended; a 32-bit literal is zero-extended (lowering checked the mask is one of the two)
+            let s = if (-16..=64).contains(&k) { format!("{k}") } else { format!("0x{:x}", m) };
+            vec![format!("s_mov_b64 exec, {s}")]
+        }
         MOp::SRestoreExec => vec![format!("s_mov_b64 exec, s[{}:{}]", inst.imm, inst.imm + 1)],
         MOp::SAddM0 => vec![format!("s_add_u32 m0, {}, {}", src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SMovB32 => {

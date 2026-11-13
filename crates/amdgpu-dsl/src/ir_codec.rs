@@ -719,6 +719,7 @@ impl FromIr for Stmt {
             "ExecSave" => { v.expect_struct("ExecSave")?; Ok(Stmt::ExecSave { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
             "WaitCnt" => { v.expect_struct("WaitCnt")?; Ok(Stmt::WaitCnt { vm: FromIr::from_ir(v.field("vm")?)?, lgkm: FromIr::from_ir(v.field("lgkm")?)? }) }
             "ExecAll" => { v.expect_unit("ExecAll")?; Ok(Stmt::ExecAll) }
+            "ExecSet" => { v.expect_struct("ExecSet")?; Ok(Stmt::ExecSet { mask: FromIr::from_ir(v.field("mask")?)? }) }
             "ExecRestore" => { v.expect_struct("ExecRestore")?; Ok(Stmt::ExecRestore { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
             "TrustWait" => { v.expect_struct("TrustWait")?; Ok(Stmt::TrustWait { reason: FromIr::from_ir(v.field("reason")?)? }) }
             "EncodeE64" => { v.expect_unit("EncodeE64")?; Ok(Stmt::EncodeE64) }
@@ -796,6 +797,7 @@ impl IrIds for Stmt {
             Stmt::ExecSave { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
             Stmt::WaitCnt { vm, lgkm } => { IrIds::ids(&mut (*vm), fv, fr); IrIds::ids(&mut (*lgkm), fv, fr); }
             Stmt::ExecAll => {}
+            Stmt::ExecSet { mask } => { IrIds::ids(&mut (*mask), fv, fr); }
             Stmt::ExecRestore { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
             Stmt::TrustWait { reason } => { IrIds::ids(&mut (*reason), fv, fr); }
             Stmt::EncodeE64 => {}
