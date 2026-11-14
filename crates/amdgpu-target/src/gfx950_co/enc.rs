@@ -229,7 +229,13 @@ fn d32(v: u32) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 
+/// The SOPP branches (their operand is a label, so the oracle lines leave them out).
+const BRANCHES: &[(&str, u32)] = &[("s_branch", 2), ("s_cbranch_scc0", 4), ("s_cbranch_scc1", 5), ("s_cbranch_vccz", 6), ("s_cbranch_vccnz", 7), ("s_cbranch_execz", 8), ("s_cbranch_execnz", 9)];
+
 fn lookup(mn: &str) -> Option<(&'static str, u32)> {
+    if let Some(b) = BRANCHES.iter().find(|b| b.0 == mn) {
+        return Some(("SOPP", b.1));
+    }
     OPS.binary_search_by(|e| e.0.cmp(mn)).ok().map(|i| (OPS[i].1, OPS[i].2 as u32))
 }
 

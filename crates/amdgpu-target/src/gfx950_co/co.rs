@@ -362,7 +362,7 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
     let hash_len = 8 + 3 * 4 + 3 * 4;
     let off_dynstr = align(off_hash + hash_len, 1);
     let off_text = align(off_dynstr + dynstr.len(), 256);
-    let seg1_end = off_text;
+    let seg1_end = off_dynstr + dynstr.len();
     let va_text = align(seg1_end, 0x1000) + off_text % 0x1000;
     let off_dynamic = off_text + text.len();
     let va_dynamic = align(va_text + text.len(), 0x1000) + off_dynamic % 0x1000;
@@ -497,7 +497,8 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
     };
     let rw_msz = (dynamic_len + relro_len) as u64;
     seg(6, 4, 0x40, 0x40, 0x1c0, 0x1c0, 8, &mut ph);
-    seg(1, 4, 0, 0, off_text as u64, off_text as u64, 0x1000, &mut ph);
+    let seg1 = (off_dynstr + dynstr.len()) as u64;
+    seg(1, 4, 0, 0, seg1, seg1, 0x1000, &mut ph);
     seg(1, 5, off_text as u64, va_text as u64, text.len() as u64, text.len() as u64, 0x1000, &mut ph);
     seg(1, 6, off_dynamic as u64, va_dynamic as u64, dynamic_len as u64, rw_msz, 0x1000, &mut ph);
     seg(2, 6, off_dynamic as u64, va_dynamic as u64, dynamic_len as u64, dynamic_len as u64, 8, &mut ph);
