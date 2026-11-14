@@ -171,46 +171,52 @@ pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>,
     sizes.sort_by(|a, b| b.cmp(a));
     let mut classes = Vec::new();
     let mut notes: Vec<String> = Vec::new();
-    for (_, members) in groups {
-        if members.len() < 2 {
-            continue;
-        }
-        let (i0, i1) = (members[0], members[1]);
-        let (v0, v1) = (texts[i0].0 as i128, texts[i1].0 as i128);
-        let l0: Vec<&str> = texts[i0].1.lines().collect();
-        let l1: Vec<&str> = texts[i1].1.lines().collect();
-        let mut holes = Vec::new();
-        for (li, (a, b)) in l0.iter().zip(&l1).enumerate() {
-            let (la, lb) = (literals(a), literals(b));
-            for (k, (x, y)) in la.iter().zip(&lb).enumerate() {
-                if x.2 != y.2 {
-                    let d = y.2 - x.2;
-                    if d % (v1 - v0) != 0 {
-                        continue; // not integral: the verification below rejects every member but the base
+    for (_, group) in groups {
+        // cover the group with affine regimes: fit on the first two members left, keep the members that reproduce their full compile exactly (a literal such as `m ^ 1024` is affine only on the
+        // values with the same bit pattern), repeat with the rest
+        let mut remaining = group;
+        while remaining.len() >= 2 {
+            let (i0, i1) = (remaining[0], remaining[1]);
+            let (v0, v1) = (texts[i0].0 as i128, texts[i1].0 as i128);
+            let l0: Vec<&str> = texts[i0].1.lines().collect();
+            let l1: Vec<&str> = texts[i1].1.lines().collect();
+            let mut holes = Vec::new();
+            for (li, (a, b)) in l0.iter().zip(&l1).enumerate() {
+                let (la, lb) = (literals(a), literals(b));
+                for (k, (x, y)) in la.iter().zip(&lb).enumerate() {
+                    if x.2 != y.2 {
+                        let d = y.2 - x.2;
+                        if d % (v1 - v0) != 0 {
+                            continue; // not integral: the check below rejects every member but the base
+                        }
+                        let slope = d / (v1 - v0);
+                        holes.push(Hole { line: li, ordinal: k, a: slope, b: x.2 - slope * v0 });
                     }
-                    let slope = d / (v1 - v0);
-                    holes.push(Hole { line: li, ordinal: k, a: slope, b: x.2 - slope * v0 });
                 }
             }
-        }
-        let mut class = Class { lines: l0.iter().map(|s| s.to_string()).collect(), holes, ranges: Vec::new() };
-        // keep exactly the members whose instantiation is byte-identical to their full compile
-        let mut valid: Vec<i64> = Vec::new();
-        for &i in &members {
-            let v = texts[i].0;
-            let got = class.instantiate_unchecked(v);
-            if got == texts[i].1 {
-                valid.push(v);
-            } else if notes.len() < 3 {
-                let (a, b) = got.lines().zip(texts[i].1.lines()).enumerate().find(|(_, (a, b))| a != b).map(|(k, (a, b))| (format!("line {k}: {a}"), b.to_string())).unwrap_or_default();
-                notes.push(format!("value {v} differs: template {a} | compile {b}"));
+            let mut class = Class { lines: l0.iter().map(|s| s.to_string()).collect(), holes, ranges: Vec::new() };
+            let mut valid: Vec<i64> = Vec::new();
+            let mut rest: Vec<usize> = Vec::new();
+            for &i in &remaining {
+                let v = texts[i].0;
+                let got = class.instantiate_unchecked(v);
+                if got == texts[i].1 {
+                    valid.push(v);
+                } else {
+                    if notes.len() < 3 {
+                        let (x, y) = got.lines().zip(texts[i].1.lines()).enumerate().find(|(_, (x, y))| x != y).map(|(k, (x, y))| (format!("line {k}: {x}"), y.to_string())).unwrap_or_default();
+                        notes.push(format!("value {v} is outside this regime: template {x} | compile {y}"));
+                    }
+                    rest.push(i);
+                }
             }
+            if valid.len() < 2 {
+                break;
+            }
+            class.ranges = compress(&valid);
+            classes.push(class);
+            remaining = rest;
         }
-        if valid.len() < 2 {
-            continue;
-        }
-        class.ranges = compress(&valid);
-        classes.push(class);
     }
     (classes, sizes, notes)
 }
