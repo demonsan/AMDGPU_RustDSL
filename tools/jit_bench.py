@@ -58,7 +58,7 @@ for k in kernels:
     if nm is None:
         print('skip', k, '(no specializable i32 argument)')
         continue
-    specs += [(k, {nm: 64 * (i + 1)}) for i in range(a.n)]
+    specs += [(k, {nm: i + 1}) for i in range(a.n)]
 workers = [int(x) for x in a.workers.split(',')]
 print(f'{len(specs)} shapes ({len(kernels)} kernels x {a.n}), amdc = {amdc}, cpu = {os.cpu_count()}\n')
 
