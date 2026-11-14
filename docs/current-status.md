@@ -95,7 +95,7 @@ Main `3d064d0c`：`cargo test` 163 个测试目标 / 650 项全绿，`run_all.sh
   - 出厂 kernel 均未改变。
 - **GV-GLB-RW / untracked 的证明进度**（gw-slice，Main `86f1f585`）：
   - backend 新增的验证器形式：右移的精确性（N = 128·NT 时 N >> 7 = NT）、`(P + 2^k − 1) >> k` 读作 ceil 定义的网格、负系数（逆序 tile）数位的镜像。
-  - 由此证明了 4 个 split-K GEMM（`*_64_splitk_lc`）与 `fmha_bwd_dq_hd128_bf16_causal`，白名单 15 → 10 条。
+  - 由此证明了 4 个 split-K GEMM（`*_64_splitk_lc`）与 `fmha_bwd_dq_hd128_bf16_causal`，白名单 15 → 10 条；随后 gw-pow2（新契约形式 `ka_pow2`、wg_union 键统一）又证明了 4 个 KV-split kernel 与 `fmha_fwd_hd128_fp8pt_v3_causal`，白名单只剩 5 条数据相关的主机契约（cu_seqlens、MoE 路由排列、行内 rank、slot_mapping×2）。
   - 剩余 10 条都带理由：
     - 5 条数据相关下标：conv1d_fwd 的输出行、moe_sorting、topk_per_row、qknorm_rope_kvcache、reshape_cache；
     - 4 个 KV-split fwd：需要 `S = 1 << lg_s` 的合同形式；

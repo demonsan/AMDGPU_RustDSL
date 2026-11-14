@@ -27,7 +27,7 @@ Soundness findings of the round, all fixed with regression tests ([`current-stat
 - the causal_conv1d_fwd cross-workgroup state race. It was Python-reachable, in both the grid and `_sched` variants. `GV-GLB-RW` is now an error, certificates count untracked accesses, and reachable kernels may keep untracked accesses only via the reasoned `ALLOW_UNTRACKED` list in `crates/amdgpu-kernels/tests/verify_reachable.rs`;
 - the LLVM tail's kernarg metadata (`.args` declares every kernarg; `causal_conv1d_fwd_*_sched` faulted under the auto backend);
 - the peephole audit ([`peephole-audit.md`](peephole-audit.md)): 5 confirmed bugs with adversarial tests, f32 select -> min / max only under the opt-in `fminmax`, no shipped kernel changed.
-- GV-GLB-RW / untracked proof status: backend's verifier forms prove the 4 split-K GEMMs and `fmha_bwd_dq_hd128_bf16_causal` (allowlist 15 -> 10).
+- GV-GLB-RW / untracked proof status: backend's verifier forms prove the 4 split-K GEMMs and `fmha_bwd_dq_hd128_bf16_causal` (allowlist 15 -> 10); gw-pow2 then proves the 4 KV-split kernels (`ka_pow2` contract) and `fmha_fwd_hd128_fp8pt_v3_causal`, leaving 5 data-dependent host-contract entries (cu_seqlens, MoE routing permutation, in-row rank, slot_mapping x2).
   - The forms: exact right shifts, `(P + 2^k - 1) >> k` read as the ceil-defined grid, mirrored negative-coefficient digits.
   - The 10 entries left all carry reasons: 5 data-dependent indices, 4 KV-split fwd kernels (need an `S = 1 << lg_s` contract form), fp8pt causal (per-class caps for paired tiles).
 - argmax: its NaN behaviour differs from torch (pre-existing, documented).
