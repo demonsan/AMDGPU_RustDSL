@@ -1177,6 +1177,20 @@ fn compatible(a: &Trace, b: &Trace) -> bool {
     a.path.iter().filter(|p| p.2).all(|pa| b.path.iter().filter(|p| p.2 && p.0 == pa.0).all(|pb| pb.1 == pa.1))
 }
 
+thread_local! {
+    static REFERENCE_PAIR_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `g` with the straightforward (quadratic) pair checks of `check_pair` instead of the indexed ones: the reference of the differential test
+/// (`crates/amdgpu-kernels/tests/gpu_protocol_diff.rs`): the two must report the same diagnostics in the same order for every kernel.
+#[doc(hidden)]
+pub fn with_reference_pair_checks<R>(g: impl FnOnce() -> R) -> R {
+    REFERENCE_PAIR_CHECKS.with(|c| c.set(true));
+    let r = g();
+    REFERENCE_PAIR_CHECKS.with(|c| c.set(false));
+    r
+}
+
 fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
     // OWNER events (lds_owned, every access proven in the issuing thread's own words): never conflict with each other across threads
     let is_owner = |ev: &Ev| f.contract.tiles[ev.tile].owned.is_some() && owned.get(&ev.stmt).copied().unwrap_or(false);
@@ -1319,6 +1333,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     // reads completed and a barrier between) - unless the write provably stays in the writer's own slice of a private old region (gpu_verify's
     // `own_reuse` proof: the wave's own storage, dead for itself by program order). A private region counts as its whole extent (the simulation does
     // not track wave keys); plain `lds_alias` declarations (overlapping declared extents of interleaved rings) are not reuses and are not checked here.
+    let reference = REFERENCE_PAIR_CHECKS.with(|c| c.get());
     let tiles = &f.contract.tiles;
     let reuse = |x: usize, y: usize| {
         let (a, b) = (&tiles[x].name, &tiles[y].name);
@@ -1334,7 +1349,9 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     };
     // a write of a shared reuse tile proven to stay in the writer's own slice of the private region `p`
     let own = |w: &Info, p: usize| w.ev.produce && !tiles[w.ev.tile].private && tiles[p].private && own_reuse.get(&(w.ev.stmt, tiles[p].name.clone())).copied().unwrap_or(false);
-    for (i, a) in infos.iter().enumerate() {
+    // without a declared reuse every pair is skipped by `reuse` below: the quadratic scan has nothing to find
+    let scan_reuse = reference || !f.contract.tile_reuses.is_empty();
+    for (i, a) in infos.iter().enumerate().filter(|_| scan_reuse) {
         for b in infos.iter().skip(i + 1) {
             if a.ev.tile == b.ev.tile || !(a.ev.produce || b.ev.produce) || a.ev.global || b.ev.global || !reuse(a.ev.tile, b.ev.tile) {
                 continue;
@@ -1366,14 +1383,39 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
         }
     }
-    for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
-        for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
-                let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
-                if aw.0 < bw.1 && bw.0 < aw.1 {
-                    diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
+    let pp_msg = |a: &Info, b: &Info, aw: (u32, u32), bw: (u32, u32)| format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1);
+    if reference {
+        for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
+            for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
+                if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
+                    let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+                    if aw.0 < bw.1 && bw.0 < aw.1 {
+                        diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, pp_msg(a, b, aw, bw)));
+                    }
                 }
             }
+        }
+    } else {
+        // only the producers of one (tile, slot) can pair up: walk each group (indices ascending) and report in the order of the full scan (i, then j)
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for ks in prod_of.values() {
+            for (x, &i) in ks.iter().enumerate() {
+                for &j in &ks[x + 1..] {
+                    let (a, b) = (&infos[i], &infos[j]);
+                    if a.role != b.role && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
+                        let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+                        if aw.0 < bw.1 && bw.0 < aw.1 {
+                            hits.push((i, j));
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort_unstable();
+        for (i, j) in hits {
+            let (a, b) = (&infos[i], &infos[j]);
+            let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+            diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, pp_msg(a, b, aw, bw)));
         }
     }
 }
