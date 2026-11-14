@@ -1,4 +1,4 @@
-﻿//! The back-end-added instruction table (tests/golden/added_table.tsv) must match the current compiler: every change of the default path's
+//! The back-end-added instruction table (tests/golden/added_table.tsv) must match the current compiler: every change of the default path's
 //! copies / waits / s_nops / constant materializations shows here per kernel. Regenerate with the md5 manifest (tests/golden/README.md).
 
 #[test]

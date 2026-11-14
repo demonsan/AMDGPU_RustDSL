@@ -641,6 +641,7 @@ impl Lowerer {
             alias: HashMap::new(),
             elide_fallthrough: false,
             edge_pad: opt_on("edgepad"),
+            ra_dword: opt_on("radword"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));
@@ -4654,8 +4655,14 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V2);
                 let d0 = self.sub_alias(d, 0, RClass::V1);
                 let d1 = self.sub_alias(d, 1, RClass::V1);
-                self.push(MInst::new(MOp::VMovB32).def(d0).srcreg(ra));
-                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                // `dupfold`: a single-use source defined in this block writes the pair's low dword directly (one copy instead of two)
+                let single = matches!(a, Opnd::Val(v) if self.read_counts.get(v).copied() == Some(1) && self.use_counts.get(v).copied() == Some(1));
+                if single && opt_on("dupfold") && self.retarget_def(ra, d, 0, RClass::V1) {
+                    self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(d0));
+                } else {
+                    self.push(MInst::new(MOp::VMovB32).def(d0).srcreg(ra));
+                    self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                }
                 self.val.insert(dst, d);
             }
             Op::CvtPknormP8x4(a, b, c, e, sc) => {
@@ -4680,8 +4687,15 @@ impl Lowerer {
                 self.touch(&[Src::Reg(ra)]);
                 let d1 = self.new_vreg(RClass::V1);
                 let d2 = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
-                self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(ra));
+                // `dupfold`: a single-use source defined in this block is produced into d1 directly
+                let single = matches!(a, Opnd::Val(v) if self.read_counts.get(v).copied() == Some(1) && self.use_counts.get(v).copied() == Some(1));
+                let folded = single && opt_on("dupfold") && self.retarget_def(ra, d1, 0, RClass::V1);
+                if folded {
+                    self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(d1));
+                } else {
+                    self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                    self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(ra));
+                }
                 // afterwards d1 = [lo, lo], d2 = [hi, hi]
                 self.push(MInst::new(MOp::VPermlane32Swap).def(d1).srcreg(d1).srcreg(d2));
                 let r = self.new_vreg(RClass::V1);

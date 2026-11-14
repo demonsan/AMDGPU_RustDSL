@@ -230,6 +230,8 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     // tracked per register DWORD (the scheduler's effects model: lane writes, partial writers, in-place operands), so a
     // fragment built lane by lane stays live between its lane writes.
     let segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) { precise_segments(m, &idx_of, &succs) } else { vec![Vec::new(); n] };
+    // `radword`: per tuple DWORD (a tuple's dead dwords hold other values while its live ones stay put)
+    let slot_segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) && m.ra_dword { precise_slot_segments(m, &idx_of, &succs) } else { Vec::new() };
     // --- register plan (MFunction::reg_hints; regplan.rs) ----------------
     let plan = Plan::new(m);
     // --- linear scan -------------------------------------------------
@@ -272,6 +274,13 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         for (s, e, r, c) in order {
             let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
+            // the segments each dword of the tuple occupies (`radword`), else the tuple's union on every dword
+            let my_dw: Vec<Vec<(usize, usize)>> = (0..width)
+                .map(|k| match slot_segs.get(r as usize * 16 + k) {
+                    Some(sg) if m.ra_dword && !segs[r as usize].is_empty() => sg.clone(),
+                    _ => my.clone(),
+                })
+                .collect();
             let lo = if width == 1 { V_RESERVED } else { width };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut found = None;
@@ -281,7 +290,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 // tuple alignment: the allocator's own rule is width alignment; an explicit pin needs only the ISA's even alignment (gfx90a+:
                 // 64-bit aligned VGPR tuples; the vendor FMHA keeps its S tiles at v[52:67])
                 let aligned = i % width == 0 || (plan.pin(r).is_some() && i % 2 == 0);
-                if pin_ok && aligned && (0..width).all(|k| !forbid[i + k] && occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
+                if pin_ok && aligned && (0..width).all(|k| !forbid[i + k] && occ[i + k].iter().all(|(os, oe)| my_dw[k].iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
                     found = Some(i);
                     break;
                 }
@@ -330,7 +339,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {VGPR_COUNT})")
             })?;
             for k in 0..width {
-                occ[slot + k].extend(my.iter().copied());
+                occ[slot + k].extend(my_dw[k].iter().copied());
             }
             phys[r as usize] = slot as u32;
             max_v = max_v.max(slot + width);
@@ -771,6 +780,34 @@ impl Bits {
 
 /// Per virtual register (canonical tuple): the instruction-position segments in which any of its dwords is live.
 fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
+    let per = precise_slot_segments(m, idx_of, succs);
+    let n = m.vregs.len();
+    let mut out: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for (s, segs) in per.into_iter().enumerate() {
+        if s / 16 < n {
+            out[s / 16].extend(segs);
+        }
+    }
+    for segs in out.iter_mut() {
+        merge_segs(segs);
+    }
+    out
+}
+
+fn merge_segs(segs: &mut Vec<(usize, usize)>) {
+    segs.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
+    for &(a, b) in segs.iter() {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 + 1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    *segs = merged;
+}
+
+/// Per register slot (canonical tuple * 16 + dword): the instruction-position segments in which that dword is live (merged).
+fn precise_slot_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
     use crate::sched::effects::{effects, Slot, SCC, VCC};
     let n = m.vregs.len();
     let nb = m.blocks.len();
@@ -858,7 +895,8 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
         live_in[bi].and_with(&def_in[bi]);
         live_out[bi].and_with(&def_out[bi]);
     }
-    let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nslots];
+    let _ = n;
     // the open (still live going backwards) slots of the current block: position of the latest use below; usize::MAX = closed
     let mut open: Vec<usize> = vec![usize::MAX; nslots];
     let mut touched: Vec<Slot> = Vec::new();
@@ -878,7 +916,7 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
             let at = idx_of[bi][i];
             let (r, w) = &rw[bi][i];
             for s in w {
-                let v = (*s / 16) as usize;
+                let v = *s as usize;
                 let e = std::mem::replace(&mut open[*s as usize], usize::MAX);
                 if e != usize::MAX {
                     raw[v].push((at, e));
@@ -892,7 +930,7 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
                     open[*s as usize] = at;
                 }
                 // a use keeps the position itself occupied even when the slot is also written here
-                raw[(*s / 16) as usize].push((at, at));
+                raw[*s as usize].push((at, at));
             }
         }
         for s in touched.drain(..) {
@@ -901,27 +939,20 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
                 continue;
             }
             if def_in[bi].has(s) {
-                raw[(s / 16) as usize].push((first, e));
+                raw[s as usize].push((first, e));
             } else {
                 // a use with no reaching definition: keep just the use position
-                raw[(s / 16) as usize].push((e, e));
+                raw[s as usize].push((e, e));
             }
         }
     }
-    // merge overlapping / touching segments per vreg
+    // merge overlapping / touching segments per slot
     for segs in raw.iter_mut() {
-        segs.sort();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
-        for &(a, b) in segs.iter() {
-            match merged.last_mut() {
-                Some(l) if a <= l.1 + 1 => l.1 = l.1.max(b),
-                _ => merged.push((a, b)),
-            }
-        }
-        *segs = merged;
+        merge_segs(segs);
     }
     raw
-}/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
+}
+/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
 pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
     let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
     let mut next = 0usize;
