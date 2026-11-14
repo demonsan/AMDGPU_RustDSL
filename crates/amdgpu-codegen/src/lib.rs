@@ -143,7 +143,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start
     if !f.exact {
         let view = exact::physical_view(&m, &a);
         let mut c = view.clone();
-        sched::waits::insert_waits(&mut c);
+        sched::waits::with_in_order_vm_waw(|| sched::waits::insert_waits(&mut c));
         let mut out = Vec::new();
         exact::diff_pub("waits(physical)", &view, &c, &a, &mut out);
         if !out.is_empty() {
