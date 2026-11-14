@@ -1042,6 +1042,19 @@ impl Lowerer {
                 _ => return Err("unsupported loop variable class".to_string()),
             };
             self.touch(&[Src::Reg(src)]);
+            // zero-copy loop entry: an initial value used only here, in its own registers of the variable's class (not a cached constant,
+            // a conversion or a view of another tuple), becomes the variable's registers (no copy); `noloopreuse` restores the copy
+            if let Opnd::Val(v) = init[i] {
+                let own = self.val.get(&v) == Some(&src)
+                    && self.mir.canon(src) == src
+                    && self.mir.vreg_class(src) == class
+                    && !vars[..i].iter().any(|w| self.vars.get(w.0 as usize) == Some(&src))
+                    && !matches!(self.defs.get(&v), Some(Op::ConstI32(_) | Op::ConstF32(_) | Op::FragZero { .. }));
+                if own && self.use_counts.get(&v).copied() == Some(1) && !opt_on("noloopreuse") {
+                    self.vars[var.0 as usize] = src;
+                    continue;
+                }
+            }
             self.copy_reg(r, src)?;
         }
         Ok(())
