@@ -120,7 +120,7 @@ pub fn compute_cert(jobs: usize) -> Result<Vec<(String, String)>, String> {
                     Ok((f, _)) => {
                         let r = amdgpu_codegen::gpu_verify::verify_ir(&f);
                         let l = r.ledger();
-                        md5::hex(format!("{}\n{} {} {} {} {}\n{:?}", r.render(), l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust, r.proven).as_bytes())
+                        crate::md5::hex(format!("{}\n{} {} {} {} {}\n{:?}", r.render(), l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust, r.proven).as_bytes())
                     }
                 };
                 out.lock().unwrap().push((name.clone(), v));
