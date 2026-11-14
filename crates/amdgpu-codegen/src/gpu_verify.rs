@@ -3985,8 +3985,10 @@ pub fn enforce(f: &Function, m: &MFunction, a: &Alloc) -> Result<(), String> {
     if mode == Mode::Off {
         return Ok(());
     }
-    let mut rep = verify_ir(f);
-    let mir = verify_mir(f, m, a);
+    // The IR-level analyses (values / bounds, barrier balance, stage contracts, the tile protocols) decide only the `Warn` printout and the `Strict` verdict: the default mode rejects on the MIR register / wait
+    // errors alone, so it does not run them (they were 87 % of the compile time of `fmha_fwd_hd128_mxfp8_v3_vs128`; docs/compile-time.md). `amdc gpu-verify` and the strict gate still run both.
+    let mut rep = if mode == Mode::Default { Report::default() } else { crate::timing::time("verify-ir", || verify_ir(f)) };
+    let mir = crate::timing::time("verify-mir", || verify_mir(f, m, a));
     let mir_errors: Vec<String> = mir.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
     rep.merge(mir);
     if mode == Mode::Warn && !rep.findings.is_empty() {

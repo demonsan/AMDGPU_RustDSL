@@ -40,6 +40,9 @@ struct Row {
     assemble: Option<Duration>,
     ok: bool,
     lines: usize,
+    /// register-allocation runs of this compile (> 1: the retry ladders ran) and the time of the runs after the first one's share
+    ra_runs: u32,
+    ra_ms: f64,
 }
 
 /// `amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time]`
@@ -66,6 +69,7 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
         for _ in 0..jobs {
             sc.spawn(|| {
                 timing::enable(true);
+                let mut acc: Vec<Entry> = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(k) = names.get(i) else { break };
@@ -74,7 +78,7 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
                     let build = t.elapsed();
                     timing::add("dsl-build", build);
                     let Some(f) = f else {
-                        rows.lock().unwrap().push(Row { name: k.clone(), build, compile: Duration::ZERO, assemble: None, ok: false, lines: 0 });
+                        rows.lock().unwrap().push(Row { name: k.clone(), build, compile: Duration::ZERO, assemble: None, ok: false, lines: 0, ra_runs: 0, ra_ms: 0.0 });
                         continue;
                     };
                     let t = Instant::now();
@@ -95,11 +99,15 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
                         }
                         Err(_) => (false, 0, None),
                     };
-                    rows.lock().unwrap().push(Row { name: k.clone(), build, compile, assemble: asm_t, ok, lines });
+                    let ents = timing::take();
+                    let ra = ents.iter().find(|e| e.name == "regalloc");
+                    let (ra_runs, ra_ms) = ra.map_or((0, 0.0), |e| (e.runs, e.dur.as_secs_f64() * 1e3));
+                    timing::merge(&mut acc, &ents);
+                    rows.lock().unwrap().push(Row { name: k.clone(), build, compile, assemble: asm_t, ok, lines, ra_runs, ra_ms });
                 }
-                let mine = timing::take();
+                timing::merge(&mut acc, &timing::take());
                 timing::enable(false);
-                timing::merge(&mut phases.lock().unwrap(), &mine);
+                timing::merge(&mut phases.lock().unwrap(), &acc);
             });
         }
     });
@@ -118,6 +126,8 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
         cpu.as_secs_f64(),
         100.0 * cpu.as_secs_f64() / (wall.as_secs_f64().max(1e-9) * jobs as f64)
     );
+    let retried: Vec<&Row> = rows.iter().filter(|r| r.ra_runs > 1).collect();
+    println!("retry ladders: {} of {} kernels ran register allocation more than once ({} runs in all, {:.1} s of the allocation time)", retried.len(), n, retried.iter().map(|r| r.ra_runs as usize).sum::<usize>(), retried.iter().map(|r| r.ra_ms).sum::<f64>() / 1e3);
     rows.sort_by(|a, b| b.compile.cmp(&a.compile));
     println!("slowest compiles (ms): {}", rows.iter().take(8).map(|r| format!("{} {:.1}", r.name, r.compile.as_secs_f64() * 1e3)).collect::<Vec<_>>().join(", "));
     let mut by_ms: Vec<f64> = rows.iter().map(|r| r.compile.as_secs_f64() * 1e3).collect();
