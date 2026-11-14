@@ -901,6 +901,19 @@ impl Lowerer {
     /// Rewrite the instruction of the current block that defines `r` to write `cls` at dword `off` of `tuple` instead, when that is safe: `r`
     /// is a plain (non-alias) vreg of class `cls`, defined exactly once in the block by an instruction that fully writes it (not a tied partial
     /// write) and read by no instruction so far. In-flight bookkeeping (pending loads) follows the new register.
+    /// Does `r` belong to exactly one value, with no cache, view, lazy form or variable sharing it (so it may be overwritten in place)?
+    fn vreg_exclusive(&self, r: VReg) -> bool {
+        !(self.val.values().filter(|x| **x == r).count() != 1
+            || self.converted.values().any(|x| *x == r)
+            || self.consts.values().any(|x| *x == r)
+            || self.rfl_cache.values().any(|x| *x == r)
+            || self.rfl_cache.keys().any(|x| *x == r)
+            || self.alias_cache.keys().any(|k| k.0 == r)
+            || self.lazy.values().any(|x| x.0 == r)
+            || self.vars.contains(&r)
+            || self.scope_snaps.iter().any(|(c, v)| c.values().any(|x| *x == r) || v.values().any(|x| *x == r)))
+    }
+
     fn retarget_def(&mut self, r: VReg, tuple: VReg, off: u8, cls: RClass) -> bool {
         // exact mode: a value keeps the instruction and the registers the author gave it (pinned copies vanish instead)
         if self.exact {
@@ -910,16 +923,7 @@ impl Lowerer {
             return false;
         }
         // the vreg must belong to exactly one value (bitcasts / views share vregs; constants and conversions are cached)
-        if self.val.values().filter(|x| **x == r).count() != 1
-            || self.converted.values().any(|x| *x == r)
-            || self.consts.values().any(|x| *x == r)
-            || self.rfl_cache.values().any(|x| *x == r)
-            || self.rfl_cache.keys().any(|x| *x == r)
-            || self.alias_cache.keys().any(|k| k.0 == r)
-            || self.lazy.values().any(|x| x.0 == r)
-            || self.vars.contains(&r)
-            || self.scope_snaps.iter().any(|(c, v)| c.values().any(|x| *x == r) || v.values().any(|x| *x == r))
-        {
+        if !self.vreg_exclusive(r) {
             return false;
         }
         let insts = &self.mir.blocks[self.cur].insts;
@@ -1046,6 +1050,8 @@ impl Lowerer {
             // a conversion or a view of another tuple), becomes the variable's registers (no copy); `noloopreuse` restores the copy
             if let Opnd::Val(v) = init[i] {
                 let own = self.val.get(&v) == Some(&src)
+                    && self.vreg_exclusive(src)
+                    && !self.mir.alias.values().any(|(t, _)| *t == src)
                     && self.mir.canon(src) == src
                     && self.mir.vreg_class(src) == class
                     && !vars[..i].iter().any(|w| self.vars.get(w.0 as usize) == Some(&src))
