@@ -643,7 +643,7 @@ fn enc_mfma_scale(i: &Inst, _op: u32) -> Result<Vec<u8>, String> {
     }
     let cbsz = md(i, "cbsz").map_or(0, |x| x.parse::<u32>().unwrap_or(0));
     let blgp = md(i, "blgp").map_or(0, |x| x.parse::<u32>().unwrap_or(0));
-    let mut h2d0: u32 = 0xD3AD_0000 | vd | cbsz << 8 | 1 << 11;
+    let mut h2d0: u32 = if i.mn.contains("32x32x64") { 0xD3AE_0000 } else { 0xD3AD_0000 } | vd | cbsz << 8 | 1 << 11;
     if is_agpr(&ops[0]) {
         h2d0 |= 1 << 15;
     }
