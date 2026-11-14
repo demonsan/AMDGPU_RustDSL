@@ -188,15 +188,131 @@ def _run(cmd, what):
     return r.stdout
 
 
+# ---------------------------------------------------------------------------------------------------------------------------- the persistent compile server
+
+def _esc(s):
+    return s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def _unesc(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            out.append({"n": "\n", "t": "\t"}.get(s[i + 1], s[i + 1]))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+class _Server:
+    """`amdc serve`: one persistent compiler process (the process start and the registry are paid once); requests are lines on its stdin, responses lines on its stdout, matched by id."""
+
+    def __init__(self, amdc):
+        self.proc = subprocess.Popen([amdc, "serve", "--jobs", str(os.cpu_count() or 8)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.wlock = threading.Lock()
+        self.pending = {}
+        self.next_id = 0
+        self.dead = False
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in self.proc.stdout:
+            parts = line.rstrip("\n").split("\t", 2)
+            if len(parts) < 3:
+                continue
+            slot = self.pending.pop(parts[0], None)
+            if slot is not None:
+                slot[1] = (int(parts[1]), _unesc(parts[2]))
+                slot[0].set()
+        self.dead = True
+        for slot in list(self.pending.values()):
+            slot[0].set()
+
+    def request(self, fields, timeout=600):
+        if self.dead or self.proc.poll() is not None:
+            return None
+        with self.wlock:
+            self.next_id += 1
+            rid = str(self.next_id)
+            slot = [threading.Event(), None]
+            self.pending[rid] = slot
+            try:
+                self.proc.stdin.write("\t".join([rid] + [_esc(f) if f else "-" for f in fields]) + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.dead = True
+                self.pending.pop(rid, None)
+                return None
+        slot[0].wait(timeout)
+        return slot[1]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
+_servers = {}
+
+
+def _server_for(amdc):
+    if os.environ.get("AMDGPU_JIT_SERVER", "1") == "0" or os.environ.get("AMDGPU_JIT_ASSEMBLER", "inproc") == "clang":
+        return None
+    with _lock:
+        s = _servers.get(amdc)
+        if s is None or s.dead:
+            try:
+                s = _servers[amdc] = _Server(amdc)
+            except OSError:
+                return None
+        return s
+
+
+def close_servers():
+    for s in list(_servers.values()):
+        s.close()
+    _servers.clear()
+
+
+import atexit  # noqa: E402
+
+atexit.register(close_servers)
+
+
+def cert_cache_dir(amdc):
+    """The content-addressed certificate cache of this compiler (`amdc certify-batch` pre-populates the same directory)."""
+    return os.path.join(cache_dir(), "certs", _hash_file(amdc))
+
+
+
 def _compile_into(d, kernel, spec, amdc, clang, ir_path=None):
     """amdc emit + jit-info (concurrently) and clang into directory d."""
     sp = ["--specialize", spec_string(spec)] if spec else []
     if ir_path:
         sp += ["--from-ir", ir_path]
     s_path, co_path = os.path.join(d, "kernel.s"), os.path.join(d, "kernel.co")
+    certs = cert_cache_dir(amdc)
+    srv = _server_for(amdc)
+    if srv is not None:
+        # the persistent server: no process start, one compile, the certificate cached by content
+        r = srv.request([kernel, spec_string(spec) if spec else "", backend(), s_path, co_path, os.path.join(d, "info.json"), ir_path or "", certs, ""])
+        if r is not None:
+            code, msg = r
+            if code == 0 or code == 3:
+                if code == 3:
+                    if not clang:
+                        raise CompileError("the in-process assembler cannot encode this kernel and ROCm clang was not found (set AMDGPU_JIT_CLANG)")
+                    _run([clang, "-x", "assembler", "-target", "amdgcn-amd-amdhsa", f"-mcpu={arch()}", "-mcode-object-version=6", "-o", co_path, s_path], "clang")
+                with open(os.path.join(d, "info.json")) as f:
+                    return json.load(f)
+            raise CompileError(f"amdc serve {kernel} {' '.join(sp)} failed (code {code}):\n{msg[-4000:]}")
     # the in-process assembler (amdc emit --co): no clang; AMDGPU_JIT_ASSEMBLER=clang forces the external assembler
     inproc = os.environ.get("AMDGPU_JIT_ASSEMBLER", "inproc") != "clang"
-    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path, "--info", os.path.join(d, "info.json")] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path, "--info", os.path.join(d, "info.json"), "--cert-cache", certs] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     info = None if inproc else subprocess.Popen([amdc, "jit-info", kernel, "--backend", backend()] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     eo, ee = emit.communicate()
     io_, ie = info.communicate() if info else (None, "")
