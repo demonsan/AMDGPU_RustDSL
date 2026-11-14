@@ -12,7 +12,8 @@
 //!   * concurrent writes of one slot by different waves are only allowed for the same version (cooperative fill);
 //!   * reads must be complete (`wait_lds(0)`) before the next barrier so that the barrier really separates them from the next writer.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::fxhash::{FxMap as HashMap, FxSet as HashSet};
+use std::collections::BTreeSet;
 
 use amdgpu_dsl::{AtomicOp, Function, Op, Opnd, Stmt, ValueId, VarId};
 
@@ -106,8 +107,8 @@ pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
 }
 
 pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
-    let mut tv: HashSet<ValueId> = HashSet::new();
-    let mut tvars: HashSet<VarId> = HashSet::new();
+    let mut tv: HashSet<ValueId> = HashSet::default();
+    let mut tvars: HashSet<VarId> = HashSet::default();
     let tainted = |o: &Opnd, tv: &HashSet<ValueId>, tvars: &HashSet<VarId>| match o {
         Opnd::Val(v) => tv.contains(v),
         Opnd::Var(v) => tvars.contains(v),
@@ -142,7 +143,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
             break;
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for (i, st) in f.stmts().iter().enumerate() {
         if let Stmt::BeginIf { cond } = st {
             if tainted(cond, &tv, &tvars) {
@@ -850,7 +851,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
             }
         }
     }
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for (i, s) in f.stmts().iter().enumerate() {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
             if region_skipped(f, tile) {
@@ -1081,7 +1082,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
             let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
             let ops: Vec<&Opnd> = if private { vec![version] } else { vec![slot, version] };
             for o in ops {
-                let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+                let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::default() };
                 walk(f, o, &mut a);
                 let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
                 m_best = m_best.max(m);
@@ -1097,7 +1098,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
 /// and the version must advance by a constant over `p` iterations.
 fn verify_period_claim(f: &Function, traces: &[&Trace], p: usize) -> Result<(), String> {
     for (role, t) in traces.iter().enumerate() {
-        let mut by_stmt: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::new();
+        let mut by_stmt: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::default();
         for ev in &t.evs {
             by_stmt.entry(ev.stmt).or_default().push((ev.slot, ev.ver, ev.outer));
         }
@@ -1145,7 +1146,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
@@ -1217,7 +1218,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         }
     }
     // the producers per (tile, slot): every consumer looks up its own slot instead of scanning all events
-    let mut prod_of: HashMap<(usize, i64), Vec<usize>> = HashMap::new();
+    let mut prod_of: HashMap<(usize, i64), Vec<usize>> = HashMap::default();
     for (k, x) in infos.iter().enumerate() {
         if x.ev.produce {
             prod_of.entry((x.ev.tile, x.ev.slot)).or_default().push(k);
@@ -1238,7 +1239,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         by_ver: HashMap<i64, Vec<usize>>,
     }
     let groups: HashMap<(usize, i64), Group> = if reference {
-        HashMap::new()
+        HashMap::default()
     } else {
         prod_of
             .iter()
@@ -1253,7 +1254,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 }
                 let mut desc = ks.clone();
                 desc.sort_by_key(|&i| std::cmp::Reverse((infos[i].ev.ord, infos[i].ev.start, i)));
-                let mut by_ver: HashMap<i64, Vec<usize>> = HashMap::new();
+                let mut by_ver: HashMap<i64, Vec<usize>> = HashMap::default();
                 for &i in ks {
                     by_ver.entry(infos[i].ev.ver as i64).or_default().push(i);
                 }
@@ -1814,7 +1815,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
             continue;
         }
-        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. } | Op::BufferAtomicRet { op: AtomicOp::AddU32, .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. } | Op::BufferAtomicRet { op: AtomicOp::AddU32, .. }), &mut HashSet::default()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
         if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
             fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
         }
@@ -1828,7 +1829,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         // O4: the produced generation is the block's split id
         if let Some(mi) = prod_marker {
             if let Stmt::TileProduce { version, .. } = &f.stmts()[mi] {
-                let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::new());
+                let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::default());
                 if !from_block {
                     fail(rep, "GV-PROTO-STALE-GEN", format!("O4: the generation of the produce marker (stmt {mi}) is not derived from the workgroup id: the blocks do not agree on which slice (split) each of them owns"));
                 }
@@ -1865,7 +1866,7 @@ fn cone_has_val(f: &Function, o: &Opnd, target: u32) -> bool {
         let Some(op) = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
         op.operands().iter().any(|x| go(f, x, target, seen))
     }
-    go(f, o, target, &mut HashSet::new())
+    go(f, o, target, &mut HashSet::default())
 }
 
 #[cfg(test)]
