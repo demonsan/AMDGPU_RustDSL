@@ -10,6 +10,7 @@ pub mod backend;
 pub use target::gfx950::emit;
 pub mod gpu_protocol;
 pub use gpu_protocol as gpu_tiles;
+pub mod fxhash;
 pub mod gpu_verify;
 pub mod functional_proofs;
 pub mod ir_print;

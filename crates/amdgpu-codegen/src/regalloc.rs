@@ -724,11 +724,57 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
     }
     Ok(())
 }
+/// A fixed-capacity set of slots as a bit vector (liveness over thousands of slots: the hash-set version was 15 % of the compile time of the big FMHA kernels).
+#[derive(Clone, PartialEq)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Bits {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+    fn has(&self, s: u32) -> bool {
+        self.0[(s >> 6) as usize] >> (s & 63) & 1 == 1
+    }
+    fn add(&mut self, s: u32) {
+        self.0[(s >> 6) as usize] |= 1u64 << (s & 63);
+    }
+    fn union_with(&mut self, o: &Bits) {
+        for (a, b) in self.0.iter_mut().zip(&o.0) {
+            *a |= *b;
+        }
+    }
+    fn and_with(&mut self, o: &Bits) {
+        for (a, b) in self.0.iter_mut().zip(&o.0) {
+            *a &= *b;
+        }
+    }
+    /// self |= (o & !mask)
+    fn union_minus(&mut self, o: &Bits, mask: &Bits) {
+        for ((a, b), k) in self.0.iter_mut().zip(&o.0).zip(&mask.0) {
+            *a |= *b & !*k;
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut b = bits;
+            std::iter::from_fn(move || {
+                if b == 0 {
+                    return None;
+                }
+                let t = b.trailing_zeros();
+                b &= b - 1;
+                Some((w as u32) * 64 + t)
+            })
+        })
+    }
+}
+
 /// Per virtual register (canonical tuple): the instruction-position segments in which any of its dwords is live.
 fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
     use crate::sched::effects::{effects, Slot, SCC, VCC};
     let n = m.vregs.len();
     let nb = m.blocks.len();
+    let nslots = n * 16 + 16;
     let keep = |s: &Slot| *s != VCC && *s != SCC;
     // reads / writes per instruction (slots), computed once
     let mut rw: Vec<Vec<(Vec<Slot>, Vec<Slot>)>> = Vec::with_capacity(nb);
@@ -743,35 +789,31 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
                 .collect(),
         );
     }
-    let mut gen: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
-    let mut kill: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut gen: Vec<Bits> = vec![Bits::new(nslots); nb];
+    let mut kill: Vec<Bits> = vec![Bits::new(nslots); nb];
     for bi in 0..nb {
         for (r, w) in &rw[bi] {
             for s in r {
-                if !kill[bi].contains(s) {
-                    gen[bi].insert(*s);
+                if !kill[bi].has(*s) {
+                    gen[bi].add(*s);
                 }
             }
             for s in w {
-                kill[bi].insert(*s);
+                kill[bi].add(*s);
             }
         }
     }
-    let mut live_in: Vec<HashSet<Slot>> = gen.clone();
-    let mut live_out: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut live_in: Vec<Bits> = gen.clone();
+    let mut live_out: Vec<Bits> = vec![Bits::new(nslots); nb];
     loop {
         let mut changed = false;
         for bi in (0..nb).rev() {
-            let mut out: HashSet<Slot> = HashSet::new();
+            let mut out = Bits::new(nslots);
             for s in &succs[bi] {
-                out.extend(live_in[*s].iter().copied());
+                out.union_with(&live_in[*s]);
             }
             let mut inn = gen[bi].clone();
-            for s in &out {
-                if !kill[bi].contains(s) {
-                    inn.insert(*s);
-                }
-            }
+            inn.union_minus(&out, &kill[bi]);
             if inn != live_in[bi] || out != live_out[bi] {
                 live_in[bi] = inn;
                 live_out[bi] = out;
@@ -785,8 +827,8 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
     // Pruned liveness: a slot is only live where some definition of it can reach (forward may-defined sets). A slot that is
     // live without any reaching definition is a read of an uninitialised value on an infeasible path (for example two
     // correlated `if`s); keeping it live would only inflate the pressure.
-    let mut def_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
-    let mut def_out: Vec<HashSet<Slot>> = kill.clone();
+    let mut def_in: Vec<Bits> = vec![Bits::new(nslots); nb];
+    let mut def_out: Vec<Bits> = kill.clone();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
     for (b, ss) in succs.iter().enumerate() {
         for &s in ss {
@@ -796,12 +838,12 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
     loop {
         let mut changed = false;
         for bi in 0..nb {
-            let mut inn: HashSet<Slot> = HashSet::new();
+            let mut inn = Bits::new(nslots);
             for &p in &preds[bi] {
-                inn.extend(def_out[p].iter().copied());
+                inn.union_with(&def_out[p]);
             }
             let mut out = inn.clone();
-            out.extend(kill[bi].iter().copied());
+            out.union_with(&kill[bi]);
             if inn != def_in[bi] || out != def_out[bi] {
                 def_in[bi] = inn;
                 def_out[bi] = out;
@@ -813,38 +855,52 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
         }
     }
     for bi in 0..nb {
-        live_in[bi].retain(|s| def_in[bi].contains(s));
-        live_out[bi].retain(|s| def_out[bi].contains(s));
+        live_in[bi].and_with(&def_in[bi]);
+        live_out[bi].and_with(&def_out[bi]);
     }
     let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    // the open (still live going backwards) slots of the current block: position of the latest use below; usize::MAX = closed
+    let mut open: Vec<usize> = vec![usize::MAX; nslots];
+    let mut touched: Vec<Slot> = Vec::new();
     for (bi, b) in m.blocks.iter().enumerate() {
         if b.insts.is_empty() {
             continue;
         }
         let first = idx_of[bi][0];
         let last = *idx_of[bi].last().unwrap();
-        let mut open: std::collections::HashMap<Slot, usize> = std::collections::HashMap::new();
-        for s in &live_out[bi] {
-            open.insert(*s, last);
+        for s in live_out[bi].iter() {
+            if open[s as usize] == usize::MAX {
+                touched.push(s);
+            }
+            open[s as usize] = last;
         }
         for i in (0..b.insts.len()).rev() {
             let at = idx_of[bi][i];
             let (r, w) = &rw[bi][i];
             for s in w {
                 let v = (*s / 16) as usize;
-                match open.remove(s) {
-                    Some(e) => raw[v].push((at, e)),
-                    None => raw[v].push((at, at)),
+                let e = std::mem::replace(&mut open[*s as usize], usize::MAX);
+                if e != usize::MAX {
+                    raw[v].push((at, e));
+                } else {
+                    raw[v].push((at, at));
                 }
             }
             for s in r {
-                open.entry(*s).or_insert(at);
+                if open[*s as usize] == usize::MAX {
+                    touched.push(*s);
+                    open[*s as usize] = at;
+                }
                 // a use keeps the position itself occupied even when the slot is also written here
                 raw[(*s / 16) as usize].push((at, at));
             }
         }
-        for (s, e) in open {
-            if def_in[bi].contains(&s) {
+        for s in touched.drain(..) {
+            let e = std::mem::replace(&mut open[s as usize], usize::MAX);
+            if e == usize::MAX {
+                continue;
+            }
+            if def_in[bi].has(s) {
                 raw[(s / 16) as usize].push((first, e));
             } else {
                 // a use with no reaching definition: keep just the use position
@@ -865,8 +921,7 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
         *segs = merged;
     }
     raw
-}
-/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
+}/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
 pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
     let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
     let mut next = 0usize;
@@ -938,7 +993,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     use crate::sched::effects::{effects, Slot, SCC, VCC};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     // physical register -> current writer -> writers that preceded it on the paths ending in that writer
-    type Writers = HashMap<(bool, u32), BTreeMap<Slot, BTreeSet<Slot>>>;
+    type Writers = HashMap<(bool, u32), BTreeMap<Slot, BTreeSet<Slot>>, std::hash::BuildHasherDefault<crate::fxhash::Fx>>;
     let phys = |slot: Slot| -> (bool, u32) {
         let t = slot / 16;
         (m.vreg_class(t).is_vector(), a.phys[t as usize] + (slot - t * 16))
@@ -958,39 +1013,49 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     // the writes of every block, computed once (the fixpoint below visits each block many times; `effects` allocates)
     let block_writes: Vec<Vec<Slot>> = m.blocks.iter().map(|blk| blk.insts.iter().flat_map(|inst| effects(m, inst).writes.into_iter().filter(|w| *w != VCC && *w != SCC)).collect()).collect();
     let mut in_st: Vec<Option<Writers>> = vec![None; nb];
-    in_st[0] = Some(Writers::new());
-    for _ in 0..500 {
-        let mut changed = false;
-        for b in 0..nb {
-            let Some(mut st) = in_st[b].clone() else { continue };
-            for w in &block_writes[b] {
-                write(&mut st, *w);
-            }
-            for &s in &succs[b] {
-                match &mut in_st[s] {
-                    None => {
-                        in_st[s] = Some(st.clone());
-                        changed = true;
-                    }
-                    Some(x) => {
-                        for (k, v) in &st {
-                            let e = x.entry(*k).or_default();
-                            for (cur, prev) in v {
-                                let slot = e.entry(*cur).or_insert_with(|| {
-                                    changed = true;
-                                    BTreeSet::new()
-                                });
-                                for p in prev {
-                                    changed |= slot.insert(*p);
-                                }
+    in_st[0] = Some(Writers::default());
+    // worklist over the blocks whose entry state changed (the least fixed point is the same as the round-robin sweep's; a block is re-run only when its entry grew)
+    let mut queued = vec![false; nb];
+    let mut work: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    work.push_back(0);
+    queued[0] = true;
+    let mut budget = 500 * nb.max(1);
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let Some(mut st) = in_st[b].clone() else { continue };
+        for w in &block_writes[b] {
+            write(&mut st, *w);
+        }
+        for &s in &succs[b] {
+            let mut changed = false;
+            match &mut in_st[s] {
+                None => {
+                    in_st[s] = Some(st.clone());
+                    changed = true;
+                }
+                Some(x) => {
+                    for (k, v) in &st {
+                        let e = x.entry(*k).or_default();
+                        for (cur, prev) in v {
+                            let slot = e.entry(*cur).or_insert_with(|| {
+                                changed = true;
+                                BTreeSet::new()
+                            });
+                            for p in prev {
+                                changed |= slot.insert(*p);
                             }
                         }
                     }
                 }
             }
-        }
-        if !changed {
-            break;
+            if changed && !queued[s] {
+                queued[s] = true;
+                work.push_back(s);
+            }
         }
     }
     let mut report = Vec::new();
