@@ -1012,6 +1012,16 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     let nb = m.blocks.len();
     // the writes of every block, computed once (the fixpoint below visits each block many times; `effects` allocates)
     let block_writes: Vec<Vec<Slot>> = m.blocks.iter().map(|blk| blk.insts.iter().flat_map(|inst| effects(m, inst).writes.into_iter().filter(|w| *w != VCC && *w != SCC)).collect()).collect();
+    let summaries: Vec<Vec<((bool, u32), Slot, BTreeSet<Slot>)>> = block_writes
+        .iter()
+        .map(|ws| {
+            let mut by: HashMap<(bool, u32), Vec<Slot>> = HashMap::default();
+            for &w in ws {
+                by.entry(phys(w)).or_default().push(w);
+            }
+            by.into_iter().map(|(p, v)| (p, *v.last().unwrap(), v[..v.len() - 1].iter().copied().collect::<BTreeSet<Slot>>())).collect()
+        })
+        .collect();
     let mut in_st: Vec<Option<Writers>> = vec![None; nb];
     in_st[0] = Some(Writers::default());
     // worklist over the blocks whose entry state changed (the least fixed point is the same as the round-robin sweep's; a block is re-run only when its entry grew)
@@ -1027,8 +1037,19 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
         }
         budget -= 1;
         let Some(mut st) = in_st[b].clone() else { continue };
-        for w in &block_writes[b] {
-            write(&mut st, *w);
+        // The block's writes as one step per physical register: after the writes w1 .. wk to one register the state is { wk: flatten(entry state) + {w1 .. w(k-1)} } (what applying `write` k times gives:
+        // each write replaces the entry by { itself: everything that was in it }), so a visit costs one update per register written, not one per write.
+        for (p, last, earlier) in &summaries[b] {
+            let mut h: BTreeSet<Slot> = earlier.clone();
+            if let Some(e) = st.get(p) {
+                for (cur, prev) in e {
+                    h.insert(*cur);
+                    h.extend(prev.iter().copied());
+                }
+            }
+            let e = st.entry(*p).or_default();
+            e.clear();
+            e.insert(*last, h);
         }
         for &s in &succs[b] {
             let mut changed = false;

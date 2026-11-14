@@ -7,7 +7,8 @@
 //! Soundness statement: every `Error` finding is a property that could NOT be proven; a kernel without errors satisfies, under the host contract
 //! (declared extents / ranges / grid relations, trusted `assume`s, no i32 wrap-around), the checked properties. Trusted assumptions are listed as `Info`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::fxhash::{FxMap as HashMap, FxSet as HashSet};
+use std::collections::BTreeMap;
 
 use amdgpu_dsl::{Ext, Function, Node, Op, Opnd, RegionKind, Stmt, ValueId, VarId};
 use amdgpu_sym::{cap, Ctx, Itv, Poly, Sym, Q};
@@ -2871,7 +2872,7 @@ impl<'a> An<'a> {
                     // (breadth first: the nearest dependents first, within a generous bound)
                     let mut work: std::collections::VecDeque<ValueId> = std::collections::VecDeque::from(vec![v]);
                     let mut deps: Vec<(usize, ValueId)> = Vec::new();
-                    let mut seen: HashSet<ValueId> = HashSet::new();
+                    let mut seen: HashSet<ValueId> = HashSet::default();
                     while let Some(u) = work.pop_front() {
                         for &d in self.users.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
                             let Some(&pd) = self.rings.let_pos.get(&d) else { continue };
@@ -3605,8 +3606,8 @@ fn trim(mut v: Vec<i64>) -> Vec<i64> {
 }
 fn barrier_balance(f: &Function, rep: &mut Report) {
     // lane/wave-dependent values: derived from the workitem id (different waves of a workgroup take different paths)
-    let mut tv: HashSet<ValueId> = HashSet::new();
-    let mut tvars: HashSet<VarId> = HashSet::new();
+    let mut tv: HashSet<ValueId> = HashSet::default();
+    let mut tvars: HashSet<VarId> = HashSet::default();
     let tainted = |o: &Opnd, tv: &HashSet<ValueId>, tvars: &HashSet<VarId>| match o {
         Opnd::Val(v) => tv.contains(v),
         Opnd::Var(v) => tvars.contains(v),
@@ -3695,7 +3696,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_prov: HashMap::new(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::new(), var_init: HashMap::new(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::default(), vars: HashMap::default(), var_prov: HashMap::default(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::default(), var_init: HashMap::default(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::default(), assumed_trusted: HashMap::default(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::default(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
         for (v, r) in &an.rings.rings {
             eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
@@ -4037,7 +4038,7 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
     }
     let mut closed: Vec<(String, StageContract)> = Vec::new();
     let mut open: Vec<(usize, String, StageContract)> = Vec::new();
-    let mut def_stage: HashMap<u32, usize> = HashMap::new();
+    let mut def_stage: HashMap<u32, usize> = HashMap::default();
     let mut defined: std::collections::HashSet<u32> = Default::default();
     let mut barriers = 0u32;
     let mut sid = 0usize;
@@ -4322,7 +4323,7 @@ fn ring_facts(f: &Function) -> RingFacts {
         hi <= lo + 1 || !stmts[lo + 1..hi].iter().any(|s| control(s))
     };
     // every (position, value) a variable is set to: set_vars, plus non-Undef inits of loops / scopes
-    let mut sets: HashMap<VarId, Vec<(usize, Opnd)>> = HashMap::new();
+    let mut sets: HashMap<VarId, Vec<(usize, Opnd)>> = HashMap::default();
     for (k, s) in stmts.iter().enumerate() {
         match s {
             Stmt::SetVar { var, value } => sets.entry(*var).or_default().push((k, *value)),
@@ -4345,11 +4346,11 @@ fn ring_facts(f: &Function) -> RingFacts {
             _ => None,
         }
     };
-    let mut rings: HashMap<VarId, (i128, i128)> = HashMap::new();
-    let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::new();
-    let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::new();
-    let mut ring_rule: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = HashMap::new();
-    let mut sym: HashMap<VarId, Opnd> = HashMap::new();
+    let mut rings: HashMap<VarId, (i128, i128)> = HashMap::default();
+    let mut ring_step: HashMap<VarId, Vec<ValueId>> = HashMap::default();
+    let mut ring_const: HashMap<VarId, Vec<(usize, i128)>> = HashMap::default();
+    let mut ring_rule: HashMap<VarId, (amdgpu_dsl::CmpPred, amdgpu_dsl::CmpTy, bool, i128, i128, i128)> = HashMap::default();
+    let mut sym: HashMap<VarId, Opnd> = HashMap::default();
     'var: for (v, list) in &sets {
         let mut consts = Vec::new();
         let mut steps = Vec::new();
@@ -4434,7 +4435,7 @@ fn ring_facts(f: &Function) -> RingFacts {
         ring_step.insert(*v, steps);
         ring_const.insert(*v, consts);
     }
-    let mut shadows: HashMap<VarId, (Opnd, i128, i128, i128, VarId)> = HashMap::new();
+    let mut shadows: HashMap<VarId, (Opnd, i128, i128, i128, VarId)> = HashMap::default();
     'w: for (w, list) in &sets {
         if rings.contains_key(w) {
             continue;
@@ -4476,7 +4477,7 @@ fn ring_facts(f: &Function) -> RingFacts {
 
 /// value -> the `Let` values whose operations read it.
 fn value_users(f: &Function) -> HashMap<ValueId, Vec<ValueId>> {
-    let mut m: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    let mut m: HashMap<ValueId, Vec<ValueId>> = HashMap::default();
     for s in f.stmts() {
         if let Stmt::Let { dst, op } = s {
             for o in op.operands() {

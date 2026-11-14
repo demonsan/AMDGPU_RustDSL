@@ -350,7 +350,8 @@ def get_kernel(kernel, specialize=None, ir_path=None):
     return k
 
 
-def _get_kernel(kernel, spec, ir_path=None):
+def _get_kernel(kernel, spec, ir_path=None, load=True):
+    """The loaded kernel; with `load=False` only make sure the disk-cache entry exists (compile + certificate on a miss) and return its directory: `amdgpu_jit.prewarm`."""
     amdc = amdc_path()
     try:
         clang = clang_path()
@@ -369,7 +370,7 @@ def _get_kernel(kernel, spec, ir_path=None):
             k = _modules.get(key)
             if k is not None:
                 stats["memory_hits"] += 1
-                return k
+                return k if load else k.path
         use_disk = os.environ.get("AMDGPU_JIT_CACHE", "1") != "0"
         root = cache_dir()
         final = os.path.join(root, key)
@@ -398,6 +399,8 @@ def _get_kernel(kernel, spec, ir_path=None):
             with _lock:
                 stats["compiles"] += 1
                 stats["compile_seconds"] += time.perf_counter() - t0
+        if not load:
+            return final
         with open(os.path.join(final, "info.json")) as f:
             info = KernelInfo(json.load(f))
         with open(os.path.join(final, "kernel.co"), "rb") as f:
