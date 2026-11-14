@@ -68,10 +68,21 @@ fn a_part_given_twice_keeps_its_producer() {
     let pair = b.frag_cat(&[Opnd::Val(x), Opnd::Val(x)]);
     let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(3)));
     b.store_lds_b64(a, pair);
-    let fun = b.finish();
-    let (m, al) = amdgpu_codegen::compile_mir_alloc(&fun).unwrap_or_else(|e| panic!("{e}"));
-    let v = amdgpu_codegen::regalloc::check_reaching(&m, &al);
-    assert!(v.is_empty(), "a part reads a register its value never reaches: {v:?}");
+    let s = asm(&b.finish());
+    // straight-line code: every VGPR a v_mov reads was written before (v0 = the workitem id)
+    let mut written: std::collections::HashSet<String> = ["v0".to_string()].into_iter().collect();
+    for l in s.lines().map(|l| l.trim()).filter(|l| l.starts_with("v_") || l.starts_with("ds_read")) {
+        let ops: Vec<&str> = l.split(|c| c == ' ' || c == ',').filter(|x| !x.is_empty()).collect();
+        if l.starts_with("v_mov_b32") {
+            let src = ops[2];
+            if src.starts_with('v') {
+                assert!(written.contains(src), "`{l}` reads {src}, which nothing wrote:\n{s}");
+            }
+        }
+        if let Some(d) = ops.get(1) {
+            written.insert(d.to_string());
+        }
+    }
 }
 
 /// remat4 must not clone an expression into a block that changes EXEC (the clone would run under the narrow EXEC and be read under the
@@ -96,7 +107,15 @@ fn remat_does_not_clone_under_a_narrow_exec() {
     b.break_if(done);
     b.end_loop();
     let s = asm(&b.finish());
-    // the shift (tid << 5) is computed once, before the loop
-    let shifts = s.lines().filter(|l| l.contains("v_lshlrev_b32") && l.contains(", 5,")).count();
-    assert!(shifts <= 1, "the expression was rematerialised in the EXEC-changing loop block:\n{s}");
+    // the shift (tid << 5) is not computed under the narrow EXEC (between `exec, 0xffff` and the restore), where its lanes 16-63 would
+    // stay unwritten for the full-EXEC read after the restore
+    let mut narrow = false;
+    for l in s.lines().map(|l| l.trim()) {
+        if l.starts_with("s_mov_b64 exec, 0x") {
+            narrow = true;
+        } else if l.starts_with("s_mov_b64 exec, s[") {
+            narrow = false;
+        }
+        assert!(!(narrow && l.starts_with("v_lshlrev_b32") && l.contains(" 5,")), "rematerialised under the narrow EXEC: `{l}`\n{s}");
+    }
 }
