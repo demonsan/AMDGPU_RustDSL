@@ -86,6 +86,18 @@ pub fn conv1d_update(name: &str, w: i64, sl: i64, idx: bool, silu: bool) -> Func
     };
     let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0)));
     let slot_ok = b.cmp(CmpPred::Ge, CmpTy::I32, slot, 0);
+    // the slot as an address: with `_idx` a host-contract index (a negative one is masked below); the slots of different sequences are distinct
+    // (host contract, trusted and counted), so the state rows of different workgroups never overlap
+    let slot = if idx {
+        let neg = b.cmp(CmpPred::Lt, CmpTy::I32, slot, 0);
+        let s = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(neg), a: Opnd::I32(0), b: Opnd::Val(slot) });
+        let s = b.read_first_lane(s);
+        b.assume_trusted(s, Ext::c(0), Ext::sym("SLOTS") - Ext::c(1), "host contract: state_indices[b] < slots (a negative index = padding sequence)");
+        b.wg_bijection(&[s], &[1], "host contract: the state_indices of the sequences are distinct (negative = padding, nothing read or written)");
+        s
+    } else {
+        slot
+    };
     let dsz = |b: &mut FnBuilder, per: i64| { let v = b.bind_i32(ev(dim_v) * per as i32); b.read_first_lane(v) };
     let bsz = b.bind_i32(ev(dim_v) * 2);
     let r_x = { let n = b.bind_i32((ev(seq) + 1) * ev(bsz)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr[0], n) };
@@ -97,6 +109,8 @@ pub fn conv1d_update(name: &str, w: i64, sl: i64, idx: bool, silu: bool) -> Func
     // loads: state row (SL u16), weights (W u16), bias, x
     let sbase = b.bind_i32((ev(slot) * ev(dim_v) + ev(ch)) * (2 * sl) as i32);
     let sbase_l = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(slot_ok), a: Opnd::Val(sbase), b: Opnd::Val(oob) });
+    // (the channel guard on the state address too: a channel past dim reads nothing, and the lane's channel is a digit below dim)
+    let sbase_l = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ch_ok), a: Opnd::Val(sbase_l), b: Opnd::Val(oob) });
     let mut st = Vec::new();
     for l in 0..sl {
         st.push(b.buffer_load_c(r_s, Some(Opnd::Val(sbase_l)), 0i32, (2 * l) as u32, MemTy::U16, CachePolicy::NONE));
