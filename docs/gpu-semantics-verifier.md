@@ -368,3 +368,19 @@ VALU 重配对（`gcn-create-vopd`）也需要重新确认。所以这不是"补
 **当前文档口径**：gfx950 只建模 `s_barrier` + waitcnt + fence + version 四轴；TDM 与 split barrier 明确列为
 "目标 ISA 不存在 / 不在范围"，且有可执行能力表作为证据（本节）。多生产者/多消费者义务 O1–O4 与信任账本
 与资源种类无关，新增原语时复用。
+## Cross-workgroup store forms (GV-GLB-RW)
+
+Global stores outside a buffer region are proven disjoint across workgroups by a mixed-radix check over their linear offsets
+(`disjoint_group_why`). Forms beyond plain digits (tests: `crates/amdgpu-kernels/tests/gw_forms.rs`, each with an overlapping negative):
+
+* `ka_pow2(off, P)` (host contract `1 << ka(off) == P`): a shift by that kernarg is a multiplication by P; `x >> s` lies in
+  `[0, (hi(x) + 1) / P - 1]`; and when x and `q = x >> s` are both digits, x is split into `P q + r` with `r = x mod P` in `[0, P - 1]`
+  (the kv-split FMHA kernels: `z = batch * S + split`).
+* `(P + 2^k - 1) >> k` is the grid size of an axis the contract defines as `ceil(P / 2^k)`.
+* a digit with a negative coefficient (a reversed tile order `G - 1 - z`) is mirrored: `c z = (-c)(l + h - z) + c (l + h)`, in the offsets
+  and in the caps, when every store of the group has it.
+* a workgroup id that a `wg_union` lists (through any value reading the same id) shares the union's key, so both store classes of a
+  causal pairing are one digit and their row caps match.
+
+Accesses the analysis still cannot prove must carry an `ALLOW_UNTRACKED` reason in `crates/amdgpu-kernels/tests/verify_reachable.rs`;
+the remaining ones are data-dependent host contracts (cu_seqlens, slot_mapping, routing permutations, in-row ranks).
