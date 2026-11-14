@@ -340,6 +340,9 @@ fn conv1d_fwd_impl(name: &str, w: i64, split: bool, silu: bool, sched: bool, rac
     // the slot index as an address (a negative index skips the sequence: masked below), and the host contract that makes the slot accesses
     // of different workgroups disjoint: (cache slot, chunk) is injective over the workgroups (distinct cache_indices; for `_sched` also
     // distinct table entries) - trusted, counted
+    if sched {
+        b.assume_trusted(chunk, Ext::c(0), Ext::sym("NC") - Ext::c(1), "host contract: the schedule table's chunk indices are >= 0 (and < the number of entries)");
+    }
     let ci_neg = b.cmp(CmpPred::Lt, CmpTy::I32, cache_idx, 0);
     let cidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ci_neg), a: Opnd::I32(0), b: Opnd::Val(cache_idx) });
     let cidx = b.read_first_lane(cidx);

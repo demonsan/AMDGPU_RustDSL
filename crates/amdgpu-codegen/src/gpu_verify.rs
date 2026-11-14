@@ -1474,6 +1474,33 @@ impl<'a> An<'a> {
         if dbg {
             eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
         }
+        // a cap `u < bound` on a workgroup digit u the offsets do not hold, present in every access of the group, with u >= bound - 1: every
+        // access runs in workgroups with that one value of u (e.g. only chunk 0 touches a sequence's state slot), so u is covered - two
+        // accessing workgroups never differ in u
+        if caps_all.len() == ss.len() && !caps_all.is_empty() {
+            for cap0 in caps_all[0].iter() {
+                let ((latoms, lc), bound, clamp) = cap0;
+                if *clamp || latoms.len() != 1 || !lc.as_const().map_or(false, |q| q.n == 0) {
+                    continue;
+                }
+                let (k, c) = latoms.iter().next().unwrap();
+                if atoms.contains_key(k) || !is_wg(k) || c.as_const() != Some(Q::int(1)) {
+                    continue;
+                }
+                if !caps_all.iter().all(|cs| cs.iter().any(|x| x.0 .0 == *latoms && x.1 == *bound && !x.2)) {
+                    continue;
+                }
+                let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
+                let pinned = !insts.is_empty()
+                    && insts.iter().all(|o| self.int_of(o).lo.iter().any(|l| cx.le(&bound.sub(&Poly::int(1)), l)));
+                if dbg {
+                    eprintln!("gw:   pin cap on {:?} < {}: pinned {pinned}", k, bound.show());
+                }
+                if pinned {
+                    covered.insert(*k);
+                }
+            }
+        }
         if caps_all.len() == ss.len() {
             let mut used: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); ss.len()];
             for (ci, cap0) in caps_all[0].iter().enumerate() {
