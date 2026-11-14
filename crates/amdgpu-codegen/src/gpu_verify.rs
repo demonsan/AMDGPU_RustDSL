@@ -1891,6 +1891,9 @@ impl<'a> An<'a> {
         self.note_owned(size);
         self.tile_cover(what, addr, size);
         self.cur_addr = None;
+        if self.rep.quiet > 0 {
+            return; // quiet: the proof below only reports
+        }
         let limit = Itv::konst(self.f.lds_bytes as i128);
         match self.prove_range(addr, size, &limit) {
             Ok(()) => self.rep.ok("lds"),
@@ -1902,6 +1905,9 @@ impl<'a> An<'a> {
     }
 
     fn check_global(&mut self, what: &str, base: &AV, imm: i128, size: i128, store: bool) {
+        if self.rep.quiet > 0 {
+            return; // quiet (a loop fixpoint round): every effect below is a report, and reports are dropped
+        }
         if let AV::Either(arms) = base {
             for x in arms.clone() {
                 self.check_global(what, &x, imm, size, store);
@@ -1957,6 +1963,9 @@ impl<'a> An<'a> {
     }
 
     fn check_buffer(&mut self, what: &str, rsrc: &AV, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128, store: bool) {
+        if self.rep.quiet > 0 {
+            return; // quiet: only reports below
+        }
         if let AV::Either(arms) = rsrc {
             for x in arms.clone() {
                 self.check_buffer(what, &x, voff, soff, imm, size, store);
