@@ -1586,6 +1586,19 @@ impl<'a> An<'a> {
         let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
         if dbg {
             eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
+            // (the distinct caps: atoms with coefficients, constant, bound, clamp)
+            let mut seen_caps: Vec<String> = Vec::new();
+            for cs in caps_all.iter() {
+                for ((la, lc), bd, cl) in cs.iter() {
+                    let s = format!("{} + {} < {}{}", la.iter().map(|(k, c)| format!("{:x}*({})", k.1, c.show())).collect::<Vec<_>>().join(" + "), lc.show(), bd.show(), if *cl { " (clamp)" } else { "" });
+                    if !seen_caps.contains(&s) {
+                        seen_caps.push(s);
+                    }
+                }
+            }
+            for s in seen_caps.iter().take(8) {
+                eprintln!("gw:   cap: {s}");
+            }
         }
         // a cap `u < bound` on a workgroup digit u the offsets do not hold, present in every access of the group, with u >= bound - 1: every
         // access runs in workgroups with that one value of u (e.g. only chunk 0 touches a sequence's state slot), so u is covered - two
