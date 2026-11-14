@@ -104,7 +104,43 @@ pub fn last_rung() -> (u8, u8) {
     LAST_RUNG.with(|c| c.get())
 }
 
+/// The uniform-scalar lowering defaults (measured, docs/lowering-defaults.md): wave-uniform integer chains, compares and branch
+/// conditions in SALU (`scalarize`, `scalarize2`), `workitem_id >> 6` as a wave constant (`waveuni`), SGPR values as VALU operands
+/// without a copy (`sgpr`, `sgpr2`). perf_ab --quick over all families: no family below 0.998, fmha_bwd 1.042, fmha_fp8pt 1.027,
+/// fmha_mxfp8 1.025, conv 1.022, membound 1.013, fmha_bf16 1.011. `salu32` is NOT in the set (decode16 -2 .. -3 %).
+pub const DEFAULT_SCALAR: &[&str] = &["scalarize", "scalarize2", "waveuni", "sgpr", "sgpr2"];
+
+thread_local! {
+    static NO_DEFAULT_SCALAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the uniform-scalar defaults off on this thread (tests that compare a token against the lowering without it).
+pub fn without_scalar_defaults<R>(f: impl FnOnce() -> R) -> R {
+    let was = NO_DEFAULT_SCALAR.with(|c| c.replace(true));
+    let r = f();
+    NO_DEFAULT_SCALAR.with(|c| c.set(was));
+    r
+}
+
+/// Are the uniform-scalar defaults in effect for this kernel (not exact, not switched off by `AMDC_NO_SCALAR_DEFAULT=1` or for the kernels whose name contains one of its comma-separated substrings, not in the SGPR fallback)?
+fn scalar_defaults_on(f: &amdgpu_dsl::Function) -> bool {
+    !f.exact && !NO_DEFAULT_SCALAR.with(|c| c.get()) && std::env::var("AMDC_NO_SCALAR_DEFAULT").map_or(true, |v| v.is_empty() || v == "0" || (v != "1" && !v.split(',').any(|k| !k.is_empty() && f.name.contains(k))))
+}
+
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
+    match lower_and_allocate_ladder(f) {
+        // a kernel the scalar defaults push past the SGPR file compiles without them (the code it had before the defaults)
+        Err(e) if e.contains("out of SGPRs") && scalar_defaults_on(f) => {
+            NO_DEFAULT_SCALAR.with(|c| c.set(true));
+            let r = lower_and_allocate_ladder(f);
+            NO_DEFAULT_SCALAR.with(|c| c.set(false));
+            r
+        }
+        r => r,
+    }
+}
+
+fn lower_and_allocate_ladder(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
     // and try again. A kernel that allocates at the first attempt is unaffected.
     let mut last = String::new();
@@ -130,10 +166,27 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     Err(last)
 }
 
+/// Experiment switch `AMDC_LOWER_ADD=<tokens>`: comma-separated lowering tokens appended to every non-exact kernel on top of its policy
+/// (`name-substring:tokens` entries, separated by `;`, restrict them to matching kernels) - for measuring a token before it becomes a default.
+pub fn lower_add_tokens(f: &amdgpu_dsl::Function) -> Vec<String> {
+    match std::env::var("AMDC_LOWER_ADD") {
+        Ok(spec) if !spec.is_empty() && !f.exact => spec
+            .split(';')
+            .filter_map(|e| match e.split_once(':') {
+                Some((k, toks)) if f.name.contains(k) => Some(toks.to_string()),
+                Some(_) => None,
+                None => Some(e.to_string()),
+            })
+            .flat_map(|toks| toks.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
     // the GEMM profile's policy, or the lowering token `m0reuse` on any kernel (W3 B2: one M0 write per group of LDS-DMA issues)
-    f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse")
+    f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse") || lower_add_tokens(f).iter().any(|t| t == "m0reuse")
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start: u8) -> Result<(mir::MFunction, regalloc::Alloc, u8), String> {
@@ -158,6 +211,11 @@ fn lower_and_allocate_inner(f: &amdgpu_dsl::Function, extra: &[&str], inner_star
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
+    let lower_add = lower_add_tokens(f);
+    extra_all.extend(lower_add.iter().map(|s| s.as_str()));
+    if scalar_defaults_on(f) {
+        extra_all.extend(DEFAULT_SCALAR.iter().copied());
+    }
     // exact mode: operands in the form the instruction takes (inline / literal constants, SGPR sources), never via a copy
     if f.exact {
         // edgepad: MFMA windows still open at a block end are carried into the successors (checked there), not padded at every block end

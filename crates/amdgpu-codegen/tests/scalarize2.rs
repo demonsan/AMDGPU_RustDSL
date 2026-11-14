@@ -54,6 +54,10 @@ fn count(s: &str, pat: &str) -> usize {
 
 #[test]
 fn uniform_clamps_selects_and_readfirstlane_stay_scalar() {
+    amdgpu_codegen::without_scalar_defaults(uniform_clamps_body)
+}
+
+fn uniform_clamps_body() {
     let base = asm(&["dce", "cmpfold", "scalarize"]);
     let ext = asm(&["dce", "cmpfold", "scalarize", "scalarize2"]);
     assert!(count(&base, "v_readfirstlane") >= 1, "without scalarize2 the clamp chain is VALU + readfirstlane:\n{base}");
@@ -72,6 +76,10 @@ fn uniform_clamps_selects_and_readfirstlane_stay_scalar() {
 
 #[test]
 fn uniform_loop_exit_branches_on_scc() {
+    amdgpu_codegen::without_scalar_defaults(uniform_loop_exit_body)
+}
+
+fn uniform_loop_exit_body() {
     // the demo's loop exit `!(it + 1 < nkv)` compares a scalar loop variable with a kernarg: s_cmp + s_cbranch_scc*, no VALU compare / vcc
     let ext = asm(&["dce", "cmpfold", "scalarize", "scalarize2"]);
     assert!(ext.lines().any(|l| l.trim_start().starts_with("s_cbranch_scc")), "{ext}");

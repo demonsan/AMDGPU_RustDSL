@@ -3,7 +3,6 @@
 
 /// (kernel, outer rung, inner rung).
 pub static HINTS: &[(&str, u8, u8)] = &[
-    ("fmha_fwd_hd128_bf16_v3_causal_ks", 0, 2),
     ("fmha_fwd_hd192_hd128_bf16_v3_causal", 4, 0),
     ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 4, 0),
     ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4, 0),
