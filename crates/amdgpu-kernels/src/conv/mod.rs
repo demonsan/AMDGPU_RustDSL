@@ -174,6 +174,17 @@ pub fn fwd_by_name(name: &str) -> Option<Function> {
 }
 
 pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> Function {
+    conv1d_fwd_impl(name, w, split, silu, sched, false)
+}
+
+/// The PRE-FIX state protocol (every chunk loads the slot, the last chunk writes it: a cross-workgroup race), kept only for the verifier's
+/// mutation test (`tests/conv_state_race.rs`): gpu_verify must flag it (GV-GLB-RW) and prove the shipped one.
+#[doc(hidden)]
+pub fn conv1d_fwd_racy_for_tests(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> Function {
+    conv1d_fwd_impl(name, w, split, silu, sched, true)
+}
+
+fn conv1d_fwd_impl(name: &str, w: i64, split: bool, silu: bool, sched: bool, racy: bool) -> Function {
     let sl = w - 1;
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
@@ -326,16 +337,31 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
     let bias_fr = b.buffer_load_c(r_b, Some(Opnd::Val(bo)), 0i32, 0, MemTy::B128, CachePolicy::NONE);
     let bias = bf16x8_to_f32(b, bias_fr);
     // the initial state of the 8 features: [f][j] = element f * (W - 1) + j (zero when the sequence has none)
-    let st_base = b.bind_i32((ev(cache_idx) * ev(dim_v) + ev(feat)) * (2 * sl) as i32);
+    // the slot index as an address (a negative index skips the sequence: masked below), and the host contract that makes the slot accesses
+    // of different workgroups disjoint: (cache slot, chunk) is injective over the workgroups (distinct cache_indices; for `_sched` also
+    // distinct table entries) - trusted, counted
+    let ci_neg = b.cmp(CmpPred::Lt, CmpTy::I32, cache_idx, 0);
+    let cidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ci_neg), a: Opnd::I32(0), b: Opnd::Val(cache_idx) });
+    let cidx = b.read_first_lane(cidx);
+    b.assume_trusted(cidx, Ext::c(0), Ext::sym("SLOTS") - Ext::c(1), "host contract: cache_indices[s] < slots (a negative index skips the sequence)");
+    b.wg_bijection(
+        &[cidx, chunk],
+        if sched { &[1u8][..] } else { &[1u8, 2][..] },
+        "host contract: the cache_indices of the sequences are distinct (negative = skipped) and, with `_sched`, the (sequence, chunk) table entries are distinct: (cache slot, chunk) is injective over the workgroups",
+    );
+    let st_base = b.bind_i32((ev(cidx) * ev(dim_v) + ev(feat)) * (2 * sl) as i32);
     // the state slot is read AND written only by the sequence's chunk 0 (the vLLM / aiter scheme): another workgroup of the same sequence
     // never touches it, so the old state cannot be overwritten before it is read (the last chunk writing it raced with chunk 0 reading it:
     // intermittent wrong first W-1 outputs, mostly with `_sched`)
     let first0 = b.cmp(CmpPred::Eq, CmpTy::I32, chunk, 0);
     let first_i = sel_i(b, first0);
     let sk_i = sel_i(b, seq_ok);
-    let st_on = b.bind_i32(ev(sk_i) & ev(fok) & ev(first_i));
+    let st_on = if racy { b.bind_i32(ev(sk_i) & ev(fok)) } else { b.bind_i32(ev(sk_i) & ev(fok) & ev(first_i)) };
+    let chunk_lt1 = b.cmp(CmpPred::Lt, CmpTy::I32, chunk, 1);
     let st_on_c = b.cmp(CmpPred::Ne, CmpTy::I32, st_on, 0);
     let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(st_on_c), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
+    // (the chunk-0 guard spelled `chunk < 1` on the address: the verifier's cap pins the chunk digit)
+    let st_off = if racy { st_off } else { b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(chunk_lt1), a: Opnd::Val(st_off), b: Opnd::Val(oob) }) };
     let zero = b.c_f32(0.0);
     let hi_c = b.cmp(CmpPred::Ne, CmpTy::I32, has_init, 0);
     let mut st: Vec<ValueId> = Vec::new();
@@ -465,8 +491,11 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
     }
     // the final state: written by chunk 0 (uniform), the reader of the old state: the last W-1 inputs of the sequence (read from x), older
     // initial-state values when the sequence is shorter than W-1
+    let last_chunk = b.bind_i32(ev(c0) + TM as i32);
+    let is_last = b.cmp(CmpPred::Ge, CmpTy::I32, last_chunk, seqlen);
+    let owner = if racy { is_last } else { first0 };
     b.if_(active, |b| {
-        b.if_(first0, |b| {
+        b.if_(owner, |b| {
             let mut vals: Vec<ValueId> = Vec::new();    // [f][j] element f * sl + j
             let mut cols: Vec<[ValueId; 8]> = Vec::new();
             for j in 0..sl {
@@ -506,6 +535,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
                 let f4 = b.frag4(words[4 * c], words[4 * c + 1], words[4 * c + 2], words[4 * c + 3]);
                 let o = b.bind_i32(ev(base) + 16 * c as i32);
                 let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr_c), a: Opnd::Val(o), b: Opnd::Val(oob) });
+                let o = if racy { o } else { b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(chunk_lt1), a: Opnd::Val(o), b: Opnd::Val(oob) }) };
                 b.buffer_store_c(r_s, Some(Opnd::Val(o)), 0i32, 0, f4, MemTy::B128, false, CachePolicy::NONE);
             }
         });
