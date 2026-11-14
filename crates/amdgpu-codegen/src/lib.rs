@@ -122,9 +122,9 @@ pub fn without_scalar_defaults<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Are the uniform-scalar defaults in effect for this kernel (not exact, not switched off by `AMDC_NO_SCALAR_DEFAULT=1`, not in the SGPR fallback)?
+/// Are the uniform-scalar defaults in effect for this kernel (not exact, not switched off by `AMDC_NO_SCALAR_DEFAULT=1` or for the kernels whose name contains one of its comma-separated substrings, not in the SGPR fallback)?
 fn scalar_defaults_on(f: &amdgpu_dsl::Function) -> bool {
-    !f.exact && !NO_DEFAULT_SCALAR.with(|c| c.get()) && std::env::var("AMDC_NO_SCALAR_DEFAULT").map_or(true, |v| v.is_empty() || v == "0")
+    !f.exact && !NO_DEFAULT_SCALAR.with(|c| c.get()) && std::env::var("AMDC_NO_SCALAR_DEFAULT").map_or(true, |v| v.is_empty() || v == "0" || (v != "1" && !v.split(',').any(|k| !k.is_empty() && f.name.contains(k))))
 }
 
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
