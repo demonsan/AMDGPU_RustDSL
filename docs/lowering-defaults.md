@@ -58,10 +58,10 @@ slower. perf_ab did not flag it: the membound ok pattern `bad[a-z_]*=0` was matc
 **Cause.** `cmpfold` and `dce_cmp_pairs` recognised a 0/1 compare materialisation (`v_cmp ; v_cndmask t, 0, one`) by its SHAPE alone.
 - With `imm`, a select whose false arm is the constant 0 lowers to `v_cndmask d, 0, x`, with x an arbitrary per-lane value, right after the select's own compare.
 - cmpfold then rewrote a later `d != 0` into the select's compare `c`. That is wrong for the lanes where c holds and x is 0.
-- The kernels that carry `imm` in their policy (vs128 / kvsplit / t128 / replica / ring2, fp8pt, mla_decode, pa_decode16, attn_combine, rmsnorm_quant_mxfp4, hd192 causal; 24 kernels) contained the same pattern. Tests, run_all and port_gate (incl. its stress runs) passed on them, so their x values were evidently never 0 where it mattered, but the fold was unsound.
+- No shipped kernel was affected. The kernels that carry `imm` in their policy (vs128 / kvsplit / t128, fp8pt, mla_decode, pa_decode16, attn_combine, …) compile byte-identically with the fixed fold (md5 manifest unchanged): the shape never met a later `!= 0` test there. Only `topk_per_row` under `imm` (not its policy) hit it.
 
 **Fix.**
 - `cmp_i1` registers the materialisations it emits (`MAT01`); cmpfold and dce_cmp_pairs act only on those.
 - `crates/amdgpu-codegen/tests/cmpfold_select_zero.rs` reproduces the pattern; it fails on the pre-fix lowering.
 - perf_ab fails a case whose output carries a host failure marker (`XYZ_FAIL` / `FAIL`) even when the ok pattern matches, and the membound ok pattern no longer accepts `past_end_bad=0`.
-- The 24 kernels' goldens changed with the fix.
+- Goldens unchanged (an interim workaround that kept the inline-0 select arm in a register changed 24 kernels; it was replaced by the MAT01 fix).
