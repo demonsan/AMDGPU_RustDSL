@@ -586,6 +586,7 @@ fn main() -> ExitCode {
             };
             let mut bad = false;
             let (mut tot_trusted, mut tot_contracts, mut tot_unproven) = (0usize, 0usize, 0usize);
+            let mut tot_untracked = 0usize;
             if args.iter().any(|a| a == "--json") {
                 // structured findings (docs/diagnostics.md): one JSON object per kernel
                 let mut objs = Vec::new();
@@ -628,10 +629,14 @@ fn main() -> ExitCode {
                         let trusted = l.total();
                         let c = &f.contract;
                         let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
-                        println!("   certificate: {trusted} trusted assumes ({} assume_trusted, {} tile_trust_periodic, {} region_trust, {} asm_opaque, {} timing), {contracts} trusted contracts, {errs} unproven", l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust);
+                        // untracked: accesses that are bounds-checked but NOT race-checked (part of the summary: they can't hide behind "0 unproven")
+                        let untracked: usize = r.unchecked.values().sum();
+                        println!("   certificate: {trusted} trusted assumes ({} assume_trusted, {} tile_trust_periodic, {} region_trust, {} asm_opaque, {} timing), {contracts} trusted contracts, {errs} unproven, {untracked} untracked", l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust);
                         if !r.unchecked.is_empty() {
                             println!("   bounds-checked, not race-checked (docs/trust-inventory.md): {:?}", r.unchecked);
-                        }                        tot_trusted += trusted;
+                        }
+                        tot_untracked += untracked;
+                        tot_trusted += trusted;
                         tot_contracts += contracts;
                         tot_unproven += errs;
                         bad |= errs > 0;
@@ -642,7 +647,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            println!("certificate (all kernels listed): {tot_trusted} trusted assumes, {tot_contracts} trusted contracts, {tot_unproven} unproven");
+            println!("certificate (all kernels listed): {tot_trusted} trusted assumes, {tot_contracts} trusted contracts, {tot_unproven} unproven, {tot_untracked} untracked (bounds-checked, not race-checked)");
             if strict && bad {
                 ExitCode::from(1)
             } else {

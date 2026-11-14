@@ -920,6 +920,7 @@ impl<'a> An<'a> {
         match (self.defs.get(cv), live) {
             (Some(Op::CmpLtI32(x, y)), true) | (Some(Op::CmpGeI32(x, y)), false) => Some((*x, *y)),
             (Some(Op::NotI1(c)), l) => self.lt_of(c, !l),
+            (Some(Op::Cmp { pred: amdgpu_dsl::CmpPred::Lt, ty: amdgpu_dsl::CmpTy::I32, a, b }), true) | (Some(Op::Cmp { pred: amdgpu_dsl::CmpPred::Ge, ty: amdgpu_dsl::CmpTy::I32, a, b }), false) => Some((*a, *b)),
             _ => None,
         }
     }
@@ -1474,6 +1475,33 @@ impl<'a> An<'a> {
         if dbg {
             eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
         }
+        // a cap `u < bound` on a workgroup digit u the offsets do not hold, present in every access of the group, with u >= bound - 1: every
+        // access runs in workgroups with that one value of u (e.g. only chunk 0 touches a sequence's state slot), so u is covered - two
+        // accessing workgroups never differ in u
+        if caps_all.len() == ss.len() && !caps_all.is_empty() {
+            for cap0 in caps_all[0].iter() {
+                let ((latoms, lc), bound, clamp) = cap0;
+                if *clamp || latoms.len() != 1 || !lc.as_const().map_or(false, |q| q.n == 0) {
+                    continue;
+                }
+                let (k, c) = latoms.iter().next().unwrap();
+                if atoms.contains_key(k) || !is_wg(k) || c.as_const() != Some(Q::int(1)) {
+                    continue;
+                }
+                if !caps_all.iter().all(|cs| cs.iter().any(|x| x.0 .0 == *latoms && x.1 == *bound && !x.2)) {
+                    continue;
+                }
+                let insts = self.atom_inst.borrow().get(k).cloned().unwrap_or_default();
+                let pinned = !insts.is_empty()
+                    && insts.iter().all(|o| self.int_of(o).lo.iter().any(|l| cx.le(&bound.sub(&Poly::int(1)), l)));
+                if dbg {
+                    eprintln!("gw:   pin cap on {:?} < {}: pinned {pinned}", k, bound.show());
+                }
+                if pinned {
+                    covered.insert(*k);
+                }
+            }
+        }
         if caps_all.len() == ss.len() {
             let mut used: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); ss.len()];
             for (ci, cap0) in caps_all[0].iter().enumerate() {
@@ -1665,6 +1693,17 @@ impl<'a> An<'a> {
                 if spaced && kf == Poly::int(1) {
                     sized.push((kf.clone(), span.clone()));
                 }
+                // x steps by the gcd g of its (constant integer) atom coefficients when every store holds the same x constant: the digit is
+                // (k g) over span / g (e.g. a lane's first feature 8 tid + 2048 x below dim: stride 8)
+                let same_c = picks.iter().enumerate().all(|(si, p)| caps_all[si][*p].0 .1 == caps_all[0][picks[0]].0 .1);
+                let g = latoms.values().try_fold(0i128, |acc, c| c.as_const().filter(|q| q.d == 1 && q.n > 0).map(|q| gcd(acc, q.n)));
+                let (kf, span) = match g {
+                    Some(g) if g > 1 && same_c => match kf.mul(&Poly::int(g)) {
+                        Some(k2) => (k2, span.scale(Q::new(1, g))),
+                        None => (kf, span),
+                    },
+                    _ => (kf, span),
+                };
                 digits.push((kf, span));
             }
         }
@@ -3854,7 +3893,7 @@ pub fn verify_ir(f: &Function) -> Report {
         }
         an.rep.add(
             "GV-GLB-RW",
-            Severity::Warn,
+            Severity::Error,
             format!(
                 "argument `{name}` is both loaded and stored, and its {n} load(s) are not proven disjoint from the stores of OTHER workgroups: a \
                  cross-workgroup read-after-write / write-after-read race unless the launch orders them (workgroups run in no fixed order)"
