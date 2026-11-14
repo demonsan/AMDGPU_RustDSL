@@ -1568,7 +1568,11 @@ impl<'a> An<'a> {
                 let rk = (false, qk.1 ^ 0x9e37_79b9_7f4a_7c15);
                 atoms.insert(rk, c);
                 ranges.insert(rk, (Poly::int(0), pw.sub(&Poly::int(1))));
-                covered.insert(xk);
+                // (x is covered by the pair only if q still carries a coefficient: q's coefficient 0 means two values of q collide)
+                let qc = &atoms[&qk];
+                if !qc.as_const().map_or(false, |z| z.is_zero()) && cx.nonneg(qc) {
+                    covered.insert(xk);
+                }
                 if dbg_pow2() {
                     eprintln!("gw:   pow2 split of {:x}: q {:x}, r {:x} in [0, {} - 1]", xk.1, qk.1, rk.1, pw.show());
                 }
