@@ -920,6 +920,7 @@ impl<'a> An<'a> {
         match (self.defs.get(cv), live) {
             (Some(Op::CmpLtI32(x, y)), true) | (Some(Op::CmpGeI32(x, y)), false) => Some((*x, *y)),
             (Some(Op::NotI1(c)), l) => self.lt_of(c, !l),
+            (Some(Op::Cmp { pred: amdgpu_dsl::CmpPred::Lt, ty: amdgpu_dsl::CmpTy::I32, a, b }), true) | (Some(Op::Cmp { pred: amdgpu_dsl::CmpPred::Ge, ty: amdgpu_dsl::CmpTy::I32, a, b }), false) => Some((*a, *b)),
             _ => None,
         }
     }
