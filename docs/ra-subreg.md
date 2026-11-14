@@ -1,4 +1,4 @@
-﻿# Sub-register allocation (per-dword / 16-bit-half liveness)
+# Sub-register allocation (per-dword / 16-bit-half liveness)
 
 Item 3 of the default-path lowering work: register allocation that tracks liveness below the tuple, the enabler for vendor-style register
 plans. Three stages, each opt-in and gated on its own (md5 manifests + added table, perf_ab all families, port_gate); a stage becomes a

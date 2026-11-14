@@ -1,4 +1,4 @@
-﻿//! gpu_verify: ring counters (an offset cycling through a fixed set of slots) and their shadows are proven from the IR (no assume).
+//! gpu_verify: ring counters (an offset cycling through a fixed set of slots) and their shadows are proven from the IR (no assume).
 
 use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Op, Opnd};
 

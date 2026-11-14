@@ -1,4 +1,4 @@
-﻿//! The back-end-added instruction table: per reachable kernel, the final instructions the back end added on its own, by class
+//! The back-end-added instruction table: per reachable kernel, the final instructions the back end added on its own, by class
 //! (`exact::synthetic_kind`: copies, constant materializations, waits, s_nops, readfirstlanes, implicit M0 writes). The metric of the
 //! default-path lowering work: a change that removes added instructions shows here, kernel by kernel.
 //!

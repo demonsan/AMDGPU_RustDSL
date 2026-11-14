@@ -1,4 +1,4 @@
-﻿//! The soundness net of the register allocator work (docs/ra-subreg.md): every reachable kernel's allocation passes the per-dword /
+//! The soundness net of the register allocator work (docs/ra-subreg.md): every reachable kernel's allocation passes the per-dword /
 //! per-16-bit-half clobber check (`exact::check_registers`: no instruction writes a physical register dword whose value is still read later
 //! on some path).
 
