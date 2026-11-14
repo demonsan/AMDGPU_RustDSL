@@ -20,11 +20,6 @@ const ALLOW_UNTRACKED: &[(&str, &str, &str)] = &[
     ("topk_per_row_", "global-write-untracked", "per-row top-k outputs written at their in-row rank (data-dependent); rows are workgroup digits, the rank within a row is not linear"),
     ("qknorm_rope_kvcache_neox_", "global-write-untracked", "key / value cache rows written at slot_mapping[token] (host contract: distinct slots per token)"),
     ("reshape_cache_blocked_fp8_", "global-write-untracked", "cache rows written at slot_mapping[token] (host contract: distinct slots per token)"),
-    ("fmha_fwd_hd128_bf16_v3_ks", "global-write-untracked", "kv-split: z = batch * S + split with S = 1 << lg_s (host contract: the launcher passes lg_s = log2 S; not expressible in the contract language yet), so (batch, split, row, head) is a mixed radix: disjoint (proof form sym_pow2 planned)"),
-    ("fmha_fwd_hd128_bf16_v3_causal_ks", "global-write-untracked", "kv-split: z = batch * S + split with S = 1 << lg_s (host contract: the launcher passes lg_s = log2 S; not expressible in the contract language yet), so (batch, split, row, head) is a mixed radix: disjoint (proof form sym_pow2 planned)"),
-    ("fmha_fwd_hd192_hd128_bf16_v3_ks", "global-write-untracked", "kv-split: z = batch * S + split with S = 1 << lg_s (host contract: the launcher passes lg_s = log2 S; not expressible in the contract language yet), so (batch, split, row, head) is a mixed radix: disjoint (proof form sym_pow2 planned)"),
-    ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", "global-write-untracked", "kv-split: z = batch * S + split with S = 1 << lg_s (host contract: the launcher passes lg_s = log2 S; not expressible in the contract language yet), so (batch, split, row, head) is a mixed radix: disjoint (proof form sym_pow2 planned)"),
-    ("fmha_fwd_hd128_fp8pt_v3_causal", "global-write-untracked", "causal pairing (q tiles x and n - 1 - x per CTA, the wg_union bijection); each half's rows are clipped below S by its own live-row cap, which the radix check cannot merge across the pair"),
 ];
 
 #[test]

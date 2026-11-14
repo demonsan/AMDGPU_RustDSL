@@ -151,13 +151,14 @@ pub fn info_json_src(f: &Function, spec: &[(String, u32, SpecValue)], derived: &
     let hi = |h: i64| if h == i64::MAX { "null".to_string() } else { h.to_string() };
     let ka_range: Vec<String> = c.ka_ranges.iter().map(|(o, lo, h)| format!("{{\"offset\":{o},\"lo\":{lo},\"hi\":{}}}", hi(*h))).collect();
     let ka_set: Vec<String> = c.ka_sets.iter().map(|(o, vs)| format!("{{\"offset\":{o},\"values\":[{}]}}", vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))).collect();
+    let ka_pow2: Vec<String> = c.ka_pow2.iter().map(|(o, e)| format!("{{\"offset\":{o},\"ext\":{}}}", ext_json(e))).collect();
     let tensors: Vec<String> = c
         .extents
         .iter()
         .map(|e| format!("{{\"arg\":\"{}\",\"alloc_bytes\":{},\"logical_bytes\":{}}}", esc(&e.arg), ext_json(&e.alloc), e.logical.as_ref().map(ext_json).unwrap_or_else(|| "null".to_string())))
         .collect();
     let mut names: BTreeSet<String> = BTreeSet::new();
-    for e in c.grid_defs.iter().map(|x| &x.1).chain(c.ka_defs.iter().map(|x| &x.1)).chain(c.extents.iter().map(|x| &x.alloc)).chain(c.extents.iter().filter_map(|x| x.logical.as_ref())) {
+    for e in c.grid_defs.iter().map(|x| &x.1).chain(c.ka_defs.iter().map(|x| &x.1)).chain(c.ka_pow2.iter().map(|x| &x.1)).chain(c.extents.iter().map(|x| &x.alloc)).chain(c.extents.iter().filter_map(|x| x.logical.as_ref())) {
         syms_of(e, &mut names);
     }
     for (n, _, _) in &c.sym_ranges {
@@ -177,7 +178,7 @@ pub fn info_json_src(f: &Function, spec: &[(String, u32, SpecValue)], derived: &
     format!(
         "{{\"schema\":1,\"source\":\"{}\",\"kernel\":\"{k}\",\"symbol\":\"{k}\",\"arch\":\"{}\",\"compiler\":{{\"version\":\"{}\",\"git\":\"{}\"}},\"compiler_hash\":\"{}\",\"backend\":\"{}\",\"specialize\":{{{}}},\"derived\":{{{}}},\
 \"block\":[{},1,1],\"lds_bytes\":{},\"vgpr\":{},\"agpr\":{},\"sgpr\":{},\"scratch_bytes\":{},\"kernarg_size\":{},\"kernarg_align\":8,\"args\":[{}],\
-\"contract\":{{\"grid\":[{}],\"ka_is\":[{}],\"ka_range\":[{}],\"ka_set\":[{}],\"tensors\":[{}],\"syms\":[{}]}}}}",
+\"contract\":{{\"grid\":[{}],\"ka_is\":[{}],\"ka_range\":[{}],\"ka_set\":[{}],\"ka_pow2\":[{}],\"tensors\":[{}],\"syms\":[{}]}}}}",
         esc(source),
         amdgpu_codegen::target::T.name,
         esc(VERSION),
@@ -198,6 +199,7 @@ pub fn info_json_src(f: &Function, spec: &[(String, u32, SpecValue)], derived: &
         ka_is.join(","),
         ka_range.join(","),
         ka_set.join(","),
+        ka_pow2.join(","),
         tensors.join(","),
         syms.join(","),
         k = esc(&f.name)

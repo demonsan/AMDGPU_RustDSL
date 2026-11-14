@@ -264,7 +264,7 @@ pub fn summary_json(f: &Function) -> Result<String, String> {
         Ok(r) => {
             let l = r.ledger();
             let c = &f.contract;
-            let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+            let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.ka_pow2.len() + c.sym_ranges.len();
             format!(
                 "{{\"errors\":{},\"warnings\":{},\"trusted_assumes\":{},\"trusted_contracts\":{}}}",
                 r.errors().len(),

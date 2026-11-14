@@ -1104,6 +1104,9 @@ pub struct Contract {
     pub ka_defs: Vec<(u32, Ext)>,
     /// (kernarg offset, allowed values): the scalar takes one of these values (host contract; the analyzer uses their min/max as the range).
     pub ka_sets: Vec<(u32, Vec<i64>)>,
+    /// (kernarg offset, expr): `1 << ka(offset)` EQUALS `expr` (host contract), e.g. a split count S = 1 << lg_s passed both ways; the analyzer
+    /// reads a shift by that kernarg as a multiplication / floor division by `expr`.
+    pub ka_pow2: Vec<(u32, Ext)>,
     /// LDS tiles / rings (v1.1 lifetime model) and the explicitly aliased pairs (allowed to overlap).
     pub tiles: Vec<TileDecl>,
     pub tile_aliases: Vec<(String, String)>,
@@ -1987,6 +1990,10 @@ impl FnBuilder {
     #[track_caller]
     pub fn ka_one_of(&mut self, offset: u32, values: &[i64]) {
         self.f.contract.ka_sets.push((offset, values.to_vec()));
+    }
+    /// Host contract: `1 << ka(offset) == e` (see `Contract::ka_pow2`).
+    pub fn ka_pow2(&mut self, offset: u32, e: Ext) {
+        self.f.contract.ka_pow2.push((offset, e));
     }
     /// Host contract: the u32 kernarg scalar at `offset` equals `expr` (e.g. strides derived from the shape: `b.ka_is(0x70, Ext::grid_y() * Ext::ka(0x90))`).
     #[track_caller]

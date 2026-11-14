@@ -499,6 +499,8 @@ pub fn fmha_fwd_bf16_v3_o(name: &str, causal: bool, split: bool, dqk: i32, opts:
         b.arg("ptr_plse", DType::Ptr, 688, 8);
         b.sym_range("LS", 0, 4);
         b.ka_is(656, Ext::sym("LS"));
+        // the host passes S and lg_s = log2 S: 1 << lg_s == S (z = batch * S + split decodes by shifts)
+        b.ka_pow2(656, Ext::sym("SPL"));
         b.sym_range("SPL", 1, 16);
         b.sym_range("BB", 1, 1 << 12);
         b.grid_is(2, Ext::sym("BB") * Ext::sym("SPL"));

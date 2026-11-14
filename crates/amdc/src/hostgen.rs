@@ -77,6 +77,7 @@ fn collect_syms(f: &Function) -> std::collections::BTreeSet<String> {
     for e in &c.extents { collect_syms_into(&e.alloc, &mut out); if let Some(l) = &e.logical { collect_syms_into(l, &mut out); } }
     for (_, e) in &c.grid_defs { collect_syms_into(e, &mut out); }
     for (_, e) in &c.ka_defs { collect_syms_into(e, &mut out); }
+    for (_, e) in &c.ka_pow2 { collect_syms_into(e, &mut out); }
     for (n, _, _) in &c.sym_ranges { out.insert(c_ident(n)); }
     out
 }
@@ -173,6 +174,9 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
     }
     for (offv, e) in &c.ka_defs {
         checks.push_str(&format!("    if (ka(0x{offv:X}u) != {}) {{ return fail(err, \"GV-HOST-KA-IS\", \"ka(0x{offv:X}) relation failed\"); }}\n", ext_expr(e)));
+    }
+    for (offv, e) in &c.ka_pow2 {
+        checks.push_str(&format!("    if (ka(0x{offv:X}u) < 0 || ka(0x{offv:X}u) > 30 || (1LL << ka(0x{offv:X}u)) != {}) {{ return fail(err, \"GV-HOST-KA-POW2\", \"1 << ka(0x{offv:X}) relation failed\"); }}\n", ext_expr(e)));
     }
     for (offv, vals) in &c.ka_sets {
         let cond = vals.iter().map(|v| format!("ka(0x{offv:X}u) == {v}LL")).collect::<Vec<_>>().join(" || ");
