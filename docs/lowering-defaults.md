@@ -13,14 +13,24 @@ measured win:
 | `salu32` | not default | decode16 -2 ... -3 % |
 | (5) `imm` | opt-in, neutral | families 0.99 - 1.01 after the cmpfold fix (the topk_per_row -30 % was a miscompile, below) |
 | `cmpneg` | opt-in, neutral | 4 kernels change, 0.99 - 1.03 (noise) |
-| `movb64` | not measured as a default | the LLVM tail row (`VZeroSub2`) exists |
-| (4) `jthread` / `coldlayout`, (6) `m0reuse` | evaluated per family by the scheduler work | see its report |
+| `movb64` | opt-in, neutral | all 8 families inside noise (9-repetition re-runs) |
+| (4) `jthread` / `coldlayout` | nothing to adopt | 0 of 240 kernels change outside the replica |
+| (6) `m0reuse` | opt-in | 10 kernels -521 SALU; perf_ab fp8pt 1.000 / mxfp8 0.998 |
+| `kabatch` | not a candidate | - |
+| (7) `edgepad` | **default** | -609 s_nop / -3667 wait states over 28 kernels; 9 repetitions: mxfp8 1.024 / bwd 1.024 / fp8pt 1.008 |
+| (8) physical-view wait check | **default check** | md5-neutral |
+| `mfmadc` / `loopreuse` / `radword` (S1) / `dupfold` | opt-in, measured neutral | -2628 / -4386 / 0 / -152 copies |
+| RA S2 affinity / S3 | closed after profiling | the copies run once per loop entry / block |
 
 Soundness findings of the round, all fixed with regression tests ([`current-status.md`](current-status.md) section 1.0a):
 - the cmpfold shape-only fold (below);
 - the causal_conv1d_fwd cross-workgroup state race. It was Python-reachable, in both the grid and `_sched` variants. `GV-GLB-RW` is now an error, certificates count untracked accesses, and reachable kernels may keep untracked accesses only via the reasoned `ALLOW_UNTRACKED` list in `crates/amdgpu-kernels/tests/verify_reachable.rs`;
-- the LLVM tail's kernarg metadata;
-- the peephole audit.
+- the LLVM tail's kernarg metadata (`.args` declares every kernarg; `causal_conv1d_fwd_*_sched` faulted under the auto backend);
+- the peephole audit ([`peephole-audit.md`](peephole-audit.md)): 5 confirmed bugs with adversarial tests, f32 select -> min / max only under the opt-in `fminmax`, no shipped kernel changed.
+- GV-GLB-RW / untracked proof status: backend's verifier forms prove the 4 split-K GEMMs and `fmha_bwd_dq_hd128_bf16_causal` (allowlist 15 -> 10).
+  - The forms: exact right shifts, `(P + 2^k - 1) >> k` read as the ceil-defined grid, mirrored negative-coefficient digits.
+  - The 10 entries left all carry reasons: 5 data-dependent indices, 4 KV-split fwd kernels (need an `S = 1 << lg_s` contract form), fp8pt causal (per-class caps for paired tiles).
+- argmax: its NaN behaviour differs from torch (pre-existing, documented).
 
 ## Experiment switches
 

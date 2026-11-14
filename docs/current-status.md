@@ -62,8 +62,14 @@ Main `3d064d0c`：`cargo test` 163 个测试目标 / 650 项全绿，`run_all.sh
 | `salu32`（无符号比较走 SCC） | 不进默认 | decode16 −2 … −3 % |
 | (5) `imm`（内联常量） | opt-in，中性 | 族几何平均 0.99–1.01；topk_per_row 的 −30 % 其实是错误结果，见下面的健全性修复 |
 | `cmpneg`（否定比较） | opt-in，中性 | 只改变 4 个 kernel，0.99–1.03（噪声内） |
-| `movb64` | 未作为默认测量 | LLVM tail 已有 `VZeroSub2` 行 |
-| (4) `jthread` / `coldlayout`、(6) `m0reuse` | 由 sched 按族评估 | 见其报告 |
+| `movb64`（v_mov_b64 清零对） | opt-in，中性 | sched 测量：8 个族全部在噪声内（9 次重复复测） |
+| (4) `jthread` / `coldlayout` | 无可采用 | 复刻之外 240 个 kernel 中 0 个变化 |
+| (6) `m0reuse`（M0 规划） | opt-in | 10 个 kernel −521 条 SALU；perf_ab fp8pt 1.000 / mxfp8 0.998 |
+| `kabatch` | 不是候选 | — |
+| (7) `edgepad` | **默认开启** | 28 个 kernel −609 条 s_nop / −3667 个等待周期；9 次重复：mxfp8 1.024 / bwd 1.024 / fp8pt 1.008 |
+| (8) 物理视图等待检查 | **默认检查** | md5 不变 |
+| `mfmadc` / `loopreuse` / `radword`（S1）/ `dupfold` | opt-in，测量为中性 | 拷贝 −2628 / −4386 / 0 / −152 |
+| 寄存器分配 S2 亲和 / S3 | 剖析后关闭 | 这些拷贝每次进入循环 / 块只执行一次 |
 
 实验开关：`AMDC_LOWER_ADD`（给每个 kernel 加 lowering token），配合 perf_ab 的 `--new-emit-env`；静态筛查用 `tools/lower_screen.sh`。
 
@@ -83,7 +89,18 @@ Main `3d064d0c`：`cargo test` 163 个测试目标 / 650 项全绿，`run_all.sh
   - 变异测试 `tests/conv_state_race.rs`：修复前的协议被标记，出厂版本得到证明。
   - `causal_conv1d_update` 也得到证明。依据的主机合同（state 索引互不相同）计入信任账本。
 - **LLVM tail 的 kernarg 元数据**（backend）：auto / LLVM 路径的 `.args` 现在声明全部 kernarg。此前 `causal_conv1d_fwd_*_sched` 在 auto 后端下每次都非法访存。
-- **窥孔审计**（backend）：逐个审计 lowering / MIR 窥孔是否只按形状匹配。backend 把 split-K、bwd_dq 等的不相交性证明补齐，并从白名单移除对应条目。
+- **窥孔审计**（backend，[`peephole-audit.md`](peephole-audit.md)）：
+  - 确认 5 个 bug，各有对抗测试；
+  - f32 的 select → min / max 改为只在 opt-in `fminmax` 下进行；
+  - 出厂 kernel 均未改变。
+- **GV-GLB-RW / untracked 的证明进度**（gw-slice，Main `86f1f585`）：
+  - backend 新增的验证器形式：右移的精确性（N = 128·NT 时 N >> 7 = NT）、`(P + 2^k − 1) >> k` 读作 ceil 定义的网格、负系数（逆序 tile）数位的镜像。
+  - 由此证明了 4 个 split-K GEMM（`*_64_splitk_lc`）与 `fmha_bwd_dq_hd128_bf16_causal`，白名单 15 → 10 条。
+  - 剩余 10 条都带理由：
+    - 5 条数据相关下标：conv1d_fwd 的输出行、moe_sorting、topk_per_row、qknorm_rope_kvcache、reshape_cache；
+    - 4 个 KV-split fwd：需要 `S = 1 << lg_s` 的合同形式；
+    - fp8pt causal：成对 tile 的分类 cap。
+- **argmax 的 NaN 行为与 torch 不同**：既有行为，已记录。
 
 **编译时间（[`compile-time.md`](compile-time.md)）**
 - 240 个 kernel（verify 开、own 后端）：单线程 36.2 s → 3.6 s，8 线程 6.0 s → 0.49 s。
