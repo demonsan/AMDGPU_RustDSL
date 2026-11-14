@@ -129,7 +129,7 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
     let retried: Vec<&Row> = rows.iter().filter(|r| r.ra_runs > 1).collect();
     println!("retry ladders: {} of {} kernels ran register allocation more than once ({} runs in all, {:.1} s of the allocation time)", retried.len(), n, retried.iter().map(|r| r.ra_runs as usize).sum::<usize>(), retried.iter().map(|r| r.ra_ms).sum::<f64>() / 1e3);
     rows.sort_by(|a, b| b.compile.cmp(&a.compile));
-    println!("slowest compiles (ms): {}", rows.iter().take(8).map(|r| format!("{} {:.1}", r.name, r.compile.as_secs_f64() * 1e3)).collect::<Vec<_>>().join(", "));
+    println!("slowest compiles (ms, register-allocation runs): {}", rows.iter().take(14).map(|r| format!("{} {:.1} (ra x{})", r.name, r.compile.as_secs_f64() * 1e3, r.ra_runs)).collect::<Vec<_>>().join(", "));
     let mut by_ms: Vec<f64> = rows.iter().map(|r| r.compile.as_secs_f64() * 1e3).collect();
     by_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     if !by_ms.is_empty() {
