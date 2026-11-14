@@ -4656,7 +4656,7 @@ impl Lowerer {
                 let d0 = self.sub_alias(d, 0, RClass::V1);
                 let d1 = self.sub_alias(d, 1, RClass::V1);
                 // `dupfold`: a single-use source defined in this block writes the pair's low dword directly (one copy instead of two)
-                let single = matches!(a, Opnd::Val(v) if self.use_counts.get(v).copied() == Some(1));
+                let single = matches!(a, Opnd::Val(v) if self.read_counts.get(v).copied() == Some(1) && self.use_counts.get(v).copied() == Some(1));
                 if single && opt_on("dupfold") && self.retarget_def(ra, d, 0, RClass::V1) {
                     self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(d0));
                 } else {
@@ -4688,7 +4688,7 @@ impl Lowerer {
                 let d1 = self.new_vreg(RClass::V1);
                 let d2 = self.new_vreg(RClass::V1);
                 // `dupfold`: a single-use source defined in this block is produced into d1 directly
-                let single = matches!(a, Opnd::Val(v) if self.use_counts.get(v).copied() == Some(1));
+                let single = matches!(a, Opnd::Val(v) if self.read_counts.get(v).copied() == Some(1) && self.use_counts.get(v).copied() == Some(1));
                 let folded = single && opt_on("dupfold") && self.retarget_def(ra, d1, 0, RClass::V1);
                 if folded {
                     self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(d1));
