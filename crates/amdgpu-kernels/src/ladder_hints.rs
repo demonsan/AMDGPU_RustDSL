@@ -2,7 +2,14 @@
 //! at the first one (docs/compile-time.md). Skipping the rungs before it only skips attempts that run out of registers, so the output is the one of the unhinted compile (tests/ladder_hints.rs checks it).
 
 /// (kernel, outer rung, inner rung).
-pub static HINTS: &[(&str, u8, u8)] = &[];
+pub static HINTS: &[(&str, u8, u8)] = &[
+    ("fmha_fwd_hd128_bf16_v3_causal_ks", 0, 2),
+    ("fmha_fwd_hd192_hd128_bf16_v3_causal", 4, 0),
+    ("fmha_fwd_hd192_hd128_bf16_v3_causal_ks", 4, 0),
+    ("fmha_fwd_hd192_hd128_bf16_v3_ks", 4, 0),
+    ("mla_decode_bf16_hp_p1", 6, 0),
+    ("mla_decode_bf16_hp_p16", 6, 0),
+];
 
 pub fn lookup(name: &str) -> Option<(u8, u8)> {
     HINTS.iter().find(|h| h.0 == name).map(|h| (h.1, h.2))
