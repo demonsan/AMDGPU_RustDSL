@@ -1268,9 +1268,11 @@ fn main() -> ExitCode {
             };
             let build_d = t_build.elapsed();
             if must_verify(&args, &spec) {
+                let t_cert = std::time::Instant::now();
                 if let Err(c) = certify_specialized(&f) {
                     return c;
                 }
+                amdgpu_codegen::timing::add("certify-specialized", t_cert.elapsed());
             }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
