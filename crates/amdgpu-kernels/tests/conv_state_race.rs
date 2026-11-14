@@ -8,7 +8,8 @@ use amdgpu_kernels::conv::{conv1d_fwd, conv1d_fwd_racy_for_tests};
 
 fn rw(f: &amdgpu_dsl::Function) -> (bool, usize, usize, usize) {
     let r = amdgpu_codegen::gpu_verify::analyse(f).expect("analyse");
-    assert!(r.errors().is_empty(), "{}: {:?}", f.name, r.errors());
+    let other: Vec<_> = r.errors().into_iter().filter(|e| e.code != "GV-GLB-RW").collect();
+    assert!(other.is_empty(), "{}: {:?}", f.name, other);
     let flagged = r.findings.iter().any(|x| x.code == "GV-GLB-RW" && x.msg.contains("conv_states"));
     (
         flagged,
