@@ -92,7 +92,9 @@ def build_templates():
 
 configs = [('1. one `amdc emit` process per kernel', {'AMDGPU_JIT_SERVER': '0'}, False),
            ('2. persistent compile server', {'AMDGPU_JIT_SERVER': '1'}, False),
-           ('3. persistent server + certificates pre-populated (`amdc certify-batch`)', {'AMDGPU_JIT_SERVER': '1'}, True)]
+           ('3. persistent server + certificates pre-populated (`amdc certify-batch`)', {'AMDGPU_JIT_SERVER': '1'}, True),
+           ('4. persistent server + verified shape templates (`amdc template-build`)', {'AMDGPU_JIT_SERVER': '1'}, 'tpl'),
+           ('5. server + templates + certificates pre-populated', {'AMDGPU_JIT_SERVER': '1'}, 'both')]
 summary = []
 for label, env, pre in configs:
     for kk, v in env.items():
