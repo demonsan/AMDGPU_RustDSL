@@ -1918,7 +1918,7 @@ impl Lowerer {
         }
     }
 
-    /// ``o = core + k`` through chains of ``x + const``: (core, k).
+    /// `o = core + k` through chains of `x + const`: (core, k).
     fn split_const(&self, o: Opnd) -> (Opnd, i64) {
         let mut cur = o;
         let mut k = 0i64;
@@ -4134,7 +4134,9 @@ impl Lowerer {
                 };
                 // (no SGPR operand here: v_cndmask_b32_e32 reads vcc through the constant bus, so an SGPR source would be a second read)
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
-                    (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
+                    // (not 0: `v_cndmask d, 0, x` is the shape cmpfold / dce_cmp_pairs take for a 0/1 compare materialisation, and would
+                    // re-fold this select into its compare - wrong unless x is 1; topk_per_row miscompiled with imm)
+                    (true, Some(k)) if is_inline_const(k) && k != 0 => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
                 };
                 let d = self.new_vreg(RClass::V1);
