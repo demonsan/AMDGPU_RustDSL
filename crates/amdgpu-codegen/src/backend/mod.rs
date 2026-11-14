@@ -153,8 +153,78 @@ impl TailBackend for LlvmTail {
         };
         let mir = self.export_mir(m, a)?;
         let asm = self.run_llc(&m.name, &mir, &start)?;
-        Ok(strip_pad_args(&asm))
+        Ok(declare_unnatural_args(&strip_pad_args(&asm), m))
     }
+}
+
+/// Declare in `.args` the DSL arguments the IR shell could not give a natural parameter (a pointer at an offset that is not a multiple of
+/// 8, a scalar not a multiple of 4: `llvm_mir::kernarg_ir` fills their bytes with padding parameters, which `strip_pad_args` removes). The
+/// runtime copies a buffer-pointer launch (`HIP_LAUNCH_PARAM_BUFFER_POINTER`) argument by argument from this list: bytes no entry covers
+/// are not delivered (an unaligned pointer arrived as 0: illegal memory access), and a `kernelParams` launch indexes the caller's array by
+/// it - so every DSL argument gets an entry, in offset order, as a by-value blob of its size.
+pub fn declare_unnatural_args(asm: &str, m: &MFunction) -> String {
+    let unnatural: Vec<(usize, &crate::mir::MArg)> = m
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| match a.dsl_ty {
+            amdgpu_dsl::DType::Ptr => !(a.size == 8 && a.offset % 8 == 0),
+            _ => !(a.size == 4 && a.offset % 4 == 0),
+        })
+        .collect();
+    if unnatural.is_empty() {
+        return asm.to_string();
+    }
+    let lines: Vec<&str> = asm.lines().collect();
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8 * unnatural.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        out.push(l.to_string());
+        i += 1;
+        if l.trim() != ".args:" {
+            continue;
+        }
+        let base = indent(l);
+        let mut items: Vec<(i64, Vec<String>)> = Vec::new();
+        while i < lines.len() && (lines[i].trim().is_empty() || indent(lines[i]) > base) {
+            let x = lines[i];
+            if x.trim_start().starts_with("- ") {
+                items.push((-1, vec![x.to_string()]));
+            } else if let Some(last) = items.last_mut() {
+                last.1.push(x.to_string());
+            }
+            if let Some(last) = items.last_mut() {
+                if let Some(v) = x.trim().trim_start_matches("- ").strip_prefix(".offset:") {
+                    last.0 = v.trim().parse().unwrap_or(-1);
+                }
+            }
+            i += 1;
+        }
+        let item_indent = items.first().map(|it| indent(&it.1[0])).unwrap_or(base + 2);
+        let pad = " ".repeat(item_indent);
+        for (k, a) in &unnatural {
+            items.push((
+                a.offset as i64,
+                vec![
+                    format!("{pad}- .name:           a{k}"),
+                    format!("{pad}  .offset:         {}", a.offset),
+                    format!("{pad}  .size:           {}", a.size),
+                    format!("{pad}  .value_kind:     by_value"),
+                ],
+            ));
+        }
+        items.sort_by_key(|it| it.0);
+        for it in items {
+            out.extend(it.1);
+        }
+    }
+    let mut s = out.join("\n");
+    if asm.ends_with('\n') {
+        s.push('\n');
+    }
+    s
 }
 
 pub fn backend_by_name(name: &str) -> Option<Box<dyn TailBackend>> {

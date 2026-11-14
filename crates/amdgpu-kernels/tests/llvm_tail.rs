@@ -323,15 +323,10 @@ fn metadata_args_match_the_dsl_args_without_padding() {
         if args.iter().any(|a| a.0.starts_with("pad")) {
             bad.push(format!("{k}: metadata lists padding arguments: {:?}", args.iter().filter(|a| a.0.starts_with("pad")).collect::<Vec<_>>()));
         }
-        let natural: Vec<(i64, i64)> = m
-            .args
-            .iter()
-            .filter(|a| match a.dsl_ty {
-                amdgpu_dsl::DType::Ptr => a.size == 8 && a.offset % 8 == 0,
-                _ => a.size == 4 && a.offset % 4 == 0,
-            })
-            .map(|a| (a.offset as i64, a.size as i64))
-            .collect();
+        // every DSL argument, in offset order (an unaligned pointer too: the runtime copies a buffer-pointer launch argument by argument
+        // from this list; an argument it does not list arrives as 0)
+        let mut natural: Vec<(i64, i64)> = m.args.iter().map(|a| (a.offset as i64, a.size as i64)).collect();
+        natural.sort();
         let got: Vec<(i64, i64)> = args.iter().map(|a| (a.1, a.2)).collect();
         if got != natural {
             bad.push(format!("{k}: metadata args (offset,size) {got:?} != DSL args {natural:?}"));
