@@ -16,7 +16,7 @@ fn spec(s: &str) -> Vec<(String, String)> {
 #[test]
 fn the_content_address_is_deterministic_and_follows_every_field() {
     // two independent builds of the same specialized kernel: the same key (no hash-order noise in the debug text); another shape or another kernel: another key
-    for (k, s) in [("silu_mul_bf16_d4096", "m=64"), ("rmsnorm_quant_fp8_n4096", "m=64"), ("gemm_a8w8_rowcol_fp8_64", "m=64"), ("pa_decode16_bf16_hd128_p16_f", "H=64"), ("causal_conv1d_update_bf16_w4_s3_idx_silu", "B=8")] {
+    for (k, s) in [("silu_mul_bf16_d4096", "m=64"), ("rmsnorm_quant_fp8_n4096", "m=64"), ("gemm_a8w8_rowcol_fp8_64", "m=64"), ("pa_decode16_bf16_hd128_p16_f", "H=64"), ("causal_conv1d_update_bf16_w4_s3_idx_silu", "slots=4")] {
         let a = cert_key(&load(k, &spec(s), None).unwrap().0);
         let b = cert_key(&load(k, &spec(s), None).unwrap().0);
         assert_eq!(a, b, "{k} {s}");
