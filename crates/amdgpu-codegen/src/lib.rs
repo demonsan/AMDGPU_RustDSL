@@ -266,7 +266,7 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
     match lower::lower_with_extra(f, &[]) {
         Ok(m) => m.blocks.iter().any(|b| {
             b.insts.iter().any(|i| match op_attrs::attrs(i.op).backend {
-                op_attrs::Backend::OwnOnly => true,
+                op_attrs::Backend::OwnOnly | op_attrs::Backend::Both => true,
                 op_attrs::Backend::Llvm | op_attrs::Backend::NoRow => false,
             })
         }),

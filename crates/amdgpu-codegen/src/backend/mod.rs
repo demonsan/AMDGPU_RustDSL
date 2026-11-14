@@ -166,6 +166,17 @@ pub fn backend_by_name(name: &str) -> Option<Box<dyn TailBackend>> {
 }
 /// Every MOp, for table coverage checks and the per-opcode probe.
 pub const ALL_MOPS: &[crate::mir::MOp] = &[
+    MOp::SAddkI32,
+    MOp::SLoadDwordx4,
+    MOp::SLoadDwordPtr,
+    MOp::SMemTime,
+    MOp::SCselectB32,
+    MOp::SCselectB64,
+    MOp::SMinI32,
+    MOp::SLoPart,
+    MOp::SMovM0,
+    MOp::SAddM0,
+    MOp::VZeroSub2,
     MOp::VMovB32,
     MOp::VMovFromS,
     MOp::VMovFromSPair,

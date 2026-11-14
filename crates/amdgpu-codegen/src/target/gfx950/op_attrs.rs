@@ -104,6 +104,9 @@ pub enum Backend {
     Llvm,
     /// the LLVM tail cannot express it: a kernel using it is compiled by the own tail (`uses_own_only_ops`)
     OwnOnly,
+    /// has rows (an explicit `--backend llvm-tail` compiles it), but `auto` keeps routing a kernel using it to the own tail (the shipped
+    /// routing of the scalar lowering forms, kernarg batching, m0 forms)
+    Both,
     /// no LLVM rows and not (yet) routed to the own tail: only the own backend can emit it (documented gap)
     NoRow,
 }
@@ -905,7 +908,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // ---- fragments / matrix cores
         VWriteSub => a("v_mov_b32", valu).regfx(RegFx::SubWrite).wdelay(2),
         // zero two dwords of a tuple with one `v_mov_b64` (lowering token `movb64`); no LLVM row (own tail)
-        VZeroSub2 => a("v_mov_b64", valu).regfx(RegFx::SubWrite2).wdelay(2).backend(Backend::OwnOnly),
+        VZeroSub2 => a("v_mov_b64", valu).regfx(RegFx::SubWrite2).wdelay(2).backend(Backend::Both),
         VReadSub => a("v_mov_b32", valu).regfx(RegFx::SubRead).wdelay(2),
         VMfma16x16x16F16 => a("v_mfma_f32_16x16x16_f16", mfma16).mfma(12, false, false, false, false).agpr(true, 0b111),
         VMfma32x32x8F16 => a("v_mfma_f32_32x32x8_f16", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
@@ -1143,17 +1146,17 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         BufferInv => a("buffer_inv", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier),
         // ---- scalar ALU / memory
         SLoadDword => a("s_load_dword", smem).smem().dce(Load),
-        SLoadDwordPtr => a("s_load_dword", smem).smem().dce(Load).backend(Backend::OwnOnly),
+        SLoadDwordPtr => a("s_load_dword", smem).smem().dce(Load).backend(Backend::Both),
         SLoadDwordx2 => a("s_load_dwordx2", smem).smem().dce(Load),
-        SLoadDwordx4 => a("s_load_dwordx4", smem).smem().dce(Load).backend(Backend::OwnOnly),
+        SLoadDwordx4 => a("s_load_dwordx4", smem).smem().dce(Load).backend(Backend::Both),
         // a timing stamp: SMEM result, pinned in program order against every other memory op
-        SMemTime => a("s_memtime", smem).smem().fence(F::Barrier).backend(Backend::NoRow),
-        SLoPart => a("s_mov_b32", salu).backend(Backend::NoRow).dce(Pure),
+        SMemTime => a("s_memtime", smem).smem().fence(F::Barrier).backend(Backend::Llvm),
+        SLoPart => a("s_mov_b32", salu).backend(Backend::Llvm).dce(Pure),
         SReadPhys => a("s_mov_b32", salu).dce(Pure),
         SMovB32 => a("s_mov_b32", salu).dce(Pure),
-        SMovM0 => a("s_mov_b32", salu).backend(Backend::OwnOnly),
+        SMovM0 => a("s_mov_b32", salu).backend(Backend::Both),
         SSaveExec | SExecAll | SExecSet | SRestoreExec => a("s_mov_b64", salu).backend(Backend::OwnOnly),
-        SAddM0 => a("s_add_u32", salu).scc(false, true).backend(Backend::OwnOnly),
+        SAddM0 => a("s_add_u32", salu).scc(false, true).backend(Backend::Both),
         SAddU32 => a("s_add_u32", salu).scc(false, true).dce(Pure),
         SAddcU32 => a("s_addc_u32", salu).scc(true, true).dce(Pure),
         SMulI32 => a("s_mul_i32", salu).dce(Pure),
@@ -1165,16 +1168,16 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SSubU32 => a("s_sub_u32", salu).scc(false, true).dce(Pure),
         SOrB32 => a("s_or_b32", salu).scc(false, true).dce(Pure),
         // dst = src0 + simm16 (`s_addk_i32` in place; a `s_mov_b32` first when the allocator gave dst another register); own tail only
-        SAddkI32 => a("s_addk_i32", salu).scc(false, true).dce(Pure).backend(Backend::OwnOnly),
+        SAddkI32 => a("s_addk_i32", salu).scc(false, true).dce(Pure).backend(Backend::Both),
         SCmpLtI32 => a("s_cmp_lt_i32", salu).scc(false, true),
         SCmpG => a("s_cmp", salu).scc(false, true).backend(Backend::OwnOnly),
         VCmpMaskG => a("v_cmp", valu).wdelay(MASK_WAIT).backend(Backend::OwnOnly),
         SCmpEqU32 => a("s_cmp_eq_u32", salu).scc(false, true),
         SCmpGeU32 => a("s_cmp_ge_u32", salu).scc(false, true),
         SCmpLeU32 => a("s_cmp_le_u32", salu).scc(false, true),
-        SMinI32 => a("s_min_i32", salu).scc(false, true).backend(Backend::OwnOnly).dce(Pure),
-        SCselectB32 => a("s_cselect_b32", salu).scc(true, false).backend(Backend::OwnOnly).dce(Pure),
-        SCselectB64 => a("s_cselect_b64", salu).scc(true, false).backend(Backend::OwnOnly).dce(Pure),
+        SMinI32 => a("s_min_i32", salu).scc(false, true).backend(Backend::Both).dce(Pure),
+        SCselectB32 => a("s_cselect_b32", salu).scc(true, false).backend(Backend::Both).dce(Pure),
+        SCselectB64 => a("s_cselect_b64", salu).scc(true, false).backend(Backend::Both).dce(Pure),
         SCselectB128 => a("s_cselect_b64", salu).scc(true, false).backend(Backend::OwnOnly).dce(Pure),
         // ---- misc
         SNop => a("s_nop", ctrl).fence_only(F::Nop),
@@ -1206,7 +1209,7 @@ mod tests {
     #[test]
     fn llvm_coverage_list_matches_the_backend_attribute() {
         // backend::ALL_MOPS (the LLVM-tail table coverage list) = the ops whose backend attribute says they have rows
-        let mut rows: Vec<String> = ALL.iter().filter(|o| matches!(attrs(**o).backend, Backend::Llvm)).map(|o| format!("{o:?}")).collect();
+        let mut rows: Vec<String> = ALL.iter().filter(|o| matches!(attrs(**o).backend, Backend::Llvm | Backend::Both)).map(|o| format!("{o:?}")).collect();
         let mut tail: Vec<String> = crate::backend::ALL_MOPS.iter().map(|o| format!("{o:?}")).collect();
         tail.sort();
         rows.sort();
