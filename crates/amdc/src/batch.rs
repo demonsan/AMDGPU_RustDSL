@@ -45,7 +45,7 @@ struct Row {
     ra_ms: f64,
 }
 
-/// `amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time] [--asm-dir DIR]`
+/// `amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time] [--asm-dir DIR]`
 pub fn compile_batch(args: &[String]) -> ExitCode {
     let opt = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let jobs = opt("--jobs").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
@@ -53,6 +53,7 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
     let verify = !args.iter().any(|a| a == "--no-verify");
     let assemble = args.iter().any(|a| a == "--assemble");
     let show_phases = args.iter().any(|a| a == "--time");
+    let inproc = args.iter().any(|a| a == "--assemble-inproc");
     let asm_dir = opt("--asm-dir");
     let mut names: Vec<String> = match opt("--names") {
         Some(l) => l.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
@@ -89,6 +90,14 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
                         Ok(c) => {
                             if let Some(d) = &asm_dir {
                                 let _ = std::fs::write(format!("{d}/{k}.s"), &c.asm);
+                            }
+                            if inproc {
+                                let t = Instant::now();
+                                let r = amdgpu_target::gfx950_co::assemble(&c.asm);
+                                timing::add("assemble-inproc", t.elapsed());
+                                if r.is_err() {
+                                    eprintln!("error: {k}: in-process assemble failed");
+                                }
                             }
                             let a = if assemble {
                                 let d = assemble_co(&c.asm, &format!("{i}")).ok();

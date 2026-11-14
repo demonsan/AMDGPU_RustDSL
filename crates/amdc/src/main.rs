@@ -20,7 +20,7 @@ fn usage() {
     eprintln!("  amdc co-verify <dir of .s> [--show N]   the in-process code object of every .s against clang's, byte for byte");
     eprintln!("  amdc co-check <oracle.tsv>   compare the in-process instruction encoder with llvm-mc (lines \"asm<TAB>hex\")");
     eprintln!("  amdc ladder-hints [--out FILE] [--jobs N]   the retry-ladder rung each kernel compiles at (crates/amdgpu-kernels/src/ladder_hints.rs)");
-    eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
+    eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
     eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
@@ -35,7 +35,7 @@ fn usage() {
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock
   amdc weave-report <kernel>|--from-ir <file>   the back-end Weaver unit graph of the final MIR (docs/two-weavers.md)
   amdc passes [--target gfx950] [--evidence]   the compile pipeline: named passes, stage, target dependence, gate, evidence; the retry ladders
-  amdc md5-manifest [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
+  amdc md5-manifest [--co] [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
 }
 
 /// The `--specialize` bindings of the command line (`--specialize a=1,b=2` or `--specialize=a=1`, repeatable).
@@ -732,7 +732,7 @@ fn main() -> ExitCode {
             // amdc md5-manifest [--out FILE] [--check FILE] [--jobs N]: the own-backend asm md5 of every reachable kernel (the refactor's golden oracle)
             let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
             let jobs = opt("--jobs").and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-            let now = match amdc::manifest::compute(jobs) {
+            let now = match if args.iter().any(|a| a == "--co") { amdc::manifest::compute_co(jobs) } else { amdc::manifest::compute(jobs) } {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
@@ -1273,11 +1273,15 @@ fn main() -> ExitCode {
             }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
+            let mut co_path: Option<String> = None;
             let mut backend_name = env::var("AMDC_BACKEND").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--out" {
                     out_path = args.get(i + 1).cloned();
+                    i += 2;
+                } else if args[i] == "--co" {
+                    co_path = args.get(i + 1).cloned();
                     i += 2;
                 } else if args[i] == "--mir-out" {
                     mir_out = args.get(i + 1).cloned();
@@ -1332,9 +1336,34 @@ fn main() -> ExitCode {
             let t_compile = std::time::Instant::now();
             let res = amdgpu_codegen::compile_with(&f, tail);
             let compile_d = t_compile.elapsed();
+            // the in-process assembler (no clang): timed under --time, written under --co
+            let inproc = if want_time || co_path.is_some() { res.as_ref().ok().map(|c| (std::time::Instant::now(), amdgpu_target::gfx950_co::assemble(&c.asm))) } else { None };
             if want_time {
+                if let Some((t, _)) = &inproc {
+                    amdgpu_codegen::timing::add("assemble-inproc", t.elapsed());
+                }
                 let ents = amdgpu_codegen::timing::take();
                 batch::emit_report(&f.name, build_d, compile_d, res.as_ref().ok().map(|c| c.asm.as_str()), want_assemble, ents);
+            }
+            // --co FILE: the code object from the in-process assembler; exit 3 (nothing written) when it cannot encode the kernel, so the caller falls back to the external assembler
+            if let (Some(cp), Some((_, r))) = (&co_path, &inproc) {
+                match r {
+                    Ok(b) => {
+                        if let Err(e) = fs::write(cp, b) {
+                            eprintln!("cannot write {cp}: {e}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("note: in-process assembler cannot encode this kernel ({e}); use the external assembler");
+                        if let Some(p) = &out_path {
+                            if let Ok(c) = &res {
+                                let _ = fs::write(p, &c.asm);
+                            }
+                        }
+                        return ExitCode::from(3);
+                    }
+                }
             }
             match res {
                 Ok(c) if json => {
