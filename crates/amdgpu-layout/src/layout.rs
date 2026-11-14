@@ -161,26 +161,39 @@ impl Layout {
     /// The integer fast path of `at` for a fully static layout: the colexicographic coordinate of `i` over the flattened leaves dotted with the strides (what `crd2idx(idx2crd(i))` computes with symbolic
     /// `Ix` arithmetic; the last leaf takes the quotient unreduced). None (use the symbolic path) for a dynamic leaf, an empty or non-positive mode, or an overflow.
     fn at_flat(&self, i: i64) -> Option<i64> {
-        let shape = self.shape.flatten();
-        let stride = self.stride.flatten();
-        let n = shape.len();
-        if n == 0 || n != stride.len() {
+        // the leaves into fixed arrays: no heap allocation (this runs thousands of times per kernel build)
+        fn leaves(t: &IntTuple, out: &mut [i64; 24], n: &mut usize) -> bool {
+            match t {
+                IntTuple::L(x) => match x.c() {
+                    Some(v) if *n < out.len() => {
+                        out[*n] = v;
+                        *n += 1;
+                        true
+                    }
+                    _ => false,
+                },
+                IntTuple::T(v) => v.iter().all(|m| leaves(m, out, n)),
+            }
+        }
+        let (mut sh, mut st) = ([0i64; 24], [0i64; 24]);
+        let (mut ns, mut nt) = (0usize, 0usize);
+        if !leaves(&self.shape, &mut sh, &mut ns) || !leaves(&self.stride, &mut st, &mut nt) || ns == 0 || ns != nt {
             return None;
         }
         let (mut rem, mut acc) = (i, 0i64);
-        for (j, (s, t)) in shape.iter().zip(&stride).enumerate() {
-            let (sz, st) = (s.c()?, t.c()?);
+        for j in 0..ns {
+            let sz = sh[j];
             if sz <= 0 {
                 return None;
             }
-            let c = if j + 1 == n {
+            let c = if j + 1 == ns {
                 rem
             } else {
                 let q = rem % sz;
                 rem /= sz;
                 q
             };
-            acc = acc.checked_add(c.checked_mul(st)?)?;
+            acc = acc.checked_add(c.checked_mul(st[j])?)?;
         }
         Some(acc)
     }
