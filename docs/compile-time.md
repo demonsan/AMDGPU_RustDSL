@@ -9,7 +9,8 @@ Measured on node 53 (release `amdc`, 2026-11-14; a 64-CPU allocation of the 256-
 |---|--:|--:|---|
 | before this work (`485b3000`) | 36.2 s (6.6 kernels/s) | 6.0 s (40/s) | the longest single kernel (5.5 s) bounded the wall time from 8 threads up |
 | after the first round (verifier, ladder hints, allocator) | 6.3 s (38/s) | 0.84 s (287/s) | median 1.0 ms, p90 34 ms, max 0.69 s per kernel |
-| **after the second round (list scheduler, layout)** | **4.6 s (52/s)** | **0.69 s (347/s)** | median 1.0 ms, p90 29 ms, max 0.59 s |
+| after the second round (list scheduler, layout) | 4.6 s (52/s) | 0.69 s (347/s) | median 1.0 ms, p90 29 ms, max 0.59 s |
+| **after the third round (flat `check_reaching`, pooled scheduler buffers)** | **3.6 s (66/s)** | **0.49 s (488/s)** | `fmha_fwd_hd128_fp8pt_v3_causal` 500 -> 300 ms (regalloc 305 -> 108 ms) |
 
 The assembly is byte-identical: `amdc md5-manifest --check tests/golden/md5_manifest.tsv` reports 240 kernels, 0 differences after every step.
 
@@ -154,3 +155,8 @@ End to end (`tools/jit_bench.py`, median of 5 runs, ms per kernel, cold):
 | server + templates + certificates pre-populated | **6.5** | 3.8 | 1.4 | 0.7 | 0.8 |
 
 In a quiet run of the last row: eltwise 0.8 ms, `rmsnorm_quant` 3.8, `pa_decode16` 2.7, small GEMM 4.3 - 8.8 (4.0 ms mean over the four classes). Without pre-certification an unseen shape is bound by the certificate (`pa_decode16` with larger H: 18 ms), so the compile that the template removes is hidden behind it: the template pays off once the certificate is cached or pre-computed (`certify-batch`, `prewarm`).
+
+## 11. `check_reaching` on a flat state
+
+`regalloc::check_reaching` (the path-aware reaching-writer check that guards the two-phase packing) was 37 % of the instructions of `fmha_fwd_hd128_fp8pt_v3_causal`: its state was `HashMap<reg, BTreeMap<writer, BTreeSet<writer>>>`, cloned per block visit. Now the history sets are interned (sorted `Vec<Slot>`, equal sets have equal ids, so "changed" is an id comparison), the state of a physical register is its current writers sorted by slot with history ids, unions and `add` are memoized, the effects of every instruction are computed once (they were computed three times), and the per-block step is one update per register written.
+Same analysis, same reports (the report strings are built by the same code from the same sets): `md5-manifest` (asm, `.co`, certificates) 0 differences, `ra_reaching` (its three violation cases) and `hzfill` pass. Regalloc over the 240-kernel batch 1.44 -> 0.69 s CPU, fp8pt causal compile 500 -> 300 ms, the batch 4.3 -> 3.6 s on 1 thread (66 kernels / s), 0.49 s on 8 threads (488 kernels / s).
