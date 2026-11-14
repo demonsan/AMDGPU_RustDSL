@@ -2025,6 +2025,24 @@ impl<'a> An<'a> {
     /// value's definition (constants, and / xor / shifts / add / mul / select / min) intersected with the interval bound (a non-negative value <= h has
     /// no bit above h's). Sound for wrap-around: shifts truncate, sums and products that may exceed 32 bits give `u32::MAX`.
     fn bits(&self, o: &Opnd, depth: usize) -> u32 {
+        self.bits_memo(o, depth, &mut HashMap::default())
+    }
+
+    /// `bits` with a memo over (value, depth): the environment is fixed during one call (`&self`), so a shared subexpression is evaluated once instead of once per path to it.
+    fn bits_memo(&self, o: &Opnd, depth: usize, memo: &mut HashMap<(ValueId, usize), u32>) -> u32 {
+        if let Opnd::Val(v) = o {
+            if let Some(&r) = memo.get(&(*v, depth)) {
+                return r;
+            }
+        }
+        let r = self.bits_node(o, depth, memo);
+        if let Opnd::Val(v) = o {
+            memo.insert((*v, depth), r);
+        }
+        r
+    }
+
+    fn bits_node(&self, o: &Opnd, depth: usize, memo: &mut HashMap<(ValueId, usize), u32>) -> u32 {
         let all = u32::MAX;
         let from_itv = |i: &Itv| -> u32 { amdgpu_sym::bits::itv_bits32(i, &self.cx) };
         let itv_m = from_itv(&self.int_of(o));
@@ -2049,19 +2067,19 @@ impl<'a> An<'a> {
         };
         let st = match op {
             Op::ConstI32(c) => *c as u32,
-            Op::AndI32(a, b) => self.bits(a, depth - 1) & self.bits(b, depth - 1),
-            Op::XorI32(a, b) => self.bits(a, depth - 1) | self.bits(b, depth - 1),
+            Op::AndI32(a, b) => self.bits_memo(a, depth - 1, memo) & self.bits_memo(b, depth - 1, memo),
+            Op::XorI32(a, b) => self.bits_memo(a, depth - 1, memo) | self.bits_memo(b, depth - 1, memo),
             Op::ShlI32(a, b) => match k(b) {
-                Some(s) if s < 32 => self.bits(a, depth - 1).wrapping_shl(s),
+                Some(s) if s < 32 => self.bits_memo(a, depth - 1, memo).wrapping_shl(s),
                 _ => all,
             },
             Op::LshrI32(a, b) => match k(b) {
-                Some(s) if s < 32 => self.bits(a, depth - 1) >> s,
+                Some(s) if s < 32 => self.bits_memo(a, depth - 1, memo) >> s,
                 _ => all,
             },
-            Op::AddI32(a, b) => amdgpu_sym::bits::add32(self.bits(a, depth - 1), self.bits(b, depth - 1)),
-            Op::MulI32(a, b) => amdgpu_sym::bits::mul32(self.bits(a, depth - 1), self.bits(b, depth - 1)),
-            Op::Select { a, b, .. } | Op::MinI32(a, b) => self.bits(a, depth - 1) | self.bits(b, depth - 1),
+            Op::AddI32(a, b) => amdgpu_sym::bits::add32(self.bits_memo(a, depth - 1, memo), self.bits_memo(b, depth - 1, memo)),
+            Op::MulI32(a, b) => amdgpu_sym::bits::mul32(self.bits_memo(a, depth - 1, memo), self.bits_memo(b, depth - 1, memo)),
+            Op::Select { a, b, .. } | Op::MinI32(a, b) => self.bits_memo(a, depth - 1, memo) | self.bits_memo(b, depth - 1, memo),
             _ => all,
         };
         st & itv_m
