@@ -153,7 +153,7 @@ pub fn build_classes(texts: &[(i64, String)]) -> Vec<Class> {
 }
 
 /// `build_classes` and the sizes of the skeleton groups (largest first).
-pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>) {
+pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>, Vec<String>) {
     // group by skeleton (the text with every integer literal masked)
     let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
     let mut index: HashMap<Vec<String>, usize> = HashMap::new();
@@ -170,6 +170,7 @@ pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>)
     let mut sizes: Vec<usize> = groups.iter().map(|g| g.1.len()).collect();
     sizes.sort_by(|a, b| b.cmp(a));
     let mut classes = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     for (_, members) in groups {
         if members.len() < 2 {
             continue;
@@ -194,14 +195,24 @@ pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>)
         }
         let mut class = Class { lines: l0.iter().map(|s| s.to_string()).collect(), holes, ranges: Vec::new() };
         // keep exactly the members whose instantiation is byte-identical to their full compile
-        let valid: Vec<i64> = members.iter().map(|&i| texts[i].0).filter(|&v| class.instantiate_unchecked(v) == texts.iter().find(|t| t.0 == v).unwrap().1).collect();
+        let mut valid: Vec<i64> = Vec::new();
+        for &i in &members {
+            let v = texts[i].0;
+            let got = class.instantiate_unchecked(v);
+            if got == texts[i].1 {
+                valid.push(v);
+            } else if notes.len() < 3 {
+                let (a, b) = got.lines().zip(texts[i].1.lines()).enumerate().find(|(_, (a, b))| a != b).map(|(k, (a, b))| (format!("line {k}: {a}"), b.to_string())).unwrap_or_default();
+                notes.push(format!("value {v} differs: template {a} | compile {b}"));
+            }
+        }
         if valid.len() < 2 {
             continue;
         }
         class.ranges = compress(&valid);
         classes.push(class);
     }
-    (classes, sizes)
+    (classes, sizes, notes)
 }
 
 impl Class {
@@ -331,7 +342,7 @@ pub fn lookup(dir: &str, kernel: &str, spec: &[(String, String)], backend: &str)
 
 /// Builds the template of (`kernel`, `fixed` bindings, `param` over lo..=hi step `step`): full compile of every value of the domain on `jobs` threads, then `build_classes`. Returns the template and
 /// (domain size, values that compiled).
-pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi: i64, step: i64, jobs: usize) -> (Template, usize, usize, Vec<usize>) {
+pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi: i64, step: i64, jobs: usize) -> (Template, usize, usize, Vec<usize>, Vec<String>) {
     use amdgpu_codegen::backend::OwnTail;
     use amdgpu_codegen::{compile_with_options, CompileOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -357,8 +368,8 @@ pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi:
     let mut fx = fixed.to_vec();
     fx.sort();
     let compiled = texts.len();
-    let (classes, sizes) = build_classes_report(&texts);
-    (Template { kernel: kernel.to_string(), param: param.to_string(), fixed: fx, backend: "own".into(), classes }, values.len(), compiled, sizes)
+    let (classes, sizes, notes) = build_classes_report(&texts);
+    (Template { kernel: kernel.to_string(), param: param.to_string(), fixed: fx, backend: "own".into(), classes }, values.len(), compiled, sizes, notes)
 }
 
 /// `amdc template-build FILE --template-dir DIR [--jobs N]`: lines `kernel<TAB>name=v,..<TAB>param<TAB>lo:hi:step`.
@@ -377,12 +388,15 @@ pub fn build_file(file: &str, dir: &str, jobs: usize) -> Vec<String> {
             report.push(format!("bad line: {l}"));
             continue;
         };
-        let (t, n, ok, sizes) = build(f[0], &fixed, f[2], dom[0], dom[1], dom[2], jobs);
+        let (t, n, ok, sizes, notes) = build(f[0], &fixed, f[2], dom[0], dom[1], dom[2], jobs);
         let valid: usize = t.classes.iter().map(|c| c.ranges.iter().map(|&(lo, hi, st)| ((hi - lo) / st.max(1) + 1) as usize).sum::<usize>()).sum();
         if !t.classes.is_empty() {
             let _ = write(dir, &t);
         }
         report.push(format!("{} {} over {}..{} step {}: {n} values, {ok} compiled, {} class(es), {valid} verified values ({:.0} %); skeleton groups of the domain (sizes): {:?}", f[0], f[2], dom[0], dom[1], dom[2], t.classes.len(), 100.0 * valid as f64 / n.max(1) as f64, &sizes[..sizes.len().min(8)]));
+        for n in notes {
+            report.push(format!("    note: {n}"));
+        }
     }
     report
 }
