@@ -330,7 +330,10 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
     let code_len = code.len();
     let kd_off = align(code_len, 64);
     let mut text = code;
-    text.resize(kd_off, 0);
+    // the alignment fill of a text section is `s_nop 0` (0xbf800000)
+    while text.len() < kd_off {
+        text.extend(0xbf80_0000u32.to_le_bytes());
+    }
     text.extend(kernel_descriptor(&p.amdhsa, kd_off as u64));
     let kd_name = format!("{}.kd", p.name);
 
@@ -376,12 +379,19 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
     };
 
     // symbols
+    // .strtab: the labels, the two global names, then the linker's `_DYNAMIC`
     let mut strtab = vec![0u8];
+    let mut name_at: HashMap<String, u32> = HashMap::new();
+    for nm in label_order.iter().map(|l| l.0.as_str()).chain([p.name.as_str(), kd_name.as_str(), "_DYNAMIC"]) {
+        if !name_at.contains_key(nm) {
+            name_at.insert(nm.to_string(), strtab.len() as u32);
+            strtab.extend(nm.as_bytes());
+            strtab.push(0);
+        }
+    }
     let mut symtab = vec![0u8; 24];
-    let mut add_sym = |name: &str, info: u8, other: u8, shndx: u16, value: u64, size: u64, symtab: &mut Vec<u8>, strtab: &mut Vec<u8>| {
-        let no = strtab.len() as u32;
-        strtab.extend(name.as_bytes());
-        strtab.push(0);
+    let add_sym = |name: &str, info: u8, other: u8, shndx: u16, value: u64, size: u64, symtab: &mut Vec<u8>| {
+        let no = name_at[name];
         put32(symtab, no);
         symtab.push(info);
         symtab.push(other);
@@ -390,12 +400,12 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         put64(symtab, size);
     };
     for (l, o) in &label_order {
-        add_sym(l, 0, 0, 6, va_text as u64 + *o as u64, 0, &mut symtab, &mut strtab);
+        add_sym(l, 0, 0, 6, va_text as u64 + *o as u64, 0, &mut symtab);
     }
-    add_sym("_DYNAMIC", 0, 2, 7, va_dynamic as u64, 0, &mut symtab, &mut strtab);
+    add_sym("_DYNAMIC", 0, 2, 7, va_dynamic as u64, 0, &mut symtab);
     let nlocal = 1 + label_order.len() + 1;
-    add_sym(&p.name, 0x12, 3, 6, va_text as u64, code_len as u64, &mut symtab, &mut strtab);
-    add_sym(&kd_name, 0x11, 0, 6, (va_text + kd_off) as u64, 64, &mut symtab, &mut strtab);
+    add_sym(&p.name, 0x12, 3, 6, va_text as u64, code_len as u64, &mut symtab);
+    add_sym(&kd_name, 0x11, 0, 6, (va_text + kd_off) as u64, 64, &mut symtab);
 
     let mut dynsym = vec![0u8; 24];
     for (nm, info, other, val, size) in [(n1 as u32, 0x12u8, 3u8, va_text as u64, code_len as u64), (n2 as u32, 0x11, 0, (va_text + kd_off) as u64, 64)] {
