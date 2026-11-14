@@ -129,3 +129,28 @@ which the shape-bucket specialization of a pre-lowered IR (section 7, item 3) wo
 Generic values differ in 3 - 6 immediates (`v_mov_b32 v1, 32768`), the exceptions are special values where the lowering strength-reduces. A template (asm with affine holes, valid on intervals verified by exhaustively compiling the domain at build time) is therefore feasible and would be byte-identical on those intervals. But the cold latency of an unseen specialized shape is bounded below by the IR-level
 **certificate** (`verify_ir`: eltwise 1 ms, `rmsnorm_quant` 7, `pa_decode16` ~9, small GEMM ~12 ms), which depends on the constants and runs concurrently with the compile: a 6 ms compile is already hidden behind it. The template would save the compile CPU, not the wall time, until the certificate gets cheaper. Profile of `verify_ir` for the small GEMM (247 M instructions of 453 M in `emit`): `verify_tiles_cap` 219 M (`check_pair` 135 M,
 `enumerate_traces` 66 M: the protocol is re-simulated for every iteration count n = 1..nmax), the bounds analysis `An::walk` for the decode kernel (159 M, interval arithmetic and hashing). The remaining levers are an incremental simulation across n and cheaper interval joins; both must keep the findings identical (the differential test of section 8 is the instrument for the first).
+
+## 10. Verified shape templates (`amdc template-build`)
+
+`crates/amdc/src/template.rs`. A template is the specialized assembly of one kernel for one varying shape parameter: the assembly of a base value with the integer literals that vary as affine holes `a * v + b`, valid **only on the values whose instantiated text was verified byte-identical to the full compile**.
+There is no extrapolation: `amdc template-build FILE --template-dir DIR` (`kernel<TAB>fixed bindings<TAB>param<TAB>lo:hi:step`) compiles *every value of the declared domain* with the full pipeline (allocator, wait and hazard verification included), groups the values by assembly skeleton (every integer literal masked), fits the holes on two members, keeps the members whose instantiation reproduces their full-compile text exactly,
+and repeats with the rest (a literal such as `m ^ 1024` is affine only on the values with the same bit pattern: the small GEMM gets two regimes). Special values (powers of two, small values, where the lowering strength-reduces) simply stay outside the verified sets and take the full path. The directory carries the compiler's hash like the certificate cache (`<jit cache>/templates/<sha256(amdc)[:24]>`).
+
+Building is cheap because the exhaustive check is cheap: 1,088 shapes (4 kernel classes) in 0.27 s on 64 CPUs. Coverage of the domain: `rmsnorm_quant_fp8_n4096` (m = 4..1024) 100 %, `silu_mul_bf16_d4096` (m = 1..512) 99 %, the small GEMM (m = 64..8192, 2 regimes) 98 %, `pa_decode16` (H = 1..256) 99 %.
+
+Use: `compile_request` (the CLI `emit --co --info --template-dir`, `amdc serve`, the Python JIT) looks the request up by (kernel, other bindings, parameter, backend `own`); a hit replaces the compile (`.s`, then the in-process `.co`, the info JSON from the specialized IR). The **certificate still runs**: the IR-level `verify_ir` on the specialized IR (cached by exact IR as before);
+the MIR-level register / wait checks are the ones the full compile ran for that very value at build time (the verified sets are exactly the values that compiled and matched). A kernel whose request is not covered takes the full path unchanged.
+
+**The oracle** (`crates/amdc/tests/template.rs`): for every value of the domain of four families a lookup either declines or returns text identical to the full compile (exhaustive, not sampled); outside the domain / another backend / other bindings nothing is served; a request through a template yields the same `.s`, `.co`, info and exit code as the full path. Outside the test suite, 576 values sampled from the four families on the node
+(every second value of each domain, through the CLI): 0 mismatches in `.s`, `.co` and info.
+
+End to end (`tools/jit_bench.py`, median of 5 runs, ms per kernel, cold):
+
+| configuration | sequential | 1 worker | 4 workers | 16 workers | 32 workers |
+|---|--:|--:|--:|--:|--:|
+| persistent server | 9.5 | 11.7 | 2.5 | 0.9 | 0.9 |
+| server + certificates pre-populated | 10.0 | 12.8 | 2.5 | 1.0 | 0.9 |
+| server + verified shape templates | 8.8 | 8.8 | 2.1 | 0.8 | 0.8 |
+| server + templates + certificates pre-populated | **6.5** | 3.8 | 1.4 | 0.7 | 0.8 |
+
+In a quiet run of the last row: eltwise 0.8 ms, `rmsnorm_quant` 3.8, `pa_decode16` 2.7, small GEMM 4.3 - 8.8 (4.0 ms mean over the four classes). Without pre-certification an unseen shape is bound by the certificate (`pa_decode16` with larger H: 18 ms), so the compile that the template removes is hidden behind it: the template pays off once the certificate is cached or pre-computed (`certify-batch`, `prewarm`).
