@@ -1404,10 +1404,35 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     };
     // a write of a shared reuse tile proven to stay in the writer's own slice of the private region `p`
     let own = |w: &Info, p: usize| w.ev.produce && !tiles[w.ev.tile].private && tiles[p].private && own_reuse.get(&(w.ev.stmt, tiles[p].name.clone())).copied().unwrap_or(false);
-    // without a declared reuse every pair is skipped by `reuse` below: the quadratic scan has nothing to find
-    let scan_reuse = reference || !f.contract.tile_reuses.is_empty();
-    for (i, a) in infos.iter().enumerate().filter(|_| scan_reuse) {
-        for b in infos.iter().skip(i + 1) {
+    // The pairs the scan below looks at, in the order of the full scan (i, then j > i): all of them for the reference; otherwise only the pairs of events whose tiles are related by a declared reuse
+    // (every other pair is skipped by `reuse` below).
+    let reuse_pairs: Vec<(usize, usize)> = if reference {
+        (0..infos.len()).flat_map(|i| (i + 1..infos.len()).map(move |j| (i, j))).collect()
+    } else if f.contract.tile_reuses.is_empty() {
+        Vec::new()
+    } else {
+        let mut by_tile: Vec<Vec<usize>> = vec![Vec::new(); tiles.len()];
+        for (k, x) in infos.iter().enumerate() {
+            by_tile[x.ev.tile].push(k);
+        }
+        let mut v: Vec<(usize, usize)> = Vec::new();
+        for x in 0..tiles.len() {
+            for y in x + 1..tiles.len() {
+                if reuse(x, y) {
+                    for &i in &by_tile[x] {
+                        for &j in &by_tile[y] {
+                            v.push((i.min(j), i.max(j)));
+                        }
+                    }
+                }
+            }
+        }
+        v.sort_unstable();
+        v
+    };
+    for (i, j) in reuse_pairs {
+        let (a, b) = (&infos[i], &infos[j]);
+        {
             if a.ev.tile == b.ev.tile || !(a.ev.produce || b.ev.produce) || a.ev.global || b.ev.global || !reuse(a.ev.tile, b.ev.tile) {
                 continue;
             }
