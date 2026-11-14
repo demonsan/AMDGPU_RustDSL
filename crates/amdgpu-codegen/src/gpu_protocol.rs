@@ -1192,6 +1192,7 @@ pub fn with_reference_pair_checks<R>(g: impl FnOnce() -> R) -> R {
 }
 
 fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
+    let reference = REFERENCE_PAIR_CHECKS.with(|c| c.get());
     // OWNER events (lds_owned, every access proven in the issuing thread's own words): never conflict with each other across threads
     let is_owner = |ev: &Ev| f.contract.tiles[ev.tile].owned.is_some() && owned.get(&ev.stmt).copied().unwrap_or(false);
     struct Info {
@@ -1388,7 +1389,6 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     // reads completed and a barrier between) - unless the write provably stays in the writer's own slice of a private old region (gpu_verify's
     // `own_reuse` proof: the wave's own storage, dead for itself by program order). A private region counts as its whole extent (the simulation does
     // not track wave keys); plain `lds_alias` declarations (overlapping declared extents of interleaved rings) are not reuses and are not checked here.
-    let reference = REFERENCE_PAIR_CHECKS.with(|c| c.get());
     let tiles = &f.contract.tiles;
     let reuse = |x: usize, y: usize| {
         let (a, b) = (&tiles[x].name, &tiles[y].name);
