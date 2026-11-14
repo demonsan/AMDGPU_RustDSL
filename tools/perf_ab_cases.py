@@ -201,7 +201,7 @@ def mla():
             page = 64
             k = f'mla_decode_bf16_{"hp_" if hp else ""}p{page}'
             return Run([k, 'attn_combine_bf16_hd512'], ['{host:mla_host}', '{co:%s}' % k, '{co:attn_combine_bf16_hd512}', str(b), str(h), str(ctx), str(page), str(s)], dict(MLAHP=1 if hp else 0))
-        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'OK|PASS', timeout=600))
+        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', timeout=600))
     return out
 
 
@@ -242,7 +242,7 @@ def conv():
                        ('conv3d_bf16_t3r3s3_st1_p1_d1', '2 16 28 28 128 256 3 3 3 1 1 1')]:
         def build(side, name=name, args=args):
             return Run([name], ['{host:conv_host}', '{co:%s}' % name, name] + args.split(), {})
-        out.append(Case(id=f'conv/{name}', family='conv', build=build, metric='tflops', line=r'TF/s', ok=r'OK|PASS', timeout=600))
+        out.append(Case(id=f'conv/{name}', family='conv', build=build, metric='tflops', line=r'TF/s', ok=r'\bCONV_OK\b', timeout=600))
     return out
 
 
