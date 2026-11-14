@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod added;
 pub mod batch;
 pub mod hostgen;
 pub mod jit;

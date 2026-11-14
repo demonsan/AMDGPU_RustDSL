@@ -725,6 +725,46 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "added-table" => {
+            // amdc added-table [--out FILE] [--check FILE] [--jobs N]: the back-end-added instructions by class of every reachable kernel
+            let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+            let jobs = opt("--jobs").and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+            let now = match amdc::added::compute(jobs) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            if let Some(p) = opt("--check") {
+                let golden = match fs::read_to_string(&p) {
+                    Ok(s) => amdc::added::parse(&s),
+                    Err(e) => {
+                        eprintln!("cannot read {p}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let (d, tot) = amdc::added::diff(&golden, &now);
+                for l in &d {
+                    println!("{l}");
+                }
+                println!("totals: {tot}");
+                println!("{} kernels, {} difference(s) against {p}", now.len(), d.len());
+                return if d.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+            }
+            let text = amdc::added::render(&now);
+            match opt("--out") {
+                Some(p) => {
+                    if let Err(e) = fs::write(&p, &text) {
+                        eprintln!("cannot write {p}: {e}");
+                        return ExitCode::from(1);
+                    }
+                    eprintln!("wrote {p} ({} kernels)", now.len());
+                }
+                None => print!("{text}"),
+            }
+            ExitCode::SUCCESS
+        }
         "md5-manifest" => {
             // amdc md5-manifest [--out FILE] [--check FILE] [--jobs N]: the own-backend asm md5 of every reachable kernel (the refactor's golden oracle)
             let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());

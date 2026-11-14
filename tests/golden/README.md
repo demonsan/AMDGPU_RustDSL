@@ -21,3 +21,16 @@ bash tools/container/cargo.sh run -q --release --bin amdc -- md5-manifest --out 
 ```
 
 A kernel that does not compile is recorded as `ERROR` (and one that is not registered as `MISSING`), so a breakage shows up as a diff too.
+
+## `added_table.tsv`
+
+Per reachable kernel, the final instructions the back end added on its own, by class (`amdc added-table`; classes from
+`exact::synthetic_kind`): `insts` (all), `copy` (register copies), `loopcopy` (loop-variable copies), `s2v` (SGPR -> VGPR copies), `const`
+(constant materializations), `wait` (automatic waits), `nop` / `nop_states` (hazard s_nops and their wait states), `rfl` (readfirstlanes),
+`m0` (implicit M0 writes of LDS-DMAs), `other`. It is the metric of the default-path lowering work: `crates/amdc/tests/added_table.rs`
+checks it in `cargo test`; `--check` prints the per-kernel deltas and the column totals before -> after. Regenerate it together with the md5
+manifest:
+
+```bash
+bash tools/container/cargo.sh run -q --release --bin amdc -- added-table --out tests/golden/added_table.tsv
+```
