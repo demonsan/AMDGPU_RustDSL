@@ -274,3 +274,98 @@ pub fn co_check(args: &[String]) -> ExitCode {
         ExitCode::from(1)
     }
 }
+
+/// The code object clang + lld produce for `asm` (the cross-check / fallback path).
+pub fn clang_co(asm: &str, tag: &str) -> Result<Vec<u8>, String> {
+    let dir = std::env::temp_dir();
+    let (s, co) = (dir.join(format!("amdc-{}-{tag}.s", std::process::id())), dir.join(format!("amdc-{}-{tag}.co", std::process::id())));
+    std::fs::write(&s, asm).map_err(|e| format!("write {}: {e}", s.display()))?;
+    let clang = std::env::var("AMD_LLVM_BIN").ok().filter(|v| !v.is_empty()).map(|d| format!("{d}/clang")).unwrap_or_else(|| "clang".into());
+    let out = std::process::Command::new(&clang)
+        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-o"])
+        .arg(&co)
+        .arg(&s)
+        .output()
+        .map_err(|e| format!("cannot run {clang}: {e}"))?;
+    let bytes = std::fs::read(&co);
+    let _ = std::fs::remove_file(&s);
+    let _ = std::fs::remove_file(&co);
+    if !out.status.success() {
+        return Err(format!("{clang}: {}", String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>()));
+    }
+    bytes.map_err(|e| e.to_string())
+}
+
+/// `amdc assemble-co <file.s> --out <file.co>`
+pub fn assemble_co_cmd(args: &[String]) -> ExitCode {
+    let (Some(src), Some(out)) = (args.get(1), args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone())) else {
+        eprintln!("usage: amdc assemble-co <file.s> --out <file.co>");
+        return ExitCode::from(2);
+    };
+    let Ok(text) = std::fs::read_to_string(src) else {
+        eprintln!("cannot read {src}");
+        return ExitCode::from(2);
+    };
+    match amdgpu_target::gfx950_co::assemble(&text) {
+        Ok(b) => match std::fs::write(&out, b) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("cannot write {out}: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("assemble-co: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `amdc co-verify <dir> [--show N]`: for every `*.s` in the directory, the in-process code object against clang's.
+pub fn co_verify(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(1) else {
+        eprintln!("usage: amdc co-verify <dir>");
+        return ExitCode::from(2);
+    };
+    let mut files: Vec<_> = std::fs::read_dir(dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "s")).collect()).unwrap_or_default();
+    files.sort();
+    let show = args.iter().position(|a| a == "--show").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).unwrap_or(15);
+    let jobs = args.windows(2).find(|w| w[0] == "--jobs").and_then(|w| w[1].parse::<usize>().ok()).unwrap_or(8).max(1);
+    let next = AtomicUsize::new(0);
+    let report: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let same = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..jobs {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(f) = files.get(i) else { break };
+                let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let asm = std::fs::read_to_string(f).unwrap_or_default();
+                let msg = match (amdgpu_target::gfx950_co::assemble(&asm), clang_co(&asm, &format!("v{i}"))) {
+                    (Ok(a), Ok(b)) if a == b => {
+                        same.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    (Ok(a), Ok(b)) => {
+                        let at = a.iter().zip(&b).position(|(x, y)| x != y);
+                        format!("differs: ours {} bytes, clang {} bytes, first difference at {:?}", a.len(), b.len(), at)
+                    }
+                    (Err(e), _) => format!("ours failed: {e}"),
+                    (_, Err(e)) => format!("clang failed: {e}"),
+                };
+                report.lock().unwrap().push((name, msg));
+            });
+        }
+    });
+    let mut r = report.into_inner().unwrap();
+    r.sort();
+    println!("co-verify: {} of {} code objects are byte-identical to clang's", same.load(Ordering::Relaxed), files.len());
+    for (n, m) in r.iter().take(show) {
+        println!("  {n}: {m}");
+    }
+    if r.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
