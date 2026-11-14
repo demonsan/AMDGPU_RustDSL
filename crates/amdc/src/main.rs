@@ -21,6 +21,7 @@ fn usage() {
     eprintln!("  amdc co-check <oracle.tsv>   compare the in-process instruction encoder with llvm-mc (lines \"asm<TAB>hex\")");
     eprintln!("  amdc serve [--jobs N]   persistent compile server on stdin / stdout (docs/compile-time.md)");
     eprintln!("  amdc certify-batch FILE [--cert-cache DIR] [--jobs N]   pre-populate the content-addressed certificate cache from \"kernel<TAB>name=v,..\" lines");
+    eprintln!("  amdc template-build FILE --template-dir DIR [--jobs N]   verified shape templates from \"kernel<TAB>fixed<TAB>param<TAB>lo:hi:step\" lines (docs/compile-time.md)");
     eprintln!("  amdc ladder-hints [--out FILE] [--jobs N]   the retry-ladder rung each kernel compiles at (crates/amdgpu-kernels/src/ladder_hints.rs)");
     eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--co FILE.co] [--info FILE.json] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
@@ -1324,6 +1325,17 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        "template-build" => {
+            let (Some(file), Some(dir)) = (args.get(1), args.windows(2).find(|w| w[0] == "--template-dir").map(|w| w[1].clone())) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let jobs = args.windows(2).find(|w| w[0] == "--jobs").and_then(|w| w[1].parse::<usize>().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+            for l in amdc::template::build_file(file, &dir, jobs) {
+                println!("{l}");
+            }
+            ExitCode::SUCCESS
+        }
         "compile-batch" => batch::compile_batch(&args),
         "ladder-hints" => batch::ladder_hints(&args),
         "co-check" => batch::co_check(&args),
@@ -1353,6 +1365,7 @@ fn main() -> ExitCode {
                     info: val("--info"),
                     from_ir: from_ir_path(&args),
                     cert_cache: val("--cert-cache"),
+                    template_dir: val("--template-dir"),
                     no_verify: args.iter().any(|a| a == "--no-verify"),
                 };
                 let r = amdc::jitc::compile_request(&req);
