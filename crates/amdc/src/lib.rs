@@ -5,5 +5,7 @@
 pub mod batch;
 pub mod hostgen;
 pub mod jit;
+pub mod jitc;
 pub mod manifest;
 pub mod md5;
+pub mod sha256;

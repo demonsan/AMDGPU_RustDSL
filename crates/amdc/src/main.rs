@@ -19,6 +19,8 @@ fn usage() {
     eprintln!("  amdc assemble-co <file.s> --out <file.co>   assemble in-process (no clang)");
     eprintln!("  amdc co-verify <dir of .s> [--show N]   the in-process code object of every .s against clang's, byte for byte");
     eprintln!("  amdc co-check <oracle.tsv>   compare the in-process instruction encoder with llvm-mc (lines \"asm<TAB>hex\")");
+    eprintln!("  amdc serve [--jobs N]   persistent compile server on stdin / stdout (docs/compile-time.md)");
+    eprintln!("  amdc certify-batch FILE [--cert-cache DIR] [--jobs N]   pre-populate the content-addressed certificate cache from \"kernel<TAB>name=v,..\" lines");
     eprintln!("  amdc ladder-hints [--out FILE] [--jobs N]   the retry-ladder rung each kernel compiles at (crates/amdgpu-kernels/src/ladder_hints.rs)");
     eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--co FILE.co] [--info FILE.json] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
@@ -1245,6 +1247,43 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "serve" => {
+            let jobs = args.windows(2).find(|w| w[0] == "--jobs").and_then(|w| w[1].parse::<usize>().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+            match amdc::jitc::serve(jobs) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("serve: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "certify-batch" => {
+            let Some(file) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let dir = match args.windows(2).find(|w| w[0] == "--cert-cache").map(|w| w[1].clone()) {
+                Some(d) => d,
+                None => match amdc::jitc::default_cert_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            let jobs = args.windows(2).find(|w| w[0] == "--jobs").and_then(|w| w[1].parse::<usize>().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+            let (n, stored, cached, failed) = amdc::jitc::certify_batch(file, &dir, jobs);
+            println!("certify-batch: {n} shapes: {stored} certified and stored, {cached} already cached, {} failed; cache {dir}", failed.len());
+            for f in &failed {
+                eprintln!("  {f}");
+            }
+            if failed.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         "compile-batch" => batch::compile_batch(&args),
         "ladder-hints" => batch::ladder_hints(&args),
         "co-check" => batch::co_check(&args),
@@ -1255,6 +1294,31 @@ fn main() -> ExitCode {
                 usage();
                 return ExitCode::from(2);
             };
+            // the JIT request (`--co` and `--info`): one compile, the certificate (cached, concurrent), assembly, code object and info JSON: `amdc::jitc`, the code `amdc serve` runs too
+            if args.iter().any(|a| a == "--co") && args.iter().any(|a| a == "--info") && !args.iter().any(|a| a == "--time" || a == "--json" || a == "--mir-out") {
+                let val = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+                let spec = match spec_bindings(&args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let req = amdc::jitc::Req {
+                    kernel: name.clone(),
+                    spec,
+                    backend: val("--backend").or_else(|| env::var("AMDC_BACKEND").ok().filter(|v| !v.is_empty())).or_else(|| args.iter().find_map(|a| a.strip_prefix("--backend=").map(|s| s.to_string()))).unwrap_or_else(|| "auto".into()),
+                    out_s: val("--out"),
+                    co: val("--co"),
+                    info: val("--info"),
+                    from_ir: from_ir_path(&args),
+                    cert_cache: val("--cert-cache"),
+                    no_verify: args.iter().any(|a| a == "--no-verify"),
+                };
+                let r = amdc::jitc::compile_request(&req);
+                eprint!("{}", r.msg);
+                return ExitCode::from(r.code);
+            }
             // --time: per-phase timing of this compile (amdgpu_codegen::timing; stderr), --assemble: also run the external clang assembler and time it
             let want_time = args.iter().any(|a| a == "--time");
             let want_assemble = args.iter().any(|a| a == "--assemble");

@@ -62,13 +62,19 @@ pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -
 
 /// `compile_with` with explicit options.
 pub fn compile_with_options(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend, o: &CompileOptions) -> Result<Compiled, String> {
+    compile_with_mir(f, tail, o).map(|r| r.0)
+}
+
+/// `compile_with_options` that also returns the final MIR and register assignment (a caller that verifies the same compile does not compile twice).
+pub fn compile_with_mir(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend, o: &CompileOptions) -> Result<(Compiled, mir::MFunction, regalloc::Alloc), String> {
     let (m, alloc) = lower_and_allocate(f)?;
     timing::time("check-workgroup-budget", || regalloc::check_workgroup_budget(&m, &alloc))?;
     if o.verify {
         timing::time("verify-gpu", || gpu_verify::enforce(f, &m, &alloc))?;
     }
     let asm = timing::time("emit-tail", || tail.finish(&m, &alloc))?;
-    Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
+    let c = Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s };
+    Ok((c, m, alloc))
 }
 
 /// The final MIR and register assignment of a kernel (what the tail backends receive).
