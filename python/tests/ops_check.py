@@ -82,6 +82,32 @@ def rms_ref(x, g, N, eps):
 
 
 # ------------------------------------------------------------------------------------------------------------- checks
+def check_select_f32():
+    """The compiler keeps the f32 select semantics (docs/peephole-audit.md): select(x > y, x, y) with a NaN y returns the NaN, with
+    +0 / -0 the compare's choice - a `v_max_f32` fold returns x / its own zero (the case the old fold got wrong)."""
+    r = Res("select_f32 (NaN / signed zero)")
+    nan, inf = float("nan"), float("inf")
+    pairs = [(1.0, nan), (nan, 1.0), (0.0, -0.0), (-0.0, 0.0), (2.0, 1.0), (1.0, 2.0), (-inf, nan), (nan, nan)]
+    xs = [pairs[i % len(pairs)][0] for i in range(64)]
+    ys = [pairs[i % len(pairs)][1] for i in range(64)]
+    din = aj.DeviceBuffer((128,), "float32", data=struct.pack("<128f", *(xs + ys)))
+    dout = aj.DeviceBuffer((192,), "float32")
+    aj.launch("probe_select_f32", args={"in": din, "out": dout}, grid=(1, 1, 1))
+    got = down_f32(dout, 192)
+    bits = lambda v: struct.pack("<f", v)
+    for i in range(64):
+        x, y = xs[i], ys[i]
+        for k, ref in enumerate([x if x > y else y, x if x < y else y]):
+            r.cnt += 1
+            g = got[64 * k + i]
+            same = (math.isnan(g) and math.isnan(ref)) or bits(g) == bits(ref)
+            if not same:
+                if r.bad < 3:
+                    print(f"    bad: plane {k} x={x} y={y}: got {g} ref {ref}")
+                r.bad += 1
+    return r
+
+
 def check_rmsnorm(M=32, N=512, eps=1e-6):
     r = Res(f"rmsnorm M={M} N={N}")
     x, g = rand_bf16(M * N), rand_bf16(N)
@@ -925,6 +951,7 @@ CHECKS = [
     ("fused_moe_bf16", check_moe),
     ("fused_moe_fp8", lambda: check_moe(fp8=True)),
     ("mla_decode", check_mla),
+    ("select_f32", check_select_f32),
     ("argmax", lambda: check_sampling(mode="argmax")),
     ("sample", check_sampling),
     ("sample_topkp", lambda: check_sampling(top_k=50, top_p=0.9)),

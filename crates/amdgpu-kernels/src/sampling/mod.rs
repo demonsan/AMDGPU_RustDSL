@@ -217,7 +217,11 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 let xk = sel_f32(b, ok, x[k], neg);
                 let gt = b.cmp(CmpPred::Gt, CmpTy::F32, xk, best);
                 let idx = b.bind_i32((ev(ch) << 3) + k as i32);
-                best = sel_f32(b, gt, xk, best);
+                // the running maximum as the hardware max (author's op, not a compiler fold): it differs from select(xk > best, xk, best)
+                // only for a NaN best (impossible: best starts at -inf and only takes values that compared greater, never a NaN) and in
+                // the sign of an equal zero (the index below keeps the compare's choice; the value only feeds `best == block max`, which
+                // treats +0 and -0 alike)
+                best = b.let_(Op::MaxF32(Opnd::Val(xk), Opnd::Val(best)));
                 bidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt), a: Opnd::Val(idx), b: Opnd::Val(bidx) });
             }
         }

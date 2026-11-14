@@ -1475,3 +1475,34 @@ pub fn probe_valu_sgpr() -> Function {
     }
     b.finish()
 }
+
+/// `probe_select_f32(in, out)`: the f32 select semantics the compiler must keep (docs/peephole-audit.md: `select(x > y, x, y)` is not
+/// `v_max_f32` when y is a NaN or for +0 / -0). in planes 0 / 1: x, y (64 f32 each); out planes: 0 = select(x > y, x, y),
+/// 1 = select(x < y, x, y), 2 = max_f32(x, y) (the hardware max, for reference).
+pub fn probe_select_f32() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_select_f32", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(2 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(3 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let xi = b.load_global(pin, 0, MemTy::B32);
+    let yi = b.load_global(pin, 256, MemTy::B32);
+    let x = b.let_(Op::BitcastF32(Opnd::Val(xi)));
+    let y = b.let_(Op::BitcastF32(Opnd::Val(yi)));
+    let gt = b.cmp(CmpPred::Gt, CmpTy::F32, x, y);
+    let lt = b.cmp(CmpPred::Lt, CmpTy::F32, x, y);
+    let smax = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(gt), a: Opnd::Val(x), b: Opnd::Val(y) });
+    let smin = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(lt), a: Opnd::Val(x), b: Opnd::Val(y) });
+    let hmax = b.let_(Op::MaxF32(Opnd::Val(x), Opnd::Val(y)));
+    for (k, o) in [smax, smin, hmax].into_iter().enumerate() {
+        b.store_global(pout, 256 * k as u32, o, MemTy::B32, false);
+    }
+    b.finish()
+}
