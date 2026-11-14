@@ -50,6 +50,8 @@ class Case:
     better: str = None
     line: str = None                   # regex: only the output lines matching it are searched for the metric
     ok: str = None                     # regex that must match the output (correctness marker of the host)
+    fail: str = r'\b[A-Z0-9]+_FAIL\b|\bFAIL(?:ED)?\b'   # regex that must NOT match (a host's failure marker: XYZ_FAIL / FAIL) - a wrong result fails the case
+                                       # even when a weak `ok` pattern also matches (topk_per_row: `past_end_bad=0 ... TKR_FAIL` matched `bad*=0`)
     vendor: object = None              # callable() -> Run (no emit), the vendor side, same session
     vendor_line: str = None            # regex of the vendor lines (with `vendor_same`: lines of the SAME output as ours, hosts that run both kernels in one process)
     vendor_same: bool = False
@@ -380,7 +382,7 @@ def main():
                     continue
                 cmd, env = expand(r, s_, hosts)
                 text, rc, dt = run_once(cmd, env, c.timeout)
-                good = (c.ok is None or re.search(c.ok, text, re.M) is not None) and rc == 0
+                good = (c.ok is None or re.search(c.ok, text, re.M) is not None) and (not c.fail or re.search(c.fail, text, re.M) is None) and rc == 0
                 got = {}
                 for pt in parts_of(c):
                     smp = samples[(c.id, pt['name'])]

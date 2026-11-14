@@ -60,7 +60,7 @@ def membound(tree):
             continue
         env = dict(e.split('=', 1) for e in envs.split())
         out.append(Case(id=f'mb/{label}', family='membound', build=(lambda side, cmd=cmd, emit=emit, env=env: Run(emit, cmd, env)),
-                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*OK|bad[a-z_]*=0', timeout=300))
+                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*\bOK\b|^check(?!.*bad[a-z_]*=[1-9]).*\bbad[a-z_]*=0', timeout=300))
     return out
 
 
