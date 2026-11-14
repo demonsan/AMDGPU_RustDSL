@@ -1201,6 +1201,8 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         publish: Option<u32>,
         done_ord: u32,
         released: bool,
+        /// `is_owner(&ev)`, evaluated once (it looks the statement up in a map)
+        owner: bool,
     }
     let mut infos: Vec<Info> = Vec::new();
     for (role, t) in traces.iter().enumerate() {
@@ -1210,7 +1212,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 continue;
             }
             let ti = &t.infos[k];
-            infos.push(Info { role, ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
+            infos.push(Info { role, owner: is_owner(ev), ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
         }
     }
     // the producers per (tile, slot): every consumer looks up its own slot instead of scanning all events
@@ -1218,6 +1220,13 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     for (k, x) in infos.iter().enumerate() {
         if x.ev.produce {
             prod_of.entry((x.ev.tile, x.ev.slot)).or_default().push(k);
+        }
+    }
+    // the producers of one tile (infos ascending): the own-wave lookup of a private region does not scan every (tile, slot) group
+    let mut prod_by_tile: Vec<Vec<usize>> = vec![Vec::new(); f.contract.tiles.len()];
+    for (k, x) in infos.iter().enumerate() {
+        if x.ev.produce {
+            prod_by_tile[x.ev.tile].push(k);
         }
     }
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
@@ -1229,8 +1238,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         if f.contract.tiles[c.ev.tile].private {
             // own-wave semantics: the wave reads a version it produced AND completed (wait_vm/wait_lds(0)) itself; no other wave is involved, so no barrier is required
             let tname = f.contract.tiles[c.ev.tile].name.clone();
-            let mut own_k: Vec<usize> = prod_of.iter().filter(|((t, _), _)| *t == c.ev.tile).flat_map(|(_, v)| v.iter().copied()).filter(|&k| infos[k].role == c.role).collect();
-            own_k.sort_unstable();
+            let own_k: Vec<usize> = prod_by_tile[c.ev.tile].iter().copied().filter(|&k| infos[k].role == c.role).collect();
             let own: Vec<&Info> = own_k.iter().map(|&k| &infos[k]).collect();
             let completed: Vec<&&Info> = own.iter().filter(|p| p.done.map_or(false, |d| d < c.ev.start)).collect();
             let stmt = c.ev.stmt;
@@ -1253,8 +1261,8 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         let key = (c.ev.tile, c.ev.slot);
         // an owner read of a version this thread wrote itself before (owner write, program order): the thread's own words, no barrier needed
         let slot_prods: &[usize] = prod_of.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-        if is_owner(&c.ev) && slot_prods.iter().map(|&k| &infos[k]).any(|p| is_owner(&p.ev) && p.role == c.role && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
-            for q in slot_prods.iter().map(|&k| &infos[k]).filter(|q| q.ev.ver != c.ev.ver && !is_owner(&q.ev)) {
+        if c.owner && slot_prods.iter().map(|&k| &infos[k]).any(|p| p.owner && p.role == c.role && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
+            for q in slot_prods.iter().map(|&k| &infos[k]).filter(|q| q.ev.ver != c.ev.ver && !q.owner) {
                 let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
                 if overlap {
                     diags.push(("GV-TILE-RACE", Severity::Error, c.ev.stmt, format!("stmt {}: owner read of `{}` (version {}) overlaps the shared write of version {} (stmt {}): no barrier separates them", c.ev.stmt, name(c.ev.tile), c.ev.ver, q.ev.ver, q.ev.stmt)));
@@ -1313,14 +1321,14 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         }
         for p in prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord) {
             // another thread's owner write of this version touches only its own words, which an owner read never reads
-            if is_owner(&c.ev) && is_owner(&p.ev) {
+            if c.owner && p.owner {
                 continue;
             }
             if !visible(p) {
                 diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] version {} at phase {}: the part produced by role {} (stmt {}) is not yet published (publish phase {}) {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.role, p.ev.stmt, p.publish.map_or("never".to_string(), |v| v.to_string()))));
             }
         }
-        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver && !(is_owner(&c.ev) && is_owner(&q.ev))) {
+        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver && !(c.owner && q.owner)) {
             // the read window [c.ord, c.done_ord] against the write window [q.ord, q.publish) of ANY wave (same role included)
             let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
             if overlap {
@@ -1387,7 +1395,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     if reference {
         for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
             for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-                if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
+                if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(a.owner && b.owner) {
                     let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
                     if aw.0 < bw.1 && bw.0 < aw.1 {
                         diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, pp_msg(a, b, aw, bw)));
@@ -1402,7 +1410,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             for (x, &i) in ks.iter().enumerate() {
                 for &j in &ks[x + 1..] {
                     let (a, b) = (&infos[i], &infos[j]);
-                    if a.role != b.role && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
+                    if a.role != b.role && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(a.owner && b.owner) {
                         let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
                         if aw.0 < bw.1 && bw.0 < aw.1 {
                             hits.push((i, j));
