@@ -137,6 +137,24 @@ fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start: u8) -> Result<(mir::MFunction, regalloc::Alloc, u8), String> {
+    let (m, a, k) = lower_and_allocate_inner(f, extra, inner_start)?;
+    // default path: the waits re-checked on the physical-register view (a wait the value-level scoreboard missed because two values
+    // share registers is a compile error, not a silent race)
+    if !f.exact {
+        let view = exact::physical_view(&m, &a);
+        let mut c = view.clone();
+        sched::waits::insert_waits(&mut c);
+        let mut out = Vec::new();
+        exact::diff_pub("waits(physical)", &view, &c, &a, &mut out);
+        if !out.is_empty() {
+            let first: Vec<String> = out.iter().take(4).map(|v| format!("{v:?}")).collect();
+            return Err(format!("{}: {} wait(s) missing on the physical-register view: {}", f.name, out.len(), first.join(" | ")));
+        }
+    }
+    Ok((m, a, k))
+}
+
+fn lower_and_allocate_inner(f: &amdgpu_dsl::Function, extra: &[&str], inner_start: u8) -> Result<(mir::MFunction, regalloc::Alloc, u8), String> {
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
