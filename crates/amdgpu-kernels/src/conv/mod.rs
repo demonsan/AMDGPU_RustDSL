@@ -327,8 +327,13 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
     let bias = bf16x8_to_f32(b, bias_fr);
     // the initial state of the 8 features: [f][j] = element f * (W - 1) + j (zero when the sequence has none)
     let st_base = b.bind_i32((ev(cache_idx) * ev(dim_v) + ev(feat)) * (2 * sl) as i32);
+    // the state slot is read AND written only by the sequence's chunk 0 (the vLLM / aiter scheme): another workgroup of the same sequence
+    // never touches it, so the old state cannot be overwritten before it is read (the last chunk writing it raced with chunk 0 reading it:
+    // intermittent wrong first W-1 outputs, mostly with `_sched`)
+    let first0 = b.cmp(CmpPred::Eq, CmpTy::I32, chunk, 0);
+    let first_i = sel_i(b, first0);
     let sk_i = sel_i(b, seq_ok);
-    let st_on = b.bind_i32(ev(sk_i) & ev(fok));
+    let st_on = b.bind_i32(ev(sk_i) & ev(fok) & ev(first_i));
     let st_on_c = b.cmp(CmpPred::Ne, CmpTy::I32, st_on, 0);
     let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(st_on_c), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
     let zero = b.c_f32(0.0);
@@ -458,11 +463,10 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
         }
         win = nw;
     }
-    // the final state: written by the chunk that holds the last token (uniform): the last W-1 inputs of the sequence, older initial-state values when the sequence is shorter than W-1
-    let last_chunk = b.bind_i32(ev(c0) + TM as i32);
-    let is_last = b.cmp(CmpPred::Ge, CmpTy::I32, last_chunk, seqlen);
+    // the final state: written by chunk 0 (uniform), the reader of the old state: the last W-1 inputs of the sequence (read from x), older
+    // initial-state values when the sequence is shorter than W-1
     b.if_(active, |b| {
-        b.if_(is_last, |b| {
+        b.if_(first0, |b| {
             let mut vals: Vec<ValueId> = Vec::new();    // [f][j] element f * sl + j
             let mut cols: Vec<[ValueId; 8]> = Vec::new();
             for j in 0..sl {
