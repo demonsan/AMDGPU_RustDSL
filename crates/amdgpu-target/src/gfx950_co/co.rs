@@ -327,6 +327,20 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         debug_assert_eq!(b.len(), sizes[k]);
         code.extend(b);
     }
+    // the assembler creates a symbol at its first mention (a branch operand or the definition): the symbol table follows that order
+    {
+        let mut first: Vec<String> = Vec::new();
+        for (is_label, text) in &p.items {
+            let nm = if *is_label { Some(text.as_str()) } else if text.starts_with("s_branch") || text.starts_with("s_cbranch") { text.split_whitespace().nth(1) } else { None };
+            if let Some(n) = nm {
+                if !first.iter().any(|x| x == n) {
+                    first.push(n.to_string());
+                }
+            }
+        }
+        let at: HashMap<&str, usize> = first.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        label_order.sort_by_key(|(n, _)| at.get(n.as_str()).copied().unwrap_or(usize::MAX));
+    }
     let code_len = code.len();
     let kd_off = align(code_len, 64);
     let mut text = code;
