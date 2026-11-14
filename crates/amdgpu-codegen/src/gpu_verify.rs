@@ -1469,14 +1469,17 @@ impl<'a> An<'a> {
             .filter(|(k, c)| !cx.nonneg(c) && cx.nonneg(&c.scale(Q::int(-1))) && ss.iter().all(|s| s.1.as_ref().map_or(false, |(a, _)| a.contains_key(k))))
             .map(|(k, _)| *k)
             .collect();
+        let mut mirrored: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
         for k in neg {
             let c = atoms[&k].clone();
             let (l, h) = ranges[&k].clone();
-            let Some(shift) = c.mul(&l.add(&h)) else { continue };
+            let lh = l.add(&h);
+            let Some(shift) = c.mul(&lh) else { continue };
             for x in consts.iter_mut() {
                 *x = x.add(&shift);
             }
             atoms.insert(k, c.scale(Q::int(-1)));
+            mirrored.insert(k, lh);
         }
         let is_wg = |k: &(bool, u64)| (!k.0 && k.1 >= u64::MAX - 2) || self.f.contract.wg_maps.iter().any(|m| m.outs.iter().any(|v| self.atom_key(*v) == *k));
         // 3. caps (`x < bound` on the live arm of a mask, or a clamp min(x, bound - 1)) present in every store with the same atoms (constants may
@@ -1486,7 +1489,23 @@ impl<'a> An<'a> {
         // composite digits (k = 1) whose atoms are spaced by at least the access size: each footprint [x, x + size) is its own
         let mut sized: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
-        let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        let mut caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        // (a mirrored digit in a cap's x too: cl z = -cl z' + cl (l + h))
+        if !mirrored.is_empty() {
+            for cs in caps_all.iter_mut() {
+                for cap in cs.iter_mut() {
+                    let (latoms, lc) = &mut cap.0;
+                    for (k, lh) in &mirrored {
+                        if let Some(cl) = latoms.get(k).cloned() {
+                            if let Some(s) = cl.mul(lh) {
+                                *lc = lc.add(&s);
+                                latoms.insert(*k, cl.scale(Q::int(-1)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
         if dbg {
             eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
