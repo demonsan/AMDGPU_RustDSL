@@ -283,6 +283,11 @@ import atexit  # noqa: E402
 atexit.register(close_servers)
 
 
+def template_dir(amdc):
+    """Shape templates built offline (`amdc template-build --template-dir`): `<cache>/templates/<sha256(amdc)[:24]>`."""
+    return os.path.join(cache_dir(), "templates", _hash_file(amdc))
+
+
 def cert_cache_dir(amdc):
     """The content-addressed certificate cache of this compiler (`amdc certify-batch` pre-populates the same directory)."""
     return os.path.join(cache_dir(), "certs", _hash_file(amdc))
@@ -299,7 +304,7 @@ def _compile_into(d, kernel, spec, amdc, clang, ir_path=None):
     srv = _server_for(amdc)
     if srv is not None:
         # the persistent server: no process start, one compile, the certificate cached by content
-        r = srv.request([kernel, spec_string(spec) if spec else "", backend(), s_path, co_path, os.path.join(d, "info.json"), ir_path or "", certs, ""])
+        r = srv.request([kernel, spec_string(spec) if spec else "", backend(), s_path, co_path, os.path.join(d, "info.json"), ir_path or "", certs, "", template_dir(amdc)])
         if r is not None:
             code, msg = r
             if code == 0 or code == 3:
@@ -312,7 +317,7 @@ def _compile_into(d, kernel, spec, amdc, clang, ir_path=None):
             raise CompileError(f"amdc serve {kernel} {' '.join(sp)} failed (code {code}):\n{msg[-4000:]}")
     # the in-process assembler (amdc emit --co): no clang; AMDGPU_JIT_ASSEMBLER=clang forces the external assembler
     inproc = os.environ.get("AMDGPU_JIT_ASSEMBLER", "inproc") != "clang"
-    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path, "--info", os.path.join(d, "info.json"), "--cert-cache", certs] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path, "--info", os.path.join(d, "info.json"), "--cert-cache", certs, "--template-dir", template_dir(amdc)] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     info = None if inproc else subprocess.Popen([amdc, "jit-info", kernel, "--backend", backend()] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     eo, ee = emit.communicate()
     io_, ie = info.communicate() if info else (None, "")

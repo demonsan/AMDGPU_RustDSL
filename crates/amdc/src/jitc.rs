@@ -27,6 +27,8 @@ pub struct Req {
     pub info: Option<String>,
     pub from_ir: Option<String>,
     pub cert_cache: Option<String>,
+    /// the shape-template directory (`amdc template-build`); a verified template replaces the compile
+    pub template_dir: Option<String>,
     pub no_verify: bool,
 }
 
@@ -129,13 +131,25 @@ pub fn compile_request(r: &Req) -> Resp {
     } else {
         None
     };
-    let (c, m, alloc) = match compile_with_mir(&f, tail, &CompileOptions { verify: !certify }) {
-        Ok(x) => x,
-        Err(e) => return Resp { code: 1, msg: format!("compile error:\n{e}\n") },
+    // a verified shape template (exhaustively checked byte-identical to the full compile at build time) replaces the compile; its register / wait checks ran with that compile
+    let tpl_asm = match (&r.template_dir, resolved.as_str(), r.from_ir.is_none()) {
+        (Some(d), "own", true) => crate::template::lookup(d, &r.kernel, &r.spec, "own"),
+        _ => None,
+    };
+    let from_template = tpl_asm.is_some();
+    let (c, mir_parts) = match tpl_asm {
+        Some(asm) => (amdgpu_codegen::Compiled { asm, vgpr: 0, sgpr: 0 }, None),
+        None => match compile_with_mir(&f, tail, &CompileOptions { verify: !certify }) {
+            Ok((c, m, alloc)) => (c, Some((m, alloc))),
+            Err(e) => return Resp { code: 1, msg: format!("compile error:\n{e}\n") },
+        },
     };
     let mut msg = String::new();
     if certify {
-        let mir = verify_mir(&f, &m, &alloc);
+        let mir = match &mir_parts {
+            Some((m, alloc)) => verify_mir(&f, m, alloc),
+            None => Report::default(),
+        };
         let (ir_ledger, mut errs): (Ledger5, Vec<String>) = match (cached, ir_thread) {
             (Some(l), _) => (l, Vec::new()),
             (None, Some(h)) => match h.join() {
@@ -150,7 +164,7 @@ pub fn compile_request(r: &Req) -> Resp {
         let total: usize = ir_ledger.iter().sum::<usize>() + ml.iter().sum::<usize>();
         let cn = &f.contract;
         let contracts = cn.extents.len() + cn.ka_ranges.len() + cn.grid_defs.len() + cn.ka_defs.len() + cn.ka_sets.len() + cn.sym_ranges.len();
-        msg.push_str(&format!("verified {}: certificate: {total} trusted assumes, {contracts} trusted contracts, {} unproven{}\n", f.name, errs.len(), if cached.is_some() { " (IR certificate from the cache)" } else { "" }));
+        msg.push_str(&format!("verified {}: certificate: {total} trusted assumes, {contracts} trusted contracts, {} unproven{}{}\n", f.name, errs.len(), if cached.is_some() { " (IR certificate from the cache)" } else { "" }, if from_template { " (assembly from a verified shape template)" } else { "" }));
         if !errs.is_empty() {
             for e in &errs {
                 msg.push_str(&format!("  {e}\n"));
@@ -277,13 +291,13 @@ fn opt(s: &str) -> Option<String> {
 pub fn parse_line(line: &str) -> Result<(String, Req), String> {
     let f: Vec<&str> = line.split('\t').collect();
     if f.len() < 10 {
-        return Err(format!("request needs 10 tab-separated fields, got {}", f.len()));
+        return Err(format!("request needs 10 (or 11) tab-separated fields, got {}", f.len()));
     }
     let spec = match opt(f[2]) {
         Some(s) => amdgpu_dsl::specialize::parse_bindings(&s)?,
         None => Vec::new(),
     };
-    Ok((f[0].to_string(), Req { kernel: unesc(f[1]), spec, backend: unesc(f[3]), out_s: opt(f[4]), co: opt(f[5]), info: opt(f[6]), from_ir: opt(f[7]), cert_cache: opt(f[8]), no_verify: f[9].contains("no-verify") }))
+    Ok((f[0].to_string(), Req { kernel: unesc(f[1]), spec, backend: unesc(f[3]), out_s: opt(f[4]), co: opt(f[5]), info: opt(f[6]), from_ir: opt(f[7]), cert_cache: opt(f[8]), template_dir: f.get(10).and_then(|x| opt(x)), no_verify: f[9].contains("no-verify") }))
 }
 
 pub fn response_line(id: &str, r: &Resp) -> String {
