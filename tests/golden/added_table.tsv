@@ -13,7 +13,7 @@ attn_combine_bf16_hd512_sm	78	3	2	2	2	4	1	2	0	0	0
 attn_combine_bf16_sink_hd128	91	3	2	2	2	6	2	4	0	0	0
 attn_combine_bf16_sink_hd64	91	3	2	2	2	6	2	4	0	0	0
 causal_conv1d_fwd_bf16_w4_silu	2397	0	0	7	2	27	2	4	0	0	0
-causal_conv1d_update_bf16_w4_s3_idx_silu	104	0	0	2	2	6	2	4	0	0	0
+causal_conv1d_update_bf16_w4_s3_idx_silu	110	0	0	3	2	6	2	4	0	0	0
 cvt_bf16_f32	47	0	0	0	0	3	0	0	0	0	0
 cvt_f32_bf16	37	0	0	0	0	3	0	0	0	0	0
 fmha_bwd_dkdv_hd128_bf16	2345	0	1	3	13	157	98	184	1	0	286
