@@ -1462,6 +1462,25 @@ impl<'a> An<'a> {
             }
             ranges.insert(*k, r.ok_or("no atom range")?);
         }
+        // 2b. a digit with a negative coefficient c (e.g. a reversed tile order G - 1 - z): c x = (-c) (l + h - x) + c (l + h), and l + h - x is a
+        // bijection of [l, h] - mirror it when every store has it (a store without it would read 0, not the mirrored 0)
+        let neg: Vec<(bool, u64)> = atoms
+            .iter()
+            .filter(|(k, c)| !cx.nonneg(c) && cx.nonneg(&c.scale(Q::int(-1))) && ss.iter().all(|s| s.1.as_ref().map_or(false, |(a, _)| a.contains_key(k))))
+            .map(|(k, _)| *k)
+            .collect();
+        let mut mirrored: BTreeMap<(bool, u64), Poly> = BTreeMap::new();
+        for k in neg {
+            let c = atoms[&k].clone();
+            let (l, h) = ranges[&k].clone();
+            let lh = l.add(&h);
+            let Some(shift) = c.mul(&lh) else { continue };
+            for x in consts.iter_mut() {
+                *x = x.add(&shift);
+            }
+            atoms.insert(k, c.scale(Q::int(-1)));
+            mirrored.insert(k, lh);
+        }
         let is_wg = |k: &(bool, u64)| (!k.0 && k.1 >= u64::MAX - 2) || self.f.contract.wg_maps.iter().any(|m| m.outs.iter().any(|v| self.atom_key(*v) == *k));
         // 3. caps (`x < bound` on the live arm of a mask, or a clamp min(x, bound - 1)) present in every store with the same atoms (constants may
         // differ): when the offset holds k * x, x's atoms become ONE digit (coefficient k, values [min x, bound - 1]) and each store's constant
@@ -1470,7 +1489,23 @@ impl<'a> An<'a> {
         // composite digits (k = 1) whose atoms are spaced by at least the access size: each footprint [x, x + size) is its own
         let mut sized: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
-        let caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        let mut caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
+        // (a mirrored digit in a cap's x too: cl z = -cl z' + cl (l + h))
+        if !mirrored.is_empty() {
+            for cs in caps_all.iter_mut() {
+                for cap in cs.iter_mut() {
+                    let (latoms, lc) = &mut cap.0;
+                    for (k, lh) in &mirrored {
+                        if let Some(cl) = latoms.get(k).cloned() {
+                            if let Some(s) = cl.mul(lh) {
+                                *lc = lc.add(&s);
+                                latoms.insert(*k, cl.scale(Q::int(-1)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let dbg = std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty());
         if dbg {
             eprintln!("gw:   caps per store: {:?}", caps_all.iter().map(|c| c.len()).collect::<Vec<_>>());
@@ -2398,6 +2433,32 @@ impl<'a> An<'a> {
                     let x = self.int_of(a);
                     if !x.nonneg(cx) {
                         return AV::Int(Itv::top());
+                    }
+                    // (P + 2^k - 1) >> k = ceil(P / 2^k): the grid size of an axis the contract defines as exactly that (a reversed tile order
+                    // `ceil(S / 128) - 1 - z` then reads as a digit of the axis)
+                    if let Some(Op::AddI32(xa, xb)) = match a { Opnd::Val(v) => self.defs.get(v), _ => None } {
+                        let d = 1i128 << k.n;
+                        let (xi, ci) = (self.int_of(xa), self.int_of(xb));
+                        if ci.point_const() == Some(Q::int(d - 1)) {
+                            if let Some(pp) = xi.lo.iter().find(|l| xi.hi.contains(l)) {
+                                for (ax, e) in &self.f.contract.grid_defs {
+                                    if let Ext::CeilDiv(inner, kk) = e {
+                                        if *kk as i128 == d && inner.to_poly(cx).as_ref() == Some(pp) {
+                                            let g = cx.sym_poly(Sym::Grid(*ax));
+                                            return AV::Int(Itv::range(g.clone(), g));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // an exact multiple of 2^k (a point whose every coefficient is): the exact quotient (e.g. N >> 7 with N = 128 NT is NT)
+                    if let Some(p) = x.lo.iter().find(|l| x.hi.contains(l)) {
+                        let d = 1i128 << k.n;
+                        if !p.0.is_empty() && p.0.values().all(|q| q.d == 1 && q.n % d == 0) {
+                            let e = p.scale(Q::new(1, d));
+                            return AV::Int(Itv::range(e.clone(), e));
+                        }
                     }
                     let div = Q::new(1, 1i128 << k.n);
                     let mut lo: Vec<Poly> = vec![Poly::int(0)];
