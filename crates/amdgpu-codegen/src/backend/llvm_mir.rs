@@ -120,7 +120,10 @@ fn kernarg_ir(m: &MFunction) -> Result<(Vec<String>, u32), String> {
             *cursor += ty.1;
         }
     };
-    for (i, a) in m.args.iter().enumerate() {
+    // (in offset order: a kernel may declare its arguments in another order; the IR names keep the DSL index)
+    let mut order: Vec<(usize, &crate::mir::MArg)> = m.args.iter().enumerate().collect();
+    order.sort_by_key(|(_, a)| a.offset);
+    for (i, a) in order {
         if a.offset < cursor {
             return Err(format!("kernarg '{}' at offset {} overlaps the previous argument", a.name, a.offset));
         }
