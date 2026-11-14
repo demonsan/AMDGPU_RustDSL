@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use amdc::batch;
 use amdc::hostgen;
 
 use amdgpu_codegen::backend::{self, probe, LlvmTail, LlvmTools, TailBackend};
@@ -15,7 +16,8 @@ fn usage() {
     eprintln!("  amdc dispatch decode16 <B> <HK> <CTX> [--page P]   (the paged-decode launch plan as JSON)");
     eprintln!("  amdc graph plan <graph.json | -> [--cus N] [--no-fuse] (the L1 launch plan of an op graph, docs/l1-graph.md)");
     eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
+    eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
     eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
     eprintln!("  amdc ir-check <file.ir> [--verify]      parse + check an irv1 DSL IR file (docs/ir-text.md); --from-ir <file> works with emit / gpu-verify / jit-info / print-ir / regplan");
@@ -1238,15 +1240,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "compile-batch" => batch::compile_batch(&args),
         "emit" => {
             let Some(name) = args.get(1) else {
                 usage();
                 return ExitCode::from(2);
             };
+            // --time: per-phase timing of this compile (amdgpu_codegen::timing; stderr), --assemble: also run the external clang assembler and time it
+            let want_time = args.iter().any(|a| a == "--time");
+            let want_assemble = args.iter().any(|a| a == "--assemble");
+            if want_time {
+                amdgpu_codegen::timing::enable(true);
+            }
+            let t_build = std::time::Instant::now();
             let (f, spec) = match kernel_spec(name, &args) {
                 Ok(x) => x,
                 Err(c) => return c,
             };
+            let build_d = t_build.elapsed();
             if must_verify(&args, &spec) {
                 if let Err(c) = certify_specialized(&f) {
                     return c;
@@ -1310,7 +1321,14 @@ fn main() -> ExitCode {
             };
             let tail: &dyn TailBackend = tail.as_ref();
             let json = args.iter().any(|a| a == "--json");
-            match amdgpu_codegen::compile_with(&f, tail) {
+            let t_compile = std::time::Instant::now();
+            let res = amdgpu_codegen::compile_with(&f, tail);
+            let compile_d = t_compile.elapsed();
+            if want_time {
+                let ents = amdgpu_codegen::timing::take();
+                batch::emit_report(&f.name, build_d, compile_d, res.as_ref().ok().map(|c| c.asm.as_str()), want_assemble, ents);
+            }
+            match res {
                 Ok(c) if json => {
                     if let Some(p) = &out_path {
                         if let Err(e) = fs::write(p, &c.asm) {

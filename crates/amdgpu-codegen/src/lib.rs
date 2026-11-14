@@ -28,11 +28,25 @@ pub use target::gfx950::op_attrs;
 pub mod regalloc;
 pub mod regplan;
 pub mod sched;
+pub mod timing;
 
 pub struct Compiled {
     pub asm: String,
     pub vgpr: u32,
     pub sgpr: u32,
+}
+
+/// What a compile does besides producing assembly. `verify` runs the GPU-semantics verifier (`gpu_verify::enforce`) on the allocated MIR: a pure check (the assembly is the same either way), so a JIT may
+/// run it offline per shape bucket and compile with `verify: false` (docs/compile-time.md).
+#[derive(Clone, Debug)]
+pub struct CompileOptions {
+    pub verify: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        CompileOptions { verify: true }
+    }
 }
 
 /// Lowers, verifies, allocates and emits a kernel as gfx950 assembly text with our own tail.
@@ -42,10 +56,17 @@ pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
 
 /// Same pipeline, with a selectable tail backend (OwnTail or LlvmTail).
 pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -> Result<Compiled, String> {
+    compile_with_options(f, tail, &CompileOptions::default())
+}
+
+/// `compile_with` with explicit options.
+pub fn compile_with_options(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend, o: &CompileOptions) -> Result<Compiled, String> {
     let (m, alloc) = lower_and_allocate(f)?;
-    regalloc::check_workgroup_budget(&m, &alloc)?;
-    gpu_verify::enforce(f, &m, &alloc)?;
-    let asm = tail.finish(&m, &alloc)?;
+    timing::time("check-workgroup-budget", || regalloc::check_workgroup_budget(&m, &alloc))?;
+    if o.verify {
+        timing::time("verify-gpu", || gpu_verify::enforce(f, &m, &alloc))?;
+    }
+    let asm = timing::time("emit-tail", || tail.finish(&m, &alloc))?;
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
 
@@ -102,14 +123,14 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let pol = f.compile_policy();
     let mut v: Vec<&str> = pol.lower.to_vec();
     v.extend_from_slice(extra);
-    let base = match pol.lower_base {
-        amdgpu_dsl::LowerBase::Replace => lower::with_opts(&v, || lower::lower(f))?,
-        amdgpu_dsl::LowerBase::Inherit => lower::lower_with_extra(f, &v)?,
-    };
+    let base = timing::time("lower-mir", || match pol.lower_base {
+        amdgpu_dsl::LowerBase::Replace => lower::with_opts(&v, || lower::lower(f)),
+        amdgpu_dsl::LowerBase::Inherit => lower::lower_with_extra(f, &v),
+    })?;
     // AGPR requests (DSL pin_agpr / gpr): move the vregs to the AGPR file and repair the instructions that cannot touch it
     let base = {
         let mut b = base;
-        agpr::assign(&mut b)?;
+        timing::time("assign-agpr", || agpr::assign(&mut b))?;
         b
     };
     // exact authored mode: no scheduling, no allocation, no inserted waits / nops; the author's code is verified (docs/exact-mode.md)

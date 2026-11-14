@@ -382,7 +382,7 @@ pub const BACK: &[PassInfo] = &[
 /// Runs a body.
 pub fn run_body(body: &[Pass], s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     for p in body {
-        (p.run)(s, cx)?;
+        crate::timing::time(p.info.name, || (p.run)(s, cx))?;
     }
     Ok(())
 }
