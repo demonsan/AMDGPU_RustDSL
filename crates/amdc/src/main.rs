@@ -1267,13 +1267,16 @@ fn main() -> ExitCode {
                 Err(c) => return c,
             };
             let build_d = t_build.elapsed();
-            if must_verify(&args, &spec) {
-                let t_cert = std::time::Instant::now();
-                if let Err(c) = certify_specialized(&f) {
-                    return c;
-                }
-                amdgpu_codegen::timing::add("certify-specialized", t_cert.elapsed());
-            }
+            // the specialization certificate (IR-level analysis, 1 - 50 ms: more than the compile itself) runs on its own thread while the kernel compiles; a failure returns before anything is written
+            let cert = if must_verify(&args, &spec) {
+                let fc = f.clone();
+                Some(std::thread::spawn(move || {
+                    let t = std::time::Instant::now();
+                    (certify_specialized(&fc), t.elapsed())
+                }))
+            } else {
+                None
+            };
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
             let mut co_path: Option<String> = None;
@@ -1343,6 +1346,16 @@ fn main() -> ExitCode {
             let t_compile = std::time::Instant::now();
             let res = amdgpu_codegen::compile_with(&f, tail);
             let compile_d = t_compile.elapsed();
+            if let Some(h) = cert {
+                match h.join() {
+                    Ok((Err(c), _)) => return c,
+                    Ok((Ok(()), d)) => amdgpu_codegen::timing::add("certify-specialized (own thread)", d),
+                    Err(_) => {
+                        eprintln!("the certificate thread panicked");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             // the in-process assembler (no clang): timed under --time, written under --co
             let inproc = if want_time || co_path.is_some() { res.as_ref().ok().map(|c| (std::time::Instant::now(), amdgpu_target::gfx950_co::assemble(&c.asm))) } else { None };
             if want_time {
