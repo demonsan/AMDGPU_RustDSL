@@ -365,8 +365,11 @@ fn conv1d_fwd_impl(name: &str, w: i64, split: bool, silu: bool, sched: bool, rac
     let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(st_on_c), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
     // (the chunk-0 guard spelled `chunk < 1` on the address: the verifier's cap pins the chunk digit)
     let st_off = if racy { st_off } else { b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(chunk_lt1), a: Opnd::Val(st_off), b: Opnd::Val(oob) }) };
-    // (and the feature guard `feat < dim` spelled on the address: the lane's 8 features are one composite digit below dim)
-    let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(feat_ok), a: Opnd::Val(st_off), b: Opnd::Val(oob) });
+    // (and the feature guard spelled on the address: the lane's 8 features are one composite digit below dim; `feat < dim - 7` is `feat < dim`
+    // for the multiples of 8 both are (dim % 8 == 0 is the kernel's contract), and lets the digit's last value be exact)
+    let dim7 = b.bind_i32(ev(dim_v) - 7);
+    let feat_ok7 = b.let_(Op::CmpLtI32(Opnd::Val(feat), Opnd::Val(dim7)));
+    let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(feat_ok7), a: Opnd::Val(st_off), b: Opnd::Val(oob) });
     let zero = b.c_f32(0.0);
     let hi_c = b.cmp(CmpPred::Ne, CmpTy::I32, has_init, 0);
     let mut st: Vec<ValueId> = Vec::new();
@@ -541,7 +544,7 @@ fn conv1d_fwd_impl(name: &str, w: i64, split: bool, silu: bool, sched: bool, rac
                 let o = b.bind_i32(ev(base) + 16 * c as i32);
                 let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr_c), a: Opnd::Val(o), b: Opnd::Val(oob) });
                 let o = if racy { o } else { b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(chunk_lt1), a: Opnd::Val(o), b: Opnd::Val(oob) }) };
-                let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(feat_ok), a: Opnd::Val(o), b: Opnd::Val(oob) });
+                let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(feat_ok7), a: Opnd::Val(o), b: Opnd::Val(oob) });
                 b.buffer_store_c(r_s, Some(Opnd::Val(o)), 0i32, 0, f4, MemTy::B128, false, CachePolicy::NONE);
             }
         });
