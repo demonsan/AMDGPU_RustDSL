@@ -1693,6 +1693,17 @@ impl<'a> An<'a> {
                 if spaced && kf == Poly::int(1) {
                     sized.push((kf.clone(), span.clone()));
                 }
+                // x steps by the gcd g of its (constant integer) atom coefficients when every store holds the same x constant: the digit is
+                // (k g) over span / g (e.g. a lane's first feature 8 tid + 2048 x below dim: stride 8)
+                let same_c = picks.iter().enumerate().all(|(si, p)| caps_all[si][*p].0 .1 == caps_all[0][picks[0]].0 .1);
+                let g = latoms.values().try_fold(0i128, |acc, c| c.as_const().filter(|q| q.d == 1 && q.n > 0).map(|q| gcd(acc, q.n)));
+                let (kf, span) = match g {
+                    Some(g) if g > 1 && same_c => match kf.mul(&Poly::int(g)) {
+                        Some(k2) => (k2, span.scale(Q::new(1, g))),
+                        None => (kf, span),
+                    },
+                    _ => (kf, span),
+                };
                 digits.push((kf, span));
             }
         }
