@@ -5,6 +5,23 @@ measured win:
 - `tools/perf_ab.sh` over every kernel family, same commit on both sides, the new side emitting with the token;
 - the md5 manifest updated, the full test gate, and port_gate.
 
+## Outcome of the lowering round (2026-11-13 / 14)
+
+| Item | Result | Numbers |
+|---|---|---|
+| (1) uniform values in SGPRs: `scalarize`, `scalarize2`, `waveuni`, `sgpr`, `sgpr2` | **default** (SGPR fallback; `AMDC_NO_SCALAR_DEFAULT`) | family geomeans: fmha_bwd 1.040, mxfp8 1.035, membound 1.029, fp8pt 1.023, conv 1.021, the rest 0.995 - 1.004 (full perf_ab, 397 cases); port_gate vs128 per-CU 1.017x vendor |
+| `salu32` | not default | decode16 -2 ... -3 % |
+| (5) `imm` | opt-in, neutral | families 0.99 - 1.01 after the cmpfold fix (the topk_per_row -30 % was a miscompile, below) |
+| `cmpneg` | opt-in, neutral | 4 kernels change, 0.99 - 1.03 (noise) |
+| `movb64` | not measured as a default | the LLVM tail row (`VZeroSub2`) exists |
+| (4) `jthread` / `coldlayout`, (6) `m0reuse` | evaluated per family by the scheduler work | see its report |
+
+Soundness findings of the round, all fixed with regression tests ([`current-status.md`](current-status.md) section 1.0a):
+- the cmpfold shape-only fold (below);
+- the causal_conv1d_fwd cross-workgroup state race. It was Python-reachable, in both the grid and `_sched` variants. `GV-GLB-RW` is now an error, certificates count untracked accesses, and reachable kernels may keep untracked accesses only via the reasoned `ALLOW_UNTRACKED` list in `crates/amdgpu-kernels/tests/verify_reachable.rs`;
+- the LLVM tail's kernarg metadata;
+- the peephole audit.
+
 ## Experiment switches
 
 | Switch | Effect |

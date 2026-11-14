@@ -42,6 +42,53 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - 严格 GPU 语义证书（Main `a65de21a`）：`--shipped` **21 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **1 / 19 / 0**（v11.1 后 amdgpu-sym 非负性检验证明了原先 2 个信任假设）；`mlp_fp8_ws_fused` **0 / 9 / 0**；融合 decode `pa_decode16_bf16_hd128_p16_f` **2 / 18 / 0**（与 v9.2 相同）。
   信任清单与每一项的去留见 [`trust-inventory.md`](trust-inventory.md)。
 
+### 1.0a v12 本轮（2026-11-13 / 14）：1:1 厂商复刻、lowering 默认值、两处健全性修复、编译时间
+
+Main `3d064d0c`：`cargo test` 163 个测试目标 / 650 项全绿，`run_all.sh` 63 / 63，所有 golden（asm / `.co` / 证书 md5、added_table）0 差异；出厂证书打印 “0 untracked”。
+
+**1:1 厂商 MXFP8 FMHA 复刻（[`fmha-replica.md`](fmha-replica.md) §6，[`exact-mode.md`](exact-mode.md) §9）**
+- **指令序列**：9189 条中 9188 条按序相同。其余差异都有名有因：62 处等待 / nop，1 个省掉的 fall-through 分支，2 个 endpgm 后的填充。
+- **硬件**：全部输出与厂商逐位相同；同轮性能 1.001–1.003×。
+- **证明**：
+  - 在“1 个可信假设 + 31 个主机合同”之下 0 unproven，含竞争自由；
+  - LDS：1167 / 1167 次访问在 tile 内，120 880 次读事件逐一对照生产者检查，3 槽环的周期得到验证；
+  - global：18 / 18 个写在 workgroup 之间不相交。
+
+**lowering 默认值（[`lowering-defaults.md`](lowering-defaults.md)，每项都是 perf_ab 全族 + md5 + port_gate）**
+
+| 项 | 结论 | 数字 |
+|---|---|---|
+| (1) 均匀值留在标量里：`scalarize`, `scalarize2`, `waveuni`, `sgpr`, `sgpr2` | **默认开启**（SGPR 不够时回退，`AMDC_NO_SCALAR_DEFAULT`） | 全族几何平均：fmha_bwd 1.040, fmha_mxfp8 1.035, membound 1.029, fp8pt 1.023, conv 1.021，其余 0.995–1.004；port_gate：vs128 每 CU 1.017× 厂商（原记录 0.971×） |
+| `salu32`（无符号比较走 SCC） | 不进默认 | decode16 −2 … −3 % |
+| (5) `imm`（内联常量） | opt-in，中性 | 族几何平均 0.99–1.01；topk_per_row 的 −30 % 其实是错误结果，见下面的健全性修复 |
+| `cmpneg`（否定比较） | opt-in，中性 | 只改变 4 个 kernel，0.99–1.03（噪声内） |
+| `movb64` | 未作为默认测量 | LLVM tail 已有 `VZeroSub2` 行 |
+| (4) `jthread` / `coldlayout`、(6) `m0reuse` | 由 sched 按族评估 | 见其报告 |
+
+实验开关：`AMDC_LOWER_ADD`（给每个 kernel 加 lowering token），配合 perf_ab 的 `--new-emit-env`；静态筛查用 `tools/lower_screen.sh`。
+
+**健全性发现（都已修复，各带回归测试）**
+- **cmpfold 按形状匹配**：0/1 物化的识别只看 `v_cndmask t, 0, x` 的形状。`imm` 下“假分支为 0 的 select”会被误折叠回它的比较（`topk_per_row` 全部行错）。
+  - 现在只作用于 `cmp_i1` 登记的物化（`MAT01`）。
+  - 出厂 kernel 未受影响：修复后 md5 不变。
+  - 回归：`tests/cmpfold_select_zero.rs`（对修复前的 lowering 失败）。
+  - perf_ab 遇到主机的 `XYZ_FAIL` 即判失败，各族的 ok 标记改为主机的 `XYZ_OK` 记号。
+- **`causal_conv1d_fwd` 跨 workgroup 竞争**（Python 可达，grid 与 `_sched` 两个变体都有）：
+  - 原因：每个 chunk 都读 state 槽，序列的最后一个 chunk（另一个 workgroup）写同一个槽，所以 chunk 0 可能读到最终状态；硬件上 8/20 次出错。
+  - 修复：沿用 vLLM / aiter 的方案，只由 chunk 0 读写该槽；修复后 0/30。
+- **验证器的缺口与补强**：
+  - 原先只证明写与写不相交，跨 workgroup 的读写（RAW / WAR）没有检查；而且这些写本来就记为 “untracked”，却不进入 “0 unproven”。
+  - 现在 `GV-GLB-RW` 是 **Error**：被写的参数，其读与写合起来必须跨 workgroup 不相交。已验证的 last-arriver 赢家读视为有序。
+  - 证书行加上 “N untracked”。可达 kernel 的 untracked 访问只能经 `verify_reachable.rs` 的 `ALLOW_UNTRACKED`（带理由的白名单）。
+  - 变异测试 `tests/conv_state_race.rs`：修复前的协议被标记，出厂版本得到证明。
+  - `causal_conv1d_update` 也得到证明。依据的主机合同（state 索引互不相同）计入信任账本。
+- **LLVM tail 的 kernarg 元数据**（backend）：auto / LLVM 路径的 `.args` 现在声明全部 kernarg。此前 `causal_conv1d_fwd_*_sched` 在 auto 后端下每次都非法访存。
+- **窥孔审计**（backend）：逐个审计 lowering / MIR 窥孔是否只按形状匹配。backend 把 split-K、bwd_dq 等的不相交性证明补齐，并从白名单移除对应条目。
+
+**编译时间（[`compile-time.md`](compile-time.md)）**
+- 240 个 kernel（verify 开、own 后端）：单线程 36.2 s → 3.6 s，8 线程 6.0 s → 0.49 s。
+- 每一步 asm 逐字节不变。手段包括：验证器、梯度提示（ladder hints）、分配器与调度器数据结构、扁平的 `check_reaching`、进程内汇编器、`amdc compile-batch`。
+
 ### 1.0 v11 本轮（2026-11-11 / 12）：四层 + 两个 Weaver
 
 **结构（已建成，[`two-weavers-plan.md`](two-weavers-plan.md)，接口设计 [`two-weavers.md`](two-weavers.md)，v10 分层 [`refactor-4layer-plan.md`](refactor-4layer-plan.md)）**
