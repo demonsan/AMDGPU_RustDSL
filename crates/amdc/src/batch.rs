@@ -45,7 +45,7 @@ struct Row {
     ra_ms: f64,
 }
 
-/// `amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time]`
+/// `amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time] [--asm-dir DIR]`
 pub fn compile_batch(args: &[String]) -> ExitCode {
     let opt = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let jobs = opt("--jobs").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
@@ -53,6 +53,8 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
     let verify = !args.iter().any(|a| a == "--no-verify");
     let assemble = args.iter().any(|a| a == "--assemble");
     let show_phases = args.iter().any(|a| a == "--time");
+    let inproc = args.iter().any(|a| a == "--assemble-inproc");
+    let asm_dir = opt("--asm-dir");
     let mut names: Vec<String> = match opt("--names") {
         Some(l) => l.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
         None => amdgpu_kernels::reachable::manifest_names().into_iter().collect(),
@@ -86,6 +88,17 @@ pub fn compile_batch(args: &[String]) -> ExitCode {
                     let compile = t.elapsed();
                     let (ok, lines, asm_t) = match &res {
                         Ok(c) => {
+                            if let Some(d) = &asm_dir {
+                                let _ = std::fs::write(format!("{d}/{k}.s"), &c.asm);
+                            }
+                            if inproc {
+                                let t = Instant::now();
+                                let r = amdgpu_target::gfx950_co::assemble(&c.asm);
+                                timing::add("assemble-inproc", t.elapsed());
+                                if r.is_err() {
+                                    eprintln!("error: {k}: in-process assemble failed");
+                                }
+                            }
                             let a = if assemble {
                                 let d = assemble_co(&c.asm, &format!("{i}")).ok();
                                 if let Some(d) = d {
@@ -216,5 +229,152 @@ pub fn ladder_hints(args: &[String]) -> ExitCode {
             print!("{src}");
             ExitCode::SUCCESS
         }
+    }
+}
+
+/// `amdc co-check <oracle.tsv>`: every line "asm<TAB>hex bytes" (llvm-mc's encoding) against the in-process encoder; prints the mismatches and errors grouped by mnemonic.
+pub fn co_check(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(1) else {
+        eprintln!("usage: amdc co-check <oracle.tsv>");
+        return ExitCode::from(2);
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("cannot read {path}");
+        return ExitCode::from(2);
+    };
+    let (mut total, mut ok) = (0usize, 0usize);
+    let mut bad: std::collections::BTreeMap<String, (usize, Vec<String>)> = std::collections::BTreeMap::new();
+    let no_label = |_: &str| None;
+    for l in text.lines() {
+        let Some((asm, hex)) = l.split_once('\t') else { continue };
+        total += 1;
+        let want: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
+        let mn = asm.split_whitespace().next().unwrap_or("").to_string();
+        match amdgpu_target::gfx950_co::enc::encode_line(asm, 0, &no_label) {
+            Ok(got) if got == want => ok += 1,
+            Ok(got) => {
+                let e = bad.entry(mn).or_default();
+                e.0 += 1;
+                if e.1.len() < 3 {
+                    let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                    e.1.push(format!("{asm}\n      want {}\n      got  {}", h(&want), h(&got)));
+                }
+            }
+            Err(msg) => {
+                let e = bad.entry(mn).or_default();
+                e.0 += 1;
+                if e.1.len() < 3 {
+                    e.1.push(format!("{asm}\n      error: {msg}"));
+                }
+            }
+        }
+    }
+    println!("co-check: {ok} of {total} lines encode identically; {} mnemonics with differences", bad.len());
+    let limit = args.iter().position(|a| a == "--show").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).unwrap_or(40);
+    for (mn, (n, ex)) in bad.iter().take(limit) {
+        println!("{mn}: {n} lines");
+        for e in ex.iter().take(2) {
+            println!("    {e}");
+        }
+    }
+    if ok == total {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// The code object clang + lld produce for `asm` (the cross-check / fallback path).
+pub fn clang_co(asm: &str, tag: &str) -> Result<Vec<u8>, String> {
+    let dir = std::env::temp_dir();
+    let (s, co) = (dir.join(format!("amdc-{}-{tag}.s", std::process::id())), dir.join(format!("amdc-{}-{tag}.co", std::process::id())));
+    std::fs::write(&s, asm).map_err(|e| format!("write {}: {e}", s.display()))?;
+    let clang = std::env::var("AMD_LLVM_BIN").ok().filter(|v| !v.is_empty()).map(|d| format!("{d}/clang")).unwrap_or_else(|| "clang".into());
+    let out = std::process::Command::new(&clang)
+        .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx950", "-mcode-object-version=6", "-o"])
+        .arg(&co)
+        .arg(&s)
+        .output()
+        .map_err(|e| format!("cannot run {clang}: {e}"))?;
+    let bytes = std::fs::read(&co);
+    let _ = std::fs::remove_file(&s);
+    let _ = std::fs::remove_file(&co);
+    if !out.status.success() {
+        return Err(format!("{clang}: {}", String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>()));
+    }
+    bytes.map_err(|e| e.to_string())
+}
+
+/// `amdc assemble-co <file.s> --out <file.co>`
+pub fn assemble_co_cmd(args: &[String]) -> ExitCode {
+    let (Some(src), Some(out)) = (args.get(1), args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone())) else {
+        eprintln!("usage: amdc assemble-co <file.s> --out <file.co>");
+        return ExitCode::from(2);
+    };
+    let Ok(text) = std::fs::read_to_string(src) else {
+        eprintln!("cannot read {src}");
+        return ExitCode::from(2);
+    };
+    match amdgpu_target::gfx950_co::assemble(&text) {
+        Ok(b) => match std::fs::write(&out, b) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("cannot write {out}: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("assemble-co: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `amdc co-verify <dir> [--show N]`: for every `*.s` in the directory, the in-process code object against clang's.
+pub fn co_verify(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(1) else {
+        eprintln!("usage: amdc co-verify <dir>");
+        return ExitCode::from(2);
+    };
+    let mut files: Vec<_> = std::fs::read_dir(dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "s")).collect()).unwrap_or_default();
+    files.sort();
+    let show = args.iter().position(|a| a == "--show").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).unwrap_or(15);
+    let jobs = args.windows(2).find(|w| w[0] == "--jobs").and_then(|w| w[1].parse::<usize>().ok()).unwrap_or(8).max(1);
+    let next = AtomicUsize::new(0);
+    let report: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let same = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..jobs {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(f) = files.get(i) else { break };
+                let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let asm = std::fs::read_to_string(f).unwrap_or_default();
+                let msg = match (amdgpu_target::gfx950_co::assemble(&asm), clang_co(&asm, &format!("v{i}"))) {
+                    (Ok(a), Ok(b)) if a == b => {
+                        same.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    (Ok(a), Ok(b)) => {
+                        let at = a.iter().zip(&b).position(|(x, y)| x != y);
+                        format!("differs: ours {} bytes, clang {} bytes, first difference at {:?}", a.len(), b.len(), at)
+                    }
+                    (Err(e), _) => format!("ours failed: {e}"),
+                    (_, Err(e)) => format!("clang failed: {e}"),
+                };
+                report.lock().unwrap().push((name, msg));
+            });
+        }
+    });
+    let mut r = report.into_inner().unwrap();
+    r.sort();
+    println!("co-verify: {} of {} code objects are byte-identical to clang's", same.load(Ordering::Relaxed), files.len());
+    for (n, m) in r.iter().take(show) {
+        println!("  {n}: {m}");
+    }
+    if r.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }

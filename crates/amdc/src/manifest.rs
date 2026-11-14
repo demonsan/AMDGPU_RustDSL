@@ -53,6 +53,36 @@ fn compute_unchecked(jobs: usize) -> Vec<(String, String)> {
     v
 }
 
+/// (name, md5 of the in-process code object or "ERROR" / "MISSING") for every manifest kernel: the clang-free regression oracle of the assembler (`tests/golden/co_md5_manifest.tsv`).
+pub fn compute_co(jobs: usize) -> Result<Vec<(String, String)>, String> {
+    let ov = env_overrides();
+    if !ov.is_empty() {
+        return Err(format!("the manifest needs a scrubbed environment; unset: {}", ov.join(" ")));
+    }
+    let names: Vec<String> = amdgpu_kernels::reachable::manifest_names().into_iter().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::with_capacity(names.len()));
+    std::thread::scope(|s| {
+        for _ in 0..jobs.max(1) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(k) = names.get(i) else { break };
+                let v = match amdgpu_kernels::kernel_by_name(k) {
+                    None => "MISSING".to_string(),
+                    Some(f) => match compile_with(&f, &OwnTail).and_then(|c| amdgpu_target::gfx950_co::assemble(&c.asm)) {
+                        Ok(co) => crate::md5::hex(&co),
+                        Err(_) => "ERROR".to_string(),
+                    },
+                };
+                out.lock().unwrap().push((k.clone(), v));
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap();
+    v.sort();
+    Ok(v)
+}
+
 /// The manifest text.
 pub fn render(entries: &[(String, String)]) -> String {
     let mut s = String::from("# golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md\n");
