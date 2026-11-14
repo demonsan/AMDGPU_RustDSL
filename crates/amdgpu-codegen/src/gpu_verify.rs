@@ -2399,6 +2399,14 @@ impl<'a> An<'a> {
                     if !x.nonneg(cx) {
                         return AV::Int(Itv::top());
                     }
+                    // an exact multiple of 2^k (a point whose every coefficient is): the exact quotient (e.g. N >> 7 with N = 128 NT is NT)
+                    if let Some(p) = x.lo.iter().find(|l| x.hi.contains(l)) {
+                        let d = 1i128 << k.n;
+                        if !p.0.is_empty() && p.0.values().all(|q| q.d == 1 && q.n % d == 0) {
+                            let e = p.scale(Q::new(1, d));
+                            return AV::Int(Itv::range(e.clone(), e));
+                        }
+                    }
                     let div = Q::new(1, 1i128 << k.n);
                     let mut lo: Vec<Poly> = vec![Poly::int(0)];
                     // (values are integers: a constant lower bound rounds up)
