@@ -58,7 +58,8 @@ for k in kernels:
     if nm is None:
         print('skip', k, '(no specializable i32 argument)')
         continue
-    specs += [(k, {nm: 4 * (i + 1)}) for i in range(a.n)]
+    step = 64 if 'gemm' in k else 4 if 'rmsnorm' in k else 1  # the kernels' contracts: m a multiple of the tile rows
+    specs += [(k, {nm: step * (i + 1)}) for i in range(a.n)]
 workers = [int(x) for x in a.workers.split(',')]
 print(f'{len(specs)} shapes ({len(kernels)} kernels x {a.n}), amdc = {amdc}, cpu = {os.cpu_count()}\n')
 
