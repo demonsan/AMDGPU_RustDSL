@@ -163,7 +163,7 @@ pub fn compile_request(r: &Req) -> Resp {
         let ml = ledger_of(&mir);
         let total: usize = ir_ledger.iter().sum::<usize>() + ml.iter().sum::<usize>();
         let cn = &f.contract;
-        let contracts = cn.extents.len() + cn.ka_ranges.len() + cn.grid_defs.len() + cn.ka_defs.len() + cn.ka_sets.len() + cn.sym_ranges.len();
+        let contracts = cn.extents.len() + cn.ka_ranges.len() + cn.grid_defs.len() + cn.ka_defs.len() + cn.ka_sets.len() + cn.ka_pow2.len() + cn.sym_ranges.len();
         msg.push_str(&format!("verified {}: certificate: {total} trusted assumes, {contracts} trusted contracts, {} unproven{}{}\n", f.name, errs.len(), if cached.is_some() { " (IR certificate from the cache)" } else { "" }, if from_template { " (assembly from a verified shape template)" } else { "" }));
         if !errs.is_empty() {
             for e in &errs {

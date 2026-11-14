@@ -747,7 +747,18 @@ impl<'a> An<'a> {
                             let f = Q::int(1i128 << s.n);
                             Some((x.into_iter().map(|(k, p)| (k, p.scale(f))).collect(), c.scale(f)))
                         }
-                        _ => atom(self.atom_key(*v), *o),
+                        // a shift by a `ka_pow2` kernarg: the multiplication by its power of two
+                        _ => match self.pow2_of(b) {
+                            Some(pw) => {
+                                let (x, c) = self.slin(a, depth + 1)?;
+                                let mut m = BTreeMap::new();
+                                for (k, p) in x {
+                                    m.insert(k, p.mul(&pw)?);
+                                }
+                                Some((m, c.mul(&pw)?))
+                            }
+                            None => atom(self.atom_key(*v), *o),
+                        },
                     },
                     // a masked store: the sentinel arm (an offset >= 2^30, dropped by the descriptor's range check, which the bounds proof
                     // establishes) writes nothing - only the live arm matters
@@ -905,6 +916,40 @@ impl<'a> An<'a> {
             },
             _ => 0,
         }
+    }
+
+    /// `2^b` when the shift amount b is a kernarg the contract relates by `ka_pow2` (1 << ka == expr): that expression.
+    fn pow2_of(&self, b: &Opnd) -> Option<Poly> {
+        if self.f.contract.ka_pow2.is_empty() {
+            return None;
+        }
+        let pb = self.point_of(b)?;
+        self.f.contract.ka_pow2.iter().find_map(|(off, e)| if Ext::Ka(*off).to_poly(&self.cx).as_ref() == Some(&pb) { e.to_poly(&self.cx) } else { None })
+    }
+
+    /// The exact quotient h / d for a one-term divisor d whose monomial divides every term of h (None otherwise).
+    fn div_mono(h: &Poly, d: &Poly) -> Option<Poly> {
+        if d.0.len() != 1 {
+            return None;
+        }
+        let (dm, dq) = d.0.iter().next()?;
+        if dq.is_zero() {
+            return None;
+        }
+        let mut out = Poly::int(0);
+        for (m, q) in &h.0 {
+            let mut rest = m.clone();
+            for s in dm {
+                let i = rest.iter().position(|x| x == s)?;
+                rest.remove(i);
+            }
+            let mut term = Poly::konst(Q::new(q.n * dq.d, q.d * dq.n));
+            for s in &rest {
+                term = term.mul(&Poly::sym(s.clone()))?;
+            }
+            out = out.add(&term);
+        }
+        Some(out)
     }
 
     /// The exact (point) value of a uniform operand, if its interval is one polynomial.
@@ -1489,6 +1534,38 @@ impl<'a> An<'a> {
         // composite digits (k = 1) whose atoms are spaced by at least the access size: each footprint [x, x + size) is its own
         let mut sized: Vec<(Poly, Poly)> = Vec::new();
         let mut covered: std::collections::BTreeSet<(bool, u64)> = Default::default();
+        // 2c. `ka_pow2` (1 << s == P): when both x and q = x >> s are digits of every store, x = P q + r with r = x mod P in [0, P - 1] (x >= 0):
+        // x's coefficient c moves to q (+ c P) and to a new digit r; x itself is then covered by the pair (a workgroup axis stays a digit)
+        if !self.f.contract.ka_pow2.is_empty() {
+            let pairs: Vec<((bool, u64), (bool, u64), Poly)> = atoms
+                .keys()
+                .filter_map(|qk| {
+                    let insts = self.atom_inst.borrow().get(qk).cloned()?;
+                    let Some(Opnd::Val(v)) = insts.first() else { return None };
+                    let Some(Op::LshrI32(Opnd::Val(xv), s)) = self.defs.get(v) else { return None };
+                    let pw = self.pow2_of(s)?;
+                    if !self.int_of(&Opnd::Val(*xv)).nonneg(cx) {
+                        return None;
+                    }
+                    Some((*qk, self.atom_key(*xv), pw))
+                })
+                .collect();
+            for (qk, xk, pw) in pairs {
+                let both = ss.iter().all(|s| s.1.as_ref().map_or(false, |(a, _)| a.contains_key(&qk) && a.contains_key(&xk)));
+                let (Some(c), true) = (atoms.get(&xk).cloned(), both) else { continue };
+                let Some(cp) = c.mul(&pw) else { continue };
+                atoms.remove(&xk);
+                let q = atoms[&qk].add(&cp);
+                atoms.insert(qk, q);
+                let rk = (false, qk.1 ^ 0x9e37_79b9_7f4a_7c15);
+                atoms.insert(rk, c);
+                ranges.insert(rk, (Poly::int(0), pw.sub(&Poly::int(1))));
+                covered.insert(xk);
+                if dbg_pow2() {
+                    eprintln!("gw:   pow2 split of {:x}: q {:x}, r {:x} in [0, {} - 1]", xk.1, qk.1, rk.1, pw.show());
+                }
+            }
+        }
         let mut caps_all = self.group_caps.borrow().get(&ss[0].0).cloned().unwrap_or_default();
         // (a mirrored digit in a cap's x too: cl z = -cl z' + cl (l + h))
         if !mirrored.is_empty() {
@@ -2426,7 +2503,10 @@ impl<'a> An<'a> {
             Op::MulI32(a, b) => AV::Int(self.int_of(a).mul(&self.int_of(b), cx)),
             Op::ShlI32(a, b) => match self.int_of(b).point_const() {
                 Some(k) if k.d == 1 && (0..31).contains(&k.n) => AV::Int(self.int_of(a).scale(Q::int(1i128 << k.n))),
-                _ => AV::Int(Itv::top()),
+                _ => match self.pow2_of(b) {
+                    Some(pw) => AV::Int(self.int_of(a).mul(&Itv::range(pw.clone(), pw), cx)),
+                    None => AV::Int(Itv::top()),
+                },
             },
             Op::LshrI32(a, b) => match self.int_of(b).point_const() {
                 Some(k) if k.d == 1 && (0..31).contains(&k.n) => {
@@ -2472,7 +2552,21 @@ impl<'a> An<'a> {
                     }));
                     AV::Int(Itv { lo: cap(lo), hi: cap(x.hi.iter().map(|p| { let q = p.scale(div); match q.floor_const() { Some(k) => Poly::int(k), None => q } }).collect()) })
                 }
-                _ => AV::Int(Itv::top()),
+                _ => match self.pow2_of(b) {
+                    // x >> s with 1 << s == P: [0, (hi + 1) / P - 1] when hi + 1 is an exact multiple of P (e.g. z < BB SPL gives z >> LS < BB)
+                    Some(pw) => {
+                        let x = self.int_of(a);
+                        if !x.nonneg(cx) {
+                            return AV::Int(Itv::top());
+                        }
+                        let his: Vec<Poly> = x.hi.iter().filter_map(|h| Self::div_mono(&h.add(&Poly::int(1)), &pw)).map(|q| q.sub(&Poly::int(1))).collect();
+                        match his.first() {
+                            Some(h) => AV::Int(Itv::range(Poly::int(0), h.clone())),
+                            None => AV::Int(Itv::top()),
+                        }
+                    }
+                    None => AV::Int(Itv::top()),
+                },
             },
             Op::AndI32(a, b) => {
                 let (x, y) = (self.int_of(a), self.int_of(b));
@@ -4724,4 +4818,8 @@ fn subst_sym(p: &Poly, s: &Sym, q: &Poly) -> Option<Poly> {
         out = out.add(&term);
     }
     Some(out)
+}
+
+fn dbg_pow2() -> bool {
+    std::env::var("AMDC_GW_DEBUG").map_or(false, |v| !v.is_empty())
 }

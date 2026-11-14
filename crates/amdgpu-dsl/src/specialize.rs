@@ -241,6 +241,17 @@ pub fn specialize(f: &Function, binds: &[(String, String)]) -> Result<Function, 
     for (_, e) in c.ka_defs.iter_mut() {
         *e = subst_all(e, &ka, &syms);
     }
+    // a bound shift amount fixes its power of two: `1 << ka == sym` binds the symbol
+    for (o, v) in &ka {
+        for (po, e) in c.ka_pow2.clone() {
+            if po == *o && (0..31).contains(v) {
+                if let Ext::Sym(s) = &e {
+                    c.sym_ranges.retain(|(n, _, _)| n != s);
+                    c.sym_ranges.push((s.clone(), 1i64 << *v, 1i64 << *v));
+                }
+            }
+        }
+    }
     for (o, v) in &ka {
         c.ka_ranges.retain(|(x, _, _)| x != o);
         c.ka_sets.retain(|(x, _)| x != o);

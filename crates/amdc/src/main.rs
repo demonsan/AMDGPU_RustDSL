@@ -134,7 +134,7 @@ fn certify_specialized(f: &amdgpu_dsl::Function) -> Result<(), ExitCode> {
         Ok(r) => {
             let l = r.ledger();
             let c = &f.contract;
-            let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+            let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.ka_pow2.len() + c.sym_ranges.len();
             let errs = r.errors();
             eprintln!("verified {}: certificate: {} trusted assumes, {contracts} trusted contracts, {} unproven", f.name, l.total(), errs.len());
             if errs.is_empty() {
@@ -628,7 +628,7 @@ fn main() -> ExitCode {
                         let l = r.ledger();
                         let trusted = l.total();
                         let c = &f.contract;
-                        let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+                        let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.ka_pow2.len() + c.sym_ranges.len();
                         // untracked: accesses that are bounds-checked but NOT race-checked (part of the summary: they can't hide behind "0 unproven")
                         let untracked: usize = r.unchecked.values().sum();
                         println!("   certificate: {trusted} trusted assumes ({} assume_trusted, {} tile_trust_periodic, {} region_trust, {} asm_opaque, {} timing), {contracts} trusted contracts, {errs} unproven, {untracked} untracked", l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust);
