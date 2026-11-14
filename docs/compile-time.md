@@ -98,22 +98,25 @@ Shape buckets: the compile result is a pure function of (kernel, specialization)
 
 ## 8. End to end: a Python `get_kernel` call to a loaded kernel (`tools/jit_bench.py`)
 
-Measured on node 53 / GPU 1 (HIP module load included), release `amdc`, the Python JIT with the in-process assembler. Each kernel is specialized on its first specializable 32-bit kernarg, 32 distinct shapes per kernel; "cold" = empty disk cache.
-Three changes made the cold path one process, one compile and concurrent: `amdc emit --co --info` (the jit-info JSON from the same compile; the JIT ran `emit` and `jit-info` as two processes, i.e. two compiles), one lock per cache key instead of one global lock around the compile, and the specialization certificate on its own thread.
+Measured on node 53 / GPU 1 (HIP module load included), release `amdc`, the Python JIT with the in-process assembler; 4 kernels x 32 distinct specializations (the eltwise kernel, `rmsnorm_quant_fp8_n4096`, the small GEMM, `pa_decode16`), "cold" = empty disk cache.
+The node is shared, so a single run varies by 30 - 50 %; the table is the **median of 5 runs**.
 
-| kernel | cold (ms, median / p10 / p90) | disk-warm (ms) |
-|---|--:|--:|
-| `silu_mul_bf16_d4096` (eltwise) | **4.1** / 3.4 / 5.1 | 0.43 |
-| `rmsnorm_quant_fp8_n4096` | 18.6 / 12.7 / 22.6 | 0.45 |
-| `pa_decode16_bf16_hd128_p16_f` | 22.4 / 21.1 / 30.2 | 0.54 |
-| `gemm_a8w8_rowcol_fp8_64` (small GEMM) | 40.5 / 37.2 / 46.0 | 0.53 |
+What the cold path now is (each item was measured; the first two were in `sched-jit`):
+* **one process, one compile** (`amdc emit --co --info`; the JIT used to run `emit` and `jit-info`, i.e. compile twice), one lock per cache key, the certificate on its own thread;
+* **the certificate** (`certify_specialized`: the IR-level analysis that proves the launch contract for the bound constants) **is never skipped**, but:
+  * it no longer compiles the kernel a second time (it was `gpu_verify::analyse` = compile + `verify_ir` + `verify_mir`; now `verify_ir` runs on the thread, `verify_mir` runs on the MIR of the compile that produces the assembly: the verdict is the same set of findings);
+  * `gpu_protocol::check_pair` (the tile-protocol pair check, 39 % self time of the small GEMM's certificate) was quadratic in the number of events: the reuse-alias scan now looks only at pairs of events whose tiles are related by a declared reuse, the write-write scan at the producers of one (tile, slot), the consumer scan skips a consumer that an index proves clean (anything else takes the full scan, which reports exactly as before), `is_owner` is evaluated once per event, the simulation's maps use the Fx hasher. **Identical verdicts**: `crates/amdgpu-kernels/tests/gpu_protocol_diff.rs` runs the indexed and the reference (quadratic) pair checks on every manifest kernel and compares the rendered findings; the mutation tests (`gpu_tiles`, `gpu_semantics`) pass. Certificate time: small GEMM 47 -> 18 ms, `pa_decode16` 24 -> 17 -> ~9 ms of `verify_ir` on its own thread, `rmsnorm_quant` 10 -> 7 ms, eltwise 1 ms;
+* **a content-addressed certificate cache**: the key is the md5 of the exact specialized IR (`format!("{:?}", Function)`: every field; a test checks the text is deterministic across independent builds and that another shape or kernel gets another key), the cache directory carries the compiler's hash
+  (`<jit cache>/certs/<sha256(amdc)[:24]>`, next to the `.co` cache), so a cached verdict is reused only for a byte-identical IR under the same compiler; only passing verdicts are stored, a damaged or foreign entry is recomputed (`tests/jitc.rs`). The MIR-level check always runs (it needs the compile). `amdc certify-batch FILE` (`kernel<TAB>name=v,..` lines) pre-populates the cache offline: 128 shapes in 0.06 s;
+* **`amdc serve`**: a persistent compile server (std only; stdin / stdout lines, one worker thread per CPU, the very `compile_request` the CLI runs) that the Python JIT uses by default (`AMDGPU_JIT_SERVER=0` goes back to one process per kernel; any server failure falls back to the CLI).
 
-* all 128 shapes cold and sequential: 3.0 s = **23.5 ms per kernel**; disk-warm (new process state, populated cache): **0.50 ms** per kernel; memory-warm: **2.3 us**;
-* cold in parallel (all 128 shapes through `ThreadPoolExecutor`): 1 / 4 / 16 / 32 workers = 20.7 / 5.7 / 1.7 / **1.3 ms per kernel** (wall 2.65 / 0.73 / 0.21 / 0.17 s; 17.8x over sequential);
-* the `amdc` process alone (`emit --co --info`, the eltwise kernel): 2.2 ms wall.
+| configuration (ms per kernel, cold, median of 5 runs) | sequential | 1 worker | 4 workers | 16 workers | 32 workers |
+|---|--:|--:|--:|--:|--:|
+| one `amdc emit` process per kernel | 15.8 | 14.7 | 3.6 | 1.2 | 1.1 |
+| persistent compile server | 15.2 | 17.8 | 4.5 | 1.1 | 0.9 |
+| server + certificates pre-populated (`certify-batch`) | **7.3** | 11.0 | 2.4 | 0.9 | **0.8** |
 
-**Where the cold time goes.** The compile itself is small (eltwise 0.7 ms, rmsnorm 6.4 ms, decode 9 ms, small GEMM 6 ms) and the in-process assemble 0.1 - 1 ms. For a *specialized* kernel the specialization **certificate**
-(`certify_specialized`: the IR-level analysis that proves the launch contract for the bound constants) costs more than the whole compile: 1.0 ms (eltwise), 10 ms (rmsnorm), 24 ms (decode), 47 ms (small GEMM). It already runs on its own thread, so the cold time is
-about max(compile, certificate) + process start + module load. Profile of the small GEMM's certificate: `gpu_protocol::check_pair` (the tile-protocol pair check) is 39 % self time, the rest is the trace enumeration and the contract analysis. The honest end-to-end statement:
-**a cold specialized kernel is 4 - 40 ms from the Python call to a loaded kernel (certificate-bound for everything but the elementwise kernels), a disk-warm one 0.5 ms, a repeated call 2 us; a cold batch of 128 shapes on 32 workers averages 1.3 ms per kernel.**
-To bring the sequential cold number to ~1 ms the certificate has to leave the cold path (cache it per (kernel, shape bucket) offline, or make `check_pair` incremental), and the process start (2 ms) has to be amortized (a persistent compile server or a batch entry point).
+A quiet run of the last row, per kernel (cold sequential, median ms): eltwise 1.2, `rmsnorm_quant` 8.6, small GEMM 8.8, `pa_decode16` 9.3. **Disk-warm** (new process state, populated cache: key + read + `hipModuleLoadData`): **0.5 ms** per kernel (0.3 ms in a quiet run); **memory-warm**: **1.4 us**.
+
+**The honest end-to-end statement:** a cold specialized kernel is **1 - 9 ms** from the Python call to a loaded kernel with the certificates pre-populated (7.3 ms mean over the four kernel classes; the eltwise kernel is at 1.2 ms), about 15 ms when the certificate has to be computed on the spot; a cold batch of 128 shapes over 32 workers is **0.8 ms per kernel** (1.2 k kernels / s). What is left of the cold time is the compile itself (rmsnorm 6 ms, small GEMM 6 ms, decode 9 ms: register allocation, lowering, the schedulers),
+which the shape-bucket specialization of a pre-lowered IR (section 7, item 3) would cut; the certificate is off the cold path for pre-certified shapes and runs concurrently with the compile otherwise.

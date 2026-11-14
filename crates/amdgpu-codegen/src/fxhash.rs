@@ -45,3 +45,7 @@ impl Hasher for Fx {
         self.0
     }
 }
+
+/// `HashMap` / `HashSet` with the Fx hasher (`::default()` constructs them).
+pub type FxMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+pub type FxSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<Fx>>;

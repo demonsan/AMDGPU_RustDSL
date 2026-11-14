@@ -12,7 +12,8 @@
 //!   * concurrent writes of one slot by different waves are only allowed for the same version (cooperative fill);
 //!   * reads must be complete (`wait_lds(0)`) before the next barrier so that the barrier really separates them from the next writer.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::fxhash::{FxMap as HashMap, FxSet as HashSet};
+use std::collections::BTreeSet;
 
 use amdgpu_dsl::{AtomicOp, Function, Op, Opnd, Stmt, ValueId, VarId};
 
@@ -106,8 +107,8 @@ pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
 }
 
 pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
-    let mut tv: HashSet<ValueId> = HashSet::new();
-    let mut tvars: HashSet<VarId> = HashSet::new();
+    let mut tv: HashSet<ValueId> = HashSet::default();
+    let mut tvars: HashSet<VarId> = HashSet::default();
     let tainted = |o: &Opnd, tv: &HashSet<ValueId>, tvars: &HashSet<VarId>| match o {
         Opnd::Val(v) => tv.contains(v),
         Opnd::Var(v) => tvars.contains(v),
@@ -142,7 +143,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
             break;
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for (i, st) in f.stmts().iter().enumerate() {
         if let Stmt::BeginIf { cond } = st {
             if tainted(cond, &tv, &tvars) {
@@ -850,7 +851,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
             }
         }
     }
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for (i, s) in f.stmts().iter().enumerate() {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
             if region_skipped(f, tile) {
@@ -1081,7 +1082,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
             let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
             let ops: Vec<&Opnd> = if private { vec![version] } else { vec![slot, version] };
             for o in ops {
-                let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+                let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::default() };
                 walk(f, o, &mut a);
                 let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
                 m_best = m_best.max(m);
@@ -1097,7 +1098,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
 /// and the version must advance by a constant over `p` iterations.
 fn verify_period_claim(f: &Function, traces: &[&Trace], p: usize) -> Result<(), String> {
     for (role, t) in traces.iter().enumerate() {
-        let mut by_stmt: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::new();
+        let mut by_stmt: HashMap<usize, Vec<(i64, i64, i64)>> = HashMap::default();
         for ev in &t.evs {
             by_stmt.entry(ev.stmt).or_default().push((ev.slot, ev.ver, ev.outer));
         }
@@ -1145,7 +1146,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
@@ -1177,7 +1178,22 @@ fn compatible(a: &Trace, b: &Trace) -> bool {
     a.path.iter().filter(|p| p.2).all(|pa| b.path.iter().filter(|p| p.2 && p.0 == pa.0).all(|pb| pb.1 == pa.1))
 }
 
+thread_local! {
+    static REFERENCE_PAIR_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `g` with the straightforward (quadratic) pair checks of `check_pair` instead of the indexed ones: the reference of the differential test
+/// (`crates/amdgpu-kernels/tests/gpu_protocol_diff.rs`): the two must report the same diagnostics in the same order for every kernel.
+#[doc(hidden)]
+pub fn with_reference_pair_checks<R>(g: impl FnOnce() -> R) -> R {
+    REFERENCE_PAIR_CHECKS.with(|c| c.set(true));
+    let r = g();
+    REFERENCE_PAIR_CHECKS.with(|c| c.set(false));
+    r
+}
+
 fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
+    let reference = REFERENCE_PAIR_CHECKS.with(|c| c.get());
     // OWNER events (lds_owned, every access proven in the issuing thread's own words): never conflict with each other across threads
     let is_owner = |ev: &Ev| f.contract.tiles[ev.tile].owned.is_some() && owned.get(&ev.stmt).copied().unwrap_or(false);
     struct Info {
@@ -1187,6 +1203,8 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         publish: Option<u32>,
         done_ord: u32,
         released: bool,
+        /// `is_owner(&ev)`, evaluated once (it looks the statement up in a map)
+        owner: bool,
     }
     let mut infos: Vec<Info> = Vec::new();
     for (role, t) in traces.iter().enumerate() {
@@ -1196,16 +1214,54 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 continue;
             }
             let ti = &t.infos[k];
-            infos.push(Info { role, ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
+            infos.push(Info { role, owner: is_owner(ev), ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
         }
     }
     // the producers per (tile, slot): every consumer looks up its own slot instead of scanning all events
-    let mut prod_of: HashMap<(usize, i64), Vec<usize>> = HashMap::new();
+    let mut prod_of: HashMap<(usize, i64), Vec<usize>> = HashMap::default();
     for (k, x) in infos.iter().enumerate() {
         if x.ev.produce {
             prod_of.entry((x.ev.tile, x.ev.slot)).or_default().push(k);
         }
     }
+    // the producers of one tile (infos ascending): the own-wave lookup of a private region does not scan every (tile, slot) group
+    let mut prod_by_tile: Vec<Vec<usize>> = vec![Vec::new(); f.contract.tiles.len()];
+    for (k, x) in infos.iter().enumerate() {
+        if x.ev.produce {
+            prod_by_tile[x.ev.tile].push(k);
+        }
+    }
+    // Per (tile, slot) group of producers (infos ascending), the indexes the clean-consumer pre-check uses: by phase with a prefix maximum of the publish phase (None = never), the latest first, and by version.
+    struct Group {
+        by_ord: Vec<usize>,
+        prefmax: Vec<u64>,
+        desc: Vec<usize>,
+        by_ver: HashMap<i64, Vec<usize>>,
+    }
+    let groups: HashMap<(usize, i64), Group> = if reference {
+        HashMap::default()
+    } else {
+        prod_of
+            .iter()
+            .map(|(k, ks)| {
+                let mut by_ord = ks.clone();
+                by_ord.sort_by_key(|&i| (infos[i].ev.ord, i));
+                let mut prefmax = Vec::with_capacity(by_ord.len());
+                let mut m = 0u64;
+                for &i in &by_ord {
+                    m = m.max(infos[i].publish.map_or(u64::MAX, |v| v as u64));
+                    prefmax.push(m);
+                }
+                let mut desc = ks.clone();
+                desc.sort_by_key(|&i| std::cmp::Reverse((infos[i].ev.ord, infos[i].ev.start, i)));
+                let mut by_ver: HashMap<i64, Vec<usize>> = HashMap::default();
+                for &i in ks {
+                    by_ver.entry(infos[i].ev.ver as i64).or_default().push(i);
+                }
+                (*k, Group { by_ord, prefmax, desc, by_ver })
+            })
+            .collect()
+    };
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
     // the location suffixes of the messages, formatted once per pair (not per consumer)
     let wh_priv: [String; 2] = [0, 1].map(|r| format!("(role {r}, {n} iteration(s) simulated)"));
@@ -1215,8 +1271,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         if f.contract.tiles[c.ev.tile].private {
             // own-wave semantics: the wave reads a version it produced AND completed (wait_vm/wait_lds(0)) itself; no other wave is involved, so no barrier is required
             let tname = f.contract.tiles[c.ev.tile].name.clone();
-            let mut own_k: Vec<usize> = prod_of.iter().filter(|((t, _), _)| *t == c.ev.tile).flat_map(|(_, v)| v.iter().copied()).filter(|&k| infos[k].role == c.role).collect();
-            own_k.sort_unstable();
+            let own_k: Vec<usize> = prod_by_tile[c.ev.tile].iter().copied().filter(|&k| infos[k].role == c.role).collect();
             let own: Vec<&Info> = own_k.iter().map(|&k| &infos[k]).collect();
             let completed: Vec<&&Info> = own.iter().filter(|p| p.done.map_or(false, |d| d < c.ev.start)).collect();
             let stmt = c.ev.stmt;
@@ -1239,14 +1294,30 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         let key = (c.ev.tile, c.ev.slot);
         // an owner read of a version this thread wrote itself before (owner write, program order): the thread's own words, no barrier needed
         let slot_prods: &[usize] = prod_of.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-        if is_owner(&c.ev) && slot_prods.iter().map(|&k| &infos[k]).any(|p| is_owner(&p.ev) && p.role == c.role && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
-            for q in slot_prods.iter().map(|&k| &infos[k]).filter(|q| q.ev.ver != c.ev.ver && !is_owner(&q.ev)) {
+        if c.owner && slot_prods.iter().map(|&k| &infos[k]).any(|p| p.owner && p.role == c.role && p.ev.ver == c.ev.ver && p.ev.start < c.ev.start) {
+            for q in slot_prods.iter().map(|&k| &infos[k]).filter(|q| q.ev.ver != c.ev.ver && !q.owner) {
                 let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
                 if overlap {
                     diags.push(("GV-TILE-RACE", Severity::Error, c.ev.stmt, format!("stmt {}: owner read of `{}` (version {}) overlaps the shared write of version {} (stmt {}): no barrier separates them", c.ev.stmt, name(c.ev.tile), c.ev.ver, q.ev.ver, q.ev.stmt)));
                 }
             }
             continue;
+        }
+        // Pre-check (indexed): a consumer that certainly produces no finding below is skipped; anything else takes the full scan, which reports exactly as before. Clean means: no pending-read warning, not a global region,
+        // the latest published version at this phase is the expected one, every producer of the expected version up to this phase is published, and no producer up to the end of the read window is still unpublished at
+        // the start of the read (a superset of the overlap the race scan looks for).
+        if !reference && !c.ev.global {
+            if let Some(g) = groups.get(&key) {
+                let vis = |p: &Info| p.publish.map_or(false, |v| v <= c.ev.ord);
+                let pending_warn = c.done.is_none() && traces[c.role].bar_from.get(c.ev.last + 1).copied().unwrap_or(false);
+                let latest_ok = g.desc.iter().find(|&&k| vis(&infos[k])).map_or(false, |&k| infos[k].ev.ver == c.ev.ver);
+                let same_ver_ok = g.by_ver.get(&(c.ev.ver as i64)).map_or(true, |l| l.iter().all(|&k| { let p = &infos[k]; p.ev.ord > c.ev.ord || (c.owner && p.owner) || vis(p) }));
+                let cnt = g.by_ord.partition_point(|&k| infos[k].ev.ord <= c.done_ord);
+                let no_overlap = cnt == 0 || g.prefmax[cnt - 1] <= c.ev.ord as u64;
+                if !pending_warn && latest_ok && same_ver_ok && no_overlap {
+                    continue;
+                }
+            }
         }
         let prods: Vec<&Info> = slot_prods.iter().map(|&k| &infos[k]).collect();
         let stmt = c.ev.stmt;
@@ -1299,14 +1370,14 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         }
         for p in prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord) {
             // another thread's owner write of this version touches only its own words, which an owner read never reads
-            if is_owner(&c.ev) && is_owner(&p.ev) {
+            if c.owner && p.owner {
                 continue;
             }
             if !visible(p) {
                 diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] version {} at phase {}: the part produced by role {} (stmt {}) is not yet published (publish phase {}) {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.role, p.ev.stmt, p.publish.map_or("never".to_string(), |v| v.to_string()))));
             }
         }
-        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver && !(is_owner(&c.ev) && is_owner(&q.ev))) {
+        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver && !(c.owner && q.owner)) {
             // the read window [c.ord, c.done_ord] against the write window [q.ord, q.publish) of ANY wave (same role included)
             let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
             if overlap {
@@ -1334,8 +1405,35 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     };
     // a write of a shared reuse tile proven to stay in the writer's own slice of the private region `p`
     let own = |w: &Info, p: usize| w.ev.produce && !tiles[w.ev.tile].private && tiles[p].private && own_reuse.get(&(w.ev.stmt, tiles[p].name.clone())).copied().unwrap_or(false);
-    for (i, a) in infos.iter().enumerate() {
-        for b in infos.iter().skip(i + 1) {
+    // The pairs the scan below looks at, in the order of the full scan (i, then j > i): all of them for the reference; otherwise only the pairs of events whose tiles are related by a declared reuse
+    // (every other pair is skipped by `reuse` below).
+    let reuse_pairs: Vec<(usize, usize)> = if reference {
+        (0..infos.len()).flat_map(|i| (i + 1..infos.len()).map(move |j| (i, j))).collect()
+    } else if f.contract.tile_reuses.is_empty() {
+        Vec::new()
+    } else {
+        let mut by_tile: Vec<Vec<usize>> = vec![Vec::new(); tiles.len()];
+        for (k, x) in infos.iter().enumerate() {
+            by_tile[x.ev.tile].push(k);
+        }
+        let mut v: Vec<(usize, usize)> = Vec::new();
+        for x in 0..tiles.len() {
+            for y in x + 1..tiles.len() {
+                if reuse(x, y) {
+                    for &i in &by_tile[x] {
+                        for &j in &by_tile[y] {
+                            v.push((i.min(j), i.max(j)));
+                        }
+                    }
+                }
+            }
+        }
+        v.sort_unstable();
+        v
+    };
+    for (i, j) in reuse_pairs {
+        let (a, b) = (&infos[i], &infos[j]);
+        {
             if a.ev.tile == b.ev.tile || !(a.ev.produce || b.ev.produce) || a.ev.global || b.ev.global || !reuse(a.ev.tile, b.ev.tile) {
                 continue;
             }
@@ -1366,14 +1464,39 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
         }
     }
-    for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
-        for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(is_owner(&a.ev) && is_owner(&b.ev)) {
-                let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
-                if aw.0 < bw.1 && bw.0 < aw.1 {
-                    diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
+    let pp_msg = |a: &Info, b: &Info, aw: (u32, u32), bw: (u32, u32)| format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1);
+    if reference {
+        for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
+            for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
+                if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(a.owner && b.owner) {
+                    let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+                    if aw.0 < bw.1 && bw.0 < aw.1 {
+                        diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, pp_msg(a, b, aw, bw)));
+                    }
                 }
             }
+        }
+    } else {
+        // only the producers of one (tile, slot) can pair up: walk each group (indices ascending) and report in the order of the full scan (i, then j)
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for ks in prod_of.values() {
+            for (x, &i) in ks.iter().enumerate() {
+                for &j in &ks[x + 1..] {
+                    let (a, b) = (&infos[i], &infos[j]);
+                    if a.role != b.role && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private && !(a.owner && b.owner) {
+                        let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+                        if aw.0 < bw.1 && bw.0 < aw.1 {
+                            hits.push((i, j));
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort_unstable();
+        for (i, j) in hits {
+            let (a, b) = (&infos[i], &infos[j]);
+            let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+            diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, pp_msg(a, b, aw, bw)));
         }
     }
 }
@@ -1692,7 +1815,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
             continue;
         }
-        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. } | Op::BufferAtomicRet { op: AtomicOp::AddU32, .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. } | Op::BufferAtomicRet { op: AtomicOp::AddU32, .. }), &mut HashSet::default()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
         if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
             fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
         }
@@ -1706,7 +1829,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         // O4: the produced generation is the block's split id
         if let Some(mi) = prod_marker {
             if let Stmt::TileProduce { version, .. } = &f.stmts()[mi] {
-                let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::new());
+                let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::default());
                 if !from_block {
                     fail(rep, "GV-PROTO-STALE-GEN", format!("O4: the generation of the produce marker (stmt {mi}) is not derived from the workgroup id: the blocks do not agree on which slice (split) each of them owns"));
                 }
@@ -1743,7 +1866,7 @@ fn cone_has_val(f: &Function, o: &Opnd, target: u32) -> bool {
         let Some(op) = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
         op.operands().iter().any(|x| go(f, x, target, seen))
     }
-    go(f, o, target, &mut HashSet::new())
+    go(f, o, target, &mut HashSet::default())
 }
 
 #[cfg(test)]
