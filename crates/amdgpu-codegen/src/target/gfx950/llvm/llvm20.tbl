@@ -8,6 +8,7 @@
 #   MIR text   one MachineInstr; ' ;; ' separates several. Tokens:
 #     {d} {d.K}    destination register (K-th dword)       {sN} {sN.K}  source N (register or immediate)
 #     {i0}         source 0 if immediate else inst.imm      {imm} {imm32}  inst.imm
+#     {dsub2}      the $vgpr pair at dst base + imm
 #     {dsub}       $vgpr (dst base + imm)                   {s0sub}  $vgpr (src0 base + imm)
 #     {pv} {ps}    physical $vgpr<imm> / $sgpr<imm>          {vmcnt} {lgkmcnt}  S_WAITCNT immediates
 #     {t}          branch target block
@@ -601,3 +602,4 @@ SMinI32     | S1 <- S1 S1 | {d} = S_MIN_I32 {s0}, {s1}, implicit-def $scc
 SLoPart     | S1 <- S2 | {d} = S_MOV_B32 {s0.0}
 SMovM0      | <- S1 | $m0 = S_MOV_B32 {s0}
 SAddM0      | <- S1 S1 | $m0 = S_ADD_U32 {s0}, {s1}, implicit-def $scc
+VZeroSub2   | V2 <-    | {dsub2} = V_MOV_B64_e32 0, implicit $exec
