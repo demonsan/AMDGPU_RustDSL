@@ -28,6 +28,7 @@ CACHE_FORMAT = 1
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _lock = threading.Lock()
 _modules = {}  # key -> Kernel
+_key_locks = {}  # key -> Lock: one compile per key, different keys concurrently
 _fast = {}  # (kernel, spec items, backend, arch, cache flag) -> Kernel: the per-call lookup (no stat / hashing once loaded)
 stats = {"memory_hits": 0, "disk_hits": 0, "compiles": 0, "compile_seconds": 0.0}
 
@@ -195,20 +196,23 @@ def _compile_into(d, kernel, spec, amdc, clang, ir_path=None):
     s_path, co_path = os.path.join(d, "kernel.s"), os.path.join(d, "kernel.co")
     # the in-process assembler (amdc emit --co): no clang; AMDGPU_JIT_ASSEMBLER=clang forces the external assembler
     inproc = os.environ.get("AMDGPU_JIT_ASSEMBLER", "inproc") != "clang"
-    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    info = subprocess.Popen([amdc, "jit-info", kernel, "--backend", backend()] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + (["--co", co_path, "--info", os.path.join(d, "info.json")] if inproc else []) + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    info = None if inproc else subprocess.Popen([amdc, "jit-info", kernel, "--backend", backend()] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     eo, ee = emit.communicate()
-    io_, ie = info.communicate()
+    io_, ie = info.communicate() if info else (None, "")
     # exit 3: the in-process assembler cannot encode this kernel (the asm is written): fall back to clang below
     use_clang = (not inproc) or emit.returncode == 3
     if emit.returncode not in (0, 3):
         raise CompileError(f"amdc emit {kernel} {' '.join(sp)} failed (exit {emit.returncode}):\n{ee[-4000:]}{eo[-1000:]}")
-    if info.returncode != 0:
+    if info is not None and info.returncode != 0:
         raise CompileError(f"amdc jit-info {kernel} {' '.join(sp)} failed (exit {info.returncode}):\n{ie[-4000:]}")
     if use_clang:
         if not clang:
             raise CompileError("the in-process assembler cannot encode this kernel and ROCm clang was not found (set AMDGPU_JIT_CLANG)")
         _run([clang, "-x", "assembler", "-target", "amdgcn-amd-amdhsa", f"-mcpu={arch()}", "-mcode-object-version=6", "-o", co_path, s_path], "clang")
+    if io_ is None:  # one-process path: amdc wrote the info next to the code object
+        with open(os.path.join(d, "info.json")) as f:
+            return json.load(f)
     d_info = json.loads(io_)
     with open(os.path.join(d, "info.json"), "w") as f:
         json.dump(d_info, f, indent=1, sort_keys=True)
@@ -242,6 +246,14 @@ def _get_kernel(kernel, spec, ir_path=None):
         if k is not None:
             stats["memory_hits"] += 1
             return k
+        klock = _key_locks.setdefault(key, threading.Lock())
+    # one lock per key: different kernels / shapes compile concurrently (amdc runs as a subprocess), the same key compiles once
+    with klock:
+        with _lock:
+            k = _modules.get(key)
+            if k is not None:
+                stats["memory_hits"] += 1
+                return k
         use_disk = os.environ.get("AMDGPU_JIT_CACHE", "1") != "0"
         root = cache_dir()
         final = os.path.join(root, key)
@@ -267,15 +279,18 @@ def _get_kernel(kernel, spec, ir_path=None):
             except BaseException:
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise
-            stats["compiles"] += 1
-            stats["compile_seconds"] += time.perf_counter() - t0
+            with _lock:
+                stats["compiles"] += 1
+                stats["compile_seconds"] += time.perf_counter() - t0
         with open(os.path.join(final, "info.json")) as f:
             info = KernelInfo(json.load(f))
         with open(os.path.join(final, "kernel.co"), "rb") as f:
             image = f.read()
         if not use_disk:
             shutil.rmtree(final, ignore_errors=True)
-        k = _modules[key] = Kernel(key, info, image, final if use_disk else None)
+        k = Kernel(key, info, image, final if use_disk else None)
+        with _lock:
+            _modules[key] = k
         return k
 
 

@@ -21,7 +21,7 @@ fn usage() {
     eprintln!("  amdc co-check <oracle.tsv>   compare the in-process instruction encoder with llvm-mc (lines \"asm<TAB>hex\")");
     eprintln!("  amdc ladder-hints [--out FILE] [--jobs N]   the retry-ladder rung each kernel compiles at (crates/amdgpu-kernels/src/ladder_hints.rs)");
     eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--assemble-inproc] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--co FILE.co] [--info FILE.json] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
     eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
     eprintln!("  amdc ir-check <file.ir> [--verify]      parse + check an irv1 DSL IR file (docs/ir-text.md); --from-ir <file> works with emit / gpu-verify / jit-info / print-ir / regplan");
@@ -1307,19 +1307,28 @@ fn main() -> ExitCode {
                 Err(c) => return c,
             };
             let build_d = t_build.elapsed();
-            if must_verify(&args, &spec) {
-                if let Err(c) = certify_specialized(&f) {
-                    return c;
-                }
-            }
+            // the specialization certificate (IR-level analysis, 1 - 50 ms: more than the compile itself) runs on its own thread while the kernel compiles; a failure returns before anything is written
+            let cert = if must_verify(&args, &spec) {
+                let fc = f.clone();
+                Some(std::thread::spawn(move || {
+                    let t = std::time::Instant::now();
+                    (certify_specialized(&fc), t.elapsed())
+                }))
+            } else {
+                None
+            };
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
             let mut co_path: Option<String> = None;
+            let mut info_path: Option<String> = None;
             let mut backend_name = env::var("AMDC_BACKEND").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--out" {
                     out_path = args.get(i + 1).cloned();
+                    i += 2;
+                } else if args[i] == "--info" {
+                    info_path = args.get(i + 1).cloned();
                     i += 2;
                 } else if args[i] == "--co" {
                     co_path = args.get(i + 1).cloned();
@@ -1377,6 +1386,16 @@ fn main() -> ExitCode {
             let t_compile = std::time::Instant::now();
             let res = amdgpu_codegen::compile_with(&f, tail);
             let compile_d = t_compile.elapsed();
+            if let Some(h) = cert {
+                match h.join() {
+                    Ok((Err(c), _)) => return c,
+                    Ok((Ok(()), d)) => amdgpu_codegen::timing::add("certify-specialized (own thread)", d),
+                    Err(_) => {
+                        eprintln!("the certificate thread panicked");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             // the in-process assembler (no clang): timed under --time, written under --co
             let inproc = if want_time || co_path.is_some() { res.as_ref().ok().map(|c| (std::time::Instant::now(), amdgpu_target::gfx950_co::assemble(&c.asm))) } else { None };
             if want_time {
@@ -1385,6 +1404,18 @@ fn main() -> ExitCode {
                 }
                 let ents = amdgpu_codegen::timing::take();
                 batch::emit_report(&f.name, build_d, compile_d, res.as_ref().ok().map(|c| c.asm.as_str()), want_assemble, ents);
+            }
+            // --info FILE: the `jit-info` JSON of this very compile (one process and one compile where the JIT used two)
+            if let (Some(ip), Ok(c)) = (&info_path, &res) {
+                let source = match from_ir_path(&args).and_then(|p| fs::read_to_string(p).ok()) {
+                    Some(t) => format!("ir:{}", amdc::jit::fnv_hex(&t)),
+                    None => "registry".to_string(),
+                };
+                let j = amdc::jit::info_json_src(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm), &source);
+                if let Err(e) = fs::write(ip, j) {
+                    eprintln!("cannot write {ip}: {e}");
+                    return ExitCode::from(1);
+                }
             }
             // --co FILE: the code object from the in-process assembler; exit 3 (nothing written) when it cannot encode the kernel, so the caller falls back to the external assembler
             if let (Some(cp), Some((_, r))) = (&co_path, &inproc) {
