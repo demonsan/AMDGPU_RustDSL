@@ -224,3 +224,43 @@ pub fn pad(m: &mut MFunction) -> usize {
     }
     n
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dma(m0: VReg) -> MInst {
+        // buffer_load_dword ... lds: srcs rsrc, voff, soff, M0 source
+        MInst::new(MOp::BufferLoadDwordX1Lds).srcreg(1).srcreg(2).srcreg(3).srcreg(m0)
+    }
+
+    fn func(alias: Vec<(VReg, (VReg, u8))>, insts: Vec<MInst>) -> MFunction {
+        let mut b = amdgpu_dsl::FnBuilder::new("pp_m0", 64);
+        let _ = b.let_(amdgpu_dsl::Op::WorkitemId);
+        let mut m = crate::lower::lower(&b.finish()).expect("template");
+        m.vregs = vec![RClass::S4, RClass::S4, RClass::V1, RClass::S1, RClass::S1, RClass::S1, RClass::S1];
+        m.alias = alias.into_iter().collect();
+        let mut blk = Block::new(0);
+        blk.insts = insts;
+        m.blocks = vec![blk];
+        m
+    }
+
+    #[test]
+    fn two_words_of_one_tuple_are_two_m0_sources() {
+        // r5, r6: words 2 and 3 of the kernarg batch r0 (kabatch): different LDS bases
+        let mut m = func(vec![(5, (0, 2)), (6, (0, 3))], vec![dma(5), dma(6)]);
+        reuse(&mut m);
+        assert!(!m.blocks[0].insts[1].skip_m0);
+        let mut same = func(vec![(5, (0, 2)), (6, (0, 2))], vec![dma(5), dma(6)]);
+        reuse(&mut same);
+        assert!(same.blocks[0].insts[1].skip_m0, "control: the same word is reused");
+    }
+
+    #[test]
+    fn an_m0_write_in_between_resets_the_reuse() {
+        let mut m = func(vec![], vec![dma(4), MInst::new(MOp::SMovM0).srcreg(5), dma(4)]);
+        reuse(&mut m);
+        assert!(!m.blocks[0].insts[2].skip_m0);
+    }
+}

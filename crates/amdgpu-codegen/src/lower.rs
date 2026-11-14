@@ -190,16 +190,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
             }
             // a definition evaluated later (at its reader) must see the same operands and the same EXEC: no set_var of a variable it reads,
             // no EXEC change, no control-flow boundary in between
-            let movable = |k: usize, to: usize, op: &Op| -> bool {
-                let vars: Vec<amdgpu_dsl::VarId> = op.operands().iter().filter_map(|o| if let Opnd::Var(v) = o { Some(*v) } else { None }).collect();
-                to > k
-                    && !stmts[k + 1..to].iter().any(|s| match s {
-                        Stmt::SetVar { var, .. } => vars.contains(var),
-                        Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } => true,
-                        Stmt::BeginIf { .. } | Stmt::Else | Stmt::EndIf | Stmt::BeginLoop { .. } | Stmt::EndLoop | Stmt::BreakIf { .. } | Stmt::DeclareVars { .. } => true,
-                        _ => false,
-                    })
-            };
+            let movable = |k: usize, to: usize, op: &Op| def_movable(&stmts, k, to, op);
             for (k, st) in stmts.iter().enumerate() {
                 let Stmt::Let { dst, op } = st else { continue };
                 let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -670,29 +661,10 @@ impl Lowerer {
         mir.blocks.push(Block::new(0));
 
         let mut defs = HashMap::new();
-        let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
-        let mut count = |o: &Opnd| {
-            if let Opnd::Val(v) = o {
-                *use_counts.entry(*v).or_insert(0) += 1;
-            }
-        };
+        let use_counts = value_use_counts(f);
         for st in f.stmts() {
-            match st {
-                Stmt::Let { dst, op } => {
-                    defs.insert(*dst, op.clone());
-                    for o in op.operands() {
-                        count(&o);
-                    }
-                }
-                // contract markers read nothing at run time
-                Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::Assume { .. } => {}
-                // every other statement: each operand occurrence is a use (asm inputs, variable MFMA / pk-fma / set-lane forms, scope
-                // inits, LDS-DMA addresses, set_m0, ...): the "single use" folds rely on a complete count
-                _ => {
-                    for o in amdgpu_dsl::stmt_operands(st) {
-                        count(&o);
-                    }
-                }
+            if let Stmt::Let { dst, op } = st {
+                defs.insert(*dst, op.clone());
             }
         }
 
@@ -6589,4 +6561,152 @@ fn fuse_minmax3(m: &mut MFunction) {
 fn op_has_effect(op: &Op) -> bool {
     let d = format!("{op:?}");
     ["Load", "Atomic", "Store", "MemTime", "Mfma", "Smfmac", "ReadFirstLane", "Permlane", "Dpp", "Swizzle", "Bpermute"].iter().any(|k| d.starts_with(k))
+}
+
+/// Uses of each value: every operand occurrence of every statement that reads at run time (contract markers read nothing). The "single
+/// use" folds (in-place loop entry, load coalescing, MFMA accumulator reuse, producer retargeting) rely on this count being complete.
+pub(crate) fn value_use_counts(f: &Function) -> HashMap<ValueId, usize> {
+    let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
+    let mut count = |o: &Opnd| {
+        if let Opnd::Val(v) = o {
+            *use_counts.entry(*v).or_insert(0) += 1;
+        }
+    };
+    for st in f.stmts() {
+        match st {
+            Stmt::Let { op, .. } => {
+                for o in op.operands() {
+                    count(&o);
+                }
+            }
+            Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::Assume { .. } => {}
+            _ => {
+                for o in amdgpu_dsl::stmt_operands(st) {
+                    count(&o);
+                }
+            }
+        }
+    }
+    use_counts
+}
+
+/// May the definition at statement `k` (operation `op`) be evaluated at its reader, statement `to`, instead? Only if it would see the same
+/// operands and the same EXEC: no `set_var` of a variable it reads, no EXEC change and no control-flow boundary in between.
+pub(crate) fn def_movable(stmts: &[Stmt], k: usize, to: usize, op: &Op) -> bool {
+    let vars: Vec<amdgpu_dsl::VarId> = op.operands().iter().filter_map(|o| if let Opnd::Var(v) = o { Some(*v) } else { None }).collect();
+    to > k
+        && !stmts[k + 1..to].iter().any(|s| match s {
+            Stmt::SetVar { var, .. } => vars.contains(var),
+            Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } => true,
+            Stmt::BeginIf { .. } | Stmt::Else | Stmt::EndIf | Stmt::BeginLoop { .. } | Stmt::EndLoop | Stmt::BreakIf { .. } | Stmt::DeclareVars { .. } => true,
+            _ => false,
+        })
+}
+
+#[cfg(test)]
+mod peephole_preconditions {
+    //! Adversarial inputs for the peephole folds (the shape of the pattern without its semantics): each fold must check the precondition,
+    //! not just the opcode pattern.
+    use super::*;
+    use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder};
+
+    /// An MFunction template (all fields set) with the given registers and one block of instructions.
+    fn mf(vregs: Vec<RClass>, alias: Vec<(VReg, (VReg, u8))>, insts: Vec<MInst>) -> MFunction {
+        let mut b = FnBuilder::new("pp_template", 64);
+        let _ = b.let_(Op::WorkitemId);
+        let mut m = lower(&b.finish()).expect("template");
+        m.vregs = vregs;
+        m.alias = alias.into_iter().collect();
+        m.loops.clear();
+        let mut blk = Block::new(0);
+        blk.insts = insts;
+        m.blocks = vec![blk];
+        m
+    }
+
+    #[test]
+    fn use_counts_see_every_reading_statement() {
+        // a value read by set_m0, a scope init and a loop init: three uses (the folds that need a single use must not fire)
+        let mut b = FnBuilder::new("pp_counts", 64);
+        let x = b.let_(Op::WorkitemId);
+        b.set_m0(x);
+        let _ = b.declare_vars(&[(DType::I32, Opnd::Val(x))]);
+        let _ = b.begin_loop(&[(DType::I32, Opnd::Val(x))]);
+        let c = b.let_(Op::Cmp { pred: CmpPred::Ge, ty: CmpTy::I32, a: Opnd::Val(x), b: Opnd::I32(1) });
+        b.break_if(c);
+        b.end_loop();
+        let f = b.finish();
+        assert_eq!(value_use_counts(&f).get(&x).copied(), Some(4));
+    }
+
+    #[test]
+    fn a_compare_is_not_moved_across_exec_or_a_variable_write() {
+        let mut b = FnBuilder::new("pp_move", 64);
+        let v = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let c = b.let_(Op::Cmp { pred: CmpPred::Lt, ty: CmpTy::I32, a: Opnd::Var(v[0]), b: Opnd::I32(4) });
+        b.exec_set(0xffff);
+        let n = b.let_(Op::NotI1(Opnd::Val(c)));
+        b.exec_set(u64::MAX);
+        let one = b.let_(Op::AddI32(Opnd::Var(v[0]), Opnd::I32(1)));
+        b.set_var(v[0], one);
+        let n2 = b.let_(Op::NotI1(Opnd::Val(c)));
+        b.break_if(n);
+        b.break_if(n2);
+        b.end_loop();
+        let f = b.finish();
+        let st = f.stmts();
+        let pos = |id: ValueId| st.iter().position(|s| matches!(s, Stmt::Let { dst, .. } if *dst == id)).unwrap();
+        let cop = Op::Cmp { pred: CmpPred::Lt, ty: CmpTy::I32, a: Opnd::Var(v[0]), b: Opnd::I32(4) };
+        // across exec_set: no
+        assert!(!def_movable(&st, pos(c), pos(n), &cop));
+        // across a set_var of an operand (and the exec changes): no
+        assert!(!def_movable(&st, pos(c), pos(n2), &cop));
+        // adjacent: yes
+        assert!(def_movable(&st, pos(c), pos(c) + 1, &cop));
+    }
+
+    #[test]
+    fn med3_is_not_formed_across_a_write_through_a_view() {
+        use MOp::*;
+        // r0: V4 tuple, r1 = its dword 3 (view); t = max(r1, lo); <write dword 3 of r0>; r = min(t, hi)
+        let lo = MInst::new(VMovB32).def(2).imm(0);
+        let hi = MInst::new(VMovB32).def(4).imm(100);
+        let mk = |write: bool| {
+            let mut v = vec![lo.clone(), hi.clone(), MInst::new(VMaxI32).def(3).srcreg(1).srcreg(2)];
+            if write {
+                v.push(MInst::new(VWriteSub).def(0).srcreg(4).imm(3));
+            }
+            v.push(MInst::new(VMinI32).def(5).srcreg(3).srcreg(4));
+            v.push(MInst::new(VMovB32).def(6).srcreg(5));
+            mf(vec![RClass::V4, RClass::V1, RClass::V1, RClass::V1, RClass::V1, RClass::V1, RClass::V1], vec![(1, (0, 3))], v)
+        };
+        let mut ok = mk(false);
+        fuse_minmax3(&mut ok);
+        assert!(ok.blocks[0].insts.iter().any(|i| i.op == VMed3I32), "control: the fold applies without the write");
+        let mut bad = mk(true);
+        fuse_minmax3(&mut bad);
+        assert!(!bad.blocks[0].insts.iter().any(|i| i.op == VMed3I32), "the view's tuple is written between the two halves");
+    }
+
+    #[test]
+    fn an_f32_select_is_not_a_min_max_by_default() {
+        use MOp::*;
+        // d = (x > y) ? x : y   (v_cndmask d, b = y, a = x)
+        let mk = |cmp: MOp| {
+            mf(
+                vec![RClass::V1; 4],
+                vec![],
+                vec![MInst::new(cmp).srcreg(0).srcreg(1), MInst::new(VCndmask).def(2).srcreg(1).srcreg(0), MInst::new(VMovB32).def(3).srcreg(2)],
+            )
+        };
+        let mut i = mk(VCmpGtI32);
+        select_minmax(&mut i);
+        assert!(i.blocks[0].insts.iter().any(|x| x.op == VMaxI32), "control: integers fold");
+        let mut f = mk(VCmpGtF32);
+        select_minmax(&mut f);
+        assert!(!f.blocks[0].insts.iter().any(|x| x.op == VMaxF32), "a NaN y: the select returns y, v_max_f32 returns x");
+        let mut g = mk(VCmpGtF32);
+        with_opts(&["fminmax"], || select_minmax(&mut g));
+        assert!(g.blocks[0].insts.iter().any(|x| x.op == VMaxF32), "fminmax (fast-math) folds");
+    }
 }
