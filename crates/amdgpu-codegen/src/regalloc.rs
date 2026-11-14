@@ -991,39 +991,146 @@ pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
 /// Returns the violations; used to guard the hole-filling packing and for allocator experiments.
 pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     use crate::sched::effects::{effects, Slot, SCC, VCC};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
-    // physical register -> current writer -> writers that preceded it on the paths ending in that writer
-    type Writers = HashMap<(bool, u32), BTreeMap<Slot, BTreeSet<Slot>>, std::hash::BuildHasherDefault<crate::fxhash::Fx>>;
+    use std::collections::HashMap;
+    type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<crate::fxhash::Fx>>;
+    // Flat representation of the state (the same analysis as the nested sets it replaced): the history sets are interned (sorted, deduplicated `Vec<Slot>`, equal sets have equal ids, so a change is an
+    // id change), the state of a physical register is the list of its current writers (sorted by slot) with their history ids, and the unions are memoized.
+    struct Sets {
+        sets: Vec<Vec<Slot>>,
+        ids: FxMap<Vec<Slot>, u32>,
+        union_memo: FxMap<(u32, u32), u32>,
+        add_memo: FxMap<(u32, Slot), u32>,
+    }
+    impl Sets {
+        fn intern(&mut self, v: Vec<Slot>) -> u32 {
+            if let Some(&i) = self.ids.get(&v) {
+                return i;
+            }
+            let i = self.sets.len() as u32;
+            self.sets.push(v.clone());
+            self.ids.insert(v, i);
+            i
+        }
+        fn union(&mut self, a: u32, b: u32) -> u32 {
+            if a == b || b == 0 {
+                return a;
+            }
+            if a == 0 {
+                return b;
+            }
+            let key = (a.min(b), a.max(b));
+            if let Some(&r) = self.union_memo.get(&key) {
+                return r;
+            }
+            let (x, y) = (&self.sets[a as usize], &self.sets[b as usize]);
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            let (mut i, mut j) = (0, 0);
+            while i < x.len() && j < y.len() {
+                match x[i].cmp(&y[j]) {
+                    std::cmp::Ordering::Less => {
+                        out.push(x[i]);
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.push(y[j]);
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        out.push(x[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            out.extend_from_slice(&x[i..]);
+            out.extend_from_slice(&y[j..]);
+            let r = self.intern(out);
+            self.union_memo.insert(key, r);
+            r
+        }
+        fn add(&mut self, a: u32, x: Slot) -> u32 {
+            if let Some(&r) = self.add_memo.get(&(a, x)) {
+                return r;
+            }
+            let mut v = self.sets[a as usize].clone();
+            if let Err(pos) = v.binary_search(&x) {
+                v.insert(pos, x);
+            }
+            let r = self.intern(v);
+            self.add_memo.insert((a, x), r);
+            r
+        }
+        fn contains(&self, id: u32, x: Slot) -> bool {
+            self.sets[id as usize].binary_search(&x).is_ok()
+        }
+    }
+    // physical register index -> current writers (sorted by slot) and the history id of each
+    type Entry = Vec<(Slot, u32)>;
+    type St = Vec<Entry>;
+    let mut sets = Sets { sets: vec![Vec::new()], ids: FxMap::default(), union_memo: FxMap::default(), add_memo: FxMap::default() };
+    sets.ids.insert(Vec::new(), 0);
     let phys = |slot: Slot| -> (bool, u32) {
         let t = slot / 16;
         (m.vreg_class(t).is_vector(), a.phys[t as usize] + (slot - t * 16))
     };
-    let write = |st: &mut Writers, w: Slot| {
-        let e = st.entry(phys(w)).or_default();
-        let mut hist: BTreeSet<Slot> = BTreeSet::new();
-        for (cur, prev) in e.iter() {
-            hist.insert(*cur);
-            hist.extend(prev.iter().copied());
+    // every instruction's effects once (the fixpoint, the write sites and the report pass all use them; `effects` allocates)
+    let fx: Vec<Vec<_>> = m.blocks.iter().map(|blk| blk.insts.iter().map(|inst| effects(m, inst)).collect()).collect();
+    let mut pidx_of: FxMap<(bool, u32), usize> = FxMap::default();
+    let block_writes: Vec<Vec<Slot>> = fx.iter().map(|b| b.iter().flat_map(|e| e.writes.iter().copied().filter(|w| *w != VCC && *w != SCC)).collect()).collect();
+    for ws in &block_writes {
+        for &w in ws {
+            let n = pidx_of.len();
+            pidx_of.entry(phys(w)).or_insert(n);
         }
-        e.clear();
-        e.insert(w, hist);
+    }
+    let np = pidx_of.len();
+    // flatten(entry) = every current writer and everything in its history
+    let flatten = |sets: &mut Sets, e: &Entry| -> u32 {
+        let mut acc = 0u32;
+        for &(cur, h) in e {
+            acc = sets.union(acc, h);
+            acc = sets.add(acc, cur);
+        }
+        acc
+    };
+    // the state after one write: { w: everything that was in the register's entry }
+    let write = |sets: &mut Sets, st: &mut St, w: Slot| {
+        let pi = pidx_of[&phys(w)];
+        let h = flatten(sets, &st[pi]);
+        st[pi].clear();
+        st[pi].push((w, h));
     };
     let succs = crate::sched::liveness::successors(m);
     let nb = m.blocks.len();
-    // the writes of every block, computed once (the fixpoint below visits each block many times; `effects` allocates)
-    let block_writes: Vec<Vec<Slot>> = m.blocks.iter().map(|blk| blk.insts.iter().flat_map(|inst| effects(m, inst).writes.into_iter().filter(|w| *w != VCC && *w != SCC)).collect()).collect();
-    let summaries: Vec<Vec<((bool, u32), Slot, BTreeSet<Slot>)>> = block_writes
+    // The block's writes as one step per physical register: after the writes w1 .. wk to one register the state is { wk: flatten(entry state) + {w1 .. w(k-1)} } (what applying `write` k times
+    // gives), so a visit costs one update per register written, not one per write.
+    let summaries: Vec<Vec<(usize, Slot, u32)>> = block_writes
         .iter()
         .map(|ws| {
-            let mut by: HashMap<(bool, u32), Vec<Slot>> = HashMap::default();
+            let mut by: FxMap<usize, Vec<Slot>> = FxMap::default();
+            let mut order: Vec<usize> = Vec::new();
             for &w in ws {
-                by.entry(phys(w)).or_default().push(w);
+                let pi = pidx_of[&phys(w)];
+                by.entry(pi).or_insert_with(|| {
+                    order.push(pi);
+                    Vec::new()
+                })
+                .push(w);
             }
-            by.into_iter().map(|(p, v)| (p, *v.last().unwrap(), v[..v.len() - 1].iter().copied().collect::<BTreeSet<Slot>>())).collect()
+            order
+                .into_iter()
+                .map(|pi| {
+                    let v = &by[&pi];
+                    let mut earlier: Vec<Slot> = v[..v.len() - 1].to_vec();
+                    earlier.sort_unstable();
+                    earlier.dedup();
+                    (pi, *v.last().unwrap(), sets.intern(earlier))
+                })
+                .collect()
         })
         .collect();
-    let mut in_st: Vec<Option<Writers>> = vec![None; nb];
-    in_st[0] = Some(Writers::default());
+    let mut in_st: Vec<Option<St>> = vec![None; nb];
+    in_st[0] = Some(vec![Vec::new(); np]);
     // worklist over the blocks whose entry state changed (the least fixed point is the same as the round-robin sweep's; a block is re-run only when its entry grew)
     let mut queued = vec![false; nb];
     let mut work: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
@@ -1037,19 +1144,11 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
         }
         budget -= 1;
         let Some(mut st) = in_st[b].clone() else { continue };
-        // The block's writes as one step per physical register: after the writes w1 .. wk to one register the state is { wk: flatten(entry state) + {w1 .. w(k-1)} } (what applying `write` k times gives:
-        // each write replaces the entry by { itself: everything that was in it }), so a visit costs one update per register written, not one per write.
-        for (p, last, earlier) in &summaries[b] {
-            let mut h: BTreeSet<Slot> = earlier.clone();
-            if let Some(e) = st.get(p) {
-                for (cur, prev) in e {
-                    h.insert(*cur);
-                    h.extend(prev.iter().copied());
-                }
-            }
-            let e = st.entry(*p).or_default();
-            e.clear();
-            e.insert(*last, h);
+        for &(pi, last, earlier) in &summaries[b] {
+            let h = flatten(&mut sets, &st[pi]);
+            let h = sets.union(earlier, h);
+            st[pi].clear();
+            st[pi].push((last, h));
         }
         for &s in &succs[b] {
             let mut changed = false;
@@ -1059,15 +1158,20 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                     changed = true;
                 }
                 Some(x) => {
-                    for (k, v) in &st {
-                        let e = x.entry(*k).or_default();
-                        for (cur, prev) in v {
-                            let slot = e.entry(*cur).or_insert_with(|| {
-                                changed = true;
-                                BTreeSet::new()
-                            });
-                            for p in prev {
-                                changed |= slot.insert(*p);
+                    for (xe, e) in x.iter_mut().zip(st.iter()) {
+                        for &(cur, h) in e {
+                            match xe.binary_search_by_key(&cur, |p| p.0) {
+                                Ok(k) => {
+                                    let u = sets.union(xe[k].1, h);
+                                    if u != xe[k].1 {
+                                        xe[k].1 = u;
+                                        changed = true;
+                                    }
+                                }
+                                Err(k) => {
+                                    xe.insert(k, (cur, h));
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -1084,7 +1188,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     let mut wloc: HashMap<Slot, Vec<(usize, usize, MOp)>> = HashMap::new();
     for (b, blk) in m.blocks.iter().enumerate() {
         for (ii, inst) in blk.insts.iter().enumerate() {
-            for w in &effects(m, inst).writes {
+            for w in &fx[b][ii].writes {
                 wloc.entry(*w).or_default().push((b, ii, inst.op));
             }
         }
@@ -1092,7 +1196,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     for b in 0..nb {
         let Some(mut st) = in_st[b].clone() else { continue };
         for (ii, inst) in m.blocks[b].insts.iter().enumerate() {
-            let e = effects(m, inst);
+            let e = &fx[b][ii];
             for r in &e.reads {
                 if *r == VCC || *r == SCC {
                     continue;
@@ -1101,11 +1205,11 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                     continue;
                 }
                 let p = phys(*r);
-                if let Some(ws) = st.get(&p) {
-                    let own_arrives = ws.contains_key(r);
-                    let clobbered: Vec<Slot> = ws.iter().filter(|(w, prev)| *w != r && prev.contains(r)).map(|(w, _)| *w).collect();
+                if let Some(ws) = pidx_of.get(&p).map(|&pi| &st[pi]).filter(|ws| !ws.is_empty()) {
+                    let own_arrives = ws.binary_search_by_key(r, |x| x.0).is_ok();
+                    let clobbered: Vec<Slot> = ws.iter().filter(|(w, prev)| w != r && sets.contains(*prev, *r)).map(|(w, _)| *w).collect();
                     if !own_arrives || !clobbered.is_empty() {
-                        let list: Vec<Slot> = if !clobbered.is_empty() { clobbered.clone() } else { ws.keys().copied().collect() };
+                        let list: Vec<Slot> = if !clobbered.is_empty() { clobbered.clone() } else { ws.iter().map(|x| x.0).collect() };
                         let at: Vec<String> = list.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(3).collect::<Vec<_>>()).unwrap_or_default())).collect();
                         report.push(format!(
                             "block {b} inst {ii} {:?}: reads slot {r} ({}{}) but {} [{}]",
@@ -1120,7 +1224,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
             }
             for w in &e.writes {
                 if *w != VCC && *w != SCC {
-                    write(&mut st, *w);
+                    write(&mut sets, &mut st, *w);
                 }
             }
         }
