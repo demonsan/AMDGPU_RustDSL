@@ -6669,8 +6669,8 @@ mod peephole_preconditions {
     fn med3_is_not_formed_across_a_write_through_a_view() {
         use MOp::*;
         // r0: V4 tuple, r1 = its dword 3 (view); t = max(r1, lo); <write dword 3 of r0>; r = min(t, hi)
-        let lo = MInst::new(VMovB32).def(2).imm(0);
-        let hi = MInst::new(VMovB32).def(4).imm(100);
+        let lo = MInst::new(VMovB32).def(2).src(Src::Imm(0));
+        let hi = MInst::new(VMovB32).def(4).src(Src::Imm(100));
         let mk = |write: bool| {
             let mut v = vec![lo.clone(), hi.clone(), MInst::new(VMaxI32).def(3).srcreg(1).srcreg(2)];
             if write {

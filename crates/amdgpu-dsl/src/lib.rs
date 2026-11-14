@@ -4939,6 +4939,8 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarMfmaScale16 { a, b, scale_a, scale_b, .. } => vec![*a, *b, *scale_a, *scale_b],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
+        // (the M0 value an exact kernel sets for its DMAs is a read)
+        Stmt::SetM0 { value } => vec![*value],
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
         _ => Vec::new(),
     }
