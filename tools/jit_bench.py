@@ -74,6 +74,22 @@ def precertify():
     return time.perf_counter() - t, r.stdout.strip()
 
 
+def build_templates():
+    f = os.path.join(tempfile.gettempdir(), 'jit-bench-tpl.tsv')
+    doms = {}
+    for k, sp in specs:
+        (nm, v), = sp.items()
+        lo, hi = doms.get((k, nm), (v, v))
+        doms[(k, nm)] = (min(lo, v), max(hi, v))
+    with open(f, 'w') as fh:
+        for (k, nm), (lo, hi) in doms.items():
+            step = 64 if 'gemm' in k else 4 if 'rmsnorm' in k else 1
+            fh.write(f'{k}\t\t{nm}\t{lo}:{hi}:{step}\n')
+    t = time.perf_counter()
+    r = subprocess.run([amdc, 'template-build', f, '--template-dir', C.template_dir(amdc), '--jobs', str(os.cpu_count() or 8)], capture_output=True, text=True, check=True)
+    return time.perf_counter() - t, r.stdout.strip()
+
+
 configs = [('1. one `amdc emit` process per kernel', {'AMDGPU_JIT_SERVER': '0'}, False),
            ('2. persistent compile server', {'AMDGPU_JIT_SERVER': '1'}, False),
            ('3. persistent server + certificates pre-populated (`amdc certify-batch`)', {'AMDGPU_JIT_SERVER': '1'}, True)]
@@ -84,9 +100,12 @@ for label, env, pre in configs:
     C.close_servers()
     fresh()
     note = ''
-    if pre:
+    if pre in (True, 'both'):
         dt, out = precertify()
         note = f' (offline certification of {len(specs)} shapes: {dt:.2f} s)'
+    if pre in ('tpl', 'both'):
+        dt, out = build_templates()
+        note += f' (templates built offline: {dt:.2f} s)'
     print(f'## {label}{note}\n')
     per = {}
     t0 = time.perf_counter()
@@ -106,8 +125,10 @@ for label, env, pre in configs:
     for w in workers:
         C.close_servers()
         fresh()
-        if pre:
+        if pre in (True, 'both'):
             precertify()
+        if pre in ('tpl', 'both'):
+            build_templates()
         t0 = time.perf_counter()
         with ThreadPoolExecutor(w) as ex:
             list(ex.map(lambda ks: C.get_kernel(ks[0], ks[1]), specs))
@@ -116,7 +137,7 @@ for label, env, pre in configs:
         row.append(f'{wall * 1e3 / len(specs):.2f}')
     print()
     summary.append((label, row))
-    if pre:
+    if pre is True:
         forget()
         t0 = time.perf_counter()
         for k, sp in specs:
