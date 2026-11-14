@@ -1925,6 +1925,22 @@ impl Lowerer {
         }
     }
 
+    /// The MFMA accumulator registers (D, C): in place when C may be overwritten (`reusable`); otherwise D is a new register and the
+    /// MFMA reads C where it is (gfx950 `v_mfma vdst, a, b, srcC`: D and C identical or disjoint - same-width aligned tuples are), so the
+    /// accumulator is not copied (`mfmadc`, opt-in: same-run A/B neutral on fmha_mxfp8 / fp8pt, 9 reps: 1.003 / 1.002); otherwise C is
+    /// copied into D.
+    fn mfma_acc(&mut self, rc: VReg, cls: RClass, reusable: bool) -> Result<(VReg, VReg), String> {
+        if reusable {
+            return Ok((rc, rc));
+        }
+        let d = self.new_vreg(cls);
+        if !opt_on("mfmadc") {
+            self.copy_reg(d, rc)?;
+            return Ok((d, d));
+        }
+        Ok((d, rc))
+    }
+
     /// A freshly zeroed sixteen-dword fragment.
     fn fresh_zero16(&mut self) -> VReg {
         let d = self.new_vreg(RClass::V16);
@@ -3782,14 +3798,8 @@ impl Lowerer {
                             return Ok(());
                         }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
-                        let d = if reusable {
-                            rc
-                        } else {
-                            let d = self.new_vreg(cls);
-                            self.copy_reg(d, rc)?;
-                            d
-                        };
-                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d).srcreg(sa).srcreg(sb).imm(imm));
+                        let (d, cr) = self.mfma_acc(rc, cls, reusable)?;
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(cr).srcreg(sa).srcreg(sb).imm(imm));
                         self.val.insert(dst, d);
                     }
                     _ => {
@@ -3822,14 +3832,8 @@ impl Lowerer {
                             return Ok(());
                         }
                         let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
-                        let d = if reusable {
-                            rc
-                        } else {
-                            let d = self.new_vreg(cls);
-                            self.copy_reg(d, rc)?;
-                            d
-                        };
-                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d).imm(imm));
+                        let (d, cr) = self.mfma_acc(rc, cls, reusable)?;
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(cr).imm(imm));
                         self.val.insert(dst, d);
                     }
                     _ => {
@@ -4413,14 +4417,13 @@ impl Lowerer {
                     return Ok(());
                 }
                 let rc = self.as_v16(*c)?;
-                let d = self.new_vreg(RClass::V16);
-                self.copy_reg(d, rc)?;
+                let (d, cr) = self.mfma_acc(rc, RClass::V16, false)?;
                 self.push(
                     MInst::new(if bf16 { MOp::VMfma32x32x8Bf16 } else { MOp::VMfma32x32x8F16 })
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(d),
+                        .srcreg(cr),
                 );
                 self.val.insert(dst, d);
             }
@@ -4507,14 +4510,8 @@ impl Lowerer {
                     Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1)
                         && matches!(self.defs.get(cv), Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::MfmaFp8_32x32x64 { .. }))
                 );
-                let d = if reusable {
-                    rc
-                } else {
-                    let d = self.new_vreg(RClass::V16);
-                    self.copy_reg(d, rc)?;
-                    d
-                };
-                self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                let (d, cr) = self.mfma_acc(rc, RClass::V16, reusable)?;
+                self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(d).srcreg(ra).srcreg(rb).srcreg(cr));
                 self.val.insert(dst, d);
             }
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
@@ -4537,8 +4534,9 @@ impl Lowerer {
                     self.val.insert(dst, d);
                     return Ok(());
                 }
-                let d = if c_is_zero {
-                    self.fresh_zero16()
+                let (d, cr) = if c_is_zero {
+                    let z = self.fresh_zero16();
+                    (z, z)
                 } else {
                     let rc = self.as_v16(*c)?;
                     // A single-use accumulator produced by an MFMA or a fragment build can be
@@ -4552,20 +4550,14 @@ impl Lowerer {
                                     Some(Op::MfmaScaleFp8_32x32x64 { .. })
                                 )
                     );
-                    if reusable {
-                        rc
-                    } else {
-                        let d = self.new_vreg(RClass::V16);
-                        self.copy_reg(d, rc)?;
-                        d
-                    }
+                    self.mfma_acc(rc, RClass::V16, reusable)?
                 };
                 self.push(
                     MInst::new(MOp::VMfmaScale32x32x64Fp8)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(d)
+                        .srcreg(cr)
                         .srcreg(sa)
                         .srcreg(sb),
                 );
