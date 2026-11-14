@@ -1229,6 +1229,37 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             prod_by_tile[x.ev.tile].push(k);
         }
     }
+    // Per (tile, slot) group of producers (infos ascending), the indexes the clean-consumer pre-check uses: by phase with a prefix maximum of the publish phase (None = never), the latest first, and by version.
+    struct Group {
+        by_ord: Vec<usize>,
+        prefmax: Vec<u64>,
+        desc: Vec<usize>,
+        by_ver: HashMap<i64, Vec<usize>>,
+    }
+    let groups: HashMap<(usize, i64), Group> = if reference {
+        HashMap::new()
+    } else {
+        prod_of
+            .iter()
+            .map(|(k, ks)| {
+                let mut by_ord = ks.clone();
+                by_ord.sort_by_key(|&i| (infos[i].ev.ord, i));
+                let mut prefmax = Vec::with_capacity(by_ord.len());
+                let mut m = 0u64;
+                for &i in &by_ord {
+                    m = m.max(infos[i].publish.map_or(u64::MAX, |v| v as u64));
+                    prefmax.push(m);
+                }
+                let mut desc = ks.clone();
+                desc.sort_by_key(|&i| std::cmp::Reverse((infos[i].ev.ord, infos[i].ev.start, i)));
+                let mut by_ver: HashMap<i64, Vec<usize>> = HashMap::new();
+                for &i in ks {
+                    by_ver.entry(infos[i].ev.ver as i64).or_default().push(i);
+                }
+                (*k, Group { by_ord, prefmax, desc, by_ver })
+            })
+            .collect()
+    };
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
     // the location suffixes of the messages, formatted once per pair (not per consumer)
     let wh_priv: [String; 2] = [0, 1].map(|r| format!("(role {r}, {n} iteration(s) simulated)"));
@@ -1269,6 +1300,22 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 }
             }
             continue;
+        }
+        // Pre-check (indexed): a consumer that certainly produces no finding below is skipped; anything else takes the full scan, which reports exactly as before. Clean means: no pending-read warning, not a global region,
+        // the latest published version at this phase is the expected one, every producer of the expected version up to this phase is published, and no producer up to the end of the read window is still unpublished at
+        // the start of the read (a superset of the overlap the race scan looks for).
+        if !reference && !c.ev.global {
+            if let Some(g) = groups.get(&key) {
+                let vis = |p: &Info| p.publish.map_or(false, |v| v <= c.ev.ord);
+                let pending_warn = c.done.is_none() && traces[c.role].bar_from.get(c.ev.last + 1).copied().unwrap_or(false);
+                let latest_ok = g.desc.iter().find(|&&k| vis(&infos[k])).map_or(false, |&k| infos[k].ev.ver == c.ev.ver);
+                let same_ver_ok = g.by_ver.get(&(c.ev.ver as i64)).map_or(true, |l| l.iter().all(|&k| { let p = &infos[k]; p.ev.ord > c.ev.ord || (c.owner && p.owner) || vis(p) }));
+                let cnt = g.by_ord.partition_point(|&k| infos[k].ev.ord <= c.done_ord);
+                let no_overlap = cnt == 0 || g.prefmax[cnt - 1] <= c.ev.ord as u64;
+                if !pending_warn && latest_ok && same_ver_ok && no_overlap {
+                    continue;
+                }
+            }
         }
         let prods: Vec<&Info> = slot_prods.iter().map(|&k| &infos[k]).collect();
         let stmt = c.ev.stmt;
