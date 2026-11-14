@@ -149,6 +149,11 @@ fn parse_val(s: &str) -> Option<i64> {
 /// Builds the classes of one (kernel, fixed bindings, parameter) from the full-compile assembly of every value (`texts`, sorted by value). Every returned class is verified: each of its values reproduces
 /// its full-compile text exactly when instantiated.
 pub fn build_classes(texts: &[(i64, String)]) -> Vec<Class> {
+    build_classes_report(texts).0
+}
+
+/// `build_classes` and the sizes of the skeleton groups (largest first).
+pub fn build_classes_report(texts: &[(i64, String)]) -> (Vec<Class>, Vec<usize>) {
     // group by skeleton (the text with every integer literal masked)
     let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
     let mut index: HashMap<Vec<String>, usize> = HashMap::new();
@@ -162,6 +167,8 @@ pub fn build_classes(texts: &[(i64, String)]) -> Vec<Class> {
             }
         }
     }
+    let mut sizes: Vec<usize> = groups.iter().map(|g| g.1.len()).collect();
+    sizes.sort_by(|a, b| b.cmp(a));
     let mut classes = Vec::new();
     for (_, members) in groups {
         if members.len() < 2 {
@@ -194,7 +201,7 @@ pub fn build_classes(texts: &[(i64, String)]) -> Vec<Class> {
         class.ranges = compress(&valid);
         classes.push(class);
     }
-    classes
+    (classes, sizes)
 }
 
 impl Class {
@@ -324,7 +331,7 @@ pub fn lookup(dir: &str, kernel: &str, spec: &[(String, String)], backend: &str)
 
 /// Builds the template of (`kernel`, `fixed` bindings, `param` over lo..=hi step `step`): full compile of every value of the domain on `jobs` threads, then `build_classes`. Returns the template and
 /// (domain size, values that compiled).
-pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi: i64, step: i64, jobs: usize) -> (Template, usize, usize) {
+pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi: i64, step: i64, jobs: usize) -> (Template, usize, usize, Vec<usize>) {
     use amdgpu_codegen::backend::OwnTail;
     use amdgpu_codegen::{compile_with_options, CompileOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -350,7 +357,8 @@ pub fn build(kernel: &str, fixed: &[(String, String)], param: &str, lo: i64, hi:
     let mut fx = fixed.to_vec();
     fx.sort();
     let compiled = texts.len();
-    (Template { kernel: kernel.to_string(), param: param.to_string(), fixed: fx, backend: "own".into(), classes: build_classes(&texts) }, values.len(), compiled)
+    let (classes, sizes) = build_classes_report(&texts);
+    (Template { kernel: kernel.to_string(), param: param.to_string(), fixed: fx, backend: "own".into(), classes }, values.len(), compiled, sizes)
 }
 
 /// `amdc template-build FILE --template-dir DIR [--jobs N]`: lines `kernel<TAB>name=v,..<TAB>param<TAB>lo:hi:step`.
@@ -369,12 +377,12 @@ pub fn build_file(file: &str, dir: &str, jobs: usize) -> Vec<String> {
             report.push(format!("bad line: {l}"));
             continue;
         };
-        let (t, n, ok) = build(f[0], &fixed, f[2], dom[0], dom[1], dom[2], jobs);
+        let (t, n, ok, sizes) = build(f[0], &fixed, f[2], dom[0], dom[1], dom[2], jobs);
         let valid: usize = t.classes.iter().map(|c| c.ranges.iter().map(|&(lo, hi, st)| ((hi - lo) / st.max(1) + 1) as usize).sum::<usize>()).sum();
         if !t.classes.is_empty() {
             let _ = write(dir, &t);
         }
-        report.push(format!("{} {} over {}..{} step {}: {n} values, {ok} compiled, {} class(es), {valid} verified values ({:.0} %)", f[0], f[2], dom[0], dom[1], dom[2], t.classes.len(), 100.0 * valid as f64 / n.max(1) as f64));
+        report.push(format!("{} {} over {}..{} step {}: {n} values, {ok} compiled, {} class(es), {valid} verified values ({:.0} %); skeleton groups of the domain (sizes): {:?}", f[0], f[2], dom[0], dom[1], dom[2], t.classes.len(), 100.0 * valid as f64 / n.max(1) as f64, &sizes[..sizes.len().min(8)]));
     }
     report
 }
