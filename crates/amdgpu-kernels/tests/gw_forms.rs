@@ -52,7 +52,7 @@ fn a_pow2_split_of_the_workgroup_id_is_a_mixed_radix() {
 
 #[test]
 fn without_the_pow2_fact_or_with_overlapping_batches_it_is_not_proven() {
-    assert!(!proven(&split_kernel(false, 1)), "1 << lg == SPL is the host contract: without it the split is unbounded");
+    // (gap 1 is z itself: provable without the fact) gap 2: z + (batch << lg) needs 1 << lg == SPL, the host contract`r`n    assert!(!proven(&split_kernel(false, 2)), "without the pow2 fact the shifted batch is unbounded");
     // gap 0: every batch writes rows [0, SPL)
     assert!(!proven(&split_kernel(true, 0)));
 }
