@@ -14,12 +14,42 @@ use super::effects::*;
 use super::model::{self, OpCost, NPIPES};
 use crate::mir::*;
 
+/// Dense per-vreg state buffers, kept all-default between uses and recycled per thread: a pressure tracker touches only the vregs of one block, so building one costs the block, not the function's vreg count
+/// (it used to zero-allocate four vectors of that size per tracker, i.e. per block and per window).
+#[derive(Default)]
+struct Bufs {
+    st: Vec<(u32, bool)>,
+    seen: Vec<bool>,
+    width: Vec<i64>,
+    lo: Vec<bool>,
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Bufs>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct Pressure {
     /// vreg -> (remaining reading instructions, currently live); dense by vreg number (only the vregs some instruction names are ever queried)
-    st: Vec<(u32, bool)>,
-    live_out: Vec<bool>,
-    width: Vec<i64>,
+    b: Bufs,
+    touched: Vec<VReg>,
+    lo_touched: Vec<VReg>,
     cur: i64,
+}
+
+impl Drop for Pressure {
+    fn drop(&mut self) {
+        let mut b = std::mem::take(&mut self.b);
+        for &v in &self.touched {
+            let u = v as usize;
+            b.st[u] = (0, false);
+            b.seen[u] = false;
+            b.width[u] = 0;
+        }
+        for &v in &self.lo_touched {
+            b.lo[v as usize] = false;
+        }
+        POOL.with(|p| p.borrow_mut().push(b));
+    }
 }
 
 fn vregs_of(m: &MFunction, slots: &[Slot]) -> Vec<VReg> {
@@ -39,45 +69,53 @@ fn vregs_of(m: &MFunction, slots: &[Slot]) -> Vec<VReg> {
 impl Pressure {
     fn new(m: &MFunction, rd: &[Vec<VReg>], wr: &[Vec<VReg>], live_in: &HashSet<VReg>, live_out: &HashSet<VReg>) -> Pressure {
         let nv = m.vregs.len();
-        let mut st: Vec<(u32, bool)> = vec![(0, false); nv];
-        let mut seen = vec![false; nv];
-        let mut width = vec![0i64; nv];
+        let mut b = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+        if b.st.len() < nv {
+            b.st.resize(nv, (0, false));
+            b.seen.resize(nv, false);
+            b.width.resize(nv, 0);
+            b.lo.resize(nv, false);
+        }
+        let mut touched: Vec<VReg> = Vec::new();
         for i in 0..rd.len() {
             for &v in rd[i].iter().chain(wr[i].iter()) {
                 let u = v as usize;
-                if !seen[u] {
-                    seen[u] = true;
-                    st[u] = (0, live_in.contains(&v));
+                if !b.seen[u] {
+                    b.seen[u] = true;
+                    b.st[u] = (0, live_in.contains(&v));
+                    touched.push(v);
                 }
-                width[u] = m.vreg_class(v).dwords() as i64;
+                b.width[u] = m.vreg_class(v).dwords() as i64;
             }
             for &v in &rd[i] {
-                st[v as usize].0 += 1;
+                b.st[v as usize].0 += 1;
             }
         }
         let mut cur = 0i64;
-        let mut lo = vec![false; nv];
+        let mut lo_touched: Vec<VReg> = Vec::new();
         for &v in live_out {
             if (v as usize) < nv {
-                lo[v as usize] = true;
+                b.lo[v as usize] = true;
+                lo_touched.push(v);
             }
-            if m.vreg_class(v).is_vector() && !seen[v as usize] {
+            if m.vreg_class(v).is_vector() && !b.seen[v as usize] {
                 cur += m.vreg_class(v).dwords() as i64;
             }
         }
-        for u in 0..nv {
-            if seen[u] && st[u].1 {
-                cur += width[u];
+        for &v in &touched {
+            let u = v as usize;
+            if b.st[u].1 {
+                cur += b.width[u];
             }
         }
-        Pressure { st, live_out: lo, width, cur }
+        Pressure { b, touched, lo_touched, cur }
     }
 
     #[inline]
     fn after(&self, v: VReg, reads: bool) -> (u32, bool, bool) {
-        let (rr, live) = self.st[v as usize];
+        let (rr, live) = self.b.st[v as usize];
         let rr_after = rr - if reads { 1 } else { 0 };
-        let live_after = self.live_out[v as usize] || rr_after > 0;
+        let live_after = self.b.lo[v as usize] || rr_after > 0;
         (rr_after, live, live_after)
     }
 
@@ -85,7 +123,7 @@ impl Pressure {
         let mut d = 0i64;
         for &v in rd.iter().chain(wr.iter().filter(|w| !rd.contains(w))) {
             let (_, live, live_after) = self.after(v, rd.contains(&v));
-            d += self.width[v as usize] * (live_after as i64 - live as i64);
+            d += self.b.width[v as usize] * (live_after as i64 - live as i64);
         }
         d
     }
@@ -93,8 +131,8 @@ impl Pressure {
     fn commit(&mut self, rd: &[VReg], wr: &[VReg]) {
         for &v in rd.iter().chain(wr.iter().filter(|w| !rd.contains(w))) {
             let (rr_after, live, live_after) = self.after(v, rd.contains(&v));
-            self.cur += self.width[v as usize] * (live_after as i64 - live as i64);
-            self.st[v as usize] = (rr_after, live_after);
+            self.cur += self.b.width[v as usize] * (live_after as i64 - live as i64);
+            self.b.st[v as usize] = (rr_after, live_after);
         }
     }
 }
