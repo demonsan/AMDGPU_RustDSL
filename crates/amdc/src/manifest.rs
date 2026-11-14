@@ -83,6 +83,55 @@ pub fn compute_co(jobs: usize) -> Result<Vec<(String, String)>, String> {
     Ok(v)
 }
 
+/// The specialized shapes whose certificates the certificate manifest covers besides the generic IR of every kernel.
+pub const CERT_SHAPES: &[(&str, &str)] = &[
+    ("silu_mul_bf16_d4096", "m=7"),
+    ("silu_mul_bf16_d4096", "m=64"),
+    ("rmsnorm_quant_fp8_n4096", "m=64"),
+    ("rmsnorm_quant_fp8_n4096", "m=1024"),
+    ("gemm_a8w8_rowcol_fp8_64", "m=64"),
+    ("gemm_a8w8_rowcol_fp8_64", "m=1152"),
+    ("pa_decode16_bf16_hd128_p16_f", "H=8"),
+    ("pa_decode16_bf16_hd128_p16_f", "H=64"),
+    ("pa_decode16_bf16_hd128_p16_f", "H=128"),
+];
+
+/// (name, md5 of the IR-level certificate: every finding rendered plus the trust ledger) for the generic IR of every manifest kernel and for `CERT_SHAPES`: the oracle of the `verify_ir` optimizations
+/// (`tests/golden/cert_md5_manifest.tsv`): same findings, same certificates.
+pub fn compute_cert(jobs: usize) -> Result<Vec<(String, String)>, String> {
+    let ov = env_overrides();
+    if !ov.is_empty() {
+        return Err(format!("the manifest needs a scrubbed environment; unset: {}", ov.join(" ")));
+    }
+    let mut items: Vec<(String, String, String)> = amdgpu_kernels::reachable::manifest_names().into_iter().map(|k| (k.clone(), k, String::new())).collect();
+    for (k, s) in CERT_SHAPES {
+        items.push((format!("{k}@{s}"), k.to_string(), s.to_string()));
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|sc| {
+        for _ in 0..jobs.max(1) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((name, k, s)) = items.get(i) else { break };
+                let spec = if s.is_empty() { Ok(Vec::new()) } else { amdgpu_dsl::specialize::parse_bindings(s) };
+                let v = match spec.and_then(|sp| crate::jitc::load(k, &sp, None)) {
+                    Err(_) => "MISSING".to_string(),
+                    Ok((f, _)) => {
+                        let r = amdgpu_codegen::gpu_verify::verify_ir(&f);
+                        let l = r.ledger();
+                        crate::md5::hex(format!("{}\n{} {} {} {} {}\n{:?}", r.render(), l.assume_trusted, l.tile_trust, l.region_trust, l.asm_opaque, l.timing_trust, r.proven).as_bytes())
+                    }
+                };
+                out.lock().unwrap().push((name.clone(), v));
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap();
+    v.sort();
+    Ok(v)
+}
+
 /// The manifest text.
 pub fn render(entries: &[(String, String)]) -> String {
     let mut s = String::from("# golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md\n");

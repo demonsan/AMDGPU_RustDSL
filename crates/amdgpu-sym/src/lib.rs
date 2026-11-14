@@ -189,7 +189,11 @@ impl Ctx {
     }
     /// Sufficient test for `p >= 0` for all admissible symbol values: shift every symbol s = lb(s) + t (t >= 0) and require non-negative coefficients.
     pub fn nonneg(&self, p: &Poly) -> bool {
-        let mut out: BTreeMap<Vec<Sym>, Q> = BTreeMap::new();
+        // every coefficient non-negative and every lower bound non-negative: every expanded coefficient below is a sum of non-negative products, the first test passes without the expansion
+        if p.0.iter().all(|(m, c)| m.len() <= 10 && !c.is_neg() && m.iter().all(|s| self.lower_bound(s) >= 0)) {
+            return true;
+        }
+        let mut out: BTreeMap<Vec<&Sym>, Q> = BTreeMap::new();
         for (mono, c) in &p.0 {
             let k = mono.len();
             if k > 10 {
@@ -197,10 +201,10 @@ impl Ctx {
             }
             for mask in 0u32..(1u32 << k) {
                 let mut coef = *c;
-                let mut ts: Vec<Sym> = Vec::new();
+                let mut ts: Vec<&Sym> = Vec::new();
                 for (i, s) in mono.iter().enumerate() {
                     if mask >> i & 1 == 1 {
-                        ts.push(s.clone());
+                        ts.push(s);
                     } else {
                         coef = coef.mul(Q::int(self.lower_bound(s)));
                     }

@@ -38,7 +38,7 @@ fn usage() {
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock
   amdc weave-report <kernel>|--from-ir <file>   the back-end Weaver unit graph of the final MIR (docs/two-weavers.md)
   amdc passes [--target gfx950] [--evidence]   the compile pipeline: named passes, stage, target dependence, gate, evidence; the retry ladders
-  amdc md5-manifest [--co] [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
+  amdc md5-manifest [--co | --cert] [--out FILE | --check FILE] [--jobs N]   the golden asm md5 of every reachable kernel (tests/golden/README.md)");
 }
 
 /// The `--specialize` bindings of the command line (`--specialize a=1,b=2` or `--specialize=a=1`, repeatable).
@@ -775,7 +775,7 @@ fn main() -> ExitCode {
             // amdc md5-manifest [--out FILE] [--check FILE] [--jobs N]: the own-backend asm md5 of every reachable kernel (the refactor's golden oracle)
             let opt = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
             let jobs = opt("--jobs").and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-            let now = match if args.iter().any(|a| a == "--co") { amdc::manifest::compute_co(jobs) } else { amdc::manifest::compute(jobs) } {
+            let now = match if args.iter().any(|a| a == "--cert") { amdc::manifest::compute_cert(jobs) } else if args.iter().any(|a| a == "--co") { amdc::manifest::compute_co(jobs) } else { amdc::manifest::compute(jobs) } {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
@@ -798,7 +798,9 @@ fn main() -> ExitCode {
                 return if d.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
             }
             let text = amdc::manifest::render(&now);
-            let text = if args.iter().any(|a| a == "--co") { text.replacen("golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md", "golden code-object md5 manifest (in-process assembler, own backend): amdc md5-manifest --co --out tests/golden/co_md5_manifest.tsv", 1) } else { text };
+            let text = if args.iter().any(|a| a == "--cert") {
+                text.replacen("golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md", "golden certificate md5 manifest (verify_ir findings + ledger): amdc md5-manifest --cert --out tests/golden/cert_md5_manifest.tsv", 1)
+            } else if args.iter().any(|a| a == "--co") { text.replacen("golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md", "golden code-object md5 manifest (in-process assembler, own backend): amdc md5-manifest --co --out tests/golden/co_md5_manifest.tsv", 1) } else { text };
             match opt("--out") {
                 Some(p) => {
                     if let Err(e) = fs::write(&p, &text) {
