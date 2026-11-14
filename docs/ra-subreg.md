@@ -13,3 +13,20 @@ default only on a measured win.
 Soundness net, every stage: `crates/amdc/tests/register_check.rs` runs `exact::check_registers` (no instruction writes a physical register
 dword whose value is still read later on some path, per dword and 16-bit half, across the CFG) on the allocation of every reachable
 kernel; the two-phase packing keeps its reaching-writer check; the default path re-checks its waits on the physical-register view.
+
+## Where the remaining copies are (decision record)
+
+Copy removal moved no time on the FMHA kernels (MFMA / memory bound): `mfmadc`, `loopreuse`, `dupfold`, `radword` all measured neutral
+(docs/pass-catalog.md 2.2). The kernels where a VALU instruction could matter are the VALU / SALU-bound ones; their back-end copies by
+class (`amdc exact-report`, Main after lowopt-dup):
+
+| Kernel | insts | copies | where |
+|---|---|---|---|
+| mla_decode_bf16_p16 | 2071 | 148 | 138 loop-entry (`BeginLoop` init, once per loop entry), 8 permlane16/32 swap operands (reductions, once per block), 2 loop-variable sets |
+| pa_decode16_bf16_hd128_p16_c | 1032 | 66 | 52 loop-entry, 8 permlane swap operands, 5 loop-variable sets, 1 atomic |
+| topk_softmax_renorm_bf16_e256_k8 | 746 | 54 | 36 DPP old-value operands, 18 permlane16 swap operands (a membound kernel) |
+
+Almost all of them run once per loop entry or once per block, not per loop iteration: removing them cannot move these kernels' time either.
+Decision (lead, 2026-11-14): S2 allocator affinity and S3 16-bit halves are stopped; `radword` and `dupfold` stay opt-in as building blocks
+for a future register plan that needs them (e.g. vendor-style packing in an exact or planned kernel). The candidates left if a VALU-bound
+kernel ever shows copy pressure in its loop: DPP with `bound_ctrl` instead of the old-value copy, and the in-loop loop-variable sets.
