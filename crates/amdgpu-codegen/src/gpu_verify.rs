@@ -271,6 +271,13 @@ struct An<'a> {
     /// plain global / buffer stores outside `buf_region` markers (statement -> pointer kernarg, symbolic linear byte offset, size): the
     /// cross-workgroup disjointness proof runs over them at the end
     gstores: BTreeMap<usize, (u32, Option<SLin>, i128, ARanges)>,
+    /// plain global / buffer LOADS, recorded like the stores (keyed by statement * 4 + part): an argument that is also stored must have its
+    /// loads and stores workgroup-disjoint together (cross-workgroup RAW / WAR), see `global_disjointness`
+    gloads: BTreeMap<usize, (u32, Option<SLin>, i128, ARanges)>,
+    gl_caps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
+    gl_win: BTreeMap<usize, Vec<u8>>,
+    /// `record_store` is recording a load (into gloads)
+    loading: bool,
     /// atom key -> the operands it stands for (structurally equal values share a key)
     atom_inst: std::cell::RefCell<HashMap<(bool, u64), Vec<Opnd>>>,
     sig_memo: std::cell::RefCell<HashMap<ValueId, String>>,
@@ -1058,10 +1065,32 @@ impl<'a> An<'a> {
             }
             Some(m)
         });
+        let caps = std::mem::take(&mut *self.caps_cur.borrow_mut());
+        if self.loading {
+            let mut k = self.idx * 4;
+            while self.gloads.contains_key(&k) && k < self.idx * 4 + 3 {
+                k += 1;
+            }
+            self.gloads.insert(k, (rec.0, rec.1, size, ranges));
+            self.gl_win.insert(k, self.winner_axes.clone());
+            self.gl_caps.insert(k, caps);
+            return;
+        }
         self.gstores.insert(self.idx, (rec.0, rec.1, size, ranges));
         self.gwin.insert(self.idx, self.winner_axes.clone());
-        let caps = std::mem::take(&mut *self.caps_cur.borrow_mut());
         self.gcaps.insert(self.idx, caps);
+    }
+
+    /// Records a global / buffer load for the cross-workgroup read / write check (only arguments that are also stored are checked).
+    fn record_load_buffer(&mut self, rsrc: &Opnd, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128) {
+        self.loading = true;
+        self.record_buffer_store(rsrc, voff, soff, imm, size);
+        self.loading = false;
+    }
+    fn record_load_global(&mut self, base: &Opnd, byte_off: i128, size: i128) {
+        self.loading = true;
+        self.record_global_store(base, byte_off, size);
+        self.loading = false;
     }
 
     fn pmin(&self, a: &Poly, b: &Poly) -> Option<Poly> {
@@ -1302,7 +1331,8 @@ impl<'a> An<'a> {
     /// and the per-store constants as digits) is injective - sorted by coefficient, every coefficient is at least the span of the smaller digits
     /// plus the access size (a mixed radix) - and every workgroup axis that can exceed 1 is one of its digits, so two different workgroups can
     /// never write the same byte. Returns the number of stores proven / not proven.
-    fn global_disjointness(&self) -> (usize, usize) {
+    /// (stores proven, stores not proven, loads proven, per argument with unproven loads: (kernarg offset, loads))
+    fn global_disjointness(&self) -> (usize, usize, usize, Vec<(u32, usize)>) {
         let mut by_arg: BTreeMap<u32, Vec<&(u32, Option<SLin>, i128, ARanges)>> = BTreeMap::new();
         let mut caps_by_arg: BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>> = BTreeMap::new();
         for (i, s) in &self.gstores {
@@ -1316,14 +1346,46 @@ impl<'a> An<'a> {
         }
         *self.group_win.borrow_mut() = win_by_arg;
         let (mut ok, mut bad) = (0, 0);
-        for (arg, ss) in by_arg {
+        let mut store_args: Vec<u32> = Vec::new();
+        for (arg, ss) in by_arg.clone() {
+            store_args.push(arg);
             if arg != u32::MAX && self.disjoint_group(&ss) {
                 ok += ss.len();
             } else {
                 bad += ss.len();
             }
         }
-        (ok, bad)
+        // cross-workgroup RAW / WAR: an argument that is stored must have its loads and stores disjoint across workgroups TOGETHER (a load of
+        // bytes another workgroup writes is a race unless a verified protocol orders them, e.g. a last-arriver ticket: its winner's accesses
+        // carry the winner axes like its stores)
+        let (mut rw_ok, mut rw_bad) = (0usize, Vec::new());
+        let mut loads_by_arg: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (k, l) in &self.gloads {
+            loads_by_arg.entry(l.0).or_default().push(*k);
+        }
+        for arg in store_args {
+            if arg == u32::MAX {
+                continue;
+            }
+            let Some(lk) = loads_by_arg.get(&arg) else { continue };
+            let mut ss: Vec<&(u32, Option<SLin>, i128, ARanges)> = by_arg[&arg].clone();
+            let mut caps: Vec<Vec<(SLin, Poly, bool)>> = self.group_caps.borrow().get(&arg).cloned().unwrap_or_default();
+            let mut win: Vec<Vec<u8>> = self.group_win.borrow().get(&arg).cloned().unwrap_or_default();
+            for k in lk {
+                ss.push(&self.gloads[k]);
+                caps.push(self.gl_caps.get(k).cloned().unwrap_or_default());
+                win.push(self.gl_win.get(k).cloned().unwrap_or_default());
+            }
+            self.group_caps.borrow_mut().insert(arg, caps);
+            self.group_win.borrow_mut().insert(arg, win);
+            if self.disjoint_group(&ss) {
+                rw_ok += lk.len();
+            } else {
+                rw_bad.push((arg, lk.len()));
+            }
+        }
+        // loads of an argument whose address has no provenance can't be attributed: an argument stored through such a pointer is already counted
+        (ok, bad, rw_ok, rw_bad)
     }
 
     fn disjoint_group(&self, ss: &[&(u32, Option<SLin>, i128, ARanges)]) -> bool {
@@ -2536,6 +2598,7 @@ impl<'a> An<'a> {
             };
             let b = self.av_of(base);
             self.check_global("global load", &b, off as i128, sz, false);
+            self.record_load_global(base, off as i128, sz);
             return;
         }
         match op {
@@ -2564,11 +2627,13 @@ impl<'a> An<'a> {
             Op::BufferLoad { rsrc, voff, soff, imm, dwords } => {
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer load", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
+                self.record_load_buffer(rsrc, voff, soff, *imm as i128, 4 * *dwords as i128);
             }
             Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => {
                 let r = self.av_of(rsrc);
                 for imm in [*imm_lo, *imm_hi] {
                     self.check_buffer("buffer load (b128x2)", &r, voff, soff, imm as i128, 16, false);
+                    self.record_load_buffer(rsrc, voff, soff, imm as i128, 16);
                 }
             }
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => {}
@@ -2576,14 +2641,17 @@ impl<'a> An<'a> {
             Op::LoadGlobalN { base, byte_off, ty, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global load", &b, *byte_off as i128, ty.bytes() as i128, false);
+                self.record_load_global(base, *byte_off as i128, ty.bytes() as i128);
             }
             Op::LoadGlobalD16 { base, byte_off, ty, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global load d16", &b, *byte_off as i128, ty.bytes() as i128, false);
+                self.record_load_global(base, *byte_off as i128, ty.bytes() as i128);
             }
             Op::BufferLoadN { rsrc, voff, soff, imm, ty, .. } => {
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer load", &r, voff, soff, *imm as i128, ty.bytes() as i128, false);
+                self.record_load_buffer(rsrc, voff, soff, *imm as i128, ty.bytes() as i128);
             }
             Op::LoadLdsN { addr, ty } => self.check_lds_at("ds_read", addr, ty.bytes() as i128),
             Op::LoadLdsD16 { addr, ty, .. } => self.check_lds_at("ds_read d16", addr, ty.bytes() as i128),
@@ -3315,6 +3383,7 @@ impl<'a> An<'a> {
             Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
+                self.record_load_buffer(rsrc, voff, soff, *imm as i128, 4 * *dwords as i128);
                 let a = self.int_of(lds_addr).add_const(*imm as i128);
                 self.cur_addr = Some((*lds_addr, *imm as i128));
                 let lanes = self.exec_lanes as i128;
@@ -3723,7 +3792,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::default(), vars: HashMap::default(), var_prov: HashMap::default(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::default(), var_init: HashMap::default(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::default(), assumed_trusted: HashMap::default(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::default(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::default(), vars: HashMap::default(), var_prov: HashMap::default(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::default(), var_init: HashMap::default(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::default(), assumed_trusted: HashMap::default(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), gloads: Default::default(), gl_caps: Default::default(), gl_win: Default::default(), loading: false, atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::default(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
         for (v, r) in &an.rings.rings {
             eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));
@@ -3759,12 +3828,29 @@ pub fn verify_ir(f: &Function) -> Report {
     for m in &f.contract.wg_maps {
         an.rep.add("GV-ASSUME", Severity::Info, format!("wg_bijection {:?} over grid axes {:?}: TRUSTED ({})", m.outs, m.axes, m.reason));
     }
-    let (gw_ok, gw_bad) = an.global_disjointness();
+    let (gw_ok, gw_bad, rw_ok, rw_bad) = an.global_disjointness();
     for _ in 0..gw_ok {
         an.rep.ok("global-write-disjoint");
     }
     for _ in 0..gw_bad {
         an.rep.unchecked_access("global-write-untracked");
+    }
+    for _ in 0..rw_ok {
+        an.rep.ok("global-rw-disjoint");
+    }
+    for (arg, n) in rw_bad {
+        let name = f.args.iter().find(|a| a.kernarg_offset == arg).map(|a| a.name.clone()).unwrap_or_else(|| format!("kernarg 0x{arg:x}"));
+        for _ in 0..n {
+            an.rep.unchecked_access("global-rw-untracked");
+        }
+        an.rep.add(
+            "GV-GLB-RW",
+            Severity::Warn,
+            format!(
+                "argument `{name}` is both loaded and stored, and its {n} load(s) are not proven disjoint from the stores of OTHER workgroups: a \
+                 cross-workgroup read-after-write / write-after-read race unless the launch orders them (workgroups run in no fixed order)"
+            ),
+        );
     }
     let has_asm = an.has_asm;
     let mut rep = an.rep;
