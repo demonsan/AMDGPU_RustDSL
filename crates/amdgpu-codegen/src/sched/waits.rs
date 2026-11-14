@@ -437,8 +437,17 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             touched.push(*s);
         }
     }
-    if let Some(n) = st.vm.need(&touched) {
-        
+    // a global load overwriting a register an older global load still writes needs no vmcnt wait: loads complete in issue order, so the
+    // younger data lands last (the physical-register check of the default path, `with_in_order_vm_waw`; the value-level pass never sees
+    // two values in one register)
+    let vm_touched: Vec<Slot> = if IN_ORDER_VM_WAW.with(|c| c.get()) && matches!(&e.mem, Some(a) if a.space == Space::Global) && !e.writes.is_empty() {
+        let mut v: Vec<Slot> = e.reads.clone();
+        v.retain(|s| !e.writes.contains(s) || e.reads.contains(s));
+        v
+    } else {
+        touched.clone()
+    };
+    if let Some(n) = st.vm.need(&vm_touched) {
         if let Some(o) = out {
             o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
         }
@@ -479,6 +488,18 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         o.push(inst.clone());
     }
     inserted
+}
+
+thread_local! {
+    static IN_ORDER_VM_WAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with global-load WAW against older global loads exempt (in-order completion); see `insert_waits_physical`.
+pub fn with_in_order_vm_waw<R>(f: impl FnOnce() -> R) -> R {
+    IN_ORDER_VM_WAW.with(|c| c.set(true));
+    let r = f();
+    IN_ORDER_VM_WAW.with(|c| c.set(false));
+    r
 }
 
 fn run_block(m: &MFunction, b: usize, st: &mut State, mut out: Option<&mut Vec<MInst>>) -> usize {

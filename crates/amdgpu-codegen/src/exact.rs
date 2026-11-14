@@ -183,6 +183,11 @@ fn diff(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::re
 
 /// Verifies a final (allocated) function without changing it: every fixing pass runs on a copy, and whatever it would insert is a
 /// violation (docs/exact-mode.md section 4). `strict` = the scheduled path's block-end MFMA padding.
+/// `diff` for callers outside this module (the default path's physical wait check).
+pub fn diff_pub(rule: &'static str, before: &MFunction, after: &MFunction, a: &crate::regalloc::Alloc, out: &mut Vec<Violation>) {
+    diff(rule, before, after, a, out)
+}
+
 pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> Vec<Violation> {
     verify_final_with(m, m, a, strict)
 }
