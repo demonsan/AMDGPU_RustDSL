@@ -37,7 +37,7 @@ fn asm(f: &Function) -> String {
 
 #[test]
 fn sgpr2_reads_the_uniform_operand_from_its_sgpr() {
-    let base = asm(&uniform_operand_kernel(&[]));
+    let base = amdgpu_codegen::without_scalar_defaults(|| asm(&uniform_operand_kernel(&[])));
     let s2 = asm(&uniform_operand_kernel(&["sgpr2"]));
     let has = |a: &str, re: &str| a.lines().any(|l| l.trim().starts_with(re) && l.contains(", s"));
     for mn in ["v_max_u32_e32", "v_min_u32_e32", "v_sub_u32_e32"] {

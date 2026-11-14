@@ -114,6 +114,14 @@ thread_local! {
     static NO_DEFAULT_SCALAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Run `f` with the uniform-scalar defaults off on this thread (tests that compare a token against the lowering without it).
+pub fn without_scalar_defaults<R>(f: impl FnOnce() -> R) -> R {
+    let was = NO_DEFAULT_SCALAR.with(|c| c.replace(true));
+    let r = f();
+    NO_DEFAULT_SCALAR.with(|c| c.set(was));
+    r
+}
+
 /// Are the uniform-scalar defaults in effect for this kernel (not exact, not switched off by `AMDC_NO_SCALAR_DEFAULT=1`, not in the SGPR fallback)?
 fn scalar_defaults_on(f: &amdgpu_dsl::Function) -> bool {
     !f.exact && !NO_DEFAULT_SCALAR.with(|c| c.get()) && std::env::var("AMDC_NO_SCALAR_DEFAULT").map_or(true, |v| v.is_empty() || v == "0")

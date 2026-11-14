@@ -67,6 +67,10 @@ fn a_view_used_before_the_write_stays_an_alias() {
 
 #[test]
 fn a_view_used_after_the_write_is_snapshotted() {
+    amdgpu_codegen::without_scalar_defaults(view_after_write_body)
+}
+
+fn view_after_write_body() {
     let f = kernel(true, false);
     let roots = stale_view_roots(&f);
     assert_eq!(roots.len(), 1, "the bitcast of the variable is a stale view");

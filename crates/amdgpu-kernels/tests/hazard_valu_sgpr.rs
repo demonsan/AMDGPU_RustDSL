@@ -62,7 +62,8 @@ fn check(asm: &str) -> Result<usize, String> {
 #[test]
 fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
     let f = kernel_by_name("probe_valu_sgpr").expect("registered");
-    let asm = compile_with(&f, &OwnTail).expect("compiles").asm;
+    // the probe's readfirstlane -> soffset sites exist in the lowering without the uniform-scalar defaults (which keep these values in SGPRs)
+    let asm = amdgpu_codegen::without_scalar_defaults(|| compile_with(&f, &OwnTail).expect("compiles").asm);
     match check(&asm) {
         Ok(n) => assert!(n >= 32, "the probe's readfirstlane -> soffset sites: {n}"),
         Err(e) => panic!("{e}"),
@@ -73,6 +74,6 @@ fn readfirstlane_results_wait_before_vmem_and_valu_readers() {
 #[test]
 fn the_check_bites_without_the_hazard_pass() {
     let f = kernel_by_name("probe_valu_sgpr").expect("registered");
-    let asm = amdgpu_codegen::hazards::testing::without_valu_sgpr(|| compile_with(&f, &OwnTail).expect("compiles").asm);
+    let asm = amdgpu_codegen::without_scalar_defaults(|| amdgpu_codegen::hazards::testing::without_valu_sgpr(|| compile_with(&f, &OwnTail).expect("compiles").asm));
     assert!(check(&asm).is_err(), "the regression check did not detect the missing VALU-writes-SGPR padding");
 }
