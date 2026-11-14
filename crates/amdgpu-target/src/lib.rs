@@ -5,6 +5,7 @@
 
 pub mod gfx1250;
 pub mod gfx950;
+pub mod gfx950_co;
 
 /// One target.
 #[derive(Debug)]

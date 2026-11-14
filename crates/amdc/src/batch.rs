@@ -222,3 +222,55 @@ pub fn ladder_hints(args: &[String]) -> ExitCode {
         }
     }
 }
+
+/// `amdc co-check <oracle.tsv>`: every line "asm<TAB>hex bytes" (llvm-mc's encoding) against the in-process encoder; prints the mismatches and errors grouped by mnemonic.
+pub fn co_check(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(1) else {
+        eprintln!("usage: amdc co-check <oracle.tsv>");
+        return ExitCode::from(2);
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("cannot read {path}");
+        return ExitCode::from(2);
+    };
+    let (mut total, mut ok) = (0usize, 0usize);
+    let mut bad: std::collections::BTreeMap<String, (usize, Vec<String>)> = std::collections::BTreeMap::new();
+    let no_label = |_: &str| None;
+    for l in text.lines() {
+        let Some((asm, hex)) = l.split_once('\t') else { continue };
+        total += 1;
+        let want: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
+        let mn = asm.split_whitespace().next().unwrap_or("").to_string();
+        match amdgpu_target::gfx950_co::enc::encode_line(asm, 0, &no_label) {
+            Ok(got) if got == want => ok += 1,
+            Ok(got) => {
+                let e = bad.entry(mn).or_default();
+                e.0 += 1;
+                if e.1.len() < 3 {
+                    let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                    e.1.push(format!("{asm}\n      want {}\n      got  {}", h(&want), h(&got)));
+                }
+            }
+            Err(msg) => {
+                let e = bad.entry(mn).or_default();
+                e.0 += 1;
+                if e.1.len() < 3 {
+                    e.1.push(format!("{asm}\n      error: {msg}"));
+                }
+            }
+        }
+    }
+    println!("co-check: {ok} of {total} lines encode identically; {} mnemonics with differences", bad.len());
+    let limit = args.iter().position(|a| a == "--show").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).unwrap_or(40);
+    for (mn, (n, ex)) in bad.iter().take(limit) {
+        println!("{mn}: {n} lines");
+        for e in ex.iter().take(2) {
+            println!("    {e}");
+        }
+    }
+    if ok == total {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
