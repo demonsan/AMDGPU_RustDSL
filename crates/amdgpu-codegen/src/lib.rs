@@ -83,17 +83,38 @@ pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
 /// lower -> [schedule] -> hazards -> verify -> register allocation. With the scheduler enabled
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.
+/// The inner-ladder index meaning "the per-phase fallback rung" / "the unscheduled body" in a ladder hint and in [`last_rung`].
+pub const RUNG_FREE_PHASES: u8 = 254;
+pub const RUNG_UNSCHEDULED: u8 = 255;
+
+thread_local! {
+    static LAST_RUNG: std::cell::Cell<(u8, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The (outer, inner) retry-ladder rung the last compile of this thread succeeded at (inner: the index in `pass::inner_ladder`, `RUNG_FREE_PHASES`, `RUNG_UNSCHEDULED`; 0 for a kernel without a scheduler): what
+/// `Function::ladder_hint` records.
+pub fn last_rung() -> (u8, u8) {
+    LAST_RUNG.with(|c| c.get())
+}
+
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
     // and try again. A kernel that allocates at the first attempt is unaffected.
     let mut last = String::new();
-    for extra in pass::OUTER_LADDER {
-        match lower_and_allocate_with(f, extra) {
-            Ok(r) => {
-                if r.0.lds_bytes > 160 * 1024 {
-                    return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", r.0.lds_bytes));
+    let hint = f.ladder_hint;
+    for (oi, extra) in pass::OUTER_LADDER.iter().enumerate() {
+        // a hinted kernel starts at its known rung: the earlier outer rungs are skipped, and the inner ladder of the hinted outer rung starts at the hinted inner rung
+        if hint.map_or(false, |h| (oi as u8) < h.0) {
+            continue;
+        }
+        let inner_start = hint.filter(|h| h.0 as usize == oi).map_or(0, |h| h.1);
+        match lower_and_allocate_with(f, extra, inner_start) {
+            Ok((m, a, rung)) => {
+                if m.lds_bytes > 160 * 1024 {
+                    return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", m.lds_bytes));
                 }
-                return Ok(r);
+                LAST_RUNG.with(|c| c.set((oi as u8, rung)));
+                return Ok((m, a));
             }
             Err(e) if pass::retryable(&e) => last = e,
             Err(e) => return Err(e),
@@ -108,7 +129,7 @@ fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
     f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse")
 }
 
-fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
+fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start: u8) -> Result<(mir::MFunction, regalloc::Alloc, u8), String> {
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
@@ -135,7 +156,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     };
     // exact authored mode: no scheduling, no allocation, no inserted waits / nops; the author's code is verified (docs/exact-mode.md)
     if f.exact {
-        return exact::finalize(f, base);
+        return exact::finalize(f, base).map(|(m, a)| (m, a, 0));
     }
     let sched_opts = scheduler_options(f).map(|mut o| {
         // weave regions: the strategies declared by name, mapped onto the region ids lowering stamped (one id per scope instance; an undeclared region inherits its parent's strategy)
@@ -168,7 +189,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let m0_reuse = m0_reuse_on(f);
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
-        for (cut, hoist) in pass::inner_ladder(&opts, base.workgroup_size) {
+        for (ri, (cut, hoist)) in pass::inner_ladder(&opts, base.workgroup_size).into_iter().enumerate() {
+            if inner_start >= RUNG_FREE_PHASES || (ri as u8) < inner_start {
+                continue;
+            }
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
             if let Some(h) = hoist {
@@ -178,14 +202,14 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
             let mut s = pass::MirState::new(base.clone());
             match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
-                Ok(()) => return Ok((s.m, s.alloc.expect("allocated"))),
+                Ok(()) => return Ok((s.m, s.alloc.expect("allocated"), ri as u8)),
                 Err(e) if pass::retryable(&e) => last_err = e,
                 Err(e) => return Err(e),
             }
         }
         // W3 B6c: before the whole kernel falls back, keep the schedule everywhere except the back-end-ordered (Free) plan phases, whose
         // regions keep their emitted order (waits still recomputed); docs/w3-b5-b6.md section 4
-        if let Some(o) = free_phases_unordered(f, &opts) {
+        if let Some(o) = free_phases_unordered(f, &opts).filter(|_| inner_start != RUNG_UNSCHEDULED) {
             let cx = pass::PassCtx { f, path: pass::Path::Scheduled, sched: Some(&o), hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
             let mut s = pass::MirState::new(base.clone());
             match pass::run_body(pass::SCHEDULED, &mut s, &cx) {
@@ -193,18 +217,20 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                     if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
                         eprintln!("sched: {}: the Free phases keep their order (allocation failed with them scheduled)", f.name);
                     }
-                    return Ok((s.m, s.alloc.expect("allocated")));
+                    return Ok((s.m, s.alloc.expect("allocated"), RUNG_FREE_PHASES));
                 }
                 Err(e) if pass::retryable(&e) => last_err = e,
                 Err(e) => return Err(e),
             }
         }
-        eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
+        if inner_start != RUNG_UNSCHEDULED {
+            eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
+        }
     }
     let cx = pass::PassCtx { f, path: pass::Path::Unscheduled, sched: None, hz_opts: hz_opts.as_ref(), hzfill, m0_reuse };
     let mut s = pass::MirState::new(base);
     pass::run_body(pass::UNSCHEDULED, &mut s, &cx)?;
-    Ok((s.m, s.alloc.expect("allocated")))
+    Ok((s.m, s.alloc.expect("allocated"), if hz_opts.is_some() { RUNG_UNSCHEDULED } else { 0 }))
 }
 
 /// The scheduler options with every region of a Free plan phase set to its emitted order (`rewait`), or None when no region belongs

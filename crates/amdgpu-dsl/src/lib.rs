@@ -1648,6 +1648,9 @@ pub struct Function {
     /// The kernel plan of the front-end Weaver (docs/two-weavers.md): constraints and hints for the back end. None for every kernel without one
     /// (nothing changes then).
     pub plan: Option<plan::KernelPlan>,
+    /// Compile-time hint: the first rung of the retry ladders (`amdgpu_codegen::pass::OUTER_LADDER` x the inner ladder) that this kernel compiles at, so a compile can skip the rungs known to run out of registers
+    /// (docs/compile-time.md). Output-neutral by construction (the skipped rungs fail) and checked by `crates/amdgpu-kernels/tests/ladder_hints.rs`; None for every kernel without an entry, cleared by specialization.
+    pub ladder_hint: Option<(u8, u8)>,
     /// Exact authored mode (docs/exact-mode.md): the instruction order, every register, the wait states and waits are the author's; the
     /// back end only verifies. false for every kernel that does not ask for it.
     pub exact: bool,
@@ -1916,6 +1919,7 @@ impl FnBuilder {
             regions: Vec::new(),
             reg_plan: Vec::new(),
             plan: None,
+            ladder_hint: None,
             exact: false,
             fp_mode: None,
             },

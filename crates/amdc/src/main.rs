@@ -16,6 +16,7 @@ fn usage() {
     eprintln!("  amdc dispatch decode16 <B> <HK> <CTX> [--page P]   (the paged-decode launch plan as JSON)");
     eprintln!("  amdc graph plan <graph.json | -> [--cus N] [--no-fuse] (the L1 launch plan of an op graph, docs/l1-graph.md)");
     eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
+    eprintln!("  amdc ladder-hints [--out FILE] [--jobs N]   the retry-ladder rung each kernel compiles at (crates/amdgpu-kernels/src/ladder_hints.rs)");
     eprintln!("  amdc compile-batch [--jobs N] [--names a,b,c] [--no-verify] [--assemble] [--repeat R] [--time]   compile many kernels on N threads and report where the time goes (docs/compile-time.md)");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--time] [--assemble] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
@@ -1241,6 +1242,7 @@ fn main() -> ExitCode {
             }
         }
         "compile-batch" => batch::compile_batch(&args),
+        "ladder-hints" => batch::ladder_hints(&args),
         "emit" => {
             let Some(name) = args.get(1) else {
                 usage();

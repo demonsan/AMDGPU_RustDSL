@@ -225,6 +225,7 @@ pub fn specialize(f: &Function, binds: &[(String, String)]) -> Result<Function, 
     let vals = check(f, binds)?;
     let cl = close(f, &vals)?;
     let mut g = f.clone();
+    g.ladder_hint = None; // a specialization may compile at an earlier rung than the generic kernel
     let ka = cl.ka;
     let syms = cl.syms;
     let kf: HashMap<u32, f32> = vals.iter().filter_map(|(_, o, v)| if let SpecValue::F32(x) = v { Some((*o, *x)) } else { None }).collect();
