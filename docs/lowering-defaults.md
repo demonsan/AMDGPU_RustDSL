@@ -48,4 +48,20 @@ port_gate (`fmha_fwd_hd128_mxfp8_v3`): OVERALL PASS. vs128 per-CU is 1.017x the 
 | Token | Result |
 |---|---|
 | `salu32` (unsigned / equality uniform compares on SCC) | decode16 −2 … −3 % on every case (family 0.977, alone and in the set); not a default |
-| `imm` (constants as VALU operands) | families neutral (0.986 … 1.005); topk_per_row decode −30 %, hd192 causal −3.9 %, mxfp8 4x8x2048 −2.8 %, fp8 blockscale GEMM −2.4 %; opt-in |
+| `imm` (constants as VALU operands) | families neutral (0.986 … 1.005); the topk_per_row −30 % was a miscompile (below), equal after the fix; opt-in |
+
+## A latent unsound fold found by the `imm` screen (fixed)
+
+**Symptom.** With `imm`, `topk_per_row_decode` returned wrong results on every row (`TKR_FAIL`, bad_rows 256 / 256) and ran 30 %
+slower. perf_ab did not flag it: the membound ok pattern `bad[a-z_]*=0` was matched by `past_end_bad=0`.
+
+**Cause.** `cmpfold` and `dce_cmp_pairs` recognised a 0/1 compare materialisation (`v_cmp ; v_cndmask t, 0, one`) by its SHAPE alone.
+- With `imm`, a select whose false arm is the constant 0 lowers to `v_cndmask d, 0, x`, with x an arbitrary per-lane value, right after the select's own compare.
+- cmpfold then rewrote a later `d != 0` into the select's compare `c`. That is wrong for the lanes where c holds and x is 0.
+- The kernels that carry `imm` in their policy (vs128 / kvsplit / t128 / replica / ring2, fp8pt, mla_decode, pa_decode16, attn_combine, rmsnorm_quant_mxfp4, hd192 causal; 24 kernels) contained the same pattern. Tests, run_all and port_gate (incl. its stress runs) passed on them, so their x values were evidently never 0 where it mattered, but the fold was unsound.
+
+**Fix.**
+- `cmp_i1` registers the materialisations it emits (`MAT01`); cmpfold and dce_cmp_pairs act only on those.
+- `crates/amdgpu-codegen/tests/cmpfold_select_zero.rs` reproduces the pattern; it fails on the pre-fix lowering.
+- perf_ab fails a case whose output carries a host failure marker (`XYZ_FAIL` / `FAIL`) even when the ok pattern matches, and the membound ok pattern no longer accepts `past_end_bad=0`.
+- The 24 kernels' goldens changed with the fix.

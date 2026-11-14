@@ -187,6 +187,7 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 | VALU 写 SGPR 的冒险（本轮新增）| `pad_valu_sgpr`（RA 之后）：VMEM 读该 SGPR 需 5 个等待态，VALU 读需 2 个（LLVM GCNHazardRecognizer：checkVMEMHazards、hasVDecCoExecHazard）；`probe_valu_sgpr` 在硬件上复现了不加等待时读到过期 SGPR（2048 个值中错 1984 个）；LLVM 尾端在相同位置插入相同的 s_nop |
 | 在途 load 的物理 WAW、物理 WAR | RA 之后的 `pad_inflight_waw` / `pad_physical_war`（本轮的 MLA / Vs128 错误发生在这里，不在 gpu_verify 的范围） |
 | 均匀性分析（scalarize / waveuni） | 编译器自身的分析，没有独立证明 |
+| lowering 的窥孔折叠（`cmpfold` / `dce_cmp_pairs`：把 0/1 物化的比较重新发出） | 只作用于 `cmp_i1` 登记的物化（`MAT01`），不再按指令形状识别。此前按形状识别：`imm` 下“假分支为常数 0 的 select”（`v_cndmask d, 0, x`）会被误折叠成它自己的比较（`topk_per_row` 在 imm 下全部行错）；带 imm 策略的 24 个出厂 kernel（vs128 等）含同样形状，测试、run_all、port_gate 均未触发，属潜在不健全，已修复。回归：`tests/cmpfold_select_zero.rs`（对修复前的 lowering 失败）；perf_ab 遇到主机的失败标记（`XYZ_FAIL`）即判该用例失败（docs/lowering-defaults.md） |
 | M0 / LDS-DMA 语义、调度器、LLVM 尾端、汇编器 | 门禁、探针、md5 回归 |
 | 可达 kernel 能否编译 | `dispatch_compile` 测试；本轮 `bf16_v3_causal` 的 SGPR 溢出就是这类漏网 |
 

@@ -235,6 +235,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         let (_, v) = uniform_analysis(f);
         lw.uvars = v.into_iter().filter(|x| matches!(f.var_tys.get(x.0 as usize), Some(DType::Ptr | DType::Rsrc))).collect();
     }
+    MAT01.with(|s| s.borrow_mut().clear());
     let res = lw.run(f);
     // diagnostics: which value each virtual register was lowered from (read by `diag::from_compile_error` for allocation failures)
     LAST_ORIGINS.with(|o| *o.borrow_mut() = lw.val.iter().map(|(v, r)| (*r, *v)).collect());
@@ -244,6 +245,17 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         (p.run)(&mut m)?;
     }
     Ok(m)
+}
+
+thread_local! {
+    /// The 0/1 compare materialisations of the current lowering (`cmp_i1`: `v_cmp ; v_cndmask t, 0, one`), by result register. cmpfold and
+    /// dce_cmp_pairs act ONLY on these: a select whose false arm is the inline constant 0 (`imm`) has the same shape `v_cndmask d, 0, x`
+    /// but is not a 0/1 value (re-folding it into its compare miscompiled topk_per_row with imm).
+    static MAT01: std::cell::RefCell<HashSet<VReg>> = std::cell::RefCell::new(HashSet::new());
+}
+
+fn is_mat01(inst: &MInst) -> bool {
+    inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) && inst.dst.map_or(false, |d| MAT01.with(|s| s.borrow().contains(&d)))
 }
 
 /// One lowering clean-up pass on the fresh MIR (gated by the lowering tokens in effect, `opt_on`).
@@ -1919,7 +1931,7 @@ impl Lowerer {
         }
     }
 
-    /// ``o = core + k`` through chains of ``x + const``: (core, k).
+    /// `o = core + k` through chains of `x + const`: (core, k).
     fn split_const(&self, o: Opnd) -> (Opnd, i64) {
         let mut cur = o;
         let mut k = 0i64;
@@ -4135,6 +4147,7 @@ impl Lowerer {
                 };
                 // (no SGPR operand here: v_cndmask_b32_e32 reads vcc through the constant bus, so an SGPR source would be a second read)
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
+                    // (also 0: cmpfold / dce_cmp_pairs act only on the materialisations `cmp_i1` registers in MAT01, not on this select's shape)
                     (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
                 };
@@ -5047,6 +5060,7 @@ impl Lowerer {
                 let one = self.const_vreg(1);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
+                MAT01.with(|s| s.borrow_mut().insert(d));
                 self.val.insert(dst, d);
                 return Ok(());
             }
@@ -5062,6 +5076,7 @@ impl Lowerer {
         let one = self.const_vreg(1);
         let d = self.new_vreg(RClass::V1);
         self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
+        MAT01.with(|s| s.borrow_mut().insert(d));
         self.val.insert(dst, d);
         Ok(())
     }
@@ -5184,7 +5199,7 @@ fn fold_select_cmp(m: &mut MFunction) {
                 mat.remove(&canon(d));
             }
             // materialisation: v_cndmask t, 0, one  right after a compare (a const mov may sit in between)
-            if inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) && inst.dst.is_some() {
+            if is_mat01(&inst) {
                 let mut j = i;
                 while j > 0 {
                     j -= 1;
@@ -5231,7 +5246,7 @@ fn dce_cmp_pairs(m: &mut MFunction) {
         let mut dead = vec![false; b.insts.len()];
         for i in 0..b.insts.len() {
             let inst = &b.insts[i];
-            if inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) {
+            if is_mat01(inst) {
                 if let Some(d) = inst.dst {
                     if used.get(&d).copied().unwrap_or(0) == 0 && !alias.contains_key(&d) {
                         let mut j = i;
