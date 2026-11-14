@@ -176,7 +176,8 @@ fn src(op: &Op) -> Result<(u16, Option<u32>), String> {
             },
             None,
         ),
-        Op::Int(v) => {
+        Op::Int(v0) => {
+            let v = &(if (0x8000_0000..=0xffff_ffff).contains(v0) { *v0 - (1i64 << 32) } else { *v0 });
             if (0..=64).contains(v) {
                 (128 + *v as u16, None)
             } else if (-16..0).contains(v) {
@@ -362,6 +363,21 @@ fn dpp_ctrl(s: &str) -> Result<u32, String> {
 }
 
 fn enc_vop12c(i: &Inst, fmt: &str, op: u32) -> Result<Vec<u8>, String> {
+    match enc_vop12c_e32(i, fmt, op) {
+        Err(e) if !(i.mn.ends_with("_e32") || i.mn.ends_with("_dpp") || i.mn.ends_with("_sdwa")) => {
+            // no suffix: the assembler picks the 64-bit form when the 32-bit one cannot hold the operands
+            let base = match fmt {
+                "VOP2" => 0x100,
+                "VOP1" => 0x140,
+                _ => 0,
+            };
+            enc_vop3(i, base + op).map_err(|e2| format!("{e}; as VOP3: {e2}"))
+        }
+        r => r,
+    }
+}
+
+fn enc_vop12c_e32(i: &Inst, fmt: &str, op: u32) -> Result<Vec<u8>, String> {
     let dpp = i.mn.ends_with("_dpp");
     let sdwa = i.mn.ends_with("_sdwa");
     // operands without the implicit vcc tokens
@@ -370,7 +386,12 @@ fn enc_vop12c(i: &Inst, fmt: &str, op: u32) -> Result<Vec<u8>, String> {
     let (dst, s0, s1): (Option<&Op>, &Op, Option<&Op>);
     match fmt {
         "VOP2" => {
-            if o.len() == 4 && is_vcc(o[3]) {
+            if o.len() == 5 && is_vcc(o[1]) && is_vcc(o[4]) {
+                o.pop();
+                o.remove(1);
+            } else if o.len() == 4 && is_vcc(o[1]) && !is_vcc(o[3]) {
+                o.remove(1);
+            } else if o.len() == 4 && is_vcc(o[3]) {
                 o.pop();
             }
             if o.len() != 3 {
@@ -441,6 +462,14 @@ fn enc_vop12c(i: &Inst, fmt: &str, op: u32) -> Result<Vec<u8>, String> {
             0x100 + x.parse::<u32>().map_err(|e| e.to_string())?
         } else if let Some(x) = md(i, "row_shr") {
             0x110 + x.parse::<u32>().map_err(|e| e.to_string())?
+        } else if let Some(x) = md(i, "wave_shl") {
+            0x130 + x.parse::<u32>().map_err(|e| e.to_string())? - 1
+        } else if let Some(x) = md(i, "wave_rol") {
+            0x134 + x.parse::<u32>().map_err(|e| e.to_string())? - 1
+        } else if let Some(x) = md(i, "wave_shr") {
+            0x138 + x.parse::<u32>().map_err(|e| e.to_string())? - 1
+        } else if let Some(x) = md(i, "wave_ror") {
+            0x13c + x.parse::<u32>().map_err(|e| e.to_string())? - 1
         } else if let Some(x) = md(i, "row_ror") {
             0x120 + x.parse::<u32>().map_err(|e| e.to_string())?
         } else {
@@ -590,8 +619,49 @@ fn enc_vop3(i: &Inst, op: u32) -> Result<Vec<u8>, String> {
     Ok(v)
 }
 
-fn enc_mfma_scale(_i: &Inst, _op: u32) -> Result<Vec<u8>, String> {
-    Err("v_mfma_scale: not yet".into())
+fn enc_mfma_scale(i: &Inst, _op: u32) -> Result<Vec<u8>, String> {
+    // 128 bits: [scales: op 0x2ac, src0 = scale A, src1 = scale B, op_sel / op_sel_hi] [the MFMA: op 0x2ad, vdst, A, B, C, cbsz, blgp, acc bits]
+    let ops = &i.ops;
+    if ops.len() != 6 {
+        return Err("v_mfma_scale: expected 6 operands".into());
+    }
+    let (vd, a, b, c) = (reg_n(&ops[0])?, &ops[1], &ops[2], &ops[3]);
+    let (sa, sb) = (reg_n(&ops[4])?, reg_n(&ops[5])?);
+    let mut h1d0: u32 = 0xD3AC_0000;
+    let mut h1d1: u32 = (256 + sa) | (256 + sb) << 9;
+    if let Some(s) = md(i, "op_sel") {
+        for (k, bit) in sel_bits(s).iter().enumerate() {
+            if *bit != 0 {
+                h1d0 |= 1 << (11 + k);
+            }
+        }
+    }
+    if let Some(s) = md(i, "op_sel_hi") {
+        let hi = sel_bits(s);
+        h1d1 |= (hi.first().copied().unwrap_or(0) & 1) << 27 | (hi.get(1).copied().unwrap_or(0) & 1) << 28;
+        h1d0 |= (hi.get(2).copied().unwrap_or(0) & 1) << 14;
+    }
+    let cbsz = md(i, "cbsz").map_or(0, |x| x.parse::<u32>().unwrap_or(0));
+    let blgp = md(i, "blgp").map_or(0, |x| x.parse::<u32>().unwrap_or(0));
+    let mut h2d0: u32 = 0xD3AD_0000 | vd | cbsz << 8 | 1 << 11;
+    if is_agpr(&ops[0]) {
+        h2d0 |= 1 << 15;
+    }
+    let (ca, _) = src(a)?;
+    let (cb, _) = src(b)?;
+    let (cc, _) = src(c)?;
+    let mut h2d1: u32 = ca as u32 | (cb as u32) << 9 | (cc as u32) << 18 | blgp << 29;
+    if is_agpr(a) {
+        h2d1 |= 1 << 27;
+    }
+    if is_agpr(b) {
+        h2d1 |= 1 << 28;
+    }
+    let mut v = d32(h1d0);
+    v.extend(d32(h1d1));
+    v.extend(d32(h2d0));
+    v.extend(d32(h2d1));
+    Ok(v)
 }
 
 fn enc_ds(i: &Inst, op: u32) -> Result<Vec<u8>, String> {
@@ -629,6 +699,15 @@ fn enc_ds(i: &Inst, op: u32) -> Result<Vec<u8>, String> {
         if let Some(sw) = v.strip_prefix("swizzle(QUAD_PERM,") {
             let p: Vec<u32> = sw.trim_end_matches(')').split(',').map(|x| x.parse().unwrap_or(0)).collect();
             off16 = 0x8000 | p[0] | p[1] << 2 | p[2] << 4 | p[3] << 6;
+        } else if let Some(sw) = v.strip_prefix("swizzle(SWAP,") {
+            let n: u32 = sw.trim_end_matches(')').parse().map_err(|_| "swizzle SWAP")?;
+            off16 = 0x1f | n << 10;
+        } else if let Some(sw) = v.strip_prefix("swizzle(REVERSE,") {
+            let n: u32 = sw.trim_end_matches(')').parse().map_err(|_| "swizzle REVERSE")?;
+            off16 = 0x1f | (n - 1) << 10;
+        } else if let Some(sw) = v.strip_prefix("swizzle(BROADCAST,") {
+            let p: Vec<u32> = sw.trim_end_matches(')').split(',').map(|x| x.parse().unwrap_or(0)).collect();
+            off16 = (0x1f & !(p[0] - 1)) | p[1] << 5;
         } else {
             off16 = parse_num(v).ok_or("ds offset")? as u32 & 0xffff;
         }
@@ -644,12 +723,12 @@ fn enc_ds(i: &Inst, op: u32) -> Result<Vec<u8>, String> {
     if two {
         off16 = o0 | o1 << 8;
     }
-    let mut d0 = 0xD800_0000 | (op & 0x7f) << 18 | off16;
-    if acc || op & 0x80 != 0 {
+    let mut d0 = 0xD800_0000 | op << 17 | off16;
+    if acc {
         d0 |= 1 << 25;
     }
     if has(i, "gds") {
-        d0 |= 1 << 17;
+        d0 |= 1 << 16;
     }
     let d1 = addr | d0v << 8 | d1v << 16 | vdst << 24;
     let mut v = d32(d0);

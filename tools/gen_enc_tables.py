@@ -13,7 +13,7 @@ def fmt(b):  # b: bytes of the instruction
     if (d0>>31)==0: return 'VOP2',(d0>>25)&0x3f
     if top6==0x34: return 'VOP3',(d0>>16)&0x3ff
     if top6==0x33: return 'VOP3P',(d0>>16)&0x7f
-    if top6==0x36: return 'DS',(d0>>18)&0xff
+    if top6==0x36: return 'DS',(d0>>17)&0xff
     if top6==0x38: return 'MUBUF',(d0>>18)&0x7f
     if top6==0x3a: return 'MTBUF',(d0>>16)&0xf
     if top6==0x37: 
