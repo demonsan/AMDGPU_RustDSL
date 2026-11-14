@@ -1645,19 +1645,57 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     let mut untagged: BTreeSet<usize> = BTreeSet::new();
     let mut checked = 0usize;
     let mut paths = 0usize;
-    for n in 1..=nmax {
-        let t0 = enumerate_traces(f, 0, n, &div, &mut diags, &mut untagged);
-        let t1 = enumerate_traces(f, 1, n, &div, &mut diags, &mut untagged);
+    // One scenario per loop-iteration count n: enumerate the traces of both roles, check the plan's rings, check every compatible pair. The scenarios are independent except that a finding is reported once per
+    // (code, statement) / message over the whole run (the `diags` dedupe). A run with NO finding in any scenario cannot depend on that dedupe (it only ever removes findings), so the scenarios of a clean kernel
+    // run concurrently and merge their counters; any finding anywhere re-runs the sequential loop, which reports exactly as before (the reference mode of the differential test is always sequential).
+    let run_n = |n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>, checked: &mut usize, paths: &mut usize| {
+        let t0 = enumerate_traces(f, 0, n, &div, diags, untagged);
+        let t1 = enumerate_traces(f, 1, n, &div, diags, untagged);
         for tr in t0.iter().chain(t1.iter()) {
-            check_plan_rings(f, tr, &mut diags);
+            check_plan_rings(f, tr, diags);
         }
         for a in &t0 {
             for b in &t1 {
                 if compatible(a, b) {
-                    paths += 1;
-                    check_pair(f, [a, b], n, &mut diags, &mut checked, &own_reuse, &owned);
+                    *paths += 1;
+                    check_pair(f, [a, b], n, diags, checked, &own_reuse, &owned);
                 }
             }
+        }
+    };
+    let mut done_parallel = false;
+    if nmax >= 2 && !REFERENCE_PAIR_CHECKS.with(|c| c.get()) {
+        let workers = std::thread::available_parallelism().map_or(1, |p| p.get()).min(nmax).min(16);
+        if workers >= 2 {
+            let next = std::sync::atomic::AtomicUsize::new(1);
+            let results = std::sync::Mutex::new(Vec::new());
+            std::thread::scope(|sc| {
+                for _ in 0..workers {
+                    sc.spawn(|| loop {
+                        let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n > nmax {
+                            break;
+                        }
+                        let (mut d, mut u, mut c, mut p) = (Vec::new(), BTreeSet::new(), 0usize, 0usize);
+                        run_n(n, &mut d, &mut u, &mut c, &mut p);
+                        results.lock().unwrap().push((d, u, c, p));
+                    });
+                }
+            });
+            let results = results.into_inner().unwrap();
+            if results.iter().all(|r| r.0.is_empty()) {
+                for (_, u, c, p) in results {
+                    untagged.extend(u);
+                    checked += c;
+                    paths += p;
+                }
+                done_parallel = true;
+            }
+        }
+    }
+    if !done_parallel {
+        for n in 1..=nmax {
+            run_n(n, &mut diags, &mut untagged, &mut checked, &mut paths);
         }
     }
     // the claimed period must be real: verify it on the longest simulated trace of each role
