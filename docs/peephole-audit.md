@@ -17,5 +17,13 @@ lowering / MIR fold was audited for the same class of bug: for each, the precond
 | `remat_consts` / `remat_exprs` / LDS-spill reloads (opt-in remat1-4) | the clone runs under the EXEC its readers run under | **bug**: a clone in a block that narrows EXEC was read under the full EXEC | no clone / reload in an EXEC-changing block | `remat_does_not_clone_under_a_narrow_exec` |
 | `batch_kernarg_loads`, `retarget_def` (itself), `retarget_producer`, `lazy_add` / `split_const`, `coalesce`, `dce_cmp_pairs`, `m0_source`, `m0::explicit`, `const_of` / `const_bits`, `lower_condition` VCC folds, `VCndmaskM` | (as stated in the code) | sound | - | - |
 
-The DSL-level and M0 tests fail on the pre-audit compiler and pass after it. Only the f32 `select_minmax` fold changed shipped code
-(argmax_bf16_v128256, sample_bf16_v128256, sample_topkp_bf16_v128256: their f32 max reductions keep the select semantics).
+The DSL-level and M0 tests fail on the pre-audit compiler and pass after it; on hardware, `ops_check.py select_f32`
+(`probe_select_f32`: NaN and signed-zero pairs) fails on the pre-audit compiler (48 of 128 values) and passes after it.
+
+The only shipped code the f32 fold reached were the per-thread running maxima of argmax / sample (`argmax_bf16_v128256`,
+`sample_bf16_v128256`, `sample_topkp_bf16_v128256`). Keeping the select there cost mb/argmax v128256 5 % (0.951, 9 reps). The kernels now
+state the hardware max themselves (`Op::MaxF32`): it equals the select there because the running maximum is never a NaN (it starts at -inf
+and only takes values that compared greater) and an equal zero's sign does not reach the result (the index keeps the compare's choice; the
+value only feeds `best == block max`). Their code is identical to before the audit (same md5), so no performance change. Both kernels
+ignore a NaN logit (it never compares greater); torch.argmax returns the first NaN's index - a pre-existing kernel-level deviation, not
+changed here.
