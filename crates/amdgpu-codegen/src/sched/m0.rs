@@ -16,12 +16,14 @@ fn m0_src(inst: &MInst) -> Option<VReg> {
 /// Mark the redundant M0 writes; returns how many were saved.
 pub fn reuse(m: &mut MFunction) -> usize {
     let alias = m.alias.clone();
-    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
+    // (base register, dword offset): two views of one tuple are the same source only at the same offset
+    let canon = |r: VReg| alias.get(&r).map(|a| (a.0, a.1 as u32)).unwrap_or((r, 0));
     let mut saved = 0;
     for b in &mut m.blocks {
-        let mut last: Option<VReg> = None;
+        let mut last: Option<(VReg, u32)> = None;
         for inst in b.insts.iter_mut() {
-            if inst.pin {
+            // a pinned (hand-written) instruction or another M0 writer (`set_m0`, an M0 add) changes M0
+            if inst.pin || is_m0_writer(inst.op) {
                 last = None;
                 continue;
             }
@@ -36,8 +38,9 @@ pub fn reuse(m: &mut MFunction) -> usize {
                 }
                 continue;
             }
+            // a write to any part of the source's tuple invalidates it
             if let (Some(d), Some(l)) = (inst.dst, last) {
-                if canon(d) == l {
+                if canon(d).0 == l.0 {
                     last = None;
                 }
             }

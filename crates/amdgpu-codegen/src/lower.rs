@@ -188,15 +188,27 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                 }
                 lw.ghosts = ghost;
             }
+            // a definition evaluated later (at its reader) must see the same operands and the same EXEC: no set_var of a variable it reads,
+            // no EXEC change, no control-flow boundary in between
+            let movable = |k: usize, to: usize, op: &Op| -> bool {
+                let vars: Vec<amdgpu_dsl::VarId> = op.operands().iter().filter_map(|o| if let Opnd::Var(v) = o { Some(*v) } else { None }).collect();
+                to > k
+                    && !stmts[k + 1..to].iter().any(|s| match s {
+                        Stmt::SetVar { var, .. } => vars.contains(var),
+                        Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } => true,
+                        Stmt::BeginIf { .. } | Stmt::Else | Stmt::EndIf | Stmt::BeginLoop { .. } | Stmt::EndLoop | Stmt::BreakIf { .. } | Stmt::DeclareVars { .. } => true,
+                        _ => false,
+                    })
+            };
             for (k, st) in stmts.iter().enumerate() {
                 let Stmt::Let { dst, op } = st else { continue };
                 let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
                 match op {
                     // read by set_m0 (and otherwise only by the DMAs' LDS-address operand, which is the verifier's view of M0)
-                    Op::AddI32(..) if !pinned.contains(dst) && rd.iter().any(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. } | Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. })) => {
+                    Op::AddI32(..) if !pinned.contains(dst) && rd.iter().any(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. } | Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. })) && rd.iter().filter(|&&r| matches!(&stmts[r], Stmt::SetM0 { .. })).all(|&r| movable(k, r, op)) => {
                         lw.m0_adds.insert(*dst);
                     }
-                    Op::Cmp { .. } if rd.len() == 1 => {
+                    Op::Cmp { .. } if rd.len() == 1 && movable(k, rd[0], op) => {
                         if let Stmt::Let { dst: n, op: Op::NotI1(Opnd::Val(c)) } = &stmts[rd[0]] {
                             if c == dst && lw.mask_i1.contains(n) {
                                 lw.neg_folded.insert(*dst);
@@ -205,7 +217,6 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
                     }
                     _ => {}
                 }
-                let _ = k;
             }
         }
         // exact mode: a value is scalar exactly when the author pinned it to an SGPR (and it is provably wave-uniform)
@@ -673,43 +684,15 @@ impl Lowerer {
                         count(&o);
                     }
                 }
-                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => {
-                    count(base);
-                    count(value);
-                }
-                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => {
-                    count(addr);
-                    count(value);
-                }
-                Stmt::BufferStore { rsrc, voff, soff, value, .. } => {
-                    count(rsrc);
-                    for o in voff.iter() {
-                        count(o);
-                    }
-                    count(soff);
-                    count(value);
-                }
-                Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, .. } => {
-                    count(rsrc);
-                    for o in voff.iter() {
-                        count(o);
-                    }
-                    count(soff);
-                    count(lds_addr);
-                }
-                Stmt::SetVar { value, .. } => count(value),
-                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
+                // contract markers read nothing at run time
+                Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::Assume { .. } => {}
+                // every other statement: each operand occurrence is a use (asm inputs, variable MFMA / pk-fma / set-lane forms, scope
+                // inits, LDS-DMA addresses, set_m0, ...): the "single use" folds rely on a complete count
+                _ => {
                     for o in amdgpu_dsl::stmt_operands(st) {
                         count(&o);
                     }
                 }
-                Stmt::BeginLoop { init, .. } => {
-                    for o in init {
-                        count(o);
-                    }
-                }
-                Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => count(cond),
-                _ => {}
             }
         }
 
@@ -1842,15 +1825,17 @@ impl Lowerer {
                     }
                 }
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
+                    // (the folded add's other operand is read HERE, at the access: only an SSA value whose register no `set_var` can
+                    // rewrite in between - not a variable, nor a value living in a variable's register)
                     if let Some(k) = self.const_of(y) {
-                        if k >= 0 && off + k < 65536 {
+                        if k >= 0 && off + k < 65536 && self.stable_at_use(x) {
                             off += k;
                             cur = x;
                             continue;
                         }
                     }
                     if let Some(k) = self.const_of(x) {
-                        if k >= 0 && off + k < 65536 {
+                        if k >= 0 && off + k < 65536 && self.stable_at_use(y) {
                             off += k;
                             cur = y;
                             continue;
@@ -1861,6 +1846,20 @@ impl Lowerer {
             break;
         }
         Ok((self.as_v1(cur)?, off))
+    }
+
+    /// May the operand of an earlier definition be read at a later instruction instead (the value cannot have changed)? Constants and SSA
+    /// values in their own registers can; a variable (or a value whose register is a variable's) may have been set in between.
+    fn stable_at_use(&self, o: Opnd) -> bool {
+        match o {
+            Opnd::Var(_) => false,
+            Opnd::Val(v) => match self.val.get(&v) {
+                Some(&r) => !self.var_backed(r),
+                // (not lowered yet: a lazy add or a constant, materialised on demand from SSA values)
+                None => true,
+            },
+            _ => true,
+        }
     }
 
     /// Is `r` a loop variable's register or a view (lane / sub-register) of one? Such registers are overwritten in place.
@@ -2942,15 +2941,21 @@ impl Lowerer {
                     let sreg = if let Some(s) = direct {
                         self.touch(&[Src::Reg(s)]);
                         s
-                    } else { match self.rfl_cache.get(&lv) {
-                        Some(s) => *s,
-                        None => {
-                            let s = self.new_vreg(RClass::S1);
-                            self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(lv));
-                            self.rfl_cache.insert(lv, s);
-                            s
+                    } else {
+                        // (a variable's register is rewritten by `set_var`: its readfirstlane is not reusable)
+                        let cacheable = !self.var_backed(lv);
+                        match self.rfl_cache.get(&lv).filter(|_| cacheable) {
+                            Some(s) => *s,
+                            None => {
+                                let s = self.new_vreg(RClass::S1);
+                                self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(lv));
+                                if cacheable {
+                                    self.rfl_cache.insert(lv, s);
+                                }
+                                s
+                            }
                         }
-                    } };
+                    };
                     // imm = instruction offset: added to the global address AND to the LDS destination (M0 + imm + 16 lane)
                     if let Some((sr0, off0)) = sad {
                         let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128S } else { MOp::GlobalLoadLdsB32S };
@@ -3588,6 +3593,9 @@ impl Lowerer {
                     n => return Err(format!("frag_cat of {n} dwords")),
                 };
                 let d = self.new_vreg(cls);
+                // (a value given as several parts - `frag_cat([x, x])` - is read once per occurrence, while `read_counts` counts it once:
+                // only a part that occurs once may take over its producer)
+                let occurrences: Vec<Opnd> = regs.iter().map(|x| x.0).collect();
                 for (p, r, off, w) in regs {
                     let c = match w {
                         1 => RClass::V1,
@@ -3599,7 +3607,7 @@ impl Lowerer {
                     // IN PLACE: a part that is a fresh, single-use value defined in this block by an instruction that fully writes it gets that
                     // instruction retargeted to its slot of the result (no copy, and no wait for an in-flight load)
                     if let Opnd::Val(v) = p {
-                        if self.read_counts.get(&v).copied() == Some(1) && self.retarget_def(r, d, off, c) {
+                        if self.read_counts.get(&v).copied() == Some(1) && occurrences.iter().filter(|q| **q == p).count() == 1 && self.retarget_def(r, d, off, c) {
                             continue;
                         }
                     }
@@ -5529,7 +5537,8 @@ fn remat_consts(m: &mut MFunction, max_blocks: usize) {
     // loop blocks using each constant
     let mut users: HashMap<VReg, Vec<usize>> = HashMap::new();
     for (bi, b) in m.blocks.iter().enumerate() {
-        if !in_loop[bi] {
+        // (a block that changes EXEC is not a remat target: the clone would run under one EXEC and be read under another)
+        if !in_loop[bi] || b.insts.iter().any(|i| matches!(i.op, MOp::SExecSet | MOp::SExecAll | MOp::SRestoreExec)) {
             continue;
         }
         for inst in &b.insts {
@@ -5663,7 +5672,13 @@ fn remat_exprs(m: &mut MFunction) {
     }
     for (c, e) in cands {
         let blocks: Vec<usize> = (0..m.blocks.len())
-            .filter(|&bi| in_loop[bi] && m.blocks[bi].insts.iter().any(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c))))
+            // (not in a block that changes EXEC: the clone would run under one EXEC and be read under another; such a block keeps
+            // reading the original value)
+            .filter(|&bi| {
+                in_loop[bi]
+                    && m.blocks[bi].insts.iter().any(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c)))
+                    && !m.blocks[bi].insts.iter().any(|i| matches!(i.op, MOp::SExecSet | MOp::SExecAll | MOp::SRestoreExec))
+            })
             .collect();
         for bi in blocks {
             // fresh copies of the expression, renamed
@@ -5761,12 +5776,18 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
         }
         let mut loop_blocks: HashMap<VReg, std::collections::BTreeSet<usize>> = HashMap::new();
         let mut loop_uses: HashMap<VReg, usize> = HashMap::new();
+        // values read in a block that changes EXEC: a reload there would run under one EXEC and be read under another
+        let mut exec_read: HashSet<VReg> = HashSet::new();
         for (bi, b) in m.blocks.iter().enumerate() {
             if !in_loop[bi] {
                 continue;
             }
+            let exec_block = b.insts.iter().any(|i| matches!(i.op, MOp::SExecSet | MOp::SExecAll | MOp::SRestoreExec));
             for inst in &b.insts {
                 for r in inst.uses() {
+                    if exec_block {
+                        exec_read.insert(r);
+                    }
                     loop_blocks.entry(r).or_default().insert(bi);
                     *loop_uses.entry(r).or_insert(0) += 1;
                 }
@@ -5775,7 +5796,7 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
         let mut cands: Vec<(usize, usize, VReg)> = Vec::new();
         for (r, blocks) in &loop_blocks {
             let r = *r;
-            if r == addr || m.vreg_class(r) != RClass::V1 || m.alias.contains_key(&r) || ndefs.get(&r) != Some(&1) {
+            if r == addr || m.vreg_class(r) != RClass::V1 || m.alias.contains_key(&r) || ndefs.get(&r) != Some(&1) || exec_read.contains(&r) {
                 continue;
             }
             let Some(&(db, di)) = def.get(&r) else { continue };
@@ -6353,6 +6374,7 @@ pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {
 /// vcc free. f32: identical for ordered operands (a NaN operand: v_min / v_max return the other operand, the select returned b).
 fn select_minmax(m: &mut MFunction) {
     use MOp::*;
+    let fminmax = opt_on("fminmax");
     // (compare, select-a-is-x gives) -> (op when a == x, op when a == y)
     let pick = |c: MOp| -> Option<(MOp, MOp)> {
         Some(match c {
@@ -6360,8 +6382,10 @@ fn select_minmax(m: &mut MFunction) {
             VCmpGtI32 | VCmpGeI32 => (VMaxI32, VMinI32),
             VCmpLtU32 | VCmpLeU32 => (VMinU32, VMaxU32),
             VCmpGtU32 | VCmpGeU32 => (VMaxU32, VMinU32),
-            VCmpLtF32 | VCmpLeF32 => (VMinF32, VMaxF32),
-            VCmpGtF32 | VCmpGeF32 => (VMaxF32, VMinF32),
+            // f32 only with `fminmax` (opt-in): the select and v_min / v_max differ when the second compare operand is a NaN (the select
+            // returns it, v_min / v_max the other operand) and for +0 / -0 (the select keeps the compare's order, v_min / v_max their own)
+            VCmpLtF32 | VCmpLeF32 if fminmax => (VMinF32, VMaxF32),
+            VCmpGtF32 | VCmpGeF32 if fminmax => (VMaxF32, VMinF32),
             _ => return None,
         })
     };
@@ -6464,6 +6488,8 @@ fn fuse_minmax3(m: &mut MFunction) {
         }
     }
     let alias = m.alias.clone();
+    // the register a value lives in, through views (a write to any part of a tuple writes its base)
+    let base = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     for b in &mut m.blocks {
         // constants defined in this block (v_mov r, imm)
         let mut konst: HashMap<VReg, i64> = HashMap::new();
@@ -6472,7 +6498,8 @@ fn fuse_minmax3(m: &mut MFunction) {
         for i in 0..b.insts.len() {
             let inst = b.insts[i].clone();
             if let Some(d) = inst.dst {
-                konst.remove(&d);
+                let bd = base(d);
+                konst.retain(|r, _| base(*r) != bd);
                 if inst.op == VMovB32 {
                     if let Some(Src::Imm(v)) = inst.srcs.first() {
                         konst.insert(d, *v);
@@ -6504,12 +6531,17 @@ fn fuse_minmax3(m: &mut MFunction) {
                             continue;
                         }
                         // the inner operands must not be redefined between j and i
-                        let redefined = b.insts[j + 1..i].iter().any(|z| z.dst.map_or(false, |x| iregs.contains(&x)));
+                        // (through views: a write to any part of an operand's tuple, e.g. an MFMA into the tuple a lane view reads)
+                        let redefined = b.insts[j + 1..i].iter().any(|z| z.dst.map_or(false, |x| iregs.iter().any(|r| base(*r) == base(x))));
                         if redefined {
                             continue;
                         }
                         let new = if matches!(outer, VMinI32 | VMinU32 | VMinF32) && inner.op == inner_max {
-                            // min(max(x, lo), hi): lo, hi constants with lo <= hi
+                            // min(max(x, lo), hi): lo, hi constants with lo <= hi (f32 only with `fminmax`: v_med3_f32's NaN handling is
+                            // not the min / max chain's)
+                            if outer == VMinF32 && !opt_on("fminmax") {
+                                continue;
+                            }
                             let (x, lo) = match (konst.get(&iregs[0]), konst.get(&iregs[1])) {
                                 (None, Some(l)) => (iregs[0], (iregs[1], *l)),
                                 (Some(l), None) => (iregs[1], (iregs[0], *l)),
