@@ -1835,7 +1835,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, exact: false, fp_mode: None };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, ladder_hint: None, exact: false, fp_mode: None };
         f.set_body(body);
         f
     }
