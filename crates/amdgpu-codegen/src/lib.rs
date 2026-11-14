@@ -130,16 +130,35 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     Err(last)
 }
 
+/// Experiment switch `AMDC_LOWER_ADD=<tokens>`: comma-separated lowering tokens appended to every non-exact kernel on top of its policy
+/// (`name-substring:tokens` entries, separated by `;`, restrict them to matching kernels) - for measuring a token before it becomes a default.
+pub fn lower_add_tokens(f: &amdgpu_dsl::Function) -> Vec<String> {
+    match std::env::var("AMDC_LOWER_ADD") {
+        Ok(spec) if !spec.is_empty() && !f.exact => spec
+            .split(';')
+            .filter_map(|e| match e.split_once(':') {
+                Some((k, toks)) if f.name.contains(k) => Some(toks.to_string()),
+                Some(_) => None,
+                None => Some(e.to_string()),
+            })
+            .flat_map(|toks| toks.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
     // the GEMM profile's policy, or the lowering token `m0reuse` on any kernel (W3 B2: one M0 write per group of LDS-DMA issues)
-    f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse")
+    f.compile_policy().m0_reuse || f.lower_opts.iter().any(|t| t == "m0reuse") || lower_add_tokens(f).iter().any(|t| t == "m0reuse")
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start: u8) -> Result<(mir::MFunction, regalloc::Alloc, u8), String> {
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
     let mut extra_all: Vec<&str> = extra.to_vec();
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
+    let lower_add = lower_add_tokens(f);
+    extra_all.extend(lower_add.iter().map(|s| s.as_str()));
     // exact mode: operands in the form the instruction takes (inline / literal constants, SGPR sources), never via a copy
     if f.exact {
         // edgepad: MFMA windows still open at a block end are carried into the successors (checked there), not padded at every block end
