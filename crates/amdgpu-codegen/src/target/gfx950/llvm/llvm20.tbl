@@ -589,3 +589,15 @@ BufferStoreDwordX4:rrrr | <- V4 S4 V1 S1 | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}
 BufferStoreDwordX4:rrri | <- V4 S4 V1 I | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
 BufferStoreDwordX4:rrir | <- V4 S4 I S1 | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
 BufferStoreDwordX4:rrii | <- V4 S4 I I | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
+
+# SALU forms of the scalar lowering options (scalarize / salu32 / sgpr / m0reuse)
+SAddkI32:r  | S1 <- S1 | {d} = S_ADD_I32 {s0}, {imm}, implicit-def $scc
+SLoadDwordx4 | S4 <-   | {d} = S_LOAD_DWORDX4_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s128), addrspace 4)
+SLoadDwordPtr | S1 <- S2 | {d} = S_LOAD_DWORD_IMM {s0}, {imm}, 0 :: (dereferenceable invariant load (s32), addrspace 4)
+SMemTime    | S2 <-    | {d} = S_MEMTIME
+SCselectB32 | S1 <- S1 S1 | {d} = S_CSELECT_B32 {s0}, {s1}, implicit $scc
+SCselectB64 | S2 <- S2 S2 | {d} = S_CSELECT_B64 {s0}, {s1}, implicit $scc
+SMinI32     | S1 <- S1 S1 | {d} = S_MIN_I32 {s0}, {s1}, implicit-def $scc
+SLoPart     | S1 <- S2 | {d} = S_MOV_B32 {s0.0}
+SMovM0      | <- S1 | $m0 = S_MOV_B32 {s0}
+SAddM0      | <- S1 S1 | $m0 = S_ADD_U32 {s0}, {s1}, implicit-def $scc
