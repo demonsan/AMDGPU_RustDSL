@@ -3893,7 +3893,7 @@ pub fn verify_ir(f: &Function) -> Report {
         }
         an.rep.add(
             "GV-GLB-RW",
-            Severity::Warn,
+            Severity::Error,
             format!(
                 "argument `{name}` is both loaded and stored, and its {n} load(s) are not proven disjoint from the stores of OTHER workgroups: a \
                  cross-workgroup read-after-write / write-after-read race unless the launch orders them (workgroups run in no fixed order)"
