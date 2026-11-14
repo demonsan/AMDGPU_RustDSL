@@ -1359,6 +1359,7 @@ impl<'a> An<'a> {
         // bytes another workgroup writes is a race unless a verified protocol orders them, e.g. a last-arriver ticket: its winner's accesses
         // carry the winner axes like its stores)
         let (mut rw_ok, mut rw_bad) = (0usize, Vec::new());
+        let mut rw_ordered = 0usize;
         let mut loads_by_arg: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         for (k, l) in &self.gloads {
             loads_by_arg.entry(l.0).or_default().push(*k);
@@ -1367,7 +1368,15 @@ impl<'a> An<'a> {
             if arg == u32::MAX {
                 continue;
             }
-            let Some(lk) = loads_by_arg.get(&arg) else { continue };
+            let Some(lk_all) = loads_by_arg.get(&arg) else { continue };
+            // a load by the winner of a VERIFIED last-arriver protocol (gpu_protocol::verify_last_arrivers: the other members' writes are
+            // released before their ticket increment and acquired by the winner) is ordered after those writes: not a race
+            let (ordered, lk): (Vec<usize>, Vec<usize>) = lk_all.iter().partition(|k| self.gl_win.get(k).map_or(false, |w| !w.is_empty()));
+            rw_ordered += ordered.len();
+            if lk.is_empty() {
+                continue;
+            }
+            let lk = &lk;
             let mut ss: Vec<&(u32, Option<SLin>, i128, ARanges)> = by_arg[&arg].clone();
             let mut caps: Vec<Vec<(SLin, Poly, bool)>> = self.group_caps.borrow().get(&arg).cloned().unwrap_or_default();
             let mut win: Vec<Vec<u8>> = self.group_win.borrow().get(&arg).cloned().unwrap_or_default();
@@ -1385,7 +1394,7 @@ impl<'a> An<'a> {
             }
         }
         // loads of an argument whose address has no provenance can't be attributed: an argument stored through such a pointer is already counted
-        (ok, bad, rw_ok, rw_bad)
+        (ok, bad, rw_ok + rw_ordered, rw_bad)
     }
 
     fn disjoint_group(&self, ss: &[&(u32, Option<SLin>, i128, ARanges)]) -> bool {
