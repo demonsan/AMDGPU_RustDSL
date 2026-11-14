@@ -1047,7 +1047,8 @@ impl Lowerer {
             };
             self.touch(&[Src::Reg(src)]);
             // zero-copy loop entry: an initial value used only here, in its own registers of the variable's class (not a cached constant,
-            // a conversion or a view of another tuple), becomes the variable's registers (no copy); `noloopreuse` restores the copy
+            // a conversion or a view of another tuple), becomes the variable's registers (no copy). `loopreuse`, opt-in: -4386 copies over 39
+            // kernels, same-run perf neutral (perf_ab --quick all families, 9 reps fmha / gemm: 0.999..1.006)
             if let Opnd::Val(v) = init[i] {
                 let own = self.val.get(&v) == Some(&src)
                     && self.vreg_exclusive(src)
@@ -1056,7 +1057,7 @@ impl Lowerer {
                     && self.mir.vreg_class(src) == class
                     && !vars[..i].iter().any(|w| self.vars.get(w.0 as usize) == Some(&src))
                     && !matches!(self.defs.get(&v), Some(Op::ConstI32(_) | Op::ConstF32(_) | Op::FragZero { .. }));
-                if own && self.use_counts.get(&v).copied() == Some(1) && !opt_on("noloopreuse") {
+                if own && self.use_counts.get(&v).copied() == Some(1) && opt_on("loopreuse") {
                     self.vars[var.0 as usize] = src;
                     continue;
                 }
