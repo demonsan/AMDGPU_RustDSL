@@ -755,6 +755,7 @@ fn main() -> ExitCode {
                 return if d.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
             }
             let text = amdc::manifest::render(&now);
+            let text = if args.iter().any(|a| a == "--co") { text.replacen("golden asm md5 manifest (own backend): amdc md5-manifest --out tests/golden/md5_manifest.tsv; see tests/golden/README.md", "golden code-object md5 manifest (in-process assembler, own backend): amdc md5-manifest --co --out tests/golden/co_md5_manifest.tsv", 1) } else { text };
             match opt("--out") {
                 Some(p) => {
                     if let Err(e) = fs::write(&p, &text) {
