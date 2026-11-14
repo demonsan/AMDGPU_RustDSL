@@ -224,6 +224,12 @@ def validate(info: KernelInfo, ka: dict, grid, syms: dict, sizes: dict):
         have = ka.get(r["offset"])
         if have not in r["values"]:
             raise ContractError(f"{info.kernel}: kernarg 0x{r['offset']:x} = {have} not in {r['values']}")
+    for r in c.get("ka_pow2", []):
+        # 1 << kernarg == expr (e.g. lg_s and S of a kv split)
+        have = ka.get(r["offset"])
+        want = eval_ext(r["ext"], ka, grid, syms)
+        if have is None or not 0 <= have < 31 or (1 << have) != want:
+            raise ContractError(f"{info.kernel}: 1 << kernarg 0x{r['offset']:x} = 1 << {have}, the contract requires {fmt_ext(r['ext'])} = {want}")
     for t in c.get("tensors", []):
         need = eval_ext(t["alloc_bytes"], ka, grid, syms)
         have = sizes.get(t["arg"])
