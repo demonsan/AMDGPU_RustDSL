@@ -792,6 +792,14 @@ impl<'a> An<'a> {
         if let Some(i) = self.f.contract.wg_maps.iter().position(|m| m.union && m.outs.contains(&v)) {
             return (false, (1u64 << 62) + i as u64);
         }
+        // a workgroup id that a union lists as one of its outputs through another value (the same id read again, e.g. by another stage): the
+        // same index, so the same key (else the union's two classes would be compared as two unrelated digits)
+        if let Some(d @ (Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ)) = self.defs.get(&v) {
+            let same = |o: &ValueId| self.defs.get(o).map_or(false, |x| std::mem::discriminant(x) == std::mem::discriminant(d));
+            if let Some(i) = self.f.contract.wg_maps.iter().position(|m| m.union && m.outs.iter().any(same)) {
+                return (false, (1u64 << 62) + i as u64);
+            }
+        }
         match self.defs.get(&v) {
             Some(Op::WorkgroupIdX) => return (false, u64::MAX),
             Some(Op::WorkgroupIdY) => return (false, u64::MAX - 1),
