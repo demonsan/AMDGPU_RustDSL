@@ -146,6 +146,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start
         // saddr: a per-lane address over an SGPR-pair pointer is the global saddr form (`global_load v, vOff, s[..]`)
         extra_all.extend(["imm", "sgpr", "sgpr2", "salu32", "cmpneg", "edgepad", "saddr"]);
     }
+    // default: MFMA hazard windows open at a block end are checked in the successors (`edgepad`), not padded at every block end;
+    // a kernel opts out with `noedgepad`
+    if !extra_all.contains(&"noedgepad") && !f.compile_policy().lower.contains(&"noedgepad") {
+        extra_all.push("edgepad");
+    }
     let extra: &[&str] = &extra_all;
     // the kernel's declared compile policy (amdgpu_dsl::CompileProfile::policy): its lowering tokens, then the retry ladder's and the kernel's own
     let pol = f.compile_policy();
