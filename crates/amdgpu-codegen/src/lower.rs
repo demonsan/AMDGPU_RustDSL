@@ -641,6 +641,7 @@ impl Lowerer {
             alias: HashMap::new(),
             elide_fallthrough: false,
             edge_pad: opt_on("edgepad"),
+            ra_dword: opt_on("radword"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));

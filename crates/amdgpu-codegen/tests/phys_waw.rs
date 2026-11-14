@@ -23,7 +23,7 @@ fn func(blocks: Vec<Vec<MInst>>, classes: Vec<RClass>) -> MFunction {
         vregs: classes,
         loops: Vec::new(),
         alias: Default::default(),
-        elide_fallthrough: false, edge_pad: false,
+        elide_fallthrough: false, edge_pad: false, ra_dword: false,
         agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }

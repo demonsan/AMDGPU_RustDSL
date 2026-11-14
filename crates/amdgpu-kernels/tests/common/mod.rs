@@ -91,7 +91,7 @@ pub fn func(name: &str, blocks: Vec<Block>, vregs: Vec<RClass>) -> MFunction {
         vregs,
         loops: vec![],
         alias: std::collections::HashMap::new(),
-        elide_fallthrough: false, edge_pad: false,
+        elide_fallthrough: false, edge_pad: false, ra_dword: false,
         agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }

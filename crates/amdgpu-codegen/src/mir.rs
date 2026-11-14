@@ -837,6 +837,9 @@ pub struct MFunction {
     pub elide_fallthrough: bool,
     /// `edgepad` lowering option: block-end MFMA padding follows untouched successors and goes on the edges that need it (hazards.rs)
     pub edge_pad: bool,
+    /// `radword` lowering option (S1 of docs/ra-subreg.md): the hole-filling allocation tracks liveness per tuple DWORD, so a tuple's dead
+    /// dwords hold other values
+    pub ra_dword: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
     /// Register planning (DSL `RegMark`s resolved to vregs) and the weave / stage regions instructions are tagged with (`MInst::region`).
