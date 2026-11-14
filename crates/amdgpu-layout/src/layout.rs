@@ -151,7 +151,38 @@ impl Layout {
     }
     /// `L(i)` of a fully static layout.
     pub fn at(&self, i: i64) -> i64 {
+        if i >= 0 {
+            if let Some(v) = self.at_flat(i) {
+                return v;
+            }
+        }
         self.call(&Ix::C(i), &Dyns::new()).st()
+    }
+    /// The integer fast path of `at` for a fully static layout: the colexicographic coordinate of `i` over the flattened leaves dotted with the strides (what `crd2idx(idx2crd(i))` computes with symbolic
+    /// `Ix` arithmetic; the last leaf takes the quotient unreduced). None (use the symbolic path) for a dynamic leaf, an empty or non-positive mode, or an overflow.
+    fn at_flat(&self, i: i64) -> Option<i64> {
+        let shape = self.shape.flatten();
+        let stride = self.stride.flatten();
+        let n = shape.len();
+        if n == 0 || n != stride.len() {
+            return None;
+        }
+        let (mut rem, mut acc) = (i, 0i64);
+        for (j, (s, t)) in shape.iter().zip(&stride).enumerate() {
+            let (sz, st) = (s.c()?, t.c()?);
+            if sz <= 0 {
+                return None;
+            }
+            let c = if j + 1 == n {
+                rem
+            } else {
+                let q = rem % sz;
+                rem /= sz;
+                q
+            };
+            acc = acc.checked_add(c.checked_mul(st)?)?;
+        }
+        Some(acc)
     }
     pub fn is_static(&self) -> bool {
         self.shape.is_static() && self.stride.is_static()

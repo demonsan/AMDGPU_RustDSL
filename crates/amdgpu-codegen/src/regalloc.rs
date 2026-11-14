@@ -955,18 +955,16 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     };
     let succs = crate::sched::liveness::successors(m);
     let nb = m.blocks.len();
+    // the writes of every block, computed once (the fixpoint below visits each block many times; `effects` allocates)
+    let block_writes: Vec<Vec<Slot>> = m.blocks.iter().map(|blk| blk.insts.iter().flat_map(|inst| effects(m, inst).writes.into_iter().filter(|w| *w != VCC && *w != SCC)).collect()).collect();
     let mut in_st: Vec<Option<Writers>> = vec![None; nb];
     in_st[0] = Some(Writers::new());
     for _ in 0..500 {
         let mut changed = false;
         for b in 0..nb {
             let Some(mut st) = in_st[b].clone() else { continue };
-            for inst in &m.blocks[b].insts {
-                for w in &effects(m, inst).writes {
-                    if *w != VCC && *w != SCC {
-                        write(&mut st, *w);
-                    }
-                }
+            for w in &block_writes[b] {
+                write(&mut st, *w);
             }
             for &s in &succs[b] {
                 match &mut in_st[s] {
