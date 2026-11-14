@@ -235,6 +235,12 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
             let d = dst()?;
             dword_name(RClass::V1, cx.phys(d), inst.imm as u32)
         }
+        // the dword pair at dst base + imm ($vgprN_vgprN+1)
+        "dsub2" => {
+            let d = dst()?;
+            let b = cx.phys(d) + inst.imm as u32;
+            format!("$vgpr{}_vgpr{}", b, b + 1)
+        }
         "s0sub" => {
             let r = src_reg(inst, 0)?;
             dword_name(RClass::V1, cx.phys(r), inst.imm as u32)
