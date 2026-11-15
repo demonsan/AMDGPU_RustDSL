@@ -32,9 +32,15 @@ int main(int argc, char** argv) {
     long bad = 0, near = 0;
     for (long r = 0; r < B; ++r) {
         const uint16_t* row = &hl[(size_t)r * V];
-        if (!sample) { long best = 0; for (long i = 1; i < V; ++i) if (bf16_to_f32(row[i]) > bf16_to_f32(row[best])) best = i; if (ho[r] != best) { if (bad < 5) std::fprintf(stderr, "row %ld: got %d ref %ld\n", r, ho[r], best); ++bad; } }
+        // torch.argmax: the first NaN if the row has one, else the first maximum (+0 / -0 tie)
+        long best = 0; bool nan = false;
+        for (long i = 0; i < V && !nan; ++i) if (std::isnan(bf16_to_f32(row[i]))) { best = i; nan = true; }
+        if (!nan) for (long i = 1; i < V; ++i) if (bf16_to_f32(row[i]) > bf16_to_f32(row[best])) best = i;
+        double mx = -1e300; for (long i = 0; i < V; ++i) mx = std::max(mx, (double)bf16_to_f32(row[i]) * inv_t);
+        // sampling where softmax is undefined (a NaN, or no finite maximum: torch.multinomial rejects the row): the argmax
+        bool undefined = nan || std::isinf(mx) || mx == -1e300;
+        if (!sample || undefined) { if (ho[r] != best) { if (bad < 5) std::fprintf(stderr, "row %ld: got %d ref %ld\n", r, ho[r], best); ++bad; } }
         else {
-            double mx = -1e300; for (long i = 0; i < V; ++i) mx = std::max(mx, (double)bf16_to_f32(row[i]) * inv_t);
             std::vector<double> p(V); double s = 0; for (long i = 0; i < V; ++i) { p[i] = std::exp((double)bf16_to_f32(row[i]) * inv_t - mx); s += p[i]; }
             // top-k then top-p on the kept set, as sets of values (ties kept): the kernel keeps x >= threshold
             std::vector<char> keep(V, 1);
