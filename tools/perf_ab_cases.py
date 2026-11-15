@@ -30,6 +30,28 @@ def _vname(path):
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
 # memory-bound families: every timed case of tools/b2_matrix.sh (parsed, so the matrix stays the single list)
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
+# the aiter (vendor) side of the memory-bound cases that have an aiter entry point callable without torch (tools/vendor_membound.sh builds the harness; VENDOR_MB = its path):
+# our host's command gives the case (mode token) and the shape, the vendor harness runs the same logical op on a ~1 GB working set
+MB_VENDOR_MODES = {'silu_mul': 'silu_mul', 'gelu_tanh_mul': 'gelu_tanh_mul', 'rmsnorm': 'rmsnorm', 'add_rmsnorm': 'add_rmsnorm', 'token': 'quant_token', 'token_int8': 'quant_token_int8',
+                   'group128': 'quant_group128', 'silu_token': 'silu_mul_quant'}
+
+
+def _mb_vendor(cmd):
+    vmb = os.environ.get('VENDOR_MB')
+    if not vmb or not os.path.exists(vmb) or len(cmd) < 6:
+        return None
+    mode = cmd[3]
+    if mode in MB_VENDOR_MODES and cmd[4].isdigit() and cmd[5].isdigit():
+        run = Run([], [vmb, MB_VENDOR_MODES[mode], cmd[4], cmd[5]], {})
+    elif mode == 'quant_static' and cmd[4].isdigit():
+        run = Run([], [vmb, 'quant_static', str(int(cmd[4]) // 4096), '4096'], {})
+    elif cmd[2].startswith('topk_softmax_bf16') and cmd[3].isdigit() and cmd[4].isdigit() and cmd[5].isdigit():   # the plain (non-renorm) gate: tokens, experts, K
+        run = Run([], [vmb, 'topk_softmax', cmd[3], cmd[4]], dict(TOPK=cmd[5]))
+    else:
+        return None
+    return lambda run=run: run
+
+
 def membound(tree):
     path = os.path.join(tree, 'tools', 'b2_matrix.sh')
     if not os.path.exists(path):
@@ -42,7 +64,7 @@ def membound(tree):
         if not m:
             continue
         envs, label, rest = m.groups()
-        if re.search(r'\bcorr\b|correct', label):
+        if re.search(r'\bcorr\b(?!\+perf)|correct', label):
             continue  # correctness-only shapes (a few rows): no bandwidth to compare
         toks = shlex.split(rest)
         cmd, emit = [], []
@@ -59,8 +81,9 @@ def membound(tree):
         if not cmd or not cmd[0].startswith('{host:'):
             continue
         env = dict(e.split('=', 1) for e in envs.split())
+        vend = _mb_vendor(cmd)
         out.append(Case(id=f'mb/{label}', family='membound', build=(lambda side, cmd=cmd, emit=emit, env=env: Run(emit, cmd, env)),
-                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*(?:_OK|\bOK)\b', timeout=300))
+                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*(?:_OK|\bOK)\b', vendor=vend, vendor_line=r'^vendor ', timeout=300))
     return out
 
 
@@ -180,7 +203,9 @@ def attn_bwd():
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
 def decode():
     out = []
-    for (b, h, hk, ctx) in [(1, 64, 8, 8192), (8, 64, 8, 4096), (32, 64, 8, 2048), (64, 32, 4, 1024), (4, 16, 1, 16384), (1, 32, 4, 32768)]:
+    for (b, h, hk, ctx) in [(1, 64, 8, 8192), (8, 64, 8, 4096), (32, 64, 8, 2048), (64, 32, 4, 1024), (4, 16, 1, 16384), (1, 32, 4, 32768),
+                           # the v9.2 comparison rows (op-coverage-design 7.5: B16 / B64 H64 HK8 ctx 2048)
+                           (16, 64, 8, 2048), (64, 64, 8, 2048)]:
         def build(side, b=b, h=h, hk=hk, ctx=ctx):
             page = 16
             p = side.dispatch('decode16', b, hk, ctx, '--page', page)
@@ -188,20 +213,28 @@ def decode():
             env = dict(KPREFIX='pa_decode16_bf16_hd128_p')
             env.update(dict(FUSED=1, KSUFFIX='_f') if form == 'fused' else dict(LASTC=1, KSUFFIX='_c'))
             return Run([k, 'attn_combine_bf16_hd128'], ['{host:pa_host}', 'ours', '{co:%s}' % k, '{co:attn_combine_bf16_hd128}', str(b), str(h), str(hk), str(ctx), str(page), str(s)], env)
-        out.append(Case(id=f'decode16/B{b}H{h}HK{hk}C{ctx}', family='decode', build=build, metric='us', line=r'^ours ', ok=r'PA_OK', timeout=600))
+        gqa = h // hk
+        vco = f'{HSA}/pa/pa_bf16_noquant_gqa{gqa}_1tg_4w.co'
+        vend = (lambda vco=vco, b=b, h=h, hk=hk, ctx=ctx: Run([], ['{host:pa_host}', 'vendor', vco, _vname(vco), str(b), str(h), str(hk), str(ctx)], {})) if gqa in (8, 16) and os.path.exists(vco) else None
+        out.append(Case(id=f'decode16/B{b}H{h}HK{hk}C{ctx}', family='decode', build=build, metric='us', line=r'^ours ', ok=r'PA_OK', vendor=vend, vendor_line=r'^vendor ', timeout=600))
     return out
 
 
 def mla():
     out = []
-    for (b, h, ctx) in [(1, 128, 8192), (8, 128, 4096), (32, 16, 2048), (4, 16, 16384), (1, 16, 2048), (4, 16, 4096), (16, 16, 1024), (1, 32, 2048), (4, 16, 8192), (64, 16, 4096), (2, 16, 3072), (8, 32, 4096), (12, 48, 2048)]:
+    for (b, h, ctx) in [(1, 128, 8192), (8, 128, 4096), (32, 16, 2048), (4, 16, 16384), (1, 16, 2048), (4, 16, 4096), (16, 16, 1024), (1, 32, 2048), (4, 16, 8192), (64, 16, 4096), (2, 16, 3072), (8, 32, 4096), (12, 48, 2048), (128, 16, 4096)]:   # + the v9.2 B128 H16 row
         def build(side, b=b, h=h, ctx=ctx):
             p = side.dispatch('mla', b, h, '--ctx', ctx)
             hp, s = p['hp'], p['splits']
             page = 64
             k = f'mla_decode_bf16_{"hp_" if hp else ""}p{page}'
-            return Run([k, 'attn_combine_bf16_hd512'], ['{host:mla_host}', '{co:%s}' % k, '{co:attn_combine_bf16_hd512}', str(b), str(h), str(ctx), str(page), str(s)], dict(MLAHP=1 if hp else 0))
-        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', timeout=600))
+            return Run([k, 'attn_combine_bf16_hd512', 'attn_combine_bf16_hd512_sm'], ['{host:mla_host}', '{co:%s}' % k, '{co:attn_combine_bf16_hd512}', str(b), str(h), str(ctx), str(page), str(s)], dict(MLAHP=1 if hp else 0))
+        vco = f'{HSA}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co'
+        def vend(side, b=b, h=h, ctx=ctx, vco=vco):
+            # the dispatch plan of the new commit gives S; the vendor kernel keeps NS = S (its H = 16 form)
+            sp = side.dispatch('mla', b, h, '--ctx', ctx)['splits']
+            return Run([], ['{host:mla_host}', vco, '{co:attn_combine_bf16_hd512_sm}', str(b), str(h), str(ctx), '1', str(sp)], dict(VENDOR=vco))   # the vendor kernel reads a page-size-1 cache (v9.2 MLA decode H16 P1)
+        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', vendor=vend if (h == 16 and os.path.exists(vco)) else None, vendor_line=r'^vendor ', timeout=600))
     return out
 
 
@@ -294,6 +327,29 @@ def gemm():
     return out
 
 
+# The aiter ASM kernel the small-M cases are compared with (vendor_gemm_host asm_* families, the same data and the same CPU check): the smallest tile of the family whose rows cover M
+# (the tile ladder aiter's own tuning CSVs draw from); fp8 per-token x per-channel is compared with the int8 per-token kernel (same operand layout, as in the v9.2 rows); bf16 has only the
+# 256x256 non-split kernel in the harness (aiter's split-K bf16 kernels write fp32 partials and need their own reduce).
+VENDOR_SMALL_M = {
+    'i8_rowcol': ('asm_i8', 'i8gemm/I8gemm_bf16_perTokenI8_BpreShuffle_{t}x128.co', (16, 32, 48, 64, 80, 96, 128, 160), 128),
+    'fp8_rowcol': ('asm_i8', 'i8gemm/I8gemm_bf16_perTokenI8_BpreShuffle_{t}x128.co', (16, 32, 48, 64, 80, 96, 128, 160), 128),
+    'fp8_blockscale': ('asm_fp8bs', 'fp8gemm_blockscale/fp8gemm_bf16_blockscale_BpreShuffle_{t}x128.co', (32, 48, 64, 80, 96, 128), 128),
+    'bf16': ('asm_bf16', 'bf16gemm/bf16gemm_bf16_tn_256x256.co', (256,), 256),
+}
+
+
+def _vendor_small_m(kind, m, n, k):
+    fam, pat, tiles, tn = VENDOR_SMALL_M.get(kind, (None, None, (), 0))
+    if fam is None:
+        return None
+    t = next((t for t in tiles if t >= m), tiles[-1])
+    co = f'{HSA}/' + pat.format(t=t)
+    if not os.path.exists(co):
+        return None
+    env = dict(ITERS=200, WARMUP=50, CHECK_ROWS=min(m, 8))
+    return lambda: Run([], ['{host:vendor_gemm_host}', fam, co, _vname(co), str(m), str(n), str(k), str(t), str(tn)], env)
+
+
 def gemv():
     """Small-M GEMM / GEMV (W6): M in {1, 4, 16, 32, 64} x square N = K in {4096, 7168, 8192}, the dispatched kernel of each kind (weight-streaming
     bound: the report's TF/s converts to weight bytes per second as N K es / (2 M N K / TF/s))."""
@@ -312,7 +368,20 @@ def gemv():
                     tm, tn = _tile(kn)
                     return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
                 # the host prints TF/s with one decimal (4.3 vs 4.2 TF/s is 2.4 % at M = 1): the small-M cases are judged on the microseconds it prints with two
-                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
+                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', vendor=_vendor_small_m(kind, m, nk, nk), vendor_line=r'^asm_', timeout=600))
+    # the v9.2 split-K rows of op-coverage-design 7.4 (M = 128, N = 4096, K = 8192), to compare with
+    for kind, fam in GEMM_KINDS:
+        def build(side, kind=kind, fam=fam, m=128, n=4096, k=8192):
+            p = side.dispatch('gemm', kind, m, n, k)
+            kn, s, red = p['kernel'], p['splits'], p['reduce']
+            env = dict(SPLITK=s, ITERS=200, WARMUP=50, CHECK_ROWS=8)
+            emit = [kn]
+            if red:
+                env.update(REDUCE_CO='{co:%s}' % red, REDUCE_KN=red)
+                emit.append(red)
+            tm, tn = _tile(kn)
+            return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
+        out.append(Case(id=f'gemv/{kind}/128x4096x8192', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', vendor=_vendor_small_m(kind, 128, 4096, 8192), vendor_line=r'^asm_', timeout=600))
     return out
 
 

@@ -7,9 +7,9 @@ set -e
 R=${ROCM:-/shared/apps/ubuntu/opt/rocm-7.0.2}; AM=${AM:-/tmp/aiter_mb}; OUT=${1:-build/vendor}
 mkdir -p "$OUT"
 F="-x hip -O2 --offload-arch=gfx950 --rocm-path=$R -std=c++17 -I $AM/csrc/include -I $AM/csrc/kernels -I $AM/csrc/include/ck_tile"
-for k in activation_kernels quant_kernels rmsnorm_quant_kernels; do
+for k in activation_kernels quant_kernels rmsnorm_quant_kernels topk_softmax_kernels; do
   [ -f "$OUT/$k.o" ] || $R/bin/amdclang++ $F -c $AM/csrc/kernels/$k.cu -o "$OUT/$k.o"
 done
 $R/bin/amdclang++ $F -c tests/gpu/vendor_membound_host.cpp -o "$OUT/vh.o"
-$R/bin/amdclang++ --rocm-path=$R "$OUT/vh.o" "$OUT"/activation_kernels.o "$OUT"/quant_kernels.o "$OUT"/rmsnorm_quant_kernels.o -o "$OUT/vendor_membound_host" -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib
+$R/bin/amdclang++ --rocm-path=$R "$OUT/vh.o" "$OUT"/activation_kernels.o "$OUT"/quant_kernels.o "$OUT"/rmsnorm_quant_kernels.o "$OUT"/topk_softmax_kernels.o -o "$OUT/vendor_membound_host" -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib
 echo "built $OUT/vendor_membound_host"
