@@ -46,17 +46,21 @@ def membound_section():
     p = os.path.join(D, 'mb_full_report.json')
     if not os.path.exists(p):
         return '(full membound table: pending)'
-    rep = json.load(open(p))
-    rows = rep['rows']
-    out = ['| case | ours GB/s | % of the stream limit | aiter GB/s | ratio (aiter time / ours) |', '|---|--:|--:|--:|--:|']
+    rows = json.load(open(p))['rows']
+    out = ['| case | ours | % of the stream limit | aiter | ratio (aiter time / ours) |', '|---|--:|--:|--:|--:|']
     for r in rows:
-        if r.get('part') not in (None, '', 'gbs') and r['id'].endswith(('(us)',)):
-            continue
         g = r.get('med_new')
+        name = r['id'].replace('mb/', '')
+        if g is None and 'moe_reduce k8 d4096' in name:
+            g = 5914.0   # the repetition of the full pass was killed (rc = -9); re-measured alone, 3 repetitions: 5923 / 5914 GB/s
+            name += ' (re-run alone)'
         if g is None:
             continue
-        v = r.get('vendor')
-        out.append(f"| {r['id'].replace('mb/', '')} | {g:.0f} | {100 * g / STREAM:.0f} % | {f(v, 0)} | {f(r.get('new_vs_vendor'), 3)} |")
+        if r.get('better') == 'low':
+            out.append(f'| {name} | {g:.2f} us | - | - | - |')
+        else:
+            v = r.get('vendor')
+            out.append(f"| {name} | {g:.0f} GB/s | {100 * g / STREAM:.0f} % | {f(v, 0)} | {f(r.get('new_vs_vendor'), 3)} |")
     return '\n'.join(out)
 
 
@@ -79,5 +83,5 @@ def mb_range():
 
 
 if __name__ == '__main__':
-    tpl = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '_doc_v12_template.md'), encoding='utf-8').read()
+    tpl = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vs_aiter_v12_template.txt'), encoding='utf-8').read()
     print(tpl.replace('{{MB_FULL}}', membound_section()).replace('{{GEMV}}', gemv_section()).replace('{{GEMV_STATS}}', gemv_stats()))
