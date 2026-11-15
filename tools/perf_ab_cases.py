@@ -30,6 +30,28 @@ def _vname(path):
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
 # memory-bound families: every timed case of tools/b2_matrix.sh (parsed, so the matrix stays the single list)
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
+# the aiter (vendor) side of the memory-bound cases that have an aiter entry point callable without torch (tools/vendor_membound.sh builds the harness; VENDOR_MB = its path):
+# our host's command gives the case (mode token) and the shape, the vendor harness runs the same logical op on a ~1 GB working set
+MB_VENDOR_MODES = {'silu_mul': 'silu_mul', 'gelu_tanh_mul': 'gelu_tanh_mul', 'rmsnorm': 'rmsnorm', 'add_rmsnorm': 'add_rmsnorm', 'token': 'quant_token', 'token_int8': 'quant_token_int8',
+                   'group128': 'quant_group128', 'silu_token': 'silu_mul_quant'}
+
+
+def _mb_vendor(cmd):
+    vmb = os.environ.get('VENDOR_MB')
+    if not vmb or not os.path.exists(vmb) or len(cmd) < 6:
+        return None
+    mode = cmd[3]
+    if mode in MB_VENDOR_MODES and cmd[4].isdigit() and cmd[5].isdigit():
+        run = Run([], [vmb, MB_VENDOR_MODES[mode], cmd[4], cmd[5]], {})
+    elif mode == 'quant_static' and cmd[4].isdigit():
+        run = Run([], [vmb, 'quant_static', str(int(cmd[4]) // 4096), '4096'], {})
+    elif cmd[2].startswith('topk_softmax_bf16') and cmd[3].isdigit() and cmd[4].isdigit() and cmd[5].isdigit():   # the plain (non-renorm) gate: tokens, experts, K
+        run = Run([], [vmb, 'topk_softmax', cmd[3], cmd[4]], dict(TOPK=cmd[5]))
+    else:
+        return None
+    return lambda run=run: run
+
+
 def membound(tree):
     path = os.path.join(tree, 'tools', 'b2_matrix.sh')
     if not os.path.exists(path):
@@ -42,7 +64,7 @@ def membound(tree):
         if not m:
             continue
         envs, label, rest = m.groups()
-        if re.search(r'\bcorr\b|correct', label):
+        if re.search(r'\bcorr\b(?!\+perf)|correct', label):
             continue  # correctness-only shapes (a few rows): no bandwidth to compare
         toks = shlex.split(rest)
         cmd, emit = [], []
@@ -59,8 +81,9 @@ def membound(tree):
         if not cmd or not cmd[0].startswith('{host:'):
             continue
         env = dict(e.split('=', 1) for e in envs.split())
+        vend = _mb_vendor(cmd)
         out.append(Case(id=f'mb/{label}', family='membound', build=(lambda side, cmd=cmd, emit=emit, env=env: Run(emit, cmd, env)),
-                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*(?:_OK|\bOK)\b', timeout=300))
+                        metric=['gbs', 'us'], line=r'^timing', ok=r'^check.*(?:_OK|\bOK)\b', vendor=vend, vendor_line=r'^vendor ', timeout=300))
     return out
 
 
