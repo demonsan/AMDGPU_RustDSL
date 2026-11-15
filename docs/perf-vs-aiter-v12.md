@@ -34,3 +34,30 @@ Sections by owner:
 Notes:
 - **bf16 small M**: aiter's split-K bf16 code objects (`bf16gemm_fp32bf16_*_splitk`) are not driven by the host, so the 6.1x compares our split-K against aiter's non-split kernel. It is not a like-for-like number. v9.2 left it out for the same reason.
 - **MXFP4 8192^3 regressed** from 0.90 to 0.73: ours went from 270 to 311 us. Being investigated (see section 6).
+
+## 4. Attention backward (`tools/attn_family_table.sh`, `ONLY=bwd`)
+
+- Ours: `fmha_bwd_dot` + `dq` + `dkdv` (causal: the dispatched forms).
+- aiter: the `fmha_v3_bwd` pipeline (odo + dqdkdv a32 + dq_convert).
+- Shapes: B H HK S, bf16, hd 128; all `bad=0`.
+
+| shape | causal | ours us | aiter us | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| B4 H16 2048^2 | no | 601.8 | 496.5 | 0.83 | 0.79 |
+| B1 H16 4096^2 | no | 554.0 | 462.9 | 0.84 | 0.79 |
+| B4 H16 HK4 2048^2 | no | 587.2 | 490.5 | 0.84 | 0.79 |
+| B4 H16 2048^2 | yes | 361.9 | 313.6 | 0.87 | 0.82 |
+| B1 H16 4096^2 | yes | 332.7 | 342.7 | 1.03 | 0.97 |
+| B4 H16 HK4 2048^2 | yes | 356.2 | 306.6 | 0.86 | 0.81 |
+
+## 5. Fused MoE, stage 1 (`tools/vs_aiter_moe.sh`)
+
+- Ours: `gemm_moe1_<dt>_silu`, run by `tests/gpu/moe_host.cpp`.
+- aiter: the `fmoe_2stages` stage 1 `fmoe_stage1_bf16_pertokenFp8[_blockscale]_g1u1_128x128_pf2`, on the same sorted routes.
+- Both at BLOCK_M 128; aiter's stage-1 output matches ours (MOE_OK).
+
+| dtype | shape (M D I E topk) | ours us | aiter us | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| fp8 per-token | 1024 4096 1024 8 2 | 36.8 | 40.2 | 1.09 | 1.07 |
+| fp8 per-token | 4096 7168 512 32 8 | 323.7 | 365.1 | 1.13 | 1.14 |
+| fp8 per-token | 256 7168 2048 64 8 | 386.0 | 377.3 | 0.98 | 0.93 |
