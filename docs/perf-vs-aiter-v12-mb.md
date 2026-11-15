@@ -39,7 +39,7 @@ Stream reference measured in the same session (`tests/gpu/membw_survey.cpp`, 1 G
 | topk_softmax, E = 128, K = 8, T = 65536 (us) | **16.7 us** | 20.4 - 21.4 us | **1.25** | 0.99 (21.2 vs 20.9 us) |
 
 Notes:
-- **11 of the 12 bandwidth-bound comparisons are ahead by 3 - 48 %**; the 12th, `add_rmsnorm`, is not a comparison: aiter's 6966 GB/s is above the measured stream limit (6266), so its kernel moves fewer bytes than the formula counts (a different `residual_out` / output contract), and it is kept as data only (as in v9.2).
+- **All 14 bandwidth-bound comparisons are ahead, by 3 - 48 %** (the weakest, `quant_static` fp8 at 1.03, is a tie within noise); `add_rmsnorm` is listed but is not a comparison: aiter's 6966 GB/s is above the measured stream limit (6266), so its kernel moves fewer bytes than the formula counts (a different `residual_out` / output contract), and it is kept as data only (as in v9.2).
 - The topk_softmax row compares **time** (the gate is not bandwidth-bound: 21 MB of traffic; our host and the vendor harness count different bytes). Ours went from 21.2 us (v9.2, LDS round trips) to 16.7 us with the DPP row reductions.
 - Not re-run: `rmsnorm_quant` (ours has no row in the matrix) and `topk_softmax_renorm` (no renorm case in the vendor harness); v9.2: 0.94 and 0.87 - 0.92.
 
@@ -259,7 +259,7 @@ The small shapes in `docs/op-coverage-design.md` section on conv use the `_c128`
 
 | family | ours vs aiter now (ratio) | v9.2 |
 |---|---|---|
-| elementwise / norm / quant (bandwidth-bound, 15 comparable cases) | **1.03 - 1.48**, 100 % of the comparable cases ahead except the invalid `add_rmsnorm`; 90 - 107 % of the stream limit | 1.07 - 1.45, 90 - 103 % |
+| elementwise / norm / quant (bandwidth-bound, 14 comparable cases) | **1.03 - 1.48**, all ahead (`add_rmsnorm` excluded: not a valid comparison); 91 - 107 % of the stream limit | 1.07 - 1.45, 90 - 103 % |
 | topk_softmax (E = 128) | 1.25 | 0.99 |
 | paged decode16 (incl. `_c`) | 0.76 - 1.55 | 0.67 - 1.24 |
 | MLA decode H16 | 0.56 - 1.07 (geomean about 0.74) | ~0.63 |
