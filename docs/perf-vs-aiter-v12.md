@@ -77,6 +77,9 @@ On real data the shipped kernel is now ahead of the vendor kernel on every gate 
 
 | dtype | shape (M D I E topk) | ours us | aiter us | ratio | v9.2 |
 |---|---|--:|--:|--:|--:|
-| fp8 per-token | 1024 4096 1024 8 2 | 36.8 | 40.2 | 1.09 | 1.07 |
-| fp8 per-token | 4096 7168 512 32 8 | 323.7 | 365.1 | 1.13 | 1.14 |
-| fp8 per-token | 256 7168 2048 64 8 | 386.0 | 377.3 | 0.98 | 0.93 |
+| fp8 per-token | 1024 4096 1024 8 2 | 37.0 | 40.3 | 1.09 | 1.07 |
+| fp8 per-token | 4096 7168 512 32 8 | 323.0 | 370.4 | 1.15 | 1.14 |
+| fp8 per-token | 256 7168 2048 64 8 | 392.1 | 382.7 | 0.98 | 0.93 |
+| fp8 blockscale | 1024 4096 1024 8 2 | 59.2 | 51.0 | 0.86 | 0.87 |
+| fp8 blockscale | 4096 7168 512 32 8 | 483.7 | 426.5 | 0.88 | 0.87 |
+| fp8 blockscale | 256 7168 2048 64 8 | 471.6 | 401.6 | 0.85 | 0.79 |
