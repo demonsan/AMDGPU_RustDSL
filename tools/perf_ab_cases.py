@@ -208,7 +208,7 @@ def mla():
         def vend(side, b=b, h=h, ctx=ctx, vco=vco):
             # the dispatch plan of the new commit gives S; the vendor kernel keeps NS = S (its H = 16 form)
             sp = side.dispatch('mla', b, h, '--ctx', ctx)['splits']
-            return Run([], ['{host:mla_host}', vco, '{co:attn_combine_bf16_hd512_sm}', str(b), str(h), str(ctx), '64', str(sp)], dict(VENDOR=vco))
+            return Run([], ['{host:mla_host}', vco, '{co:attn_combine_bf16_hd512_sm}', str(b), str(h), str(ctx), '1', str(sp)], dict(VENDOR=vco))   # the vendor kernel reads a page-size-1 cache (v9.2 MLA decode H16 P1)
         out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', vendor=vend if (h == 16 and os.path.exists(vco)) else None, vendor_line=r'^vendor ', timeout=600))
     return out
 
