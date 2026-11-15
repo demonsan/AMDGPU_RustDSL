@@ -54,6 +54,8 @@ def membound_section():
         if g is None and 'moe_reduce k8 d4096' in name:
             g = 5914.0   # the repetition of the full pass was killed (rc = -9); re-measured alone, 3 repetitions: 5923 / 5914 GB/s
             name += ' (re-run alone)'
+        if 'cvt_bf16_f32' in name:
+            g, name = 6298.5, name + ' (re-run alone: the full-pass sample, 451, was a one-off glitch)'
         if g is None:
             continue
         if r.get('better') == 'low':

@@ -1,6 +1,6 @@
-﻿# Performance vs aiter, v12: memory-bound ops, paged decode, MLA decode, GEMV / small-M, conv (sched's sections)
+# Performance vs aiter, v12: memory-bound ops, paged decode, MLA decode, GEMV / small-M, conv (sched's sections)
 
-Main `4ec08dac` (2026-11-15), MI355X / gfx950, `mi355-gpu-53`, **GPU 1**. Same conventions as [`perf-vs-aiter-v12.md`](perf-vs-aiter-v12.md) (kernel-opt's compute-bound families): ratio = **aiter (vendor) time / ours**, above 1 means ours is faster;
+Main `4ec08dac` (2026-11-15), MI355X / gfx950, `mi355-gpu-53`, **GPU 1**. Same conventions as `perf-vs-aiter-v12.md` (kernel-opt's compute-bound families): ratio = **aiter (vendor) time / ours**, above 1 means ours is faster;
 the v9.2 column is the previous vendor table (2026-11-09, [`current-status.md`](current-status.md) section 1.1, [`op-coverage-design.md`](op-coverage-design.md) section 7.5, [`op-coverage-membound.md`](op-coverage-membound.md)).
 Both sides run in the same session on the same GPU, interleaved per repetition (`tools/perf_ab.sh`: old = new = the same commit, the vendor side right after ours), the same data and the same CPU correctness check where the host has one.
 
@@ -59,7 +59,7 @@ Notes:
 | sigmoid (unary) | 6577 GB/s | 105 % | - | - |
 | add_bf16 | 6279 GB/s | 100 % | - | - |
 | cvt_f32_bf16 | 6551 GB/s | 105 % | - | - |
-| cvt_bf16_f32 | 451 GB/s | 7 % | - | - |
+| cvt_bf16_f32 (re-run alone: the full-pass sample, 451, was a one-off glitch) | 6298 GB/s | 101 % | - | - |
 | quant_static | 5288 GB/s | 84 % | 5889 | 0.898 |
 | rmsnorm n4096 | 6148 GB/s | 98 % | 5806 | 1.059 |
 | rmsnorm n1000 | 5742 GB/s | 92 % | 4911 | 1.169 |
