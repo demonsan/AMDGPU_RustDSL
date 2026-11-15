@@ -35,6 +35,25 @@ Notes:
 - **bf16 small M**: aiter's split-K bf16 code objects (`bf16gemm_fp32bf16_*_splitk`) are not driven by the host, so the 6.1x compares our split-K against aiter's non-split kernel. It is not a like-for-like number. v9.2 left it out for the same reason.
 - **MXFP4 8192^3 regressed** from 0.90 to 0.73: ours went from 270 to 311 us. Being investigated (see section 6).
 
+## 2. Shipped MXFP8 FMHA (`tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3`, OVERALL PASS)
+
+- aiter: the vendor `fmha_fwd_hd128_mxfp8` code object in the same process (`ref_host`).
+- Each value is the median of 5 runs; v9.2 is the last `port_gate` of that round.
+
+| path | shape | ours TF/s | ratio | v9.2 |
+|---|---|--:|--:|--:|
+| default (KV-split main + combine) | B1 H8 S2048, real data | 768.0 | **1.063** | 1.028 |
+| `_vs128` per CU (64 blocks) | real data | 733.4 | **1.017** | 0.952 |
+| `_vs128` | B4 H8 S2048 | 1945.7 | **1.033** | 0.955 |
+| `_vs128` | B1 H8 S8192 | 2567.5 | **1.011** | 0.981 |
+| `_vs128` | B2 H8 S2048 | 1334.3 | **1.022** | - |
+| `_vs128` per CU, median over 8 layouts | | 732.0 | 1.011 | 0.943 |
+| `_t128` | B2 H8 S2048, median over 8 layouts | 1170.7 | 0.896 | 0.900 |
+| default (KV-split) | B1 H8 S2048, palette data (`lcg`) | 745.0 | 1.392 | - |
+| `_vs128` | the shapes above, palette data | | 0.994 - 1.002 | - |
+
+On real data the shipped kernel is now ahead of the vendor kernel on every gate shape except `_t128`. The `_vs128` gain since v9.2 (+5 - 7 %) comes from this round's uniform-scalar lowering defaults ([`lowering-defaults.md`](lowering-defaults.md)).
+
 ## 4. Attention backward (`tools/attn_family_table.sh`, `ONLY=bwd`)
 
 - Ours: `fmha_bwd_dot` + `dq` + `dkdv` (causal: the dispatched forms).
