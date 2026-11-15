@@ -73,6 +73,7 @@ def main():
     ap.add_argument('--amdc', default='/tmp/target-kfmha/release/amdc')
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--out', default='build/vs_aiter_gemm')
+    ap.add_argument('--only', default='', help='substring of the family label')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     host = os.path.join(a.out, 'vendor_gemm_host')
@@ -97,6 +98,8 @@ def main():
 
     rows = []
     for label, kind, ofam, vdir, vfam, shapes in FAMS:
+        if a.only and a.only not in label:
+            continue
         vcos = sorted(f for f in os.listdir(os.path.join(HSA, vdir)) if f.endswith('.co'))
         for (m, n, k) in shapes:
             # ours: the dispatched kernel
