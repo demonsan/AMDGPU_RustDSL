@@ -32,7 +32,7 @@ V92 = {('MXFP4 (a4w4)', (8192, 8192, 8192)): 0.90, ('MXFP4 (a4w4)', (4096, 4096,
 
 
 def sh(cmd, env=None, timeout=900):
-    p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, **(env or {})), timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, **{k: str(v) for k, v in (env or {}).items()}), timeout=timeout)
     return p.returncode, p.stdout + p.stderr
 
 
