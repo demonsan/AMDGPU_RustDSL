@@ -16,8 +16,8 @@ Sections by owner:
 
 | family | shape (M x N x K) | ours us (kernel) | aiter us (best tile) | ratio | v9.2 |
 |---|---|--:|--:|--:|--:|
-| MXFP4 (a4w4) | 8192 x 8192 x 8192 | 311.2 (`gemm_a4w4_mxfp4`) | 227.6 (f4gemm 256x256) | **0.73** | 0.90 |
-| MXFP4 (a4w4) | 4096 x 4096 x 4096 | 41.3 (`gemm_a4w4_mxfp4`) | 38.4 (f4gemm 256x256) | 0.93 | 0.86 |
+| MXFP4 (a4w4) | 8192 x 8192 x 8192 | 255.4 - 256.0 (`gemm_a4w4_mxfp4`) | 228.1 - 229.2 (f4gemm 256x256) | 0.89 - 0.90 | 0.90 |
+| MXFP4 (a4w4) | 4096 x 4096 x 4096 | 41.3 - 42.6 (`gemm_a4w4_mxfp4`) | 36.6 - 37.5 (f4gemm 128x512 / 256x256) | 0.88 - 0.91 | 0.86 |
 | int8 per-token | 8192 x 8192 x 8192 | 387.2 (`gemm_a8w8_i8`) | 619.5 (i8gemm 160x128) | 1.60 | 1.53 |
 | int8 per-token | 4096 x 4096 x 4096 | 63.4 (`gemm_a8w8_i8`) | 105.3 (i8gemm 128x128) | 1.66 | 1.63 |
 | int8 per-token | 1024 x 4096 x 8192 | 50.6 (`gemm_a8w8_i8_128`) | 50.6 (i8gemm 128x128) | 1.00 | 1.08 |
@@ -33,7 +33,7 @@ Sections by owner:
 
 Notes:
 - **bf16 small M**: aiter's split-K bf16 code objects (`bf16gemm_fp32bf16_*_splitk`) are not driven by the host, so the 6.1x compares our split-K against aiter's non-split kernel. It is not a like-for-like number. v9.2 left it out for the same reason.
-- **MXFP4 8192^3 regressed** from 0.90 to 0.73: ours went from 270 to 311 us. Being investigated (see section 6).
+- MXFP4: the ranges are three separate re-runs (5 runs each). A first sweep had measured 311 us for 8192^3; see section 6.
 
 ## 2. Shipped MXFP8 FMHA (`tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3`, OVERALL PASS)
 
@@ -151,3 +151,31 @@ Summary:
 | fp8 blockscale | 1024 4096 1024 8 2 | 59.2 | 51.0 | 0.86 | 0.87 |
 | fp8 blockscale | 4096 7168 512 32 8 | 483.7 | 426.5 | 0.88 | 0.87 |
 | fp8 blockscale | 256 7168 2048 64 8 | 471.6 | 401.6 | 0.85 | 0.79 |
+
+## 6. The MXFP4 8192^3 outlier: not a regression
+
+The first GEMM sweep measured `gemm_a4w4_mxfp4` at 311 us for 8192^3 (ratio 0.73, against 270 us in v9.2). Three re-runs of the MXFP4 rows (5 runs each, same build, same GPU) measured 255.4 / 255.9 / 256.0 us, ratio 0.89 - 0.90, which is v9.2's 0.90.
+
+The scalar defaults don't explain it either: the same kernel with `AMDC_NO_SCALAR_DEFAULT=1` runs at 258.3 us, against 257.8 us with them.
+
+So the 311 us was one transient measurement (the first kernel of the sweep, measured cold), not a code change, and no bisection was needed. Since v9.2 the kernel is 5 % faster (270 -> 256 us), but so is the vendor (242 -> 228 us), so the ratio is unchanged.
+
+## 7. Summary (kernel-opt families)
+
+| family | v12 ratio (aiter time / ours) | v9.2 |
+|---|---|---|
+| shipped MXFP8 FMHA, `port_gate`, real data | KV-split 1.063; `_vs128` 1.011 - 1.033, per CU 1.017; `_t128` 0.896 | 1.028; 0.952 - 0.981; 0.900 |
+| GEMM: int8 per-token | 1.00 - 1.66 | 1.01 - 1.63 |
+| GEMM: fp8 blockscale | 0.93 - 1.45 (split-K small M 1.45) | 0.91 - 1.45 |
+| GEMM: bf16 | 1.03 (2048 x 4096^2); small M split-K vs aiter's non-split kernel 6.1 | 0.96 |
+| GEMM: MXFP4 | 0.88 - 0.91 | 0.86 - 0.90 |
+| attention fp8 per-tensor | 1.13 - 1.77 | 1.07 - 1.74 |
+| attention bf16 v3 hd128 | full 0.85 - 1.05, causal 0.84 - 1.24 | 0.89 - 1.07, 0.80 - 1.23 |
+| attention hd192 (MLA prefill) | 0.78 - 1.06 | 0.73 - 0.98 |
+| attention backward | 0.83 - 1.03 (S 2048 / 4096); 1.06 - 1.44 (S 1024) | 0.79 - 0.97 |
+| fused MoE stage 1 | fp8 per-token 0.98 - 1.15; fp8 blockscale 0.85 - 0.88 | 0.93 - 1.14; 0.79 - 0.87 |
+
+Where aiter has no comparable kernel:
+- bf16 GEMM split-K: aiter has split-K bf16 code objects, but our host does not drive them;
+- MXFP8 blockscale GEMM v4: compared against aiter PR #6696 by `tools/gemm_gate.sh`, not in this table;
+- MoE stage 2: aiter's stage 2 is not driven by the host; stage 1 only.
