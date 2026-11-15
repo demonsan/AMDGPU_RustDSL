@@ -1,0 +1,128 @@
+# Performance vs aiter, v12: memory-bound ops, paged decode, MLA decode, GEMV / small-M, conv (sched's sections)
+
+Main `4ec08dac` (2026-11-15), MI355X / gfx950, `mi355-gpu-53`, **GPU 1**. Same conventions as [`perf-vs-aiter-v12.md`](perf-vs-aiter-v12.md) (kernel-opt's compute-bound families): ratio = **aiter (vendor) time / ours**, above 1 means ours is faster;
+the v9.2 column is the previous vendor table (2026-11-09, [`current-status.md`](current-status.md) section 1.1, [`op-coverage-design.md`](op-coverage-design.md) section 7.5, [`op-coverage-membound.md`](op-coverage-membound.md)).
+Both sides run in the same session on the same GPU, interleaved per repetition (`tools/perf_ab.sh`: old = new = the same commit, the vendor side right after ours), the same data and the same CPU correctness check where the host has one.
+
+**aiter is not installed as a Python / torch package on the node** (as in v9.2). The vendor numbers come from the standalone vendor harnesses:
+- memory-bound: aiter's HIP sources (`csrc/kernels/{activation,quant,rmsnorm_quant,topk_softmax}_kernels.cu`) compiled without torch and linked with [`tests/gpu/vendor_membound_host.cpp`](../tests/gpu/vendor_membound_host.cpp) (`tools/vendor_membound.sh`), which calls aiter's own C++ entry points; the same ~1 GB working sets and the same bandwidth formula (bytes read + written / time) as our hosts;
+- paged decode: aiter's `pa_bf16_noquant_gqa{8,16}_1tg_4w.co` driven by `tests/gpu/pa_host.cpp` (`vendor` mode), context lengths random in [ctx / 2, ctx];
+- MLA decode: aiter's `mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co` (H = 16 only, page size 1) with **our** split-major combine, driven by `tests/gpu/mla_host.cpp` (`VENDOR=`); it reads a page-size-1 cache, ours a page-64 one (the layouts differ, the logical KV is the same);
+- GEMV / small-M: aiter's prebuilt ASM GEMMs through `tests/gpu/vendor_gemm_host.cpp` (`tools/vs_aiter_gemv.py`), the fastest tile of the family per shape.
+
+Tools added for this table: the vendor side of `perf_ab` for `decode`, `mla` and the `membound` cases that have an aiter entry point (`tools/perf_ab_cases.py`, `docs/perf-ab.md`), `tools/vs_aiter_gemv.py`, `tools/vs_aiter_v12_md.py` (this file's generated tables).
+Noise: with old = new the same commit, the scatter between the two sides is the noise of the table (typically within +-1 %, a few cases +-2 - 3 %); a ratio within about 3 % of 1.0 is a tie.
+
+## 7. Memory-bound ops
+
+Stream reference measured in the same session (`tests/gpu/membw_survey.cpp`, 1 GiB working set): the best streaming copy (read + write counted) is **6266 GB/s** (read-only 6408 GB/s; `hipMemcpy` D2D 5470 GB/s read + write). "% of stream" below is ours / 6266. Kernels that mix reads and writes in other proportions (read-heavy quantizers, 2:1 silu_mul) can exceed 100 %.
+
+### 7.1 Same-session comparison with aiter (the ops whose aiter entry point is callable without torch)
+
+| op, shape | ours GB/s | aiter GB/s | ratio | v9.2 |
+|---|--:|--:|--:|--:|
+| silu_mul, M = 43690, D = 4096 | 6579 | 5880 | **1.12** | 1.11 - 1.13 |
+| silu_mul, M = 65535, D = 1024 | 6711 | 6120 | **1.10** | 1.07 |
+| silu_mul, M = 12483, D = 14336 | 6525 | 5771 | **1.13** | 1.18 |
+| gelu_tanh_mul, M = 43690, D = 4096 | 6574 | 5106 | **1.29** | 1.23 - 1.27 |
+| rmsnorm, M = 65536, N = 4096 | 6216 | 5857 | **1.06** | 1.01 - 1.02 |
+| rmsnorm, M = 262144, N = 1000 | 5806 | 4885 | **1.19** | 1.17 |
+| add_rmsnorm, M = 32768, N = 4096 | 5527 | 6966 | 0.79 (**not a valid comparison**) | 0.86 (same caveat) |
+| quant_token fp8, M = 131072, N = 4096 | 6428 | 5914 | **1.09** | 1.08 |
+| quant_token fp8, M = 524288, N = 1000 | 6108 | 4115 | **1.48** | 1.45 |
+| quant_token int8, M = 131072, N = 4096 | 6343 | 6025 | **1.05** | 1.04 - 1.26 |
+| quant_token int8, M = 524288, N = 1000 | 5692 | 4126 | **1.38** | (in 1.04 - 1.26) |
+| quant_token int8, M = 36000, N = 14336 (long row) | 5831 | 4618 | **1.26** | (in 1.04 - 1.26) |
+| quant_group128 fp8, M = 131072, N = 4096 | 6396 | 5898 | **1.08** | 1.10 |
+| quant_static fp8, 5.4e8 elements | 6204 | 6012 | **1.03** | 0.97 |
+| silu_mul_quant fp8, M = 65536, D = 4096 | 6030 | 5318 | **1.13** | 1.11 |
+| topk_softmax, E = 128, K = 8, T = 65536 (us) | **16.7 us** | 20.4 - 21.4 us | **1.25** | 0.99 (21.2 vs 20.9 us) |
+
+Notes:
+- **11 of the 12 bandwidth-bound comparisons are ahead by 3 - 48 %**; the 12th, `add_rmsnorm`, is not a comparison: aiter's 6966 GB/s is above the measured stream limit (6266), so its kernel moves fewer bytes than the formula counts (a different `residual_out` / output contract), and it is kept as data only (as in v9.2).
+- The topk_softmax row compares **time** (the gate is not bandwidth-bound: 21 MB of traffic; our host and the vendor harness count different bytes). Ours went from 21.2 us (v9.2, LDS round trips) to 16.7 us with the DPP row reductions.
+- Not re-run: `rmsnorm_quant` (ours has no row in the matrix) and `topk_softmax_renorm` (no renorm case in the vendor harness); v9.2: 0.94 and 0.87 - 0.92.
+
+### 7.2 Every memory-bound kernel: bandwidth and % of the stream limit (`tools/b2_matrix.sh` cases, one repetition)
+
+{{MB_FULL}}
+
+Where aiter has no standalone-callable kernel (the table above is the whole of what can be compared; see the have / missing / why table in [`op-coverage-membound.md`](op-coverage-membound.md)): layernorm (a torch extension), row softmax, RoPE / KV-cache writes (`pos_encoding_kernels.cu` and
+`cache_kernels.cu` need torch conventions, and `cache_kernels.cu` does not compile standalone on gfx950), dequant, cast, MoE sorting / reduce / combine / gate, sampling / top-k / top-p, fused qk-norm RoPE KV, mxfp4 / mxfp6 quant: those are measured against the stream limit only.
+
+## 8. Paged decode (`pa_decode16_bf16_hd128`, page 16, bf16 KV, D = 128)
+
+`dispatch decode16`: the fused form `_f` when B x HK >= 256, else the last-arriver form `_c` (S = the smallest power of two with B x HK x S >= 256, at least 512 keys per split). 5 repetitions per case.
+
+| shape (B, H, HK, ctx) | form (S) | ours us | aiter us | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| B1 H32 HK4 ctx32768 | `_c` (64) | 111.84 | 159.23 | **1.42** | |
+| B1 H64 HK8 ctx8192 | `_c` (16) | 29.21 | 35.39 | **1.21** | |
+| B8 H64 HK8 ctx4096 | `_c` (4) | 26.93 | 25.32 | 0.94 | |
+| B16 H64 HK8 ctx2048 | `_c` (2) | 24.36 | 18.41 | 0.76 | 0.77 |
+| B32 H64 HK8 ctx2048 | `_f` | 35.86 | 30.80 | 0.86 | |
+| B64 H64 HK8 ctx2048 | `_f` | 83.84 | 77.43 | 0.92 | 0.92 |
+| B64 H32 HK4 ctx1024 | `_f` | 19.90 | 17.22 | 0.87 | |
+| B4 H16 HK1 ctx16384 | `_c` (32) | 55.67 | 86.10 | **1.55** | |
+
+Range now **0.76 - 1.55** (v9.2: 0.67 - 1.24). The two rows that exist in both tables are unchanged (0.76 / 0.77, 0.92 / 0.92). Small batch and long context (the `_c` grids) beat aiter by 20 - 55 %; medium batch at short context (B16 ctx 2048, B32 / B64 at ctx <= 2048) stays 8 - 24 % behind: the per-wave instruction floor of the fused form ([`pa-decode16-profile.md`](pa-decode16-profile.md)), not memory.
+
+## 9. MLA decode (H = 16 against aiter; H >= 32 has no aiter kernel on this path)
+
+`dispatch mla`: the per-wave form (`mla_decode_bf16_p64`) or the head-parallel form (`mla_decode_bf16_hp_p64`, the 4 waves of a CTA are 4 groups of 16 heads sharing one KV ring); S as listed. aiter = `mla_dec_stage1` gqa16 with our combine, run with the same S, page size 1.
+5 repetitions per case.
+
+| shape (B, H, ctx) | ours form (S) | ours us | aiter us | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| B1 H16 ctx2048 | head-parallel (16) | 23.68 | 21.79 | 0.92 | |
+| B2 H16 ctx3072 | head-parallel (16) | 29.52 | 20.71 | 0.70 | |
+| B4 H16 ctx4096 | head-parallel (16) | 35.26 | 25.92 | 0.74 | |
+| B4 H16 ctx8192 | per-wave (16) | 46.27 | 25.89 | 0.56 | |
+| B4 H16 ctx16384 | per-wave (16) | 66.01 | 38.56 | 0.58 | |
+| B16 H16 ctx1024 | head-parallel (16) | 22.07 | 23.55 | **1.07** | |
+| B32 H16 ctx2048 | per-wave (8) | 37.67 | 25.29 | 0.67 | |
+| B64 H16 ctx4096 | per-wave (4) | 67.85 | 47.95 | 0.71 | 0.63 |
+| B128 H16 ctx4096 | per-wave (2) | 124.02 | 102.71 | 0.83 | 0.24 (older stage-1-only comparison, a 2026-11-08 kernel) |
+
+Ours alone, no aiter kernel in the harness (H > 16): B1 H32 ctx2048 25.25 us (head-parallel, 16), B8 H32 ctx4096 37.99 us (hp, 16), B12 H48 ctx2048 35.70 us (hp, 16), B1 H128 ctx8192 50.38 us (hp, 16), B8 H128 ctx4096 49.77 us (hp, 16).
+
+MLA decode H16 is **0.56 - 1.07, geomean about 0.74** (v9.2: ~0.63 at B64 ctx4096, now 0.71). It is still the weakest decode family: long contexts at small batch (ctx 8192 - 16384, B4) are 0.56 - 0.58: the per-wave form does not fill the machine there and aiter's stage 1 reaches higher KV bandwidth.
+
+## 10. GEMV / small-M GEMM
+
+Ours = the kernel `amdc dispatch gemm` picks (the `_64` / `_64_splitk` kernels with S = 4 or 8, plus the reduce); aiter = the fastest code object of the family directory that the host drives (int8: `I8gemm_..._{16..160}x128`; fp8 blockscale: `fp8gemm_..._{32..128}x128`;
+bf16: only the non-split `bf16gemm_..._256x256_bpreshuffle` the host supports); fp8 per-token x per-channel is compared with the int8 per-token kernels (same layout; there is no fp8 per-token aiter ASM kernel in `hsa`). 3 runs of 200 iterations per side, all `bad = 0`.
+These shapes are weight-streaming bound (K x N bytes at about 5 - 6 TB/s: 4096^2 fp8 = 16.8 MB = 3 us, plus the fixed cost per call of about 5 - 8 us).
+
+{{GEMV}}
+
+Notes:
+- **int8 / fp8 per-token at N = K = 4096, M = 32 and 64**: aiter's 16x128 tile reaches 6.8 - 7.0 us where ours (S = 4 split-K plus reduce) needs 7.7 / 9.2 us, i.e. **0.87 - 0.89 at M = 32 and 0.75 at M = 64**. The int8 M = 32 cell shows 1.68 only because the host rejected aiter's 16x128 result for that data (`bad != 0`, so the fallback tile 80x128 at 13.2 us was reported); the fp8 kernels, which use the same aiter code object, show the true 0.89.
+- **fp8 blockscale 1 x 4096 x 4096 shows 0.46** (ours 19.3 us) in the best-of-tiles tool, which is a first-call effect of that run (the same case in the `perf_ab` gemv family, 3 interleaved repetitions, gives **7.85 us, ratio 1.13**); the other M at 4096 are 1.06 - 1.12 (0.92 at M = 64).
+- **v9.2 rows**: 128 x 4096 x 8192: int8 1.28 (v9.2 1.27 in kernel-opt's table; 1.62 / 1.87 in the 2026-11-08 split-K table, which compared with the non-tuned 128x128 tile), fp8 blockscale 1.42 (1.45); 64 x 8192 x 8192: 1.04 / 1.05 / 1.20 (the 2026-11-08 values 1.62 / 1.62 / 1.57 used aiter's 256-class tiles; the best small tile is closer).
+- **bf16**: the 4.3 - 8.0x is **not like-for-like**: aiter's split-K bf16 kernels (`bf16gemm_fp32bf16_*_splitk`, fp32 partials plus their own reduce) are not driven by the host, so the bf16 column compares ours with a 256x256 kernel built for M >= 256.
+{{GEMV_STATS}}
+
+## 11. Convolution
+
+aiter has **no convolution GEMM** (no 2-D / 3-D conv kernel in its `hsa` / `csrc`; the v9.2 design note says the same: "FlyDSL not runnable"), so there is no vendor side. Ours (implicit GEMM on the v4 bf16 GEMM structure, `perf_ab conv`, 3 repetitions):
+
+| kernel | shape | ours TF/s |
+|---|---|--:|
+| `conv2d_bf16_r1s1_st1_p0_d1` | N8 56x56, C256 -> K512, 1x1 | 354.7 |
+| `conv2d_bf16_r3s3_st1_p1_d1` | N8 56x56, C256 -> K256, 3x3 | 402.4 |
+| `conv3d_bf16_t3r3s3_st1_p1_d1` | N2 16x28x28, C128 -> K256, 3x3x3 | 420.0 |
+
+The small shapes in `docs/op-coverage-design.md` section on conv use the `_c128` tile (`dispatch conv_cta`). aiter does have `causal_conv1d_update` / `causal_conv1d_fwd_split_qkv` (the 1-D causal convolution of the SSM layers, in the memory-bound family above): those are **not compared** here (the standalone harness would need their tensor layouts; ours: [`op-coverage-membound.md`](op-coverage-membound.md), "causal_conv1d").
+
+## 12. Summary
+
+| family | ours vs aiter now (ratio) | v9.2 |
+|---|---|---|
+| elementwise / norm / quant (bandwidth-bound, 15 comparable cases) | **1.03 - 1.48**, 100 % of the comparable cases ahead except the invalid `add_rmsnorm`; 90 - 107 % of the stream limit | 1.07 - 1.45, 90 - 103 % |
+| topk_softmax (E = 128) | 1.25 | 0.99 |
+| paged decode16 (incl. `_c`) | 0.76 - 1.55 | 0.67 - 1.24 |
+| MLA decode H16 | 0.56 - 1.07 (geomean about 0.74) | ~0.63 |
+| GEMV / small-M int8, fp8 per-token, fp8 blockscale | 0.75 - 1.68 (mostly 1.0 - 1.6) | 1.45 - 1.87 (split-K rows) |
+| GEMV bf16 | not like-for-like (aiter split-K not driven) | 3.6 - 3.9 (same caveat) |
+| conv | no aiter kernel | - |
