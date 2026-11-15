@@ -220,6 +220,12 @@ def expand(run, side, hosts):
     return [sub(t) for t in run.cmd], {k: sub(str(v)) for k, v in run.env.items()}
 
 
+def vendor_run(c, side):
+    """The vendor Run of a case; a vendor callable that takes `side` (the NEW commit) can ask that commit's dispatch plan (e.g. the split count the vendor kernel is run with)."""
+    import inspect
+    return c.vendor(side) if 'side' in inspect.signature(c.vendor).parameters else c.vendor()
+
+
 def parse(text, metric, line):
     """(value, metric key) of the first metric of `metric` (a key / regex or a list of them, tried in order) found in the lines matching `line`."""
     keys = list(metric) if isinstance(metric, (list, tuple)) else [metric]
@@ -326,7 +332,7 @@ def main():
                 hosts_needed |= set(re.findall(r'\{host:([^}]+)\}', t))
     for c in cases:
         if callable(c.vendor) and not args.no_vendor:
-            for t in c.vendor().cmd:
+            for t in vendor_run(c, new).cmd:
                 hosts_needed |= set(re.findall(r'\{host:([^}]+)\}', t))
     for s in (old, new):
         emit_all(s, kernels[s.name], args.jobs)
@@ -351,7 +357,7 @@ def main():
             print(f'== {c.id}  rc={rc}  {dt:.1f}s\n   env {env}\n   cmd {" ".join(cmd)}')
             print('\n'.join('   | ' + l for l in text.strip().splitlines()[-int(os.environ.get("SHOW_LINES", "12")):]))
             if callable(c.vendor) and not args.no_vendor:
-                vc, ve = expand(c.vendor(), new, hosts)
+                vc, ve = expand(vendor_run(c, new), new, hosts)
                 vt, vrc, vdt = run_once(vc, ve, c.timeout)
                 print(f'   vendor rc={vrc} {vdt:.1f}s: ' + ' '.join(vc))
                 print('\n'.join('   | ' + l for l in vt.strip().splitlines()[-6:]))
@@ -400,7 +406,7 @@ def main():
                             smp['vendor'].append(vv)
                 raw.write(json.dumps(dict(case=c.id, side=s_.name, rep=rep, values=got, ok=good, rc=rc, sec=round(dt, 2), tail=text[-300:] if (not good or None in got.values()) else '')) + '\n')
             if callable(c.vendor) and not c.vendor_same and not args.no_vendor:
-                vr = c.vendor()
+                vr = vendor_run(c, new)
                 cmd, env = expand(vr, new, hosts)
                 text, rc, dt = run_once(cmd, env, c.timeout)
                 for pt in parts_of(c):

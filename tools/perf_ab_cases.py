@@ -188,7 +188,10 @@ def decode():
             env = dict(KPREFIX='pa_decode16_bf16_hd128_p')
             env.update(dict(FUSED=1, KSUFFIX='_f') if form == 'fused' else dict(LASTC=1, KSUFFIX='_c'))
             return Run([k, 'attn_combine_bf16_hd128'], ['{host:pa_host}', 'ours', '{co:%s}' % k, '{co:attn_combine_bf16_hd128}', str(b), str(h), str(hk), str(ctx), str(page), str(s)], env)
-        out.append(Case(id=f'decode16/B{b}H{h}HK{hk}C{ctx}', family='decode', build=build, metric='us', line=r'^ours ', ok=r'PA_OK', timeout=600))
+        gqa = h // hk
+        vco = f'{HSA}/pa/pa_bf16_noquant_gqa{gqa}_1tg_4w.co'
+        vend = (lambda vco=vco, b=b, h=h, hk=hk, ctx=ctx: Run([], ['{host:pa_host}', 'vendor', vco, _vname(vco), str(b), str(h), str(hk), str(ctx)], {})) if gqa in (8, 16) and os.path.exists(vco) else None
+        out.append(Case(id=f'decode16/B{b}H{h}HK{hk}C{ctx}', family='decode', build=build, metric='us', line=r'^ours ', ok=r'PA_OK', vendor=vend, vendor_line=r'^vendor ', timeout=600))
     return out
 
 
@@ -200,8 +203,13 @@ def mla():
             hp, s = p['hp'], p['splits']
             page = 64
             k = f'mla_decode_bf16_{"hp_" if hp else ""}p{page}'
-            return Run([k, 'attn_combine_bf16_hd512'], ['{host:mla_host}', '{co:%s}' % k, '{co:attn_combine_bf16_hd512}', str(b), str(h), str(ctx), str(page), str(s)], dict(MLAHP=1 if hp else 0))
-        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', timeout=600))
+            return Run([k, 'attn_combine_bf16_hd512', 'attn_combine_bf16_hd512_sm'], ['{host:mla_host}', '{co:%s}' % k, '{co:attn_combine_bf16_hd512}', str(b), str(h), str(ctx), str(page), str(s)], dict(MLAHP=1 if hp else 0))
+        vco = f'{HSA}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co'
+        def vend(side, b=b, h=h, ctx=ctx, vco=vco):
+            # the dispatch plan of the new commit gives S; the vendor kernel keeps NS = S (its H = 16 form)
+            sp = side.dispatch('mla', b, h, '--ctx', ctx)['splits']
+            return Run([], ['{host:mla_host}', vco, '{co:attn_combine_bf16_hd512_sm}', str(b), str(h), str(ctx), '64', str(sp)], dict(VENDOR=vco))
+        out.append(Case(id=f'mla/B{b}H{h}C{ctx}', family='mla', build=build, metric=['us', 'gbs'], line=r'us|GB/s', ok=r'\bMLA_OK\b', vendor=vend if (h == 16 and os.path.exists(vco)) else None, vendor_line=r'^vendor ', timeout=600))
     return out
 
 
