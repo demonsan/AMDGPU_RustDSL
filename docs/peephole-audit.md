@@ -24,6 +24,20 @@ The only shipped code the f32 fold reached were the per-thread running maxima of
 `sample_bf16_v128256`, `sample_topkp_bf16_v128256`). Keeping the select there cost mb/argmax v128256 5 % (0.951, 9 reps). The kernels now
 state the hardware max themselves (`Op::MaxF32`): it equals the select there because the running maximum is never a NaN (it starts at -inf
 and only takes values that compared greater) and an equal zero's sign does not reach the result (the index keeps the compare's choice; the
-value only feeds `best == block max`). Their code is identical to before the audit (same md5), so no performance change. Both kernels
-ignore a NaN logit (it never compares greater); torch.argmax returns the first NaN's index - a pre-existing kernel-level deviation, not
-changed here.
+value only feeds `best == block max`). Their code is identical to before the audit (same md5), so no performance change.
+
+**NaN semantics - fixed** (user decision, after the audit): the kernels used to ignore a NaN logit (it never compares greater) where
+torch.argmax returns the first NaN's index. Now (`crates/amdgpu-kernels/src/sampling/mod.rs`):
+
+* argmax: the index of the FIRST NaN if the row has one, else the first index of the maximum (+0 / -0 tie; a row of -inf: 0). Pass 1 keeps
+  a witness `fma(x, 0, w)` (NaN once any element is NaN or infinite: one instruction per element); a row whose witness is NaN (block-wide)
+  is searched again for its first NaN (exact `x` unordered with itself, the lowest index over the block). The start value is -FLT_MAX
+  (below every bf16 number, above -inf), so rows of -inf or of the lowest bf16 values keep their first index (the old -3e38 start returned
+  0 for a row whose maximum was below it).
+* sample / sample_topkp: where the softmax is undefined - a NaN logit (any sign, even one top-k would drop), or no finite maximum (+inf,
+  a row of -inf) - torch.softmax gives NaN probabilities and torch.multinomial rejects the row (undefined in the reference). The kernels
+  return the argmax there (the first NaN, else the first maximum); the references (`ops_check.py` `sample_ref`, `tests/gpu/sampling_host.cpp`)
+  state the same rule.
+* tests: `ops_check.py` `argmax_nan` (V 1024 and 128256), `sample_nan`, `sample_topkp_nan`: NaN first / middle / last, several NaNs (a
+  negative NaN first), an all-NaN row, +0 / -0 ties, rows of -inf and of the lowest numbers, +inf twice, +inf then NaN, a tied maximum. All
+  four fail on the previous kernels and pass now.

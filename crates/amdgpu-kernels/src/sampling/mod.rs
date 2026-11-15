@@ -1,7 +1,8 @@
 //! Sampling from logits (docs/op-coverage-memtemplates.md T5 / T6), one 1024-thread block per row, the whole row register-resident (each thread owns `C = ceil(V / 8192)` consecutive 16-byte chunks, so a
 //! thread's elements are contiguous in index order, which the cumulative-sum search needs).
 //!
-//! * `argmax_bf16_v<V>`  greedy: `out[b] = argmax_v logits[b][v]` (ties: the lowest index). ABI logits @0 (bf16 [B][V]), out @8 (i32 [B]), B @16 (i32).
+//! * `argmax_bf16_v<V>`  greedy: `out[b] = argmax_v logits[b][v]` (torch.argmax: the first NaN if the row has one, else the lowest index of
+//!   the maximum). ABI logits @0 (bf16 [B][V]), out @8 (i32 [B]), B @16 (i32).
 //! * `sample_bf16_v<V>`  temperature sampling: `p = softmax(logits / T)`, `out[b]` = the smallest index whose cumulative probability reaches `u[b] * sum` (inverse-CDF / multinomial with the caller's uniform
 //!   random number). ABI logits @0, u @8 (f32 [B], in [0, 1)), out @16 (i32 [B]), inv_temperature @24 (f32), B @28 (i32).
 //!
