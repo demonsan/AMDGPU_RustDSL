@@ -54,6 +54,74 @@ Notes:
 
 On real data the shipped kernel is now ahead of the vendor kernel on every gate shape except `_t128`. The `_vs128` gain since v9.2 (+5 - 7 %) comes from this round's uniform-scalar lowering defaults ([`lowering-defaults.md`](lowering-defaults.md)).
 
+## 3. Attention prefill (perf_ab with the vendor side: `tools/perf_ab.sh --old HEAD --new . --reps 3`, families fmha_bf16 / fmha_hd192 / fmha_fp8pt / fmha_mxfp8 / fmha_bwd)
+
+- Ours: the form `amdc dispatch` picks (key split, q128, pairing, KV split).
+- aiter: `hsa/gfx950/fmha_v3_fwd` (`fwd_hd128_bf16[_causal]`, `fwd_hd192_hd128_bf16[_causal]`, `fwd_hd128_fp8[_causal]`) and the MXFP8 vendor object, in the same process on the same data.
+- Each value is the median of 3 interleaved repetitions, TF/s; all correctness markers OK.
+- Shapes are B x H x HK x S_q x S_k.
+
+**fp8 per-tensor** (`fmha_fwd_hd128_fp8pt_v3[_causal][_kvsplit]`)
+
+| shape | causal | ours TF/s | aiter TF/s | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| 2x32x32x8192x8192 | no | 2454 | 2038 | 1.20 | 1.20 |
+| 2x32x32x8192x8192 | yes | 2156 | 1827 | 1.18 | 1.13 |
+| 4x16x16x2048x2048 | no | 2002 | 1608 | 1.25 | 1.22 |
+| 4x16x16x2048x2048 | yes | 1367 | 1209 | 1.13 | 1.07 |
+| 2x32x8x4096x4096 (GQA4) | no | 2350 | 1979 | 1.19 | 1.17 |
+| 2x32x8x4096x4096 (GQA4) | yes | 1961 | 1697 | 1.16 | 1.10 |
+| 1x8x8x4096x4096 (KV split S2) | no | 1650 | 1057 | 1.56 | 1.48 |
+| 1x8x8x4096x4096 (KV split S2) | yes | 888 | 503 | 1.77 | 1.70 |
+
+**bf16 v3 hd128**
+
+| shape | causal | ours TF/s | aiter TF/s | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| 2x32x32x8192x8192 | no | 1123 | 1172 | 0.96 | 0.96 |
+| 4x16x16x2048x2048 | no | 812 | 899 | 0.90 | 0.89 |
+| 1x8x8x4096x4096 (`_ks`) | no | 748 | 713 | 1.05 | 1.07 |
+| 4x16x16x1024x1024 | no | 750 | 878 | 0.85 | - |
+| 1x32x8x2048x2048 | no | 851 | 949 | 0.90 | - |
+| 2x32x32x8192x8192 | yes | 1001 | 1120 | 0.89 | 0.90 |
+| 4x16x16x2048x2048 | yes | 638 | 758 | 0.84 | 0.80 |
+| 1x8x8x4096x4096 (`_causal_ks`) | yes | 472 | 379 | 1.24 | 1.23 |
+| 4x16x16x1024x1024 (`_causal_q128`) | yes | 431 | 419 | 1.03 | 1.01 |
+| 1x32x8x2048x2048 (`_causal_q128`) | yes | 560 | 541 | 1.04 | 1.01 |
+
+**bf16 hd192 / hd128 (MLA prefill)**
+
+| shape | causal | ours TF/s | aiter TF/s | ratio | v9.2 |
+|---|---|--:|--:|--:|--:|
+| 1x16x16x4096x4096 | no | 1150 | 1181 | 0.97 | 0.95 |
+| 4x16x16x2048x2048 | no | 1043 | 1096 | 0.95 | 0.91 |
+| 1x8x8x4096x4096 (`_ks`) | no | 932 | 1184 | 0.79 | 0.81 |
+| 1x128x128x1024x1024 | no | 896 | 849 | 1.06 | - |
+| 4x16x16x2048x2048 (paired) | yes | 825 | 826 | 1.00 | 0.98 |
+| 1x128x128x1024x1024 (paired) | yes | 629 | 677 | 0.93 | 0.96 |
+| 1x16x16x4096x4096 (`_np`) | yes | 719 | 920 | 0.78 | 0.77 |
+| 1x8x8x4096x4096 (`_causal_ks`) | yes | 577 | 614 | 0.94 | 0.95 |
+
+**MXFP8 `_vs128` forced at 256 rows per block** (real data; the dispatched paths are in section 2)
+
+| B x H x S | ours TF/s | aiter TF/s | ratio | v9.2 |
+|---|--:|--:|--:|--:|
+| 2 x 32 x 8192 | 2584 | 2504 | 1.03 | 0.99 |
+| 1 x 8 x 8192 | 2417 | 2411 | 1.00 | 0.96 |
+| 4 x 8 x 2048 | 1906 | 1900 | 1.00 | 1.02 |
+| 1 x 8 x 2048 | 720 | 712 | 1.01 | - |
+
+**Backward at S = 1024** (the perf_ab shapes, complementing section 4)
+
+| shape | causal | ours TF/s | aiter TF/s | ratio |
+|---|---|--:|--:|--:|
+| 1x16x16, 2x8x8, 1x16x4 | no | 272 - 275 | 256 | 1.06 - 1.08 |
+| the same three | yes | 141 - 144 | 100 | 1.41 - 1.44 |
+
+Summary:
+- fp8 per-tensor is ahead of aiter everywhere (1.13 - 1.77) and improved since v9.2.
+- bf16 hd128 is at or slightly above v9.2 (0.84 - 1.24); full-grid shapes are at 0.85 - 0.96, the split / q128 forms at 1.03 - 1.24.
+- hd192 is unchanged within noise (0.78 - 1.06); its two weakest forms are the split `_ks` (0.79) and the unpaired causal `_np` (0.78).
 ## 4. Attention backward (`tools/attn_family_table.sh`, `ONLY=bwd`)
 
 - Ours: `fmha_bwd_dot` + `dq` + `dkdv` (causal: the dispatched forms).
