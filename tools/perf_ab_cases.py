@@ -325,6 +325,29 @@ def gemm():
     return out
 
 
+# The aiter ASM kernel the small-M cases are compared with (vendor_gemm_host asm_* families, the same data and the same CPU check): the smallest tile of the family whose rows cover M
+# (the tile ladder aiter's own tuning CSVs draw from); fp8 per-token x per-channel is compared with the int8 per-token kernel (same operand layout, as in the v9.2 rows); bf16 has only the
+# 256x256 non-split kernel in the harness (aiter's split-K bf16 kernels write fp32 partials and need their own reduce).
+VENDOR_SMALL_M = {
+    'i8_rowcol': ('asm_i8', 'i8gemm/I8gemm_bf16_perTokenI8_BpreShuffle_{t}x128.co', (16, 32, 48, 64, 80, 96, 128, 160), 128),
+    'fp8_rowcol': ('asm_i8', 'i8gemm/I8gemm_bf16_perTokenI8_BpreShuffle_{t}x128.co', (16, 32, 48, 64, 80, 96, 128, 160), 128),
+    'fp8_blockscale': ('asm_fp8bs', 'fp8gemm_blockscale/fp8gemm_bf16_blockscale_BpreShuffle_{t}x128.co', (32, 48, 64, 80, 96, 128), 128),
+    'bf16': ('asm_bf16', 'bf16gemm/bf16gemm_bf16_tn_256x256.co', (256,), 256),
+}
+
+
+def _vendor_small_m(kind, m, n, k):
+    fam, pat, tiles, tn = VENDOR_SMALL_M.get(kind, (None, None, (), 0))
+    if fam is None:
+        return None
+    t = next((t for t in tiles if t >= m), tiles[-1])
+    co = f'{HSA}/' + pat.format(t=t)
+    if not os.path.exists(co):
+        return None
+    env = dict(ITERS=200, WARMUP=50, CHECK_ROWS=min(m, 8))
+    return lambda: Run([], ['{host:vendor_gemm_host}', fam, co, _vname(co), str(m), str(n), str(k), str(t), str(tn)], env)
+
+
 def gemv():
     """Small-M GEMM / GEMV (W6): M in {1, 4, 16, 32, 64} x square N = K in {4096, 7168, 8192}, the dispatched kernel of each kind (weight-streaming
     bound: the report's TF/s converts to weight bytes per second as N K es / (2 M N K / TF/s))."""
@@ -343,7 +366,20 @@ def gemv():
                     tm, tn = _tile(kn)
                     return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
                 # the host prints TF/s with one decimal (4.3 vs 4.2 TF/s is 2.4 % at M = 1): the small-M cases are judged on the microseconds it prints with two
-                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', timeout=600))
+                out.append(Case(id=f'gemv/{kind}/{m}x{nk}x{nk}', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', vendor=_vendor_small_m(kind, m, nk, nk), vendor_line=r'^asm_', timeout=600))
+    # the v9.2 split-K rows of op-coverage-design 7.4 (M = 128, N = 4096, K = 8192), to compare with
+    for kind, fam in GEMM_KINDS:
+        def build(side, kind=kind, fam=fam, m=128, n=4096, k=8192):
+            p = side.dispatch('gemm', kind, m, n, k)
+            kn, s, red = p['kernel'], p['splits'], p['reduce']
+            env = dict(SPLITK=s, ITERS=200, WARMUP=50, CHECK_ROWS=8)
+            emit = [kn]
+            if red:
+                env.update(REDUCE_CO='{co:%s}' % red, REDUCE_KN=red)
+                emit.append(red)
+            tm, tn = _tile(kn)
+            return Run(emit, ['{host:vendor_gemm_host}', fam, '{co:%s}' % kn, kn, str(m), str(n), str(k), str(tm), str(tn)], env)
+        out.append(Case(id=f'gemv/{kind}/128x4096x8192', family='gemv', build=build, metric='us', line=r'ours|OURS|TF', ok=r'GEMM_OK', vendor=_vendor_small_m(kind, 128, 4096, 8192), vendor_line=r'^asm_', timeout=600))
     return out
 
 
