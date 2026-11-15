@@ -29,11 +29,12 @@ value only feeds `best == block max`). Their code is identical to before the aud
 **NaN semantics - fixed** (user decision, after the audit): the kernels used to ignore a NaN logit (it never compares greater) where
 torch.argmax returns the first NaN's index. Now (`crates/amdgpu-kernels/src/sampling/mod.rs`):
 
-* argmax: the index of the FIRST NaN if the row has one, else the first index of the maximum (+0 / -0 tie; a row of -inf: 0). Pass 1 keeps
-  a witness `fma(x, 0, w)` (NaN once any element is NaN or infinite: one instruction per element); a row whose witness is NaN (block-wide)
-  is searched again for its first NaN (exact `x` unordered with itself, the lowest index over the block). The start value is -FLT_MAX
-  (below every bf16 number, above -inf), so rows of -inf or of the lowest bf16 values keep their first index (the old -3e38 start returned
-  0 for a row whose maximum was below it).
+* argmax: the index of the FIRST NaN if the row has one, else the first index of the maximum (+0 / -0 tie; a row of -inf: 0). Pass 1
+  keeps a NaN witness `w = sum of x 2^-100` (one fma per element; NaN once an element is NaN, or +inf and -inf are both present); a thread
+  whose witness is NaN reports +inf to the existing block maximum, so the row's maximum is +inf exactly for rows with a NaN or a +inf -
+  only those are searched again (block-uniform branch: the first NaN by `x` unordered with itself, else the first maximum), every other row
+  pays no extra reduction. The start value is -FLT_MAX (below every bf16 number, above -inf), so rows of -inf or of the lowest bf16
+  values keep their first index (the old -3e38 start returned 0 for a row whose maximum was below it).
 * sample / sample_topkp: where the softmax is undefined - a NaN logit (any sign, even one top-k would drop), or no finite maximum (+inf,
   a row of -inf) - torch.softmax gives NaN probabilities and torch.multinomial rejects the row (undefined in the reference). The kernels
   return the argmax there (the first NaN, else the first maximum); the references (`ops_check.py` `sample_ref`, `tests/gpu/sampling_host.cpp`)
@@ -41,3 +42,6 @@ torch.argmax returns the first NaN's index. Now (`crates/amdgpu-kernels/src/samp
 * tests: `ops_check.py` `argmax_nan` (V 1024 and 128256), `sample_nan`, `sample_topkp_nan`: NaN first / middle / last, several NaNs (a
   negative NaN first), an all-NaN row, +0 / -0 ties, rows of -inf and of the lowest numbers, +inf twice, +inf then NaN, a tied maximum. All
   four fail on the previous kernels and pass now.
+* cost (perf_ab 9 reps against Main 45631eca, random rows without NaN): mb/argmax v128256 0.983, mb/argmax v32000 0.964 (the fma per element
+  and the witness select; a first version with a separate NaN reduction cost 0.916 on v32000), mb/sample v128256 1.000, v32000 0.998;
+  topk cases unchanged. A row with a NaN or +inf reads the logits once more.
