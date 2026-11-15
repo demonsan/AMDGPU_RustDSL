@@ -173,6 +173,8 @@ Main `3d064d0c`：`cargo test` 163 个测试目标 / 650 项全绿，`run_all.sh
 - 退出决策的路径上限从 64 提到 256：修复了 `fmha_fwd_hd128_fp8pt_v3_causal` 被推过上限的问题。
 - 新守卫 `verify_reachable`：每个可达 kernel 严格验证 0 错误。
 
+- **与 aiter 的最新对比（v12，Main `4ec08dac`，同进程同数据，含 v9.2 对照列）**：计算密集族见 [`perf-vs-aiter-v12.md`](perf-vs-aiter-v12.md)，访存 / decode / MLA / GEMV / conv 见 [`perf-vs-aiter-v12-mb.md`](perf-vs-aiter-v12-mb.md)。
+
 ### 1.1 v9.2（2026-11-09 / 10，历史记录）
 
 - **与厂商的比值（同进程同数据，比 = 厂商时间 / ours）**，详见 [`op-coverage-design.md`](op-coverage-design.md) §7.4–§7.8 的汇总表与 [`op-coverage-membound.md`](op-coverage-membound.md) 的总表：
