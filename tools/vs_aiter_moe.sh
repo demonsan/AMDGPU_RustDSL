@@ -17,10 +17,10 @@ for dt in fp8 fp8bs; do
     for sh in "1024 4096 1024 8 2" "4096 7168 512 32 8" "256 7168 2048 64 8"; do
         set -- $sh
         ks="gemm_moe1_${dt}_silu gemm_moe2_${dt} moe_sum_bf16_k$5"
-        [ $dt != bf16 ] && ks="$ks quant_token_bf16_fp8_n$3"
+        if [ $dt = fp8bs ]; then ks="$ks quant_group128_bf16_fp8_n$3"; else ks="$ks quant_token_bf16_fp8_n$3"; fi
         for k in $ks; do emit "$k"; done
         out=$(BLOCK_M=128 CHECK=2 ITERS=50 WARMUP=10 VENDOR1="$vco" VENDOR1_KN="$(vname "$vco")" timeout 900 "$OUT/moe_host" "$dt" "$OUT" $1 $2 $3 $4 $5 silu 2>&1)
-        o=$(echo "$out" | grep -oE 'stage1 [0-9.]+ us' | head -1 | grep -oE '[0-9.]+')
+        o=$(echo "$out" | grep -oE '(^|[^r] )stage1 [0-9.]+ us' | head -1 | grep -oE '[0-9.]+ us' | grep -oE '[0-9.]+')
         v=$(echo "$out" | grep -E '^vendor stage1' | grep -oE ': [0-9.]+ us' | grep -oE '[0-9.]+')
         ok=$(echo "$out" | grep -oE 'MOE_(OK|FAIL)' | head -1)
         r=$(python3 -c "print(f'{$v/$o:.2f}')" 2>/dev/null || echo -)
