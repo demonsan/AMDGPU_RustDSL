@@ -108,6 +108,59 @@ def check_select_f32():
     return r
 
 
+def up_bf16_bits(bits, shape):
+    return aj.DeviceBuffer(shape, "bfloat16", data=struct.pack(f"<{len(bits)}H", *bits))
+
+
+def nan_rows(V):
+    """Rows as bf16 bit patterns with NaN / signed-zero / infinity cases (torch.argmax: the first NaN wins; ties: the lowest index)."""
+    QNAN, NNAN, PINF, NINF, PZ, NZ = 0x7FC0, 0xFFC0, 0x7F80, 0xFF80, 0x0000, 0x8000
+    rnd = lambda: [bf16_bits(rbf(R.gauss(0, 3))) for _ in range(V)]
+    rows = []
+    r = rnd(); r[0] = QNAN; rows.append(("NaN first", r))
+    r = rnd(); r[V // 2 + 3] = QNAN; rows.append(("NaN middle", r))
+    r = rnd(); r[V - 1] = QNAN; rows.append(("NaN last", r))
+    r = rnd(); r[700 % V] = QNAN; r[37] = NNAN; r[V - 5] = QNAN; rows.append(("several NaNs (negative first)", r))
+    rows.append(("all NaN", [QNAN] * V))
+    r = [NZ] * V; r[5] = PZ; rows.append(("-0 / +0 ties", r))
+    r = [PZ] * V; r[3] = NZ; rows.append(("+0 / -0 ties", r))
+    rows.append(("all -inf", [NINF] * V))
+    r = [NINF] * V; r[V - 2] = bf16_bits(-3.0e38); rows.append(("-inf and the lowest numbers", r))
+    r = rnd(); r[11] = PINF; r[900 % V] = PINF; rows.append(("+inf twice", r))
+    r = rnd(); r[9] = PINF; r[20] = QNAN; rows.append(("+inf then NaN", r))
+    r = rnd(); m = max(range(V), key=lambda i: (bf16(r[i]), -i)); r[m + 1 if m + 1 < V else 0] = r[m]; rows.append(("tie of the maximum", r))
+    return rows
+
+
+def check_nan_semantics(mode="argmax", V=1024, top_k=0, top_p=1.0):
+    """argmax / sample on NaN, signed-zero and infinite rows (argmax_ref / sample_ref semantics)."""
+    rows = nan_rows(V)
+    B = len(rows)
+    r = Res(f"{mode} NaN / +-0 / inf rows B={B} V={V}" + (f" top_k={top_k} top_p={top_p}" if mode == "sample" else ""))
+    bits = [x for _, row in rows for x in row]
+    dl, do = up_bf16_bits(bits, (B, V)), aj.DeviceBuffer((B,), "int32")
+    us = [0.5] * B
+    if mode == "argmax":
+        aj.argmax(dl, do)
+    else:
+        aj.sample(dl, up_f32(us, (B,)), do, temperature=1.0, top_k=top_k, top_p=top_p)
+    got = struct.unpack(f"<{B}i", do.download())
+    for b, (name, row) in enumerate(rows):
+        vals = [bf16(h) for h in row]
+        if mode == "argmax":
+            ref = argmax_ref(vals)
+        else:
+            ref = sample_ref(vals, 1.0, us[b], top_k, top_p)[0]
+            if not (any(math.isnan(x) for x in vals) or math.isinf(max(vals))):
+                continue  # a finite row: the regular sampling checks cover it
+        r.cnt += 1
+        if got[b] != ref:
+            if r.bad < 6:
+                print(f"    bad: {name}: got {got[b]} ref {ref}")
+            r.bad += 1
+    return r
+
+
 def check_rmsnorm(M=32, N=512, eps=1e-6):
     r = Res(f"rmsnorm M={M} N={N}")
     x, g = rand_bf16(M * N), rand_bf16(N)
@@ -678,9 +731,23 @@ def check_mla(B=2, H=16, CTX=256, P=16, heads=4):
     return r
 
 
+def argmax_ref(row):
+    """torch.argmax: the index of the first NaN if the row has one, else the first index of the maximum (+0 and -0 tie; -inf rows: 0)."""
+    for i, v in enumerate(row):
+        if math.isnan(v):
+            return i
+    return max(range(len(row)), key=lambda i: (row[i], -i))
+
+
 def sample_ref(row, inv_t, u, top_k, top_p):
+    """Inverse-CDF sampling of softmax(row / T) (filtered by top-k / top-p). Where the softmax is undefined - a NaN logit, or no finite
+    maximum (+inf, or a row of -inf) - torch.softmax gives NaN probabilities and torch.multinomial rejects the row; the kernels (and this
+    reference) then return the argmax (torch.argmax semantics: the first NaN, else the first maximum)."""
     V = len(row)
     xs = [v * inv_t for v in row]
+    if any(math.isnan(x) for x in xs) or math.isinf(max(xs)):
+        i = argmax_ref(xs)
+        return i, [0.0] * V, [True] * V, 1.0
     mx = max(xs)
     p = [math.exp(x - mx) for x in xs]
     keep = [True] * V
@@ -724,7 +791,7 @@ def check_sampling(B=8, V=1024, mode="sample", top_k=0, top_p=1.0, temp=0.8):
     for b in range(B):
         row = lg[b * V:(b + 1) * V]
         if mode == "argmax":
-            r.cmp(got[b], max(range(V), key=lambda i: (row[i], -i)), 0)
+            r.cmp(got[b], argmax_ref(row), 0)
             continue
         ref, p, keep, sk2 = sample_ref(row, 1 / temp, us[b], top_k, top_p)
         if got[b] != ref and 0 <= got[b] < V:
@@ -953,6 +1020,10 @@ CHECKS = [
     ("mla_decode", check_mla),
     ("select_f32", check_select_f32),
     ("argmax", lambda: check_sampling(mode="argmax")),
+    ("argmax_nan", lambda: check_nan_semantics("argmax")),
+    ("argmax_nan_v128256", lambda: check_nan_semantics("argmax", V=128256)),
+    ("sample_nan", lambda: check_nan_semantics("sample")),
+    ("sample_topkp_nan", lambda: check_nan_semantics("sample", top_k=50, top_p=0.9)),
     ("sample", check_sampling),
     ("sample_topkp", lambda: check_sampling(top_k=50, top_p=0.9)),
     ("topk_per_row_decode", check_topk_per_row),

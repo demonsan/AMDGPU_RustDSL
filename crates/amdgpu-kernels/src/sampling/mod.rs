@@ -15,7 +15,6 @@ use amdgpu_stage::templates::scan::{HsScan, ScanElem};
 use amdgpu_tile::{ev, Shared, SlotIdx};
 
 const T: i32 = 1024;
-const NEG: f32 = -3.0e38;
 
 pub fn by_name(name: &str) -> Option<Function> {
     let (rest, sample, filtered) = if let Some(r) = name.strip_prefix("sample_topkp_bf16_v") {
@@ -50,7 +49,8 @@ fn sel_f32(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId 
 struct Tiles {
     /// per-wave private slice (16 quad values) of the block reductions
     ws: Shared,
-    /// one 64-byte slot per reduction round (16 wave results)
+    /// one 64-byte slot per reduction round (16 wave results): 0 / 1 the maximum and its index, 2 the sample, 3 the top-p mass, 4 / 5 the NaN
+    /// test and the first NaN's index
     blk: Shared,
     sc0: Shared,
     sc1: Shared,
@@ -67,7 +67,7 @@ struct Tiles {
 fn declare_tiles(b: &mut FnBuilder) -> Tiles {
     Tiles {
         ws: private_at(b, "WS", 0, 64, 16),
-        blk: ring_at(b, "BLK", 1024, 64, 4),
+        blk: ring_at(b, "BLK", 1024, 64, 6),
         sc0: tile_at(b, "SC0", 1536, 4096),
         sc1: tile_at(b, "SC1", 5632, 4096),
         hist: tile_at(b, "HIST", 9728, 1280),
@@ -178,7 +178,9 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
     let r_l = { let n = b.bind_i32(ev(b_v) * (2 * v) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
     let r_o = { let n = b.bind_i32(ev(b_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
     let rowb = b.bind_i32(ev(row) * (2 * v) as i32);
-    let neg = b.c_f32(NEG);
+    // -FLT_MAX: below every bf16 number (the lowest is -3.39e38) and above -inf, so an element past the row never wins, a row of -inf keeps
+    // its first index (nothing compares greater than the start value) and the NaN witness below stays clean (no infinity)
+    let neg = b.c_f32(f32::MIN);
     let zero = b.c_f32(0.0);
     let big = b.c_f32(-1.0e9);
     // the passes are runtime loops of 4 chunks per iteration: the row is read once per pass (2nd / 3rd read from L2); a 1024-thread block can hold <= 128 VGPRs per thread, so
@@ -190,13 +192,15 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
         let ok = b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)));
         (ch, ok)
     };
-    // ---- pass 1 (coalesced): the lowest-index maximum
-    let res1 = b.loop_(&[(DType::F32, Opnd::F32(NEG)), (DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))], |b, vars| {
-        let (vb, vi, vit) = (vars[0], vars[1], vars[2]);
+    // ---- pass 1 (coalesced): the lowest-index maximum, and a NaN-or-inf witness (fma(x, 0, w): NaN once any element is NaN or infinite; one
+    // instruction per element; the exact first-NaN search below only runs for a row that has one)
+    let res1 = b.loop_(&[(DType::F32, Opnd::F32(f32::MIN)), (DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0)), (DType::F32, Opnd::F32(0.0))], |b, vars| {
+        let (vb, vi, vit, vw) = (vars[0], vars[1], vars[2], vars[3]);
         let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
         b.break_if(done);
         let mut best = b.let_(Op::AddF32(Opnd::Var(vb), Opnd::F32(0.0)));
         let mut bidx = b.let_(Op::AddI32(Opnd::Var(vi), Opnd::I32(0)));
+        let mut wit = b.let_(Op::AddF32(Opnd::Var(vw), Opnd::F32(0.0)));
         let mut loaded = Vec::new();
         for u in 0..4i32 {
             let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
@@ -223,16 +227,19 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 // treats +0 and -0 alike)
                 best = b.let_(Op::MaxF32(Opnd::Val(xk), Opnd::Val(best)));
                 bidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt), a: Opnd::Val(idx), b: Opnd::Val(bidx) });
+                wit = b.let_(Op::FmaF32(Opnd::Val(xk), Opnd::F32(0.0), Opnd::Val(wit)));
             }
         }
         b.set_var(vb, best);
         b.set_var(vi, bidx);
+        b.set_var(vw, wit);
         let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
         b.set_var(vit, nx);
-        (vb, vi)
+        (vb, vi, vw)
     });
     let best = b.let_(Op::AddF32(Opnd::Var(res1.0), Opnd::F32(0.0)));
     let bidx = b.let_(Op::AddI32(Opnd::Var(res1.1), Opnd::I32(0)));
+    let wit = b.let_(Op::AddF32(Opnd::Var(res1.2), Opnd::F32(0.0)));
     let m = block_reduce(b, &tl, RedOp::Max, best, wave, lane, 0);
     // the lowest index among the threads holding the maximum: the maximum of the negated indices
     let at_max = b.cmp(CmpPred::Eq, CmpTy::F32, best, m);
@@ -241,7 +248,59 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
     let cand = sel_f32(b, at_max, nidx, big);
     let min_neg = block_reduce(b, &tl, RedOp::Max, cand, wave, lane, 1);
     let argmax_f = b.sub_f32(zero, min_neg);
-    let argmax = b.un(amdgpu_dsl::UnOp::CvtI32F32, argmax_f);
+    let argmax_v = b.un(amdgpu_dsl::UnOp::CvtI32F32, argmax_f);
+    // ---- torch.argmax semantics for NaN: the index of the FIRST NaN of the row wins over every number. The witness says whether the row may
+    // hold one (a NaN or an infinity); only then (a block-uniform branch) the row is searched again for its first NaN (exact: x unordered with
+    // itself), the lowest index over the block (max of the negated indices)
+    let one_f = b.c_f32(1.0);
+    let wnan = b.cmp(CmpPred::Uno, CmpTy::F32, wit, wit);
+    let wv = sel_f32(b, wnan, one_f, zero);
+    let any_w = block_reduce(b, &tl, RedOp::Max, wv, wave, lane, 4);
+    let nv = b.declare_vars(&[(DType::F32, Opnd::F32(-3.0e9))]);
+    let half_f = b.c_f32(0.5);
+    let has_w = b.cmp(CmpPred::Gt, CmpTy::F32, any_w, half_f);
+    b.if_(has_w, |b| {
+        let first = b.loop_(&[(DType::I32, Opnd::I32(i32::MAX)), (DType::I32, Opnd::I32(0))], |b, vars| {
+            let (vn, vit) = (vars[0], vars[1]);
+            let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
+            b.break_if(done);
+            let mut nmin = b.let_(Op::AddI32(Opnd::Var(vn), Opnd::I32(0)));
+            let mut loaded = Vec::new();
+            for u in 0..4i32 {
+                let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+                let ci = b.bind_i32(ev(ci) * 4 + u);
+                let (ch, ok) = chunk_of(b, ci, true);
+                let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+                let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+                loaded.push((ch, ok, frag));
+            }
+            for (ch, ok, frag) in loaded {
+                let x = bf16x8_to_f32(b, frag);
+                for k in 0..8usize {
+                    let un = b.cmp(CmpPred::Uno, CmpTy::F32, x[k], x[k]);
+                    let idx = b.bind_i32((ev(ch) << 3) + k as i32);
+                    let c1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(un), a: Opnd::Val(idx), b: Opnd::I32(i32::MAX) });
+                    let c2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(c1), b: Opnd::I32(i32::MAX) });
+                    nmin = b.min_i32(nmin, c2);
+                }
+            }
+            b.set_var(vn, nmin);
+            let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
+            b.set_var(vit, nx);
+            vn
+        });
+        let nm = b.let_(Op::AddI32(Opnd::Var(first), Opnd::I32(0)));
+        let nneg = b.bind_i32(ev(nm) * (-1));
+        let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, nneg);
+        let red = block_reduce(b, &tl, RedOp::Max, nf, wave, lane, 5);
+        b.set_var(nv[0], red);
+    });
+    let nan_neg = b.let_(Op::AddF32(Opnd::Var(nv[0]), Opnd::F32(0.0)));
+    let nan_lim = b.c_f32(-0.5e9);
+    let has_nan = b.cmp(CmpPred::Gt, CmpTy::F32, nan_neg, nan_lim);
+    let nan_f = b.sub_f32(zero, nan_neg);
+    let nan_idx = b.un(amdgpu_dsl::UnOp::CvtI32F32, nan_f);
+    let argmax = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_nan), a: Opnd::Val(nan_idx), b: Opnd::Val(argmax_v) });
     let result = if !sample {
         argmax
     } else {
@@ -535,7 +594,9 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
         let none = b.cmp(CmpPred::Lt, CmpTy::F32, mn, half);
         let pick_f = b.sub_f32(zero, mn);
         let pick = b.un(amdgpu_dsl::UnOp::CvtI32F32, pick_f);
-        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(none), a: Opnd::Val(argmax), b: Opnd::Val(pick) })
+        let s = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(none), a: Opnd::Val(argmax), b: Opnd::Val(pick) });
+        // a row with a NaN: its first NaN (the argmax rule; torch's softmax is NaN there and torch.multinomial rejects the row - undefined)
+        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_nan), a: Opnd::Val(nan_idx), b: Opnd::Val(s) })
     };
     let is0 = b.let_(Op::CmpLtI32(Opnd::Val(tid), Opnd::I32(1)));
     let oo = b.bind_i32(ev(row) << 2);
