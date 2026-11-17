@@ -1360,7 +1360,8 @@ fn main() -> ExitCode {
                     Ok(x) => x,
                     Err(c) => return c,
                 };
-                return match amdgpu_codegen::compile_target(&f, &tn) {
+                let be = args.windows(2).find(|w| w[0] == "--backend").map(|w| w[1].clone()).unwrap_or_else(|| "own".into());
+                return match amdgpu_codegen::compile_target_with(&f, &tn, &be) {
                     Ok(c) => {
                         match args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone()) {
                             Some(p) => {

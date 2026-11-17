@@ -483,5 +483,17 @@ pub fn compile_target(f: &amdgpu_dsl::Function, target: &str) -> Result<Compiled
     }
 }
 
+/// `compile_target` with a tail backend (`own`, `llvm-tail`; gfx950 also `auto` as `amdc emit`).
+pub fn compile_target_with(f: &amdgpu_dsl::Function, target: &str, backend: &str) -> Result<Compiled, String> {
+    let t = amdgpu_target::by_name(target).ok_or_else(|| format!("unknown target `{target}` (known: {})", amdgpu_target::TARGET_NAMES.join(", ")))?;
+    match t.name {
+        "gfx950" => {
+            let b = backend::backend_by_name(backend).ok_or_else(|| format!("unknown backend `{backend}`"))?;
+            compile_with(f, b.as_ref())
+        }
+        _ => target::with_target(t, || target::gfx1250::compile_with(f, backend)),
+    }
+}
+
 /// The target descriptions and the in-process encoders (`amdgpu_codegen::amdgpu_target::gfx1250_co`, ...).
 pub use amdgpu_target;

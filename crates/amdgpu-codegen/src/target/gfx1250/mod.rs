@@ -9,10 +9,42 @@ pub mod emit;
 /// Compiles `f` for gfx1250 (G1: the shared lowering / scheduling / allocation, then the gfx1250 emitter; wave32 kernels without
 /// divergent control flow, v0..v255, no AGPRs; the waits are the gfx950 ones mapped conservatively onto the split counters).
 pub fn compile(f: &Function) -> Result<crate::Compiled, String> {
+    compile_with(f, "own")
+}
+
+/// The pinned gfx1250 llc directory (backend.gfx1250.lock): `ROCM_LLVM_BIN_GFX1250`, else the MI450 nodes' build.
+pub fn llvm_bin() -> std::path::PathBuf {
+    std::env::var("ROCM_LLVM_BIN_GFX1250").map(std::path::PathBuf::from).unwrap_or_else(|_| "/data/blyu/llvm-tools/rocm-10.2.0/bin".into())
+}
+
+/// Compiles `f` for gfx1250 with the `own` tail (the gfx1250 emitter) or the `llvm-tail` (the allocated MIR through the pinned gfx1250 llc
+/// from `gcn-create-vopd`: LLVM computes the waits, hazards and the kernel prologue; our auto waits are not exported).
+pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, String> {
     if f.workgroup_size > 1024 {
         return Err(format!("{}: workgroup size {} (gfx1250: at most 1024 work-items)", f.name, f.workgroup_size));
     }
     let (m, alloc) = crate::lower_and_allocate(f)?;
-    let asm = emit::emit(&m, &alloc)?;
+    let asm = match backend {
+        "own" => emit::emit(&m, &alloc)?,
+        "llvm-tail" => {
+            let own_only: Vec<String> = m
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .filter(|i| matches!(i.op, crate::mir::MOp::TensorLoadToLds | crate::mir::MOp::TensorStoreFromLds | crate::mir::MOp::SWaitTensor | crate::mir::MOp::SWaitCtr | crate::mir::MOp::SBarrierSignal | crate::mir::MOp::SBarrierWait | crate::mir::MOp::SSetVgprMsb))
+                .map(|i| format!("{:?}", i.op))
+                .collect();
+            if !own_only.is_empty() {
+                return Err(format!("{}: the gfx1250 LLVM tail has no rows for {own_only:?} (use the own tail)", f.name));
+            }
+            let mut t = crate::backend::LlvmTail::new();
+            t.tools = crate::backend::LlvmTools { bin: llvm_bin() };
+            t.drop_auto_waits = true;
+            let mir = t.export_mir(&m, &alloc)?;
+            let asm = t.run_llc(&m.name, &mir, crate::backend::llvm20::START_PASS_PREFERENCE[0])?;
+            crate::backend::declare_unnatural_args(&asm, &m)
+        }
+        b => return Err(format!("unknown backend `{b}` (own, llvm-tail)")),
+    };
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }

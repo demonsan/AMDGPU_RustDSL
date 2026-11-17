@@ -64,3 +64,26 @@ fn a_raw_tensor_op_is_emitted_verbatim() {
     assert!(n.asm.lines().any(|l| l.trim_start().starts_with("tensor_load_to_lds s[")), "{}", n.asm);
     assert!(n.asm.contains("s_wait_tensorcnt 0x0") && n.asm.contains("s_barrier_signal -1"), "{}", n.asm);
 }
+
+/// The gfx1250 LLVM tail: the probes without own-only ops compile through the pinned gfx1250 llc (backend.gfx1250.lock) and assemble.
+#[test]
+fn the_probes_compile_through_the_gfx1250_llvm_tail() {
+    let llc = amdgpu_codegen::target::gfx1250::llvm_bin().join("llc");
+    if !llc.exists() {
+        eprintln!("SKIPPED: no gfx1250 llc at {}", llc.display());
+        return;
+    }
+    let Some(cl) = clang() else { return };
+    let dir = std::env::temp_dir().join(format!("g1250_tail_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for k in ["probe_g1250_add", "probe_g1250_math"] {
+        let f = amdgpu_kernels::kernel_by_name(k).unwrap();
+        let c = amdgpu_codegen::compile_target_with(&f, "gfx1250", "llvm-tail").unwrap_or_else(|e| panic!("{k}: {e}"));
+        assert!(c.asm.contains("global_prefetch_b8"), "{k}: LLVM's prologue\n{}", c.asm);
+        let s = dir.join(format!("{k}.s"));
+        std::fs::write(&s, &c.asm).unwrap();
+        let out = Command::new(&cl).args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx1250", "-c"]).arg(&s).arg("-o").arg(dir.join(format!("{k}.o"))).output().unwrap();
+        assert!(out.status.success(), "{k}:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

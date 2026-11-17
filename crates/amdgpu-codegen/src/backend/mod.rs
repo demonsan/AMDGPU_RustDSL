@@ -109,7 +109,8 @@ impl LlvmTail {
             let _ = std::fs::write(k.join(format!("{name}.mir")), mir);
         }
         let start_arg = format!("-start-before={start}");
-        let mut args: Vec<&str> = llvm20::LLC_ARGS.to_vec();
+        // the compilation target's llc arguments (gfx950: llvm20::LLC_ARGS)
+        let mut args: Vec<&str> = crate::target::cur().llvm.llc_args.to_vec();
         args.push(&start_arg);
         args.push("-filetype=asm");
         let extra = std::env::var("AMDC_LLC_ARGS").unwrap_or_default();
