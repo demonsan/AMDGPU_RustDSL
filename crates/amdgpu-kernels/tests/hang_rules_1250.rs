@@ -9,7 +9,7 @@
 
 use amdgpu_codegen::gpu_verify_1250::{verify_asm, verify_ir, with_rules_disabled, RULES};
 use amdgpu_codegen::compile_target;
-use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Function, Op, Opnd, TdmCpol};
+use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol};
 
 fn gfx1250(f: &Function) -> Result<String, String> {
     compile_target(f, "gfx1250").map(|c| c.asm)
@@ -246,6 +246,38 @@ fn pos_mcast() {
     ir_positive(&tdm_host_kernel(&[0x10000, 0x20000]));   // the host contract: the low 16 bits are zero
 }
 
+/// The scope word the vendor builds (a variable cleared / set bit by bit): group 1 word 0 = a loop-carried variable starting at 0 and updated `x = (x & 0x1ffffff) | or_const`.
+fn tdm_var_kernel(or_const: i32) -> Function {
+    let mut b = FnBuilder::new("hr_tdm_var", 64);
+    b.lds(4096);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let a = b.let_(Op::AndI32(Opnd::Var(vars[0]), Opnd::I32(0x01ff_ffff)));
+    let o = b.bin(amdgpu_dsl::BinOp::OrB32, a, Opnd::I32(or_const));
+    b.set_var(vars[0], o);
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::I32(0), Opnd::I32(0), Opnd::I32((2u32 << 30) as i32)] });
+    let g1 = b.sgpr_cat8([Opnd::Var(vars[0]), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64), Opnd::I32(0), Opnd::I32(0)]);
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, o, n);
+    b.break_if(c);
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn mut_mcast_known_bits() {
+    // the loop sets a bit inside the mask (bit 1): the word is no longer provably mask-free
+    ir_mutation(&tdm_var_kernel(0x0600_0002), "GV-1250-MCAST");
+}
+
+#[test]
+fn pos_mcast_known_bits() {
+    // every write clears bits or sets bits >= 16 starting from 0: bits 15:0 are provably zero on every path, no cluster needed
+    ir_positive(&tdm_var_kernel(0x0600_0000));
+    ir_positive(&tdm_var_kernel(0x0018_0000));
+}
+
 // GV-1250-BAR-ID
 
 #[test]
@@ -253,7 +285,6 @@ fn mut_bar_id() {
     compile_mutation(&barrier_kernel(&[(true, 0), (false, 0)], &[]), "GV-1250-BAR-ID");     // the null barrier
     compile_mutation(&barrier_kernel(&[(true, 17), (false, 17)], &[]), "GV-1250-BAR-ID");   // beyond the named barriers
     compile_mutation(&barrier_kernel(&[(true, -5), (false, -5)], &[]), "GV-1250-BAR-ID");
-    compile_mutation(&barrier_kernel(&[(true, -3), (false, -3)], &[]), "GV-1250-BAR-ID");   // the cluster barrier outside a cluster launch
     compile_mutation(&named_kernel(|b| { init(b, 2, 2); b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 0, 0), "GV-1250-BAR-ID");     // a named barrier that is not allocated
     compile_mutation(&named_kernel(|b| { init(b, 3, 2); b.barrier_join(3); b.barrier_signal(3); b.barrier_wait(3); b.barrier_leave(); }, 2, 0), "GV-1250-BAR-ID");   // beyond the allocated count
 }
@@ -273,7 +304,6 @@ fn pos_bar_id_asm() {
 fn pos_bar_id() {
     compile_positive(&barrier_kernel(&[(true, -1), (false, -1)], &[]));
     compile_positive(&named_kernel(|b| { init(b, 2, 2); b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 2, 0));
-    compile_positive(&barrier_kernel(&[(true, -3), (false, -3)], &[("cluster_dims", 4)]));
 }
 
 #[test]
@@ -388,6 +418,89 @@ fn pos_bar_init() {
     ir_positive(&named_kernel(|b| { b.barrier_init(1, 2); b.barrier_signal(-1); b.barrier_wait(-1); b.barrier_join(1); b.barrier_signal(1); b.barrier_wait(1); b.barrier_leave(); }, 1, 0));
 }
 
+// GV-1250-BAR-COUNT
+
+/// A 4-wave kernel in a cluster launch; the body gets the wave id (tid / 32).
+fn wave_kernel(body: impl FnOnce(&mut FnBuilder, amdgpu_dsl::ValueId)) -> Function {
+    let mut b = FnBuilder::new("hr_cnt", 128);
+    b.arg("n", DType::I32, 0, 4);
+    let t = b.let_(Op::WorkitemId);
+    let w = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+    body(&mut b, w);
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 4));
+    f
+}
+
+/// `if cond(w) { signal(-3) }; wait(-3)`: the shape of a cluster barrier whose leader arm signals.
+fn leader_barrier(b: &mut FnBuilder, cond: Opnd) {
+    b.begin_if(cond);
+    b.barrier_signal(-3);
+    b.end_if();
+    b.barrier_wait(-3);
+}
+
+fn wave_is(b: &mut FnBuilder, w: amdgpu_dsl::ValueId, k: i32) -> Opnd {
+    Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(k)))
+}
+
+#[test]
+fn mut_bar_count() {
+    // no wave satisfies the leader condition (4 waves: ids 0..3): nobody signals, the cluster barrier never completes
+    ir_mutation(&wave_kernel(|b, w| { let c = wave_is(b, w, 7); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // two waves per work-group signal: the count runs ahead (a cluster-wide count by signals, not by waves)
+    ir_mutation(&wave_kernel(|b, w| { let c = Opnd::Val(b.cmp(CmpPred::Lt, CmpTy::I32, w, Opnd::I32(2))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // every wave signals
+    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal(-3); b.barrier_wait(-3); }), "GV-1250-BAR-COUNT");
+    // the leader's signal removed (the wait stays)
+    ir_mutation(&wave_kernel(|b, _| b.barrier_wait(-3)), "GV-1250-BAR-COUNT");
+    // a loop body whose leader arm signals twice per pass but waits once
+    ir_mutation(&wave_kernel(|b, w| {
+        let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let c0 = wave_is(b, w, 0);
+        b.begin_if(c0);
+        b.barrier_signal(-3);
+        b.barrier_signal(-3);
+        b.end_if();
+        b.barrier_wait(-3);
+        let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+        b.break_if(c);
+        b.end_loop();
+    }), "GV-1250-BAR-COUNT");
+    // a uniform condition the verifier cannot evaluate (a kernarg): every resolution is checked, and with every wave signalling under it neither passes
+    ir_mutation(&wave_kernel(|b, _| { let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // a condition that is neither evaluable nor wave-uniform (a per-lane loaded value) and no declared launch fact: not provable, not silently accepted
+    ir_mutation(&wave_kernel(|b, _| { let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // the fact itself must say 1 for the cluster barrier
+    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+}
+
+#[test]
+fn pos_bar_count() {
+    // the leader arm: exactly one wave per work-group signals (proved from the wave id)
+    ir_positive(&wave_kernel(|b, w| { let c = wave_is(b, w, 0); leader_barrier(b, c) }));
+    ir_positive(&wave_kernel(|b, w| { let c = wave_is(b, w, 3); leader_barrier(b, c) }));
+    // the same inside a loop body, one pass per wait
+    ir_positive(&wave_kernel(|b, w| {
+        let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let c0 = wave_is(b, w, 0);
+        leader_barrier(b, c0);
+        let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+        b.break_if(c);
+        b.end_loop();
+    }));
+    // a condition that is neither evaluable nor wave-uniform (a per-lane loaded value), with the named launch fact: accepted, and listed as a trusted item
+    let f = wave_kernel(|b, _| { b.barrier_signal_count(-3, 1); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) });
+    ir_positive(&f);
+    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(t[0].contains("barrier -3") && t[0].contains("declared launch fact"), "{t:?}");
+    // a proved kernel has no trusted items
+    assert!(amdgpu_codegen::gpu_verify_1250::trusted_items(&wave_kernel(|b, w| { let c = wave_is(b, w, 0); leader_barrier(b, c) })).is_empty());
+}
+
 // the exact-mode forward gotos: the blocks of a region form a DAG, and the rules join the facts of every path into a target
 
 /// An exact kernel whose body `f(b, c_div, c_uni)` gets a condition that differs between the waves (work-item id) and one every wave evaluates alike (a kernarg).
@@ -434,7 +547,19 @@ fn pos_bar_goto() {
     ir_positive(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.goto(2); b.layout_key(1); b.barrier_join(1); b.layout_key(2); b.barrier_leave(); }, 1));
     ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.goto(2); b.layout_key(1); b.barrier_signal(-1); b.layout_key(2); b.barrier_wait(-1); }, 0));
     // completion is count-based: a wave may wait on a barrier only OTHER waves signal (the cluster barrier: one signaller per workgroup, every wave waits), also behind a goto
-    let mut f = goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-3); b.layout_key(1); b.barrier_wait(-3); }, 0);
+    // every path signals once, from the leader wave only (a uniform goto picks the path): proved, no fact needed
+    let mut f = goto_kernel(|b, _, cu| {
+        let t = b.let_(Op::WorkitemId);
+        let w = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+        let lead = |b: &mut FnBuilder| { let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(0))); b.begin_if(c); b.barrier_signal(-3); b.end_if(); };
+        b.goto_if(cu, 1);
+        lead(b);
+        b.goto(2);
+        b.layout_key(1);
+        lead(b);
+        b.layout_key(2);
+        b.barrier_wait(-3);
+    }, 0);
     f.kd.push(("cluster_dims".into(), 4));
     ir_positive(&f);
 }
@@ -578,6 +703,53 @@ fn pos_tdm_drain() {
     asm_positive(&base_asm());
 }
 
+/// A ring-marked tensor load whose LDS address is computed like a cooperative stage: slot * `stride` + wave * `slice`, the slot a loop variable cycling 0 .. `slots`, a work-group of 128 (4 waves),
+/// a tile of `tile_bytes` bytes, `lds` bytes of LDS declared, a ring `r` of `slots` slots of `ring_stride` bytes from 0.
+fn tdm_lds_kernel(lds: u32, slots: u32, ring_stride: i64, stride: i32, slice: i32, tile_bytes: i32) -> Function {
+    let mut b = FnBuilder::new("hr_tdm_lds", 128);
+    b.lds(lds);
+    b.lds_ring("r", 0, ring_stride, slots);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let off = b.let_(Op::MulI32(Opnd::Var(vars[0]), Opnd::I32(stride)));
+    let wl = b.let_(Op::MulI32(Opnd::Val(w), Opnd::I32(slice)));
+    let lds_addr = b.let_(Op::AddI32(Opnd::Val(off), Opnd::Val(wl)));
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::Val(lds_addr), Opnd::I32(0), Opnd::I32((2u32 << 30) as i32)] });
+    let g1 = b.sgpr_cat8([Opnd::I32(0), Opnd::I32(4096 << 16), Opnd::I32(0), Opnd::I32(tile_bytes << 16), Opnd::I32(1), Opnd::I32(4096), Opnd::I32(0), Opnd::I32(0)]);
+    b.tile_produce("r", Opnd::Var(vars[0]), Opnd::I32(0));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.tile_end();
+    let nxt = b.add_i32(vars[0], Opnd::I32(1));
+    let wrap = b.cmp(CmpPred::Lt, CmpTy::I32, nxt, Opnd::I32(slots as i32));
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wrap), a: Opnd::Val(nxt), b: Opnd::I32(0) });
+    b.set_var(vars[0], s2);
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, s2, n);
+    b.break_if(c);
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn mut_tdm_lds_extent() {
+    // the tile is larger than a ring slot (a slot is 1024 bytes, the tile 2048)
+    ir_mutation(&tdm_lds_kernel(8192, 3, 1024, 1024, 0, 2048), "GV-1250-TDM-DESC");
+    // the waves' slices run past the slot: 4 waves x 512 + 512 > 1024
+    ir_mutation(&tdm_lds_kernel(8192, 3, 1024, 1024, 512, 512), "GV-1250-TDM-DESC");
+    // the last slot's tile ends beyond the declared LDS (3 slots of 1024 declared as 2048)
+    ir_mutation(&tdm_lds_kernel(2048, 3, 1024, 1024, 0, 1024), "GV-1250-TDM-DESC");
+}
+
+#[test]
+fn pos_tdm_lds_extent() {
+    // every wave loads its 256-byte slice of the 1024-byte slot, all slots inside the 3072 declared bytes
+    ir_positive(&tdm_lds_kernel(3072, 3, 1024, 1024, 256, 256));
+    ir_positive(&tdm_lds_kernel(4096, 3, 1024, 1024, 0, 1024));
+}
+
 // GV-1250-DPP
 
 #[test]
@@ -668,6 +840,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-NBAR-COUNT", "nbar_count"),
     ("GV-1250-BAR-JOIN", "bar_join"),
     ("GV-1250-BAR-INIT", "bar_init"),
+    ("GV-1250-BAR-COUNT", "bar_count"),
     ("GV-1250-BAR-WAIT-IMM", "bar_wait_imm"),
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),

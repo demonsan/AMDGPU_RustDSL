@@ -43,6 +43,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant in the field's range (1..=63); completion is count-based, so the count is the number of signals per phase, joined or not" },
     Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
     Rule { id: "GV-1250-BAR-INIT", layer: Layer::Ir, what: "a named barrier is initialized before it is used, and a work-group barrier orders the initialization before the first use (a re-initialization after another wave signalled loses the count)" },
+    Rule { id: "GV-1250-BAR-COUNT", layer: Layer::Ir, what: "the cluster barrier is signalled by exactly one wave per work-group per phase: proved statically when the signalling condition is a function of the wave id, otherwise an explicit, named launch fact that is listed as a trusted item (never an implicit pass)" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -133,14 +134,123 @@ fn const_of(o: &Opnd, defs: &HashMap<ValueId, Op>) -> Option<i64> {
     }
 }
 
+/// Known-zero bits (a set bit = provably 0 on every execution) of every value and variable: a forward fixpoint over the statements. Constants are exact; `and` clears (the union of the operands'
+/// known zeros), `or` / `xor` keep what both operands have, shifts move the facts, `bitset1` / `bitset0` set / clear one bit, a sum or product keeps its low zero bits, a variable is the meet
+/// (intersection) of everything assigned to it (an undefined initial value constrains nothing). Everything else (loads, kernargs, ...) is unknown.
+struct KnownZero {
+    vals: HashMap<ValueId, u32>,
+    vars: HashMap<VarId, u32>,
+}
+
+impl KnownZero {
+    fn of(&self, o: &Opnd) -> u32 {
+        match o {
+            Opnd::I32(c) => !(*c as u32),
+            Opnd::Val(v) => self.vals.get(v).copied().unwrap_or(0),
+            Opnd::Var(v) => self.vars.get(v).copied().unwrap_or(0),
+            Opnd::F32(_) => 0,
+        }
+    }
+    fn tz(&self, o: &Opnd) -> u32 {
+        self.of(o).trailing_ones()
+    }
+    fn low(n: u32) -> u32 {
+        if n >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << n) - 1
+        }
+    }
+    fn op(&self, op: &Op) -> u32 {
+        let k = |o: &Opnd| if let Opnd::I32(c) = o { Some(*c as u32) } else { None };
+        match op {
+            Op::ConstI32(c) => !(*c as u32),
+            Op::AndI32(a, b) => self.of(a) | self.of(b),
+            Op::XorI32(a, b) | Op::Bin(amdgpu_dsl::BinOp::OrB32, a, b) => self.of(a) & self.of(b),
+            Op::ShlI32(a, b) => match k(b) {
+                Some(n) if n < 32 => (self.of(a) << n) | Self::low(n),
+                _ => 0,
+            },
+            Op::LshrI32(a, b) => match k(b) {
+                Some(n) if n < 32 => (self.of(a) >> n) | !(u32::MAX >> n),
+                _ => 0,
+            },
+            Op::AddI32(a, b) | Op::Salu { op: amdgpu_dsl::SaluOp::AddCoI32 | amdgpu_dsl::SaluOp::SubCoI32, a, b } => Self::low(self.tz(a).min(self.tz(b))),
+            Op::MulI32(a, b) => Self::low(self.tz(a) + self.tz(b)),
+            Op::MovS { a, .. } | Op::MovV { a, .. } => self.of(a),
+            Op::Select { a, b, .. } => self.of(a) & self.of(b),
+            Op::Salu { op: amdgpu_dsl::SaluOp::Bitset1, a, b } => match k(b) {
+                Some(n) => self.of(a) & !(1u32 << (n & 31)),
+                None => 0,
+            },
+            Op::Salu { op: amdgpu_dsl::SaluOp::Bitset0, a, b } => match k(b) {
+                Some(n) => self.of(a) | (1u32 << (n & 31)),
+                None => 0,
+            },
+            Op::Salu { op: amdgpu_dsl::SaluOp::BfeU32, a, b } => match k(b) {
+                Some(bw) => {
+                    let (off, w) = (bw & 31, (bw >> 16) & 0x7f);
+                    if w == 0 {
+                        u32::MAX
+                    } else if w >= 32 {
+                        (self.of(a) >> off) | !(u32::MAX >> off)
+                    } else {
+                        ((self.of(a) >> off) & Self::low(w)) | !Self::low(w)
+                    }
+                }
+                None => 0,
+            },
+            _ => 0,
+        }
+    }
+}
+
+fn known_zero(f: &Function, defs: &HashMap<ValueId, Op>) -> KnownZero {
+    let asg = var_assignments(f);
+    let mut kz = KnownZero { vals: HashMap::default(), vars: asg.keys().map(|v| (*v, u32::MAX)).collect() };
+    let undef = |o: &Opnd| matches!(o, Opnd::Val(u) if matches!(defs.get(u), Some(Op::Undef { .. })));
+    for _ in 0..16 {
+        // values in statement order with the current variable estimates
+        for st in f.stmts() {
+            if let Stmt::Let { dst, op } = st {
+                let z = kz.op(op);
+                kz.vals.insert(*dst, z);
+            }
+        }
+        // variables: the meet of their assignments
+        let mut changed = false;
+        for (v, list) in &asg {
+            let mut z = u32::MAX;
+            for a in list {
+                if !undef(a) {
+                    z &= kz.of(a);
+                }
+            }
+            let old = kz.vars[v];
+            if z != old {
+                kz.vars.insert(*v, z & old);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    kz
+}
+
 /// The multicast mask (group 1, word 0, bits 15:0) of a tensor operation's group-1 operand.
-fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, g1: &Opnd) -> Mask {
+fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, kz: &KnownZero, g1: &Opnd) -> Mask {
     let Opnd::Val(v) = g1 else { return Mask::Unknown };
     let Some(Op::SgprCat8 { words }) = defs.get(v) else { return Mask::Unknown };
     let w0 = &words[0];
     if let Some(c) = const_of(w0, defs) {
         let m = (c as u32) & 0xffff;
         return if m == 0 { Mask::Zero } else { Mask::Const(m) };
+    }
+    // known-zero bits: every operation that built the word either clears bits or sets bits above 15 (bits 15:0 are the multicast mask)
+    if kz.of(w0) & 0xffff == 0xffff {
+        return Mask::Zero;
     }
     // a word the host supplies in the kernarg segment: provable only through the host contract (a fixed value / a set of values whose low 16 bits are zero)
     if let Opnd::Val(x) = w0 {
@@ -167,6 +277,116 @@ fn group_words(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Option<u32>> {
     match defs.get(v) {
         Some(Op::RsrcCat { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
         Some(Op::SgprCat8 { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The range [lo, hi] a value can take over every work-item and every execution, when it is built from constants, the work-item id (`wg` work-items), wave-uniform reads of it and the ring slot
+/// the surrounding marker names (`slot`: the operand and the number of slots); `None` when not bounded. Interval arithmetic; variables are bounded only by their single non-recursive assignment.
+fn range_i(o: &Opnd, cx: &EvCtx, wg: i64, slot: Option<(&Opnd, i64)>, depth: u32) -> Option<(i64, i64)> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some((so, n)) = slot {
+        if so == o && !matches!(o, Opnd::I32(_)) {
+            return Some((0, n - 1));
+        }
+    }
+    let go = |x: &Opnd| range_i(x, cx, wg, slot, depth + 1);
+    let corners = |a: (i64, i64), b: (i64, i64), f: &dyn Fn(i64, i64) -> i64| -> (i64, i64) {
+        let c = [f(a.0, b.0), f(a.0, b.1), f(a.1, b.0), f(a.1, b.1)];
+        (*c.iter().min().unwrap(), *c.iter().max().unwrap())
+    };
+    match o {
+        Opnd::I32(c) => Some((*c as i64, *c as i64)),
+        Opnd::Var(v) => {
+            let asg = cx.vars.get(v)?;
+            let mut r: Option<(i64, i64)> = None;
+            for a in asg {
+                if matches!(a, Opnd::Val(u) if matches!(cx.defs.get(u), Some(Op::Undef { .. }))) {
+                    continue;
+                }
+                let x = go(a)?;
+                r = Some(match r {
+                    None => x,
+                    Some(y) => (x.0.min(y.0), x.1.max(y.1)),
+                });
+            }
+            r
+        }
+        Opnd::Val(v) => match cx.defs.get(v)? {
+            Op::ConstI32(c) => Some((*c as i64, *c as i64)),
+            Op::WorkitemId => Some((0, wg - 1)),
+            Op::ReadFirstLane(x) | Op::MovS { a: x, .. } | Op::MovV { a: x, .. } => go(x),
+            Op::AddI32(a, b) => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0 + y.0, x.1 + y.1))
+            }
+            Op::MulI32(a, b) => Some(corners(go(a)?, go(b)?, &|p, q| p * q)),
+            Op::ShlI32(a, Opnd::I32(k)) if (0..31).contains(k) => {
+                let x = go(a)?;
+                Some((x.0 << k, x.1 << k))
+            }
+            Op::LshrI32(a, Opnd::I32(k)) if (0..32).contains(k) => {
+                let x = go(a)?;
+                if x.0 < 0 {
+                    return None;
+                }
+                Some((x.0 >> k, x.1 >> k))
+            }
+            Op::AndI32(a, Opnd::I32(m)) | Op::AndI32(Opnd::I32(m), a) if *m >= 0 => {
+                let x = go(a)?;
+                if x.0 >= 0 && x.1 <= *m as i64 {
+                    Some(x)
+                } else {
+                    Some((0, *m as i64))
+                }
+            }
+            Op::Select { a, b, .. } => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0.min(y.0), x.1.max(y.1)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// GV-1250-TDM-DESC, the LDS extent: a tensor operation's LDS tile (`lds_addr` .. + the tile's bytes) lies inside the LDS the kernel declares and, inside a ring marker, inside the ring the marker
+/// names (every slot the marker's slot operand can take). A destination the hardware silently drops or wraps is a protocol that waits for data that never arrives, or a read of garbage.
+fn lds_extent_check(f: &Function, cx: &EvCtx, marker: Option<(&str, &Opnd)>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
+    let w0 = group_words_ops(cx.defs, g0);
+    let w1 = group_words(cx.defs, g1);
+    let (Some(lds), true) = (w0.get(1), w1.len() == 8) else { return };
+    let (Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w1.first(), w1.get(3), w1.get(4)) else { return };
+    if a0 >> 20 & 1 != 0 {
+        return;   // padded: the footprint is larger than the tile (not modelled)
+    }
+    let esize = 1i64 << (a0 >> 16 & 3);
+    let (t0, t1, t2) = ((a3 >> 16) as i64, (a4 & 0xffff) as i64, (a4 >> 16) as i64);
+    let bytes = t0 * t1.max(1) * t2.max(1) * esize;
+    if t0 == 0 {
+        return;
+    }
+    let decl = marker.and_then(|(name, _)| f.contract.tiles.iter().find(|t| t.name == name));
+    let slot = marker.zip(decl).map(|((_, so), d)| (so, d.slots as i64));
+    let Some((lo, hi)) = range_i(lds, cx, f.workgroup_size as i64, slot, 0) else { return };
+    if f.lds_bytes > 0 && hi + bytes > f.lds_bytes as i64 {
+        viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can end beyond the {} bytes of LDS the kernel declares: an address at or beyond the allocation is silently dropped", f.lds_bytes));
+    }
+    if let Some(d) = decl {
+        let (rlo, rhi) = (d.base, d.base + d.slot_size * d.slots as i64);
+        if lo < rlo || hi + bytes > rhi {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can lie outside the ring `{}` ({rlo}..{rhi}) the marker names", d.name));
+        }
+    }
+}
+
+/// The compile-time-known words of a descriptor group as operands (group 0: the LDS address word may be a computed value).
+fn group_words_ops(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Opnd> {
+    let Opnd::Val(v) = o else { return Vec::new() };
+    match defs.get(v) {
+        Some(Op::RsrcCat { words }) => words.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -214,6 +434,8 @@ enum Ev {
 fn ev_of(st: &Stmt) -> Option<Ev> {
     match st {
         Stmt::Barrier => Some(Ev::Full),
+        // the cluster barrier is signalled by ONE wave per work-group (any of them): its signals are not arrivals every wave must make; GV-1250-BAR-COUNT counts them
+        Stmt::BarrierSignal { id: -3 } => None,
         Stmt::BarrierSignal { id } => Some(Ev::Signal(*id)),
         Stmt::BarrierWait { id } => Some(Ev::Wait(*id)),
         Stmt::BarrierJoin { id } => Some(Ev::Join(*id)),
@@ -645,17 +867,379 @@ fn bar_structure(f: &Function, v: &mut Vec<Violation>) {
     flow_checks(f, &sh, v);
 }
 
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// GV-1250-BAR-COUNT: per-work-group signal accounting of the cluster barrier
+
+/// The kernel's launch fact "barrier `id` is signalled by `per_wg` waves of every work-group per phase" (`FnBuilder::barrier_signal_count`): a TRUSTED item (see `trusted_items`).
+fn signal_count_fact(f: &Function, id: i32) -> Option<i64> {
+    let key = format!("g5:signals_per_wg:{id}");
+    f.kd.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+/// What the guard evaluator reads: the defining op of every value and every operand a variable is ever assigned (declaration, loop init, `SetVar`).
+struct EvCtx<'a> {
+    defs: &'a HashMap<ValueId, Op>,
+    vars: &'a HashMap<VarId, Vec<Opnd>>,
+}
+
+fn var_assignments(f: &Function) -> HashMap<VarId, Vec<Opnd>> {
+    let mut m: HashMap<VarId, Vec<Opnd>> = HashMap::default();
+    for st in f.stmts() {
+        match st {
+            Stmt::DeclareVars { vars, init } | Stmt::BeginLoop { vars, init } => {
+                for (v, i) in vars.iter().zip(init.iter()) {
+                    m.entry(*v).or_default().push(*i);
+                }
+            }
+            Stmt::SetVar { var, value } => m.entry(*var).or_default().push(*value),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// The value of an operand for the work-item `tid`, when it is a function of constants and the work-item id only (the wave id and lane arithmetic the guards of leader arms use).
+fn eval_i(o: &Opnd, cx: &EvCtx, tid: i32, depth: u32) -> Option<i64> {
+    if depth > 24 {
+        return None;
+    }
+    let defs = cx.defs;
+    let go = |x: &Opnd| eval_i(x, cx, tid, depth + 1).map(|v| v as i32);
+    match o {
+        Opnd::I32(c) => Some(*c as i64),
+        // a variable whose every assignment evaluates to one value (a register the author copied once)
+        Opnd::Var(v) => {
+            let asg = cx.vars.get(v)?;
+            let mut val: Option<i32> = None;
+            for a in asg {
+                // an undefined initial value (a register declared before its first assignment) constrains nothing
+                if matches!(a, Opnd::Val(u) if matches!(defs.get(u), Some(Op::Undef { .. }))) {
+                    continue;
+                }
+                let x = go(a)?;
+                match val {
+                    None => val = Some(x),
+                    Some(y) if y == x => {}
+                    _ => return None,
+                }
+            }
+            val.map(|x| x as i64)
+        }
+        Opnd::Val(v) => {
+            let r: i32 = match defs.get(v)? {
+                Op::ConstI32(c) => *c,
+                Op::WorkitemId => tid,
+                Op::AddI32(a, b) => go(a)?.wrapping_add(go(b)?),
+                Op::MulI32(a, b) => go(a)?.wrapping_mul(go(b)?),
+                Op::ShlI32(a, b) => ((go(a)? as u32).checked_shl(go(b)? as u32).unwrap_or(0)) as i32,
+                Op::LshrI32(a, b) => ((go(a)? as u32).checked_shr(go(b)? as u32).unwrap_or(0)) as i32,
+                Op::AndI32(a, b) => go(a)? & go(b)?,
+                Op::XorI32(a, b) => go(a)? ^ go(b)?,
+                Op::MinI32(a, b) => go(a)?.min(go(b)?),
+                Op::CmpLtI32(a, b) => (go(a)? < go(b)?) as i32,
+                Op::CmpGeI32(a, b) => (go(a)? >= go(b)?) as i32,
+                Op::NotI1(a) => (go(a)? == 0) as i32,
+                Op::Cmp { pred, ty, a, b } => {
+                    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+                    let (x, y) = (go(a)?, go(b)?);
+                    let (xu, yu) = (x as u32, y as u32);
+                    let r = match (ty, pred) {
+                        (T::I32, P::Lt) => x < y,
+                        (T::I32, P::Le) => x <= y,
+                        (T::I32, P::Gt) => x > y,
+                        (T::I32, P::Ge) => x >= y,
+                        (T::U32, P::Lt) => xu < yu,
+                        (T::U32, P::Le) => xu <= yu,
+                        (T::U32, P::Gt) => xu > yu,
+                        (T::U32, P::Ge) => xu >= yu,
+                        (T::I32 | T::U32, P::Eq) => x == y,
+                        (T::I32 | T::U32, P::Ne | P::Lg) => x != y,
+                        _ => return None,
+                    };
+                    r as i32
+                }
+                Op::Select { cond, a, b, .. } => {
+                    if go(cond)? != 0 {
+                        go(a)?
+                    } else {
+                        go(b)?
+                    }
+                }
+                // TTMP8 = {debug mark, grid-YZ valid, waveIDinGroup[4:0] (bits 29:25), dispatch index[24:0]}: only the wave id field is a function of the work-item id, so a bit-field
+                // extract that lies entirely inside bits 29:25 is evaluated; any other use of the register is not
+                Op::Salu { op: amdgpu_dsl::SaluOp::BfeU32, a, b } if is_ttmp8(a, cx, 0) => {
+                    let bw = go(b)? as u32;
+                    let (off, w) = (bw & 31, (bw >> 16) & 0x7f);
+                    if off < 25 || w == 0 || off + w > 30 {
+                        return None;
+                    }
+                    let wave = (tid as u32) >> 5;
+                    ((wave >> (off - 25)) & ((1u32 << w) - 1)) as i32
+                }
+                Op::Salu { op, a, b } if !matches!(op, amdgpu_dsl::SaluOp::AddNcU64) => op.eval(go(a)? as u32 as u64, go(b)? as u32 as u64) as u32 as i32,
+                _ => return None,
+            };
+            Some(r as i64)
+        }
+        _ => None,
+    }
+}
+
+/// Is the operand TTMP8 itself (the register read, or a variable whose only assignment is that read)?
+fn is_ttmp8(o: &Opnd, cx: &EvCtx, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match o {
+        Opnd::Val(v) => matches!(cx.defs.get(v), Some(Op::ReadTtmp { idx: 8 })),
+        Opnd::Var(v) => match cx.vars.get(v) {
+            Some(a) if !a.is_empty() => a.iter().all(|x| matches!(x, Opnd::Val(u) if matches!(cx.defs.get(u), Some(Op::Undef { .. }))) || is_ttmp8(x, cx, depth + 1)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The value for the wave `w` (work-items 32 w ..): every lane of the wave must agree, else not a wave-level fact.
+fn eval_wave(o: &Opnd, cx: &EvCtx, w: i32) -> Option<i64> {
+    let a = eval_i(o, cx, 32 * w, 0)?;
+    let b = eval_i(o, cx, 32 * w + 31, 0)?;
+    let c = eval_i(o, cx, 32 * w + 15, 0)?;
+    if a == b && b == c {
+        Some(a)
+    } else {
+        None
+    }
+}
+
+/// One region's cluster-barrier accounting over every resolution of the wave-uniform conditions the verifier cannot evaluate.
+#[derive(Debug)]
+struct CountItem {
+    region: usize,
+    id: i32,
+    /// None: not provable (a path depends on something wave-divergent the verifier cannot evaluate, or too many resolutions). Some: for every resolution, (signals per work-group, waits per wave).
+    worlds: Option<Vec<(i64, i64)>>,
+    /// when `worlds` is None: the statement whose condition stopped the proof
+    why: String,
+}
+
+/// The most resolutions of unknown uniform conditions the verifier enumerates.
+const MAX_WORLDS: usize = 4096;
+
+/// The statements wave `w` reaches, deciding every branch / goto condition for that wave: a condition the verifier can evaluate is decided; a wave-UNIFORM condition it cannot evaluate takes the
+/// value of `assign` (every wave takes the same side; `Err(stmt)` asks the caller to assign it); a wave-divergent one it cannot evaluate: `Err(usize::MAX)`. Loops are entered and left (a loop
+/// exit is not decided: statements after the loop are reached when the loop is).
+fn wave_reach(f: &Function, sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) -> bool, rel: &[u32], assign: &HashMap<usize, bool>, w: i32) -> Result<Vec<bool>, (usize, bool)> {
+    let stmts = f.stmts();
+    let n = stmts.len();
+    let mut reach = vec![false; n + 1];
+    let mut work = vec![0usize];
+    reach[0] = true;
+    while let Some(i) = work.pop() {
+        if i >= n {
+            continue;
+        }
+        // the statements the two sides of the branch at `i` differ by: (from, to); a uniform condition the verifier cannot evaluate is only enumerated when a relevant statement
+        // (a signal / wait of the barrier being counted) lies there, otherwise both sides count alike and the fall-through side is taken
+        let differ = |from: usize, to: usize| rel[to.min(rel.len() - 1)] > rel[from.min(rel.len() - 1)];
+        let decide = |cond: &Opnd, lo: usize, hi: usize, dflt: bool| -> Result<bool, (usize, bool)> {
+            match eval_wave(cond, cx, w) {
+                Some(v) => Ok(v != 0),
+                None if !uniform(cond) => Err((i, true)),
+                None if !differ(lo, hi) => Ok(dflt),
+                None => assign.get(&i).copied().ok_or((i, false)),
+            }
+        };
+        let mut next: Vec<usize> = Vec::new();
+        match &stmts[i] {
+            Stmt::BeginIf { cond } => {
+                let &(e, end) = sh.if_else.get(&i).ok_or((i, true))?;
+                let v = decide(cond, i, end, true)?;
+                if v {
+                    next.push(i + 1);
+                } else {
+                    next.push(match e {
+                        Some(e) => e + 1,
+                        None => end,
+                    });
+                }
+            }
+            Stmt::GotoIf { cond, key } => {
+                let tgt = *sh.key_pos.get(key).ok_or((i, true))?;
+                let v = decide(cond, i, tgt, false)?;
+                if v {
+                    next.push(*sh.key_pos.get(key).ok_or((i, true))?);
+                } else {
+                    next.push(i + 1);
+                }
+            }
+            _ => next = succs(stmts, sh, i),
+        }
+        for t in next {
+            if t <= n && !reach[t] {
+                reach[t] = true;
+                work.push(t);
+            }
+        }
+    }
+    Ok(reach)
+}
+
+fn count_items(f: &Function) -> Vec<CountItem> {
+    let stmts = f.stmts();
+    let defs = defs_of(f);
+    let vars = var_assignments(f);
+    let cx = EvCtx { defs: &defs, vars: &vars };
+    let sh = shape_of(stmts);
+    let nw = (f.workgroup_size / 32).max(1) as i32;
+    let (uv, uvars) = amdgpu_dsl::uniform_values(f);
+    let uniform = |o: &Opnd| match o {
+        Opnd::Val(x) => uv.contains(x),
+        Opnd::Var(x) => uvars.contains(x),
+        _ => true,
+    };
+    // the region of every statement: its innermost loop (the top level otherwise): the signals and waits of one pass
+    let mut region: Vec<usize> = Vec::with_capacity(stmts.len());
+    let mut regions: Vec<usize> = vec![usize::MAX];
+    for (i, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::BeginLoop { .. } => regions.push(i),
+            Stmt::EndLoop => {
+                regions.pop();
+            }
+            _ => {}
+        }
+        region.push(*regions.last().unwrap());
+    }
+    let mut all_regions: Vec<usize> = region.clone();
+    all_regions.sort();
+    all_regions.dedup();
+    let id = -3;
+    let mut items: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();   // (region, signal statements, wait statements)
+    let mut unpaired: Vec<usize> = Vec::new();
+    for &r in &all_regions {
+        let sig: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierSignal { id: j } if j == id)).collect();
+        let wts: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierWait { id: j } if j == id)).collect();
+        // a region that waits on the barrier but never signals it: the signal is issued outside the region (a split barrier: signal early, wait late), which a per-region count cannot see
+        if sig.is_empty() && !wts.is_empty() {
+            unpaired.push(r);
+        }
+        if !(sig.is_empty() && wts.is_empty()) {
+            items.push((r, sig, wts));
+        }
+    }
+    if items.is_empty() {
+        return Vec::new();
+    }
+    // prefix counts of the relevant statements (the signals and waits being counted)
+    let mut rel: Vec<u32> = vec![0; stmts.len() + 1];
+    for (i, st) in stmts.iter().enumerate() {
+        rel[i + 1] = rel[i] + matches!(st, Stmt::BarrierSignal { id: -3 } | Stmt::BarrierWait { id: -3 }) as u32;
+    }
+    // enumerate the resolutions of the unknown wave-uniform conditions (each world: one assignment; every wave takes the assigned side)
+    let mut results: Vec<Vec<(i64, i64)>> = vec![Vec::new(); items.len()];
+    let mut stack: Vec<HashMap<usize, bool>> = vec![HashMap::default()];
+    let mut seen_worlds = 0usize;
+    while let Some(assign) = stack.pop() {
+        seen_worlds += 1;
+        if seen_worlds > MAX_WORLDS {
+            return items.into_iter().map(|(r, _, _)| CountItem { region: r, id, worlds: None, why: format!("more than {MAX_WORLDS} resolutions of the uniform conditions") }).collect();
+        }
+        let reach: Result<Vec<Vec<bool>>, (usize, bool)> = (0..nw).map(|w| wave_reach(f, &sh, &cx, &uniform, &rel, &assign, w)).collect();
+        match reach {
+            Err((at, true)) => {
+                let why = format!("statement {at} ({:.90?}) branches on a condition that is neither evaluable nor wave-uniform", stmts[at]);
+                return items.into_iter().map(|(r, _, _)| CountItem { region: r, id, worlds: None, why: why.clone() }).collect();
+            }
+            Err((at, false)) => {
+                for v in [true, false] {
+                    let mut a = assign.clone();
+                    a.insert(at, v);
+                    stack.push(a);
+                }
+            }
+            Ok(rc) => {
+                for (k, (_, sig, wts)) in items.iter().enumerate() {
+                    // signals per work-group: every (wave, signal statement) the wave reaches; waits per wave: the most any wave reaches
+                    let signals: i64 = rc.iter().map(|rw| sig.iter().filter(|&&i| rw[i]).count() as i64).sum();
+                    let waits = rc.iter().map(|rw| wts.iter().filter(|&&i| rw[i]).count() as i64).max().unwrap_or(0);
+                    results[k].push((signals, waits));
+                }
+            }
+        }
+    }
+    items
+        .into_iter()
+        .zip(results)
+        .map(|((r, _, _), w)| {
+            let mut w = w;
+            w.sort();
+            w.dedup();
+            if unpaired.contains(&r) {
+                CountItem { region: r, id, worlds: None, why: "the region waits on the barrier but contains no signal of it: the matching signal is issued outside the region".to_string() }
+            } else {
+                CountItem { region: r, id, worlds: Some(w), why: String::new() }
+            }
+        })
+        .collect()
+}
+
+fn bar_count(f: &Function, v: &mut Vec<Violation>) {
+    for it in count_items(f) {
+        let where_ = if it.region == usize::MAX { "the top level".to_string() } else { format!("the loop at statement {}", it.region) };
+        match &it.worlds {
+            Some(ws) => {
+                for &(sig, waits) in ws {
+                    if waits > 0 && sig != waits {
+                        viol(v, "GV-1250-BAR-COUNT", format!("{where_}: barrier {} is signalled by {sig} wave(s) per work-group and waited on {waits} time(s) per wave (on some resolution of the kernel's uniform conditions): the cluster barrier needs exactly one signalling wave per work-group per wait (the count is by signals, not by waves)", it.id));
+                    }
+                }
+            }
+            None => {
+                match signal_count_fact(f, it.id) {
+                    None => viol(v, "GV-1250-BAR-COUNT", format!("{where_}: cannot prove how many waves per work-group signal barrier {} ({}): declare the launch fact with `barrier_signal_count({}, per_wg)` (a trusted item), or restructure so the verifier can count", it.id, it.why, it.id)),
+                    Some(k) if it.id == -3 && k != 1 => viol(v, "GV-1250-BAR-COUNT", format!("the launch fact says {k} signal(s) per work-group for the cluster barrier: exactly 1 is required")),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
+pub fn trusted_items(f: &Function) -> Vec<String> {
+    let mut v = Vec::new();
+    for it in count_items(f) {
+        if it.worlds.is_none() {
+            if let Some(k) = signal_count_fact(f, it.id) {
+                v.push(format!("barrier {}: {k} signalling wave(s) per work-group per phase (declared launch fact, not proved)", it.id));
+            }
+        }
+    }
+    v
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
     let defs = defs_of(f);
+    let kz = known_zero(f, &defs);
     let cluster = cluster_wgs(f);
     let named = kd_val(f, "named_barrier_count");
+    let vars_m = var_assignments(f);
+    let cxm = EvCtx { defs: &defs, vars: &vars_m };
+    let mut marker: Option<(String, Opnd)> = None;
     for (pos, st) in f.stmts().iter().enumerate() {
+        match st {
+            Stmt::TileProduce { tile, slot, .. } => marker = Some((tile.clone(), *slot)),
+            Stmt::TileConsume { .. } | Stmt::TileEnd => marker = None,
+            _ => {}
+        }
         match st {
             Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
-                let m = mcast_mask(f, &defs, g1);
+                lds_extent_check(f, &cxm, marker.as_ref().map(|(n, o)| (n.as_str(), o)), pos, g0, g1, &mut v);
+                let m = mcast_mask(f, &defs, &kz, g1);
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {
                         Mask::Const(c) => format!("the multicast mask is {c:#x}"),
@@ -704,6 +1288,7 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
         }
     }
     bar_structure(f, &mut v);
+    bar_count(f, &mut v);
     v
 }
 
