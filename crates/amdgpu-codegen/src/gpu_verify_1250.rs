@@ -40,6 +40,8 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-SLEEP", layer: Layer::Asm, what: "no indefinite sleep: a wave that sleeps forever may never wake" },
     Rule { id: "GV-1250-MCAST", layer: Layer::Ir, what: "a tensor operation's multicast mask is provably zero unless the launch declares a cluster of at least two workgroups" },
     Rule { id: "GV-1250-BAR-ID", layer: Layer::Ir, what: "barrier ids are in range and allocated (work-group, cluster only in a cluster launch, named ones within the declared count)" },
+    Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant between 1 and the number of waves that can join it (a count above that never completes)" },
+    Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, signal / wait on a named barrier only while joined to it" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -203,6 +205,9 @@ enum Ev {
     Full,
     Signal(i32),
     Wait(i32),
+    Join(i32),
+    Leave,
+    Cluster,
 }
 
 fn ev_of(st: &Stmt) -> Option<Ev> {
@@ -210,6 +215,9 @@ fn ev_of(st: &Stmt) -> Option<Ev> {
         Stmt::Barrier => Some(Ev::Full),
         Stmt::BarrierSignal { id } => Some(Ev::Signal(*id)),
         Stmt::BarrierWait { id } => Some(Ev::Wait(*id)),
+        Stmt::BarrierJoin { id } => Some(Ev::Join(*id)),
+        Stmt::BarrierLeave => Some(Ev::Leave),
+        Stmt::ClusterBarrier => Some(Ev::Cluster),
         _ => None,
     }
 }
@@ -353,6 +361,63 @@ fn bar_reach(f: &Function, v: &mut Vec<Violation>) {
     }
 }
 
+/// GV-1250-BAR-JOIN: the join state (which named barrier the wave is joined to, if any) through the structured body.
+fn bar_join(f: &Function, v: &mut Vec<Violation>) {
+    let stmts = f.stmts();
+    let mut state: Option<i32> = None;
+    let mut stack: Vec<(Option<i32>, Option<Option<i32>>)> = Vec::new();   // (state at the construct's entry, the then-arm's end state once the else begins)
+    let mut loops: Vec<Option<i32>> = Vec::new();
+    for (pos, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::BarrierJoin { id } => {
+                if let Some(j) = state {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: join of barrier {id} while still joined to barrier {j} (one joined barrier at a time)"));
+                }
+                state = Some(*id);
+            }
+            Stmt::BarrierLeave => {
+                if state.is_none() {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: leave with no barrier joined"));
+                }
+                state = None;
+            }
+            Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } if (1..=16).contains(id) => {
+                if state != Some(*id) {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: named barrier {id} signalled / waited on while {}", match state { Some(j) => format!("joined to barrier {j}"), None => "not joined".to_string() }));
+                }
+            }
+            Stmt::BeginIf { .. } => stack.push((state, None)),
+            Stmt::Else => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 = Some(state);
+                    state = top.0;
+                }
+            }
+            Stmt::EndIf => {
+                if let Some((entry, then_end)) = stack.pop() {
+                    let (t, e) = match then_end {
+                        Some(t) => (t, state),
+                        None => (state, entry),
+                    };
+                    if t != e {
+                        viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: the two paths of a branch end with different join states ({t:?} vs {e:?})"));
+                    }
+                    state = t;
+                }
+            }
+            Stmt::BeginLoop { .. } => loops.push(state),
+            Stmt::EndLoop => {
+                if let Some(entry) = loops.pop() {
+                    if entry != state {
+                        viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: a loop body that changes the join state ({entry:?} at entry, {state:?} at the back edge)"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
@@ -370,6 +435,25 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
                         _ => "the multicast mask is not provably zero".to_string(),
                     };
                     viol(&mut v, "GV-1250-MCAST", format!("statement {pos}: {what}, but the launch declares no cluster (cluster_dims >= 2): a multicast outside a cluster may hang or corrupt data"));
+                }
+            }
+            Stmt::BarrierInit { id, members } => {
+                if !(1..=16).contains(id) || (*id as i64) > named {
+                    viol(&mut v, "GV-1250-BAR-ID", format!("statement {pos}: barrier init of id {id}: named barriers are 1..=16 and must be allocated (named_barrier_count = {named})"));
+                }
+                let waves = f.workgroup_size.div_ceil(32) as i64;
+                if !(1..=63).contains(&(*members as i64)) || (*members as i64) > waves {
+                    viol(&mut v, "GV-1250-NBAR-COUNT", format!("statement {pos}: named barrier {id} with {members} members in a work-group of {waves} wave(s): the count must be between 1 and the number of waves that can join (a larger count never completes)"));
+                }
+            }
+            Stmt::BarrierJoin { id } => {
+                if !(1..=16).contains(id) || (*id as i64) > named {
+                    viol(&mut v, "GV-1250-BAR-ID", format!("statement {pos}: barrier join of id {id}: named barriers are 1..=16 and must be allocated (named_barrier_count = {named})"));
+                }
+            }
+            Stmt::ClusterBarrier => {
+                if cluster < 2 {
+                    viol(&mut v, "GV-1250-BAR-ID", format!("statement {pos}: the cluster barrier in a launch that declares no cluster"));
                 }
             }
             Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } => {
@@ -394,6 +478,7 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
         }
     }
     bar_reach(f, &mut v);
+    bar_join(f, &mut v);
     v
 }
 
@@ -629,6 +714,9 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
             let first = ins.ops.split(',').next_back().unwrap_or("").trim();   // the barrier operand is the last one (`s_get_barrier_state sdst, id` is excluded above)
             // a disassembler prints the 16-bit immediate of a negative id as unsigned (0xffff = -1, 0xfffd = -3)
             let id16 = parse_int(first).map(|x| if (0x8000..=0xffff).contains(&x) { x - 0x1_0000 } else { x });
+            if ins.mn == "s_barrier_signal_isfirst" && id16 == Some(-3) {
+                viol(&mut v, "GV-1250-BAR-ID", format!("line {}: `{} {}`: the first-arriver form on the cluster barrier (only the work-group barrier idiom uses it)", ins.line, ins.mn, ins.ops));
+            }
             match id16 {
                 Some(-2) | Some(-4) => viol(&mut v, "GV-1250-TRAP-BAR", format!("line {}: `{} {}` uses a trap-handler barrier", ins.line, ins.mn, ins.ops)),
                 Some(id) if id == -1 || id == -3 || (1..=16).contains(&id) => {}
