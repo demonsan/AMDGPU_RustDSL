@@ -185,3 +185,33 @@ pub fn probe_g1250_select() -> Function {
     b.store_global(qo, 1024, s2, MemTy::B32, false);
     b.finish()
 }
+
+/// Buffers on gfx1250 (the 57-bit-base / 45-bit-num_records V#): `out[i] = 3 * a[i] + b[i]` through buffer loads / stores with a
+/// constant and a kernarg-sized `num_records`, plus a returning buffer atomic add into `out[256]`; 256 work-items.
+pub fn probe_g1250_buffer() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_buffer", 256);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg("nb", DType::I32, 24, 4);
+    b.arg_tensor("a", Ext::c(256 * 4));
+    b.arg_tensor("b", Ext::c(256 * 4));
+    b.arg_tensor("out", Ext::c(257 * 4));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let po = b.let_(Op::KernargPtr { offset: 16 });
+    let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let ra = b.buffer_desc(pa, 1024);
+    let rb = b.buffer_desc_dyn(pb, nb);
+    let ro = b.buffer_desc(po, 1028);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.buffer_load_f32(ra, off, Opnd::I32(0), 0);
+    let y = b.buffer_load_f32(rb, off, Opnd::I32(0), 0);
+    let x3 = b.mul_f32(x, Opnd::F32(3.0));
+    let s = b.add_f32(x3, y);
+    b.buffer_store_f32(ro, off, Opnd::I32(0), 0, s);
+    let one = b.let_(Op::ConstI32(1));
+    let _r = b.buffer_atomic_add_ret(ro, Opnd::I32(0), Opnd::I32(0), 1024, one);
+    b.finish()
+}

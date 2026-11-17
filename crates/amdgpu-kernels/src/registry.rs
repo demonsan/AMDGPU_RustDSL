@@ -8,7 +8,7 @@ pub fn kernel_names() -> &'static [&'static str] {
 /// The gfx1250 probes (docs/gfx1250-plan.md): compiled with `--target gfx1250` only, so they are not in `kernel_names` (whose sweeps and
 /// golden manifests are gfx950's).
 pub fn gfx1250_kernel_names() -> &'static [&'static str] {
-    &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm", "probe_g1250_select", "probe_g1250_wmma_fp8", "probe_g1250_wmma_fp8_k128", "probe_g1250_wmma_f4"]
+    &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm", "probe_g1250_select", "probe_g1250_buffer", "probe_g1250_wmma_fp8", "probe_g1250_wmma_fp8_k128", "probe_g1250_wmma_f4"]
 }
 
 /// The kernel `name` with its compile-time ladder hint (`crate::ladder_hints`); `kernel_by_name_raw` is the kernel as built.
@@ -42,6 +42,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_g1250_math" => Some(crate::probes::g1250::probe_g1250_math()),
         "probe_g1250_tdm" => Some(crate::probes::g1250::probe_g1250_tdm()),
         "probe_g1250_select" => Some(crate::probes::g1250::probe_g1250_select()),
+        "probe_g1250_buffer" => Some(crate::probes::g1250::probe_g1250_buffer()),
         "probe_g1250_wmma_fp8" => Some(crate::probes::g1250::probe_g1250_wmma_fp8()),
         "probe_g1250_wmma_fp8_k128" => Some(crate::probes::g1250::probe_g1250_wmma_fp8_k128()),
         "probe_g1250_wmma_f4" => Some(crate::probes::g1250::probe_g1250_wmma_f4()),
