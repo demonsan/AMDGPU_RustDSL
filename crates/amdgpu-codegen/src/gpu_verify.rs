@@ -2510,6 +2510,8 @@ impl<'a> An<'a> {
             // the kernarg segment pointer: no tensor provenance (an access through it is GV-GLB-PROV)
             Op::KernargSegment => AV::Ptr { arg: None, off: Itv::konst(0) },
             Op::WorkitemId => AV::Int(Itv::range(Poly::int(0), Poly::int(self.f.workgroup_size as i128 - 1))),
+            // the packed ids (x [9:0], y [19:10], z [29:20])
+            Op::WorkitemIdPacked => AV::Int(Itv::range(Poly::int(0), Poly::int((1i128 << 30) - 1))),
             Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => {
                 let axis = match op {
                     Op::WorkgroupIdX => 0u8,

@@ -161,7 +161,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } | Op::SgprCat8 { .. } => ResClass::Marker,
         Op::ReadTtmp { .. } => ResClass::Salu,
         Op::Raw { scalar: true, .. } => ResClass::Salu,
-        Op::Salu { .. } => ResClass::Salu,
+        Op::Salu { .. } | Op::SysVal { .. } => ResClass::Salu,
         Op::Raw { .. } => ResClass::Valu,
         Op::KernargPreload { .. } => ResClass::Marker,
         Op::LoadScalar { .. } => ResClass::Salu,
@@ -170,6 +170,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
             ResClass::Sync
         }
         Op::WorkitemId
+        | Op::WorkitemIdPacked
         | Op::AddI32(..)
         | Op::MulI32(..)
         | Op::ShlI32(..)
@@ -340,6 +341,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
         // gfx1250 TDM: an asynchronous global <-> LDS transfer (completion on TENSORcnt); its wait orders like a fence
         // a verbatim instruction: ordered like a fence (its effects are not modelled)
         Stmt::Raw { .. } => (ResClass::Sync, vec![], false),
+        Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } => (ResClass::Sync, vec![], false),
         Stmt::LayoutKey { .. } | Stmt::GotoIf { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => (ResClass::Sync, vec![], false),
         Stmt::TensorLoadToLds { .. } => {
             e.dma = true;
