@@ -44,6 +44,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
     Rule { id: "GV-1250-BAR-INIT", layer: Layer::Ir, what: "a named barrier is initialized before it is used, and a work-group barrier orders the initialization before the first use (a re-initialization after another wave signalled loses the count)" },
     Rule { id: "GV-1250-BAR-COUNT", layer: Layer::Ir, what: "the cluster barrier is signalled by exactly one wave per work-group per phase: proved statically when the signalling condition is a function of the wave id, otherwise an explicit, named launch fact that is listed as a trusted item (never an implicit pass)" },
+    Rule { id: "GV-1250-LDS-64K", layer: Layer::Ir, what: "a kernel that declares more than 64 KiB of LDS names, as a trusted launch fact, the hardware evidence for LDS above 64 KiB (an interim guard: configurations above it have produced a hung device and wrong data, cause open)" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -1209,6 +1210,9 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
 /// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
 pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
+    if declared_lds(f) > 65536 && kd_val(f, "g5:lds_above_64k") != 0 {
+        v.push(format!("LDS above 64 KiB ({} bytes declared): launch fact g5:lds_above_64k (hardware evidence cited by the kernel, not proved)", declared_lds(f)));
+    }
     for it in count_items(f) {
         if it.worlds.is_none() {
             if let Some(k) = signal_count_fact(f, it.id) {
@@ -1219,9 +1223,18 @@ pub fn trusted_items(f: &Function) -> Vec<String> {
     v
 }
 
+/// The LDS bytes a kernel declares (the DSL's `lds`, or the author's kernel-descriptor value in exact mode).
+fn declared_lds(f: &Function) -> i64 {
+    (f.lds_bytes as i64).max(kd_val(f, "group_segment_fixed_size"))
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
+    // interim guard (GV-1250-LDS-64K): LDS above 64 KiB needs the named evidence fact; see docs/gfx1250-hang-rules.md
+    if declared_lds(f) > 65536 && kd_val(f, "g5:lds_above_64k") == 0 {
+        viol(&mut v, "GV-1250-LDS-64K", format!("the kernel declares {} bytes of LDS (above 64 KiB) without the launch fact `g5:lds_above_64k` naming the hardware evidence for it: configurations of this shape have hung a device / returned wrong data and the cause is not established", declared_lds(f)));
+    }
     let defs = defs_of(f);
     let kz = known_zero(f, &defs);
     let cluster = cluster_wgs(f);
