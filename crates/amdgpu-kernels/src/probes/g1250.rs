@@ -249,3 +249,26 @@ pub fn probe_g1250_tdm2d() -> Function {
     b.store_global(qo, 0, x, MemTy::B32, false);
     b.finish()
 }
+
+/// Named and cluster barriers (compile / encode coverage; the cluster barrier needs a cluster launch): every wave initialises and joins
+/// named barrier 1 (all 4 waves), signals / waits it, leaves it, then the cluster barrier; out[tid] = tid.
+pub fn probe_g1250_barriers() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_barriers", 128);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    b.barrier_init(1, 4);
+    b.barrier_join(1);
+    b.barrier_signal(1);
+    b.barrier_wait(1);
+    b.barrier_leave();
+    b.cluster_barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(q, 0, tid, MemTy::B32, false);
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f.kd.push(("named_barrier_count".into(), 1));
+    f
+}

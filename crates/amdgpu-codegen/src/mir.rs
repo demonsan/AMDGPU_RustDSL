@@ -608,6 +608,17 @@ pub enum MOp {
     /// gfx1250: imm = barrier id
     SBarrierSignal,
     SBarrierWait,
+    /// gfx1250: imm = members << 16 | id (`s_mov_b32 m0, imm; s_barrier_init m0`)
+    SBarrierInit,
+    /// gfx1250: imm = id
+    SBarrierJoin,
+    SBarrierLeave,
+    /// gfx1250: the cluster barrier idiom (isfirst on -1, then -3)
+    SClusterBarrier,
+    /// gfx1250: imm = the scheduling mode (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), imm`)
+    SSetSchedMode,
+    /// gfx1250: `s_wait_alu imm` (depctr)
+    SWaitAlu,
     /// gfx1250: `s_set_vgpr_msb imm`
     SSetVgprMsb,
     /// gfx1250: dst = ttmp<imm>
