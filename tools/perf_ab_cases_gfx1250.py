@@ -66,10 +66,25 @@ def f4gemm(tree):
     return out
 
 
+def mla(tree):
+    """aiter MLA decode (fp8 Q / KV, qh16, page 64, one split) through tests/gpu/g1250_mla_host.cpp: the vendor baseline until our own replica exists (the old/new pair is then the noise floor).
+    The host checks against an fp32 CPU reference (aiter's tolerance plus a cosine) and prints one JSON line."""
+    host = os.path.join(tree, 'tests', 'gpu', 'g1250_mla_host.cpp')
+    co = os.path.join(HSA, 'mla', 'mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co')
+    if not (os.path.exists(host) and os.path.exists(co)):
+        return []
+    out = []
+    for (b, ctx) in [(1, 64), (4, 1000), (32, 2048), (128, 4096)]:
+        def build(side, b=b, ctx=ctx):
+            return Run([], ['{host:g1250_mla_host}', co, _vname(co), str(b), str(ctx), '16', '50', '20000'], {})
+        out.append(Case(id=f'mla/vendor/B{b}C{ctx}', family='mla', build=build, metric=['json_us', 'json_gbs'], line=r'^\{"host"', ok=r'"ok":\s*true', timeout=300))
+    return out
+
+
 def cases(tree, args):
     out = []
-    for f in (smoke, f4gemm):
-        out += f(tree) if f is smoke else f(tree)
+    for f in (smoke, f4gemm, mla):
+        out += f(tree)
     # the --quick set: the first and the last case of every family
     groups = {}
     for c in out:
