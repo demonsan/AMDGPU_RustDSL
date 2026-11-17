@@ -4,6 +4,7 @@
 
 use amdgpu_dsl::Function;
 
+pub mod check;
 pub mod emit;
 pub mod hazards;
 pub mod waits;

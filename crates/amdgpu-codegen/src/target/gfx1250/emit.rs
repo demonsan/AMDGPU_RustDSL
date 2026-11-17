@@ -62,10 +62,11 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
     }
     // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
-    let plan = super::waits::plan(m, a);
+    // exact mode: the author's waits and padding are verified (check.rs), never added to
+    let plan = if m.exact { super::waits::Plan::default() } else { super::waits::plan(m, a) };
     // the gfx1250 software hazards (hazards.rs); the shared pass's s_nop wait states are not needed on gfx1250 (all other VALU dependencies
     // interlock) and are dropped, except the author's in exact mode
-    let hz = super::hazards::plan(m, a);
+    let hz = if m.exact { super::hazards::Plan::default() } else { super::hazards::plan(m, a) };
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
@@ -253,6 +254,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
         MOp::SBarrierInit => vec![format!("s_mov_b32 m0, {:#x}", inst.imm), "s_barrier_init m0".to_string()],
         MOp::SBarrierJoin => vec![format!("s_barrier_join {}", inst.imm)],
+        MOp::SSetSchedMode => vec![format!("s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), {}", inst.imm)],
+        MOp::SWaitAlu => vec![format!("s_wait_alu {:#x}", inst.imm)],
         MOp::SBarrierLeave => vec!["s_barrier_leave".to_string(), "s_wait_kmcnt 0x0".to_string()],
         // the cluster barrier (CDNA5 ISA section 5.6.6; LLVM's lowering): the first wave of each workgroup (isfirst on the workgroup barrier, SCC
         // via KMcnt, read after the wait) signals the cluster barrier; every wave waits on it

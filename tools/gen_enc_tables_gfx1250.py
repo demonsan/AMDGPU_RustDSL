@@ -49,7 +49,7 @@ WMMA = [("v_wmma_f32_16x16x32_bf16", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], 
         ("v_wmma_f32_16x16x64_fp8_fp8", "v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[16:23], v[24:31]"),
         ("v_wmma_f32_16x16x128_fp8_fp8", "v_wmma_f32_16x16x128_fp8_fp8 v[8:15], v[16:31], v[32:47], v[48:55]"),
         ("v_wmma_scale_f32_32x16x128_f4", "v_wmma_scale_f32_32x16x128_f4 v[64:79], v[16:31], v[32:39], v[48:63], v3, v4")]
-EXTRA = [("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
+EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
 
 
 def samples():

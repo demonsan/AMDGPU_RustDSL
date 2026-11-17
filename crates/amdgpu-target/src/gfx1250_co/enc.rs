@@ -204,6 +204,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         let f: Vec<&str> = h.split(',').map(|x| x.trim()).collect();
         let id = match f.first() {
             Some(&"HW_REG_WAVE_MODE") => 1u32,
+            Some(&"HW_REG_WAVE_SCHED_MODE") => 26u32,
             x => return Err(format!("`{t}`: hardware register {x:?}")),
         };
         let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);

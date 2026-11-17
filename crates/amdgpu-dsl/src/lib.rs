@@ -1468,6 +1468,13 @@ pub enum Stmt {
     ClusterBarrier,
     /// gfx1250 exact mode: `s_set_vgpr_msb imm` as the author wrote it.
     SetVgprMsb { imm: u16 },
+    /// gfx1250: the wave's scheduling mode (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), mode`). Mode 2 (LLVM's "expert
+    /// scheduling mode 2") leaves the VALU-result -> non-VALU and the vector-memory-source -> overwrite dependencies to the program: exact
+    /// mode only, where the verifier then requires the author's `WaitAlu` for them (target/gfx1250/check.rs).
+    SetSchedMode { mode: u8 },
+    /// gfx1250: `s_wait_alu imm` (the dependency counters: va_vdst [15:12], vm_vsrc [4:2], va_sdst [11:9], va_ssrc [8], hold_cnt [7],
+    /// va_vcc [1], sa_sdst [0]; all-ones fields = no wait, 0xff9f).
+    WaitAlu { imm: u16 },
     /// gfx1250 TDM: `tensor_load_to_lds` with the descriptor groups g0 (4 SGPRs, `Rsrc`), g1 (8, `Sgpr8`) and the optional g2 / g3 (4 each;
     /// both or neither). `raw`: the instruction's three words as written by another assembler (exact replays; the operands still describe
     /// what it reads). Completion: TENSORcnt (`WaitTensor`).
@@ -3689,6 +3696,26 @@ impl FnBuilder {
     /// `s_barrier`.
     #[track_caller]
     /// gfx1250: `s_barrier_signal id` (-1 work-group, -3 cluster, 1..=16 named); the verifier (`gpu_verify_1250`) checks the id.
+    /// gfx1250: `s_wait_<counter>cnt n`.
+    pub fn wait_counter(&mut self, counter: WaitCtr, count: u8) {
+        self.push_stmt(Stmt::WaitCounter { counter, count });
+    }
+
+    /// gfx1250 exact mode: the wave's scheduling mode (see `Stmt::SetSchedMode`).
+    pub fn set_sched_mode(&mut self, mode: u8) {
+        self.push_stmt(Stmt::SetSchedMode { mode });
+    }
+
+    /// gfx1250: `s_wait_alu imm` (see `Stmt::WaitAlu`).
+    pub fn wait_alu(&mut self, imm: u16) {
+        self.push_stmt(Stmt::WaitAlu { imm });
+    }
+
+    /// gfx1250 exact mode: `s_set_vgpr_msb imm`.
+    pub fn set_vgpr_msb(&mut self, imm: u16) {
+        self.push_stmt(Stmt::SetVgprMsb { imm });
+    }
+
     /// gfx1250: initialise named barrier `id` for `members` waves.
     pub fn barrier_init(&mut self, id: i32, members: u8) {
         self.push_stmt(Stmt::BarrierInit { id, members });
@@ -4798,6 +4825,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
             Stmt::BarrierInit { .. } | Stmt::BarrierJoin { .. } | Stmt::BarrierLeave | Stmt::ClusterBarrier => {}
+            Stmt::SetSchedMode { .. } | Stmt::WaitAlu { .. } => {}
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {

@@ -615,6 +615,10 @@ pub enum MOp {
     SBarrierLeave,
     /// gfx1250: the cluster barrier idiom (isfirst on -1, then -3)
     SClusterBarrier,
+    /// gfx1250: imm = the scheduling mode (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), imm`)
+    SSetSchedMode,
+    /// gfx1250: `s_wait_alu imm` (depctr)
+    SWaitAlu,
     /// gfx1250: `s_set_vgpr_msb imm`
     SSetVgprMsb,
     /// gfx1250: dst = ttmp<imm>

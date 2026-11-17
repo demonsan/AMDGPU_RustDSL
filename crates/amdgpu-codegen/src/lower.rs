@@ -2922,6 +2922,20 @@ impl Lowerer {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SClusterBarrier));
                 }
+                Stmt::SetSchedMode { mode } => {
+                    tdm_target()?;
+                    if !self.exact {
+                        return Err(format!("set_sched_mode({mode}): the scheduling mode is an exact-mode statement (the compiler's own wait insertion models only mode 0; the exact verifier models the relaxed mode)"));
+                    }
+                    if *mode > 3 {
+                        return Err(format!("set_sched_mode({mode}): a 2-bit mode"));
+                    }
+                    self.push(MInst::new(MOp::SSetSchedMode).imm(*mode as i64));
+                }
+                Stmt::WaitAlu { imm } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SWaitAlu).imm(*imm as i64));
+                }
                 Stmt::SetVgprMsb { imm } => {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));

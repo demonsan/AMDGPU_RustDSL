@@ -102,6 +102,7 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("s_sleep", "SOPP", 3),
     ("s_sub_co_ci_u32", "SOP2", 5),
     ("s_sub_co_u32", "SOP2", 1),
+    ("s_wait_alu", "SOPP", 8),
     ("s_wait_asynccnt", "SOPP", 74),
     ("s_wait_dscnt", "SOPP", 70),
     ("s_wait_kmcnt", "SOPP", 71),

@@ -709,6 +709,8 @@ pub const ALL: &[MOp] = &[
     MOp::SBarrierJoin,
     MOp::SBarrierLeave,
     MOp::SClusterBarrier,
+    MOp::SSetSchedMode,
+    MOp::SWaitAlu,
     MOp::SSetVgprMsb,
     MOp::SReadTtmp,
     MOp::TensorLoadToLds,
@@ -1209,6 +1211,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SBarrierJoin => a("s_barrier_join", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SBarrierLeave => a("s_barrier_leave", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SClusterBarrier => a("s_barrier_signal_isfirst", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
+        SSetSchedMode => a("s_setreg_imm32_b32", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
+        SWaitAlu => a("s_wait_alu", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SSetVgprMsb => a("s_set_vgpr_msb", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SReadTtmp => a("s_mov_b32", salu).backend(Backend::OwnOnly),
         // gfx1250 WMMA (latencies provisional until the MI450 probes; no AGPR forms)
