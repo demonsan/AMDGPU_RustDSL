@@ -17,6 +17,25 @@ fn round_up(v: u32, m: u32) -> u32 {
 
 /// The gfx1250 assembly of an allocated function.
 pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
+    emit_kd(m, a, &[])
+}
+
+/// The kernel-descriptor directives an exact kernel may set (`Function::kd`).
+pub const KD_DIRECTIVES: &[&str] = &[
+    "user_sgpr_kernarg_preload_length", "user_sgpr_kernarg_preload_offset", "inst_pref_size", "system_vgpr_workitem_id",
+    "system_sgpr_workgroup_id_x", "system_sgpr_workgroup_id_y", "system_sgpr_workgroup_id_z", "next_free_vgpr", "next_free_sgpr",
+    "memory_ordered", "forward_progress", "float_denorm_mode_32", "float_denorm_mode_16_64", "named_barrier_count", "round_robin_scheduling",
+    "fp16_overflow", "group_segment_fixed_size", "kernarg_size",
+];
+
+/// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
+pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String, String> {
+    for (k, _) in kd {
+        if !KD_DIRECTIVES.contains(&k.as_str()) {
+            return Err(format!("{}: kernel-descriptor directive `{k}` is not settable (known: {})", m.name, KD_DIRECTIVES.join(", ")));
+        }
+    }
+    let kdv = |k: &str| kd.iter().rev().find(|x| x.0 == k).map(|x| x.1);
     let t = &amdgpu_target::gfx1250::GFX1250;
     if crate::regalloc::agpr_count(m, a) > 0 {
         return Err(format!("{}: gfx1250 has no AGPRs (the allocation used some)", m.name));
@@ -32,11 +51,14 @@ pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
     // the kernel prologue the gfx1250 assembler requires (s_mov_b64 / v_nop / global_prefetch_b8 first) and LLVM emits for every kernel, in
-    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only)
-    out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
-    out.push_str("    s_mov_b64 s[6:7], 0\n");
-    out.push_str("    v_nop\n");
-    out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only). Exact mode: the author's
+    // instructions are the prologue (none added).
+    if !m.exact {
+        out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
+        out.push_str("    s_mov_b64 s[6:7], 0\n");
+        out.push_str("    v_nop\n");
+        out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+    }
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
@@ -70,27 +92,39 @@ pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     }
     out.push_str(&format!(".size {}, .-{}\n", m.name, m.name));
 
-    let vgpr = round_up(a.max_v.max(1), t.emit.vgpr_granule);
-    let sgpr = a.max_s.max(1);
+    let vgpr = kdv("next_free_vgpr").map(|v| v as u32).unwrap_or_else(|| round_up(a.max_v.max(1), t.emit.vgpr_granule));
+    let sgpr = kdv("next_free_sgpr").map(|v| v as u32).unwrap_or(a.max_s.max(1));
+    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(0);
+    let d = |k: &str, dflt: i64| kdv(k).unwrap_or(dflt);
     out.push_str("\n.p2align 6\n");
     out.push_str(&format!(".amdhsa_kernel {}\n", m.name));
-    out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", m.lds_bytes));
+    out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", d("group_segment_fixed_size", m.lds_bytes as i64)));
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
-    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", round_up(m.kernarg_size, 8)));
-    // the kernarg segment pointer in s[0:1]; the workgroup ids are architected (TTMP9 / TTMP7), the workitem ids packed in v0
-    out.push_str("    .amdhsa_user_sgpr_count 2\n");
+    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", d("kernarg_size", round_up(m.kernarg_size, 8) as i64)));
+    // the kernarg segment pointer in s[0:1] (then the preloaded kernarg dwords); the workgroup ids are architected (TTMP9 / TTMP7), the
+    // workitem ids packed in v0
+    out.push_str(&format!("    .amdhsa_user_sgpr_count {}\n", 2 + preload));
     out.push_str("    .amdhsa_user_sgpr_kernarg_segment_ptr 1\n");
+    if preload > 0 {
+        out.push_str(&format!("    .amdhsa_user_sgpr_kernarg_preload_length {preload}\n"));
+        out.push_str(&format!("    .amdhsa_user_sgpr_kernarg_preload_offset {}\n", d("user_sgpr_kernarg_preload_offset", 0)));
+    }
     out.push_str("    .amdhsa_wavefront_size32 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_x 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_y 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_z 1\n");
-    out.push_str("    .amdhsa_system_vgpr_workitem_id 2\n");
+    for k in ["x", "y", "z"] {
+        out.push_str(&format!("    .amdhsa_system_sgpr_workgroup_id_{k} {}\n", d(&format!("system_sgpr_workgroup_id_{k}"), 1)));
+    }
+    out.push_str(&format!("    .amdhsa_system_vgpr_workitem_id {}\n", d("system_vgpr_workitem_id", 2)));
     out.push_str(&format!("    .amdhsa_next_free_vgpr {vgpr}\n"));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {sgpr}\n"));
-    out.push_str("    .amdhsa_named_barrier_count 0\n");
+    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", 0)));
     let (d32, d64, _ieee) = m.fp_mode.unwrap_or((3, 3, false));
-    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {d32}\n"));
-    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {d64}\n"));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {}\n", d("float_denorm_mode_32", d32 as i64)));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {}\n", d("float_denorm_mode_16_64", d64 as i64)));
+    for k in ["inst_pref_size", "memory_ordered", "forward_progress", "round_robin_scheduling", "fp16_overflow"] {
+        if let Some(v) = kdv(k) {
+            out.push_str(&format!("    .amdhsa_{k} {v}\n"));
+        }
+    }
     out.push_str(".end_amdhsa_kernel\n");
 
     out.push_str("\n.amdgpu_metadata\n---\namdhsa.kernels:\n");
@@ -130,13 +164,14 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
     let lines = match inst.op {
         // the ABI registers: s[0:1] the kernarg segment pointer (user SGPRs); the workgroup ids are architected: x = TTMP9, y = TTMP7[15:0],
         // z = TTMP7[31:16] (no workgroup clusters in G1)
-        MOp::SReadPhys => match inst.imm {
-            0 | 1 => vec![format!("s_mov_b32 {}, s{}", d_s(), inst.imm)],
-            2 => vec![format!("s_mov_b32 {}, ttmp9", d_s())],
-            3 => vec![format!("s_and_b32 {}, ttmp7, 0xffff", d_s())],
-            4 => vec![format!("s_lshr_b32 {}, ttmp7, 16", d_s())],
-            k => return Err(format!("s{k} is not an ABI register on gfx1250")),
-        },
+        // (the workgroup ids lower to SReadTtmp on gfx1250; s2.. hold the preloaded kernarg dwords: `Op::KernargPreload`)
+        MOp::SReadPhys => {
+            if inst.dst.map(|r| a.phys[r as usize] as i64) == Some(inst.imm) {
+                vec![]
+            } else {
+                vec![format!("s_mov_b32 {}, s{}", d_s(), inst.imm)]
+            }
+        }
         // the workitem ids are packed in v0 (x = v0[9:0])
         MOp::VReadPhys => match inst.imm {
             0 => vec![format!("v_and_b32_e32 {}, 0x3ff, v0", d_v())],
@@ -159,6 +194,32 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         // the split barrier of the workgroup (id -1)
         MOp::SBarrier => vec!["s_barrier_signal -1".to_string(), "s_barrier_wait -1".to_string()],
         MOp::SWaitTensor => vec![format!("s_wait_tensorcnt {:#x}", inst.imm)],
+        // the gfx1250 V#: base [56:0], num_records [101:57] (bytes, 45 bits), stride 0, type 0 (buffer)
+        MOp::SBufferRsrc | MOp::SBufferRsrcDyn => {
+            let d = a.phys[inst.dst.ok_or("dst")? as usize];
+            let src = |k: usize| -> Result<u32, String> {
+                match inst.srcs.get(k) {
+                    Some(Src::Reg(r)) => Ok(a.phys[*r as usize]),
+                    _ => Err("buffer descriptor operand".into()),
+                }
+            };
+            let b = src(0)?;
+            let mut v = vec![format!("s_mov_b32 s{d}, s{b}"), format!("s_and_b32 s{}, s{}, 0x1ffffff", d + 1, b + 1)];
+            if inst.op == MOp::SBufferRsrc {
+                let n = inst.imm as u32 as u64;
+                if n & 0x7f != 0 {
+                    v.push(format!("s_or_b32 s{}, s{}, {:#x}", d + 1, d + 1, ((n & 0x7f) << 25) as u32));
+                }
+                v.push(format!("s_mov_b32 s{}, {:#x}", d + 2, (n >> 7) as u32));
+            } else {
+                let n = src(1)?;
+                v.push(format!("s_lshl_b32 s{}, s{n}, 25", d + 3));
+                v.push(format!("s_or_b32 s{}, s{}, s{}", d + 1, d + 1, d + 3));
+                v.push(format!("s_lshr_b32 s{}, s{n}, 7", d + 2));
+            }
+            v.push(format!("s_mov_b32 s{}, 0", d + 3));
+            v
+        }
         MOp::SWaitCtr => {
             const MN: [&str; 7] = ["s_wait_loadcnt", "s_wait_storecnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_xcnt", "s_wait_asynccnt", "s_wait_tensorcnt"];
             let c = (inst.imm >> 8) as usize;
@@ -285,6 +346,22 @@ const RENAMES: &[(&str, &str)] = &[
     ("ds_write_b128", "ds_store_b128"),
     ("ds_write_b16", "ds_store_b16"),
     ("ds_write_b8", "ds_store_b8"),
+    ("buffer_load_dword", "buffer_load_b32"),
+    ("buffer_load_dwordx2", "buffer_load_b64"),
+    ("buffer_load_dwordx3", "buffer_load_b96"),
+    ("buffer_load_dwordx4", "buffer_load_b128"),
+    ("buffer_load_ushort", "buffer_load_u16"),
+    ("buffer_load_sshort", "buffer_load_i16"),
+    ("buffer_load_ubyte", "buffer_load_u8"),
+    ("buffer_load_sbyte", "buffer_load_i8"),
+    ("buffer_store_dword", "buffer_store_b32"),
+    ("buffer_store_dwordx2", "buffer_store_b64"),
+    ("buffer_store_dwordx3", "buffer_store_b96"),
+    ("buffer_store_dwordx4", "buffer_store_b128"),
+    ("buffer_store_short", "buffer_store_b16"),
+    ("buffer_store_byte", "buffer_store_b8"),
+    ("buffer_atomic_add", "buffer_atomic_add_u32"),
+    ("buffer_atomic_add_f32", "buffer_atomic_add_f32"),
     ("v_add_u32_e32", "v_add_nc_u32_e32"),
     ("v_add_u32_e64", "v_add_nc_u32_e64"),
     ("v_sub_u32_e32", "v_sub_nc_u32_e32"),
@@ -314,6 +391,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
+    "v_mad_u64_u32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
@@ -337,8 +415,56 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // wave32 lane masks are one SGPR: an SGPR pair in a mask position is its low register; exec moves are 32-bit
+    let lo = |o: &str| -> String {
+        match o.strip_prefix("s[").and_then(|r| r.strip_suffix(']')).and_then(|r| r.split_once(':')) {
+            Some((a, _)) => format!("s{a}"),
+            None => o.to_string(),
+        }
+    };
+    let ops: Vec<&str> = if rest.is_empty() { vec![] } else { rest.split(", ").collect() };
+    if mn == "s_mov_b64" && ops.len() == 2 && (ops[0] == "exec" || ops[1] == "exec") {
+        let f = |o: &str| if o == "exec" { "exec_lo".to_string() } else { lo(o) };
+        return Ok(vec![format!("s_mov_b32 {}, {}", f(ops[0]), f(ops[1]))]);
+    }
+    if mn.starts_with("v_cmp_") && mn.ends_with("_e64") && !ops.is_empty() {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[0] = if o[0] == "vcc" { "vcc_lo".into() } else { lo(&o[0]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
+    if mn == "v_cndmask_b32_e64" && ops.len() == 4 {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[3] = if o[3] == "vcc" { "vcc_lo".into() } else { lo(&o[3]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
+    // memory operands: gfx950 cache-policy bits have no gfx1250 spelling yet (only an atomic's return); a buffer's immediate soffset 0 is
+    // NULL; the LDS-DMA forms do not exist (async loads instead)
+    let mem = mn.starts_with("buffer_") || mn.starts_with("global_");
+    if mem {
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        if toks.iter().any(|x| matches!(*x, "sc0" | "sc1" | "nt" | "lds")) && !(mn.starts_with("buffer_atomic") && toks.contains(&"sc0")) {
+            return Err(format!("`{line}`: a gfx950 cache policy / LDS-DMA form (no gfx1250 spelling in G1)"));
+        }
+    }
     if let Some((_, to)) = RENAMES.iter().find(|(f, _)| *f == mn) {
-        let rest = wave32(rest);
+        let mut rest = wave32(rest);
+        if mn.starts_with("buffer_") {
+            let mut ops: Vec<String> = rest.split(", ").map(|s| s.to_string()).collect();
+            if ops.len() >= 4 {
+                let mut tail: Vec<String> = ops[3].split_whitespace().map(|s| s.to_string()).collect();
+                if tail.first().map(|s| s == "0") == Some(true) {
+                    tail[0] = "null".into();
+                }
+                // an atomic with return: gfx950 sc0 (glc) -> TH_ATOMIC_RETURN
+                for x in tail.iter_mut() {
+                    if x == "sc0" || x == "glc" {
+                        *x = "th:TH_ATOMIC_RETURN".into();
+                    }
+                }
+                ops[3] = tail.join(" ");
+            }
+            rest = ops.join(", ");
+        }
         return Ok(vec![if rest.is_empty() { to.to_string() } else { format!("{to} {rest}") }]);
     }
     // VOPC e32 writes vcc (vcc_lo on wave32); v_add_co / v_sub_co carry through vcc

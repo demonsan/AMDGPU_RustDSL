@@ -4151,6 +4151,13 @@ impl Lowerer {
                 self.sgpr_words(d, words)?;
                 self.val.insert(dst, d);
             }
+            Op::KernargPreload { dword } => {
+                tdm_target()?;
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SReadPhys).def(d).imm(2 + *dword as i64));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::ReadTtmp { idx } => {
                 tdm_target()?;
                 let d = self.new_vreg(RClass::S1);

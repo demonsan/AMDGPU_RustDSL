@@ -57,7 +57,7 @@ fn the_emitted_lines_encode_like_llvm_mc() {
         "ds_store_b64 v9, v[2:3] offset:8", "tensor_load_to_lds s[0:3], s[4:11]", "tensor_store_from_lds s[8:11], s[16:23], s[24:27], s[28:31]",
         "tensor_load_to_lds s[0:3], s[4:11] th:TH_LOAD_BYPASS scope:SCOPE_SYS", "s_wait_tensorcnt 0x3", "s_barrier_signal -3", "s_barrier_wait -3",
         "s_wait_loadcnt_dscnt 0x0", "s_set_vgpr_msb 0x41", "v_readfirstlane_b32 s7, v3", "s_mov_b32 s1, ttmp7",
-        "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]",
+        "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_cmp_gt_f32_e64 s10, v1, v2", "buffer_load_b32 v1, v2, s[4:7], null offen offset:16", "buffer_load_b128 v[4:7], off, s[8:11], s3 offset:64", "buffer_store_b16 v1, v2, s[4:7], s3 offen", "buffer_atomic_add_u32 v1, off, s[4:7], null offset:1024 th:TH_ATOMIC_RETURN", "v_cmp_lt_i32_e64 s12, v1, 5", "v_cndmask_b32_e64 v1, v2, v3, s10", "s_mov_b32 exec_lo, s10", "s_mov_b32 s11, exec_lo",
         "v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[16:23], 0",
         "v_wmma_scale_f32_32x16x128_f4 v[64:79], v[16:31], v[32:39], 0, v3, v4 matrix_b_scale:MATRIX_SCALE_ROW1", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE", "global_load_b32 v1, v2, s[4:5] scope:SCOPE_SE",
     ] {

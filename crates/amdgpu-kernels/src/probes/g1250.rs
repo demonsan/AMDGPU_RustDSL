@@ -151,3 +151,67 @@ pub fn probe_g1250_wmma_f4() -> Function {
     probe_g1250_wmma_with("probe_g1250_wmma_f4", amdgpu_dsl::WmmaKind::ScaleF4_32x16x128, true)
 }
 
+/// Lane masks on wave32: `out[i] = a[i] > b[i] ? a[i] : 2 b[i]` and `out[i + 256] = (i & 1) ? 7 : -i` (compares into VCC and into an SGPR,
+/// `v_cndmask`), 256 work-items.
+pub fn probe_g1250_select() -> Function {
+    use amdgpu_dsl::{CmpPred, CmpTy};
+    let mut b = FnBuilder::new("probe_g1250_select", 256);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg_tensor("a", Ext::c(256 * 4));
+    b.arg_tensor("b", Ext::c(256 * 4));
+    b.arg_tensor("out", Ext::c(512 * 4));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let po = b.let_(Op::KernargPtr { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let qa = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) });
+    let qb = b.let_(Op::PtrAdd { base: Opnd::Val(pb), byte_off: Opnd::Val(off) });
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(off) });
+    let x = b.load_global(qa, 0, MemTy::B32);
+    let y = b.load_global(qb, 0, MemTy::B32);
+    let xf = b.let_(Op::BitcastF32(Opnd::Val(x)));
+    let yf = b.let_(Op::BitcastF32(Opnd::Val(y)));
+    let y2 = b.add_f32(yf, yf);
+    let c = b.cmp(CmpPred::Gt, CmpTy::F32, xf, yf);
+    let s = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(c), a: Opnd::Val(xf), b: Opnd::Val(y2) });
+    b.store_global(qo, 0, s, MemTy::B32, false);
+    let odd = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(1)));
+    let c2 = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
+    let neg = b.bin(amdgpu_dsl::BinOp::SubU32, Opnd::I32(0), tid);
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::I32(7), b: Opnd::Val(neg) });
+    b.store_global(qo, 1024, s2, MemTy::B32, false);
+    b.finish()
+}
+
+/// Buffers on gfx1250 (the 57-bit-base / 45-bit-num_records V#): `out[i] = 3 * a[i] + b[i]` through buffer loads / stores with a
+/// constant and a kernarg-sized `num_records`, plus a returning buffer atomic add into `out[256]`; 256 work-items.
+pub fn probe_g1250_buffer() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_buffer", 256);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg("nb", DType::I32, 24, 4);
+    b.arg_tensor("a", Ext::c(256 * 4));
+    b.arg_tensor("b", Ext::c(256 * 4));
+    b.arg_tensor("out", Ext::c(257 * 4));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let po = b.let_(Op::KernargPtr { offset: 16 });
+    let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let ra = b.buffer_desc(pa, 1024);
+    let rb = b.buffer_desc_dyn(pb, nb);
+    let ro = b.buffer_desc(po, 1028);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.buffer_load_f32(ra, off, Opnd::I32(0), 0);
+    let y = b.buffer_load_f32(rb, off, Opnd::I32(0), 0);
+    let x3 = b.mul_f32(x, Opnd::F32(3.0));
+    let s = b.add_f32(x3, y);
+    b.buffer_store_f32(ro, off, Opnd::I32(0), 0, s);
+    let one = b.let_(Op::ConstI32(1));
+    let _r = b.buffer_atomic_add_ret(ro, Opnd::I32(0), Opnd::I32(0), 1024, one);
+    b.finish()
+}
