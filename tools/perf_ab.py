@@ -32,6 +32,7 @@ METRICS = {
     'us': (r'([0-9]+(?:\.[0-9]+)?)\s*us\b', 'low'),
     # the one JSON line of the gfx1250 hosts: {"host":..,"kernel":..,"us":..,"tflops":..|"gbs":..,"bad":N,"ok":bool}
     'json_us': (r'"us":\s*([0-9]+(?:\.[0-9]+)?)', 'low'),
+    'json_us2': (r'"us2":\s*([0-9]+(?:\.[0-9]+)?)', 'low'),
     'json_tflops': (r'"tflops":\s*([0-9]+(?:\.[0-9]+)?)', 'high'),
     'json_gbs': (r'"gbs":\s*([0-9]+(?:\.[0-9]+)?)', 'high'),
 }
@@ -56,6 +57,8 @@ class Case:
     ok: str = None                     # regex that must match the output (correctness marker of the host)
     fail: str = r'\b[A-Z0-9]+_FAIL\b|\bFAIL(?:ED)?\b'   # regex that must NOT match (a host's failure marker: XYZ_FAIL / FAIL) - a wrong result fails the case
                                        # even when a weak `ok` pattern also matches (topk_per_row: `past_end_bad=0 ... TKR_FAIL` matched `bad*=0`)
+    paired_swap: bool = True           # paired cases: also run with the two code objects swapped and combine (cancels the load-order bias)
+    paired: bool = False               # ONE run per repetition (on the new tree's host) gives BOTH sides: the host times the old kernel ({oldco:K}) and the new one ({co:K}) alternately on the same buffers (CO2 / KERNEL2)
     vendor: object = None              # callable() -> Run (no emit), the vendor side, same session
     vendor_line: str = None            # regex of the vendor lines (with `vendor_same`: lines of the SAME output as ours, hosts that run both kernels in one process)
     vendor_same: bool = False
@@ -225,8 +228,13 @@ def build_host(tree, name, out):
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
 # running
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
+OLD_SIDE = None
+
+
 def expand(run, side, hosts):
     def sub(tok):
+        if OLD_SIDE is not None:
+            tok = re.sub(r'\{oldco:([^}]+)\}', lambda m: os.path.join(OLD_SIDE.codir, m.group(1) + '.co'), tok)
         tok = re.sub(r'\{co:([^}]+)\}', lambda m: os.path.join(side.codir, m.group(1) + '.co'), tok)
         tok = tok.replace('{codir}', side.codir)
         tok = re.sub(r'\{host:([^}]+)\}', lambda m: hosts.get(m.group(1)) or 'MISSING_HOST_' + m.group(1), tok)
@@ -315,6 +323,8 @@ def main():
     out = os.path.abspath(args.out or os.path.join(ROOT, 'build', 'ab', f'run-{args.old.replace("/", "_")}-{args.new.replace("/", "_")}'.replace('.', 'wt')))
     os.makedirs(out, exist_ok=True)
     old, new = make_side('old', args.old, out), make_side('new', args.new, out)
+    global OLD_SIDE
+    OLD_SIDE = old
     old.emit_env = dict(e.split('=', 1) for e in args.old_emit_env)
     new.emit_env = dict(e.split('=', 1) for e in args.new_emit_env)
     fam = [f for f in args.families.split(',') if f]
@@ -392,6 +402,42 @@ def main():
     for rep in range(args.reps):
         for c in cases:
             order = (old, new) if rep % 2 == 0 else (new, old)
+            if c.paired:   # one paired run gives both sides (same buffers, alternating blocks): see Case.paired. A second run with the two code objects swapped cancels the load-order bias of the host
+                r = runs[(c.id, 'new')]
+                if not isinstance(r, Run):
+                    for pt in parts_of(c):
+                        samples[(c.id, pt['name'])]['notes'].append(f'paired: no launch ({r})')
+                    continue
+                smp = samples[(c.id, parts_of(c)[0]['name'])]
+
+                def one(run, label):
+                    cmd, env = expand(run, new, hosts)
+                    text, rc, dt = run_once(cmd, env, c.timeout)
+                    good = (c.ok is None or re.search(c.ok, text, re.M) is not None) and rc == 0
+                    va, key = parse(text, 'json_us', r'"paired"')
+                    vb, _ = parse(text, 'json_us2', r'"paired"')
+                    vr, _ = parse(text, r'"ratio":\s*([0-9]+(?:\.[0-9]+)?)', r'"paired"')
+                    smp['key'] = smp['key'] or key
+                    raw.write(json.dumps(dict(case=c.id, side='paired-' + label, rep=rep, values=dict(a=va, b=vb, ratio=vr), ok=good, rc=rc, sec=round(dt, 2), tail=text[-300:] if not good else '')) + '\n')
+                    if va is None or vb is None or vr is None or not good:
+                        smp['ok_new'] = smp['ok_old'] = False
+                        smp['notes'].append(f'paired {label} rep {rep}: ' + ('no paired metric' if va is None or vb is None or vr is None else 'correctness marker missing or exit != 0') + f' (rc={rc})')
+                        return None
+                    return va, vb, vr
+
+                res1 = one(r, 'ab')
+                res2 = None
+                if c.paired_swap:
+                    sw = lambda t: t.replace('{oldco:', '{@@:').replace('{co:', '{oldco:').replace('{@@:', '{co:')
+                    res2 = one(Run(r.emit, [sw(t) for t in r.cmd], {k: sw(str(v)) for k, v in r.env.items()}), 'ba')
+                if res1 is not None and (res2 is not None or not c.paired_swap):
+                    a1, b1, r1 = res1
+                    if res2 is not None:   # swapped run: its A is the new kernel, its B the old one
+                        a2, b2, r2 = res2
+                        smp['old'].append(math.sqrt(a1 * b2)); smp['new'].append(math.sqrt(b1 * a2)); smp.setdefault('pratio', []).append(math.sqrt(r1 / r2))
+                    else:
+                        smp['old'].append(a1); smp['new'].append(b1); smp.setdefault('pratio', []).append(r1)
+                continue
             for s_ in order:
                 r = runs[(c.id, s_.name)]
                 if not isinstance(r, Run):
@@ -443,6 +489,10 @@ def main():
         row = dict(id=cid, family=c.family, better=better, notes=smp['notes'][:3])
         if len(smp['old']) >= 1 and len(smp['new']) >= 1:
             j = judge(smp['old'], smp['new'], better, c.floor if c.floor is not None else args.floor, args.k) if (len(smp['old']) >= 3 and len(smp['new']) >= 3) else None
+            if c.paired and len(smp.get('pratio', [])) >= 3:   # paired: the verdict is on the per-run B / A ratios (placement cancels inside a run), not on the absolute times
+                pr = smp['pratio']
+                j = judge([1.0] * len(pr), pr, 'low', c.floor if c.floor is not None else args.floor, args.k)
+                j.update(med_old=statistics.median(smp['old']), med_new=statistics.median(smp['new']))
             if j is None:  # too few samples for a noise estimate: a plain ratio with the floor
                 perf = (lambda v: v) if better == 'high' else (lambda v: 1.0 / v)
                 r = statistics.median([perf(v) for v in smp['new']]) / statistics.median([perf(v) for v in smp['old']])

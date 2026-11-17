@@ -54,6 +54,8 @@ function Invoke-Remote([string]$bash, [switch]$Wrap) {
         if ($s -eq '@@MI450-BEGIN@@') { $inside = $true; continue }
         if ($inside) { Write-Host $s }
     }
+    if ($null -eq $exit -and $Wrap -and $script:retry -lt 2) { $script:retry++; Start-Sleep 5; return (Invoke-Remote $bash.Substring($bash.IndexOf("`n") + 1, $bash.LastIndexOf("`n") - $bash.IndexOf("`n") - 1) -Wrap) }   # the sync steps are idempotent: a dropped connection is retried (never the payload: no blind retry of a GPU run)
+    $script:retry = 0
     if ($null -eq $exit) { Write-Error "no end marker (ssh rc=$rc): the connection or the node failed" -ErrorAction Continue; return 250 }
     return $exit
 }
