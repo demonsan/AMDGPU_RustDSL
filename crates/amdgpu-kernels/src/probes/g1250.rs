@@ -258,6 +258,7 @@ pub fn probe_g1250_barriers() -> Function {
     b.arg_tensor("out", Ext::c(128 * 4));
     let po = b.let_(Op::KernargPtr { offset: 0 });
     b.barrier_init(1, 4);
+    b.barrier(); // orders the initialization before any wave uses the barrier (GV-1250-BAR-INIT)
     b.barrier_join(1);
     b.barrier_signal(1);
     b.barrier_wait(1);
@@ -340,7 +341,10 @@ pub fn probe_g1250_named() -> Function {
     b.lds(128 * 4);
     let po = b.let_(Op::KernargPtr { offset: 0 });
     b.barrier_init(1, 4);
+    b.barrier(); // orders the initialization before any wave uses the barrier (GV-1250-BAR-INIT)
     b.barrier_join(1);
+    // (the ISA's recommended order: the member count is set before any wave uses the barrier)
+    b.barrier();
     let tid = b.let_(Op::WorkitemId);
     let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
     let v = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));

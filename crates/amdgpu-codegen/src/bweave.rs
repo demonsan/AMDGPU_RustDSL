@@ -654,6 +654,44 @@ mod interleave_tests {
         assert!(ops2[..4].iter().all(|o| *o != MOp::BufferLoadDwordX4Lds), "the DMAs stay after both K reads: {ops2:?}");
     }
 
+    /// gfx1250 B5: the same shape with tensor loads (TDM) as the ring producers of tile t + 2: with 3 slots they merge into the QK window,
+    /// with 2 slots (they overwrite the slot QK reads) they stay behind the reads.
+    #[test]
+    fn ring_tensor_loads_of_another_slot_merge_into_the_qk_window() {
+        let mk = |slots: u32| {
+            let u = |id, name: &str, class, iter| UnitDecl { id, name: name.into(), phase: 0, class, anchor: false, iter, latency: 0, roles: 0 };
+            KernelPlan {
+                phases: vec![Phase { id: 0, name: "m".into(), parent: None, kind: PhaseKind::Straight, order: OrderSpec::Free, budget: Budget::default() }],
+                rings: vec![RingDecl { id: 0, name: "k".into(), slots, bytes_per_slot: 8192, cadence: Cadence::OneWindow, producer_phase: 0, consumer_phase: 0, owner: RingOwner::Cta }],
+                units: vec![u(0, "tdm", UnitClass::Dma, 2), u(1, "qk", UnitClass::Mfma, 0)],
+                hints: Hints { interleave: vec![(1, vec![0])], ..Default::default() },
+                ..Default::default()
+            }
+        };
+        let tag = |mut i: MInst, u: u32| {
+            i.unit = u;
+            i
+        };
+        let mut b = Block::new(0);
+        b.insts.push(tag(MInst::new(MOp::LdsReadB128).def(1).srcreg(4).imm(0), 2));
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(0).srcreg(1).srcreg(1), 2));
+        b.insts.push(tag(MInst::new(MOp::LdsReadB128).def(3).srcreg(4).imm(64), 2));
+        b.insts.push(tag(MInst::new(MOp::VMfma16x16x32Bf16Z).def(2).srcreg(3).srcreg(3), 2));
+        for _ in 0..2 {
+            b.insts.push(tag(MInst::new(MOp::TensorLoadToLds).srcreg(5).srcreg(6), 1));
+        }
+        let mut m = mf(vec![b.clone()], 8);
+        m.vregs[5] = RClass::S4;
+        m.vregs[6] = RClass::S8;
+        let mut m2 = m.clone();
+        assert_eq!(interleave(&mut m, &mk(3)), (1, 0), "3 slots: the tensor loads write another slot");
+        let ops: Vec<MOp> = m.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert_eq!(ops[2], MOp::TensorLoadToLds, "a tensor load right after the first MFMA: {ops:?}");
+        interleave(&mut m2, &mk(2));
+        let ops2: Vec<MOp> = m2.blocks[0].insts.iter().map(|i| i.op).collect();
+        assert!(ops2[..4].iter().all(|o| *o != MOp::TensorLoadToLds), "the tensor loads stay after both K reads: {ops2:?}");
+    }
+
     #[test]
     fn an_unmoved_instruction_in_between_blocks_the_merge() {
         let mut b = block();
