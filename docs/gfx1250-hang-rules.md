@@ -34,7 +34,7 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | `GV-1250-PERMLANE-CMPX` | asm | a lane permute directly after a `v_cmpx` | `mut_permlane_cmpx` | `pos_permlane_cmpx` |
 | `GV-1250-DVGPR` | asm | dynamic VGPR allocation (the feature does not exist on this target) | `mut_dvgpr` | `pos_dvgpr` |
 | `GV-1250-PRIV` | asm | a write of privileged state from a kernel (halt, privileged registers) | `mut_priv` | `pos_priv` |
-| `GV-1250-SCHED-MODE` | asm | entering the relaxed dependency-checking mode | `mut_sched_mode` | `pos_sched_mode` |
+| `GV-1250-SCHED-MODE` | asm | selecting the full relaxed dependency-checking mode or the reserved value of the scheduling-mode register, or writing it with a value the verifier cannot see; the normal mode and the partial mode (the program owns two dependency classes) are accepted, because exact replays use the partial one | `mut_sched_mode` | `pos_sched_mode` |
 | `GV-1250-SETREG-MSB` | asm | a mode-register write directly followed by a VGPR MSB write | `mut_setreg_msb` | `pos_setreg_msb` |
 
 Tests are in [`crates/amdgpu-kernels/tests/hang_rules_1250.rs`](../crates/amdgpu-kernels/tests/hang_rules_1250.rs).
