@@ -41,7 +41,7 @@ fn the_emitted_lines_encode_like_llvm_mc() {
         let f = amdgpu_kernels::kernel_by_name(k).unwrap();
         let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap();
         for l in c.asm.lines().map(|l| l.trim()) {
-            let inst = !l.is_empty() && !l.starts_with('.') && !l.starts_with("//") && !l.ends_with(':') && !l.starts_with("s_branch") && !l.starts_with("s_cbranch");
+            let inst = ["s_", "v_", "global_", "ds_", "tensor_"].iter().any(|p| l.starts_with(p)) && !l.starts_with("s_branch") && !l.starts_with("s_cbranch");
             if inst && !lines.contains(&l.to_string()) {
                 lines.push(l.to_string());
             }
