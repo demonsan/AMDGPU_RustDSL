@@ -482,3 +482,6 @@ pub fn compile_target(f: &amdgpu_dsl::Function, target: &str) -> Result<Compiled
         _ => target::with_target(t, || target::gfx1250::compile(f)),
     }
 }
+
+/// The target descriptions and the in-process encoders (`amdgpu_codegen::amdgpu_target::gfx1250_co`, ...).
+pub use amdgpu_target;

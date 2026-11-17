@@ -64,7 +64,7 @@ fn the_emitted_lines_encode_like_llvm_mc() {
     assert_eq!(want.len(), lines.len(), "llvm-mc gave {} encodings for {} lines", want.len(), lines.len());
     let mut bad = Vec::new();
     for (l, w) in lines.iter().zip(&want) {
-        match amdgpu_target::gfx1250_co::encode_line(l, 0, &|_| Some(0)) {
+        match amdgpu_codegen::amdgpu_target::gfx1250_co::encode_line(l, 0, &|_| Some(0)) {
             Ok(b) if &b == w => {}
             Ok(b) => bad.push(format!("{l}: ours {b:02x?} llvm-mc {w:02x?}")),
             Err(e) => bad.push(format!("{l}: {e}")),
