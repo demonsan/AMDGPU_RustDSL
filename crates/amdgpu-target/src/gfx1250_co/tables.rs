@@ -195,7 +195,7 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("v_wmma_f32_16x16x128_fp8_fp8", "VOP3P", 128),
     ("v_wmma_f32_16x16x32_bf16", "VOP3P", 98),
     ("v_wmma_f32_16x16x64_fp8_fp8", "VOP3P", 106),
-    ("v_wmma_scale_f32_32x16x128_f4", "VOP3PX2", 8),
+    ("v_wmma_scale_f32_32x16x128_f4", "VOP3PX2", 136),
     ("v_xad_u32", "VOP3", 581),
     ("v_xor_b32", "VOP2", 29),
 ];

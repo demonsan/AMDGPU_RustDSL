@@ -93,7 +93,7 @@ def fmt(b):
     d0 = int.from_bytes(b[:4], "little")
     # VOP3PX2: a scale prefix (VOP3P) and the matrix instruction (VOP3P): the second one's opcode
     if len(b) == 16 and d0 >> 26 == 0x33 and int.from_bytes(b[8:12], "little") >> 26 == 0x33:
-        return "VOP3PX2", (int.from_bytes(b[8:12], "little") >> 16) & 0x7F
+        return "VOP3PX2", (int.from_bytes(b[8:12], "little") >> 16) & 0xFF
     if d0 >> 23 == 0x17D:
         return "SOP1", (d0 >> 8) & 0xFF
     if d0 >> 23 == 0x17E:
@@ -115,7 +115,7 @@ def fmt(b):
     if d0 >> 26 == 0x35:
         return "VOP3", (d0 >> 16) & 0x3FF
     if d0 >> 26 == 0x33:
-        return "VOP3P", (d0 >> 16) & 0x7F
+        return "VOP3P", (d0 >> 16) & 0xFF
     if d0 >> 26 == 0x36:
         return "VDS", (d0 >> 18) & 0xFF
     if d0 >> 24 == 0xEE:
