@@ -2887,6 +2887,39 @@ impl Lowerer {
                 Stmt::WaitVm { count } => {
                     self.push(MInst::new(MOp::SWaitVm).imm(*count as i64));
                 }
+                Stmt::WaitTensor { count } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SWaitTensor).imm(*count as i64));
+                }
+                Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => {
+                    tdm_target()?;
+                    let load = matches!(st, Stmt::TensorLoadToLds { .. });
+                    if g2.is_some() != g3.is_some() {
+                        return Err("tensor operation: descriptor groups 2 and 3 are both given or both omitted".into());
+                    }
+                    let mut inst = MInst::new(if load { MOp::TensorLoadToLds } else { MOp::TensorStoreFromLds });
+                    for (g, cls) in [(Some(*g0), RClass::S4), (Some(*g1), RClass::S8), (*g2, RClass::S4), (*g3, RClass::S4)] {
+                        let Some(g) = g else { continue };
+                        let r = match g {
+                            Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
+                            Opnd::Var(w) => *self.vars.get(w.0 as usize).ok_or("variable not lowered")?,
+                            _ => return Err("tensor descriptor groups are SGPR tuples".into()),
+                        };
+                        if self.mir.vreg_class(r) != cls {
+                            return Err(format!("tensor descriptor group: {:?} expected, {:?} given", cls, self.mir.vreg_class(r)));
+                        }
+                        self.touch(&[Src::Reg(r)]);
+                        inst = inst.srcreg(r);
+                    }
+                    let mut imm = (cpol.th as i64 & 7) | ((cpol.scope as i64 & 3) << 3) | ((cpol.nv as i64) << 5);
+                    if let Some(w) = raw {
+                        imm |= RAW_TDM;
+                        for x in w {
+                            inst = inst.src(Src::Imm(*x as i64));
+                        }
+                    }
+                    self.push(inst.imm(imm));
+                }
                 Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                     let sad = if opt_on("saddrlds") { self.saddr_parts_force(*base)? } else { None };
                     let rb = if sad.is_some() { u32::MAX } else { self.as_v2(*base)? };
@@ -4043,6 +4076,11 @@ impl Lowerer {
             }
             Op::RsrcCat { words } => {
                 let d = self.new_vreg(RClass::S4);
+                self.sgpr_words(d, words)?;
+                self.val.insert(dst, d);
+            }
+            Op::SgprCat8 { words } => {
+                let d = self.new_vreg(RClass::S8);
                 self.sgpr_words(d, words)?;
                 self.val.insert(dst, d);
             }
@@ -6708,5 +6746,17 @@ mod peephole_preconditions {
         let mut g = mk(VCmpGtF32);
         with_opts(&["fminmax"], || select_minmax(&mut g));
         assert!(g.blocks[0].insts.iter().any(|x| x.op == VMaxF32), "fminmax (fast-math) folds");
+    }
+}
+
+/// `MInst::imm` flag of a tensor operation whose instruction words are given verbatim (the `Imm` sources after the groups).
+pub const RAW_TDM: i64 = 1 << 8;
+
+/// The tensor operations exist on gfx1250 only.
+fn tdm_target() -> Result<(), String> {
+    if crate::target::cur().name == "gfx1250" {
+        Ok(())
+    } else {
+        Err(format!("tensor (TDM) operations need --target gfx1250 (compiling for {})", crate::target::cur().name))
     }
 }

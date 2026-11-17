@@ -152,6 +152,39 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         }
         // the split barrier of the workgroup (id -1)
         MOp::SBarrier => vec!["s_barrier_signal -1".to_string(), "s_barrier_wait -1".to_string()],
+        MOp::SWaitTensor => vec![format!("s_wait_tensorcnt {:#x}", inst.imm)],
+        MOp::TensorLoadToLds | MOp::TensorStoreFromLds => {
+            let mn = if inst.op == MOp::TensorLoadToLds { "tensor_load_to_lds" } else { "tensor_store_from_lds" };
+            let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
+            if inst.imm & crate::lower::RAW_TDM != 0 {
+                // the author's / another assembler's words, verbatim (an exact replay)
+                let w: Vec<String> = inst.srcs.iter().filter_map(|s| if let Src::Imm(x) = s { Some(format!("{:#010x}", *x as u32)) } else { None }).collect();
+                vec![format!(".long {} // {mn} (verbatim words)", w.join(", "))]
+            } else {
+                let g = |r: u32, n: u32| format!("s[{}:{}]", r, r + n - 1);
+                let mut ops = vec![g(regs[0], 4), g(regs[1], 8)];
+                if regs.len() == 4 {
+                    ops.push(g(regs[2], 4));
+                    ops.push(g(regs[3], 4));
+                }
+                const TH: [&str; 8] = ["", "TH_LOAD_NT", "TH_LOAD_HT", "TH_LOAD_BYPASS", "TH_LOAD_LU", "TH_LOAD_NT_RT", "TH_LOAD_RT_NT", "TH_LOAD_NT_HT"];
+                const TH_ST: [&str; 8] = ["", "TH_STORE_NT", "TH_STORE_HT", "TH_STORE_BYPASS", "TH_STORE_LU", "TH_STORE_NT_RT", "TH_STORE_RT_NT", "TH_STORE_NT_HT"];
+                const SCOPE: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
+                let th = (inst.imm & 7) as usize;
+                let scope = ((inst.imm >> 3) & 3) as usize;
+                let mut l = format!("{mn} {}", ops.join(", "));
+                if th != 0 {
+                    l.push_str(&format!(" th:{}", if inst.op == MOp::TensorLoadToLds { TH[th] } else { TH_ST[th] }));
+                }
+                if scope != 0 {
+                    l.push_str(&format!(" scope:{}", SCOPE[scope]));
+                }
+                if inst.imm & 32 != 0 {
+                    l.push_str(" nv");
+                }
+                vec![l]
+            }
+        }
         _ => {
             let mut v = Vec::new();
             for l in crate::target::gfx950::emit::inst_lines(a, inst) {

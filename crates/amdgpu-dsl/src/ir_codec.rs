@@ -30,6 +30,7 @@ impl FromIr for DType {
             "Frag8" => { v.expect_unit("Frag8")?; Ok(DType::Frag8) }
             "Frag16" => { v.expect_unit("Frag16")?; Ok(DType::Frag16) }
             "Rsrc" => { v.expect_unit("Rsrc")?; Ok(DType::Rsrc) }
+            "Sgpr8" => { v.expect_unit("Sgpr8")?; Ok(DType::Sgpr8) }
             other => Err(v.err(format!("unknown DType variant `{other}`"))),
         }
     }
@@ -48,6 +49,7 @@ impl IrIds for DType {
             DType::Frag8 => {}
             DType::Frag16 => {}
             DType::Rsrc => {}
+            DType::Sgpr8 => {}
         }
     }
 }
@@ -204,6 +206,7 @@ impl FromIr for Op {
             "PtrHi" => { v.expect_tuple("PtrHi", 1)?; Ok(Op::PtrHi(FromIr::from_ir(v.item(0)?)?)) }
             "PtrCat" => { v.expect_struct("PtrCat")?; Ok(Op::PtrCat { lo: FromIr::from_ir(v.field("lo")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "RsrcCat" => { v.expect_struct("RsrcCat")?; Ok(Op::RsrcCat { words: FromIr::from_ir(v.field("words")?)? }) }
+            "SgprCat8" => { v.expect_struct("SgprCat8")?; Ok(Op::SgprCat8 { words: FromIr::from_ir(v.field("words")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
         }
     }
@@ -338,6 +341,7 @@ impl IrIds for Op {
             Op::PtrHi(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::PtrCat { lo, hi } => { IrIds::ids(&mut (*lo), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::RsrcCat { words } => { IrIds::ids(&mut (*words), fv, fr); }
+            Op::SgprCat8 { words } => { IrIds::ids(&mut (*words), fv, fr); }
         }
     }
 }
@@ -695,6 +699,9 @@ impl FromIr for Stmt {
             "SetPrio" => { v.expect_struct("SetPrio")?; Ok(Stmt::SetPrio { prio: FromIr::from_ir(v.field("prio")?)? }) }
             "SchedGroup" => { v.expect_struct("SchedGroup")?; Ok(Stmt::SchedGroup { mask: FromIr::from_ir(v.field("mask")?)?, size: FromIr::from_ir(v.field("size")?)?, sync: FromIr::from_ir(v.field("sync")?)? }) }
             "WaitVm" => { v.expect_struct("WaitVm")?; Ok(Stmt::WaitVm { count: FromIr::from_ir(v.field("count")?)? }) }
+            "WaitTensor" => { v.expect_struct("WaitTensor")?; Ok(Stmt::WaitTensor { count: FromIr::from_ir(v.field("count")?)? }) }
+            "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
+            "TensorStoreFromLds" => { v.expect_struct("TensorStoreFromLds")?; Ok(Stmt::TensorStoreFromLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "LoadGlobalLds" => { v.expect_struct("LoadGlobalLds")?; Ok(Stmt::LoadGlobalLds { base: FromIr::from_ir(v.field("base")?)?, lds_addr: FromIr::from_ir(v.field("lds_addr")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "SetVar" => { v.expect_struct("SetVar")?; Ok(Stmt::SetVar { var: FromIr::from_ir(v.field("var")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "VarScaleF32" => { v.expect_struct("VarScaleF32")?; Ok(Stmt::VarScaleF32 { var: FromIr::from_ir(v.field("var")?)?, scalar: FromIr::from_ir(v.field("scalar")?)? }) }
@@ -773,6 +780,9 @@ impl IrIds for Stmt {
             Stmt::SetPrio { prio } => { IrIds::ids(&mut (*prio), fv, fr); }
             Stmt::SchedGroup { mask, size, sync } => { IrIds::ids(&mut (*mask), fv, fr); IrIds::ids(&mut (*size), fv, fr); IrIds::ids(&mut (*sync), fv, fr); }
             Stmt::WaitVm { count } => { IrIds::ids(&mut (*count), fv, fr); }
+            Stmt::WaitTensor { count } => { IrIds::ids(&mut (*count), fv, fr); }
+            Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
+            Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*lds_addr), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Stmt::SetVar { var, value } => { fr(&mut (*var)); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::VarScaleF32 { var, scalar } => { fr(&mut (*var)); IrIds::ids(&mut (*scalar), fv, fr); }

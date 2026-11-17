@@ -20,6 +20,8 @@ pub enum RClass {
     S2,
     /// Four consecutive SGPRs (a MUBUF buffer resource descriptor), 4-aligned.
     S4,
+    /// Eight consecutive SGPRs (gfx1250: a tensor descriptor's group 1).
+    S8,
     /// Accumulation VGPRs (gfx90a+/gfx950 unified file: arch VGPRs v0..accum_offset-1, AGPRs a0.. above them). Written by MFMA with
     /// cc_cd, by ds_read/loads, and by _accvgpr_write; read by MFMA (any operand), stores and _accvgpr_read, never by VALU.
     A1,
@@ -41,7 +43,7 @@ impl RClass {
         match self {
             RClass::V2 | RClass::S2 | RClass::A2 => 2,
             RClass::V4 | RClass::S4 | RClass::A4 => 4,
-            RClass::V8 | RClass::A8 => 8,
+            RClass::V8 | RClass::A8 | RClass::S8 => 8,
             RClass::V16 | RClass::A16 => 16,
             _ => 1,
         }
@@ -57,7 +59,7 @@ impl RClass {
     }
 
     pub fn is_scalar(self) -> bool {
-        matches!(self, RClass::S1 | RClass::S2 | RClass::S4)
+        matches!(self, RClass::S1 | RClass::S2 | RClass::S4 | RClass::S8)
     }
 
     /// The vector-register class of the same width (V* <-> A*).
@@ -599,6 +601,11 @@ pub enum MOp {
     SNop,
     SWaitVm,
     SWaitLgkm,
+    /// gfx1250: `s_wait_tensorcnt imm`
+    SWaitTensor,
+    /// gfx1250 TDM: srcs = g0 (S4), g1 (S8)[, g2 (S4), g3 (S4)][, Imm raw word x 3]; imm = cpol (TH bits 0..2, SCOPE bits 3..4, NV bit 5) | RAW_TDM
+    TensorLoadToLds,
+    TensorStoreFromLds,
     SEndpgm,
 }
 

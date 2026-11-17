@@ -1182,6 +1182,10 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // ---- misc
         SNop => a("s_nop", ctrl).fence_only(F::Nop),
         SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
+        // gfx1250 only (the gfx950 pipeline rejects them in lowering); kept in program order
+        SWaitTensor => a("s_wait_tensorcnt", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
+        TensorLoadToLds => a("tensor_load_to_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
+        TensorStoreFromLds => a("tensor_store_from_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
         SWaitCnt => a("s_waitcnt", ctrl).fence_only(F::WaitBoth).backend(Backend::OwnOnly),
         SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),

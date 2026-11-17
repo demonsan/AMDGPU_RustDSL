@@ -51,6 +51,8 @@ pub enum DType {
     Frag16,
     /// MUBUF buffer resource descriptor: 4 consecutive SGPRs (base, size, flags). Only exists in scalar registers; built by `Op::BufferRsrc`.
     Rsrc,
+    /// Eight consecutive SGPRs (gfx1250: group 1 of a tensor descriptor). Only exists in scalar registers; built by `Op::SgprCat8`.
+    Sgpr8,
 }
 
 impl DType {
@@ -75,6 +77,7 @@ impl DType {
             DType::Frag8 => "frag8",
             DType::Frag16 => "frag16",
             DType::Rsrc => "rsrc",
+            DType::Sgpr8 => "sgpr8",
         }
     }
 
@@ -85,6 +88,7 @@ impl DType {
             DType::Frag8 => 8,
             DType::Frag16 => 16,
             DType::Rsrc => 4,
+            DType::Sgpr8 => 8,
             _ => 1,
         }
     }
@@ -713,6 +717,8 @@ pub enum Op {
     /// a buffer descriptor from four dwords pinned at consecutive SGPRs (base lo, base hi | stride, num_records, format); no instruction
     /// when they are already there. gpu_verify recognises the raw-buffer pattern over a pointer (docs/exact-mode.md).
     RsrcCat { words: [Opnd; 4] },
+    /// Eight uniform 32-bit words in consecutive SGPRs (gfx1250: a tensor descriptor's group 1).
+    SgprCat8 { words: [Opnd; 8] },
 }
 
 impl Op {
@@ -810,6 +816,7 @@ impl Op {
             Op::AddK { .. } => DType::I32,
             Op::PtrCat { .. } => DType::Ptr,
             Op::RsrcCat { .. } => DType::Rsrc,
+            Op::SgprCat8 { .. } => DType::Sgpr8,
         }
     }
 
@@ -887,6 +894,7 @@ impl Op {
             Op::AddK { a, .. } => vec![*a],
             Op::PtrCat { lo, hi } => vec![*lo, *hi],
             Op::RsrcCat { words } => words.to_vec(),
+            Op::SgprCat8 { words } => words.to_vec(),
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
@@ -1220,6 +1228,14 @@ impl StageContract {
     pub const ANY_PHASE: u32 = u32::MAX;
 }
 
+/// Cache policy of a gfx1250 tensor operation: TH (temporal hint, 3 bits), SCOPE (2 bits), NV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct TdmCpol {
+    pub th: u8,
+    pub scope: u8,
+    pub nv: bool,
+}
+
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -1300,6 +1316,14 @@ pub enum Stmt {
     SchedGroup { mask: u32, size: u32, sync: u32 },
     /// `s_waitcnt vmcnt(count)`: wait until at most `count` global/LDS-DMA loads are outstanding.
     WaitVm { count: u8 },
+    /// gfx1250: wait until at most `count` tensor operations (TENSORcnt) of this wave are outstanding.
+    WaitTensor { count: u8 },
+    /// gfx1250 TDM: `tensor_load_to_lds` with the descriptor groups g0 (4 SGPRs, `Rsrc`), g1 (8, `Sgpr8`) and the optional g2 / g3 (4 each;
+    /// both or neither). `raw`: the instruction's three words as written by another assembler (exact replays; the operands still describe
+    /// what it reads). Completion: TENSORcnt (`WaitTensor`).
+    TensorLoadToLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
+    /// gfx1250 TDM: `tensor_store_from_lds` (operands as `TensorLoadToLds`).
+    TensorStoreFromLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
     /// `lds_addr + 16 i` (`+ 4 i`), `lds_addr` being wave-uniform; completion is tracked by `vmcnt` only.
     LoadGlobalLds { base: Opnd, lds_addr: Opnd, byte_off: i32, dwords: u8 },
@@ -3502,6 +3526,26 @@ impl FnBuilder {
 
     /// `s_barrier`.
     #[track_caller]
+    /// gfx1250: wait for the tensor operations of this wave (at most `count` outstanding).
+    pub fn wait_tensor(&mut self, count: u8) {
+        self.push_stmt(Stmt::WaitTensor { count });
+    }
+
+    /// gfx1250: eight uniform words in consecutive SGPRs (a tensor descriptor's group 1).
+    pub fn sgpr_cat8(&mut self, words: [Opnd; 8]) -> ValueId {
+        self.let_(Op::SgprCat8 { words })
+    }
+
+    /// gfx1250 TDM load (see `Stmt::TensorLoadToLds`).
+    pub fn tensor_load_to_lds(&mut self, g0: Opnd, g1: Opnd, g23: Option<(Opnd, Opnd)>, cpol: TdmCpol) {
+        self.push_stmt(Stmt::TensorLoadToLds { g0, g1, g2: g23.map(|x| x.0), g3: g23.map(|x| x.1), cpol, raw: None });
+    }
+
+    /// gfx1250 TDM store (see `Stmt::TensorStoreFromLds`).
+    pub fn tensor_store_from_lds(&mut self, g0: Opnd, g1: Opnd, g23: Option<(Opnd, Opnd)>, cpol: TdmCpol) {
+        self.push_stmt(Stmt::TensorStoreFromLds { g0, g1, g2: g23.map(|x| x.0), g3: g23.map(|x| x.1), cpol, raw: None });
+    }
+
     pub fn wait_vm(&mut self, count: u8) {
         self.push_stmt(Stmt::WaitVm { count });
     }
@@ -4946,6 +4990,12 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarMfmaScale16 { a, b, scale_a, scale_b, .. } => vec![*a, *b, *scale_a, *scale_b],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
+        Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
+            let mut v = vec![*g0, *g1];
+            v.extend(g2.iter().copied());
+            v.extend(g3.iter().copied());
+            v
+        }
         // (the M0 value an exact kernel sets for its DMAs is a read)
         Stmt::SetM0 { value } => vec![*value],
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
