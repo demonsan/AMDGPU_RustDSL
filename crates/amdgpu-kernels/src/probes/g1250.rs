@@ -151,7 +151,7 @@ pub fn probe_g1250_wmma_f4() -> Function {
     probe_g1250_wmma_with("probe_g1250_wmma_f4", amdgpu_dsl::WmmaKind::ScaleF4_32x16x128, true)
 }
 
-/// Lane masks on wave32: `out[i] = a[i] > b[i] ? a[i] : 2 b[i]` and `out[i + 256] = (i & 1) ? i : -i` (compares into VCC and into an SGPR,
+/// Lane masks on wave32: `out[i] = a[i] > b[i] ? a[i] : 2 b[i]` and `out[i + 256] = (i & 1) ? 7 : -i` (compares into VCC and into an SGPR,
 /// `v_cndmask`), 256 work-items.
 pub fn probe_g1250_select() -> Function {
     use amdgpu_dsl::{CmpPred, CmpTy};
@@ -181,7 +181,7 @@ pub fn probe_g1250_select() -> Function {
     let odd = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(1)));
     let c2 = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
     let neg = b.bin(amdgpu_dsl::BinOp::SubU32, Opnd::I32(0), tid);
-    let s2 = b.let_(Op::Select { ty: DType::U32, cond: Opnd::Val(c2), a: Opnd::Val(tid), b: Opnd::Val(neg) });
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::I32(7), b: Opnd::Val(neg) });
     b.store_global(qo, 1024, s2, MemTy::B32, false);
     b.finish()
 }
