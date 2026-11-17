@@ -215,3 +215,35 @@ pub fn probe_g1250_buffer() -> Function {
     let _r = b.buffer_atomic_add_ret(ro, Opnd::I32(0), Opnd::I32(0), 1024, one);
     b.finish()
 }
+
+/// A 2-D TDM tile from the typed descriptor builder (`FnBuilder::tensor_desc_2d`): a 16 x 8 f32 tile of a row-major tensor, starting
+/// `off` bytes into `src`, with `dim0` / `dim1` the extents from the tile start (elements outside read as 0) and `pitch` elements per
+/// row; then every work-item copies one LDS dword to `out[tid]`. 128 work-items. Kernargs: src @0, out @8, dim0 @16, dim1 @20,
+/// pitch @24, off @28.
+pub fn probe_g1250_tdm2d() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_tdm2d", 128);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    for (k, n) in ["dim0", "dim1", "pitch", "off"].iter().enumerate() {
+        b.arg(n, DType::I32, 16 + 4 * k as u32, 4);
+    }
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.lds(128 * 4);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let d0 = b.let_(Op::KernargI32 { offset: 16 });
+    let d1 = b.let_(Op::KernargI32 { offset: 20 });
+    let pitch = b.let_(Op::KernargI32 { offset: 24 });
+    let off = b.let_(Op::KernargI32 { offset: 28 });
+    let t = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::Val(d0), Opnd::Val(d1)], stride0: Opnd::Val(pitch), tile: [16, 8], pad: None, wg_mask: 0 };
+    let (g0, g1) = b.tensor_desc_2d(&t, Opnd::Val(ps), Opnd::Val(off), Opnd::I32(0));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+    b.wait_tensor(0);
+    b.barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.load_lds(a, MemTy::B32);
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(qo, 0, x, MemTy::B32, false);
+    b.finish()
+}

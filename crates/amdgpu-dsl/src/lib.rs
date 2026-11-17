@@ -1343,6 +1343,24 @@ impl WaitCtr {
     }
 }
 
+/// A 1-D / 2-D tile of a gfx1250 tensor (the D# groups 0 and 1 of `FnBuilder::tensor_desc_2d`; CDNA5 ISA section 10.11.4). Sizes and
+/// strides in elements of `data_size` bytes; `tile[1]` = 0 or 1 for a 1-D tile.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorTile {
+    /// element bytes: 1, 2, 4 or 8
+    pub data_size: u8,
+    /// the tensor's extents (elements): dim0 (contiguous), dim1; out-of-bounds elements read as 0
+    pub tensor_dim: [Opnd; 2],
+    /// elements between consecutive dim1 rows (< 2^32 here)
+    pub stride0: Opnd,
+    /// the tile (elements): tile[0] along dim0, tile[1] rows
+    pub tile: [u16; 2],
+    /// LDS padding: (interval, amount) in dwords: `amount` dwords after every `interval` dwords (interval 2..256, a power of two; amount 1..128)
+    pub pad: Option<(u16, u16)>,
+    /// cluster multicast workgroup mask (0 outside a cluster)
+    pub wg_mask: u16,
+}
+
 /// Cache policy of a gfx1250 tensor operation: TH (temporal hint, 3 bits), SCOPE (2 bits), NV.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TdmCpol {
@@ -3669,6 +3687,69 @@ impl FnBuilder {
     /// gfx1250: eight uniform words in consecutive SGPRs (a tensor descriptor's group 1).
     pub fn sgpr_cat8(&mut self, words: [Opnd; 8]) -> ValueId {
         self.let_(Op::SgprCat8 { words })
+    }
+
+    /// gfx1250: the tensor descriptor groups 0 and 1 of a 1-D / 2-D tile `t` whose first element is at `base + byte_off` (a uniform pointer
+    /// and offset) and lands at LDS byte `lds_addr` (uniform). Returns (g0, g1) for `tensor_load_to_lds` / `tensor_store_from_lds`.
+    /// Every word is a uniform scalar value; words of constants fold.
+    pub fn tensor_desc_2d(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd) -> (ValueId, ValueId) {
+        let ds = match t.data_size {
+            1 => 0u32,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            d => panic!("tensor data_size {d}: 1, 2, 4 or 8 bytes"),
+        };
+        let (pad_en, pi, pa) = match t.pad {
+            None => (0u32, 0u32, 0u32),
+            Some((iv, am)) => {
+                assert!(iv.is_power_of_two() && (2..=256).contains(&iv) && (1..=128).contains(&am), "tensor padding: interval 2..256 (power of two), amount 1..128 dwords");
+                (1, iv.trailing_zeros() - 1, am as u32 - 1)
+            }
+        };
+        // group 0: [1:0] count = 1, [63:32] lds_addr, [120:64] global_addr (57 bits), [127:126] type = 2
+        let p = self.let_(Op::PtrAdd { base, byte_off });
+        let lo = self.let_(Op::PtrLo(Opnd::Val(p)));
+        let hi = self.let_(Op::PtrHi(Opnd::Val(p)));
+        let hm = self.let_(Op::AndI32(Opnd::Val(hi), Opnd::I32(0x01ff_ffff)));
+        let w3 = self.bin(BinOp::OrB32, hm, Opnd::I32(0x8000_0000u32 as i32));
+        let g0 = self.let_(Op::RsrcCat { words: [Opnd::I32(1), lds_addr, Opnd::Val(lo), Opnd::Val(w3)] });
+        // group 1 (256 bits): see the field table of CDNA5 ISA Table 63
+        let w0 = t.wg_mask as u32 | ds << 16 | pad_en << 20 | pi << 22 | pa << 25;
+        let c = |x: Opnd| match x {
+            Opnd::I32(v) => Some(v as u32),
+            _ => None,
+        };
+        // a word = (a >> sa) | (b << sb), folded when both are constants
+        let mut word = |s: &mut Self, a: Option<(Opnd, u32)>, b: Option<(Opnd, u32)>, k: u32| -> Opnd {
+            let part = |s: &mut Self, x: Option<(Opnd, u32)>, left: bool| -> Option<Opnd> {
+                let (o, sh) = x?;
+                Some(match c(o) {
+                    Some(v) => Opnd::I32((if left { v << sh } else { v >> sh }) as i32),
+                    None if sh == 0 => o,
+                    None => Opnd::Val(if left { s.let_(Op::ShlI32(o, Opnd::I32(sh as i32))) } else { s.let_(Op::LshrI32(o, Opnd::I32(sh as i32))) }),
+                })
+            };
+            let pa = part(s, a, false);
+            let pb = part(s, b, true);
+            let mut acc = Opnd::I32(k as i32);
+            for x in [pa, pb].into_iter().flatten() {
+                acc = match (c(acc), c(x)) {
+                    (Some(u), Some(v)) => Opnd::I32((u | v) as i32),
+                    (Some(0), None) => x,
+                    _ => Opnd::Val(s.bin(BinOp::OrB32, acc, x)),
+                };
+            }
+            acc
+        };
+        let [d0, d1] = t.tensor_dim;
+        let w1 = word(self, None, Some((d0, 16)), 0);
+        let w2 = word(self, Some((d0, 16)), Some((d1, 16)), 0);
+        let w3g = word(self, Some((d1, 16)), None, (t.tile[0] as u32) << 16);
+        let w4 = Opnd::I32((t.tile[1] as u32) as i32);
+        let w5 = t.stride0;
+        let g1 = self.let_(Op::SgprCat8 { words: [Opnd::I32(w0 as i32), w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
+        (g0, g1)
     }
 
     /// gfx1250 TDM load (see `Stmt::TensorLoadToLds`).
