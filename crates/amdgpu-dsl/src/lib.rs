@@ -547,6 +547,8 @@ pub enum Op {
     /// stamp in program order (it is a fence for the scheduler) and drains `lgkmcnt` right after it (SMEM result): place stamps where the kernel already waits.
     MemTimeLo { id: u32 },
     WorkitemId,
+    /// gfx1250 (`system_vgpr_workitem_id 2`): v0 as the hardware writes it, the packed work-item ids x [9:0], y [19:10], z [29:20]
+    WorkitemIdPacked,
     WorkgroupIdX,
     WorkgroupIdY,
     WorkgroupIdZ,
@@ -645,6 +647,9 @@ pub enum Op {
     Permlane32SwapA { a: Opnd, b: Opnd },
     /// gfx1250 scalar forms with their own semantics (`SaluOp`): one SALU instruction, the result in an SGPR (a pair for `AddNcU64`).
     Salu { op: SaluOp, a: Opnd, b: Opnd },
+    /// gfx1250 wave-state reads (`SysValOp`): `GetReg` the hardware register field `imm` (s_getreg_b32's simm16) as an I32, `GetPc` the
+    /// program counter of the next instruction (s_get_pc_i64) as a Ptr. Wave-uniform; no other effect.
+    SysVal { op: SysValOp, imm: u32 },
     /// `v_swap_b32 vA, vB` (gfx1250) in place on two registers: the value is the new content of a's register (= b), `Permlane32SwapB`
     /// names the new content of b's register (= a).
     SwapA { a: Opnd, b: Opnd },
@@ -824,6 +829,8 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Wmma { kind, .. } => kind.acc_ty(),
             Op::Raw { ty, .. } => *ty,
+            Op::SysVal { op: SysValOp::GetPc, .. } => DType::Ptr,
+            Op::SysVal { .. } => DType::I32,
             Op::Salu { op: SaluOp::AddNcU64, .. } => DType::Ptr,
             Op::Salu { .. } => DType::I32,
             Op::Cvt { op, .. } => op.sig().1,
@@ -867,7 +874,7 @@ impl Op {
                 _ => DType::Frag4,
             },
             Op::CvtF32ToF16(..) => DType::I32,
-            Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
+            Op::WorkitemId | Op::WorkitemIdPacked | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
             Op::Max3F32(..) => DType::F32,
             Op::Select { ty, .. } => *ty,
@@ -917,7 +924,7 @@ impl Op {
     pub fn operands(&self) -> Vec<Opnd> {
         match self {
             Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
-            | Op::KernargPtr { .. } | Op::KernargSegment | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
+            | Op::KernargPtr { .. } | Op::KernargSegment | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkitemIdPacked | Op::WorkgroupIdX | Op::WorkgroupIdY
             | Op::WorkgroupIdZ | Op::Undef { .. } => vec![],
             Op::AddI32(a, b)
             | Op::MulI32(a, b)
@@ -973,6 +980,7 @@ impl Op {
                 v
             }
             Op::Raw { reads, .. } => reads.clone(),
+            Op::SysVal { .. } => vec![],
             Op::Salu { a, b, .. } => vec![*a, *b],
             Op::Wmma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
@@ -1501,6 +1509,13 @@ pub enum Stmt {
     /// Exact mode only: the code from here on is the author's basic block `key` (its position in the author's layout). The exact
     /// emission lays the blocks out in key order, whatever the structure's own order (a block boundary, no instruction).
     LayoutKey { key: u32 },
+    /// gfx1250 wave-control instructions with no effect on the program's values or memory (`SysOp`): the version marker, a mode-register
+    /// write, the idle wait, instruction / data prefetches. `reads`: the registers the instruction reads (prefetch addresses).
+    Sys { op: SysOp, imm: u32, imm2: u32, reads: Vec<Opnd> },
+    /// wave32: EXEC = the lane mask `mask` (an I1 compare result held as a lane mask, e.g. in VCC) - `s_mov_b32 exec_lo, <mask>`
+    ExecFromMask { mask: Opnd },
+    /// wave32: EXEC = `cond` (a uniform I1 in SCC) ? `a` : `b` - `s_cselect_b32 exec_lo, a, b`
+    ExecSelect { cond: Opnd, a: Opnd, b: Opnd },
     /// Exact mode only: the next statement's single instruction is emitted as these words (the author's encoding: its operands and
     /// semantics are the statement's; only fields an assembler fills differently, such as an unused source, may differ from our encoding)
     AuthorWords { words: Vec<u32> },
@@ -4356,6 +4371,26 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
     }
 }
 
+/// `Stmt::Sys` (gfx1250 wave control, no value / memory effect): `Version` (s_version imm), `SetRegImm` (s_setreg_imm32_b32: imm = the
+/// hwreg simm16 = id [5:0], offset [10:6], size-1 [15:11]; imm2 = the value; the scheduling mode has its own `SetSchedMode`), `WaitIdle`
+/// (s_wait_idle), `PrefetchInst` (s_prefetch_inst base, imm = byte offset, len, imm2 = the cache immediate; reads [base pair, length]),
+/// `PrefetchGlobal` (global_prefetch_b8 voff, base; reads [voff, base pair]; imm = offset).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SysOp {
+    Version,
+    SetRegImm,
+    WaitIdle,
+    PrefetchInst,
+    PrefetchGlobal,
+}
+
+/// `Op::SysVal`: `GetReg` (s_getreg_b32, imm = the hwreg simm16), `GetPc` (s_get_pc_i64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SysValOp {
+    GetReg,
+    GetPc,
+}
+
 /// The scalar forms of `Op::Salu` (gfx1250 SALU; each one instruction, wave-uniform operands).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SaluOp {
@@ -4971,6 +5006,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
+            Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } => {}
             Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
                     errs.push(here("a layout key / goto outside exact mode".to_string()));
@@ -5490,6 +5526,9 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
         Stmt::Raw { reads, .. } => reads.clone(),
+        Stmt::Sys { reads, .. } => reads.clone(),
+        Stmt::ExecFromMask { mask } => vec![*mask],
+        Stmt::ExecSelect { cond, a, b } => vec![*cond, *a, *b],
         Stmt::GotoIf { cond, .. } => vec![*cond],
         Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
             let mut v = vec![*g0, *g1];

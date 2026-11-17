@@ -2510,6 +2510,8 @@ impl<'a> An<'a> {
             // the kernarg segment pointer: no tensor provenance (an access through it is GV-GLB-PROV)
             Op::KernargSegment => AV::Ptr { arg: None, off: Itv::konst(0) },
             Op::WorkitemId => AV::Int(Itv::range(Poly::int(0), Poly::int(self.f.workgroup_size as i128 - 1))),
+            // the packed ids (x [9:0], y [19:10], z [29:20])
+            Op::WorkitemIdPacked => AV::Int(Itv::range(Poly::int(0), Poly::int((1i128 << 30) - 1))),
             Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => {
                 let axis = match op {
                     Op::WorkgroupIdX => 0u8,
@@ -4231,7 +4233,7 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if n >= 2 && p % need != 0 {
                 rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors / wider multiple of 4; assembler-measured)", if n == 4 { "descriptor quad" } else { "tuple" }));
             }
-            if p + n > SGPR_LIMIT && !(f.exact && ((p == crate::mir::VCC_PIN && n == 2) || (p == crate::mir::SCC_PIN && n == 1))) {
+            if p + n > SGPR_LIMIT && !(f.exact && ((p == crate::mir::VCC_PIN && n == 2) || (p == crate::mir::SCC_PIN && n == 1) || (p >= crate::mir::TTMP_PIN && p + n <= crate::mir::TTMP_PIN + 16))) {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));
             }
         }

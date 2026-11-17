@@ -127,6 +127,14 @@ pub enum MOp {
     SBitset0,
     SBitset1,
     SAddNcU64,
+    /// gfx1250 `Stmt::Sys`: imm = op [7:0] | imm [23:8] | imm2 [55:24]; srcs = its reads (pinned, program order)
+    SSys,
+    /// gfx1250 `Op::SysVal`: imm = op [7:0] | simm16 [23:8]; dst S1 (GetReg) / S2 (GetPc)
+    SSysVal,
+    /// wave32 `s_mov_b32 exec_lo, <mask lo>`: srcs = [the lane-mask register (pair)]
+    SExecFromMask,
+    /// wave32 `s_cselect_b32 exec_lo, a, b`: srcs = [scc value, a, b]
+    SExecSelect,
     VPkMulF32,
     VAddU32,
     VAddCoU32,
@@ -700,6 +708,9 @@ pub struct MInst {
 
 /// Exact mode: an SGPR pin at this base is VCC (the lane-mask register `v_cmp_*_e32` writes and `v_cndmask_b32_e32` / `s_cbranch_vcc*` read).
 pub const VCC_PIN: u32 = 106;
+/// Exact mode (gfx1250): an SGPR pin at TTMP_PIN + n is the trap temporary ttmp<n> (operand encoding 108 + n), read in place by the
+/// author's instructions (`Op::ReadTtmp` pinned there is no instruction).
+pub const TTMP_PIN: u32 = 108;
 /// Exact mode: an SGPR pin at this base (the ISA's operand encoding of SCC) is SCC: a scalar compare's result read by `s_cselect` /
 /// `s_cbranch_scc*`.
 pub const SCC_PIN: u32 = 253;

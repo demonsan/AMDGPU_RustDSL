@@ -441,7 +441,7 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 match x {
                     Src::Reg(r) => {
                         let p = a.phys[*r as usize];
-                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { format!("s{p}") })
+                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
                     }
                     Src::Imm(k) => Ok(format!("{:#x}", *k as u32)),
                     _ => Err("scalar form: register or constant operands".into()),
@@ -455,6 +455,44 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 MOp::SBitset0 | MOp::SBitset1 => vec![format!("{mn} {dn}, {}", s(&inst.srcs[1])?)],
                 _ => vec![format!("{mn} {dn}, {}, {}", s(&inst.srcs[0])?, s(&inst.srcs[1])?)],
             }
+        }
+        MOp::SExecFromMask | MOp::SExecSelect => {
+            let s = |x: &Src| -> String {
+                match x {
+                    Src::Reg(r) => {
+                        let p = a.phys[*r as usize];
+                        if p == crate::mir::VCC_PIN { "vcc_lo".to_string() } else { sgpr_name(p) }
+                    }
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".to_string(),
+                }
+            };
+            if inst.op == MOp::SExecFromMask {
+                vec![format!("s_mov_b32 exec_lo, {}", s(&inst.srcs[0]))]
+            } else {
+                vec![format!("s_cselect_b32 exec_lo, {}, {}", s(&inst.srcs[1]), s(&inst.srcs[2]))]
+            }
+        }
+        MOp::SSys | MOp::SSysVal => {
+            let (op, k, k2) = (inst.imm & 0xff, ((inst.imm >> 8) & 0xffff) as u32, ((inst.imm >> 24) & 0xffff_ffff) as u32);
+            let hw = |s: u32| format!("hwreg({}, {}, {})", s & 0x3f, (s >> 6) & 0x1f, ((s >> 11) & 0x1f) + 1);
+            let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
+            let line = if inst.op == MOp::SSysVal {
+                let d = a.phys[inst.dst.ok_or("a wave-state read without a destination")? as usize];
+                match op {
+                    0 => format!("s_getreg_b32 s{d}, {}", hw(k)),
+                    _ => format!("s_get_pc_i64 s[{}:{}]", d, d + 1),
+                }
+            } else {
+                match op {
+                    0 => format!("s_version {k:#x}"),
+                    1 => format!("s_setreg_imm32_b32 {}, {k2:#x}", hw(k)),
+                    2 => "s_wait_idle".to_string(),
+                    3 => format!("s_prefetch_inst s[{}:{}], {k:#x}, s{}, {k2}", regs[0], regs[0] + 1, regs[1]),
+                    _ => format!("global_prefetch_b8 v{}, s[{}:{}]{}", regs[0], regs[1], regs[1] + 1, if k != 0 { format!(" offset:{k}") } else { String::new() }),
+                }
+            };
+            vec![line]
         }
         MOp::VSwapB32 => {
             let r: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
@@ -579,6 +617,7 @@ const RENAMES: &[(&str, &str)] = &[
     ("s_addc_u32", "s_add_co_ci_u32"),
     ("s_sub_u32", "s_sub_co_u32"),
     ("s_subb_u32", "s_sub_co_ci_u32"),
+    ("s_addk_i32", "s_addk_co_i32"),
 ];
 
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
@@ -597,8 +636,31 @@ const SAME_PREFIX: &[&str] = &[
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
+/// An SGPR operand's name: s<n>, or ttmp<n - 108> for the trap temporaries an exact kernel reads in place (`mir::TTMP_PIN`).
+fn sgpr_name(p: u32) -> String {
+    if (crate::mir::TTMP_PIN..crate::mir::TTMP_PIN + 16).contains(&p) {
+        format!("ttmp{}", p - crate::mir::TTMP_PIN)
+    } else {
+        format!("s{p}")
+    }
+}
+
+/// `s108`..`s123` operands (the shared emitter's spelling of a ttmp pin) as `ttmp0`..`ttmp15`.
+fn ttmp_names(line: &str) -> String {
+    let Some(i) = line.find(' ') else { return line.to_string() };
+    let ops: Vec<String> = line[i + 1..]
+        .split(", ")
+        .map(|o| match o.strip_prefix('s').and_then(|n| n.parse::<u32>().ok()) {
+            Some(n) if (crate::mir::TTMP_PIN..crate::mir::TTMP_PIN + 16).contains(&n) => sgpr_name(n),
+            _ => o.to_string(),
+        })
+        .collect();
+    format!("{} {}", &line[..i], ops.join(", "))
+}
+
 pub fn respell(line: &str) -> Result<Vec<String>, String> {
-    let line = line.trim();
+    let owned = ttmp_names(line.trim());
+    let line = owned.as_str();
     if line.is_empty() || line.starts_with("//") || line.starts_with(';') {
         return Ok(vec![line.to_string()]);
     }

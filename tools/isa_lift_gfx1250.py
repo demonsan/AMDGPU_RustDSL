@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """gfx1250 front end of the exact lifter (tools/isa_lift.py; docs/exact-mode.md): the node's `llvm-objdump --mcpu=gfx1250` text of one kernel
 -> the lifter's instruction list, then the same structured whole-kernel lift into DSL IR text (irv1).
 
@@ -27,7 +27,7 @@ TO_950 = {
     'ds_load_b32': 'ds_read_b32', 'ds_load_b64': 'ds_read_b64', 'ds_load_b128': 'ds_read_b128', 'ds_store_b32': 'ds_write_b32',
     'ds_store_b64': 'ds_write_b64', 'ds_store_b128': 'ds_write_b128', 'v_add_nc_u32': 'v_add_u32', 'v_sub_nc_u32': 'v_sub_u32',
     's_add_co_u32': 's_add_u32', 's_add_co_ci_u32': 's_addc_u32', 's_sub_co_u32': 's_sub_u32', 's_load_b32': 's_load_dword',
-    's_load_b64': 's_load_dwordx2', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
+    's_load_b64': 's_load_dwordx2', 's_addk_co_i32': 's_addk_i32', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
 }
 WAITS = {'s_wait_loadcnt': 'Load', 's_wait_storecnt': 'Store', 's_wait_dscnt': 'Ds', 's_wait_kmcnt': 'Km', 's_wait_xcnt': 'X',
          's_wait_asynccnt': 'Async', 's_wait_tensorcnt': 'Tensor'}
@@ -98,13 +98,27 @@ def parse(path):
         if op == 's_set_vgpr_msb':
             msb = int(args[0], 0) & 0xFF
         words = list(r['words'])
+        # a 64-bit add of a zero-extended 32-bit offset (`s_add_co_u32 lo, lo, x; s_add_co_ci_u32 hi, 0, hi`): one pointer add, both words
+        if (op == 's_add_co_u32' and i + 1 < len(recs) and recs[i + 1]['op'] == 's_add_co_ci_u32' and (i + 1) not in scc_live
+                and recs[i + 1]['addr'] not in targets):
+            n = recs[i + 1]['args']
+            lo, hi = isa_lift.reg(args[0]), isa_lift.reg(n[0])
+            blo, bhi = isa_lift.reg(args[1]), isa_lift.reg(n[2]) if len(n) > 2 else None
+            if (lo and hi and blo and bhi and n[1] == '0' and hi[1] == lo[1] + 1 and bhi[1] == blo[1] + 1 and lo[1] == blo[1]
+                    and lo[1] % 2 == 0):
+                pw = '/'.join(f'{w:#x}' for w in r['words']) + ';' + '/'.join(f'{w:#x}' for w in recs[i + 1]['words'])
+                out.append((sec, 's_ptradd_zext', f's[{lo[1]}:{lo[1] + 1}], {args[2]} pwords:{pw}'))
+                i += 2
+                continue
         if op == 'v_wmma_ld_scale_paired_b32' and i + 1 < len(recs) and recs[i + 1]['op'] == 'raw':
             args, mods = decode_vop3px2(r, recs[i + 1], msb)
             op = 'v_wmma_scale_f32_32x16x128_f4'
             words += recs[i + 1]['words']
             i += 1
         wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
-        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32')) or any(op == f or op.startswith(f + '_e') for f in wops):
+        SYS = ('s_version', 's_wait_idle', 's_prefetch_inst', 'global_prefetch_b8', 's_getreg_b32', 's_get_pc_i64')
+        exec_w = op in ('s_mov_b32', 's_cselect_b32') and args and args[0] == 'exec_lo'
+        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32') + SYS) or exec_w or any(op == f or op.startswith(f + '_e') for f in wops):
             mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
         elif op in BRANCHES:
             args = [f'L{r["target"]:x}'] if 'target' in r else args
@@ -115,6 +129,9 @@ def parse(path):
         base = re.sub(r'_e(32|64)$', '', op)
         e64 = op.endswith('_e64')
         op = TO_950.get(base, base) + ('_e64' if e64 else '')
+        args = [f's{108 + int(x[4:])}' if re.fullmatch(r'ttmp\d+', x) else x for x in args]
+        # wave32: the lane mask is one register; the lifter's mask model names it vcc / exec (the emitter writes vcc_lo / exec_lo)
+        args = [{'vcc_lo': 'vcc', 'exec_lo': 'exec'}.get(x, x) for x in args]
         # (branches carry their target label only: the CFG reads it)
         text = '' if op in BRANCHES else r.get('text', '')
         if text and '--raw-text' not in sys.argv:
@@ -158,6 +175,9 @@ class Lifter(isa_lift.Lifter):
                         at = k
                         break
             if ok and at is not None:
+                # (before the instruction's encode_e64: that marks the statement right after it)
+                if at > mark and self.lines[at - 1].strip() == 'EncodeE64':
+                    at -= 1
                 self.lines.insert(at, 'AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in w) + '] }')
                 return True
             del self.lines[mark:]
@@ -308,7 +328,118 @@ class Lifter(isa_lift.Lifter):
             w = next(x[6:].split('/') for x in m if x.startswith('words:'))
             self.stmt(f'SetSchedMode {{ mode: {int(w[1], 16)} }}')
             return True
-        return False
+        w = next(x[6:].split('/') for x in m if x.startswith('words:'))
+        return self._sys(m, 'SetRegImm', int(w[0], 16) & 0xffff, int(w[1], 16), [])
+
+    def h_v_mul_u32_u24(self, t, m, op):
+        return self.bin(t, 'Bin(MulU32U24, {a}, {b})', 'I32', 'I32')
+    def h_v_mul_lo_u32(self, t, m, op): return self.bin(t, 'MulI32({a}, {b})', 'I32', 'I32')
+    def h_v_max_i32(self, t, m, op): return self.bin(t, 'Bin(MaxI32, {a}, {b})', 'I32', 'I32')
+    def h_v_sub_u32(self, t, m, op): return self.bin(t, 'Bin(SubU32, {a}, {b})', 'I32', 'I32')
+    def h_v_cmp_gt_u32(self, t, m, op): return self.cmp64(t, 'Gt', 'U32')
+
+    def _words(self, m):
+        # (an instruction without operands: toks() takes its only modifier for an operand - h_s_wait_idle passes t + m)
+        w = next(x[6:].split('/') for x in m if x.startswith('words:'))
+        self.stmt('AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in w) + '] }')
+        return [int(x, 16) for x in w]
+
+    def _sys(self, m, op, imm, imm2, reads):
+        self._words(m)
+        self.stmt(f'Sys {{ op: {op}, imm: {imm}, imm2: {imm2}, reads: [{", ".join(reads)}] }}')
+        return True
+
+    def h_s_version(self, t, m, op):
+        w = next(x[6:].split('/') for x in m if x.startswith('words:'))
+        return self._sys(m, 'Version', int(w[0], 16) & 0xffff, 0, [])
+
+    def h_s_wait_idle(self, t, m, op):
+        return self._sys(list(t) + list(m), 'WaitIdle', 0, 0, [])
+
+    def h_s_prefetch_inst(self, t, m, op):
+        return self._sys(m, 'PrefetchInst', isa_lift.imm(t[1]) & 0xffff, isa_lift.imm(t[3]) or 0, [self.src(t[0], 'Ptr'), self.src(t[2], 'I32')])
+
+    def h_global_prefetch_b8(self, t, m, op):
+        off = next((int(x.split(':')[1], 0) for x in m if x.startswith('offset:')), 0)
+        return self._sys(m, 'PrefetchGlobal', off & 0xffff, 0, [self.src(t[0], 'I32'), self.src(t[1], 'Ptr')])
+
+    def h_s_getreg_b32(self, t, m, op):
+        w = self._words(m)
+        self.dst(t[0], 'I32', f'SysVal {{ op: GetReg, imm: {w[0] & 0xffff} }}')
+        return True
+
+    def h_s_get_pc_i64(self, t, m, op):
+        self._words(m)
+        self.dst(t[0], 'Ptr', 'SysVal { op: GetPc, imm: 0 }')
+        return True
+
+    def h_s_mov_b32(self, t, m, op):
+        # wave32 EXEC writes (the author's words: the shared lowering spells the 64-bit forms)
+        if t[0] == 'exec':
+            if t[1] == 'vcc':
+                if ('vcc', 0) not in self.state:
+                    return False
+                self._words(m)
+                self.stmt(f'ExecFromMask {{ mask: Val({self.state[("vcc", 0)][0]}) }}')
+                return True
+            k = isa_lift.imm(t[1])
+            if k is not None:
+                self._words(m)
+                self.stmt('ExecAll' if (k & 0xffffffff) == 0xffffffff else f'ExecSet {{ mask: {k & 0xffffffff} }}')
+                return True
+            return False
+        return super().h_s_mov_b32(t, m, op)
+
+    def h_s_cselect_b32(self, t, m, op):
+        if t[0] == 'exec':
+            if ('scc', 0) not in self.state:
+                return False
+            c = self.state[('scc', 0)][0]
+            a, b = self.src(t[1], 'I32'), self.src(t[2], 'I32')
+            self._words(m)
+            self.stmt(f'ExecSelect {{ cond: Val({c}), a: {a}, b: {b} }}')
+            return True
+        return super().h_s_cselect_b32(t, m, op)
+
+    def h_s_ptradd_zext(self, t, m, op):
+        # the author's pair (s_add_co_u32 + s_add_co_ci_u32, constant-first) as one pointer add; each instruction keeps its words
+        pw = next(x for x in m if x.startswith('pwords:'))[7:].split(';')
+        base, off = self.src(t[0], 'Ptr'), self.src(t[1], 'I32')
+        for ws in pw:
+            self.stmt('AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in ws.split('/')) + '] }')
+        self.dst(t[0], 'Ptr', f'PtrAdd {{ base: {base}, byte_off: {off} }}')
+        return True
+
+    def _salu(self, t, sop, ty='I32'):
+        a, b = self.src(t[1], 'I32' if ty == 'I32' else None), self.src(t[2], 'I32' if ty == 'I32' else None)
+        self.dst(t[0], ty, f'Salu {{ op: {sop}, a: {a}, b: {b} }}')
+        return True
+
+    def h_s_add_co_i32(self, t, m, op):
+        return self._salu(t, 'AddCoI32')
+
+    def h_s_sub_co_i32(self, t, m, op):
+        return self._salu(t, 'SubCoI32')
+
+    def h_s_bfe_u32(self, t, m, op):
+        if t[1].startswith('ttmp'):
+            return False
+        return self._salu(t, 'BfeU32')
+
+    def h_s_add_nc_u64(self, t, m, op):
+        return self._salu(t, 'AddNcU64', 'Ptr')
+
+    def _bitset(self, t, sop):
+        # in place: the destination's old value is the first operand
+        old, bit = self.src(t[0], 'I32'), self.src(t[1], 'I32')
+        self.dst(t[0], 'I32', f'Salu {{ op: {sop}, a: {old}, b: {bit} }}')
+        return True
+
+    def h_s_bitset0_b32(self, t, m, op):
+        return self._bitset(t, 'Bitset0')
+
+    def h_s_bitset1_b32(self, t, m, op):
+        return self._bitset(t, 'Bitset1')
 
     def h_v_swap_b32(self, t, m, op):
         # both registers in place: SwapA is the instruction (vA's new content), Permlane32SwapB names vB's
@@ -374,7 +505,7 @@ NO_DST_1250 = ('tensor_', 's_setreg', 's_wait', 's_prefetch', 's_version', 'glob
 def defs_uses(op, args):
     """isa_lift.defs_uses for the gfx1250 forms (the verbatim text and the decoded modifiers are not operands)."""
     args = args.split(' ||| ', 1)[0]
-    args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:')) and w != 'scc_live')
+    args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:', 'pwords:')) and w != 'scc_live')
     t, m = isa_lift.toks(args)
     rr = lambda tok: [(r[0], r[1] + i) for r in [isa_lift.reg(tok)] if r for i in range(r[2])]
     if op.startswith(NO_DST_1250):
@@ -383,7 +514,7 @@ def defs_uses(op, args):
             u |= set(rr(x))
         return set(), u
     d, u = _defs_uses_950(op, args)
-    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk')):
+    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk', 's_ptradd_zext')):
         u |= d
     if op.startswith('v_swap') and len(t) > 1:
         d |= set(rr(t[1]))
@@ -395,12 +526,16 @@ def entry_hw(L, live):
     """gfx1250 entry: v0 = the packed workitem ids (x [9:0], y [19:10], z [29:20]), s[0:1] = the kernarg segment, s2.. = preloaded kernarg
     dwords."""
     # (until the IR has the hardware-initialised forms: ghost definitions, no instruction)
-    L.new('v', 0, 1, 'U32', 'Raw { text: "", reads: [], ty: U32, scalar: false, dwords: 1 }')
+    L.new('v', 0, 1, 'U32', 'WorkitemIdPacked')
     L.new('s', 0, 2, 'Ptr', 'KernargSegment')
     n = int(sys.argv[sys.argv.index('--preload') + 1]) if '--preload' in sys.argv else 0
     for k in range(n):
         if ('s', 2 + k) in live:
             L.new('s', 2 + k, 1, 'I32', f'KernargPreload {{ dword: {k} }}')
+    for r in range(108, 124):
+        if ('s', r) in live:
+            # a trap temporary (hardware-initialised: workgroup / cluster ids), read in place
+            L.new('s', r, 1, 'I32', f'ReadTtmp {{ idx: {r - 108} }}')
 
 
 def main():
@@ -408,7 +543,7 @@ def main():
     isa_lift.Lifter = Lifter
     isa_lift.ENTRY_HW = entry_hw
     isa_lift.defs_uses = defs_uses
-    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
+    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'ReadTtmp': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
     # the kernel's argument layout (--args P,P,I,...: 8-byte pointers / 4-byte words in kernarg order): the code object's metadata lists every
     # argument (a launcher sizes and copies the kernarg buffer by it), also those only the preload reads
