@@ -47,7 +47,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
     Rule { id: "GV-1250-PRIV", layer: Layer::Asm, what: "privileged state is not written from a kernel" },
-    Rule { id: "GV-1250-SCHED-MODE", layer: Layer::Asm, what: "the relaxed dependency-checking mode is never entered" },
+    Rule { id: "GV-1250-SCHED-MODE", layer: Layer::Asm, what: "the full relaxed dependency-checking mode (and the reserved value) of the scheduling-mode register is never selected; the partial mode used by exact replays is accepted" },
     Rule { id: "GV-1250-SETREG-MSB", layer: Layer::Asm, what: "a mode register write is not directly followed by a VGPR MSB write" },
 ];
 
@@ -433,6 +433,29 @@ fn has_literal(ops: &str) -> bool {
     false
 }
 
+/// A write to the scheduling-mode register that can leave the full relaxed dependency-checking mode (value 1) or the reserved value (3) selected, or whose value is not a constant.
+/// The partial mode (2: the hardware stops checking two dependency classes, the program owns those waits) and the normal mode (0) are accepted: exact replays of vendor code use the partial mode.
+fn sched_mode_problem(mn: &str, ops: &str) -> Option<String> {
+    let open = ops.find('(')?;
+    let close = ops.rfind(')')?;
+    let parts: Vec<&str> = ops[open + 1..close].split(',').map(|x| x.trim()).collect();
+    let (off, size) = if parts.len() >= 3 { (parse_int(parts[1])?, parse_int(parts[2])?) } else { (0, 32) };
+    // the value operand after the closing parenthesis
+    let val = ops[close + 1..].trim_start_matches(',').trim();
+    let imm = if mn.contains("imm") { parse_int(val) } else { None };
+    let Some(imm) = imm else { return Some("a write to the scheduling-mode register whose value is not a constant".into()) };
+    let bit = |r: i64| -> Option<i64> { if r >= off && r < off + size { Some((imm >> (r - off)) & 1) } else { None } };
+    match (bit(0), bit(1)) {
+        (Some(b0), Some(b1)) => {
+            let mode = b0 | (b1 << 1);
+            if mode == 1 || mode == 3 { Some(format!("scheduling mode {mode}: the full relaxed dependency-checking mode (1) and the reserved value (3) are not allowed; the partial mode (2) is")) } else { None }
+        }
+        (Some(1), None) => Some("a write that can select scheduling mode 1 or 3".into()),
+        (None, Some(1)) => Some("a write of mode bit 1 alone: the resulting mode may be the reserved value (3)".into()),
+        _ => None,
+    }
+}
+
 const BARRIER_MNEMONICS: &[&str] = &["s_barrier_signal", "s_barrier_signal_isfirst", "s_barrier_wait", "s_barrier_join", "s_barrier_init", "s_wakeup_barrier", "s_get_barrier_state"];
 
 /// The final-instruction-stream rules (the text of a kernel as the assembler will see it).
@@ -460,7 +483,9 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
         // barrier operands
         if BARRIER_MNEMONICS.contains(&ins.mn.as_str()) && ins.mn != "s_get_barrier_state" {
             let first = ins.ops.split(',').next_back().unwrap_or("").trim();   // the barrier operand is the last one (`s_get_barrier_state sdst, id` is excluded above)
-            match parse_int(first) {
+            // a disassembler prints the 16-bit immediate of a negative id as unsigned (0xffff = -1, 0xfffd = -3)
+            let id16 = parse_int(first).map(|x| if (0x8000..=0xffff).contains(&x) { x - 0x1_0000 } else { x });
+            match id16 {
                 Some(-2) | Some(-4) => viol(&mut v, "GV-1250-TRAP-BAR", format!("line {}: `{} {}` uses a trap-handler barrier", ins.line, ins.mn, ins.ops)),
                 Some(id) if id == -1 || id == -3 || (1..=16).contains(&id) => {}
                 Some(id) => viol(&mut v, "GV-1250-BAR-ID", format!("line {}: `{} {}`: barrier id {id} is not a valid barrier", ins.line, ins.mn, ins.ops)),
@@ -498,7 +523,9 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
                 viol(&mut v, "GV-1250-PRIV", format!("line {}: `{} {}`: privileged register", ins.line, ins.mn, ins.ops));
             }
             if up.contains("SCHED_MODE") {
-                viol(&mut v, "GV-1250-SCHED-MODE", format!("line {}: `{} {}`: the relaxed dependency-checking mode", ins.line, ins.mn, ins.ops));
+                if let Some(why) = sched_mode_problem(&ins.mn, &ins.ops) {
+                    viol(&mut v, "GV-1250-SCHED-MODE", format!("line {}: `{} {}`: {why}", ins.line, ins.mn, ins.ops));
+                }
             } else if up.contains("MODE") && insts.get(k + 1).map(|n| n.mn == "s_set_vgpr_msb").unwrap_or(false) {
                 viol(&mut v, "GV-1250-SETREG-MSB", format!("line {}: a mode register write directly followed by `s_set_vgpr_msb`", ins.line));
             }

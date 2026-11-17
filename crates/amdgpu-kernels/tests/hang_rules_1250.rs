@@ -225,6 +225,17 @@ fn mut_bar_id() {
 }
 
 #[test]
+fn mut_bar_id_asm() {
+    asm_mutation(&inject("tensor_load_to_lds", &["s_barrier_wait 0x11"]), "GV-1250-BAR-ID");
+}
+
+#[test]
+fn pos_bar_id_asm() {
+    // a disassembler prints the 16-bit immediate of -1 / -3 as unsigned
+    asm_positive(&inject("tensor_load_to_lds", &["s_barrier_wait 0xffff", "s_barrier_wait 0xfffd"]));
+}
+
+#[test]
 fn pos_bar_id() {
     compile_positive(&barrier_kernel(&[(true, -1), (false, -1)], &[]));
     compile_positive(&barrier_kernel(&[(true, 2), (false, 2)], &[("named_barrier_count", 2)]));
@@ -367,12 +378,15 @@ fn pos_priv() {
 
 #[test]
 fn mut_sched_mode() {
-    asm_mutation(&inject("tensor_load_to_lds", &["s_setreg_imm32_b32 hwreg(HW_REG_SCHED_MODE, 0, 2), 1"]), "GV-1250-SCHED-MODE");
+    asm_mutation(&inject("tensor_load_to_lds", &["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 1"]), "GV-1250-SCHED-MODE");   // the full relaxed mode
+    asm_mutation(&inject("tensor_load_to_lds", &["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 3"]), "GV-1250-SCHED-MODE");   // the reserved value
+    asm_mutation(&inject("tensor_load_to_lds", &["s_setreg_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), s5"]), "GV-1250-SCHED-MODE");        // a value the verifier cannot see
 }
 
 #[test]
 fn pos_sched_mode() {
-    asm_positive(&inject("tensor_load_to_lds", &["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1", "s_nop 0"]));
+    // the normal mode, the partial mode (the program owns two dependency classes: exact replays of vendor code) and the unrelated field above the mode bits
+    asm_positive(&inject("tensor_load_to_lds", &["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 0", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1"]));
 }
 
 // GV-1250-SETREG-MSB
