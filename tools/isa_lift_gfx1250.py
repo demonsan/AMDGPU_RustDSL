@@ -103,7 +103,7 @@ def parse(path):
             op = 'v_wmma_scale_f32_32x16x128_f4'
             words += recs[i + 1]['words']
             i += 1
-        if op.startswith('v_wmma'):
+        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32')):
             mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
         elif op in BRANCHES:
             args = [f'L{r["target"]:x}'] if 'target' in r else args
@@ -269,6 +269,26 @@ class Lifter(isa_lift.Lifter):
         kind = 'TensorLoadToLds' if op.startswith('tensor_load') else 'TensorStoreFromLds'
         words = ', '.join(str(int(x, 16)) for x in raw)
         self.stmt(f'{kind} {{ g0: Val({a}), g1: Val({b}), g2: None, g3: None, cpol: TdmCpol {{ th: {th}, scope: {sc}, nv: false }}, raw: Some([{words}]) }}')
+        return True
+
+    def h_s_wait_alu(self, t, m, op):
+        # the dependency-counter wait (depctr fields; the SOPP immediate)
+        w = next(x[6:].split('/') for x in m if x.startswith('words:'))
+        self.stmt(f'WaitAlu {{ imm: {int(w[0], 16) & 0xffff} }}')
+        return True
+
+    def h_s_setreg_imm32_b32(self, t, m, op):
+        # the scheduling mode (WAVE_SCHED_MODE bits [1:0]) is a statement the exact checker models; other fields stay verbatim
+        if 'HW_REG_WAVE_SCHED_MODE' in t[0] and t[0].replace(' ', '').endswith(',0,2)'):
+            w = next(x[6:].split('/') for x in m if x.startswith('words:'))
+            self.stmt(f'SetSchedMode {{ mode: {int(w[1], 16)} }}')
+            return True
+        return False
+
+    def h_ds_write_b128(self, t, m, op):
+        # ds_store_b128 vaddr, vdata[4] offset:N
+        addr = self.lds_addr(['', t[0]], m)
+        self.stmt(f'StoreLdsB128 {{ addr: {addr}, value: {self.src(t[1])} }}')
         return True
 
     h_tensor_load_to_lds = _tdm

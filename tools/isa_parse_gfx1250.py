@@ -132,7 +132,87 @@ def parse(text):
         out.append(dict(addr=r['addr'], words=r['words'], op=r['op'], args=args, enc_args=enc, mods=mods, cls=classify(r['op']),
                         text=(r['op'] + ' ' + re.sub(r'\s*/\*.*?\*/', '', r['rest'])).strip(), raw=False))
         i += 1
+    fix_msb(out)
     return out
+
+
+VREG = re.compile(r'^v(\d+)$|^v\[(\d+):(\d+)\]$')
+
+
+def _vbase(tok):
+    m = VREG.match(tok)
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1) else int(m.group(2))
+
+
+def _targets(out):
+    """Branch-target addresses (s_branch / s_cbranch_*: SOPP simm16 in words, from the next instruction)."""
+    tg = set()
+    for r in out:
+        if r['op'].startswith(('s_branch', 's_cbranch')):
+            k = r['words'][0] & 0xffff
+            k = k - 0x10000 if k >= 0x8000 else k
+            tg.add(r['addr'] + 4 + 4 * k)
+    return tg
+
+
+def fix_msb(out):
+    """objdump tracks `s_set_vgpr_msb` in layout order but forgets it at a branch target: from a label to the next s_set_vgpr_msb it
+    prints the ENCODED registers only. Rebuild their physical registers: the MSB state in layout order, and for each (mnemonic, operand
+    position) the MSB field it uses, learned from the instructions objdump printed while it knew the state (bank 0 included). An operand
+    always in bank 0, also under states where no field is 0, ignores the MSB (the WMMA scale operands). Returns the number fixed."""
+    tg = _targets(out)
+    cand, zero = {}, {}
+    s, tracked = 0, True
+    for r in out:
+        if r['addr'] in tg:
+            tracked = False
+        if r['op'] == 's_set_vgpr_msb':
+            s, tracked = r['words'][0] & 0xff, True
+            continue
+        if not tracked or r.get('raw') or 'enc_args' not in r:
+            continue
+        for k, (a, e) in enumerate(zip(r['args'], r['enc_args'])):
+            pa, pe = _vbase(a), _vbase(e)
+            if pa is None or pe is None:
+                continue
+            bank = (pa - pe) // 256
+            key = (r['op'], k)
+            cand[key] = cand.get(key, {0, 1, 2, 3}) & {f for f in range(4) if (s >> (2 * f)) & 3 == bank}
+            zero[key] = zero.get(key, True) and bank == 0
+    s, tracked, fixed = 0, True, 0
+    for r in out:
+        if r['addr'] in tg:
+            tracked = False
+        if r['op'] == 's_set_vgpr_msb':
+            s, tracked = r['words'][0] & 0xff, True
+            continue
+        if tracked or s == 0 or r.get('raw') or 'enc_args' not in r:
+            continue
+        new = list(r['args'])
+        for k, e in enumerate(r['enc_args']):
+            pe = _vbase(e)
+            if pe is None:
+                continue
+            key = (r['op'], k)
+            fs = cand.get(key)
+            if not fs and zero.get(key):
+                continue
+            if not fs:
+                raise SystemExit(f"{r['addr']:#x} {r['op']}: operand {k} under MSB state {s:#x}: no instance to learn its MSB field")
+            banks = {(s >> (2 * f)) & 3 for f in fs}
+            if len(banks) != 1:
+                raise SystemExit(f"{r['addr']:#x} {r['op']}: operand {k}: MSB field ambiguous ({sorted(fs)}) under state {s:#x}")
+            bank = banks.pop()
+            if bank:
+                m = VREG.match(e)
+                new[k] = f'v{pe + 256 * bank}' if m.group(1) else f'v[{pe + 256 * bank}:{int(m.group(3)) + 256 * bank}]'
+        if new != r['args']:
+            r['args'] = new
+            r['msb_fixed'] = True
+            fixed += 1
+    return fixed
 
 
 def selftest():
