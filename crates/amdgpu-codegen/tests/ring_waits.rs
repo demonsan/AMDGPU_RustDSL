@@ -117,3 +117,28 @@ fn a_loop_back_edge_ages_the_tokens() {
     assert_eq!(m.blocks[1].insts[0].op, MOp::SWaitVm, "{:?}", m.blocks[1].insts.iter().map(|i| i.op).collect::<Vec<_>>());
     waits::with_ring_model(model, || waits::verify_waits(&m)).unwrap();
 }
+
+/// gfx1250: a tensor load as the ring producer (TENSORcnt): the read of its slot waits with `s_wait_tensorcnt`, never with vmcnt, and an
+/// unrelated vmcnt wait does not count as its completion.
+fn tdm() -> MInst {
+    tagged(MInst::new(MOp::TensorLoadToLds).srcreg(2).srcreg(2), 0)
+}
+
+#[test]
+fn tensor_raw_waits_on_tensorcnt_only() {
+    let model = RingModel::of(&plan(2, 2));
+    let mut m = mf(vec![tdm(), read()]);
+    assert!(waits::with_ring_model(model.clone(), || waits::verify_waits(&m)).is_err(), "a read of a slot whose tensor load is in flight");
+    let n = waits::with_ring_model(model.clone(), || waits::insert_waits(&mut m));
+    assert_eq!(n, 1);
+    assert_eq!(ops(&m), vec![MOp::TensorLoadToLds, MOp::SWaitTensor, MOp::LdsReadB32]);
+    waits::with_ring_model(model.clone(), || waits::verify_waits(&m)).expect("verifies");
+    // an unrelated vmcnt(0) does not complete a tensor operation
+    let mut m2 = mf(vec![tdm(), MInst::new(MOp::SWaitVm).imm(0), read()]);
+    assert!(waits::with_ring_model(model.clone(), || waits::verify_waits(&m2)).is_err());
+    waits::with_ring_model(model.clone(), || waits::insert_waits(&mut m2));
+    assert!(ops(&m2).contains(&MOp::SWaitTensor), "{:?}", ops(&m2));
+    // an explicit tensor wait completes it
+    let m3 = mf(vec![tdm(), MInst::new(MOp::SWaitTensor).imm(0), read()]);
+    waits::with_ring_model(model, || waits::verify_waits(&m3)).expect("the author's tensor wait covers the read");
+}

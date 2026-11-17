@@ -310,10 +310,38 @@ static int run_named(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_wide: 320 values per lane (one wave), all live at once (more than 256 VGPRs: the MSB window), summed in reverse order.
+static int run_wide(Kernel& k, const char* kn) {
+    const int N = 320;
+    std::vector<float> src(N * 32);
+    for (int i = 0; i < N * 32; ++i) src[i] = (float)((i * 7919) % 1000) * 0.125f - 60.f;
+    float* dsrc;
+    float* dout;
+    HC(hipMalloc(&dsrc, src.size() * 4));
+    HC(hipMalloc(&dout, 32 * 4));
+    HC(hipMemcpy(dsrc, src.data(), src.size() * 4, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0xee, 32 * 4));
+    std::vector<uint8_t> args(16, 0);
+    put64(args, 0, dsrc);
+    put64(args, 8, dout);
+    k.launch(1, 32, args, kn);
+    std::vector<float> o(32);
+    HC(hipMemcpy(o.data(), dout, 32 * 4, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int l = 0; l < 32; ++l) {
+        float acc = src[(N - 1) * 32 + l];
+        for (int kk = N - 2; kk >= 0; --kk) acc = acc + src[kk * 32 + l];
+        bad += o[l] != acc;
+    }
+    printf("wide: %d live values per lane: out[0]=%g bad=%ld %s\n", N, o[0], bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"values\":%d},\"bad\":%ld,\"ok\":%s}\n", kn, N, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : mode == "named" ? "probe_g1250_named" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : mode == "named" ? "probe_g1250_named" : mode == "wide" ? "probe_g1250_wide" : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -331,6 +359,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm2d") return run_tdm2d(k, kn);
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
+    if (mode == "wide") return run_wide(k, kn);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
