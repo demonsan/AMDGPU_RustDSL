@@ -5,5 +5,6 @@ pub mod body;
 pub mod formats;
 pub mod mma;
 pub mod tdm;
+pub mod tdm_f4;
 
 pub use formats::{Elem, Scales};

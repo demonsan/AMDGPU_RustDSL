@@ -376,3 +376,112 @@ pub fn gemm_tdm_stage_fp8() -> Function {
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
     f
 }
+
+/// The MXFP4 kernel name.
+pub const F4_NAME: &str = "gemm_g1250_tdm_stage_f4";
+
+/// MXFP4 GEMM on the TDM stage template (`amdgpu_stage::gemm::tdm_f4::TdmF4Body`): C[M][N] f32 = A[M][K] x B[N][K]^T, fp4 e2m1 operands (two per byte, low nibble first) with E8M0 scales
+/// per 32 K (`sa` [M][K / 32] bytes, `sb` [N][K / 32] bytes), `v_wmma_scale_f32_32x16x128_f4`. A 128 x 64 C tile per workgroup (4 waves 2 x 2, each wave 2 x 2 WMMAs of 32 x 16), K tiles of
+/// 128, the 3-slot ring of the OneWindow cadence. Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40 (K elements, a multiple of 128), n @44. Grid (N / 64, M / 128).
+pub fn gemm_tdm_stage_f4() -> Function {
+    use amdgpu_dsl::ev;
+    use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
+    use amdgpu_stage::{Cadence, Pipeline};
+    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::shared::{Layout, LdsPlan};
+    let sh = F4Shape { wm: 2, wn: 2, tm: 2, tn: 2 };
+    let (bm, bn) = (sh.bm(), sh.bn());
+    let mut b = FnBuilder::new(F4_NAME, (sh.waves() * 32) as u32);
+    for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
+        b.arg(n, DType::Ptr, 8 * i as u32, 8);
+    }
+    b.arg("k", DType::I32, 40, 4);
+    b.arg("n", DType::I32, 44, 4);
+    b.arg_tensor("c", Ext::c(1 << 28));
+    b.ka_range(40, 128, 1 << 20);
+    let mut lds = LdsPlan::new();
+    let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64) as i64, Layout::Linear), ("B", (bn * 64) as i64, Layout::Linear), ("SA", (bm * 4) as i64, Layout::Linear), ("SB", (bn * 4) as i64, Layout::Linear)]);
+    lds.commit(&mut b);
+    let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
+    let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
+    let kk = b.let_(Op::KernargI32 { offset: 40 });
+    let nn = b.let_(Op::KernargI32 { offset: 44 });
+    let tid = b.let_(Op::WorkitemId);
+    let wgx = b.let_(Op::WorkgroupIdX);
+    let wgy = b.let_(Op::WorkgroupIdY);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
+    let w = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let wi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(1)));
+    let wj = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1)));
+    let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
+    let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
+    let row0 = b.mul_i32(wgy, Opnd::I32(bm));
+    let col0 = b.mul_i32(wgx, Opnd::I32(bn));
+    // bytes per row: fp4 K / 2, scales K / 32
+    let kb = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(1)));
+    let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
+    let a_org = b.mul_i32(row0, kb);
+    let b_org = b.mul_i32(col0, kb);
+    let sa_org = b.mul_i32(row0, ks);
+    let sb_org = b.mul_i32(col0, ks);
+    // per-lane LDS offsets inside a slot: the wave's first row of A / B + the lane's row m, 16 h bytes into the 64-byte row; scale rows
+    let h16 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(4)));
+    let a_row = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
+    let a_row_m = b.add_i32(a_row, m);
+    let abase = b.let_(Op::ShlI32(Opnd::Val(a_row_m), Opnd::I32(6)));
+    let abase = b.add_i32(abase, h16);
+    let b_row = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
+    let b_row_m = b.add_i32(b_row, m);
+    let bbase = b.let_(Op::ShlI32(Opnd::Val(b_row_m), Opnd::I32(6)));
+    let bbase = b.add_i32(bbase, h16);
+    let a_row_l = b.add_i32(a_row, lane);
+    let sabase = b.let_(Op::ShlI32(Opnd::Val(a_row_l), Opnd::I32(2)));
+    let sbbase = b.let_(Op::ShlI32(Opnd::Val(b_row_m), Opnd::I32(2)));
+    // descriptor group 1 of the four tensors: [rows][K / 2] bytes (tile 64 bytes x rows), scales [rows][K / 128] dwords (tile 1 dword x rows)
+    let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16| -> ValueId {
+        let tile = TensorTile { data_size: esz, tensor_dim: [dim0, Opnd::I32(rows)], stride0: stride, tile: [t0, rows as u16], pad: None, wg_mask: 0 };
+        let z = b.add_i32(org, Opnd::I32(0));
+        b.tensor_desc_2d(&tile, Opnd::Val(base), Opnd::Val(z), Opnd::I32(0)).1
+    };
+    let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64), bm, Opnd::Val(kb), 64);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64), bn, Opnd::Val(kb), 64);
+    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(1), bm, Opnd::Val(k128), 1);
+    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(1), bn, Opnd::Val(k128), 1);
+    let nkv = b.bind_i32(ev(kk).lshr(7));
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128), "nkv = K / 128 >= 1 (a K that is a multiple of 128)");
+    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128, Ext::ka(40).ceil_div(128));
+    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, acc: Vec::new() };
+    pipe.run(&mut b, Role::All, &mut body);
+
+    // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
+    let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
+    let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+    for i in 0..sh.tm {
+        for j in 0..sh.tn {
+            let acc = body.acc[(i * sh.tn + j) as usize];
+            // first row of the block (the lane's row group) and the lane's column
+            let r0 = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
+            let r0 = b.add_i32(r0, row0);
+            let r0 = b.add_i32(r0, Opnd::I32(i * 32));
+            let r0 = b.add_i32(r0, g8);
+            let c0 = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
+            let c0 = b.add_i32(c0, col0);
+            let c0 = b.add_i32(c0, Opnd::I32(j * 16));
+            let c0 = b.add_i32(c0, m);
+            let lin = b.mul_i32(r0, nn);
+            let lin = b.add_i32(lin, c0);
+            let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+            for v in 0..16i32 {
+                let rowv = (v % 8) + 16 * (v / 8);
+                let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
+                let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                b.store_global(q, 0, x, MemTy::B32, false);
+            }
+        }
+    }
+    let mut f = b.finish();
+    f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
+    f
+}
