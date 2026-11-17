@@ -476,6 +476,51 @@ fn mut_bar_count() {
     ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
 }
 
+/// The replica's shape: a switch on the wave id; wave 0 (and 2) run loop A, whose leader arm signals and which waits once per pass; waves 1 and 3 run loop B, which only waits. `fact`: the named
+/// launch fact that the two loops iterate alike.
+fn two_loop_kernel(fact: bool) -> Function {
+    wave_kernel(|b, w| {
+        if fact {
+            b.barrier_wait_trips_match(-3);
+        }
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let odd = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1)));
+        let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, odd, Opnd::I32(0)));
+        b.begin_if(c);
+        // loop A: the leader arm signals, everyone waits
+        let va = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let c0 = wave_is(b, w, 0);
+        leader_barrier(b, c0);
+        let ca = b.cmp(CmpPred::Gt, CmpTy::I32, va[0], n);
+        b.break_if(ca);
+        b.end_loop();
+        b.else_();
+        // loop B: only waits
+        let vb = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        b.barrier_wait(-3);
+        let cb = b.cmp(CmpPred::Gt, CmpTy::I32, vb[0], n);
+        b.break_if(cb);
+        b.end_loop();
+        b.end_if();
+    })
+}
+
+#[test]
+fn mut_bar_count_trips() {
+    // waits in a loop no signal sits in: without the named fact the trip counts are not provable
+    ir_mutation(&two_loop_kernel(false), "GV-1250-BAR-COUNT");
+}
+
+#[test]
+fn pos_bar_count_trips() {
+    // the same kernel with the launch fact: accepted, and listed as a trusted item
+    let f = two_loop_kernel(true);
+    let v = verify_ir(&f);
+    assert!(!has(&v, "GV-1250-BAR-COUNT"), "{v:?}");
+    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
+    assert!(t.iter().any(|x| x.contains("iterate the same number of times")), "{t:?}");
+}
+
 #[test]
 fn pos_bar_count() {
     // the leader arm: exactly one wave per work-group signals (proved from the wave id)

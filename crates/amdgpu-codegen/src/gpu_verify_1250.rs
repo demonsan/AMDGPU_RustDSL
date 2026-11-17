@@ -1019,6 +1019,8 @@ struct AltResult {
     /// not provable: a path depends on a wave-divergent condition the verifier cannot evaluate (the named launch fact is then required)
     unknown: Option<String>,
     violations: Vec<String>,
+    /// the waves that do not signal wait in loops the signalling wave's path does not contain: the proof needs the trip counts to agree, which is a named launch fact
+    needs_trip_fact: Option<String>,
 }
 
 /// The control-flow successors of statement `i` for wave `w`: a condition the verifier can evaluate for the wave is decided; a wave-UNIFORM one it cannot evaluate takes both sides (every wave
@@ -1121,6 +1123,47 @@ fn alternation(f: &Function) -> AltResult {
             return res;
         }
     }
+    // every wave waits the same number of times as the signalling wave per phase: outside loops by counting, inside loops only when the waves share the loop (a wave-uniform exit: the same trips);
+    // waits in different loops need the trip counts to agree, which the verifier cannot compare
+    {
+        let mut region: Vec<usize> = Vec::with_capacity(stmts.len());
+        let mut regions: Vec<usize> = vec![usize::MAX];
+        for (i, st) in stmts.iter().enumerate() {
+            match st {
+                Stmt::BeginLoop { .. } => regions.push(i),
+                Stmt::EndLoop => {
+                    regions.pop();
+                }
+                _ => {}
+            }
+            region.push(*regions.last().unwrap());
+        }
+        let lw = leaders[0] as usize;
+        let per = |w: usize| -> (usize, std::collections::BTreeSet<usize>) {
+            let mut top = 0usize;
+            let mut loops = std::collections::BTreeSet::new();
+            for &i in &wts {
+                if reach[w][i] {
+                    if region[i] == usize::MAX {
+                        top += 1;
+                    } else {
+                        loops.insert(region[i]);
+                    }
+                }
+            }
+            (top, loops)
+        };
+        let (ltop, lloops) = per(lw);
+        for w in 0..nw as usize {
+            let (top, loops) = per(w);
+            if top != ltop {
+                res.violations.push(format!("wave {w} reaches {top} wait(s) on the cluster barrier (-3) outside loops, the signalling wave {lw} reaches {ltop}: a wave that waits more often than the barrier completes never gets out"));
+            }
+            if loops != lloops && res.needs_trip_fact.is_none() {
+                res.needs_trip_fact = Some(format!("wave {w} waits on the cluster barrier in the loops at statements {:?}, the signalling wave {lw} in {:?}: the loops must iterate the same number of times", loops, lloops));
+            }
+        }
+    }
     // the leader's alternation
     let w = leaders[0];
     let mut state: Vec<u8> = vec![0; stmts.len() + 1];   // bit k: "k signals since the last wait" reachable at the entry of the statement (k = 2: two or more)
@@ -1166,6 +1209,11 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
     for m in r.violations {
         viol(v, "GV-1250-BAR-COUNT", m);
     }
+    if let Some(why) = r.needs_trip_fact {
+        if kd_val(f, "g5:wait_trips_match:-3") == 0 {
+            viol(v, "GV-1250-BAR-COUNT", format!("{why}: the verifier cannot compare the trip counts; declare the launch fact with `barrier_wait_trips_match(-3)` (a trusted item) or put the waits in one loop"));
+        }
+    }
     if let Some(why) = r.unknown {
         match signal_count_fact(f, -3) {
             None => viol(v, "GV-1250-BAR-COUNT", format!("cannot prove the cluster barrier's signal count ({why}): declare the launch fact with `barrier_signal_count(-3, per_wg)` (a trusted item), or restructure so the verifier can count")),
@@ -1180,6 +1228,9 @@ pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
     if declared_lds(f) > 65536 && kd_val(f, "g5:lds_above_64k") != 0 {
         v.push(format!("LDS above 64 KiB ({} bytes declared): launch fact g5:lds_above_64k (hardware evidence cited by the kernel, not proved)", declared_lds(f)));
+    }
+    if alternation(f).needs_trip_fact.is_some() && kd_val(f, "g5:wait_trips_match:-3") != 0 {
+        v.push("barrier -3: the loops the waves wait in iterate the same number of times (declared launch fact g5:wait_trips_match:-3, not proved)".to_string());
     }
     if alternation(f).unknown.is_some() {
         if let Some(k) = signal_count_fact(f, -3) {
