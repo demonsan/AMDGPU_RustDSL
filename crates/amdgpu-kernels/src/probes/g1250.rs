@@ -33,7 +33,7 @@ pub fn probe_g1250_add() -> Function {
     b.finish()
 }
 
-/// Transcendentals and scalar arithmetic: `out[tid] = exp2(x) * rcp(y) + sqrt(z)` from three kernarg floats, 64 work-items.
+/// Transcendentals and scalar arithmetic: `out[tid] = exp2(x) * rsq(y) + sqrt(z)` from three kernarg floats, 64 work-items.
 pub fn probe_g1250_math() -> Function {
     let mut b = FnBuilder::new("probe_g1250_math", 64);
     b.arg("out", DType::Ptr, 0, 8);
@@ -47,7 +47,7 @@ pub fn probe_g1250_math() -> Function {
     let z = b.let_(Op::KernargF32 { offset: 16 });
     let tid = b.let_(Op::WorkitemId);
     let e = b.exp2_f32(x);
-    let r = b.un(amdgpu_dsl::UnOp::RcpF32, y);
+    let r = b.un(amdgpu_dsl::UnOp::RsqF32, y);
     let q = b.un(amdgpu_dsl::UnOp::SqrtF32, z);
     let t = b.mul_f32(e, r);
     let v = b.add_f32(t, q);
