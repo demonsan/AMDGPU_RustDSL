@@ -26,6 +26,25 @@ fn a_raw_text(k: i64) -> Result<String, String> {
 
 /// The gfx1250 assembly of an allocated function.
 pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
+    emit_kd(m, a, &[])
+}
+
+/// The kernel-descriptor directives an exact kernel may set (`Function::kd`).
+pub const KD_DIRECTIVES: &[&str] = &[
+    "user_sgpr_kernarg_preload_length", "user_sgpr_kernarg_preload_offset", "inst_pref_size", "system_vgpr_workitem_id",
+    "system_sgpr_workgroup_id_x", "system_sgpr_workgroup_id_y", "system_sgpr_workgroup_id_z", "next_free_vgpr", "next_free_sgpr",
+    "memory_ordered", "forward_progress", "float_denorm_mode_32", "float_denorm_mode_16_64", "named_barrier_count", "round_robin_scheduling",
+    "fp16_overflow", "group_segment_fixed_size", "kernarg_size",
+];
+
+/// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
+pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String, String> {
+    for (k, _) in kd {
+        if !KD_DIRECTIVES.contains(&k.as_str()) {
+            return Err(format!("{}: kernel-descriptor directive `{k}` is not settable (known: {})", m.name, KD_DIRECTIVES.join(", ")));
+        }
+    }
+    let kdv = |k: &str| kd.iter().rev().find(|x| x.0 == k).map(|x| x.1);
     let t = &amdgpu_target::gfx1250::GFX1250;
     RAW_TEXTS.with(|r| *r.borrow_mut() = m.reg_hints.raw_texts.clone());
     if crate::regalloc::agpr_count(m, a) > 0 {
@@ -42,11 +61,14 @@ pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
     // the kernel prologue the gfx1250 assembler requires (s_mov_b64 / v_nop / global_prefetch_b8 first) and LLVM emits for every kernel, in
-    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only)
-    out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
-    out.push_str("    s_mov_b64 s[6:7], 0\n");
-    out.push_str("    v_nop\n");
-    out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only). Exact mode: the author's
+    // instructions are the prologue (none added).
+    if !m.exact {
+        out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
+        out.push_str("    s_mov_b64 s[6:7], 0\n");
+        out.push_str("    v_nop\n");
+        out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+    }
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
@@ -80,27 +102,39 @@ pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     }
     out.push_str(&format!(".size {}, .-{}\n", m.name, m.name));
 
-    let vgpr = round_up(a.max_v.max(1), t.emit.vgpr_granule);
-    let sgpr = a.max_s.max(1);
+    let vgpr = kdv("next_free_vgpr").map(|v| v as u32).unwrap_or_else(|| round_up(a.max_v.max(1), t.emit.vgpr_granule));
+    let sgpr = kdv("next_free_sgpr").map(|v| v as u32).unwrap_or(a.max_s.max(1));
+    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(0);
+    let d = |k: &str, dflt: i64| kdv(k).unwrap_or(dflt);
     out.push_str("\n.p2align 6\n");
     out.push_str(&format!(".amdhsa_kernel {}\n", m.name));
-    out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", m.lds_bytes));
+    out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", d("group_segment_fixed_size", m.lds_bytes as i64)));
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
-    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", round_up(m.kernarg_size, 8)));
-    // the kernarg segment pointer in s[0:1]; the workgroup ids are architected (TTMP9 / TTMP7), the workitem ids packed in v0
-    out.push_str("    .amdhsa_user_sgpr_count 2\n");
+    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", d("kernarg_size", round_up(m.kernarg_size, 8) as i64)));
+    // the kernarg segment pointer in s[0:1] (then the preloaded kernarg dwords); the workgroup ids are architected (TTMP9 / TTMP7), the
+    // workitem ids packed in v0
+    out.push_str(&format!("    .amdhsa_user_sgpr_count {}\n", 2 + preload));
     out.push_str("    .amdhsa_user_sgpr_kernarg_segment_ptr 1\n");
+    if preload > 0 {
+        out.push_str(&format!("    .amdhsa_user_sgpr_kernarg_preload_length {preload}\n"));
+        out.push_str(&format!("    .amdhsa_user_sgpr_kernarg_preload_offset {}\n", d("user_sgpr_kernarg_preload_offset", 0)));
+    }
     out.push_str("    .amdhsa_wavefront_size32 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_x 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_y 1\n");
-    out.push_str("    .amdhsa_system_sgpr_workgroup_id_z 1\n");
-    out.push_str("    .amdhsa_system_vgpr_workitem_id 2\n");
+    for k in ["x", "y", "z"] {
+        out.push_str(&format!("    .amdhsa_system_sgpr_workgroup_id_{k} {}\n", d(&format!("system_sgpr_workgroup_id_{k}"), 1)));
+    }
+    out.push_str(&format!("    .amdhsa_system_vgpr_workitem_id {}\n", d("system_vgpr_workitem_id", 2)));
     out.push_str(&format!("    .amdhsa_next_free_vgpr {vgpr}\n"));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {sgpr}\n"));
-    out.push_str("    .amdhsa_named_barrier_count 0\n");
+    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", 0)));
     let (d32, d64, _ieee) = m.fp_mode.unwrap_or((3, 3, false));
-    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {d32}\n"));
-    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {d64}\n"));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {}\n", d("float_denorm_mode_32", d32 as i64)));
+    out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {}\n", d("float_denorm_mode_16_64", d64 as i64)));
+    for k in ["inst_pref_size", "memory_ordered", "forward_progress", "round_robin_scheduling", "fp16_overflow"] {
+        if let Some(v) = kdv(k) {
+            out.push_str(&format!("    .amdhsa_{k} {v}\n"));
+        }
+    }
     out.push_str(".end_amdhsa_kernel\n");
 
     out.push_str("\n.amdgpu_metadata\n---\namdhsa.kernels:\n");
@@ -140,13 +174,14 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
     let lines = match inst.op {
         // the ABI registers: s[0:1] the kernarg segment pointer (user SGPRs); the workgroup ids are architected: x = TTMP9, y = TTMP7[15:0],
         // z = TTMP7[31:16] (no workgroup clusters in G1)
-        MOp::SReadPhys => match inst.imm {
-            0 | 1 => vec![format!("s_mov_b32 {}, s{}", d_s(), inst.imm)],
-            2 => vec![format!("s_mov_b32 {}, ttmp9", d_s())],
-            3 => vec![format!("s_and_b32 {}, ttmp7, 0xffff", d_s())],
-            4 => vec![format!("s_lshr_b32 {}, ttmp7, 16", d_s())],
-            k => return Err(format!("s{k} is not an ABI register on gfx1250")),
-        },
+        // (the workgroup ids lower to SReadTtmp on gfx1250; s2.. hold the preloaded kernarg dwords: `Op::KernargPreload`)
+        MOp::SReadPhys => {
+            if inst.dst.map(|r| a.phys[r as usize] as i64) == Some(inst.imm) {
+                vec![]
+            } else {
+                vec![format!("s_mov_b32 {}, s{}", d_s(), inst.imm)]
+            }
+        }
         // the workitem ids are packed in v0 (x = v0[9:0])
         MOp::VReadPhys => match inst.imm {
             0 => vec![format!("v_and_b32_e32 {}, 0x3ff, v0", d_v())],

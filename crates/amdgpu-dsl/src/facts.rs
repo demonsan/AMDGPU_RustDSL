@@ -162,6 +162,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::ReadTtmp { .. } => ResClass::Salu,
         Op::Raw { scalar: true, .. } => ResClass::Salu,
         Op::Raw { .. } => ResClass::Valu,
+        Op::KernargPreload { .. } => ResClass::Marker,
         Op::LoadScalar { .. } => ResClass::Salu,
         Op::MemTimeLo { .. } => {
             e.directive = true;

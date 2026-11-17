@@ -44,6 +44,19 @@ pub fn current() -> &'static Dialect {
 pub const START_PASS_PREFERENCE: &[&str] = &["gcn-create-vopd", "si-memory-legalizer"];
 pub const LLC_ARGS: &[&str] = crate::target::T.llvm.llc_args;
 
+/// The gfx1250 rows that replace llvm24.tbl rows of the same key (target/gfx1250/llvm/gfx1250.tbl) and the gfx1250 MIR header.
+pub const GFX1250_ROWS: &str = include_str!("../target/gfx1250/llvm/gfx1250.tbl");
+pub const GFX1250_HEADER: &str = include_str!("../target/gfx1250/llvm/gfx1250_header.txt");
+
+/// The MIR header template of the compilation's target.
+pub fn header_src() -> &'static str {
+    if crate::target::cur().name == "gfx1250" {
+        GFX1250_HEADER
+    } else {
+        current().header_src
+    }
+}
+
 /// Operand class named in a table signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigClass {
@@ -120,7 +133,13 @@ impl Table {
     }
 
     pub fn load() -> Table {
-        Table::parse(current().table_src).expect("llvm20.tbl is malformed")
+        let mut t = Table::parse(current().table_src).expect("llvm20.tbl is malformed");
+        if crate::target::cur().name == "gfx1250" {
+            // the gfx1250 rows replace the rows of the same key
+            let o = Table::parse(GFX1250_ROWS).expect("gfx1250.tbl is malformed");
+            t.rows.extend(o.rows);
+        }
+        t
     }
 
     /// Most specific row for an instruction: `Op:kinds` then `Op`.
@@ -250,6 +269,7 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "opselB" => format!("{}", 4 * ((inst.imm >> 4) & 3)),
         "pv" => format!("$vgpr{}", inst.imm),
         "ps" => format!("$sgpr{}", inst.imm),
+        "pt" => format!("$ttmp{}", inst.imm),
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
         "lgkmcnt" => format!("{}", waitcnt_imm(None, Some(inst.imm as u32))),
         "t" => cx.target.clone().ok_or("{t} outside a terminator")?,

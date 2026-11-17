@@ -19,10 +19,13 @@ const SGPR_BASE: Slot = 10_000;
 const AGPR_BASE: Slot = 30_000;
 const VCC: Slot = 20_000;
 const SCC: Slot = 20_001;
+const TTMP_BASE: Slot = 40_000;
 
 fn slot_name(s: Slot) -> String {
     match s {
+        VCC if crate::target::cur().name == "gfx1250" => "$vcc_lo".to_string(),
         VCC => "$vcc".to_string(),
+        s if s >= TTMP_BASE => format!("$ttmp{}", s - TTMP_BASE),
         SCC => "$scc".to_string(),
         s if s >= AGPR_BASE => format!("$agpr{}", s - AGPR_BASE),
         s if s >= SGPR_BASE => format!("$sgpr{}", s - SGPR_BASE),
@@ -48,6 +51,10 @@ fn slots_of(name: &str) -> Vec<Slot> {
         } else if let Some(n) = part.strip_prefix("sgpr") {
             if let Ok(n) = n.parse::<u32>() {
                 out.push(SGPR_BASE + n);
+            }
+        } else if let Some(n) = part.strip_prefix("ttmp") {
+            if let Ok(n) = n.parse::<u32>() {
+                out.push(TTMP_BASE + n);
             }
         } else if let Some(n) = part.strip_prefix("agpr") {
             if let Ok(n) = n.parse::<u32>() {
@@ -272,7 +279,7 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
     // 3. Header from the per-version template.
     let (irargs, kernarg) = kernarg_ir(m)?;
     let kernarg = ((kernarg + 7) / 8) * 8;
-    let mut mir = llvm20::current().header_src
+    let mut mir = llvm20::header_src()
         .replace("@NAME@", &m.name)
         .replace("@IRARGS@", &irargs.join(", "))
         .replace("@FLATWG@", &m.workgroup_size.to_string())

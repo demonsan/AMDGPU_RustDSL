@@ -156,8 +156,8 @@ class Lifter(isa_lift.Lifter):
         ty = 'U32' if n == 1 else isa_lift.FRAG.get(n, 'Frag16')
         if f == 's' and n not in (1,):
             ty = {2: 'Ptr', 4: 'Rsrc'}.get(n, ty)
-        self.notes[f'live-in {f} register(s) as Undef'] += 1
-        return self.new(f, base, n, ty, f'Undef {{ ty: {ty} }}', shell=True)
+        self.notes[f'live-in {f} register(s): ghost definition'] += 1
+        return self.new(f, base, n, ty, f'Raw {{ text: "", reads: [], ty: {ty}, scalar: {"true" if f == "s" else "false"}, dwords: {n} }}', shell=True)
 
     # instructions without a register destination (the first operand is a source), and those that read their destination too
     NO_DST = ('s_cmp', 's_bitcmp', 's_setreg', 's_wait', 's_prefetch', 's_version', 'global_prefetch', 's_code_end', 's_nop', 'v_nop',
@@ -298,7 +298,7 @@ def entry_hw(L, live):
     n = int(sys.argv[sys.argv.index('--preload') + 1]) if '--preload' in sys.argv else 0
     for k in range(n):
         if ('s', 2 + k) in live:
-            L.new('s', 2 + k, 1, 'U32', 'Raw { text: "", reads: [], ty: U32, scalar: true, dwords: 1 }')
+            L.new('s', 2 + k, 1, 'I32', f'KernargPreload {{ dword: {k} }}')
 
 
 def main():

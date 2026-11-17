@@ -210,6 +210,7 @@ impl FromIr for Op {
             "RsrcCat" => { v.expect_struct("RsrcCat")?; Ok(Op::RsrcCat { words: FromIr::from_ir(v.field("words")?)? }) }
             "SgprCat8" => { v.expect_struct("SgprCat8")?; Ok(Op::SgprCat8 { words: FromIr::from_ir(v.field("words")?)? }) }
             "ReadTtmp" => { v.expect_struct("ReadTtmp")?; Ok(Op::ReadTtmp { idx: FromIr::from_ir(v.field("idx")?)? }) }
+            "KernargPreload" => { v.expect_struct("KernargPreload")?; Ok(Op::KernargPreload { dword: FromIr::from_ir(v.field("dword")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
         }
     }
@@ -348,6 +349,7 @@ impl IrIds for Op {
             Op::RsrcCat { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Op::SgprCat8 { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Op::ReadTtmp { idx } => { IrIds::ids(&mut (*idx), fv, fr); }
+            Op::KernargPreload { dword } => { IrIds::ids(&mut (*dword), fv, fr); }
         }
     }
 }

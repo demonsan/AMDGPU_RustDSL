@@ -798,6 +798,9 @@ pub enum Op {
     SgprCat8 { words: [Opnd; 8] },
     /// gfx1250: the trap temporary register `ttmp<idx>` (the architected workgroup / cluster ids: TTMP6 / 7 / 9).
     ReadTtmp { idx: u8 },
+    /// gfx1250: kernarg dword `dword` preloaded by the hardware in SGPR s(2 + dword) (`Function::kd`
+    /// `user_sgpr_kernarg_preload_length` > dword); no instruction when the value stays in that SGPR (exact mode pins it there).
+    KernargPreload { dword: u8 },
 }
 
 impl Op {
@@ -898,7 +901,7 @@ impl Op {
             Op::PtrCat { .. } => DType::Ptr,
             Op::RsrcCat { .. } => DType::Rsrc,
             Op::SgprCat8 { .. } => DType::Sgpr8,
-            Op::ReadTtmp { .. } => DType::I32,
+            Op::ReadTtmp { .. } | Op::KernargPreload { .. } => DType::I32,
         }
     }
 
@@ -987,7 +990,7 @@ impl Op {
             Op::PtrCat { lo, hi } => vec![*lo, *hi],
             Op::RsrcCat { words } => words.to_vec(),
             Op::SgprCat8 { words } => words.to_vec(),
-            Op::ReadTtmp { .. } => vec![],
+            Op::ReadTtmp { .. } | Op::KernargPreload { .. } => vec![],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
@@ -1813,6 +1816,9 @@ pub struct Function {
     /// Exact mode: the author's FP mode in the kernel descriptor (f32 denorm mode, f16/f64 denorm mode, IEEE mode); None = the defaults
     /// (denormals kept, IEEE off).
     pub fp_mode: Option<(u8, u8, bool)>,
+    /// gfx1250 exact mode: kernel-descriptor directives as the author's descriptor has them (`.amdhsa_<name> <value>`, e.g.
+    /// `("user_sgpr_kernarg_preload_length", 20)`), replacing the emitter's value of the same directive. Empty for every other kernel.
+    pub kd: Vec<(String, i64)>,
 }
 
 /// Builder call sites of the values of a function (see `Function::src_locs`).
@@ -1991,7 +1997,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, ladder_hint: None, exact: false, fp_mode: None };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions, plan: None, ladder_hint: None, exact: false, fp_mode: None, kd: Vec::new() };
         f.set_body(body);
         f
     }
@@ -2078,6 +2084,7 @@ impl FnBuilder {
             ladder_hint: None,
             exact: false,
             fp_mode: None,
+            kd: Vec::new(),
             },
             expr_consts: Default::default(),
             captures: Vec::new(),

@@ -1,0 +1,21 @@
+# gfx1250 rows of the LLVM tail (docs/gfx1250-plan.md G1): they replace the llvm24.tbl rows of the same key when the target is gfx1250.
+# wave32: the lane mask is VCC_LO (SReg_32); VOP2 v_add_co_u32 / v_sub_co_u32 do not exist on gfx12 (VOP3 only); the split counters and the
+# split barrier replace s_waitcnt / s_barrier; the workitem id is packed in v0.
+VPtrAdd:rr  | V2 <- V2 V1 | {d.0}, $vcc_lo = V_ADD_CO_U32_e64 {s1}, {s0.0}, 0, implicit $exec ;; {d.1}, $vcc_lo = V_ADDC_U32_e64 {s0.1}, 0, $vcc_lo, 0, implicit $exec
+VPtrAdd:ri  | V2 <- V2 I | {d.0}, $vcc_lo = V_ADD_CO_U32_e64 {s0.0}, {s1}, 0, implicit $exec ;; {d.1}, $vcc_lo = V_ADDC_U32_e64 {s0.1}, 0, $vcc_lo, 0, implicit $exec
+VAddCoU32:rr | V1 <- V1 V1 | {d}, $vcc_lo = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddCoU32:ir | V1 <- I V1  | {d}, $vcc_lo = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddCoU32:ri | V1 <- V1 I  | {d}, $vcc_lo = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddCoU32:ii | V1 <- I I   | {d}, $vcc_lo = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddcCoU32:rr | V1 <- V1 V1 | {d}, $vcc_lo = V_ADDC_U32_e64 {s0}, {s1}, $vcc_lo, 0, implicit $exec
+VAddcCoU32:ir | V1 <- I V1  | {d}, $vcc_lo = V_ADDC_U32_e64 {s0}, {s1}, $vcc_lo, 0, implicit $exec
+VAddcCoU32:ri | V1 <- V1 I  | {d}, $vcc_lo = V_ADDC_U32_e64 {s0}, {s1}, $vcc_lo, 0, implicit $exec
+VAddcCoU32:ii | V1 <- I I   | {d}, $vcc_lo = V_ADDC_U32_e64 {s0}, {s1}, $vcc_lo, 0, implicit $exec
+VReadPhys   | V1 <-    | {d} = V_AND_B32_e32 1023, {pv}, implicit $exec
+SReadTtmp   | S1 <-    | {d} = S_MOV_B32 {pt}
+SWaitVm     | <- | S_WAIT_LOADCNT {imm} ;; S_WAIT_STORECNT {imm}
+SWaitLgkm   | <- | S_WAIT_DSCNT {imm} ;; S_WAIT_KMCNT {imm}
+SBarrier    | <- | S_BARRIER_SIGNAL_IMM -1 ;; S_BARRIER_WAIT -1
+T_Vccnz     | <- | S_CBRANCH_VCCNZ {t}, implicit $vcc_lo
+T_Vccz      | <- | S_CBRANCH_VCCZ {t}, implicit $vcc_lo
+X_Drain     | <- | S_WAIT_LOADCNT 0 ;; S_WAIT_STORECNT 0 ;; S_WAIT_DSCNT 0 ;; S_WAIT_KMCNT 0

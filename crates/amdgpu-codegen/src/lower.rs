@@ -3350,6 +3350,28 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VReadPhys).def(d).imm(0));
                 self.val.insert(dst, d);
             }
+            // gfx1250: the workgroup ids are architected (x = TTMP9, y = TTMP7[15:0], z = TTMP7[31:16]; no workgroup clusters)
+            Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ if crate::target::cur().name == "gfx1250" => {
+                let t = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SReadTtmp).def(t).imm(if matches!(op, Op::WorkgroupIdX) { 9 } else { 7 }));
+                let d = match op {
+                    Op::WorkgroupIdX => t,
+                    Op::WorkgroupIdY => {
+                        let k = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::SMovB32).def(k).src(Src::Imm(0xffff)));
+                        let d = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::SAndB32).def(d).srcreg(t).srcreg(k));
+                        d
+                    }
+                    _ => {
+                        let d = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::SLshrB32).def(d).srcreg(t).src(Src::Imm(16)));
+                        d
+                    }
+                };
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => {
                 let phys = match op {
                     Op::WorkgroupIdX => 2,
@@ -4174,6 +4196,13 @@ impl Lowerer {
             Op::SgprCat8 { words } => {
                 let d = self.new_vreg(RClass::S8);
                 self.sgpr_words(d, words)?;
+                self.val.insert(dst, d);
+            }
+            Op::KernargPreload { dword } => {
+                tdm_target()?;
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SReadPhys).def(d).imm(2 + *dword as i64));
+                self.uniform.insert(dst);
                 self.val.insert(dst, d);
             }
             Op::ReadTtmp { idx } => {

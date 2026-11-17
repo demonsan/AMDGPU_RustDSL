@@ -601,6 +601,9 @@ pub fn print(f: &Function) -> String {
     if f.exact {
         let _ = writeln!(s, "exact");
     }
+    for (k, v) in &f.kd {
+        let _ = writeln!(s, "kd {k:?} {v}");
+    }
     if let Some(m) = f.fp_mode {
         let _ = writeln!(s, "fp_mode {m:?}");
     }
@@ -753,6 +756,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     let mut extra_tys: Vec<(u32, DType)> = Vec::new();
     let mut exact = false;
     let mut fp_mode: Option<(u8, u8, bool)> = None;
+    let mut kd: Vec<(String, i64)> = Vec::new();
     loop {
         let k = lx.ident()?;
         match k.as_str() {
@@ -766,6 +770,11 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
             "var_tys" => var_tys = lx.typed()?,
             "exact" => exact = true,
             "fp_mode" => fp_mode = Some(lx.typed()?),
+            "kd" => {
+                let k: String = lx.typed()?;
+                let v: i64 = lx.typed()?;
+                kd.push((k, v));
+            }
             "arg" => args.push(lx.typed()?),
             "agpr" => agpr.push(lx.typed()?),
             "reg_plan" => reg_plan.push(lx.typed()?),
@@ -824,6 +833,7 @@ pub fn parse_unchecked(src: &str) -> Result<Function, IrErr> {
     f.plan = plan;
     f.exact = exact;
     f.fp_mode = fp_mode;
+    f.kd = kd;
     Ok(f)
 }
 
