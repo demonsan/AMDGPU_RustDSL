@@ -1591,6 +1591,10 @@ pub enum Stmt {
     /// guarantee complete (a vendor timing reliance, docs/exact-mode.md section 5.2). Counted in the certificate (GV-TRUST-TIMING); rejected
     /// in every dispatch-reachable kernel; a waiver that waives nothing is an error.
     TrustWait { reason: String },
+    /// Exact mode (gfx1250), NON-DISPATCHED kernels only: the next statement's instruction is exempt from the gfx1250 software-hazard check
+    /// (a vendor reliance the public rules do not grant, e.g. no `v_nop` between a TRANS and its VALU reader). Counted in the certificate
+    /// (GV-TRUST-HAZARD); a waiver that waives nothing is an error.
+    TrustHazard { reason: String },
     /// Exact mode: the next statement's VALU instruction(s) use the VOP3 (`_e64`) encoding even where the VOP2 / VOPC one would encode
     /// (the author's encoding).
     EncodeE64,
@@ -2596,6 +2600,12 @@ impl FnBuilder {
     #[track_caller]
     pub fn trust_wait(&mut self, reason: &str) {
         self.push_stmt(Stmt::TrustWait { reason: reason.to_string() });
+    }
+
+    /// Exact mode (gfx1250), non-dispatched kernels only: waive the software-hazard check of the next statement (see `Stmt::TrustHazard`).
+    #[track_caller]
+    pub fn trust_hazard(&mut self, reason: &str) {
+        self.push_stmt(Stmt::TrustHazard { reason: reason.to_string() });
     }
 
     /// Exact mode: the next statement is encoded `_e64` (see `Stmt::EncodeE64`).
@@ -5048,7 +5058,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             Stmt::BarrierInit { .. } | Stmt::BarrierJoin { .. } | Stmt::BarrierLeave | Stmt::ClusterBarrier => {}
             Stmt::SetSchedMode { .. } | Stmt::WaitAlu { .. } => {}
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::TrustHazard { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {

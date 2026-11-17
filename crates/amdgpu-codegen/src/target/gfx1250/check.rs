@@ -138,7 +138,8 @@ fn merge(a: &State, b: &State) -> State {
 }
 
 /// The violations of the author's waits (one message per missing wait: block, instruction, counter, the operation it depends on).
-pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, String)> {
+/// (statement, is a software-hazard finding, message).
+pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
     let n = m.blocks.len();
     let idx: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let succ: Vec<Vec<usize>> = m
@@ -152,7 +153,7 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, String)> {
         .collect();
     let mut entry: Vec<Option<State>> = vec![None; n];
     entry[0] = Some(State { items: BTreeMap::new(), mode: Some(0) });
-    let mut errs: BTreeMap<(usize, usize, Ctr), (u32, String)> = BTreeMap::new();
+    let mut errs: BTreeMap<(usize, usize, Ctr), (u32, bool, String)> = BTreeMap::new();
     for _round in 0..200 {
         let mut changed = false;
         for bi in 0..n {
@@ -205,6 +206,7 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, String)> {
                         let (pb, pi) = k.1;
                         errs.entry((bi, ii, k.0)).or_insert((
                             inst.stmt,
+                            false,
                             format!(
                                 "block {} instruction {ii} (`{}`): needs {} for the operation at block {} instruction {pi} (`{}`){}",
                                 m.blocks[bi].label,
@@ -263,14 +265,14 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, String)> {
             break;
         }
     }
-    let mut out: Vec<(u32, String)> = errs.into_values().collect();
+    let mut out: Vec<(u32, bool, String)> = errs.into_values().collect();
     // the software hazards: the author's instructions must already satisfy them
     let hz = super::hazards::plan(m, a);
     let mut hk: Vec<_> = hz.before.iter().collect();
     hk.sort_by_key(|x| x.0);
     for ((bi, ii), lines) in hk {
         let inst = &m.blocks[*bi].insts[*ii];
-        out.push((inst.stmt, format!("block {} instruction {ii} (`{}`): missing `{}` (gfx1250 software hazard, docs/gfx1250-hazards.md)", m.blocks[*bi].label, crate::op_attrs::attrs(inst.op).mnemonic, lines.join("; "))));
+        out.push((inst.stmt, true, format!("block {} instruction {ii} (`{}`): missing `{}` (gfx1250 software hazard, docs/gfx1250-hazards.md)", m.blocks[*bi].label, crate::op_attrs::attrs(inst.op).mnemonic, lines.join("; "))));
     }
     out
 }

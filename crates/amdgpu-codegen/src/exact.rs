@@ -641,12 +641,27 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         }
         if crate::target::cur().name == "gfx1250" {
             // gfx1250: the split counters, XCNT, the scheduling mode's dependency counters and the gfx1250 software hazards
-            for (stmt, msg) in crate::target::gfx1250::check::verify(&m, &a) {
+            let th = crate::lower::last_trust_hazards();
+            let mut used_h: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for (stmt, hazard, msg) in crate::target::gfx1250::check::verify(&m, &a) {
+                if hazard {
+                    if th.iter().any(|&t| stmt == t + 1) {
+                        used_h.insert(stmt - 1);
+                        continue;
+                    }
+                    errs.push(format!("exact: hazard: {msg}"));
+                    continue;
+                }
                 if trusts.iter().any(|&t| stmt == t + 1) {
                     used.insert(stmt - 1);
                     continue;
                 }
                 errs.push(format!("exact: waits: {msg}"));
+            }
+            for t in th {
+                if !used_h.contains(&t) {
+                    errs.push(format!("exact: TrustHazard at stmt {} waives nothing (the next statement has no gfx1250 software-hazard finding)", t as i64 - 1));
+                }
             }
         } else {
             for v in verify_final_with(&m, &m_phys, &a, false) {
