@@ -233,9 +233,9 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, String)> {
                             issue(&mut st, Ctr::VmVsrc, at, class, vec![], vsrc, 1);
                         }
                         Space::Lds => {
-                            if !e.writes.is_empty() {
-                                issue(&mut st, Ctr::Ds, at, 0, writes.clone(), reads.clone(), 1);
-                            }
+                            // every LDS operation (loads, stores, the transposing loads) counts on DScnt, in order (LLVM: one event,
+                            // LDS_ACCESS): a store younger than a load is one of the "n youngest" a wait for n leaves outstanding
+                            issue(&mut st, Ctr::Ds, at, 0, writes.clone(), reads.clone(), 1);
                             issue(&mut st, Ctr::VmVsrc, at, 1, vec![], vsrc, 1);
                         }
                     }
