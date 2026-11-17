@@ -414,8 +414,14 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
 
     // SGPRs.
     let mut sregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
+    // gfx1250: a view (alias) takes its register from its tuple and a never-live vreg needs none, as in the VGPR scan; on gfx950 they
+    // keep their historical slots (the golden allocation depends on them)
+    let skip_views = crate::target::cur().name == "gfx1250";
     for (r, c) in m.vregs.iter().enumerate() {
         if c.is_scalar() {
+            if skip_views && (m.alias.contains_key(&(r as VReg)) || start[r] == usize::MAX) {
+                continue;
+            }
             let s = if start[r] == usize::MAX { 0 } else { start[r] };
             sregs.push((s, end[r], r as VReg, *c));
         }
