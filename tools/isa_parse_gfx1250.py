@@ -129,7 +129,8 @@ def parse(text):
             p, e = phys(head.strip() if head.strip() else t)
             args.append(p)
             enc.append(e)
-        out.append(dict(addr=r['addr'], words=r['words'], op=r['op'], args=args, enc_args=enc, mods=mods, cls=classify(r['op']), raw=False))
+        out.append(dict(addr=r['addr'], words=r['words'], op=r['op'], args=args, enc_args=enc, mods=mods, cls=classify(r['op']),
+                        text=(r['op'] + ' ' + re.sub(r'\s*/\*.*?\*/', '', r['rest'])).strip(), raw=False))
         i += 1
     return out
 

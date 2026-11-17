@@ -715,6 +715,7 @@ pub const ALL: &[MOp] = &[
     MOp::VWmmaF32_16x16x128Fp8Z,
     MOp::VWmmaScaleF32_32x16x128F4,
     MOp::VWmmaScaleF32_32x16x128F4Z,
+    MOp::RawInst,
     MOp::SEndpgm,
 ];
 
@@ -1210,6 +1211,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VWmmaF32_16x16x128Fp8Z => a("v_wmma_f32_16x16x128_fp8_fp8", c(Mfma, 32, 48, Experimental)).mfma(32, false, false, true, false).backend(Backend::OwnOnly),
         VWmmaScaleF32_32x16x128F4 => a("v_wmma_scale_f32_32x16x128_f4", c(Mfma, 32, 48, Experimental)).mfma(32, true, true, false, false).backend(Backend::OwnOnly),
         VWmmaScaleF32_32x16x128F4Z => a("v_wmma_scale_f32_32x16x128_f4", c(Mfma, 32, 48, Experimental)).mfma(32, false, true, true, false).backend(Backend::OwnOnly),
+        // a verbatim instruction: its effects are the author's; the lowering pins it (program order)
+        RawInst => a("raw", ctrl).backend(Backend::OwnOnly),
         TensorLoadToLds => a("tensor_load_to_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         TensorStoreFromLds => a("tensor_store_from_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),

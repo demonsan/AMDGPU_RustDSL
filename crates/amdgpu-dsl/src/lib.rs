@@ -773,6 +773,11 @@ pub enum Op {
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
     /// gfx1250: D = A x B + C (`c: None`: zero accumulator) of the WMMA `kind`; result `kind.acc_ty()`; `scale` exactly for the scaled kinds
     Wmma { kind: WmmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<WmmaScale> },
+    /// Exact mode only: one instruction emitted VERBATIM (`text`, the author's spelling and encoding), for forms the DSL does not have yet.
+    /// It reads `reads` and writes the value (`dwords` registers, SGPRs when `scalar`), pinned like every exact value. The compiler knows
+    /// nothing else of it: no folding, no reordering (a pinned instruction), and its other effects (SCC, a second destination) are the
+    /// author's. Each one is a named deviation from a lifted kernel (docs/exact-mode.md).
+    Raw { text: String, reads: Vec<Opnd>, ty: DType, scalar: bool, dwords: u8 },
     // ---- (s) SGPR words of pointers / buffer descriptors (exact mode; owner kernel-opt): zero-instruction views / assemblies ----
     /// dword 0 (low address bits) of a pointer pair, read in place
     /// The kernarg segment pointer itself (hardware `s[0:1]` at entry; no instruction). `KernargPtr` loads a pointer stored in it.
@@ -808,6 +813,7 @@ impl Op {
             Op::LoadLdsTrB16 { .. } => DType::Frag2,
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Wmma { kind, .. } => kind.acc_ty(),
+            Op::Raw { ty, .. } => *ty,
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
@@ -954,6 +960,7 @@ impl Op {
                 }
                 v
             }
+            Op::Raw { reads, .. } => reads.clone(),
             Op::Wmma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
@@ -1442,6 +1449,8 @@ pub enum Stmt {
     /// both or neither). `raw`: the instruction's three words as written by another assembler (exact replays; the operands still describe
     /// what it reads). Completion: TENSORcnt (`WaitTensor`).
     TensorLoadToLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
+    /// Exact mode only: one instruction emitted verbatim that defines no value (see `Op::Raw`); `reads` for the analyses.
+    Raw { text: String, reads: Vec<Opnd> },
     /// gfx1250 TDM: `tensor_store_from_lds` (operands as `TensorLoadToLds`).
     TensorStoreFromLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
@@ -3930,6 +3939,14 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
         Op::Wmma { kind, a, b, c, scale } => e.extend(check_wmma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::Raw { text, dwords, .. } => {
+            if !f.exact {
+                e.push(format!("raw instruction `{text}` outside exact mode"));
+            }
+            if ![1u8, 2, 4, 8, 16].contains(dwords) {
+                e.push(format!("raw instruction `{text}`: {dwords} result dwords"));
+            }
+        }
         Op::AtomicLds { addr, value, op } => {
             if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
                 e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
@@ -4669,6 +4686,18 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
+            Stmt::Raw { text, reads } => {
+                if !f.exact {
+                    errs.push(here(format!("raw instruction `{text}` outside exact mode")));
+                }
+                for o in reads {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, *v) {
+                            errs.push(here(format!("raw instruction reads v{v} before its definition")));
+                        }
+                    }
+                }
+            }
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
@@ -5158,6 +5187,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarMfmaScale16 { a, b, scale_a, scale_b, .. } => vec![*a, *b, *scale_a, *scale_b],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
+        Stmt::Raw { reads, .. } => reads.clone(),
         Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
             let mut v = vec![*g0, *g1];
             v.extend(g2.iter().copied());

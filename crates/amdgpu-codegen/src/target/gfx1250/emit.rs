@@ -15,9 +15,19 @@ fn round_up(v: u32, m: u32) -> u32 {
     }
 }
 
+thread_local! {
+    /// the verbatim instruction texts of the function being emitted (`RegHints::raw_texts`; `inst_lines` sees one instruction only)
+    static RAW_TEXTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn a_raw_text(k: i64) -> Result<String, String> {
+    RAW_TEXTS.with(|r| r.borrow().get(k as usize).cloned()).ok_or_else(|| format!("raw instruction #{k}: no text"))
+}
+
 /// The gfx1250 assembly of an allocated function.
 pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     let t = &amdgpu_target::gfx1250::GFX1250;
+    RAW_TEXTS.with(|r| *r.borrow_mut() = m.reg_hints.raw_texts.clone());
     if crate::regalloc::agpr_count(m, a) > 0 {
         return Err(format!("{}: gfx1250 has no AGPRs (the allocation used some)", m.name));
     }
@@ -202,6 +212,16 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 l.push_str(" matrix_b_scale:MATRIX_SCALE_ROW1");
             }
             vec![l]
+        }
+        // exact mode: the author's instruction, verbatim
+        // (an empty text: the ghost definition of a register the previous verbatim instruction wrote too; no line)
+        MOp::RawInst => {
+            let x = a_raw_text(inst.imm)?;
+            if x.is_empty() {
+                vec![]
+            } else {
+                vec![x]
+            }
         }
         MOp::TensorLoadToLds | MOp::TensorStoreFromLds => {
             let mn = if inst.op == MOp::TensorLoadToLds { "tensor_load_to_lds" } else { "tensor_store_from_lds" };

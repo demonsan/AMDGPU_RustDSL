@@ -624,6 +624,8 @@ pub enum MOp {
     /// scales from lanes 16..31 (`matrix_b_scale:MATRIX_SCALE_ROW1`)
     VWmmaScaleF32_32x16x128F4,
     VWmmaScaleF32_32x16x128F4Z,
+    /// exact mode: one verbatim instruction (`RegHints::raw_texts[imm]`); srcs = the registers it reads, dst = the one it writes (if any)
+    RawInst,
     SEndpgm,
 }
 
@@ -880,6 +882,8 @@ pub struct RegHints {
     pub pins_v: Vec<(VReg, u32)>,
     /// exact mode: SGPR placements (canonical vreg, base)
     pub pins_s: Vec<(VReg, u32)>,
+    /// exact mode: the texts of the verbatim instructions (`MOp::RawInst`, by its `imm`)
+    pub raw_texts: Vec<String>,
     pub share: Vec<Vec<VReg>>,
     pub separate: Vec<Vec<VReg>>,
     /// (region name, arch VGPR cap, AGPR cap)

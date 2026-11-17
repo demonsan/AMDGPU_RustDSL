@@ -1316,6 +1316,19 @@ def cond_for(L, bl_ins, polarity_taken):
     return f'Val({w})'
 
 
+def entry_hw_gfx950(L, live):
+    """Hardware-initialised registers at entry (gfx950): v0 = workitem id, s[0:1] = kernarg pointer, then the enabled workgroup ids."""
+    L.new('v', 0, 1, 'U32', 'WorkitemId')
+    L.new('s', 0, 2, 'Ptr', 'KernargSegment')
+    for i, wg in enumerate(['WorkgroupIdX', 'WorkgroupIdY', 'WorkgroupIdZ']):
+        if ('s', 2 + i) in live:
+            L.new('s', 2 + i, 1, 'U32', wg)
+
+
+# the entry definitions of the target (a front end for another target replaces it: tools/isa_lift_gfx1250.py)
+ENTRY_HW = entry_hw_gfx950
+
+
 def emit_kernel(path, exact, plan=None):
     """Whole-kernel structured lift. Registers live across a block boundary are scope variables: one I32 variable per dword, except
     SGPR pairs / quads that hold ONE pointer / descriptor value at every end of the blocks reaching a boundary - those are carried as one
@@ -1432,12 +1445,7 @@ def emit_kernel(path, exact, plan=None):
         L.views = {}
         L.lgkm = []
         if b == 0:
-            # hardware-initialised registers: v0 = workitem id, s[0:1] = kernarg pointer, then the enabled workgroup ids
-            L.new('v', 0, 1, 'U32', 'WorkitemId')
-            L.new('s', 0, 2, 'Ptr', 'KernargSegment')
-            for i, wg in enumerate(['WorkgroupIdX', 'WorkgroupIdY', 'WorkgroupIdZ']):
-                if ('s', 2 + i) in live_in[0]:
-                    L.new('s', 2 + i, 1, 'U32', wg)
+            ENTRY_HW(L, live_in[0])
         body = ins[s:e]
         last = body[-1][1]
         run = body[:-1] if last.startswith(('s_cbranch', 's_branch')) else body

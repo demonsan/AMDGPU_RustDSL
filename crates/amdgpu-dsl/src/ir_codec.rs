@@ -200,6 +200,7 @@ impl FromIr for Op {
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
             "Wmma" => { v.expect_struct("Wmma")?; Ok(Op::Wmma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
+            "Raw" => { v.expect_struct("Raw")?; Ok(Op::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)?, ty: FromIr::from_ir(v.field("ty")?)?, scalar: FromIr::from_ir(v.field("scalar")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "KernargSegment" => { v.expect_unit("KernargSegment")?; Ok(Op::KernargSegment) }
             "AddK" => { v.expect_struct("AddK")?; Ok(Op::AddK { a: FromIr::from_ir(v.field("a")?)?, k: FromIr::from_ir(v.field("k")?)? }) }
             "LoadScalar" => { v.expect_struct("LoadScalar")?; Ok(Op::LoadScalar { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)? }) }
@@ -337,6 +338,7 @@ impl IrIds for Op {
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
             Op::Wmma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
+            Op::Raw { text, reads, ty, scalar, dwords } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*scalar), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Op::KernargSegment => {}
             Op::AddK { a, k } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*k), fv, fr); }
             Op::LoadScalar { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
@@ -793,6 +795,7 @@ impl FromIr for Stmt {
             "BarrierWait" => { v.expect_struct("BarrierWait")?; Ok(Stmt::BarrierWait { id: FromIr::from_ir(v.field("id")?)? }) }
             "SetVgprMsb" => { v.expect_struct("SetVgprMsb")?; Ok(Stmt::SetVgprMsb { imm: FromIr::from_ir(v.field("imm")?)? }) }
             "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
+            "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "TensorStoreFromLds" => { v.expect_struct("TensorStoreFromLds")?; Ok(Stmt::TensorStoreFromLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "LoadGlobalLds" => { v.expect_struct("LoadGlobalLds")?; Ok(Stmt::LoadGlobalLds { base: FromIr::from_ir(v.field("base")?)?, lds_addr: FromIr::from_ir(v.field("lds_addr")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "SetVar" => { v.expect_struct("SetVar")?; Ok(Stmt::SetVar { var: FromIr::from_ir(v.field("var")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
@@ -878,6 +881,7 @@ impl IrIds for Stmt {
             Stmt::BarrierWait { id } => { IrIds::ids(&mut (*id), fv, fr); }
             Stmt::SetVgprMsb { imm } => { IrIds::ids(&mut (*imm), fv, fr); }
             Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
+            Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*lds_addr), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Stmt::SetVar { var, value } => { fr(&mut (*var)); IrIds::ids(&mut (*value), fv, fr); }

@@ -1965,6 +1965,28 @@ impl Lowerer {
         r
     }
 
+    /// (exact) A verbatim instruction: its text in the function's table, its reads as sources (registers only; constants are part of the
+    /// text), pinned in program order.
+    fn raw_inst(&mut self, text: &str, reads: &[Opnd]) -> Result<MInst, String> {
+        if !self.exact {
+            return Err(format!("raw instruction `{text}` outside exact mode"));
+        }
+        let k = self.mir.reg_hints.raw_texts.len();
+        self.mir.reg_hints.raw_texts.push(text.to_string());
+        let mut inst = MInst::new(MOp::RawInst).imm(k as i64);
+        inst.pin = true;
+        for o in reads {
+            let r = match o {
+                Opnd::Val(v) => *self.val.get(v).ok_or_else(|| format!("raw instruction `{text}`: value v{v} not lowered"))?,
+                Opnd::Var(w) => *self.vars.get(w.0 as usize).ok_or("raw instruction: variable not lowered")?,
+                _ => continue,
+            };
+            self.touch(&[Src::Reg(r)]);
+            inst = inst.srcreg(r);
+        }
+        Ok(inst)
+    }
+
     fn as_v1(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
             Opnd::Val(v) => {
@@ -2906,6 +2928,10 @@ impl Lowerer {
                 Stmt::SetVgprMsb { imm } => {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
+                }
+                Stmt::Raw { text, reads } => {
+                    let inst = self.raw_inst(text, reads)?;
+                    self.push(inst);
                 }
                 Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => {
                     tdm_target()?;
@@ -3904,6 +3930,27 @@ impl Lowerer {
                         self.val.insert(dst, d);
                     }
                 }
+            }
+            Op::Raw { text, reads, scalar, dwords, .. } => {
+                let cls = match (*scalar, *dwords) {
+                    (true, 1) => RClass::S1,
+                    (true, 2) => RClass::S2,
+                    (true, 4) => RClass::S4,
+                    (true, 8) => RClass::S8,
+                    (false, 1) => RClass::V1,
+                    (false, 2) => RClass::V2,
+                    (false, 4) => RClass::V4,
+                    (false, 8) => RClass::V8,
+                    (false, 16) => RClass::V16,
+                    (s, n) => return Err(format!("raw instruction `{text}`: no register class for {n} {} dwords", if s { "scalar" } else { "vector" })),
+                };
+                let d = self.new_vreg(cls);
+                let inst = self.raw_inst(text, reads)?.def(d);
+                self.push(inst);
+                if *scalar {
+                    self.uniform.insert(dst);
+                }
+                self.val.insert(dst, d);
             }
             Op::Wmma { kind, a, b, c, scale } => {
                 tdm_target()?;
