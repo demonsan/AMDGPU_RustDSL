@@ -30,6 +30,10 @@ METRICS = {
     'gbs': (r'([0-9]+(?:\.[0-9]+)?)\s*GB/s', 'high'),
     'ms': (r'([0-9]+(?:\.[0-9]+)?)\s*ms/iter', 'low'),
     'us': (r'([0-9]+(?:\.[0-9]+)?)\s*us\b', 'low'),
+    # the one JSON line of the gfx1250 hosts: {"host":..,"kernel":..,"us":..,"tflops":..|"gbs":..,"bad":N,"ok":bool}
+    'json_us': (r'"us":\s*([0-9]+(?:\.[0-9]+)?)', 'low'),
+    'json_tflops': (r'"tflops":\s*([0-9]+(?:\.[0-9]+)?)', 'high'),
+    'json_gbs': (r'"gbs":\s*([0-9]+(?:\.[0-9]+)?)', 'high'),
 }
 
 
@@ -111,9 +115,16 @@ def env_default(name, default):
     return os.environ.get(name, default)
 
 
-ROCM = env_default('ROCM_PATH', '/shared/apps/ubuntu/opt/rocm-7.0.2')
-CLANG = env_default('CLANG', '/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang')
-HSA = env_default('AITER_HSA', '/shared/amdgpu/home/blyu_qle/sessions/aiter_src/hsa/gfx950')
+# the architecture under test: PERF_AB_ARCH or --arch (gfx950 default; gfx1250 = the MI450 nodes, docs/mi450-nodes.md: native cargo, the node's ROCm, `amdc emit --target`, the GPU wrapper)
+ARCH = env_default('PERF_AB_ARCH', 'gfx950')
+if '--arch' in sys.argv:
+    ARCH = sys.argv[sys.argv.index('--arch') + 1]
+_MI450 = ARCH != 'gfx950'
+ROCM = env_default('ROCM_PATH', '/opt/rocm' if _MI450 else '/shared/apps/ubuntu/opt/rocm-7.0.2')
+CLANG = env_default('CLANG', '/opt/rocm/llvm/bin/clang' if _MI450 else '/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang')
+HSA = env_default('AITER_HSA', os.path.join(os.environ.get('BASE', '/data/blyu/amdrustdsl'), 'vendor', ARCH) if _MI450 else '/shared/amdgpu/home/blyu_qle/sessions/aiter_src/hsa/gfx950')
+# every GPU run goes through this command prefix (mi450-exec.ps1 sets it: `timeout -s KILL N` and, on the lock node, `/usr/local/bin/gpu-lock`); empty = none
+GPU_WRAP = shlex.split(os.environ.get('PERF_AB_GPU_WRAP', ''))
 REF_CO = env_default('REF_CO', '/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co')
 
 
@@ -154,6 +165,9 @@ def build_amdc(side, args):
     env = dict(os.environ, AMD_CARGO_TARGET=target)
     profile = 'release' if args.release else 'debug'
     cmd = ['bash', 'tools/container/cargo.sh', 'build', '--bin', 'amdc'] + (['--release'] if args.release else [])
+    if _MI450 or os.environ.get('PERF_AB_CARGO') == 'native':
+        cmd = ['cargo', 'build', '--bin', 'amdc'] + (['--release'] if args.release else [])
+        env = dict(env, CARGO_TARGET_DIR=target)
     t0 = time.time()
     p = sh(cmd, cwd=side.tree, env=env)
     if p.returncode != 0:
@@ -170,10 +184,10 @@ def emit_kernel(side, k):
     if os.path.exists(co) and os.path.getmtime(co) >= os.path.getmtime(side.amdc):
         return k, True, ''
     os.makedirs(os.path.dirname(s), exist_ok=True)
-    p = sh([side.amdc, 'emit', k, '--backend', 'own', '--out', s], cwd=side.tree, timeout=1200, env=dict(os.environ, **side.emit_env))
+    p = sh([side.amdc, 'emit', k, '--backend', 'own', '--out', s] + (['--target', ARCH] if _MI450 else []), cwd=side.tree, timeout=1200, env=dict(os.environ, **side.emit_env))
     if p.returncode != 0 or not os.path.exists(s):
         return k, False, (p.stdout + p.stderr)[-300:]
-    p = sh([CLANG, '-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcpu=gfx950', '-mcode-object-version=6', '-o', co, s], timeout=600)
+    p = sh([CLANG, '-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', f'-mcpu={ARCH}', '-mcode-object-version=6', '-o', co, s], timeout=600)
     if p.returncode != 0:
         return k, False, 'assemble: ' + (p.stdout + p.stderr)[-300:]
     return k, True, ''
@@ -199,7 +213,7 @@ def build_host(tree, name, out):
     if os.path.exists(exe) and os.path.exists(stamp):
         return name, exe, ''
     os.makedirs(os.path.dirname(exe), exist_ok=True)
-    cmd = [os.path.join(ROCM, 'bin', 'amdclang++'), '-x', 'hip', '-O2', '--offload-arch=gfx950', '--rocm-path=' + ROCM, '-std=c++17', '-I', os.path.join(tree, 'tests', 'gpu'),
+    cmd = [os.path.join(ROCM, 'bin', 'amdclang++'), '-x', 'hip', '-O2', f'--offload-arch={ARCH}', '--rocm-path=' + ROCM, '-std=c++17', '-I', os.path.join(tree, 'tests', 'gpu'),
            '-I', tree, src, '-o', exe, '-L' + os.path.join(ROCM, 'lib'), '-lamdhip64', '-Wl,-rpath,' + os.path.join(ROCM, 'lib')]
     p = sh(cmd, timeout=1200)
     if p.returncode != 0:
@@ -244,7 +258,7 @@ def run_once(cmd, env, timeout):
     e.update(env)
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=e, timeout=timeout, errors='replace')
+        p = subprocess.run(GPU_WRAP + list(cmd), capture_output=True, text=True, env=e, timeout=timeout, errors='replace')
         return p.stdout + p.stderr, p.returncode, time.time() - t0
     except subprocess.TimeoutExpired as ex:
         return (ex.stdout or '') if isinstance(ex.stdout, str) else '', -9, time.time() - t0
@@ -287,12 +301,15 @@ def main():
     ap.add_argument('--old-emit-env', action='append', default=[], metavar='K=V', help='environment of the old side\'s `amdc emit` (experiment switches such as AMDC_SCHED_ADD); repeatable')
     ap.add_argument('--new-emit-env', action='append', default=[], metavar='K=V', help='environment of the new side\'s `amdc emit`; repeatable')
     ap.add_argument('--show', action='store_true', help='run each selected case once on the new side and print the command and the output tail (to write / debug a case); no session')
+    ap.add_argument('--arch', default=ARCH, help='architecture under test (also PERF_AB_ARCH): gfx950 (default) or gfx1250 (MI450 nodes: native cargo, `amdc emit --target`, PERF_AB_GPU_WRAP prefix on every GPU run)')
+    ap.add_argument('--cases', default=os.environ.get('PERF_AB_CASES', 'perf_ab_cases_gfx1250' if _MI450 else 'perf_ab_cases'), help='the case library module of tools/')
     ap.add_argument('--keep-going', action='store_true', help='do not stop on a host build failure')
     args = ap.parse_args()
     if args.reps is None:
         args.reps = 3 if args.quick else 5
 
-    import perf_ab_cases as lib
+    import importlib
+    lib = importlib.import_module(args.cases)
     if not args.list:
         gpu_guard()
     out = os.path.abspath(args.out or os.path.join(ROOT, 'build', 'ab', f'run-{args.old.replace("/", "_")}-{args.new.replace("/", "_")}'.replace('.', 'wt')))
