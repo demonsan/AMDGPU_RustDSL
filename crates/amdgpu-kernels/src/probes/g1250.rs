@@ -432,7 +432,12 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     let o = b.let_(Op::AddI32(Opnd::Val(g), Opnd::Val(a)));
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
     b.store_global(q, 0, acc, MemTy::B32, false);
-    b.finish()
+    let mut f = b.finish();
+    if bytes > 65536 {
+        // this probe IS the evidence run for LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
+        f.kd.push(("g5:lds_above_64k".into(), 1));
+    }
+    f
 }
 
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
@@ -459,7 +464,10 @@ pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(ga) });
         b.store_global(q, 0, x, MemTy::B32, false);
     }
-    b.finish()
+    let mut f = b.finish();
+    // an evidence run for TDM / LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
+    f.kd.push(("g5:lds_above_64k".into(), 1));
+    f
 }
 
 /// TRANS co-execution (hardware evidence for the gfx1250 TRANS -> VALU rule): per lane, 8 independent chains x 16 steps; each step is a
