@@ -26,6 +26,8 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "system_sgpr_workgroup_id_x", "system_sgpr_workgroup_id_y", "system_sgpr_workgroup_id_z", "next_free_vgpr", "next_free_sgpr",
     "memory_ordered", "forward_progress", "float_denorm_mode_32", "float_denorm_mode_16_64", "named_barrier_count", "round_robin_scheduling",
     "fp16_overflow", "group_segment_fixed_size", "kernarg_size",
+    // a launch fact for the hang-safety verifier (workgroups per cluster; `gpu_verify_1250`): accepted, not a descriptor field, never printed
+    "cluster_dims",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.

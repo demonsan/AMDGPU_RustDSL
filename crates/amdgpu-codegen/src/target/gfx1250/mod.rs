@@ -25,6 +25,8 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
         return Err(format!("{}: workgroup size {} (gfx1250: at most 1024 work-items)", f.name, f.workgroup_size));
     }
     let (m, alloc) = crate::lower_and_allocate(f)?;
+    // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
+    crate::gpu_verify_1250::enforce(f, &m, &alloc)?;
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {
@@ -50,5 +52,6 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
         }
         b => return Err(format!("unknown backend `{b}` (own, llvm-tail)")),
     };
+    crate::gpu_verify_1250::enforce_asm(&f.name, &asm)?;
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
