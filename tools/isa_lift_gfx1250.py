@@ -73,7 +73,7 @@ def parse(path):
     scc_r = ('s_cbranch_scc', 's_cselect', 's_add_co_ci', 's_sub_co_ci', 's_cmov')
     scc_live = set()
     for k, r in enumerate(recs):
-        if not r['op'].startswith(scc_w) or r['op'].startswith('s_cmp'):
+        if not r['op'].startswith(scc_w) or r['op'].startswith(('s_cmp', 's_add_nc', 's_sub_nc')):
             continue
         for j in range(k + 1, len(recs)):
             o = recs[j]['op']
@@ -82,7 +82,7 @@ def parse(path):
             if o.startswith(scc_r):
                 scc_live.add(k)
                 break
-            if o.startswith(scc_w) or o.startswith(('s_cmp', 's_branch', 's_endpgm')):
+            if (o.startswith(scc_w) and not o.startswith(('s_add_nc', 's_sub_nc'))) or o.startswith(('s_cmp', 's_branch', 's_endpgm')):
                 break
     out, sec, msb = [], 'entry', 0
     i = 0
@@ -93,19 +93,28 @@ def parse(path):
         op, args, mods = r['op'], list(r['args']), list(r['mods'])
         if op == 's_set_vgpr_msb':
             msb = int(args[0], 0) & 0xFF
+        words = list(r['words'])
         if op == 'v_wmma_ld_scale_paired_b32' and i + 1 < len(recs) and recs[i + 1]['op'] == 'raw':
             args, mods = decode_vop3px2(r, recs[i + 1], msb)
             op = 'v_wmma_scale_f32_32x16x128_f4'
+            words += recs[i + 1]['words']
             i += 1
+        if op.startswith('v_wmma'):
+            mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
         elif op in BRANCHES:
             args = [f'L{r["target"]:x}'] if 'target' in r else args
         elif op in ('tensor_load_to_lds', 'tensor_store_from_lds'):
             mods = mods + ['raw:' + '/'.join(f'{w:#x}' for w in r['words'])]
+            # the descriptor groups as SGPR ranges (4, 8, 4, 4 dwords): the liveness sees every word
+            args = [f's[{int(x[1:])}:{int(x[1:]) + n - 1}]' for x, n in zip(args, (4, 8, 4, 4))]
         base = re.sub(r'_e(32|64)$', '', op)
         e64 = op.endswith('_e64')
         op = TO_950.get(base, base) + ('_e64' if e64 else '')
         # (branches carry their target label only: the CFG reads it)
         text = '' if op in BRANCHES else r.get('text', '')
+        if text and '--raw-text' not in sys.argv:
+            # the author's encoding, word for word (fields the assembler fills differently stay the author's), the text as a comment
+            text = '.long ' + ', '.join(f'{w:#010x}' for w in r['words']) + ' // ' + text
         if i in scc_live:
             mods = mods + ['scc_live']
         out.append((sec, op, ', '.join(args) + (' ' + ' '.join(mods) if mods else '') + (' ||| ' + text if text else '')))
@@ -118,6 +127,12 @@ class Lifter(isa_lift.Lifter):
         text = ''
         if ' ||| ' in args:
             args, text = args.split(' ||| ', 1)
+        forced = sys.argv[sys.argv.index('--raw-ops') + 1].split(',') if '--raw-ops' in sys.argv else []
+        if text and any(op == f or op.startswith(f + '_e') for f in forced) and ' scc_live' not in args and self.raw(op, args, text):
+            # (forced verbatim: a lifted form whose encoding the assembler fills differently)
+            self.cov[op] += 1
+            self.raws[op + ' (forced)'] += 1
+            return True
         if ' scc_live' in args:
             args = args.replace(' scc_live', '')
             if text and self.raw(op, args, text, scc=True):
@@ -153,7 +168,7 @@ class Lifter(isa_lift.Lifter):
     def livein(self, f, base, n):
         # registers the kernel reads before any definition on some path (accumulators of a first pass, the other arm's values): an
         # undefined value pinned there, no instruction (exact: the author issues no initialisation)
-        ty = 'U32' if n == 1 else isa_lift.FRAG.get(n, 'Frag16')
+        ty = 'I32' if n == 1 else isa_lift.FRAG.get(n, 'Frag16')
         if f == 's' and n not in (1,):
             ty = {2: 'Ptr', 4: 'Rsrc'}.get(n, ty)
         self.notes[f'live-in {f} register(s): ghost definition'] += 1
@@ -181,15 +196,19 @@ class Lifter(isa_lift.Lifter):
         if scc:
             # the value of the instruction is its SCC (read by the next branch / select); the register it writes keeps no lifted value
             # (later readers name the register through the lifter's state, the exact pin)
-            self.new('scc', 0, 1, 'I1', f'Raw {{ text: "{txt}", reads: [{rd}], ty: I1, scalar: true, dwords: 1 }}')
+            c = self.new('scc', 0, 1, 'I1', f'Raw {{ text: "{txt}", reads: [{rd}], ty: I1, scalar: true, dwords: 1 }}')
             if has_dst:
+                # the register the instruction writes too: a ghost definition (no instruction) ordered after it
                 f, a, n, _ = regs[0]
-                for i in range(n):
-                    self.state.pop((f, a + i), None)
+                ty = 'I32' if n == 1 else {2: 'Ptr', 4: 'Rsrc', 8: 'Sgpr8'}.get(n) if f == 's' else isa_lift.FRAG.get(n)
+                self.new(f, a, n, ty, f'Raw {{ text: "", reads: [Val({c})], ty: {ty}, scalar: {"true" if f == "s" else "false"}, dwords: {n} }}')
             return True
         if has_dst:
             f, a, n, _ = regs[0]
             ty = 'I32' if n == 1 else isa_lift.FRAG.get(n)
+            if f == 's' and n > 1:
+                # an SGPR tuple: the scalar tuple types (their words are read in place: PtrLo / PtrHi)
+                ty = {2: 'Ptr', 4: 'Rsrc', 8: 'Sgpr8'}.get(n)
             if ty is None or (f == 's' and n not in (1, 2, 4, 8)):
                 return False
             first = self.new(f, a, n, ty, f'Raw {{ text: "{txt}", reads: [{rd}], ty: {ty}, scalar: {"true" if f == "s" else "false"}, dwords: {n} }}')
@@ -200,7 +219,7 @@ class Lifter(isa_lift.Lifter):
                 self.new(f2, a2, n2, ty2, f'Raw {{ text: "", reads: [Val({first})], ty: {ty2}, scalar: false, dwords: {n2} }}')
         else:
             self.stmt(f'Raw {{ text: "{txt}", reads: [{rd}] }}')
-        if op.startswith(self.SCC_WRITERS):
+        if op.startswith(self.SCC_WRITERS) and not op.startswith(('s_add_nc', 's_sub_nc')):
             # SCC now holds the raw instruction's result: no lifted compare stands for it any more
             self.state.pop(('scc', 0), None)
         return True
@@ -260,7 +279,9 @@ class Lifter(isa_lift.Lifter):
         if scaled:
             sa, sb = self.src(t[4], 'I32'), self.src(t[5], 'I32')
             sc = f'Some(WmmaScale {{ sa: {sa}, sb: {sb}, b_row1: {"true" if any("MATRIX_SCALE_ROW1" in x for x in m) else "false"} }})'
-        self.dst(t[0], isa_lift.FRAG[nd], f'Wmma {{ kind: {kind}, a: {a}, b: {b}, c: {c}, scale: {sc} }}')
+        w = next((x[6:].split('/') for x in m if x.startswith('words:')), None)
+        raw = 'None' if w is None or '--wmma-no-words' in sys.argv else 'Some([' + ', '.join(str(int(x, 16)) for x in w) + '])'
+        self.dst(t[0], isa_lift.FRAG[nd], f'Wmma {{ kind: {kind}, a: {a}, b: {b}, c: {c}, scale: {sc}, raw: {raw} }}')
         return True
 
     def h_v_wmma_scale_f32_32x16x128_f4(self, t, m, op):
@@ -289,6 +310,31 @@ for _p, _n in [('lt', 'Lt'), ('le', 'Le'), ('gt', 'Gt'), ('ge', 'Ge'), ('eq', 'E
         setattr(Lifter, f'h_s_cmp_{_p}_{_t}', _scmp(_n, _tn))
 
 
+_defs_uses_950 = isa_lift.defs_uses
+NO_DST_1250 = ('tensor_', 's_setreg', 's_wait', 's_prefetch', 's_version', 'global_prefetch', 's_set_vgpr_msb', 's_code_end', 's_bitcmp',
+               's_sleep', 'v_nop')
+
+
+def defs_uses(op, args):
+    """isa_lift.defs_uses for the gfx1250 forms (the verbatim text and the decoded modifiers are not operands)."""
+    args = args.split(' ||| ', 1)[0]
+    args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:')) and w != 'scc_live')
+    t, m = isa_lift.toks(args)
+    rr = lambda tok: [(r[0], r[1] + i) for r in [isa_lift.reg(tok)] if r for i in range(r[2])]
+    if op.startswith(NO_DST_1250):
+        u = set()
+        for x in t:
+            u |= set(rr(x))
+        return set(), u
+    d, u = _defs_uses_950(op, args)
+    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk')):
+        u |= d
+    if op.startswith('v_swap') and len(t) > 1:
+        d |= set(rr(t[1]))
+        u |= set(rr(t[0]))
+    return d, u
+
+
 def entry_hw(L, live):
     """gfx1250 entry: v0 = the packed workitem ids (x [9:0], y [19:10], z [29:20]), s[0:1] = the kernarg segment, s2.. = preloaded kernarg
     dwords."""
@@ -305,8 +351,17 @@ def main():
     isa_lift.parse = parse
     isa_lift.Lifter = Lifter
     isa_lift.ENTRY_HW = entry_hw
-    isa_lift.RTY.update({'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'U32', 'WorkitemIdPacked': 'U32'})
+    isa_lift.defs_uses = defs_uses
+    isa_lift.RTY.update({'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
+    # the author's kernel-descriptor directives (--kd name=value,...): `kd "name" value` header lines after `exact`
+    if '--kd' in sys.argv and '--out' in sys.argv:
+        out = sys.argv[sys.argv.index('--out') + 1]
+        kd = [x.split('=') for x in sys.argv[sys.argv.index('--kd') + 1].split(',')]
+        txt = open(out).read().split('\n')
+        k = txt.index('exact') + 1 if 'exact' in txt else 3
+        txt[k:k] = [f'kd "{n}" {v}' for n, v in kd]
+        open(out, 'w').write('\n'.join(txt))
 
 
 if __name__ == '__main__':

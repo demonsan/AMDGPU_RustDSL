@@ -772,7 +772,9 @@ pub enum Op {
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
     /// gfx1250: D = A x B + C (`c: None`: zero accumulator) of the WMMA `kind`; result `kind.acc_ty()`; `scale` exactly for the scaled kinds
-    Wmma { kind: WmmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<WmmaScale> },
+    /// `raw`: exact replays only, the author's instruction words (their reuse hints and the fields an assembler fills differently); the
+    /// operands still state the dataflow and must name the registers the words encode
+    Wmma { kind: WmmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<WmmaScale>, raw: Option<Vec<u32>> },
     /// Exact mode only: one instruction emitted VERBATIM (`text`, the author's spelling and encoding), for forms the DSL does not have yet.
     /// It reads `reads` and writes the value (`dwords` registers, SGPRs when `scalar`), pinned like every exact value. The compiler knows
     /// nothing else of it: no folding, no reordering (a pinned instruction), and its other effects (SCC, a second destination) are the
@@ -2940,11 +2942,11 @@ impl FnBuilder {
     #[track_caller]
     /// gfx1250 WMMA (unscaled kinds).
     pub fn wmma(&mut self, kind: WmmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
-        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: None })
+        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: None, raw: None })
     }
     /// gfx1250 block-scaled WMMA.
     pub fn wmma_scaled(&mut self, kind: WmmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>, s: WmmaScale) -> ValueId {
-        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: Some(s) })
+        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: Some(s), raw: None })
     }
     pub fn mfma(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
         self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: None })
@@ -3945,7 +3947,7 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
-        Op::Wmma { kind, a, b, c, scale } => e.extend(check_wmma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::Wmma { kind, a, b, c, scale, .. } => e.extend(check_wmma(f, *kind, *a, *b, *c, scale.as_ref())),
         Op::Raw { text, dwords, .. } => {
             if !f.exact {
                 e.push(format!("raw instruction `{text}` outside exact mode"));
@@ -5333,6 +5335,9 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                             _ => false,
                         },
                         Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) | Op::MovS { .. } => true,
+                        // a verbatim instruction: uniform exactly when it writes SGPRs (the author's choice of instruction)
+                        Op::Raw { scalar, .. } => *scalar,
+                        Op::Wmma { .. } => false,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
                         Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)

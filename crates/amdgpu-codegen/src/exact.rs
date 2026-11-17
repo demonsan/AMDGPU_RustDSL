@@ -196,6 +196,11 @@ pub fn verify_final(m: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> 
 /// (the hazard passes key their value-level rules on the values).
 pub fn verify_final_with(m: &MFunction, waits_view: &MFunction, a: &crate::regalloc::Alloc, strict: bool) -> Vec<Violation> {
     let mut out = Vec::new();
+    // gfx1250: the wait and hazard passes are gfx950's (vmcnt / lgkmcnt, the gfx950 hazard table); the gfx1250 counter model and hazard rows
+    // are G2. Until then an exact gfx1250 kernel's waits and hazards are the author's, unchecked (the register checks still run).
+    if crate::target::cur().name == "gfx1250" {
+        return out;
+    }
     {
         let mut c = waits_view.clone();
         crate::sched::waits::insert_waits(&mut c);

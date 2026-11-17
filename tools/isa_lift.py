@@ -1497,6 +1497,11 @@ def emit_kernel(path, exact, plan=None):
             if k == 'block':
                 body = block(nd[1])
                 nxt = nodes[i + 1] if i + 1 < len(nodes) else None
+                if nxt and nxt[0] == 'continue' and body[-1][1].startswith('s_cbranch'):
+                    # a bottom-tested loop: the conditional back edge continues, its fall-through leaves the loop
+                    L.lines.append(f'BreakIf {{ cond: {cond_for(L, body, False)} }}')
+                    i += 2
+                    continue
                 if nxt and nxt[0] == 'if':
                     c = cond_for(L, body, False)
                     n_anchor = len(anchors)

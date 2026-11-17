@@ -194,6 +194,11 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
             for (k, st) in stmts.iter().enumerate() {
                 let Stmt::Let { dst, op } = st else { continue };
                 let rd = readers.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
+                // an unpinned add every reader may evaluate in place (no set_var of its operands in between): foldable into an access's
+                // offset even when its operand is a variable
+                if matches!(op, Op::AddI32(..)) && !pinned.contains(dst) && !rd.is_empty() && rd.iter().all(|&r| movable(k, r, op)) {
+                    lw.fold_ok.insert(*dst);
+                }
                 match op {
                     // read by set_m0 (and otherwise only by the DMAs' LDS-address operand, which is the verifier's view of M0)
                     Op::AddI32(..) if !pinned.contains(dst) && rd.iter().any(|&r| matches!(&stmts[r], Stmt::SetM0 { .. })) && rd.iter().all(|&r| matches!(&stmts[r], Stmt::SetM0 { .. } | Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. })) && rd.iter().filter(|&&r| matches!(&stmts[r], Stmt::SetM0 { .. })).all(|&r| movable(k, r, op)) => {
@@ -556,6 +561,8 @@ struct Lowerer {
     mask_vcc: HashSet<ValueId>,
     /// exact mode: I1 values held in SCC (scalar compares read by s_cselect / s_cbranch_scc*)
     scc_i1: HashSet<ValueId>,
+    /// exact mode: unpinned adds whose readers may evaluate them in place (offset folding through a variable operand)
+    fold_ok: HashSet<ValueId>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
     /// exact mode: the values the author pinned
@@ -675,6 +682,7 @@ impl Lowerer {
             mask_i1: HashSet::new(),
             mask_vcc: HashSet::new(),
             scc_i1: HashSet::new(),
+            fold_ok: HashSet::new(),
             m0_adds: HashSet::new(),
             e64_next: false,
             exact_pinned: HashSet::new(),
@@ -1799,15 +1807,16 @@ impl Lowerer {
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
                     // (the folded add's other operand is read HERE, at the access: only an SSA value whose register no `set_var` can
                     // rewrite in between - not a variable, nor a value living in a variable's register)
+                    let in_place = self.fold_ok.contains(&v);
                     if let Some(k) = self.const_of(y) {
-                        if k >= 0 && off + k < 65536 && self.stable_at_use(x) {
+                        if k >= 0 && off + k < 65536 && (self.stable_at_use(x) || in_place) {
                             off += k;
                             cur = x;
                             continue;
                         }
                     }
                     if let Some(k) = self.const_of(x) {
-                        if k >= 0 && off + k < 65536 && self.stable_at_use(y) {
+                        if k >= 0 && off + k < 65536 && (self.stable_at_use(y) || in_place) {
                             off += k;
                             cur = y;
                             continue;
@@ -3974,7 +3983,7 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
-            Op::Wmma { kind, a, b, c, scale } => {
+            Op::Wmma { kind, a, b, c, scale, raw } => {
                 tdm_target()?;
                 let (mop, zmop) = match kind {
                     amdgpu_dsl::WmmaKind::Fp8_16x16x64 => (MOp::VWmmaF32_16x16x64Fp8, MOp::VWmmaF32_16x16x64Fp8Z),
@@ -3999,6 +4008,16 @@ impl Lowerer {
                     let sb = self.as_v1(s.sb)?;
                     self.touch(&[Src::Reg(sa), Src::Reg(sb)]);
                     inst = inst.srcreg(sa).srcreg(sb).imm(s.b_row1 as i64);
+                }
+                if let Some(w) = raw {
+                    // exact replay: the author's words (imm bit 1), after the register operands
+                    if !self.exact {
+                        return Err("wmma: instruction words outside exact mode".into());
+                    }
+                    inst.imm |= 2;
+                    for x in w {
+                        inst = inst.src(Src::Imm(*x as i64));
+                    }
                 }
                 self.push(inst);
                 self.val.insert(dst, d);
@@ -5550,6 +5569,20 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                     }
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        // gfx1250: a preloaded kernarg word, a trap-temporary read; exact: a verbatim SALU instruction
+                        Op::KernargPreload { .. } | Op::ReadTtmp { .. } => true,
+                        Op::Raw { scalar, ty, .. } => {
+                            if *scalar && *ty == DType::I1 {
+                                // an SCC result: a uniform condition
+                                ucond.insert(*dst);
+                                false
+                            } else {
+                                *scalar
+                            }
+                        }
+                        // exact mode: the author's SALU forms of the generic integer ops
+                        Op::Bin(_, a, b) if f.exact => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        Op::Tri(_, a, b, c) if f.exact => is_u(a, &u, &uvars) && is_u(b, &u, &uvars) && is_u(c, &u, &uvars),
                         // (r1) the uniform pointer / descriptor values a pointer / descriptor variable may hold, and the undefined initial value
                         Op::Undef { .. } | Op::KernargPtr { .. } | Op::KernargSegment => true,
                         Op::PtrAdd { base, byte_off } => is_u(base, &u, &uvars) && is_u(byte_off, &u, &uvars),

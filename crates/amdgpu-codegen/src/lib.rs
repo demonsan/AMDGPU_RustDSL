@@ -153,8 +153,10 @@ fn lower_and_allocate_ladder(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction
         let inner_start = hint.filter(|h| h.0 as usize == oi).map_or(0, |h| h.1);
         match lower_and_allocate_with(f, extra, inner_start) {
             Ok((m, a, rung)) => {
-                if m.lds_bytes > 160 * 1024 {
-                    return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", m.lds_bytes));
+                // the per-workgroup LDS of the target (gfx950 160 KiB, gfx1250 320 KiB)
+                let limit = if crate::target::cur().name == "gfx1250" { 320 * 1024 } else { 160 * 1024 };
+                if m.lds_bytes > limit {
+                    return Err(format!("LDS spill needs {} bytes of LDS (limit {limit})", m.lds_bytes));
                 }
                 LAST_RUNG.with(|c| c.set((oi as u8, rung)));
                 return Ok((m, a));

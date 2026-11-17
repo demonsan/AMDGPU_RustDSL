@@ -15,6 +15,48 @@ fn round_up(v: u32, m: u32) -> u32 {
     }
 }
 
+/// A line's VGPR operands as encoded under an MSB window: `vN` / `v[a:b]` with N, a, b mod 256 (a tuple never crosses a window).
+fn vgpr_window(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < b.len() {
+        let prev_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if b[i] == b'v' && prev_ok && i + 1 < b.len() && (b[i + 1].is_ascii_digit() || b[i + 1] == b'[') {
+            // vN or v[a:b]
+            let mut j = i + 1;
+            if b[j] == b'[' {
+                let close = line[j..].find(']').map(|k| j + k);
+                if let Some(c) = close {
+                    let inner = &line[j + 1..c];
+                    if let Some((x, y)) = inner.split_once(':') {
+                        if let (Ok(x), Ok(y)) = (x.parse::<u32>(), y.parse::<u32>()) {
+                            out.push_str(&format!("v[{}:{}]", x % 256, x % 256 + (y - x)));
+                            i = c + 1;
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let end_ok = j >= b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+                if end_ok {
+                    if let Ok(n) = line[i + 1..j].parse::<u32>() {
+                        out.push_str(&format!("v{}", n % 256));
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 thread_local! {
     /// the verbatim instruction texts of the function being emitted (`RegHints::raw_texts`; `inst_lines` sees one instruction only)
     static RAW_TEXTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -35,6 +77,8 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "system_sgpr_workgroup_id_x", "system_sgpr_workgroup_id_y", "system_sgpr_workgroup_id_z", "next_free_vgpr", "next_free_sgpr",
     "memory_ordered", "forward_progress", "float_denorm_mode_32", "float_denorm_mode_16_64", "named_barrier_count", "round_robin_scheduling",
     "fp16_overflow", "group_segment_fixed_size", "kernarg_size",
+    // not a descriptor field: the `s_code_end` words after the kernel's code (an exact replay's padding, as the author's toolchain wrote it)
+    "code_end_pad",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
@@ -50,7 +94,10 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     if crate::regalloc::agpr_count(m, a) > 0 {
         return Err(format!("{}: gfx1250 has no AGPRs (the allocation used some)", m.name));
     }
-    if a.max_v > t.regs.vgpr.window.as_ref().map_or(256, |w| w.direct) {
+    // exact mode with the author's `s_set_vgpr_msb`: the VGPRs above v255 are addressed through the author's MSB window (the emitted number
+    // is the encoded one, physical mod 256; which window each operand uses is the author's s_set_vgpr_msb, kept verbatim and in order)
+    let msb_window = m.exact && m.blocks.iter().any(|b| b.insts.iter().any(|i| i.op == MOp::SSetVgprMsb));
+    if a.max_v > t.regs.vgpr.window.as_ref().map_or(256, |w| w.direct) && !msb_window {
         return Err(format!("{}: {} VGPRs; G1 allocates in the directly encodable v0..v255 only (the MSB window is G2)", m.name, a.max_v));
     }
     let mut out = String::new();
@@ -74,6 +121,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? {
+                let line = if msb_window && inst.op != MOp::RawInst { vgpr_window(&line) } else { line };
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
@@ -100,13 +148,17 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
             Term::Endpgm => out.push_str("    s_endpgm\n"),
         }
     }
+    for _ in 0..kdv("code_end_pad").unwrap_or(0) {
+        out.push_str("    s_code_end\n");
+    }
     out.push_str(&format!(".size {}, .-{}\n", m.name, m.name));
 
     let vgpr = kdv("next_free_vgpr").map(|v| v as u32).unwrap_or_else(|| round_up(a.max_v.max(1), t.emit.vgpr_granule));
     let sgpr = kdv("next_free_sgpr").map(|v| v as u32).unwrap_or(a.max_s.max(1));
     let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(0);
     let d = |k: &str, dflt: i64| kdv(k).unwrap_or(dflt);
-    out.push_str("\n.p2align 6\n");
+    // (the kernel descriptor's alignment padding goes into .text; an exact replay pads with the author's s_code_end instead)
+    out.push_str(if kdv("code_end_pad").is_some() { "\n" } else { "\n.p2align 6\n" });
     out.push_str(&format!(".amdhsa_kernel {}\n", m.name));
     out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", d("group_segment_fixed_size", m.lds_bytes as i64)));
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
@@ -227,6 +279,11 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 MOp::VWmmaScaleF32_32x16x128F4 => ("v_wmma_scale_f32_32x16x128_f4", 16, 8, 16, true, false),
                 _ => ("v_wmma_scale_f32_32x16x128_f4", 16, 8, 16, true, true),
             };
+            if inst.imm & 2 != 0 {
+                // the author's words, verbatim (an exact replay)
+                let w: Vec<String> = inst.srcs.iter().filter_map(|s| if let Src::Imm(x) = s { Some(format!("{:#010x}", *x as u32)) } else { None }).collect();
+                return Ok(vec![format!(".long {} // {mn} (verbatim words)", w.join(", "))]);
+            }
             let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
             let t = |p: u32, n: u32| format!("v[{}:{}]", p, p + n - 1);
             let d = a.phys[inst.dst.ok_or("wmma without a destination")? as usize];

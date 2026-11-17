@@ -199,7 +199,7 @@ impl FromIr for Op {
             "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
-            "Wmma" => { v.expect_struct("Wmma")?; Ok(Op::Wmma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
+            "Wmma" => { v.expect_struct("Wmma")?; Ok(Op::Wmma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "Raw" => { v.expect_struct("Raw")?; Ok(Op::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)?, ty: FromIr::from_ir(v.field("ty")?)?, scalar: FromIr::from_ir(v.field("scalar")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "KernargSegment" => { v.expect_unit("KernargSegment")?; Ok(Op::KernargSegment) }
             "AddK" => { v.expect_struct("AddK")?; Ok(Op::AddK { a: FromIr::from_ir(v.field("a")?)?, k: FromIr::from_ir(v.field("k")?)? }) }
@@ -338,7 +338,7 @@ impl IrIds for Op {
             Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
-            Op::Wmma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
+            Op::Wmma { kind, a, b, c, scale, raw } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Op::Raw { text, reads, ty, scalar, dwords } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*scalar), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Op::KernargSegment => {}
             Op::AddK { a, k } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*k), fv, fr); }
