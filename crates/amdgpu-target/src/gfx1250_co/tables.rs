@@ -212,6 +212,7 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("v_sub_nc_u32", "VOP2", 38),
     ("v_subrev_f32", "VOP2", 5),
     ("v_subrev_nc_u32", "VOP2", 39),
+    ("v_swap_b32", "VOP1", 101),
     ("v_trunc_f32", "VOP1", 33),
     ("v_wmma_f32_16x16x128_fp8_fp8", "VOP3P", 128),
     ("v_wmma_f32_16x16x32_bf16", "VOP3P", 98),
