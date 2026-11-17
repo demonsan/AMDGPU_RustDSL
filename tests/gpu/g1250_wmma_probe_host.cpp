@@ -135,13 +135,18 @@ int main(int argc, char** argv) {
     for (int l = 0; l < 32; l++)
         for (int v = 0; v < nc; v++) {
             const int h = l / 16, n = l % 16, m = f4 ? (v % 8) + 8 * h + 16 * (v / 8) : v + 8 * h;
-            double ref = C[m * N + n];
-            for (int k = 0; k < K; k++) ref += (double)val(true, m, k) * val(false, n, k);
+            double ref = C[m * N + n], mag = std::fabs(ref);
+            for (int k = 0; k < K; k++) {
+                const double p = (double)val(true, m, k) * val(false, n, k);
+                ref += p;
+                mag += std::fabs(p);
+            }
             float got;
             std::memcpy(&got, &ld[l * nc + v], 4);
-            const double err = std::fabs(got - ref) / std::max(1.0, std::fabs(ref));
+            // relative to the magnitude of the dot product (the hardware's fp8 accumulation is not exact fp32; a layout error is O(1))
+            const double err = std::fabs(got - ref) / std::max(1.0, mag);
             maxe = std::max(maxe, err);
-            if (!(err < 1e-4)) {
+            if (!(err < 1e-3)) {
                 bad++;
                 if (shown++ < 6) std::printf("  lane %d value %d (m %d, n %d): got %g ref %g\n", l, v, m, n, got, ref);
             }
