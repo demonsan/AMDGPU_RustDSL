@@ -134,7 +134,33 @@ def parse(text):
     return out
 
 
+def selftest():
+    """Synthetic lines built from the public CDNA5 VIMAGE encoding (no vendor content): a TDM load whose dword1 decodes as a 4-byte instruction,
+    a banked VGPR operand, an opaque 8-byte run."""
+    w0 = (0b110100 << 26) | (196 << 14)                  # DMASK = 0, DIM = 0
+    w1 = (2 << 20)                                       # TH = 2, SCOPE = 0, VADDR4 = 0
+    w2 = 0x7C7C2420                                      # VADDR0 = s32, VADDR1 = s36, VADDR2 / 3 = NULL
+    text = '\n'.join([
+        f'\t.long 0x{w0:08x}                       // 000000000100: {w0:08X}',
+        f'\tv_cndmask_b32_e32 v0, s0, v0             // 000000000104: {w1:08X}',
+        f'\tv_cmp_ge_u16_e32 vcc_lo, s32, v18.l      // 000000000108: {w2:08X}',
+        '\tds_load_b128 v[64:67] /*v[832:835]*/, v76 offset:7168 // 00000000010C: DBFC1C00 4000004C',
+        '\t.long 0xcc880064                       // 000000000114: CC880064',
+        '\tv_min_num_f64_e32 v[1:2], v[8:9], v[8:9] // 000000000118: 1A021108',
+        '\ts_endpgm                               // 00000000011C: BFB00000',
+    ])
+    ins = parse(text)
+    assert [x['op'] for x in ins] == ['tensor_load_to_lds', 'ds_load_b128', 'raw', 's_endpgm'], [x['op'] for x in ins]
+    t0 = ins[0]
+    assert t0['args'] == ['s32', 's36'] and t0['mods'] == ['th:2', 'scope:0'] and t0['words'] == [w0, w1, w2], t0
+    assert ins[1]['args'][0] == 'v[832:835]' and ins[1]['enc_args'][0] == 'v[64:67]', ins[1]
+    assert ins[2]['words'] == [0xCC880064, 0x1A021108], ins[2]
+    print('selftest ok')
+
+
 def main():
+    if '--selftest' in sys.argv:
+        return selftest()
     src = sys.argv[1]
     o = sys.argv[sys.argv.index('--out') + 1] if '--out' in sys.argv else None
     ins = parse(open(src, encoding='utf-8', errors='replace').read())
