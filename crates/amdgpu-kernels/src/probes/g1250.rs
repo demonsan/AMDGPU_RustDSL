@@ -269,5 +269,6 @@ pub fn probe_g1250_barriers() -> Function {
     b.store_global(q, 0, tid, MemTy::B32, false);
     let mut f = b.finish();
     f.kd.push(("cluster_dims".into(), 2));
+    f.kd.push(("named_barrier_count".into(), 1));
     f
 }
