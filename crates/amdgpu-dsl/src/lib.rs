@@ -3661,6 +3661,16 @@ impl FnBuilder {
 
     /// `s_barrier`.
     #[track_caller]
+    /// gfx1250: `s_barrier_signal id` (-1 work-group, -3 cluster, 1..=16 named); the verifier (`gpu_verify_1250`) checks the id.
+    pub fn barrier_signal(&mut self, id: i32) {
+        self.push_stmt(Stmt::BarrierSignal { id });
+    }
+
+    /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
+    pub fn barrier_wait(&mut self, id: i32) {
+        self.push_stmt(Stmt::BarrierWait { id });
+    }
+
     /// gfx1250: wait for the tensor operations of this wave (at most `count` outstanding).
     pub fn wait_tensor(&mut self, count: u8) {
         self.push_stmt(Stmt::WaitTensor { count });

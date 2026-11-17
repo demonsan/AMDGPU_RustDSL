@@ -69,6 +69,8 @@ pub fn probe_g1250_tdm_with(raw: Option<[u32; 3]>) -> Function {
         b.arg(&format!("d{k}"), DType::I32, 16 + 4 * k, 4);
     }
     b.arg_tensor("out", Ext::c(64 * 4));
+    // host contract: group 1 word 0 (kernarg offset 32) carries no multicast mask (low 16 bits zero): the data-size field only (docs/gfx1250-hang-rules.md GV-1250-MCAST)
+    b.ka_one_of(32, &[0, 0x10000, 0x20000, 0x30000]);
     b.lds(4096);
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let w: Vec<Opnd> = (0..12u32).map(|k| Opnd::Val(b.let_(Op::KernargI32 { offset: 16 + 4 * k }))).collect();
