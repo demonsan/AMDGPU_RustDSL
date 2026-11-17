@@ -349,6 +349,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
+    "v_mad_u64_u32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
@@ -372,6 +373,28 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // wave32 lane masks are one SGPR: an SGPR pair in a mask position is its low register; exec moves are 32-bit
+    let lo = |o: &str| -> String {
+        match o.strip_prefix("s[").and_then(|r| r.strip_suffix(']')).and_then(|r| r.split_once(':')) {
+            Some((a, _)) => format!("s{a}"),
+            None => o.to_string(),
+        }
+    };
+    let ops: Vec<&str> = if rest.is_empty() { vec![] } else { rest.split(", ").collect() };
+    if mn == "s_mov_b64" && ops.len() == 2 && (ops[0] == "exec" || ops[1] == "exec") {
+        let f = |o: &str| if o == "exec" { "exec_lo".to_string() } else { lo(o) };
+        return Ok(vec![format!("s_mov_b32 {}, {}", f(ops[0]), f(ops[1]))]);
+    }
+    if mn.starts_with("v_cmp_") && mn.ends_with("_e64") && !ops.is_empty() {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[0] = if o[0] == "vcc" { "vcc_lo".into() } else { lo(&o[0]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
+    if mn == "v_cndmask_b32_e64" && ops.len() == 4 {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[3] = if o[3] == "vcc" { "vcc_lo".into() } else { lo(&o[3]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
     if let Some((_, to)) = RENAMES.iter().find(|(f, _)| *f == mn) {
         let rest = wave32(rest);
         return Ok(vec![if rest.is_empty() { to.to_string() } else { format!("{to} {rest}") }]);
