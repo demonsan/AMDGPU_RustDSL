@@ -703,6 +703,53 @@ fn pos_tdm_drain() {
     asm_positive(&base_asm());
 }
 
+/// A ring-marked tensor load whose LDS address is computed like a cooperative stage: slot * `stride` + wave * `slice`, the slot a loop variable cycling 0 .. `slots`, a work-group of 128 (4 waves),
+/// a tile of `tile_bytes` bytes, `lds` bytes of LDS declared, a ring `r` of `slots` slots of `ring_stride` bytes from 0.
+fn tdm_lds_kernel(lds: u32, slots: u32, ring_stride: i64, stride: i32, slice: i32, tile_bytes: i32) -> Function {
+    let mut b = FnBuilder::new("hr_tdm_lds", 128);
+    b.lds(lds);
+    b.lds_ring("r", 0, ring_stride, slots);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let off = b.let_(Op::MulI32(Opnd::Var(vars[0]), Opnd::I32(stride)));
+    let wl = b.let_(Op::MulI32(Opnd::Val(w), Opnd::I32(slice)));
+    let lds_addr = b.let_(Op::AddI32(Opnd::Val(off), Opnd::Val(wl)));
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::Val(lds_addr), Opnd::I32(0), Opnd::I32((2u32 << 30) as i32)] });
+    let g1 = b.sgpr_cat8([Opnd::I32(0), Opnd::I32(4096 << 16), Opnd::I32(0), Opnd::I32(tile_bytes << 16), Opnd::I32(1), Opnd::I32(4096), Opnd::I32(0), Opnd::I32(0)]);
+    b.tile_produce("r", Opnd::Var(vars[0]), Opnd::I32(0));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.tile_end();
+    let nxt = b.add_i32(vars[0], Opnd::I32(1));
+    let wrap = b.cmp(CmpPred::Lt, CmpTy::I32, nxt, Opnd::I32(slots as i32));
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wrap), a: Opnd::Val(nxt), b: Opnd::I32(0) });
+    b.set_var(vars[0], s2);
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, s2, n);
+    b.break_if(c);
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn mut_tdm_lds_extent() {
+    // the tile is larger than a ring slot (a slot is 1024 bytes, the tile 2048)
+    ir_mutation(&tdm_lds_kernel(8192, 3, 1024, 1024, 0, 2048), "GV-1250-TDM-DESC");
+    // the waves' slices run past the slot: 4 waves x 512 + 512 > 1024
+    ir_mutation(&tdm_lds_kernel(8192, 3, 1024, 1024, 512, 512), "GV-1250-TDM-DESC");
+    // the last slot's tile ends beyond the declared LDS (3 slots of 1024 declared as 2048)
+    ir_mutation(&tdm_lds_kernel(2048, 3, 1024, 1024, 0, 1024), "GV-1250-TDM-DESC");
+}
+
+#[test]
+fn pos_tdm_lds_extent() {
+    // every wave loads its 256-byte slice of the 1024-byte slot, all slots inside the 3072 declared bytes
+    ir_positive(&tdm_lds_kernel(3072, 3, 1024, 1024, 256, 256));
+    ir_positive(&tdm_lds_kernel(4096, 3, 1024, 1024, 0, 1024));
+}
+
 // GV-1250-DPP
 
 #[test]

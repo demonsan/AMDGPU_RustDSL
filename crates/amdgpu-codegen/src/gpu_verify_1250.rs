@@ -281,6 +281,116 @@ fn group_words(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Option<u32>> {
     }
 }
 
+/// The range [lo, hi] a value can take over every work-item and every execution, when it is built from constants, the work-item id (`wg` work-items), wave-uniform reads of it and the ring slot
+/// the surrounding marker names (`slot`: the operand and the number of slots); `None` when not bounded. Interval arithmetic; variables are bounded only by their single non-recursive assignment.
+fn range_i(o: &Opnd, cx: &EvCtx, wg: i64, slot: Option<(&Opnd, i64)>, depth: u32) -> Option<(i64, i64)> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some((so, n)) = slot {
+        if so == o && !matches!(o, Opnd::I32(_)) {
+            return Some((0, n - 1));
+        }
+    }
+    let go = |x: &Opnd| range_i(x, cx, wg, slot, depth + 1);
+    let corners = |a: (i64, i64), b: (i64, i64), f: &dyn Fn(i64, i64) -> i64| -> (i64, i64) {
+        let c = [f(a.0, b.0), f(a.0, b.1), f(a.1, b.0), f(a.1, b.1)];
+        (*c.iter().min().unwrap(), *c.iter().max().unwrap())
+    };
+    match o {
+        Opnd::I32(c) => Some((*c as i64, *c as i64)),
+        Opnd::Var(v) => {
+            let asg = cx.vars.get(v)?;
+            let mut r: Option<(i64, i64)> = None;
+            for a in asg {
+                if matches!(a, Opnd::Val(u) if matches!(cx.defs.get(u), Some(Op::Undef { .. }))) {
+                    continue;
+                }
+                let x = go(a)?;
+                r = Some(match r {
+                    None => x,
+                    Some(y) => (x.0.min(y.0), x.1.max(y.1)),
+                });
+            }
+            r
+        }
+        Opnd::Val(v) => match cx.defs.get(v)? {
+            Op::ConstI32(c) => Some((*c as i64, *c as i64)),
+            Op::WorkitemId => Some((0, wg - 1)),
+            Op::ReadFirstLane(x) | Op::MovS { a: x, .. } | Op::MovV { a: x, .. } => go(x),
+            Op::AddI32(a, b) => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0 + y.0, x.1 + y.1))
+            }
+            Op::MulI32(a, b) => Some(corners(go(a)?, go(b)?, &|p, q| p * q)),
+            Op::ShlI32(a, Opnd::I32(k)) if (0..31).contains(k) => {
+                let x = go(a)?;
+                Some((x.0 << k, x.1 << k))
+            }
+            Op::LshrI32(a, Opnd::I32(k)) if (0..32).contains(k) => {
+                let x = go(a)?;
+                if x.0 < 0 {
+                    return None;
+                }
+                Some((x.0 >> k, x.1 >> k))
+            }
+            Op::AndI32(a, Opnd::I32(m)) | Op::AndI32(Opnd::I32(m), a) if *m >= 0 => {
+                let x = go(a)?;
+                if x.0 >= 0 && x.1 <= *m as i64 {
+                    Some(x)
+                } else {
+                    Some((0, *m as i64))
+                }
+            }
+            Op::Select { a, b, .. } => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0.min(y.0), x.1.max(y.1)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// GV-1250-TDM-DESC, the LDS extent: a tensor operation's LDS tile (`lds_addr` .. + the tile's bytes) lies inside the LDS the kernel declares and, inside a ring marker, inside the ring the marker
+/// names (every slot the marker's slot operand can take). A destination the hardware silently drops or wraps is a protocol that waits for data that never arrives, or a read of garbage.
+fn lds_extent_check(f: &Function, cx: &EvCtx, marker: Option<(&str, &Opnd)>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
+    let w0 = group_words_ops(cx.defs, g0);
+    let w1 = group_words(cx.defs, g1);
+    let (Some(lds), true) = (w0.get(1), w1.len() == 8) else { return };
+    let (Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w1.first(), w1.get(3), w1.get(4)) else { return };
+    if a0 >> 20 & 1 != 0 {
+        return;   // padded: the footprint is larger than the tile (not modelled)
+    }
+    let esize = 1i64 << (a0 >> 16 & 3);
+    let (t0, t1, t2) = ((a3 >> 16) as i64, (a4 & 0xffff) as i64, (a4 >> 16) as i64);
+    let bytes = t0 * t1.max(1) * t2.max(1) * esize;
+    if t0 == 0 {
+        return;
+    }
+    let decl = marker.and_then(|(name, _)| f.contract.tiles.iter().find(|t| t.name == name));
+    let slot = marker.zip(decl).map(|((_, so), d)| (so, d.slots as i64));
+    let Some((lo, hi)) = range_i(lds, cx, f.workgroup_size as i64, slot, 0) else { return };
+    if f.lds_bytes > 0 && hi + bytes > f.lds_bytes as i64 {
+        viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can end beyond the {} bytes of LDS the kernel declares: an address at or beyond the allocation is silently dropped", f.lds_bytes));
+    }
+    if let Some(d) = decl {
+        let (rlo, rhi) = (d.base, d.base + d.slot_size * d.slots as i64);
+        if lo < rlo || hi + bytes > rhi {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can lie outside the ring `{}` ({rlo}..{rhi}) the marker names", d.name));
+        }
+    }
+}
+
+/// The compile-time-known words of a descriptor group as operands (group 0: the LDS address word may be a computed value).
+fn group_words_ops(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Opnd> {
+    let Opnd::Val(v) = o else { return Vec::new() };
+    match defs.get(v) {
+        Some(Op::RsrcCat { words }) => words.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// GV-1250-TDM-DESC: the fields of a tensor descriptor that are constants must be valid for a kernel (group 0: bits 1:0 valid count 0 / 1, bits 2 / 3 / 4 context-restore / store / volatile
 /// zero, bits 127:126 type 2; the tile written to LDS fits in the declared LDS).
 fn desc_check(f: &Function, defs: &HashMap<ValueId, Op>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
@@ -1116,10 +1226,19 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let kz = known_zero(f, &defs);
     let cluster = cluster_wgs(f);
     let named = kd_val(f, "named_barrier_count");
+    let vars_m = var_assignments(f);
+    let cxm = EvCtx { defs: &defs, vars: &vars_m };
+    let mut marker: Option<(String, Opnd)> = None;
     for (pos, st) in f.stmts().iter().enumerate() {
+        match st {
+            Stmt::TileProduce { tile, slot, .. } => marker = Some((tile.clone(), *slot)),
+            Stmt::TileConsume { .. } | Stmt::TileEnd => marker = None,
+            _ => {}
+        }
         match st {
             Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
+                lds_extent_check(f, &cxm, marker.as_ref().map(|(n, o)| (n.as_str(), o)), pos, g0, g1, &mut v);
                 let m = mcast_mask(f, &defs, &kz, g1);
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {
