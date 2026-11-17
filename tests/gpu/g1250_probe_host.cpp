@@ -291,10 +291,29 @@ static int run_tdm_ring(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_named: LDS exchange across 4 waves synchronised by named barrier 1; out[t] = 3 * ((t + 32) % 128).
+static int run_named(Kernel& k, const char* kn) {
+    uint32_t* dout;
+    HC(hipMalloc(&dout, 128 * 4));
+    HC(hipMemset(dout, 0xee, 128 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    long bad = 0;
+    for (int rep = 0; rep < 50; ++rep) {
+        k.launch(256, 128, args, kn);
+        std::vector<uint32_t> o(128);
+        HC(hipMemcpy(o.data(), dout, 128 * 4, hipMemcpyDeviceToHost));
+        for (int t = 0; t < 128; ++t) bad += o[t] != 3u * (uint32_t)((t + 32) % 128);
+    }
+    printf("named: 50 x 256 workgroups x 4 waves: bad=%ld %s\n", bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"waves\":4},\"bad\":%ld,\"ok\":%s}\n", kn, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : mode == "named" ? "probe_g1250_named" : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -311,6 +330,7 @@ int main(int argc, char** argv) {
     if (mode == "buffer") return run_buffer(k, kn);
     if (mode == "tdm2d") return run_tdm2d(k, kn);
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
+    if (mode == "named") return run_named(k, kn);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }

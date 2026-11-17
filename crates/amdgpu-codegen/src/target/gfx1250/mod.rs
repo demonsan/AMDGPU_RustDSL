@@ -29,6 +29,13 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     let (m, alloc) = crate::lower_and_allocate(f)?;
     // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
     crate::gpu_verify_1250::enforce(f, &m, &alloc)?;
+    // the LDS tile protocol (gpu_protocol: completion incl. the tensor operations' TENSORcnt, publication by barriers, slot reuse) of the
+    // kernel's declared tiles / rings
+    let proto = crate::gpu_verify::verify_ir_protocol(f);
+    let errs: Vec<String> = proto.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
+    if !errs.is_empty() {
+        return Err(format!("{}: tile protocol: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
+    }
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {

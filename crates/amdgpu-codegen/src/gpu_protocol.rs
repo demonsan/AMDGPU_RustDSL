@@ -39,6 +39,10 @@ enum Item {
     /// a tile marker opened an event here (the event's `start`)
     Open,
     Access { dma: bool },
+    /// gfx1250: a tensor (TDM) operation of this wave (in order with the wave's other tensor operations only; completion on TENSORcnt)
+    Tensor,
+    /// gfx1250 `s_wait_tensorcnt count`: completes the tensor operations of this wave except the `count` most recent ones
+    WaitTensor { ord: u32, count: u8 },
     /// `fence_release`: waits vmcnt(0)/lgkmcnt(0) (completion) and, with `wb`, writes L2 back (device-scope visibility of plain stores)
     Release { ord: u32 },
     /// `fence_acquire`: `inv` invalidates the non-coherent caches
@@ -57,6 +61,8 @@ struct Ev {
     last: usize,
     dma: bool,
     ds: bool,
+    /// gfx1250: the event's accesses are tensor operations (TDM: an LDS write for a load, an LDS read for a store)
+    tensor: bool,
     n_acc: usize,
     /// a global-memory region event (stores / loads), not LDS
     global: bool,
@@ -373,7 +379,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true, outer: self.outer };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -412,6 +418,30 @@ impl<'a> Sim<'a> {
                                 ev.coherent = false;
                             }
                         }
+                    }
+                }
+            }
+            // gfx1250 tensor operations: a load writes the LDS tile, a store reads it (asynchronously: complete on TENSORcnt)
+            if let Some(write) = match st {
+                Stmt::TensorLoadToLds { .. } => Some(true),
+                Stmt::TensorStoreFromLds { .. } => Some(false),
+                _ => None,
+            } {
+                match self.open {
+                    Some(e) if !self.evs[e].global && self.evs[e].produce == write => {
+                        self.items.push(Item::Tensor);
+                        let pos = self.items.len() - 1;
+                        let ev = &mut self.evs[e];
+                        ev.last = pos;
+                        ev.n_acc += 1;
+                        ev.tensor = true;
+                    }
+                    Some(e) => {
+                        let what = if self.evs[e].global { "a global-region".to_string() } else { format!("a tile_{}", if self.evs[e].produce { "produce" } else { "consume" }) };
+                        self.diag("GV-TILE-KIND", Severity::Error, i, format!("stmt {i}: a tensor {} is issued under {what} marker (stmt {})", if write { "load (LDS write)" } else { "store (LDS read)" }, self.evs[e].stmt));
+                    }
+                    None => {
+                        self.untagged.insert(i);
                     }
                 }
             }
@@ -466,6 +496,7 @@ impl<'a> Sim<'a> {
                 Stmt::FenceRelease { .. } => self.items.push(Item::Release { ord: self.ord }),
                 Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
                 Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
+                Stmt::WaitTensor { count } | Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Tensor, count } => self.items.push(Item::WaitTensor { ord: self.ord, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
                 // the combined s_waitcnt (exact mode): both counters
                 Stmt::WaitCnt { vm, lgkm } => {
@@ -650,7 +681,7 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
     let ord_of = |it: &Item, dflt: u32| match it {
-        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
+        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } | Item::WaitTensor { ord, .. } => *ord,
         _ => dflt,
     };
     // the event's DS accesses are complete at the first wait_lds(0) after its last access. Barriers in between do not matter for completion (the access
@@ -668,8 +699,25 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
         }
         None
     };
+    // tensor operations complete at the first s_wait_tensorcnt(n) after which at least n LATER tensor operations of this wave are in flight
+    let tensor_done = || -> Option<usize> {
+        let mut later = 0usize;
+        for (k, it) in items.iter().enumerate().skip(after) {
+            match it {
+                Item::Tensor => later += 1,
+                Item::WaitTensor { count, .. } if later >= *count as usize => return Some(k),
+                _ => {}
+            }
+        }
+        None
+    };
     if ev.produce {
-        let done = if ev.global {
+        let done = if ev.tensor {
+            match (tensor_done(), ev.ds) {
+                (Some(a), true) => ds_done().map(|b| a.max(b)),
+                (x, _) => x,
+            }
+        } else if ev.global {
             // COMPLETION of global writes: wait_vm(0) or a fence_release (which waits vmcnt(0) itself)
             find(&|it| matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. }))
         } else {
@@ -716,7 +764,16 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
         // consumer: its reads are complete at the retiring wait (wait_lds(0) for LDS; wait_vm(0) / a fence for global reads). The read's
         // lifetime is [issue phase, phase of the retiring wait]: reads may stay in flight ACROSS barriers (the vendor's V read-ahead) - the race check
         // then requires that no producer writes the slot in any phase of that window.
-        let d = if ev.global { find(&|it| matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. } | Item::Acquire { .. })) } else { ds_done() };
+        let d = if ev.tensor {
+            match (tensor_done(), ev.ds) {
+                (Some(a), true) => ds_done().map(|b| a.max(b)),
+                (x, _) => x,
+            }
+        } else if ev.global {
+            find(&|it| matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. } | Item::Acquire { .. }))
+        } else {
+            ds_done()
+        };
         match d {
             Some(d) => TraceInfo { done: Some(d), publish: None, done_ord: ord_of(&items[d], ev.ord), released: true },
             None => {
@@ -1913,7 +1970,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
