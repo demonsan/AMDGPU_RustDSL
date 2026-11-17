@@ -194,6 +194,32 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         // the split barrier of the workgroup (id -1)
         MOp::SBarrier => vec!["s_barrier_signal -1".to_string(), "s_barrier_wait -1".to_string()],
         MOp::SWaitTensor => vec![format!("s_wait_tensorcnt {:#x}", inst.imm)],
+        // the gfx1250 V#: base [56:0], num_records [101:57] (bytes, 45 bits), stride 0, type 0 (buffer)
+        MOp::SBufferRsrc | MOp::SBufferRsrcDyn => {
+            let d = a.phys[inst.dst.ok_or("dst")? as usize];
+            let src = |k: usize| -> Result<u32, String> {
+                match inst.srcs.get(k) {
+                    Some(Src::Reg(r)) => Ok(a.phys[*r as usize]),
+                    _ => Err("buffer descriptor operand".into()),
+                }
+            };
+            let b = src(0)?;
+            let mut v = vec![format!("s_mov_b32 s{d}, s{b}"), format!("s_and_b32 s{}, s{}, 0x1ffffff", d + 1, b + 1)];
+            if inst.op == MOp::SBufferRsrc {
+                let n = inst.imm as u32 as u64;
+                if n & 0x7f != 0 {
+                    v.push(format!("s_or_b32 s{}, s{}, {:#x}", d + 1, d + 1, ((n & 0x7f) << 25) as u32));
+                }
+                v.push(format!("s_mov_b32 s{}, {:#x}", d + 2, (n >> 7) as u32));
+            } else {
+                let n = src(1)?;
+                v.push(format!("s_lshl_b32 s{}, s{n}, 25", d + 3));
+                v.push(format!("s_or_b32 s{}, s{}, s{}", d + 1, d + 1, d + 3));
+                v.push(format!("s_lshr_b32 s{}, s{n}, 7", d + 2));
+            }
+            v.push(format!("s_mov_b32 s{}, 0", d + 3));
+            v
+        }
         MOp::SWaitCtr => {
             const MN: [&str; 7] = ["s_wait_loadcnt", "s_wait_storecnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_xcnt", "s_wait_asynccnt", "s_wait_tensorcnt"];
             let c = (inst.imm >> 8) as usize;
@@ -320,6 +346,22 @@ const RENAMES: &[(&str, &str)] = &[
     ("ds_write_b128", "ds_store_b128"),
     ("ds_write_b16", "ds_store_b16"),
     ("ds_write_b8", "ds_store_b8"),
+    ("buffer_load_dword", "buffer_load_b32"),
+    ("buffer_load_dwordx2", "buffer_load_b64"),
+    ("buffer_load_dwordx3", "buffer_load_b96"),
+    ("buffer_load_dwordx4", "buffer_load_b128"),
+    ("buffer_load_ushort", "buffer_load_u16"),
+    ("buffer_load_sshort", "buffer_load_i16"),
+    ("buffer_load_ubyte", "buffer_load_u8"),
+    ("buffer_load_sbyte", "buffer_load_i8"),
+    ("buffer_store_dword", "buffer_store_b32"),
+    ("buffer_store_dwordx2", "buffer_store_b64"),
+    ("buffer_store_dwordx3", "buffer_store_b96"),
+    ("buffer_store_dwordx4", "buffer_store_b128"),
+    ("buffer_store_short", "buffer_store_b16"),
+    ("buffer_store_byte", "buffer_store_b8"),
+    ("buffer_atomic_add", "buffer_atomic_add_u32"),
+    ("buffer_atomic_add_f32", "buffer_atomic_add_f32"),
     ("v_add_u32_e32", "v_add_nc_u32_e32"),
     ("v_add_u32_e64", "v_add_nc_u32_e64"),
     ("v_sub_u32_e32", "v_sub_nc_u32_e32"),
@@ -395,8 +437,34 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
         o[3] = if o[3] == "vcc" { "vcc_lo".into() } else { lo(&o[3]) };
         return Ok(vec![format!("{mn} {}", o.join(", "))]);
     }
+    // memory operands: gfx950 cache-policy bits have no gfx1250 spelling yet (only an atomic's return); a buffer's immediate soffset 0 is
+    // NULL; the LDS-DMA forms do not exist (async loads instead)
+    let mem = mn.starts_with("buffer_") || mn.starts_with("global_");
+    if mem {
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        if toks.iter().any(|x| matches!(*x, "sc0" | "sc1" | "nt" | "lds")) && !(mn.starts_with("buffer_atomic") && toks.contains(&"sc0")) {
+            return Err(format!("`{line}`: a gfx950 cache policy / LDS-DMA form (no gfx1250 spelling in G1)"));
+        }
+    }
     if let Some((_, to)) = RENAMES.iter().find(|(f, _)| *f == mn) {
-        let rest = wave32(rest);
+        let mut rest = wave32(rest);
+        if mn.starts_with("buffer_") {
+            let mut ops: Vec<String> = rest.split(", ").map(|s| s.to_string()).collect();
+            if ops.len() >= 4 {
+                let mut tail: Vec<String> = ops[3].split_whitespace().map(|s| s.to_string()).collect();
+                if tail.first().map(|s| s == "0") == Some(true) {
+                    tail[0] = "null".into();
+                }
+                // an atomic with return: gfx950 sc0 (glc) -> TH_ATOMIC_RETURN
+                for x in tail.iter_mut() {
+                    if x == "sc0" || x == "glc" {
+                        *x = "th:TH_ATOMIC_RETURN".into();
+                    }
+                }
+                ops[3] = tail.join(" ");
+            }
+            rest = ops.join(", ");
+        }
         return Ok(vec![if rest.is_empty() { to.to_string() } else { format!("{to} {rest}") }]);
     }
     // VOPC e32 writes vcc (vcc_lo on wave32); v_add_co / v_sub_co carry through vcc
