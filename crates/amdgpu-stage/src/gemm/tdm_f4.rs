@@ -23,6 +23,8 @@ pub struct F4Shape {
     pub wn: i32,
     pub tm: i32,
     pub tn: i32,
+    /// K sub-steps of 128 per ring slot (a slot holds `ks x 128` K elements: A / B rows of `64 ks` bytes, scale rows of `4 ks` bytes)
+    pub ks: i32,
 }
 
 impl F4Shape {
@@ -64,6 +66,9 @@ pub struct TdmF4Body {
     pub bbase: ValueId,
     pub sabase: ValueId,
     pub sbbase: ValueId,
+    /// this wave's byte offsets (LDS) of its slice of the A / B / A-scale / B-scale tile when the waves load cooperatively (each wave `rows / waves` rows; the global origins already carry the slice);
+    /// zero when every wave loads the whole tile
+    pub wl: [ValueId; 4],
     /// the loop-carried accumulators, tm x tn (bound by `bind_state`)
     pub acc: Vec<VarId>,
 }
@@ -80,6 +85,8 @@ impl PipeBody for TdmF4Body {
         let (ra, rb, rsa, rsb) = (self.a.at(slot), self.b.at(slot), self.sa.at(slot), self.sb.at(slot));
         let lds = |b: &mut FnBuilder, r: &amdgpu_tile::shared::SlotRef<'_>| Opnd::Val(b.bind_i32(r.base()));
         let (la, lb, lsa, lsb) = (lds(b, &ra), lds(b, &rb), lds(b, &rsa), lds(b, &rsb));
+        let wl = self.wl;
+        let (la, lb, lsa, lsb) = (Opnd::Val(b.add_i32(la, wl[0])), Opnd::Val(b.add_i32(lb, wl[1])), Opnd::Val(b.add_i32(lsa, wl[2])), Opnd::Val(b.add_i32(lsb, wl[3])));
         let g0a = tdm_group0(b, self.pa, oa, la);
         let g0b = tdm_group0(b, self.pb, ob, lb);
         let g0sa = tdm_group0(b, self.psa, osa, lsa);
@@ -116,50 +123,66 @@ impl PipeBody for TdmF4Body {
         let sh = self.sh;
         let (ra, rb, rsa, rsb) = (self.a.at(&t.cur), self.b.at(&t.cur), self.sa.at(&t.cur), self.sb.at(&t.cur));
         let (abase, bbase, sabase, sbbase) = (self.abase, self.bbase, self.sabase, self.sbbase);
-        // A: per 32-row block i of the wave: 16-row halves (rows 32 i + 16 half + m), K pieces at +0 and +32 bytes of the 64-byte row
-        let mut fa: Vec<Opnd> = Vec::new();
-        let mut sa: Vec<Opnd> = Vec::new();
-        ra.read(b, |b| {
-            for i in 0..sh.tm {
-                let mut parts: Vec<Opnd> = Vec::new();
-                for half in 0..2 {
+        let (arow, brow) = (64 * sh.ks, 64 * sh.ks);   // bytes per A / B row of the slot
+        let (srow_bytes, _) = (4 * sh.ks, 0);          // bytes per scale row of the slot
+        // the fragments of sub-step `s`: A (32 rows x 128): two ds_load_b128 per 16-row half, B (16 x 128): two; the scale words
+        struct Frags {
+            fa: Vec<Opnd>,
+            sa: Vec<Opnd>,
+            fb: Vec<Opnd>,
+            sb: Vec<Opnd>,
+        }
+        let load = |b: &mut FnBuilder, s: i32| -> Frags {
+            let mut f = Frags { fa: Vec::new(), sa: Vec::new(), fb: Vec::new(), sb: Vec::new() };
+            ra.read(b, |b| {
+                for i in 0..sh.tm {
+                    let mut parts: Vec<Opnd> = Vec::new();
+                    for half in 0..2 {
+                        for piece in 0..2 {
+                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * 16) * arow + s * 64 + piece * 32);
+                            parts.push(Opnd::Val(b.load_lds_b128(addr)));
+                        }
+                    }
+                    f.fa.push(Opnd::Val(b.frag_cat(&parts)));
+                }
+            });
+            rsa.read(b, |b| {
+                for i in 0..sh.tm {
+                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + 4 * s);
+                    f.sa.push(Opnd::Val(b.load_lds_b32(addr)));
+                }
+            });
+            rb.read(b, |b| {
+                for j in 0..sh.tn {
+                    let mut parts: Vec<Opnd> = Vec::new();
                     for piece in 0..2 {
-                        let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * 16) * 64 + piece * 32);
+                        let addr = b.bind_i32(rb.base() + ev(bbase) + j * 16 * brow + s * 64 + piece * 32);
                         parts.push(Opnd::Val(b.load_lds_b128(addr)));
                     }
+                    f.fb.push(Opnd::Val(b.frag_cat(&parts)));
                 }
-                fa.push(Opnd::Val(b.frag_cat(&parts)));
-            }
-        });
-        rsa.read(b, |b| {
+            });
+            rsb.read(b, |b| {
+                for j in 0..sh.tn {
+                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + j * 16 * srow_bytes + 4 * s);
+                    f.sb.push(Opnd::Val(b.load_lds_b32(addr)));
+                }
+            });
+            f
+        };
+        // software pipeline inside the window: the loads of sub-step s + 1 are issued before the WMMAs of s
+        let mut cur = load(b, 0);
+        for s in 0..sh.ks {
+            let next = if s + 1 < sh.ks { Some(load(b, s + 1)) } else { None };
             for i in 0..sh.tm {
-                let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * 4);
-                sa.push(Opnd::Val(b.load_lds_b32(addr)));
-            }
-        });
-        let mut fb: Vec<Opnd> = Vec::new();
-        let mut sb: Vec<Opnd> = Vec::new();
-        rb.read(b, |b| {
-            for j in 0..sh.tn {
-                let mut parts: Vec<Opnd> = Vec::new();
-                for piece in 0..2 {
-                    let addr = b.bind_i32(rb.base() + ev(bbase) + j * 16 * 64 + piece * 32);
-                    parts.push(Opnd::Val(b.load_lds_b128(addr)));
+                for j in 0..sh.tn {
+                    let acc = self.acc[(i * sh.tn + j) as usize];
+                    let d = b.wmma_scaled(WmmaKind::ScaleF4_32x16x128, cur.fa[i as usize], cur.fb[j as usize], Some(Opnd::Var(acc)), WmmaScale { sa: cur.sa[i as usize], sb: cur.sb[j as usize], b_row1: false });
+                    b.set_var(acc, Opnd::Val(d));
                 }
-                fb.push(Opnd::Val(b.frag_cat(&parts)));
             }
-        });
-        rsb.read(b, |b| {
-            for j in 0..sh.tn {
-                let addr = b.bind_i32(rsb.base() + ev(sbbase) + j * 16 * 4);
-                sb.push(Opnd::Val(b.load_lds_b32(addr)));
-            }
-        });
-        for i in 0..sh.tm {
-            for j in 0..sh.tn {
-                let acc = self.acc[(i * sh.tn + j) as usize];
-                let d = b.wmma_scaled(WmmaKind::ScaleF4_32x16x128, fa[i as usize], fb[j as usize], Some(Opnd::Var(acc)), WmmaScale { sa: sa[i as usize], sb: sb[j as usize], b_row1: false });
-                b.set_var(acc, Opnd::Val(d));
+            if let Some(n) = next {
+                cur = n;
             }
         }
     }

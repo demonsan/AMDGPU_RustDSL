@@ -389,7 +389,9 @@ pub fn gemm_tdm_stage_f4() -> Function {
     use amdgpu_stage::{Cadence, Pipeline};
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
-    let sh = F4Shape { wm: 2, wn: 2, tm: 2, tn: 2 };
+    let envv = |n: &str, d: i32| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);   // TEMP exploration
+    let sh = F4Shape { wm: envv("F4_WM", 2), wn: envv("F4_WN", 2), tm: envv("F4_TM", 2), tn: envv("F4_TN", 2), ks: envv("F4_KS", 1) };
+    let coop = envv("F4_COOP", 1) != 0;
     let (bm, bn) = (sh.bm(), sh.bn());
     let mut b = FnBuilder::new(F4_NAME, (sh.waves() * 32) as u32);
     for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
@@ -398,9 +400,9 @@ pub fn gemm_tdm_stage_f4() -> Function {
     b.arg("k", DType::I32, 40, 4);
     b.arg("n", DType::I32, 44, 4);
     b.arg_tensor("c", Ext::c(1 << 28));
-    b.ka_range(40, 128, 1 << 20);
+    b.ka_range(40, 128 * sh.ks as i64, 1 << 20);
     let mut lds = LdsPlan::new();
-    let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64) as i64, Layout::Linear), ("B", (bn * 64) as i64, Layout::Linear), ("SA", (bm * 4) as i64, Layout::Linear), ("SB", (bn * 4) as i64, Layout::Linear)]);
+    let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64 * sh.ks) as i64, Layout::Linear), ("B", (bn * 64 * sh.ks) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
     lds.commit(&mut b);
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
@@ -411,8 +413,9 @@ pub fn gemm_tdm_stage_f4() -> Function {
     let wgy = b.let_(Op::WorkgroupIdY);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
     let w = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
-    let wi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(1)));
-    let wj = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1)));
+    assert!((sh.wn as u32).is_power_of_two(), "wn a power of two");
+    let wi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(sh.wn.trailing_zeros() as i32)));
+    let wj = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(sh.wn - 1)));
     let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
     let row0 = b.mul_i32(wgy, Opnd::I32(bm));
@@ -420,23 +423,39 @@ pub fn gemm_tdm_stage_f4() -> Function {
     // bytes per row: fp4 K / 2, scales K / 32
     let kb = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(1)));
     let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
-    let a_org = b.mul_i32(row0, kb);
-    let b_org = b.mul_i32(col0, kb);
-    let sa_org = b.mul_i32(row0, ks);
-    let sb_org = b.mul_i32(col0, ks);
+    // cooperative loads: wave w loads rows [w * R / waves, ..) of each tile (R / waves rows)
+    let nw = sh.waves();
+    let div = if coop { nw } else { 1 };
+    let (rpa, rpb) = (bm / div, bn / div);
+    // the wave id is wave-uniform: read it into an SGPR so the slice offsets and descriptors stay scalar
+    let wsl = if coop { b.let_(Op::ReadFirstLane(Opnd::Val(w))) } else { b.c_i32(0) };
+    let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
+    let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
+    let row0w = b.add_i32(row0, rowa_w);
+    let col0w = b.add_i32(col0, rowb_w);
+    let a_org = b.mul_i32(row0w, kb);
+    let b_org = b.mul_i32(col0w, kb);
+    let sa_org = b.mul_i32(row0w, ks);
+    let sb_org = b.mul_i32(col0w, ks);
+    let wl = [
+        b.mul_i32(rowa_w, Opnd::I32(64 * sh.ks)),
+        b.mul_i32(rowb_w, Opnd::I32(64 * sh.ks)),
+        b.mul_i32(rowa_w, Opnd::I32(4 * sh.ks)),
+        b.mul_i32(rowb_w, Opnd::I32(4 * sh.ks)),
+    ];
     // per-lane LDS offsets inside a slot: the wave's first row of A / B + the lane's row m, 16 h bytes into the 64-byte row; scale rows
     let h16 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(4)));
     let a_row = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
     let a_row_m = b.add_i32(a_row, m);
-    let abase = b.let_(Op::ShlI32(Opnd::Val(a_row_m), Opnd::I32(6)));
+    let abase = b.mul_i32(a_row_m, Opnd::I32(64 * sh.ks));
     let abase = b.add_i32(abase, h16);
     let b_row = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
     let b_row_m = b.add_i32(b_row, m);
-    let bbase = b.let_(Op::ShlI32(Opnd::Val(b_row_m), Opnd::I32(6)));
+    let bbase = b.mul_i32(b_row_m, Opnd::I32(64 * sh.ks));
     let bbase = b.add_i32(bbase, h16);
     let a_row_l = b.add_i32(a_row, lane);
-    let sabase = b.let_(Op::ShlI32(Opnd::Val(a_row_l), Opnd::I32(2)));
-    let sbbase = b.let_(Op::ShlI32(Opnd::Val(b_row_m), Opnd::I32(2)));
+    let sabase = b.mul_i32(a_row_l, Opnd::I32(4 * sh.ks));
+    let sbbase = b.mul_i32(b_row_m, Opnd::I32(4 * sh.ks));
     // descriptor group 1 of the four tensors: [rows][K / 2] bytes (tile 64 bytes x rows), scales [rows][K / 128] dwords (tile 1 dword x rows)
     let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16| -> ValueId {
         let tile = TensorTile { data_size: esz, tensor_dim: [dim0, Opnd::I32(rows)], stride0: stride, tile: [t0, rows as u16], pad: None, wg_mask: 0 };
@@ -444,14 +463,16 @@ pub fn gemm_tdm_stage_f4() -> Function {
         b.tensor_desc_2d(&tile, Opnd::Val(base), Opnd::Val(z), Opnd::I32(0)).1
     };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64), bm, Opnd::Val(kb), 64);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64), bn, Opnd::Val(kb), 64);
-    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(1), bm, Opnd::Val(k128), 1);
-    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(1), bn, Opnd::Val(k128), 1);
-    let nkv = b.bind_i32(ev(kk).lshr(7));
-    b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128), "nkv = K / 128 >= 1 (a K that is a multiple of 128)");
-    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128, Ext::ka(40).ceil_div(128));
-    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, acc: Vec::new() };
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16);
+    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(sh.ks), rpa, Opnd::Val(k128), sh.ks as u16);
+    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(sh.ks), rpb, Opnd::Val(k128), sh.ks as u16);
+    let lgk = 7 + sh.ks.trailing_zeros() as i32;   // K elements per slot: 128 ks
+    assert!(sh.ks.count_ones() == 1, "ks a power of two");
+    let nkv = b.bind_i32(ev(kk).lshr(lgk));
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128 * sh.ks as i64), "nkv = K / (128 ks) >= 1 (a K that is a multiple of the slot's K)");
+    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128 * sh.ks, Ext::ka(40).ceil_div(128 * sh.ks as i64));
+    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new() };
     pipe.run(&mut b, Role::All, &mut body);
 
     // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
