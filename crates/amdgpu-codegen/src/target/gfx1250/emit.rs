@@ -675,6 +675,8 @@ const RENAMES: &[(&str, &str)] = &[
     ("s_subb_u32", "s_sub_co_ci_u32"),
     ("s_addk_i32", "s_addk_co_i32"),
     ("ds_read_b64_tr_b8", "ds_load_tr8_b64"),
+    ("v_max3_f32", "v_max3_num_f32"),
+    ("v_min3_f32", "v_min3_num_f32"),
 ];
 
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
