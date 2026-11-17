@@ -82,6 +82,20 @@ fn tdm_kernel(w0: i32, cluster: i64) -> Function {
     f
 }
 
+/// A tensor load with every descriptor word given: group 0 = (`g0w0`, LDS address `lds`, 0, `g0w3`), group 1 = (`w0`, dims, `tile0`, `tile1`), LDS of `lds_bytes`.
+fn tdm_desc_kernel(g0w0: i32, g0w3: i32, lds: i32, w0: i32, tile0: i32, tile1: i32, lds_bytes: u32) -> Function {
+    let mut b = FnBuilder::new("hr_desc", 64);
+    b.lds(lds_bytes);
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(g0w0), Opnd::I32(lds), Opnd::I32(0), Opnd::I32(g0w3)] });
+    let g1 = b.sgpr_cat8([Opnd::I32(w0), Opnd::I32(4096 << 16), Opnd::I32(0), Opnd::I32(tile0 << 16), Opnd::I32(tile1), Opnd::I32(4096), Opnd::I32(0), Opnd::I32(0)]);
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.wait_tensor(0);
+    b.barrier();
+    b.finish()
+}
+
+const TYPE2: i32 = (2u32 << 30) as i32;
+
 /// The group-1 word 0 comes from the kernarg segment (the host builds the descriptor); `host_values` is the host contract on it (empty: none).
 fn tdm_host_kernel(host_values: &[i64]) -> Function {
     let mut b = FnBuilder::new("hr_tdm_host", 64);
@@ -323,6 +337,26 @@ fn pos_bar_reach() {
     ir_positive(&barrier_kernel(&[(true, 2), (true, 3), (false, 2), (false, 3)], &[("named_barrier_count", 3)]));
 }
 
+// GV-1250-TDM-DESC
+
+#[test]
+fn mut_tdm_desc() {
+    ir_mutation(&tdm_desc_kernel(1 | 8, TYPE2, 0, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");        // the store bit set in a load descriptor
+    ir_mutation(&tdm_desc_kernel(1 | 4, TYPE2, 0, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");        // the context-restore bit
+    ir_mutation(&tdm_desc_kernel(1 | 16, TYPE2, 0, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");       // the volatile bit
+    ir_mutation(&tdm_desc_kernel(3, TYPE2, 0, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");            // a valid count of 3
+    ir_mutation(&tdm_desc_kernel(1, 1 << 30, 0, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");          // a wrong type
+    ir_mutation(&tdm_desc_kernel(1, TYPE2, 0, 0x20000, 64, 32, 4096), "GV-1250-TDM-DESC");           // 64 x 32 x 4 bytes = 8 KiB in a 4 KiB LDS
+    ir_mutation(&tdm_desc_kernel(1, TYPE2, 4000, 0x20000, 64, 1, 4096), "GV-1250-TDM-DESC");         // the tile starts too close to the end
+}
+
+#[test]
+fn pos_tdm_desc() {
+    compile_positive(&tdm_desc_kernel(1, TYPE2, 0, 0x20000, 64, 1, 4096));
+    compile_positive(&tdm_desc_kernel(1, TYPE2, 2048, 0x20000, 64, 8, 4096));   // exactly to the end of the LDS
+    compile_positive(&tdm_desc_kernel(0, TYPE2, 0, 0x20000, 0, 0, 4096));      // a null tensor (valid count 0): a no-op by design
+}
+
 // GV-1250-DPP
 
 #[test]
@@ -413,6 +447,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-BAR-WAIT-IMM", "bar_wait_imm"),
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),
+    ("GV-1250-TDM-DESC", "tdm_desc"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
     ("GV-1250-DVGPR", "dvgpr"),
