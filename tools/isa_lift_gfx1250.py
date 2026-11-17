@@ -98,6 +98,18 @@ def parse(path):
         if op == 's_set_vgpr_msb':
             msb = int(args[0], 0) & 0xFF
         words = list(r['words'])
+        # a 64-bit add of a zero-extended 32-bit offset (`s_add_co_u32 lo, lo, x; s_add_co_ci_u32 hi, 0, hi`): one pointer add, both words
+        if (op == 's_add_co_u32' and i + 1 < len(recs) and recs[i + 1]['op'] == 's_add_co_ci_u32' and (i + 1) not in scc_live
+                and recs[i + 1]['addr'] not in targets):
+            n = recs[i + 1]['args']
+            lo, hi = isa_lift.reg(args[0]), isa_lift.reg(n[0])
+            blo, bhi = isa_lift.reg(args[1]), isa_lift.reg(n[2]) if len(n) > 2 else None
+            if (lo and hi and blo and bhi and n[1] == '0' and hi[1] == lo[1] + 1 and bhi[1] == blo[1] + 1 and lo[1] == blo[1]
+                    and lo[1] % 2 == 0):
+                pw = '/'.join(f'{w:#x}' for w in r['words']) + ';' + '/'.join(f'{w:#x}' for w in recs[i + 1]['words'])
+                out.append((sec, 's_ptradd_zext', f's[{lo[1]}:{lo[1] + 1}], {args[2]} pwords:{pw}'))
+                i += 2
+                continue
         if op == 'v_wmma_ld_scale_paired_b32' and i + 1 < len(recs) and recs[i + 1]['op'] == 'raw':
             args, mods = decode_vop3px2(r, recs[i + 1], msb)
             op = 'v_wmma_scale_f32_32x16x128_f4'
@@ -323,6 +335,15 @@ class Lifter(isa_lift.Lifter):
     def h_v_sub_u32(self, t, m, op): return self.bin(t, 'Bin(SubU32, {a}, {b})', 'I32', 'I32')
     def h_v_cmp_gt_u32(self, t, m, op): return self.cmp64(t, 'Gt', 'U32')
 
+    def h_s_ptradd_zext(self, t, m, op):
+        # the author's pair (s_add_co_u32 + s_add_co_ci_u32, constant-first) as one pointer add; each instruction keeps its words
+        pw = next(x for x in m if x.startswith('pwords:'))[7:].split(';')
+        base, off = self.src(t[0], 'Ptr'), self.src(t[1], 'I32')
+        for ws in pw:
+            self.stmt('AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in ws.split('/')) + '] }')
+        self.dst(t[0], 'Ptr', f'PtrAdd {{ base: {base}, byte_off: {off} }}')
+        return True
+
     def _salu(self, t, sop, ty='I32'):
         a, b = self.src(t[1], 'I32' if ty == 'I32' else None), self.src(t[2], 'I32' if ty == 'I32' else None)
         self.dst(t[0], ty, f'Salu {{ op: {sop}, a: {a}, b: {b} }}')
@@ -418,7 +439,7 @@ NO_DST_1250 = ('tensor_', 's_setreg', 's_wait', 's_prefetch', 's_version', 'glob
 def defs_uses(op, args):
     """isa_lift.defs_uses for the gfx1250 forms (the verbatim text and the decoded modifiers are not operands)."""
     args = args.split(' ||| ', 1)[0]
-    args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:')) and w != 'scc_live')
+    args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:', 'pwords:')) and w != 'scc_live')
     t, m = isa_lift.toks(args)
     rr = lambda tok: [(r[0], r[1] + i) for r in [isa_lift.reg(tok)] if r for i in range(r[2])]
     if op.startswith(NO_DST_1250):
@@ -427,7 +448,7 @@ def defs_uses(op, args):
             u |= set(rr(x))
         return set(), u
     d, u = _defs_uses_950(op, args)
-    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk')):
+    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk', 's_ptradd_zext')):
         u |= d
     if op.startswith('v_swap') and len(t) > 1:
         d |= set(rr(t[1]))
