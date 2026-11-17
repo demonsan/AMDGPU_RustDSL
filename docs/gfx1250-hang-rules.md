@@ -31,6 +31,7 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | `GV-1250-TRAP-BAR` | IR + asm | the barriers reserved for the trap handler used by a kernel | `mut_trap_bar` | `pos_trap_bar` |
 | `GV-1250-BAR-REACH` | IR | a barrier that not every wave of its group reaches: a barrier under a condition that differs between waves with unequal arrivals in the arms, a barrier in a loop whose exit differs between waves, a wait with no signal of that barrier | `mut_bar_reach` | `pos_bar_reach` |
 | `GV-1250-TDM-DESC` | IR | a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a type other than 2, a valid count above 1, a tile that does not fit in the declared LDS (words the host supplies are the host contract's business) | `mut_tdm_desc` | `pos_tdm_desc` |
+| `GV-1250-TDM-DRAIN` | asm | a tensor operation that can issue with more than 10 tensor operations outstanding: a sound static bound over every path (an issue adds one, a wait for the tensor counter to drop to N caps the bound at N, joins take the maximum, loops iterate to a fixpoint; a loop that issues without draining is unbounded) | `mut_tdm_drain` | `pos_tdm_drain` |
 | `GV-1250-DPP` | asm | a DPP modifier together with a literal operand or on a 64-bit integer operation | `mut_dpp` | `pos_dpp` |
 | `GV-1250-PERMLANE-CMPX` | asm | a lane permute directly after a `v_cmpx` | `mut_permlane_cmpx` | `pos_permlane_cmpx` |
 | `GV-1250-DVGPR` | asm | dynamic VGPR allocation (the feature does not exist on this target) | `mut_dvgpr` | `pos_dvgpr` |
@@ -44,6 +45,27 @@ Tests are in [`crates/amdgpu-kernels/tests/hang_rules_1250.rs`](../crates/amdgpu
 - **Positive twin** (`pos_<rule>`): the nearest legal variant is accepted, so a rule cannot hide behind a blanket rejection.
 - `every_rule_is_covered` fails the build when a rule in `RULES` has no `mut_` / `pos_` pair; `the_probes_pass_the_rules` checks that every shipped gfx1250 probe passes all rules (IR and asm).
 
+## Hazards inserted by the compiler vs rules checked here
+
+Two layers deal with "the hardware must not be asked for this", and they must agree:
+
+- **G2 hazards** ([`gfx1250-hazards.md`](gfx1250-hazards.md), `target/gfx1250/hazards.rs`) INSERT the waits / `v_nop`s the architecture needs, in kernels the compiler schedules. They can only help where the compiler owns the instruction order.
+- **G5 rules** (this page) CHECK the final instruction stream, whoever produced it: the own tail, the LLVM tail, or an exact replay (an author-placed stream the compiler may not touch, so it inserts nothing).
+  Where the two overlap (a lane permute after `v_cmpx`, a mode write before a VGPR MSB write, the tensor drain), G2's output always passes G5, and G5 is what stops an exact replay that lacks what G2 would have inserted.
+
+The tensor drain is the instructive case. The public compiler's hazard pass for this target (the feature "needs to keep tensor count low") inserts `s_wait_tensorcnt 10` before any tensor operation that an earlier one can reach on some path without a
+wait of at most 10 in between. The source states that purpose and gives no reason for the number and no consequence of a violation (stall, corruption or hang). What the insertion guarantees is a **count invariant**: at most 10 tensor operations are
+outstanding when another one issues (so at most 11 in flight). The instruction pattern is only the compiler's cheap way to guarantee it: it inserts without counting, so with one earlier operation outstanding the inserted wait is satisfied at once.
+
+`GV-1250-TDM-DRAIN` therefore checks the **invariant**, not the pattern: a sound static upper bound of the outstanding tensor operations at every tensor issue, path-sensitive over the control-flow graph (an issue adds one, a wait for the counter to drop to N
+caps the bound at N, joins take the maximum, loops iterate to a fixpoint and saturate when they issue without draining). A tensor operation that can issue with a bound above 10 is an error. The invariant holds in everything the compiler's own tails emit
+(their insertion maintains it) and is at least as strong as what the compiler enforces, so it also stops an exact replay that lacks the wait; it does not rely on any distance, timing or count of instructions between operations.
+
+**Vendor code objects, "pattern differs, invariant holds".** Of the 91 shipping vendor code objects scanned (`tools/mi450/hangscan.sh`; `tools/mi450/drainhist.sh` lists every consecutive tensor-operation pair with its instruction distance and whether a wait of
+at most 10 sits between), all satisfy the invariant. **12 of them (48 sites) differ from the compiler's pattern**: the persistent (`_ps`) MLA decode kernels with 96 or 128 query heads issue two tensor loads about 35 instructions apart with no tensor wait
+between them, with at most two operations outstanding there. They are not deviations from the invariant, and an exact replay needs no wait at those sites; the other 79 files also satisfy the compiler's pattern as it stands. (A rule written from the
+pattern, or from a distance window inferred from the corpus, would have been a timing assumption; the count form needs neither.)
+
 ## Planned (needs the forms G3 introduces)
 
 These rules are staged after the typed tensor descriptor, the named-barrier operations and the async-LDS forms exist; each lands with its mutation test and positive twin.
@@ -52,7 +74,7 @@ These rules are staged after the typed tensor descriptor, the named-barrier oper
 |---|---|
 | `GV-1250-NBAR-COUNT` | a named-barrier member count that is not larger than the signals already counted, or not a constant in range |
 | `GV-1250-TDM-DESC` | tensor descriptors with inconsistent paired fields, misaligned fields, a tile extent outside the LDS allocation or the tensor outside the declared buffer, a gather with unordered indices |
-| `GV-1250-TDM-OUTSTANDING` | more outstanding tensor / async operations per wave than the hardware allows, or a wait that depends on an operation queued behind a stalled issue |
+| `GV-1250-TDM-OUTSTANDING` | (the in-flight limit itself is `GV-1250-TDM-DRAIN` above) a wait that depends on an operation queued behind a stalled issue, and the async-copy counterpart |
 | `GV-1250-TDM-RING` | reuse of an LDS ring slot before both the producer's completion and the consumers' release |
 | `GV-1250-BLOCK-LOAD` | a block load into its own source registers; a transpose load with a partial exec mask |
 | `GV-1250-SCALAR-ALIGN` | scalar memory data operands wider than 32 bits that are not aligned; a scaled matrix multiply in a clause that is too short or ends badly |
