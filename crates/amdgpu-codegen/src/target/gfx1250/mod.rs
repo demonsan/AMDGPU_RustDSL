@@ -4,10 +4,15 @@
 
 use amdgpu_dsl::Function;
 
-/// Compiles `f` for gfx1250. G0: the target is selectable; code generation arrives with G1.
+pub mod emit;
+
+/// Compiles `f` for gfx1250 (G1: the shared lowering / scheduling / allocation, then the gfx1250 emitter; wave32 kernels without
+/// divergent control flow, v0..v255, no AGPRs; the waits are the gfx950 ones mapped conservatively onto the split counters).
 pub fn compile(f: &Function) -> Result<crate::Compiled, String> {
-    Err(format!(
-        "{}: gfx1250 code generation is not available yet (stage G1 of docs/gfx1250-plan.md); the target description is amdgpu_target::gfx1250::GFX1250",
-        f.name
-    ))
+    if f.workgroup_size > 1024 {
+        return Err(format!("{}: workgroup size {} (gfx1250: at most 1024 work-items)", f.name, f.workgroup_size));
+    }
+    let (m, alloc) = crate::lower_and_allocate(f)?;
+    let asm = emit::emit(&m, &alloc)?;
+    Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }

@@ -2308,5 +2308,6 @@ pub fn probe_mfma_scale_opsel() -> Function {
     b.finish()
 }
 
+pub mod g1250;
 pub mod handoff;
 pub mod tileops;
