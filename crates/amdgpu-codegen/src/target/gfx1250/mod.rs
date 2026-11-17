@@ -5,6 +5,7 @@
 use amdgpu_dsl::Function;
 
 pub mod emit;
+pub mod waits;
 
 /// Compiles `f` for gfx1250 (G1: the shared lowering / scheduling / allocation, then the gfx1250 emitter; wave32 kernels without
 /// divergent control flow, v0..v255, no AGPRs; the waits are the gfx950 ones mapped conservatively onto the split counters).

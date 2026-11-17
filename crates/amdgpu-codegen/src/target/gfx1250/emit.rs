@@ -59,15 +59,28 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str("    v_nop\n");
         out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
     }
+    // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
+    let plan = super::waits::plan(m, a);
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
-        for inst in &b.insts {
-            for line in inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let lines = match plan.replace.get(&(bi, ii)) {
+                Some(r) => r.clone(),
+                None => {
+                    let mut v = plan.before.get(&(bi, ii)).cloned().unwrap_or_default();
+                    v.extend(inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))?);
+                    v
+                }
+            };
+            for line in lines {
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
             }
+        }
+        for line in plan.end.get(&bi).into_iter().flatten() {
+            out.push_str(&format!("    {line}\n"));
         }
         match &b.term {
             Term::Goto(t) => {
@@ -299,15 +312,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         _ => {
             let mut v = Vec::new();
             for l in crate::target::gfx950::emit::inst_lines(a, inst) {
-                for r in respell(&l)? {
-                    // the address operands of a scalar / vector memory operation are read after issue (XCNT): until G2 tracks XCNT, every
-                    // such operation waits for its translation before anything can overwrite them
-                    let xlate = r.starts_with("s_load_") || r.starts_with("global_") || r.starts_with("buffer_") || r.starts_with("flat_");
-                    v.push(r);
-                    if xlate {
-                        v.push("s_wait_xcnt 0x0".to_string());
-                    }
-                }
+                // (the XCNT waits: waits.rs)
+                v.extend(respell(&l)?);
             }
             v
         }
