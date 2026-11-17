@@ -432,3 +432,30 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     b.store_global(q, 0, acc, MemTy::B32, false);
     b.finish()
 }
+
+/// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
+/// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
+pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
+    let mut b = FnBuilder::new(&format!("probe_g1250_tdm_hi_{lds_addr}"), 256);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("out", Ext::c(4096));
+    b.lds(163_840);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(1024), Opnd::I32(1)], stride0: Opnd::I32(1024), tile: [1024, 1], pad: None, wg_mask: 0 };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::I32(0), Opnd::I32(lds_addr));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+    b.wait_tensor(0);
+    b.barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(4)));
+    for j in 0..4 {
+        let la = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(lds_addr + 4 * j)));
+        let x = b.load_lds(la, MemTy::B32);
+        let ga = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * j)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(ga) });
+        b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    b.finish()
+}

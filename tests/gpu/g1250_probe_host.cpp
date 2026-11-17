@@ -357,6 +357,28 @@ static int run_lds_big(Kernel& k, const char* kn, int wgs) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_tdm_hi_<addr>: a 4 KiB tensor load to a high LDS address, read back; out must equal src.
+static int run_tdm_hi(Kernel& k, const char* kn) {
+    std::vector<uint32_t> src(1024);
+    for (int i = 0; i < 1024; ++i) src[i] = 0x5a000000u ^ (uint32_t)(i * 2654435761u);
+    uint32_t *dsrc, *dout;
+    HC(hipMalloc(&dsrc, 4096));
+    HC(hipMalloc(&dout, 4096));
+    HC(hipMemcpy(dsrc, src.data(), 4096, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0xee, 4096));
+    std::vector<uint8_t> args(16, 0);
+    put64(args, 0, dsrc);
+    put64(args, 8, dout);
+    k.launch(1, 256, args, kn);
+    std::vector<uint32_t> o(1024);
+    HC(hipMemcpy(o.data(), dout, 4096, hipMemcpyDeviceToHost));
+    long bad = 0, first = -1;
+    for (int i = 0; i < 1024; ++i) if (o[i] != src[i]) { if (first < 0) first = i; ++bad; }
+    printf("tdm_hi %s: bad=%ld first=%ld %s\n", kn, bad, first, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"bad\":%ld,\"ok\":%s}\n", kn, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
@@ -379,6 +401,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
     if (mode == "wide") return run_wide(k, kn);
+    if (mode == "tdm_hi") return run_tdm_hi(k, kn);
     if (mode == "lds_big") return run_lds_big(k, kn, argc > 4 ? atoi(argv[4]) : 1);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
