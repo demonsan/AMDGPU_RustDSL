@@ -6,7 +6,8 @@
 //! [`crate::gfx950`]: an operand layout maps (lane, value) to the element index of the operand tile, A `m + M k`, B `n + N k`, C `m + M n`, with
 //! `index = lane + 32 value` (wave32). Values are elements of the operand width in VGPR order (dword-major, low bits first).
 //!
-//! Provenance is the ISA for all of them; they become `Probe` once a gfx1250 hardware probe of this repository has measured them.
+//! Provenance: measured on MI450 by the probes `probe_g1250_wmma_{fp8,fp8_k128,f4}` (`tests/gpu/g1250_wmma_probe_host.cpp` fills every operand through these layouts
+//! and compares D with a CPU product: fp8 within 1e-4 of the dot-product magnitude, the scaled f4 form bit-exact).
 
 use crate::gfx950::{MmaAtom, Provenance};
 use amdgpu_layout::{make_layout, tup};
@@ -35,7 +36,7 @@ impl MmaAtom {
             c_dwords: 8,
             scaled: false,
             passes: 4,
-            provenance: Provenance::Isa,
+            provenance: Provenance::Probe("probe_g1250_wmma_* on MI450 (tests/gpu/g1250_wmma_probe_host.cpp)"),
         }
     }
     /// `v_wmma_f32_16x16x128_fp8_fp8`: "A 16x128 8-bit matrix is just two 16x64 matrices in consecutive VGPRs" (16 VGPRs per A / B).
@@ -56,7 +57,7 @@ impl MmaAtom {
             c_dwords: 8,
             scaled: false,
             passes: 8,
-            provenance: Provenance::Isa,
+            provenance: Provenance::Probe("probe_g1250_wmma_* on MI450 (tests/gpu/g1250_wmma_probe_host.cpp)"),
         }
     }
     /// `v_wmma_scale_f32_32x16x128_f4` (VOP3PX2, block size 32, E8M0 scales; ISA 7.12.6.1.3 and 7.12.6.2):
@@ -81,7 +82,7 @@ impl MmaAtom {
             c_dwords: 16,
             scaled: true,
             passes: 8,
-            provenance: Provenance::Isa,
+            provenance: Provenance::Probe("probe_g1250_wmma_* on MI450 (tests/gpu/g1250_wmma_probe_host.cpp)"),
         }
     }
 }
