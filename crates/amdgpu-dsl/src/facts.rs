@@ -203,6 +203,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::Permlane16SwapA { .. }
         | Op::VAddU64 { .. }
         | Op::CvtPkFp8Half { .. }
+        | Op::PkNegF32(_)
         | Op::Frag4(..)
         | Op::Frag4Lane { .. }
         | Op::Frag8(..)

@@ -802,7 +802,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SExecSelect => a("s_cselect_b32", salu).scc(true, false).backend(Backend::OwnOnly),
         VAddNcI32 => a("v_add_nc_i32", valu).dce(Pure).backend(Backend::OwnOnly),
         VSubrevU32 => a("v_subrev_nc_u32", valu).dce(Pure).backend(Backend::OwnOnly),
-        VRcpIflagF32 => a("v_rcp_iflag_f32", c(Trans, 4, 4, Unknown)).dce(Pure).backend(Backend::OwnOnly),
+        VRcpIflagF32 => a("v_rcp_iflag_f32", c(Trans, 4, 4, Unknown)).trans().dce(Pure).backend(Backend::OwnOnly),
         VAddNcU64 => a("v_add_nc_u64", valu).dce(Pure).backend(Backend::OwnOnly),
         GlobalLoadAsyncLds => a("global_load_async_to_lds_b128", ctrl).fence(F::Barrier).backend(Backend::OwnOnly),
         SBufferLoadB32 => a("s_buffer_load_b32", salu).backend(Backend::OwnOnly),

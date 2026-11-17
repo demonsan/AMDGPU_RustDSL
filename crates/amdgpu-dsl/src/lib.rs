@@ -754,6 +754,8 @@ pub enum Op {
     PtrMadU32 { base: Opnd, a: Opnd, b: Opnd },
     /// `v_pk_fma_f32`: a * b + c on two f32 lanes (Frag2 each)
     PkFmaF32(Opnd, Opnd, Opnd),
+    /// -x on both f32 lanes of a Frag2. Exact mode: only as a source of `PkFmaF32` (the `neg_lo` / `neg_hi` modifiers; no instruction)
+    PkNegF32(Opnd),
     /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) â€” the explicit marker
     /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
     AnyLane(Opnd),
@@ -896,6 +898,7 @@ impl Op {
             Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } => DType::U32,
             Op::VAddU64 { .. } => DType::Frag2,
             Op::CvtPkFp8Half { .. } => DType::U32,
+            Op::PkNegF32(_) => DType::Frag2,
             Op::SBufferLoad { .. } => DType::I32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } => DType::Frag16,
@@ -1015,6 +1018,7 @@ impl Op {
             Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } | Op::SwapA { a, b } | Op::Permlane16SwapA { a, b } | Op::VAddU64 { a, b } => vec![*a, *b],
             Op::SBufferLoad { rsrc, soff, .. } => vec![*rsrc, *soff],
             Op::CvtPkFp8Half { old, a, b, .. } => old.iter().copied().chain([*a, *b]).collect(),
+            Op::PkNegF32(a) => vec![*a],
             Op::Permlane32SwapB { swap } => vec![*swap],
             Op::PtrLo(p) | Op::PtrHi(p) => vec![*p],
             Op::LoadScalar { base, .. } => vec![*base],

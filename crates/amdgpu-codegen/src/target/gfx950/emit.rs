@@ -414,7 +414,14 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VPkFmaF32 => {
             // a source pair may be an SGPR pair (exact mode: the vendor's `v_pk_fma_f32 v[..], v[..], s[..], v[..]`)
             let p = |r: VReg| if a.scalar.get(r as usize).copied().unwrap_or(false) { spair(a, r) } else { pair(a, r) };
-            vec![format!("v_pk_fma_f32 {}, {}, {}, {}", pair(a, inst.dst.unwrap()), p(reg_of(&inst.srcs[0])), p(reg_of(&inst.srcs[1])), p(reg_of(&inst.srcs[2])))]
+            // (neg_lo / neg_hi: the exact mode's negated sources, both lanes)
+            let n = if inst.neg != 0 {
+                let m = format!("[{},{},{}]", inst.neg & 1, (inst.neg >> 1) & 1, (inst.neg >> 2) & 1);
+                format!(" neg_lo:{m} neg_hi:{m}")
+            } else {
+                String::new()
+            };
+            vec![format!("v_pk_fma_f32 {}, {}, {}, {}{n}", pair(a, inst.dst.unwrap()), p(reg_of(&inst.srcs[0])), p(reg_of(&inst.srcs[1])), p(reg_of(&inst.srcs[2])))]
         }
         MOp::SMulHiU32 => vec![format!("s_mul_hi_u32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::VMadU64U32 => vec![format!("v_mad_u64_u32 {}, vcc, {}, {}, {}", pair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), pair(a, reg_of(&inst.srcs[2])))],

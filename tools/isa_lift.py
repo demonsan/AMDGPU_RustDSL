@@ -1490,6 +1490,9 @@ def emit_kernel(path, exact, plan=None):
                 L.notes[f'carried dword not readable ({ex})'] += 1
                 continue
             L.lines.append(f'SetVar {{ var: VarId({k}), value: {x} }}')
+        if '--layout-keys' in sys.argv and last == 's_branch' and succ.get(b) == [b + 1]:
+            # the author's branch to the very next block (no structure edge needs it): kept as written
+            L.lines.append(f'Goto {{ key: {2 * bl[b + 1][0] + 1} }}')
         return body
 
     def emit(nodes, loopname=None):
@@ -1621,7 +1624,7 @@ def emit_kernel(path, exact, plan=None):
                 L.lines.append(f'GotoIf {{ cond: {c}, key: {key(ss[0])} }}')
                 if len(ss) > 1 and ss[1] != nxt_first:
                     L.lines.append(f'Goto {{ key: {key(ss[1])} }}')
-            elif last == 's_branch' and ss:
+            elif last == 's_branch' and ss and ss[0] != b + 1:
                 L.lines.append(f'Goto {{ key: {key(ss[0])} }}')
             elif ss and ss[0] != nxt_first:
                 L.lines.append(f'Goto {{ key: {key(ss[0])} }}')

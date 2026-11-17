@@ -53,6 +53,10 @@ fn forward_empty_jumps(m: &mut MFunction) {
             Term::Endpgm => Term::Endpgm,
         };
     }
+    // exact keyed layout: every author block stays, also one no edge reaches (the author's dead code is part of the replay)
+    if !m.reg_hints.layout_keys.is_empty() {
+        return;
+    }
     // the forwarding blocks (and any block no edge reaches any more) are gone from the layout
     let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let mut seen = vec![false; m.blocks.len()];

@@ -190,6 +190,7 @@ impl FromIr for Op {
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
             "PtrMadU32" => { v.expect_struct("PtrMadU32")?; Ok(Op::PtrMadU32 { base: FromIr::from_ir(v.field("base")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "PkFmaF32" => { v.expect_tuple("PkFmaF32", 3)?; Ok(Op::PkFmaF32(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
+            "PkNegF32" => { v.expect_tuple("PkNegF32", 1)?; Ok(Op::PkNegF32(FromIr::from_ir(v.item(0)?)?)) }
             "AnyLane" => { v.expect_tuple("AnyLane", 1)?; Ok(Op::AnyLane(FromIr::from_ir(v.item(0)?)?)) }
             "FragSlice" => { v.expect_struct("FragSlice")?; Ok(Op::FragSlice { frag: FromIr::from_ir(v.field("frag")?)?, start: FromIr::from_ir(v.field("start")?)?, n: FromIr::from_ir(v.field("n")?)? }) }
             "FragCat" => { v.expect_struct("FragCat")?; Ok(Op::FragCat { parts: FromIr::from_ir(v.field("parts")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
@@ -337,6 +338,7 @@ impl IrIds for Op {
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
             Op::PtrMadU32 { base, a, b } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::PkFmaF32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::PkNegF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::AnyLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::FragSlice { frag, start, n } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*start), fv, fr); IrIds::ids(&mut (*n), fv, fr); }
             Op::FragCat { parts, dwords } => { IrIds::ids(&mut (*parts), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }

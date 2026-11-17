@@ -685,7 +685,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
     let _ = f;
     // AMDC_EXACT_WAITS_REPORT=1 (diagnostics only, for comparing a lift's bytes while wait / hazard findings are under review): the
     // `waits:` findings are printed instead of failing; register violations still fail
-    if std::env::var("AMDC_EXACT_WAITS_REPORT").is_ok() && !errs.is_empty() && errs.iter().all(|e| e.starts_with("exact: waits:")) {
+    if std::env::var("AMDC_EXACT_WAITS_REPORT").is_ok() && !errs.is_empty() && errs.iter().all(|e| e.starts_with("exact: waits:") || e.starts_with("exact: hazard:")) {
         eprintln!("exact mode (AMDC_EXACT_WAITS_REPORT): {} wait / hazard finding(s) NOT enforced\n{}", errs.len(), errs.join("\n"));
         errs.clear();
     }

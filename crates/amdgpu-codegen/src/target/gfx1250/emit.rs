@@ -122,6 +122,62 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         l
     };
     let order: Vec<usize> = order.into_iter().filter(|&i| !thru.contains_key(&m.blocks[i].label)).collect();
+    let pos: std::collections::HashMap<u32, usize> = order.iter().enumerate().map(|(k, &i)| (m.blocks[i].label, k)).collect();
+    // keyed layout: `A: if c goto T (backward); B: goto E (forward)` with B the author's branch-only block right after A and reached only
+    // from A is the same control flow as the author's latch `A: if !c goto E; B: goto T` - written the author's way
+    let mut latch_a: std::collections::HashMap<u32, (Pred, u32, u32)> = Default::default();
+    let mut latch_b: std::collections::HashMap<u32, u32> = Default::default();
+    // (the second shape: `A: if c goto B; else goto H (backward)` with B next, empty, `goto E` (forward; B may be a shared exit): the
+    // author's `A: if c goto E; B: goto H`, every other edge into B going straight to E)
+    let mut redirect: std::collections::HashMap<u32, u32> = Default::default();
+    if keyed {
+        let mut preds: std::collections::HashMap<u32, usize> = Default::default();
+        for b in &m.blocks {
+            match &b.term {
+                Term::Goto(t) => *preds.entry(fin(*t)).or_default() += 1,
+                Term::CondGoto { target, fall, .. } => {
+                    *preds.entry(fin(*target)).or_default() += 1;
+                    *preds.entry(fin(*fall)).or_default() += 1;
+                }
+                Term::Endpgm => {}
+            }
+        }
+        for (k, &bi) in order.iter().enumerate() {
+            let b = &m.blocks[bi];
+            let Term::CondGoto { on, target, fall } = &b.term else { continue };
+            let (tg, fl) = (fin(*target), fin(*fall));
+            let Some(&nb) = order.get(k + 1) else { continue };
+            let nbk = &m.blocks[nb];
+            let keyed_b = m.reg_hints.layout_keys.iter().any(|(l, _)| *l == fl);
+            let Term::Goto(e) = &nbk.term else { continue };
+            let e = fin(*e);
+            if tg == nbk.label && nbk.insts.is_empty() && keyed_b {
+                let (pf, pe) = (pos.get(&fl).copied().unwrap_or(usize::MAX), pos.get(&e).copied().unwrap_or(0));
+                if pf <= k && pe > k + 1 {
+                    latch_a.insert(b.label, (*on, e, tg));
+                    latch_b.insert(tg, fl);
+                    redirect.insert(tg, e);
+                }
+                continue;
+            }
+            if fl != nbk.label || !nbk.insts.is_empty() || !keyed_b || preds.get(&fl) != Some(&1) {
+                continue;
+            }
+            let Term::Goto(e) = &nbk.term else { continue };
+            let e = fin(*e);
+            let (pt, pe) = (pos.get(&tg).copied().unwrap_or(usize::MAX), pos.get(&e).copied().unwrap_or(0));
+            if pt <= k && pe > k + 1 {
+                let inv = match on {
+                    Pred::Scc0 => Pred::Scc1,
+                    Pred::Scc1 => Pred::Scc0,
+                    Pred::Vccnz => Pred::Vccz,
+                    Pred::Vccz => Pred::Vccnz,
+                };
+                latch_a.insert(b.label, (inv, e, fl));
+                latch_b.insert(fl, tg);
+            }
+        }
+    }
     for (oi, &bi) in order.iter().enumerate() {
         let b = &m.blocks[bi];
         let next_label = order.get(oi + 1).map(|&n| m.blocks[n].label);
@@ -163,10 +219,17 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
             out.push_str(&format!("    {line}\n"));
         }
 
+        let redir = |l: u32| redirect.get(&l).copied().unwrap_or(l);
         let term = match &b.term {
-            Term::Goto(t) => Term::Goto(fin(*t)),
+            // an author's latch block (only its branch) whose terms were swapped by the structure: see `latch` above
+            Term::Goto(_) if latch_b.contains_key(&b.label) => Term::Goto(latch_b[&b.label]),
+            Term::CondGoto { .. } if latch_a.contains_key(&b.label) => {
+                let (p, e, f) = latch_a[&b.label];
+                Term::CondGoto { on: p, target: e, fall: f }
+            }
+            Term::Goto(t) => Term::Goto(redir(fin(*t))),
             Term::CondGoto { on, target, fall } => {
-                let (tg, fl) = (fin(*target), fin(*fall));
+                let (tg, fl) = (redir(fin(*target)), redir(fin(*fall)));
                 if tg == fl {
                     Term::Goto(tg)
                 } else {
@@ -178,7 +241,8 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         match &term {
             Term::Goto(t) => {
                 // (an author's block that is only its branch keeps it, even to the next block: the author wrote it)
-                let only_branch = keyed && b.insts.is_empty() && m.reg_hints.author_branches.contains(&b.label);
+                // (the author's own branch - `Stmt::Goto` - is written even to the next block)
+                let only_branch = keyed && m.reg_hints.author_branches.contains(&b.label);
                 if only_branch || !((m.elide_fallthrough || keyed) && next_label == Some(*t)) {
                     out.push_str(&format!("    s_branch BB{t}\n"))
                 }
@@ -190,7 +254,20 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                     Pred::Vccnz => "s_cbranch_vccnz",
                     Pred::Vccz => "s_cbranch_vccz",
                 };
-                if keyed && next_label == Some(*target) && next_label != Some(*fall) {
+                // (keyed layout, neither side next: the conditional branch goes forward and the unconditional one back, as an author
+                // writes a loop latch - `s_cbranch_<inv> exit; s_branch header`)
+                let backward = |l: u32| pos.get(&l).map_or(false, |&p| p <= oi);
+                let flip = keyed && next_label != Some(*target) && next_label != Some(*fall) && backward(*target) && !backward(*fall);
+                if flip {
+                    let inv = match on {
+                        Pred::Scc0 => "s_cbranch_scc1",
+                        Pred::Scc1 => "s_cbranch_scc0",
+                        Pred::Vccnz => "s_cbranch_vccz",
+                        Pred::Vccz => "s_cbranch_vccnz",
+                    };
+                    out.push_str(&format!("    {inv} BB{fall}\n"));
+                    out.push_str(&format!("    s_branch BB{target}\n"));
+                } else if keyed && next_label == Some(*target) && next_label != Some(*fall) {
                     // the author's layout puts the taken side next: the inverse branch to the other side, nothing else
                     let inv = match on {
                         Pred::Scc0 => "s_cbranch_scc1",
@@ -691,7 +768,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
-    "v_mad_u64_u32",
+    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).

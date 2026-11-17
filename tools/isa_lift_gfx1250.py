@@ -161,7 +161,9 @@ def parse(path):
         wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
         SYS = ('v_nop', 's_sleep', 's_version', 's_wait_idle', 's_prefetch_inst', 'global_prefetch_b8', 's_getreg_b32', 's_get_pc_i64')
         exec_w = op in ('s_mov_b32', 's_cselect_b32') and args and args[0] == 'exec_lo'
-        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32') + SYS) or exec_w or any(op == f or op.startswith(f + '_e') for f in wops):
+        # --words-vop3: every VOP3 / VOP3P-encoded instruction keeps the author's words (unused fields: the assembler fills them differently)
+        vop3 = '--words-vop3' in sys.argv and words and (words[0] >> 26) in (0b110101, 0b110011) and not op.startswith('v_wmma')
+        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32') + SYS) or exec_w or vop3 or any(op == f or op.startswith(f + '_e') for f in wops):
             mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
         elif op in BRANCHES:
             args = [f'L{r["target"]:x}'] if 'target' in r else args
@@ -199,7 +201,7 @@ class Lifter(isa_lift.Lifter):
             self.raws[op + ' (forced)'] += 1
             return True
         wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
-        if any(op == f or op.startswith(f + '_e') for f in wops) and ' words:' in args:
+        if (any(op == f or op.startswith(f + '_e') for f in wops) or ('--words-vop3' in sys.argv and op.startswith('v_') and not op.startswith('v_wmma'))) and ' words:' in args:
             # the DSL form with the author's encoding (fields an assembler fills differently, e.g. an unused VOP3 source)
             w = next(x for x in args.split(' ') if x.startswith('words:'))[6:].split('/')
             plain = ' '.join(x for x in args.split(' ') if not x.startswith('words:'))
@@ -460,6 +462,24 @@ class Lifter(isa_lift.Lifter):
     def h_v_cvt_u32_f32(self, t, m, op):
         self.dst(t[0], 'U32', f'Un(CvtU32F32, {self.src(t[1], "F32")})')
         return True
+    def h_v_pk_fma_f32(self, t, m, op):
+        # neg_lo / neg_hi on both lanes of a source: PkNegF32 (the exact source modifier); other modifiers: not lifted
+        nl = next((x.split(':')[1] for x in m if x.startswith('neg_lo:')), '[0,0,0]')
+        nh = next((x.split(':')[1] for x in m if x.startswith('neg_hi:')), '[0,0,0]')
+        if nl != nh or any(x.startswith(('op_sel', 'clamp')) for x in m):
+            return False
+        srcs = []
+        for k, tok in enumerate(t[1:4]):
+            s = self.src(tok)
+            if nl.strip('[]').split(',')[k] == '1':
+                w = self.nv
+                self.nv += 1
+                self.lines.append(f'%v{w}: Frag2 = PkNegF32({s})')
+                s = f'Val({w})'
+            srcs.append(s)
+        self.dst(t[0], 'Frag2', f'PkFmaF32({srcs[0]}, {srcs[1]}, {srcs[2]})')
+        return True
+
     def h_v_pk_add_f32(self, t, m, op):
         a, b = self.src(t[1]), self.src(t[2])
         self.dst(t[0], 'Frag2', f'PkAddF32({a}, {b})')
@@ -681,7 +701,7 @@ def main():
     isa_lift.Lifter = Lifter
     isa_lift.ENTRY_HW = entry_hw
     isa_lift.defs_uses = defs_uses
-    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'ReadTtmp': 'I32', 'WorkitemIdPacked': 'U32'})
+    isa_lift.RTY.update({'SwapA': 'U32', 'PkNegF32': 'Frag2', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'ReadTtmp': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
     # the kernel's argument layout (--args P,P,I,...: 8-byte pointers / 4-byte words in kernarg order): the code object's metadata lists every
     # argument (a launcher sizes and copies the kernarg buffer by it), also those only the preload reads

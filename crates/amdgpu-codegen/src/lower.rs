@@ -3770,10 +3770,26 @@ impl Lowerer {
                     }
                     me.as_v2(o)
                 };
-                let (ra, rb, rc) = (pk(self, *a)?, pk(self, *b)?, pk(self, *c)?);
+                // exact mode: a negated source is the `neg_lo` / `neg_hi` modifier of that source
+                let mut neg = 0u8;
+                let mut un = |me: &Self, k: u8, o: Opnd| -> Opnd {
+                    if me.exact {
+                        if let Opnd::Val(v) = o {
+                            if let Some(Op::PkNegF32(x)) = me.defs.get(&v) {
+                                neg |= 1 << k;
+                                return *x;
+                            }
+                        }
+                    }
+                    o
+                };
+                let (a, b, c) = (un(self, 0, *a), un(self, 1, *b), un(self, 2, *c));
+                let (ra, rb, rc) = (pk(self, a)?, pk(self, b)?, pk(self, c)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
                 let d = self.new_vreg(RClass::V2);
-                self.push(MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
+                let mut inst = MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc);
+                inst.neg = neg;
+                self.push(inst);
                 self.val.insert(dst, d);
             }
             // a lane mask (VCC / an SGPR pair) or an SCC value: `any lane` is the branch on it (no instruction)
@@ -4406,6 +4422,8 @@ impl Lowerer {
             }
             // exact mode: -x exists only as a source modifier of the instruction that reads it (no instruction of its own)
             Op::NegF32(_) if self.exact => {}
+            Op::PkNegF32(_) if self.exact => {}
+            Op::PkNegF32(_) => return Err("PkNegF32: only a source modifier of PkFmaF32 in exact mode".into()),
             Op::NegF32(a) => {
                 // standalone: flip the sign bit (unused when every reader folds it into a modifier: removed by dce)
                 let r = self.as_v1(*a)?;
@@ -4675,7 +4693,11 @@ impl Lowerer {
                 };
                 if matches!(op, amdgpu_dsl::SaluOp::Bitset0 | amdgpu_dsl::SaluOp::Bitset1) {
                     // in place: the result register starts as a (a copy that vanishes when the author pinned both at one register)
+                    let w = self.author_words.pop_front();
                     self.push(MInst::new(MOp::SMovB32).def(d).src(sa));
+                    if let Some(w) = w {
+                        self.author_words.push_front(w);
+                    }
                     self.push(MInst::new(mop).def(d).srcreg(d).src(sb));
                 } else {
                     self.push(MInst::new(mop).def(d).src(sa).src(sb));
@@ -4687,8 +4709,12 @@ impl Lowerer {
                 let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                 let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                let w = self.author_words.pop_front();
                 self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
                 self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                if let Some(w) = w {
+                    self.author_words.push_front(w);
+                }
                 self.push(MInst::new(MOp::VPermlane16Swap).def(la).srcreg(la).srcreg(lb));
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
@@ -4702,7 +4728,12 @@ impl Lowerer {
                     Some(o) => {
                         let ro = self.as_v1(*o)?;
                         self.touch(&[Src::Reg(ro)]);
+                        // (the in-place copy is no instruction when pinned: the author's words belong to the conversion)
+                        let w = self.author_words.pop_front();
                         self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
+                        if let Some(w) = w {
+                            self.author_words.push_front(w);
+                        }
                         self.push(MInst::new(MOp::VCvtPkFp8F32Half).def(d).srcreg(d).src(sa).src(sb).imm(*hi as i64));
                     }
                     None => self.push(MInst::new(MOp::VCvtPkFp8F32Half).def(d).src(sa).src(sb).imm(*hi as i64)),
@@ -4748,8 +4779,12 @@ impl Lowerer {
                 let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                 let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                let w = self.author_words.pop_front();
                 self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
                 self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                if let Some(w) = w {
+                    self.author_words.push_front(w);
+                }
                 self.push(MInst::new(MOp::VSwapB32).def(la).srcreg(la).srcreg(lb));
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
