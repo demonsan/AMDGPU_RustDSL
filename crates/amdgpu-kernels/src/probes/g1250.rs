@@ -181,7 +181,7 @@ pub fn probe_g1250_select() -> Function {
     let odd = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(1)));
     let c2 = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
     let neg = b.bin(amdgpu_dsl::BinOp::SubU32, Opnd::I32(0), tid);
-    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::Val(tid), b: Opnd::Val(neg) });
+    let s2 = b.let_(Op::Select { ty: DType::U32, cond: Opnd::Val(c2), a: Opnd::Val(tid), b: Opnd::Val(neg) });
     b.store_global(qo, 1024, s2, MemTy::B32, false);
     b.finish()
 }
