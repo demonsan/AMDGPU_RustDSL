@@ -42,6 +42,10 @@ DS_LOAD = [("ds_load_b32", "v1"), ("ds_load_b64", "v[2:3]"), ("ds_load_b128", "v
 DS_STORE = [("ds_store_b32", "v1"), ("ds_store_b64", "v[2:3]"), ("ds_store_b128", "v[4:7]"), ("ds_store_b16", "v1"), ("ds_store_b8", "v1")]
 TDM = ["tensor_load_to_lds", "tensor_store_from_lds"]
 # the kernel prologue (see the gfx1250 emitter)
+WMMA = [("v_wmma_f32_16x16x32_bf16", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]"),
+        ("v_wmma_f32_16x16x64_fp8_fp8", "v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[16:23], v[24:31]"),
+        ("v_wmma_f32_16x16x128_fp8_fp8", "v_wmma_f32_16x16x128_fp8_fp8 v[8:15], v[16:31], v[32:47], v[48:55]"),
+        ("v_wmma_scale_f32_32x16x128_f4", "v_wmma_scale_f32_32x16x128_f4 v[64:79], v[16:31], v[32:39], v[48:63], v3, v4")]
 EXTRA = [("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
 
 
@@ -81,11 +85,15 @@ def samples():
     for m in TDM:
         s.append((m, f"{m} s[0:3], s[4:11]"))
     s.extend(EXTRA)
+    s.extend(WMMA)
     return s
 
 
 def fmt(b):
     d0 = int.from_bytes(b[:4], "little")
+    # VOP3PX2: a scale prefix (VOP3P) and the matrix instruction (VOP3P): the second one's opcode
+    if len(b) == 16 and d0 >> 26 == 0x33 and int.from_bytes(b[8:12], "little") >> 26 == 0x33:
+        return "VOP3PX2", (int.from_bytes(b[8:12], "little") >> 16) & 0x7F
     if d0 >> 23 == 0x17D:
         return "SOP1", (d0 >> 8) & 0xFF
     if d0 >> 23 == 0x17E:

@@ -413,6 +413,30 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             out.extend_from_slice(&d32(0x7C << 24 | th.unwrap_or(0) << 20 | scope.unwrap_or(0) << 18));
             out.extend_from_slice(&d32(g(0)? | g(1)? << 8 | g(2)? << 16 | g(3)? << 24));
         }
+        "VOP3P" | "VOP3PX2" => {
+            // WMMA: vD, A, B, C (C a VGPR tuple or the inline 0); op_sel_hi = 3 (the default). VOP3PX2 (the scaled forms) is first the scale
+            // prefix (VOP3P op 0x35: scale A, scale B, the inline 0; matrix_b_scale:MATRIX_SCALE_ROW1 sets its op_sel_hi bit 0), then the
+            // matrix instruction with op_sel_hi[2] (d0 bit 14) set
+            let d = vreg(op_at(&i, 0)?)?;
+            let mut enc = [0u32; 3];
+            for k in 0..3 {
+                let (c, l) = src9(op_at(&i, k + 1)?)?;
+                if l.is_some() {
+                    return Err(format!("`{t}`: a literal in a matrix operand"));
+                }
+                enc[k] = c;
+            }
+            if fmt == "VOP3PX2" {
+                let (sa, _) = src9(op_at(&i, 4)?)?;
+                let (sb, _) = src9(op_at(&i, 5)?)?;
+                let row1 = modv(&i, "matrix_b_scale") == Some("MATRIX_SCALE_ROW1");
+                out.extend_from_slice(&d32(0xCC00_0000 | 0x35 << 16));
+                out.extend_from_slice(&d32((row1 as u32) << 27 | 128 << 18 | sb << 9 | sa));
+            }
+            let px2 = (fmt == "VOP3PX2") as u32;
+            out.extend_from_slice(&d32(0xCC00_0000 | op << 16 | px2 << 14 | d));
+            out.extend_from_slice(&d32(3 << 27 | enc[2] << 18 | enc[1] << 9 | enc[0]));
+        }
         f => return Err(format!("`{t}`: format {f} not encoded")),
     }
     Ok(out)
