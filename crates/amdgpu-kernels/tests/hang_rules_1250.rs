@@ -388,6 +388,53 @@ fn pos_bar_init() {
     ir_positive(&named_kernel(|b| { b.barrier_init(1, 2); b.barrier_signal(-1); b.barrier_wait(-1); b.barrier_join(1); b.barrier_signal(1); b.barrier_wait(1); b.barrier_leave(); }, 1, 0));
 }
 
+// the exact-mode forward gotos: the blocks of a region form a DAG, and the rules join the facts of every path into a target
+
+/// An exact kernel whose body `f(b, c_div, c_uni)` gets a condition that differs between the waves (work-item id) and one every wave evaluates alike (a kernarg).
+fn goto_kernel(f: impl FnOnce(&mut FnBuilder, Opnd, Opnd), named: i64) -> Function {
+    let mut b = FnBuilder::new("hr_goto", 64);
+    b.exact();
+    b.arg("n", DType::I32, 0, 4);
+    let t = b.let_(Op::WorkitemId);
+    let cd = b.cmp(CmpPred::Lt, CmpTy::I32, t, Opnd::I32(32));
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let cu = b.cmp(CmpPred::Gt, CmpTy::I32, n, Opnd::I32(0));
+    f(&mut b, Opnd::Val(cd), Opnd::Val(cu));
+    let mut fun = b.finish();
+    if named > 0 {
+        fun.kd.push(("named_barrier_count".into(), named));
+    }
+    fun
+}
+
+#[test]
+fn mut_bar_goto() {
+    // a goto on a per-wave condition: one side runs a barrier, the other does not
+    ir_mutation(&goto_kernel(|b, cd, _| { b.goto_if(cd, 1); b.barrier(); b.layout_key(1); }, 0), "GV-1250-BAR-REACH");
+    // a nested block: the barrier is behind a second goto on the per-wave condition
+    ir_mutation(&goto_kernel(|b, cd, cu| { b.goto_if(cu, 1); b.goto_if(cd, 2); b.barrier(); b.layout_key(2); b.layout_key(1); }, 0), "GV-1250-BAR-REACH");
+    // a goto-carried join state: one path joins, the other does not, and they meet at the key
+    ir_mutation(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.layout_key(1); b.barrier_leave(); }, 1), "GV-1250-BAR-JOIN");
+    // initialized on one path only, used after the meeting point
+    ir_mutation(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); init(b, 1, 2); b.layout_key(1); b.barrier_join(1); b.barrier_leave(); }, 1), "GV-1250-BAR-INIT");
+    // signalled on one path only, waited on after the meeting point
+    ir_mutation(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.layout_key(1); b.barrier_wait(-1); }, 0), "GV-1250-BAR-REACH");
+    // an if arm with a wave-divergent goto inside it
+    ir_mutation(&goto_kernel(|b, cd, cu| { b.begin_if(cu); b.goto_if(cd, 3); b.barrier(); b.layout_key(3); b.end_if(); }, 0), "GV-1250-BAR-REACH");
+}
+
+#[test]
+fn pos_bar_goto() {
+    // every path of a per-wave goto arrives at one barrier
+    ir_positive(&goto_kernel(|b, cd, _| { b.goto_if(cd, 1); b.barrier(); b.goto(2); b.layout_key(1); b.barrier(); b.layout_key(2); }, 0));
+    // a goto every wave takes alike may skip a barrier (the f4gemm switch shape: a uniform four-way switch whose cases differ)
+    ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier(); b.layout_key(1); }, 0));
+    ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier(); b.barrier(); b.goto(2); b.layout_key(1); b.barrier(); b.layout_key(2); }, 0));
+    // both paths join / initialize / signal
+    ir_positive(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.goto(2); b.layout_key(1); b.barrier_join(1); b.layout_key(2); b.barrier_leave(); }, 1));
+    ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.goto(2); b.layout_key(1); b.barrier_signal(-1); b.layout_key(2); b.barrier_wait(-1); }, 0));
+}
+
 // GV-1250-TRAP-BAR
 
 #[test]

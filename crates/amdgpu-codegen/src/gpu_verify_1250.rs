@@ -274,173 +274,375 @@ fn wave_varying(f: &Function) -> (HashSet<ValueId>, HashSet<VarId>) {
     (tv, tvars)
 }
 
-fn bar_reach(f: &Function, v: &mut Vec<Violation>) {
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// control flow of the statement list: structured if / loop plus the exact-mode forward gotos (blocks of a region form a DAG)
+
+type Sig = BTreeMap<Ev, i32>;
+
+fn sig_add(a: &Sig, b: &Sig) -> Sig {
+    let mut r = a.clone();
+    for (k, n) in b {
+        *r.entry(*k).or_insert(0) += n;
+    }
+    r
+}
+
+/// The most distinct barrier paths a region may have before the verifier gives up (and rejects: not provable).
+const MAX_PATH_SIGS: usize = 512;
+
+struct Shape {
+    /// BeginIf -> (Else, EndIf)
+    if_else: HashMap<usize, (Option<usize>, usize)>,
+    /// Else -> EndIf
+    else_end: HashMap<usize, usize>,
+    /// BeginLoop -> EndLoop, EndLoop -> BeginLoop
+    loop_end: HashMap<usize, usize>,
+    loop_begin: HashMap<usize, usize>,
+    /// BreakIf -> the BeginLoop it leaves
+    break_loop: HashMap<usize, usize>,
+    /// LayoutKey key -> statement
+    key_pos: HashMap<u32, usize>,
+}
+
+fn shape_of(stmts: &[Stmt]) -> Shape {
+    enum Open {
+        If(usize, Option<usize>),
+        Loop(usize),
+    }
+    let mut sh = Shape { if_else: HashMap::default(), else_end: HashMap::default(), loop_end: HashMap::default(), loop_begin: HashMap::default(), break_loop: HashMap::default(), key_pos: HashMap::default() };
+    let mut stack: Vec<Open> = Vec::new();
+    for (i, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::BeginIf { .. } => stack.push(Open::If(i, None)),
+            Stmt::Else => {
+                if let Some(Open::If(_, e)) = stack.last_mut() {
+                    *e = Some(i);
+                }
+            }
+            Stmt::EndIf => {
+                if let Some(Open::If(b, e)) = stack.pop() {
+                    sh.if_else.insert(b, (e, i));
+                    if let Some(e) = e {
+                        sh.else_end.insert(e, i);
+                    }
+                }
+            }
+            Stmt::BeginLoop { .. } => stack.push(Open::Loop(i)),
+            Stmt::EndLoop => {
+                if let Some(Open::Loop(b)) = stack.pop() {
+                    sh.loop_end.insert(b, i);
+                    sh.loop_begin.insert(i, b);
+                }
+            }
+            Stmt::BreakIf { .. } => {
+                if let Some(b) = stack.iter().rev().find_map(|o| if let Open::Loop(b) = o { Some(*b) } else { None }) {
+                    sh.break_loop.insert(i, b);
+                }
+            }
+            Stmt::LayoutKey { key } => {
+                sh.key_pos.insert(*key, i);
+            }
+            _ => {}
+        }
+    }
+    sh
+}
+
+/// Control-flow successors of statement `i` (the statement list is the CFG: if / else / loops structured, gotos forward to a LayoutKey).
+fn succs(stmts: &[Stmt], sh: &Shape, i: usize) -> Vec<usize> {
+    let n = stmts.len();
+    let mut v = Vec::new();
+    match &stmts[i] {
+        Stmt::BeginIf { .. } => {
+            v.push(i + 1);
+            if let Some(&(e, end)) = sh.if_else.get(&i) {
+                v.push(match e {
+                    Some(e) => e + 1,
+                    None => end,
+                });
+            }
+        }
+        Stmt::Else => {
+            if let Some(&end) = sh.else_end.get(&i) {
+                v.push(end);
+            }
+        }
+        Stmt::EndLoop => {
+            if let Some(&b) = sh.loop_begin.get(&i) {
+                v.push(b + 1);
+            }
+            v.push(i + 1);
+        }
+        Stmt::BreakIf { .. } => {
+            v.push(i + 1);
+            if let Some(&b) = sh.break_loop.get(&i) {
+                if let Some(&e) = sh.loop_end.get(&b) {
+                    v.push(e + 1);
+                }
+            }
+        }
+        Stmt::GotoIf { key, .. } => {
+            v.push(i + 1);
+            if let Some(&t) = sh.key_pos.get(key) {
+                v.push(t);
+            }
+        }
+        Stmt::Goto { key } => {
+            if let Some(&t) = sh.key_pos.get(key) {
+                v.push(t);
+            }
+        }
+        _ => v.push(i + 1),
+    }
+    v.retain(|&t| t <= n);
+    v
+}
+
+/// The facts tracked along every path of the CFG.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+struct Flow {
+    /// the named barrier the wave is joined to
+    joined: Option<i32>,
+    /// named barriers initialized on EVERY path
+    inited: std::collections::BTreeSet<i32>,
+    /// named barriers initialized on SOME path with no work-group barrier since
+    unordered: std::collections::BTreeSet<i32>,
+    /// barriers signalled on EVERY path
+    signalled: std::collections::BTreeSet<i32>,
+}
+
+/// Joins two path states; `.1` is true when the join states of the two paths differ.
+fn flow_merge(a: &Flow, b: &Flow) -> (Flow, bool) {
+    let r = Flow {
+        joined: a.joined,
+        inited: a.inited.intersection(&b.inited).copied().collect(),
+        unordered: a.unordered.union(&b.unordered).copied().collect(),
+        signalled: a.signalled.intersection(&b.signalled).copied().collect(),
+    };
+    (r, a.joined != b.joined)
+}
+
+fn flow_step(st: &Stmt, f: &Flow) -> Flow {
+    let mut r = f.clone();
+    match st {
+        Stmt::BarrierInit { id, .. } => {
+            r.inited.insert(*id);
+            r.unordered.insert(*id);
+        }
+        Stmt::Barrier | Stmt::BarrierWait { id: -1 } => r.unordered.clear(),
+        Stmt::BarrierJoin { id } => r.joined = Some(*id),
+        Stmt::BarrierLeave => r.joined = None,
+        Stmt::BarrierSignal { id } => {
+            r.signalled.insert(*id);
+        }
+        _ => {}
+    }
+    r
+}
+
+/// GV-1250-BAR-JOIN, GV-1250-BAR-INIT and the wait-needs-a-signal part of GV-1250-BAR-REACH: a forward dataflow over the CFG (merges join the facts of every incoming path, so a goto's target
+/// sees the facts of the fall-through and of every goto naming it).
+fn flow_checks(f: &Function, sh: &Shape, v: &mut Vec<Violation>) {
     let stmts = f.stmts();
+    let n = stmts.len();
+    let mut state: Vec<Option<Flow>> = vec![None; n + 1];
+    let mut conflict: HashSet<usize> = HashSet::default();
+    state[0] = Some(Flow::default());
+    let mut work = vec![0usize];
+    while let Some(i) = work.pop() {
+        if i >= n {
+            continue;
+        }
+        let out = flow_step(&stmts[i], state[i].as_ref().unwrap());
+        for t in succs(stmts, sh, i) {
+            let (new, differ) = match &state[t] {
+                None => (out.clone(), false),
+                Some(old) => flow_merge(old, &out),
+            };
+            if differ {
+                conflict.insert(t);
+            }
+            if state[t].as_ref() != Some(&new) {
+                state[t] = Some(new);
+                work.push(t);
+            }
+        }
+    }
+    let mut at: Vec<usize> = conflict.into_iter().collect();
+    at.sort();
+    for t in at {
+        viol(v, "GV-1250-BAR-JOIN", format!("statement {t}: control-flow paths meet with different named-barrier join states (a branch, a goto target or a loop back edge that joins / leaves on one path only)"));
+    }
+    // loop extents, for a pipelined signal that sits later in the loop body than its wait
+    let loops: Vec<(usize, usize)> = sh.loop_end.iter().map(|(b, e)| (*b, *e)).collect();
+    for (i, st) in stmts.iter().enumerate() {
+        let Some(fl) = &state[i] else { continue };
+        match st {
+            Stmt::BarrierJoin { id } => {
+                if let Some(j) = fl.joined {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {i}: join of barrier {id} while still joined to barrier {j} (one joined barrier at a time)"));
+                }
+            }
+            Stmt::BarrierLeave => {
+                if fl.joined.is_none() {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {i}: leave with no barrier joined"));
+                }
+            }
+            _ => {}
+        }
+        match st {
+            Stmt::BarrierWait { id } if (1..=16).contains(id) => {
+                if fl.joined != Some(*id) {
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {i}: wait on named barrier {id} while {} (a wave waits only on the named barrier it joined; signalling any barrier is allowed)", match fl.joined { Some(j) => format!("joined to barrier {j}"), None => "not joined".to_string() }));
+                }
+            }
+            _ => {}
+        }
+        if let Stmt::BarrierJoin { id } | Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } = st {
+            if (1..=16).contains(id) {
+                if !fl.inited.contains(id) {
+                    viol(v, "GV-1250-BAR-INIT", format!("statement {i}: named barrier {id} used with no initialization before it on every path (its member count is unset: it never completes)"));
+                } else if fl.unordered.contains(id) {
+                    viol(v, "GV-1250-BAR-INIT", format!("statement {i}: named barrier {id} used with no work-group barrier after its initialization (another wave may still be initializing it)"));
+                }
+            }
+        }
+        if let Stmt::BarrierWait { id } = st {
+            let later_in_loop = loops.iter().any(|&(b, e)| b < i && i < e && stmts[i + 1..e].iter().any(|s| matches!(s, Stmt::BarrierSignal { id: j } if j == id)));
+            if !fl.signalled.contains(id) && !later_in_loop {
+                viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a wait on barrier {id} that is not preceded by a signal of that barrier on every path (or later in its loop): the wait never completes on the path without one"));
+            }
+        }
+    }
+}
+
+/// The barrier signatures (events per path) of the statements in `lo..hi` (one region: the top level, an if arm, a loop body): a set with one signature per distinct path. Nested ifs are
+/// choices between their arms' signatures, loops contribute their body once, the blocks of a region with gotos form a DAG. Checks on the way: GV-1250-BAR-REACH for a branch / goto whose
+/// condition differs between waves and whose sides do not arrive at the same barriers, and for a loop with a wave-divergent exit that contains barrier operations.
+fn region_sigs(stmts: &[Stmt], sh: &Shape, lo: usize, hi: usize, tainted: &dyn Fn(&Opnd) -> bool, v: &mut Vec<Violation>) -> std::collections::BTreeSet<Sig> {
+    use std::collections::BTreeSet;
+    struct Block {
+        pre: BTreeSet<Sig>,
+        succ: Vec<Result<usize, u32>>,   // Ok(block) / Err(key)
+        diverging_goto: Option<usize>,   // the statement of a wave-divergent GotoIf that ends this block
+    }
+    let one = || -> BTreeSet<Sig> { std::iter::once(Sig::new()).collect() };
+    let cross = |a: &BTreeSet<Sig>, b: &BTreeSet<Sig>| -> BTreeSet<Sig> { a.iter().flat_map(|x| b.iter().map(move |y| sig_add(x, y))).collect() };
+    let mut blocks: Vec<Block> = vec![Block { pre: one(), succ: vec![], diverging_goto: None }];
+    let mut key_block: HashMap<u32, usize> = HashMap::default();
+    let mut too_many = false;
+    let mut i = lo;
+    while i < hi {
+        let cur = blocks.len() - 1;
+        match &stmts[i] {
+            Stmt::BeginIf { cond } => {
+                let &(e, end) = sh.if_else.get(&i).unwrap_or(&(None, i));
+                let (then_hi, els) = match e {
+                    Some(e) => (e, region_sigs(stmts, sh, e + 1, end, tainted, v)),
+                    None => (end, one()),
+                };
+                let then = region_sigs(stmts, sh, i + 1, then_hi, tainted, v);
+                if tainted(cond) && then != els {
+                    viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a branch on a condition that differs between the waves of a work-group whose sides arrive at different barriers (then {then:?}, else {els:?}): a wave that does not arrive leaves the others waiting forever"));
+                }
+                let choice: BTreeSet<Sig> = then.union(&els).cloned().collect();
+                let pre = cross(&blocks[cur].pre, &choice);
+                blocks[cur].pre = pre;
+                i = end + 1;
+                continue;
+            }
+            Stmt::BeginLoop { .. } => {
+                let end = *sh.loop_end.get(&i).unwrap_or(&i);
+                let body = region_sigs(stmts, sh, i + 1, end, tainted, v);
+                let mut diverges = false;
+                let mut depth = 0;
+                for st in &stmts[i + 1..end] {
+                    match st {
+                        Stmt::BeginLoop { .. } => depth += 1,
+                        Stmt::EndLoop => depth -= 1,
+                        Stmt::BreakIf { cond } if depth == 0 && tainted(cond) => diverges = true,
+                        _ => {}
+                    }
+                }
+                if diverges && body.iter().any(|s| !s.is_empty()) {
+                    viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a loop whose exit differs between the waves of a work-group contains barrier operations: waves leave at different iterations while others wait"));
+                }
+                let pre = cross(&blocks[cur].pre, &body);
+                blocks[cur].pre = pre;
+                i = end + 1;
+                continue;
+            }
+            Stmt::LayoutKey { key } => {
+                let nb = blocks.len();
+                blocks[cur].succ.push(Ok(nb));
+                blocks.push(Block { pre: one(), succ: vec![], diverging_goto: None });
+                key_block.insert(*key, nb);
+            }
+            Stmt::GotoIf { cond, key } => {
+                let nb = blocks.len();
+                blocks[cur].succ.push(Err(*key));
+                blocks[cur].succ.push(Ok(nb));
+                if tainted(cond) {
+                    blocks[cur].diverging_goto = Some(i);
+                }
+                blocks.push(Block { pre: one(), succ: vec![], diverging_goto: None });
+            }
+            Stmt::Goto { key } => {
+                blocks[cur].succ.push(Err(*key));
+                blocks.push(Block { pre: one(), succ: vec![], diverging_goto: None });
+            }
+            st => {
+                if let Some(e) = ev_of(st) {
+                    let one_ev: Sig = std::iter::once((e, 1)).collect();
+                    let pre: BTreeSet<Sig> = blocks[cur].pre.iter().map(|x| sig_add(x, &one_ev)).collect();
+                    blocks[cur].pre = pre;
+                }
+            }
+        }
+        i += 1;
+    }
+    // resolve keys, then the signatures of every block from the last one back (all edges go forward)
+    let nblocks = blocks.len();
+    let mut sigs: Vec<BTreeSet<Sig>> = vec![BTreeSet::new(); nblocks];
+    for bi in (0..nblocks).rev() {
+        let targets: Vec<usize> = blocks[bi].succ.iter().filter_map(|s| match s { Ok(b) => Some(*b), Err(k) => key_block.get(k).copied() }).filter(|&t| t > bi).collect();
+        let cont: BTreeSet<Sig> = if targets.is_empty() { one() } else { targets.iter().flat_map(|&t| sigs[t].iter().cloned()).collect() };
+        sigs[bi] = cross(&blocks[bi].pre, &cont);
+        if sigs[bi].len() > MAX_PATH_SIGS {
+            too_many = true;
+            sigs[bi] = sigs[bi].iter().take(MAX_PATH_SIGS).cloned().collect();
+        }
+    }
+    for bi in 0..nblocks {
+        if let Some(at) = blocks[bi].diverging_goto {
+            let side = |s: &Result<usize, u32>| -> BTreeSet<Sig> {
+                let t = match s { Ok(b) => Some(*b), Err(k) => key_block.get(k).copied() };
+                t.map(|t| sigs[t].clone()).unwrap_or_else(one)
+            };
+            let (taken, fall) = (side(&blocks[bi].succ[0]), side(&blocks[bi].succ[1]));
+            if taken != fall {
+                viol(v, "GV-1250-BAR-REACH", format!("statement {at}: a goto on a condition that differs between the waves of a work-group whose two sides arrive at different barriers (taken {taken:?}, fall-through {fall:?})"));
+            }
+        }
+    }
+    if too_many {
+        viol(v, "GV-1250-BAR-REACH", format!("statements {lo}..{hi}: more than {MAX_PATH_SIGS} distinct barrier paths: not provable"));
+    }
+    sigs.into_iter().next().unwrap_or_else(one)
+}
+
+/// The barrier-related IR rules over the whole body.
+fn bar_structure(f: &Function, v: &mut Vec<Violation>) {
+    let stmts = f.stmts();
+    let sh = shape_of(stmts);
     let (tv, tvars) = wave_varying(f);
     let tainted = |o: &Opnd| match o {
         Opnd::Val(x) => tv.contains(x),
         Opnd::Var(x) => tvars.contains(x),
         _ => false,
     };
-    // structure: matching positions of if / else / endif and loop / endloop
-    let mut if_stack: Vec<(usize, Option<usize>)> = Vec::new();
-    let mut loop_stack: Vec<usize> = Vec::new();
-    let mut ifs: Vec<(usize, Option<usize>, usize)> = Vec::new();
-    let mut loops: Vec<(usize, usize)> = Vec::new();
-    for (i, st) in stmts.iter().enumerate() {
-        match st {
-            Stmt::BeginIf { .. } => if_stack.push((i, None)),
-            Stmt::Else => {
-                if let Some(t) = if_stack.last_mut() {
-                    t.1 = Some(i);
-                }
-            }
-            Stmt::EndIf => {
-                if let Some((b, e)) = if_stack.pop() {
-                    ifs.push((b, e, i));
-                }
-            }
-            Stmt::BeginLoop { .. } => loop_stack.push(i),
-            Stmt::EndLoop => {
-                if let Some(b) = loop_stack.pop() {
-                    loops.push((b, i));
-                }
-            }
-            _ => {}
-        }
-    }
-    // (1) wave-divergent if: both arms must arrive at the same barriers
-    for &(b, e, end) in &ifs {
-        let Stmt::BeginIf { cond } = &stmts[b] else { continue };
-        if !tainted(cond) {
-            continue;
-        }
-        let (then_hi, els) = match e {
-            Some(e) => (e, events(stmts, e + 1, end)),
-            None => (end, BTreeMap::new()),
-        };
-        let then = events(stmts, b + 1, then_hi);
-        if then != els {
-            viol(
-                v,
-                "GV-1250-BAR-REACH",
-                format!("statement {b}: a barrier operation under a condition that differs between the waves of a work-group: the arms arrive at different barriers (then {then:?}, else {els:?}); a wave that does not arrive leaves the others waiting forever"),
-            );
-        }
-    }
-    // (2) a loop with a wave-divergent exit must not contain a barrier operation
-    for &(b, end) in &loops {
-        let mut diverges = false;
-        let mut depth = 0;
-        for st in &stmts[b + 1..end] {
-            match st {
-                Stmt::BeginLoop { .. } => depth += 1,
-                Stmt::EndLoop => depth -= 1,
-                Stmt::BreakIf { cond } if depth == 0 && tainted(cond) => diverges = true,
-                _ => {}
-            }
-        }
-        if diverges {
-            let ev = events(stmts, b + 1, end);
-            if !ev.is_empty() {
-                viol(
-                    v,
-                    "GV-1250-BAR-REACH",
-                    format!("statement {b}: a loop whose exit differs between the waves of a work-group contains barrier operations ({ev:?}): waves leave at different iterations while others wait"),
-                );
-            }
-        }
-    }
-    // (3) a wait needs a signal of the same barrier: before it, or later in the same loop (a software-pipelined signal of the next iteration)
-    for (i, st) in stmts.iter().enumerate() {
-        let Stmt::BarrierWait { id } = st else { continue };
-        let before = stmts[..i].iter().any(|s| matches!(s, Stmt::BarrierSignal { id: j } if j == id));
-        let in_loop_later = loops.iter().any(|&(b, end)| b < i && i < end && stmts[i + 1..end].iter().any(|s| matches!(s, Stmt::BarrierSignal { id: j } if j == id)));
-        if !before && !in_loop_later {
-            viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a wait on barrier {id} with no signal of that barrier before it (or later in its loop): the wait never completes"));
-        }
-    }
-}
-
-/// GV-1250-BAR-JOIN: the join state (which named barrier the wave is joined to, if any) through the structured body.
-fn bar_join(f: &Function, v: &mut Vec<Violation>) {
-    let stmts = f.stmts();
-    let mut state: Option<i32> = None;
-    let mut stack: Vec<(Option<i32>, Option<Option<i32>>)> = Vec::new();   // (state at the construct's entry, the then-arm's end state once the else begins)
-    let mut loops: Vec<Option<i32>> = Vec::new();
-    for (pos, st) in stmts.iter().enumerate() {
-        match st {
-            Stmt::BarrierJoin { id } => {
-                if let Some(j) = state {
-                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: join of barrier {id} while still joined to barrier {j} (one joined barrier at a time)"));
-                }
-                state = Some(*id);
-            }
-            Stmt::BarrierLeave => {
-                if state.is_none() {
-                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: leave with no barrier joined"));
-                }
-                state = None;
-            }
-            Stmt::BarrierWait { id } if (1..=16).contains(id) => {
-                if state != Some(*id) {
-                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: wait on named barrier {id} while {} (a wave waits only on the named barrier it joined; signalling any barrier is allowed)", match state { Some(j) => format!("joined to barrier {j}"), None => "not joined".to_string() }));
-                }
-            }
-            Stmt::BeginIf { .. } => stack.push((state, None)),
-            Stmt::Else => {
-                if let Some(top) = stack.last_mut() {
-                    top.1 = Some(state);
-                    state = top.0;
-                }
-            }
-            Stmt::EndIf => {
-                if let Some((entry, then_end)) = stack.pop() {
-                    let (t, e) = match then_end {
-                        Some(t) => (t, state),
-                        None => (state, entry),
-                    };
-                    if t != e {
-                        viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: the two paths of a branch end with different join states ({t:?} vs {e:?})"));
-                    }
-                    state = t;
-                }
-            }
-            Stmt::BeginLoop { .. } => loops.push(state),
-            Stmt::EndLoop => {
-                if let Some(entry) = loops.pop() {
-                    if entry != state {
-                        viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: a loop body that changes the join state ({entry:?} at entry, {state:?} at the back edge)"));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// GV-1250-BAR-INIT: every named barrier is initialized before its first use, with a work-group barrier between the initialization and the first use (a linear scan: the init and the
-/// barrier that orders it are straight-line code in practice).
-fn bar_init(f: &Function, v: &mut Vec<Violation>) {
-    let mut inited: HashSet<i32> = HashSet::default();
-    let mut unordered: HashSet<i32> = HashSet::default();
-    for (pos, st) in f.stmts().iter().enumerate() {
-        match st {
-            Stmt::BarrierInit { id, .. } => {
-                inited.insert(*id);
-                unordered.insert(*id);
-            }
-            Stmt::Barrier | Stmt::BarrierWait { id: -1 } => unordered.clear(),
-            Stmt::BarrierJoin { id } | Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } if (1..=16).contains(id) => {
-                if !inited.contains(id) {
-                    viol(v, "GV-1250-BAR-INIT", format!("statement {pos}: named barrier {id} used with no initialization before it (its member count is unset: it never completes)"));
-                } else if unordered.contains(id) {
-                    viol(v, "GV-1250-BAR-INIT", format!("statement {pos}: named barrier {id} used with no work-group barrier after its initialization (another wave may still be initializing it)"));
-                }
-            }
-            _ => {}
-        }
-    }
+    region_sigs(stmts, &sh, 0, stmts.len(), &tainted, v);
+    flow_checks(f, &sh, v);
 }
 
 /// The IR-level rules.
@@ -501,9 +703,7 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
             _ => {}
         }
     }
-    bar_reach(f, &mut v);
-    bar_join(f, &mut v);
-    bar_init(f, &mut v);
+    bar_structure(f, &mut v);
     v
 }
 
