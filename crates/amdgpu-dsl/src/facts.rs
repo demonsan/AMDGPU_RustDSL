@@ -345,7 +345,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.global_write = true;
             (ResClass::Dma, vec![], false)
         }
-        Stmt::WaitTensor { .. } | Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {
+        Stmt::WaitTensor { .. } | Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } | Stmt::BarrierInit { .. } | Stmt::BarrierJoin { .. } | Stmt::BarrierLeave | Stmt::ClusterBarrier => {
             e.fence = true;
             (ResClass::Sync, vec![], false)
         }

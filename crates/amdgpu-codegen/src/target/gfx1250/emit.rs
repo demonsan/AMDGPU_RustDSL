@@ -136,7 +136,11 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str(&format!("    .amdhsa_system_vgpr_workitem_id {}\n", d("system_vgpr_workitem_id", 2)));
     out.push_str(&format!("    .amdhsa_next_free_vgpr {vgpr}\n"));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {sgpr}\n"));
-    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", 0)));
+    let named = m.blocks.iter().flat_map(|b| b.insts.iter()).filter_map(|i| match i.op {
+        MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierSignal | MOp::SBarrierWait => Some((i.imm & 0xffff) as i16 as i64),
+        _ => None,
+    }).filter(|id| *id > 0).max().unwrap_or(0);
+    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", named)));
     let (d32, d64, _ieee) = m.fp_mode.unwrap_or((3, 3, false));
     out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {}\n", d("float_denorm_mode_32", d32 as i64)));
     out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {}\n", d("float_denorm_mode_16_64", d64 as i64)));
@@ -247,6 +251,25 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         }
         MOp::SBarrierSignal => vec![format!("s_barrier_signal {}", inst.imm)],
         MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
+        MOp::SBarrierInit => vec![format!("s_mov_b32 m0, {:#x}", inst.imm), "s_barrier_init m0".to_string()],
+        MOp::SBarrierJoin => vec![format!("s_barrier_join {}", inst.imm)],
+        MOp::SBarrierLeave => vec!["s_barrier_leave".to_string(), "s_wait_kmcnt 0x0".to_string()],
+        // the cluster barrier (CDNA5 ISA section 5.6.6; LLVM's lowering): the first wave of each workgroup (isfirst on the workgroup barrier, SCC
+        // via KMcnt, read after the wait) signals the cluster barrier; every wave waits on it
+        MOp::SClusterBarrier => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let l = format!(".Lcluster_bar_{}", N.fetch_add(1, Ordering::Relaxed));
+            vec![
+                "s_barrier_signal_isfirst -1".to_string(),
+                "s_barrier_wait -1".to_string(),
+                "s_wait_kmcnt 0x0".to_string(),
+                format!("s_cbranch_scc0 {l}"),
+                "s_barrier_signal -3".to_string(),
+                format!("{l}:"),
+                "s_barrier_wait -3".to_string(),
+            ]
+        }
         MOp::SSetVgprMsb => vec![format!("s_set_vgpr_msb {:#x}", inst.imm)],
         MOp::SReadTtmp => vec![format!("s_mov_b32 {}, ttmp{}", d_s(), inst.imm)],
         MOp::VWmmaF32_16x16x64Fp8

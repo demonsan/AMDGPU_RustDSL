@@ -2903,6 +2903,25 @@ impl Lowerer {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SBarrierWait).imm(*id as i64));
                 }
+                Stmt::BarrierInit { id, members } => {
+                    tdm_target()?;
+                    if !(1..=16).contains(id) || *members == 0 || *members > 63 {
+                        return Err(format!("barrier_init: named barrier id {id} (1..=16), members {members} (1..=63)"));
+                    }
+                    self.push(MInst::new(MOp::SBarrierInit).imm(((*members as i64) << 16) | *id as i64));
+                }
+                Stmt::BarrierJoin { id } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SBarrierJoin).imm(*id as i64));
+                }
+                Stmt::BarrierLeave => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SBarrierLeave));
+                }
+                Stmt::ClusterBarrier => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SClusterBarrier));
+                }
                 Stmt::SetVgprMsb { imm } => {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
