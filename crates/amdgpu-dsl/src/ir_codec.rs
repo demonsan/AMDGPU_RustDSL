@@ -140,6 +140,7 @@ impl FromIr for Op {
             "Permlane32Swap" => { v.expect_struct("Permlane32Swap")?; Ok(Op::Permlane32Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Permlane32SwapA" => { v.expect_struct("Permlane32SwapA")?; Ok(Op::Permlane32SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Salu" => { v.expect_struct("Salu")?; Ok(Op::Salu { op: FromIr::from_ir(v.field("op")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "SysVal" => { v.expect_struct("SysVal")?; Ok(Op::SysVal { op: FromIr::from_ir(v.field("op")?)?, imm: FromIr::from_ir(v.field("imm")?)? }) }
             "SwapA" => { v.expect_struct("SwapA")?; Ok(Op::SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Permlane32SwapB" => { v.expect_struct("Permlane32SwapB")?; Ok(Op::Permlane32SwapB { swap: FromIr::from_ir(v.field("swap")?)? }) }
             "Frag4" => { v.expect_tuple("Frag4", 4)?; Ok(Op::Frag4(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
@@ -281,6 +282,7 @@ impl IrIds for Op {
             Op::Permlane32Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Permlane32SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Salu { op, a, b } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::SysVal { op, imm } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*imm), fv, fr); }
             Op::SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Permlane32SwapB { swap } => { IrIds::ids(&mut (*swap), fv, fr); }
             Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
@@ -418,6 +420,48 @@ impl IrIds for SaluOp {
             SaluOp::Bitset0 => {}
             SaluOp::Bitset1 => {}
             SaluOp::AddNcU64 => {}
+        }
+    }
+}
+
+impl FromIr for SysOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Version" => { v.expect_unit("Version")?; Ok(SysOp::Version) }
+            "SetRegImm" => { v.expect_unit("SetRegImm")?; Ok(SysOp::SetRegImm) }
+            "WaitIdle" => { v.expect_unit("WaitIdle")?; Ok(SysOp::WaitIdle) }
+            "PrefetchInst" => { v.expect_unit("PrefetchInst")?; Ok(SysOp::PrefetchInst) }
+            "PrefetchGlobal" => { v.expect_unit("PrefetchGlobal")?; Ok(SysOp::PrefetchGlobal) }
+            other => Err(v.err(format!("unknown SysOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for SysOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            SysOp::Version => {}
+            SysOp::SetRegImm => {}
+            SysOp::WaitIdle => {}
+            SysOp::PrefetchInst => {}
+            SysOp::PrefetchGlobal => {}
+        }
+    }
+}
+
+impl FromIr for SysValOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "GetReg" => { v.expect_unit("GetReg")?; Ok(SysValOp::GetReg) }
+            "GetPc" => { v.expect_unit("GetPc")?; Ok(SysValOp::GetPc) }
+            other => Err(v.err(format!("unknown SysValOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for SysValOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            SysValOp::GetReg => {}
+            SysValOp::GetPc => {}
         }
     }
 }
@@ -835,6 +879,7 @@ impl FromIr for Stmt {
             "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
+            "Sys" => { v.expect_struct("Sys")?; Ok(Stmt::Sys { op: FromIr::from_ir(v.field("op")?)?, imm: FromIr::from_ir(v.field("imm")?)?, imm2: FromIr::from_ir(v.field("imm2")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "AuthorWords" => { v.expect_struct("AuthorWords")?; Ok(Stmt::AuthorWords { words: FromIr::from_ir(v.field("words")?)? }) }
             "GotoIf" => { v.expect_struct("GotoIf")?; Ok(Stmt::GotoIf { cond: FromIr::from_ir(v.field("cond")?)?, key: FromIr::from_ir(v.field("key")?)? }) }
             "Goto" => { v.expect_struct("Goto")?; Ok(Stmt::Goto { key: FromIr::from_ir(v.field("key")?)? }) }
@@ -931,6 +976,7 @@ impl IrIds for Stmt {
             Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }
+            Stmt::Sys { op, imm, imm2, reads } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*imm2), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::AuthorWords { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Stmt::GotoIf { cond, key } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*key), fv, fr); }
             Stmt::Goto { key } => { IrIds::ids(&mut (*key), fv, fr); }

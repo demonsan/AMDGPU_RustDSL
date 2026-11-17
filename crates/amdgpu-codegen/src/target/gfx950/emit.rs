@@ -1134,7 +1134,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SWaitCnt => vec![format!("s_waitcnt vmcnt({}) lgkmcnt({})", inst.imm & 0xff, inst.imm >> 8)],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
         // gfx1250 only: lowering rejects them for gfx950 (`tdm_target`); never reached
-        MOp::SWaitTensor | MOp::TensorLoadToLds | MOp::TensorStoreFromLds | MOp::RawInst | MOp::VSwapB32 | MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::VWmmaF32_16x16x64Fp8 | MOp::VWmmaF32_16x16x64Fp8Z | MOp::VWmmaF32_16x16x128Fp8 | MOp::VWmmaF32_16x16x128Fp8Z | MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z | MOp::SWaitCtr | MOp::SBarrierSignal | MOp::SBarrierWait | MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierLeave | MOp::SClusterBarrier | MOp::SSetSchedMode | MOp::SWaitAlu | MOp::SSetVgprMsb | MOp::SReadTtmp => {
+        MOp::SWaitTensor | MOp::TensorLoadToLds | MOp::TensorStoreFromLds | MOp::RawInst | MOp::VSwapB32 | MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::SSys | MOp::SSysVal | MOp::VWmmaF32_16x16x64Fp8 | MOp::VWmmaF32_16x16x64Fp8Z | MOp::VWmmaF32_16x16x128Fp8 | MOp::VWmmaF32_16x16x128Fp8Z | MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z | MOp::SWaitCtr | MOp::SBarrierSignal | MOp::SBarrierWait | MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierLeave | MOp::SClusterBarrier | MOp::SSetSchedMode | MOp::SWaitAlu | MOp::SSetVgprMsb | MOp::SReadTtmp => {
             vec![format!("; {:?}: gfx1250 only", inst.op)]
         }
         MOp::LdsWriteB32 => vec![format!(

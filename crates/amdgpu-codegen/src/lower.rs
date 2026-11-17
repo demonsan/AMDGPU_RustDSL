@@ -569,6 +569,8 @@ struct Lowerer {
     author_words: std::collections::VecDeque<Box<[u32]>>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
+    /// exact mode: lowering the statement `encode_e64` marks (gfx1250 VOP3 takes a literal in any source)
+    in_e64: bool,
     /// exact mode: the values the author pinned
     exact_pinned: HashSet<ValueId>,
     /// exact mode: values only contract markers read (no instruction)
@@ -691,6 +693,7 @@ impl Lowerer {
             author_words: Default::default(),
             m0_adds: HashSet::new(),
             e64_next: false,
+            in_e64: false,
             exact_pinned: HashSet::new(),
             ghosts: HashSet::new(),
             neg_folded: HashSet::new(),
@@ -2320,7 +2323,10 @@ impl Lowerer {
         // `encode_e64` marks the VALU instructions of the statement after it
         if std::mem::take(&mut self.e64_next) && !matches!(st, Stmt::EncodeE64) {
             let (b, n) = (self.cur, self.mir.blocks[self.cur].insts.len());
-            self.lower_stmt_inner(f, st)?;
+            self.in_e64 = true;
+            let r = self.lower_stmt_inner(f, st);
+            self.in_e64 = false;
+            r?;
             let blk = if self.cur == b { b } else { self.cur };
             let from = if blk == b { n } else { 0 };
             for i in self.mir.blocks[blk].insts[from..].iter_mut() {
@@ -2336,7 +2342,7 @@ impl Lowerer {
     fn lower_stmt_inner(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         self.cur_stmt += 1;
         // author words apply to the statement right after them, which must emit an instruction
-        if !self.author_words.is_empty() && !matches!(st, Stmt::AuthorWords { .. }) {
+        if !self.author_words.is_empty() && !matches!(st, Stmt::AuthorWords { .. } | Stmt::EncodeE64) {
             self.lower_stmt_inner2(f, st)?;
             if !std::mem::take(&mut self.author_words).is_empty() {
                 return Err(format!("stmt {}: author words not taken: the statement emits no instruction", self.cur_stmt));
@@ -3041,6 +3047,21 @@ impl Lowerer {
                 Stmt::SetVgprMsb { imm } => {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
+                }
+                Stmt::Sys { op, imm, imm2, reads } => {
+                    tdm_target()?;
+                    let mut inst = MInst::new(MOp::SSys).imm((*op as i64) | ((*imm as i64 & 0xffff) << 8) | ((*imm2 as i64) << 24));
+                    inst.pin = true;
+                    for o in reads {
+                        let r = match o {
+                            Opnd::Val(v) => *self.val.get(v).ok_or("sys: operand not lowered")?,
+                            Opnd::Var(w) => *self.vars.get(w.0 as usize).ok_or("sys: variable not lowered")?,
+                            _ => return Err("sys: register operands".into()),
+                        };
+                        self.touch(&[Src::Reg(r)]);
+                        inst = inst.srcreg(r);
+                    }
+                    self.push(inst);
                 }
                 Stmt::Raw { text, reads } => {
                     let inst = self.raw_inst(text, reads)?;
@@ -4577,6 +4598,15 @@ impl Lowerer {
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
             }
+            Op::SysVal { op, imm } => {
+                tdm_target()?;
+                let d = self.new_vreg(if *op == amdgpu_dsl::SysValOp::GetPc { RClass::S2 } else { RClass::S1 });
+                let mut inst = MInst::new(MOp::SSysVal).def(d).imm((*op as i64) | ((*imm as i64 & 0xffff) << 8));
+                inst.pin = true;
+                self.push(inst);
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::Salu { op, a, b } => {
                 tdm_target()?;
                 let wide = *op == amdgpu_dsl::SaluOp::AddNcU64;
@@ -5288,6 +5318,8 @@ impl Lowerer {
         };
         let s1 = match (self.const_bits(b), self.sgpr_src(b)) {
             (Some(k), _) if is_inline_const(k) => Src::Imm(k),
+            // gfx1250 VOP3 (the author's e64): one literal in any source
+            (Some(k), _) if self.in_e64 && !bus0 && crate::target::cur().name == "gfx1250" => Src::Imm(k),
             (None, Some(s)) if !bus0 => Src::Reg(s),
             _ => Src::Reg(self.as_v1(b)?),
         };
@@ -5722,6 +5754,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         // gfx1250: a preloaded kernarg word, a trap-temporary read; exact: a verbatim SALU instruction
                         Op::KernargPreload { .. } | Op::ReadTtmp { .. } => true,
                         Op::Salu { a, b, .. } => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        Op::SysVal { .. } => true,
                         Op::Raw { scalar, ty, .. } => {
                             if *scalar && *ty == DType::I1 {
                                 // an SCC result: a uniform condition
