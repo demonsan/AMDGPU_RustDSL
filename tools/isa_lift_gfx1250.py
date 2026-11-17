@@ -115,6 +115,7 @@ def parse(path):
         base = re.sub(r'_e(32|64)$', '', op)
         e64 = op.endswith('_e64')
         op = TO_950.get(base, base) + ('_e64' if e64 else '')
+        args = [f's{108 + int(x[4:])}' if re.fullmatch(r'ttmp\d+', x) else x for x in args]
         # (branches carry their target label only: the CFG reads it)
         text = '' if op in BRANCHES else r.get('text', '')
         if text and '--raw-text' not in sys.argv:
@@ -432,6 +433,10 @@ def entry_hw(L, live):
     for k in range(n):
         if ('s', 2 + k) in live:
             L.new('s', 2 + k, 1, 'I32', f'KernargPreload {{ dword: {k} }}')
+    for r in range(108, 124):
+        if ('s', r) in live:
+            # a trap temporary (hardware-initialised: workgroup / cluster ids), read in place
+            L.new('s', r, 1, 'I32', f'ReadTtmp {{ idx: {r - 108} }}')
 
 
 def main():
@@ -439,7 +444,7 @@ def main():
     isa_lift.Lifter = Lifter
     isa_lift.ENTRY_HW = entry_hw
     isa_lift.defs_uses = defs_uses
-    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
+    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'ReadTtmp': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
     # the kernel's argument layout (--args P,P,I,...: 8-byte pointers / 4-byte words in kernarg order): the code object's metadata lists every
     # argument (a launcher sizes and copies the kernarg buffer by it), also those only the preload reads

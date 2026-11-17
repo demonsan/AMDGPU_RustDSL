@@ -700,6 +700,9 @@ pub struct MInst {
 
 /// Exact mode: an SGPR pin at this base is VCC (the lane-mask register `v_cmp_*_e32` writes and `v_cndmask_b32_e32` / `s_cbranch_vcc*` read).
 pub const VCC_PIN: u32 = 106;
+/// Exact mode (gfx1250): an SGPR pin at TTMP_PIN + n is the trap temporary ttmp<n> (operand encoding 108 + n), read in place by the
+/// author's instructions (`Op::ReadTtmp` pinned there is no instruction).
+pub const TTMP_PIN: u32 = 108;
 /// Exact mode: an SGPR pin at this base (the ISA's operand encoding of SCC) is SCC: a scalar compare's result read by `s_cselect` /
 /// `s_cbranch_scc*`.
 pub const SCC_PIN: u32 = 253;
