@@ -392,3 +392,45 @@ pub fn probe_g1250_wide() -> Function {
     b.store_global(qo, 0, acc, MemTy::B32, false);
     b.finish()
 }
+
+/// P1 (LDS above 64 KiB): every work-item of every workgroup writes `(wg << 24) ^ (k << 12) ^ tid` to LDS byte `k * 1024 + 4 tid` for every
+/// 1 KiB row k of an allocation of `bytes`, then (after a barrier) reads the row words of work-item (tid + 37) % 256 and sums the XOR
+/// against the expected value: out[wg * 256 + tid] = 0 when every row came back. 256 work-items; many workgroups run at once (allocation
+/// granularity / overlap). Kernarg: out @0.
+pub fn probe_g1250_lds_big(bytes: u32) -> Function {
+    let rows = bytes / 1024;
+    let mut b = FnBuilder::new(&format!("probe_g1250_lds_{bytes}"), 256);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(1 << 26));
+    b.lds(bytes);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wgs = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(24)));
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let base = b.let_(Op::XorI32(Opnd::Val(wgs), Opnd::Val(tid)));
+    for k in 0..rows {
+        let la = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32((k * 1024) as i32)));
+        let v = b.let_(Op::XorI32(Opnd::Val(base), Opnd::I32((k << 12) as i32)));
+        b.store_lds_b32(la, v);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    let t37 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(37)));
+    let t2 = b.let_(Op::AndI32(Opnd::Val(t37), Opnd::I32(255)));
+    let a2 = b.let_(Op::ShlI32(Opnd::Val(t2), Opnd::I32(2)));
+    let base2 = b.let_(Op::XorI32(Opnd::Val(wgs), Opnd::Val(t2)));
+    let mut acc = b.let_(Op::ConstI32(0));
+    for k in 0..rows {
+        let la = b.let_(Op::AddI32(Opnd::Val(a2), Opnd::I32((k * 1024) as i32)));
+        let x = b.load_lds(la, MemTy::B32);
+        let e = b.let_(Op::XorI32(Opnd::Val(base2), Opnd::I32((k << 12) as i32)));
+        let d = b.let_(Op::XorI32(Opnd::Val(x), Opnd::Val(e)));
+        acc = b.let_(Op::AddI32(Opnd::Val(acc), Opnd::Val(d)));
+    }
+    let g = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(10)));
+    let o = b.let_(Op::AddI32(Opnd::Val(g), Opnd::Val(a)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+    b.store_global(q, 0, acc, MemTy::B32, false);
+    b.finish()
+}
