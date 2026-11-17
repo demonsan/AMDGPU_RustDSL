@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     const char* kn = argv[2];
     const int M = argc > 3 ? atoi(argv[3]) : 32, N = argc > 4 ? atoi(argv[4]) : 32, K = argc > 5 ? atoi(argv[5]) : 192;
     const int iters = argc > 6 ? atoi(argv[6]) : 0;
-    if (M % 32 || N % 32 || K % 192) { fprintf(stderr, "M, N multiples of 32 and K a multiple of 192 are required\n"); return 1; }
+    if (M % 32 || N % 32 || K % 64) { fprintf(stderr, "M, N multiples of 32 and K a multiple of 64 are required (the looped kernel: a multiple of 192)\n"); return 1; }
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
