@@ -4,5 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gfx950;
+/// gfx1250 (MI450) atoms; not re-exported (the shipped kernels target gfx950).
+pub mod gfx1250;
 
 pub use gfx950::*;

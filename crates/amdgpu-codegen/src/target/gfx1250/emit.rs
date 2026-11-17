@@ -168,6 +168,41 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
         MOp::SSetVgprMsb => vec![format!("s_set_vgpr_msb {:#x}", inst.imm)],
         MOp::SReadTtmp => vec![format!("s_mov_b32 {}, ttmp{}", d_s(), inst.imm)],
+        MOp::VWmmaF32_16x16x64Fp8
+        | MOp::VWmmaF32_16x16x64Fp8Z
+        | MOp::VWmmaF32_16x16x128Fp8
+        | MOp::VWmmaF32_16x16x128Fp8Z
+        | MOp::VWmmaScaleF32_32x16x128F4
+        | MOp::VWmmaScaleF32_32x16x128F4Z => {
+            let (mn, na, nb, nc, scaled, zero) = match inst.op {
+                MOp::VWmmaF32_16x16x64Fp8 => ("v_wmma_f32_16x16x64_fp8_fp8", 8, 8, 8, false, false),
+                MOp::VWmmaF32_16x16x64Fp8Z => ("v_wmma_f32_16x16x64_fp8_fp8", 8, 8, 8, false, true),
+                MOp::VWmmaF32_16x16x128Fp8 => ("v_wmma_f32_16x16x128_fp8_fp8", 16, 16, 8, false, false),
+                MOp::VWmmaF32_16x16x128Fp8Z => ("v_wmma_f32_16x16x128_fp8_fp8", 16, 16, 8, false, true),
+                MOp::VWmmaScaleF32_32x16x128F4 => ("v_wmma_scale_f32_32x16x128_f4", 16, 8, 16, true, false),
+                _ => ("v_wmma_scale_f32_32x16x128_f4", 16, 8, 16, true, true),
+            };
+            let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
+            let t = |p: u32, n: u32| format!("v[{}:{}]", p, p + n - 1);
+            let d = a.phys[inst.dst.ok_or("wmma without a destination")? as usize];
+            let mut ops = vec![t(d, nc), t(regs[0], na), t(regs[1], nb)];
+            let mut k = 2;
+            if zero {
+                ops.push("0".to_string());
+            } else {
+                ops.push(t(regs[2], nc));
+                k = 3;
+            }
+            if scaled {
+                ops.push(format!("v{}", regs[k]));
+                ops.push(format!("v{}", regs[k + 1]));
+            }
+            let mut l = format!("{mn} {}", ops.join(", "));
+            if scaled && inst.imm & 1 != 0 {
+                l.push_str(" matrix_b_scale:MATRIX_SCALE_ROW1");
+            }
+            vec![l]
+        }
         MOp::TensorLoadToLds | MOp::TensorStoreFromLds => {
             let mn = if inst.op == MOp::TensorLoadToLds { "tensor_load_to_lds" } else { "tensor_store_from_lds" };
             let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();

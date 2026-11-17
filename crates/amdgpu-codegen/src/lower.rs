@@ -3905,6 +3905,35 @@ impl Lowerer {
                     }
                 }
             }
+            Op::Wmma { kind, a, b, c, scale } => {
+                tdm_target()?;
+                let (mop, zmop) = match kind {
+                    amdgpu_dsl::WmmaKind::Fp8_16x16x64 => (MOp::VWmmaF32_16x16x64Fp8, MOp::VWmmaF32_16x16x64Fp8Z),
+                    amdgpu_dsl::WmmaKind::Fp8_16x16x128 => (MOp::VWmmaF32_16x16x128Fp8, MOp::VWmmaF32_16x16x128Fp8Z),
+                    amdgpu_dsl::WmmaKind::ScaleF4_32x16x128 => (MOp::VWmmaScaleF32_32x16x128F4, MOp::VWmmaScaleF32_32x16x128F4Z),
+                };
+                let frag = |s: &mut Self, o: Opnd, n: u32| if n == 16 { s.as_v16(o) } else { s.as_v8(o) };
+                let ra = frag(self, *a, kind.a_dwords())?;
+                let rb = frag(self, *b, kind.b_dwords())?;
+                let cls = if kind.c_dwords() == 16 { RClass::V16 } else { RClass::V8 };
+                let d = self.new_vreg(cls);
+                let mut inst = match c {
+                    Some(c) if !self.is_zero_frag(c) => {
+                        // D in a fresh register (accumulator reuse is the gfx950 MFMA path's; WMMA keeps C and D separate until G2)
+                        let rc = frag(self, *c, kind.c_dwords())?;
+                        MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(rc)
+                    }
+                    _ => MInst::new(zmop).def(d).srcreg(ra).srcreg(rb),
+                };
+                if let Some(s) = scale {
+                    let sa = self.as_v1(s.sa)?;
+                    let sb = self.as_v1(s.sb)?;
+                    self.touch(&[Src::Reg(sa), Src::Reg(sb)]);
+                    inst = inst.srcreg(sa).srcreg(sb).imm(s.b_row1 as i64);
+                }
+                self.push(inst);
+                self.val.insert(dst, d);
+            }
             Op::LoadLdsTrB16 { addr } => {
                 let (a, off) = self.lds_addr(*addr)?;
                 let d = self.new_vreg(RClass::V2);

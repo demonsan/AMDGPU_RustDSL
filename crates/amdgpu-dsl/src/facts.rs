@@ -219,6 +219,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
+        Op::Wmma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
         Op::PkFmaF32(..) | Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
         // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
         Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
