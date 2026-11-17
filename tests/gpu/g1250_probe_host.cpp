@@ -338,10 +338,29 @@ static int run_wide(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_lds_<bytes>: LDS round trip over the whole allocation, `wgs` workgroups of 256 at once; every out word must be 0.
+static int run_lds_big(Kernel& k, const char* kn, int wgs) {
+    uint32_t* dout;
+    size_t n = (size_t)wgs * 256;
+    HC(hipMalloc(&dout, n * 4));
+    HC(hipMemset(dout, 0xee, n * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(wgs, 256, args, kn);
+    std::vector<uint32_t> o(n);
+    HC(hipMemcpy(o.data(), dout, n * 4, hipMemcpyDeviceToHost));
+    long bad = 0, firstbad = -1;
+    for (size_t i = 0; i < n; ++i)
+        if (o[i] != 0) { if (firstbad < 0) firstbad = (long)i; ++bad; }
+    printf("lds_big %s: %d workgroups: bad=%ld first=%ld %s\n", kn, wgs, bad, firstbad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"workgroups\":%d},\"bad\":%ld,\"ok\":%s}\n", kn, wgs, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : mode == "named" ? "probe_g1250_named" : mode == "wide" ? "probe_g1250_wide" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : mode == "named" ? "probe_g1250_named" : mode == "wide" ? "probe_g1250_wide" : mode == "lds_big" ? (argc > 3 ? argv[3] : "probe_g1250_lds_86784") : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -360,6 +379,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
     if (mode == "wide") return run_wide(k, kn);
+    if (mode == "lds_big") return run_lds_big(k, kn, argc > 4 ? atoi(argv[4]) : 1);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
