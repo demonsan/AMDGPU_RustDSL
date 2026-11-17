@@ -341,6 +341,8 @@ pub fn probe_g1250_named() -> Function {
     let po = b.let_(Op::KernargPtr { offset: 0 });
     b.barrier_init(1, 4);
     b.barrier_join(1);
+    // (the ISA's recommended order: the member count is set before any wave uses the barrier)
+    b.barrier();
     let tid = b.let_(Op::WorkitemId);
     let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
     let v = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));

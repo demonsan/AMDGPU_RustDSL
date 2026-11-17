@@ -193,10 +193,10 @@ fn ring_tokens(e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
 /// completion dependences of the slots that do meet). False whenever either access is not a ring access.
 pub fn ring_independent(rm: &RingModel, ea: &Effects, a: &MInst, eb: &Effects, b: &MInst) -> bool {
     // a DMA of one tile and an LDS read of other tiles (the units' markers name both sides; declared tiles are disjoint unless aliased)
-    let is_dma = |e: &Effects| e.fence == Fence::Barrier && e.mem.is_some();
+    let is_dma_e = |e: &Effects| e.fence == Fence::Barrier && e.mem.is_some();
     let is_read = |e: &Effects| e.fence == Fence::None && matches!(&e.mem, Some(m) if m.space == Space::Lds && !m.write);
     for (d, de, r, re) in [(a, ea, b, eb), (b, eb, a, ea)] {
-        if is_dma(de) && is_read(re) {
+        if (is_dma_e(de) || is_tensor(d.op)) && is_read(re) {
             if let (Some(p), Some(c)) = (rm.tiles_prod.get(&d.unit), rm.tiles_cons.get(&r.unit)) {
                 if !p.is_empty() && !c.is_empty() && !rm.tiles_meet(p, c) {
                     return true;

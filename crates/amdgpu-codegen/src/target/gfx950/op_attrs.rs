@@ -1222,8 +1222,10 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VWmmaF32_16x16x128Fp8Z => a("v_wmma_f32_16x16x128_fp8_fp8", c(Mfma, 32, 48, Experimental)).mfma(32, false, false, true, false).backend(Backend::OwnOnly),
         VWmmaScaleF32_32x16x128F4 => a("v_wmma_scale_f32_32x16x128_f4", c(Mfma, 32, 48, Experimental)).mfma(32, true, true, false, false).backend(Backend::OwnOnly),
         VWmmaScaleF32_32x16x128F4Z => a("v_wmma_scale_f32_32x16x128_f4", c(Mfma, 32, 48, Experimental)).mfma(32, false, true, true, false).backend(Backend::OwnOnly),
-        TensorLoadToLds => a("tensor_load_to_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
-        TensorStoreFromLds => a("tensor_store_from_lds", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
+        // a memory fence like an LDS-DMA (ALU may cross it, memory may not), but NOT fence-only: it reads its descriptor SGPRs, which the
+        // scheduler and the wait pass must see (the descriptor's s_mov / s_load complete before it, nothing overwrites them early)
+        TensorLoadToLds => a("tensor_load_to_lds", ctrl).fence(F::Barrier).backend(Backend::OwnOnly),
+        TensorStoreFromLds => a("tensor_store_from_lds", ctrl).fence(F::Barrier).backend(Backend::OwnOnly),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
         SWaitCnt => a("s_waitcnt", ctrl).fence_only(F::WaitBoth).backend(Backend::OwnOnly),
         SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),
