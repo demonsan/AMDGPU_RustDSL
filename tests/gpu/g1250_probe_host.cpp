@@ -1,9 +1,11 @@
-// Host of the gfx1250 G1 probes (docs/gfx1250-plan.md): probe_g1250_add (3 f32 buffers), probe_g1250_math (transcendentals against the CPU) and probe_g1250_tdm (tensor_load_to_lds -> wait ->
-// barrier -> LDS read -> store). The first own-compiled gfx1250 kernels on hardware.
+// Host of the gfx1250 G1 probes (docs/gfx1250-plan.md): probe_g1250_add (3 f32 buffers), probe_g1250_math (transcendentals against the CPU), probe_g1250_tdm (tensor_load_to_lds -> wait ->
+// barrier -> LDS read -> store), probe_g1250_select (lane masks: compare / v_cndmask) and probe_g1250_buffer (buffer loads / stores / a returning atomic add). The first own-compiled gfx1250 kernels on hardware.
 //
 //   g1250_probe_host add  <co> [kernel=probe_g1250_add]  [N workgroups = 4096]
 //   g1250_probe_host math <co> [kernel=probe_g1250_math]
 //   g1250_probe_host tdm  <co> [kernel=probe_g1250_tdm]  [dwords = 64]
+//   g1250_probe_host select <co> [kernel=probe_g1250_select]
+//   g1250_probe_host buffer <co> [kernel=probe_g1250_buffer]
 //   env: PROBE_WATCHDOG_S (default 15): the wall-clock limit of every wait; ITERS (100) for the timing of `add`
 //
 // Smallest configuration first: `add` runs ONE workgroup before the full grid; `tdm` runs the smallest tile (1 dword per work-item). Hang policy (docs/mi450-nodes.md): every wait is POLLED against a
@@ -163,10 +165,68 @@ static int run_tdm(Kernel& k, const char* kn, int dwords) {
     return bad == 0 ? 0 : 3;
 }
 
+static int run_select(Kernel& k, const char* kn) {
+    std::vector<float> a(256), b(256), o(512);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> d(-50.f, 50.f);
+    for (int i = 0; i < 256; ++i) { a[i] = d(rng); b[i] = d(rng); }
+    a[7] = b[7];   // equal operands: the `>` compare is false, the select takes 2 b
+    float *da, *db, *dout;
+    HC(hipMalloc(&da, 1024)); HC(hipMalloc(&db, 1024)); HC(hipMalloc(&dout, 2048));
+    HC(hipMemcpy(da, a.data(), 1024, hipMemcpyHostToDevice));
+    HC(hipMemcpy(db, b.data(), 1024, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0xff, 2048));
+    std::vector<uint8_t> args(24, 0);
+    put64(args, 0, da); put64(args, 8, db); put64(args, 16, dout);
+    k.launch(1, 256, args, kn);
+    HC(hipMemcpy(o.data(), dout, 2048, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int i = 0; i < 256; ++i) {
+        const float ref = a[i] > b[i] ? a[i] : 2.f * b[i];
+        bad += o[i] != ref;
+        int32_t v; memcpy(&v, &o[256 + i], 4);
+        bad += v != ((i & 1) ? 7 : -i);
+    }
+    printf("select: 256 items: bad=%ld %s\n", bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"items\":256},\"bad\":%ld,\"ok\":%s}\n", kn, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
+static int run_buffer(Kernel& k, const char* kn) {
+    std::vector<float> a(256), b(256);
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<float> d(-10.f, 10.f);
+    for (int i = 0; i < 256; ++i) { a[i] = d(rng); b[i] = d(rng); }
+    float *da, *db, *dout;
+    HC(hipMalloc(&da, 1024)); HC(hipMalloc(&db, 1024)); HC(hipMalloc(&dout, 1028));
+    HC(hipMemcpy(da, a.data(), 1024, hipMemcpyHostToDevice));
+    HC(hipMemcpy(db, b.data(), 1024, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0, 1028));
+    std::vector<uint8_t> args(32, 0);
+    put64(args, 0, da); put64(args, 8, db); put64(args, 16, dout); put32(args, 24, 1024);   // nb = bytes of b's buffer resource
+    k.launch(1, 256, args, kn);
+    std::vector<uint32_t> o(257);
+    HC(hipMemcpy(o.data(), dout, 1028, hipMemcpyDeviceToHost));
+    long bad = 0;
+    double maxrel = 0;
+    for (int i = 0; i < 256; ++i) {
+        float v; memcpy(&v, &o[i], 4);
+        const double ref = 3.0 * a[i] + b[i];
+        const double rel = std::fabs(v - ref) / std::fmax(std::fabs(ref), 1e-3);
+        maxrel = std::fmax(maxrel, rel);
+        bad += !(rel <= 1e-6);
+    }
+    const bool atomic_ok = o[256] == 256u;   // 256 work-items each add 1 to out[256] (initially 0)
+    bad += !atomic_ok;
+    printf("buffer: 256 items: maxrel=%.3g out[256]=%u (atomic add of 256 ones) bad=%ld %s\n", maxrel, o[256], bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"items\":256},\"maxrel\":%.3g,\"bad\":%ld,\"ok\":%s}\n", kn, maxrel, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -179,6 +239,8 @@ int main(int argc, char** argv) {
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);
+    if (mode == "select") return run_select(k, kn);
+    if (mode == "buffer") return run_buffer(k, kn);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
