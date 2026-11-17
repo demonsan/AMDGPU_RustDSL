@@ -25,7 +25,7 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     }
     let (m, alloc) = crate::lower_and_allocate(f)?;
     let asm = match backend {
-        "own" => emit::emit(&m, &alloc)?,
+        "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {
             let own_only: Vec<String> = m
                 .blocks
@@ -34,6 +34,9 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
                 .filter(|i| matches!(i.op, crate::mir::MOp::TensorLoadToLds | crate::mir::MOp::TensorStoreFromLds | crate::mir::MOp::SWaitTensor | crate::mir::MOp::SWaitCtr | crate::mir::MOp::SBarrierSignal | crate::mir::MOp::SBarrierWait | crate::mir::MOp::SSetVgprMsb))
                 .map(|i| format!("{:?}", i.op))
                 .collect();
+            if !f.kd.is_empty() {
+                return Err(format!("{}: author kernel-descriptor directives (`kd`) are an own-tail (exact) feature", f.name));
+            }
             if !own_only.is_empty() {
                 return Err(format!("{}: the gfx1250 LLVM tail has no rows for {own_only:?} (use the own tail)", f.name));
             }

@@ -160,6 +160,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         // (s) zero-instruction views / assemblies of SGPR words
         Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } | Op::SgprCat8 { .. } => ResClass::Marker,
         Op::ReadTtmp { .. } => ResClass::Salu,
+        Op::KernargPreload { .. } => ResClass::Marker,
         Op::LoadScalar { .. } => ResClass::Salu,
         Op::MemTimeLo { .. } => {
             e.directive = true;
