@@ -118,6 +118,8 @@ pub enum MOp {
     VPkAddF32,
     /// `v_permlane32_swap_b32` dst, src: swaps dst lanes 32..63 with src lanes 0..31 (both registers change); srcs: dst, src.
     VPermlane32Swap,
+    /// gfx1250 `v_swap_b32 vA, vB`: srcs = [a, b]; writes both (dst = a's register; b's register in place)
+    VSwapB32,
     VPkMulF32,
     VAddU32,
     VAddCoU32,

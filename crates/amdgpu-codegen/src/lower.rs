@@ -4576,6 +4576,18 @@ impl Lowerer {
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
             }
+            Op::SwapA { a, b } => {
+                // in place on two registers (as Permlane32SwapA): copies into the result registers vanish when the author pinned them there
+                tdm_target()?;
+                let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                self.push(MInst::new(MOp::VSwapB32).def(la).srcreg(la).srcreg(lb));
+                self.val.insert(dst, la);
+                self.swap_second.insert(dst, lb);
+            }
             Op::Permlane32SwapB { swap: Opnd::Val(s) } => {
                 let r = *self.swap_second.get(s).ok_or("Permlane32SwapB: the operand is not a Permlane32SwapA")?;
                 self.val.insert(dst, r);

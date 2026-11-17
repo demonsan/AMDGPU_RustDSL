@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """gfx1250 front end of the exact lifter (tools/isa_lift.py; docs/exact-mode.md): the node's `llvm-objdump --mcpu=gfx1250` text of one kernel
 -> the lifter's instruction list, then the same structured whole-kernel lift into DSL IR text (irv1).
 
@@ -103,7 +103,8 @@ def parse(path):
             op = 'v_wmma_scale_f32_32x16x128_f4'
             words += recs[i + 1]['words']
             i += 1
-        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32')):
+        wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
+        if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32')) or any(op == f or op.startswith(f + '_e') for f in wops):
             mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
         elif op in BRANCHES:
             args = [f'L{r["target"]:x}'] if 'target' in r else args
@@ -137,6 +138,30 @@ class Lifter(isa_lift.Lifter):
             self.cov[op] += 1
             self.raws[op + ' (forced)'] += 1
             return True
+        wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
+        if any(op == f or op.startswith(f + '_e') for f in wops) and ' words:' in args:
+            # the DSL form with the author's encoding (fields an assembler fills differently, e.g. an unused VOP3 source)
+            w = next(x for x in args.split(' ') if x.startswith('words:'))[6:].split('/')
+            plain = ' '.join(x for x in args.split(' ') if not x.startswith('words:'))
+            mark = len(self.lines)
+            try:
+                ok = super().lift(op, plain)
+            except (TypeError, ValueError, KeyError, IndexError, StopIteration):
+                ok = False
+            # the words go right before the statement that IS the instruction: the last new value definition that is not a
+            # zero-instruction view (bitcast, lane, concatenation, pointer word)
+            at = None
+            if ok:
+                for k in range(len(self.lines) - 1, mark - 1, -1):
+                    l = self.lines[k].strip()
+                    if re.match(r'^%v\d+: \w+ = ', l) and not re.search(r'= (Bitcast|Frag\w*Lane|FragCat|PtrLo|PtrHi|PtrCat)', l):
+                        at = k
+                        break
+            if ok and at is not None:
+                self.lines.insert(at, 'AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in w) + '] }')
+                return True
+            del self.lines[mark:]
+            self.notes[f'{op}: no DSL form for the author words'] += 1
         if ' scc_live' in args:
             args = args.replace(' scc_live', '')
             if text and self.raw(op, args, text, scc=True):
@@ -285,6 +310,13 @@ class Lifter(isa_lift.Lifter):
             return True
         return False
 
+    def h_v_swap_b32(self, t, m, op):
+        # both registers in place: SwapA is the instruction (vA's new content), Permlane32SwapB names vB's
+        a, b = self.src(t[0], 'I32'), self.src(t[1], 'I32')
+        na = self.dst(t[0], 'U32', f'SwapA {{ a: {a}, b: {b} }}')
+        self.dst(t[1], 'U32', f'Permlane32SwapB {{ swap: Val({na}) }}')
+        return True
+
     def h_ds_write_b128(self, t, m, op):
         # ds_store_b128 vaddr, vdata[4] offset:N
         addr = self.lds_addr(['', t[0]], m)
@@ -376,7 +408,7 @@ def main():
     isa_lift.Lifter = Lifter
     isa_lift.ENTRY_HW = entry_hw
     isa_lift.defs_uses = defs_uses
-    isa_lift.RTY.update({'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
+    isa_lift.RTY.update({'SwapA': 'U32', 'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
     # the kernel's argument layout (--args P,P,I,...: 8-byte pointers / 4-byte words in kernarg order): the code object's metadata lists every
     # argument (a launcher sizes and copies the kernarg buffer by it), also those only the preload reads

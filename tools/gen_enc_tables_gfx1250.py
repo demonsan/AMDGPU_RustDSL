@@ -13,7 +13,7 @@ OUT = os.path.join(ROOT, "crates/amdgpu-target/src/gfx1250_co/tables.rs")
 VOP1 = ["v_mov_b32", "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_sin_f32", "v_cos_f32", "v_cvt_f32_i32", "v_cvt_f32_u32",
         "v_cvt_i32_f32", "v_cvt_u32_f32", "v_cvt_f32_f16", "v_cvt_f16_f32", "v_not_b32", "v_readfirstlane_b32", "v_floor_f32", "v_ceil_f32",
         "v_trunc_f32", "v_rndne_f32", "v_fract_f32", "v_ffbl_b32", "v_ffbh_u32", "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1", "v_cvt_f32_ubyte2",
-        "v_cvt_f32_ubyte3", "v_nop"]
+        "v_cvt_f32_ubyte3", "v_nop", "v_swap_b32"]
 VOP2 = ["v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fmac_f32", "v_mul_u32_u24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
         "v_and_b32", "v_or_b32", "v_xor_b32", "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_max_num_f32", "v_min_num_f32", "v_min_i32",
         "v_max_i32", "v_min_u32", "v_max_u32", "v_cndmask_b32", "v_add_co_ci_u32", "v_sub_co_ci_u32"]

@@ -197,6 +197,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::VarSlice4 { .. }
         | Op::Permlane32Swap { .. }
         | Op::Permlane32SwapA { .. }
+        | Op::SwapA { .. }
         | Op::Frag4(..)
         | Op::Frag4Lane { .. }
         | Op::Frag8(..)

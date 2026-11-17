@@ -453,6 +453,13 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
             }
             vec![l]
         }
+        MOp::VSwapB32 => {
+            let r: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
+            if r.len() != 2 {
+                return Err("v_swap_b32: two register operands".into());
+            }
+            vec![format!("v_swap_b32 v{}, v{}", r[0], r[1])]
+        }
         // exact mode: the author's instruction, verbatim
         // (an empty text: the ghost definition of a register the previous verbatim instruction wrote too; no line)
         MOp::RawInst => {
