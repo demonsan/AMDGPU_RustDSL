@@ -54,6 +54,8 @@ function Invoke-Remote([string]$bash, [switch]$Wrap) {
         if ($s -eq '@@MI450-BEGIN@@') { $inside = $true; continue }
         if ($inside) { Write-Host $s }
     }
+    if ($null -eq $exit -and $Wrap -and $script:retry -lt 2) { $script:retry++; Start-Sleep 5; return (Invoke-Remote $bash.Substring($bash.IndexOf("`n") + 1, $bash.LastIndexOf("`n") - $bash.IndexOf("`n") - 1) -Wrap) }   # the sync steps are idempotent: a dropped connection is retried (never the payload: no blind retry of a GPU run)
+    $script:retry = 0
     if ($null -eq $exit) { Write-Error "no end marker (ssh rc=$rc): the connection or the node failed" -ErrorAction Continue; return 250 }
     return $exit
 }
@@ -71,8 +73,8 @@ if ($Sync) {
     $rcMk = Invoke-Remote ("mkdir -p " + $wsdir.Replace('$HOME', '~')) -Wrap
     $scpArgs = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh")
     $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null
-    $scprc = $LASTEXITCODE; $ErrorActionPreference = $eap2
+    $scprc = 1; for ($try = 0; $try -lt 3 -and $scprc -ne 0; $try++) { if ($try -gt 0) { Start-Sleep 5 }; & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null; $scprc = $LASTEXITCODE }
+    $ErrorActionPreference = $eap2
     if ($Bundle) {
         Push-Location $Repo; $bun = Join-Path $env:TEMP ("mi450-" + [guid]::NewGuid().ToString('N') + '.bundle'); $headSha = (git rev-parse HEAD).Trim(); & git bundle create $bun HEAD origin/Main 2>&1 | Out-Null; Pop-Location
         $ErrorActionPreference = 'Continue'; & scp @scpArgs $bun ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.bundle") 2>&1 | Out-Null; $ErrorActionPreference = $eap2; Remove-Item $bun -ErrorAction SilentlyContinue

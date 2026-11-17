@@ -4,7 +4,10 @@
 
 use amdgpu_dsl::Function;
 
+pub mod check;
 pub mod emit;
+pub mod hazards;
+pub mod waits;
 
 /// Compiles `f` for gfx1250 (G1: the shared lowering / scheduling / allocation, then the gfx1250 emitter; wave32 kernels without
 /// divergent control flow, v0..v255, no AGPRs; the waits are the gfx950 ones mapped conservatively onto the split counters).
@@ -24,6 +27,15 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
         return Err(format!("{}: workgroup size {} (gfx1250: at most 1024 work-items)", f.name, f.workgroup_size));
     }
     let (m, alloc) = crate::lower_and_allocate(f)?;
+    // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
+    crate::gpu_verify_1250::enforce(f, &m, &alloc)?;
+    // the LDS tile protocol (gpu_protocol: completion incl. the tensor operations' TENSORcnt, publication by barriers, slot reuse) of the
+    // kernel's declared tiles / rings
+    let proto = crate::gpu_verify::verify_ir_protocol(f);
+    let errs: Vec<String> = proto.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
+    if !errs.is_empty() {
+        return Err(format!("{}: tile protocol: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
+    }
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {
@@ -49,5 +61,13 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
         }
         b => return Err(format!("unknown backend `{b}` (own, llvm-tail)")),
     };
+    // the relaxed scheduling mode is allowed only as the exact-mode statement the exact verifier models (check.rs); any other write of the
+    // mode register stays a GV-1250-SCHED-MODE error
+    let modeled = f.exact && f.stmts().iter().any(|s| matches!(s, amdgpu_dsl::Stmt::SetSchedMode { .. }));
+    if modeled {
+        crate::gpu_verify_1250::with_rules_disabled(&["GV-1250-SCHED-MODE"], || crate::gpu_verify_1250::enforce_asm(&f.name, &asm))?;
+    } else {
+        crate::gpu_verify_1250::enforce_asm(&f.name, &asm)?;
+    }
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }

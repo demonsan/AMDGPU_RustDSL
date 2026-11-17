@@ -41,12 +41,15 @@ GLOBAL_STORE = [("global_store_b32", "v1"), ("global_store_b64", "v[2:3]"), ("gl
 DS_LOAD = [("ds_load_b32", "v1"), ("ds_load_b64", "v[2:3]"), ("ds_load_b128", "v[4:7]"), ("ds_load_u16", "v1"), ("ds_load_u8", "v1")]
 DS_STORE = [("ds_store_b32", "v1"), ("ds_store_b64", "v[2:3]"), ("ds_store_b128", "v[4:7]"), ("ds_store_b16", "v1"), ("ds_store_b8", "v1")]
 TDM = ["tensor_load_to_lds", "tensor_store_from_lds"]
+BUF_LOAD = ["buffer_load_b32", "buffer_load_b64", "buffer_load_b96", "buffer_load_b128", "buffer_load_u8", "buffer_load_i8", "buffer_load_u16", "buffer_load_i16"]
+BUF_STORE = ["buffer_store_b8", "buffer_store_b16", "buffer_store_b32", "buffer_store_b64", "buffer_store_b96", "buffer_store_b128"]
+BUF_ATOMIC = ["buffer_atomic_add_u32", "buffer_atomic_add_f32"]
 # the kernel prologue (see the gfx1250 emitter)
 WMMA = [("v_wmma_f32_16x16x32_bf16", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]"),
         ("v_wmma_f32_16x16x64_fp8_fp8", "v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[16:23], v[24:31]"),
         ("v_wmma_f32_16x16x128_fp8_fp8", "v_wmma_f32_16x16x128_fp8_fp8 v[8:15], v[16:31], v[32:47], v[48:55]"),
         ("v_wmma_scale_f32_32x16x128_f4", "v_wmma_scale_f32_32x16x128_f4 v[64:79], v[16:31], v[32:39], v[48:63], v3, v4")]
-EXTRA = [("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
+EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
 
 
 def samples():
@@ -84,6 +87,11 @@ def samples():
         s.append((m, f"{m} v9, {d} offset:16"))
     for m in TDM:
         s.append((m, f"{m} s[0:3], s[4:11]"))
+    w = {"b64": "v[2:3]", "b96": "v[4:6]", "b128": "v[4:7]"}
+    for m in BUF_LOAD + BUF_STORE:
+        s.append((m, f"{m} {w.get(m.rsplit('_', 1)[1], 'v1')}, v9, s[4:7], s3 offen offset:16"))
+    for m in BUF_ATOMIC:
+        s.append((m, f"{m} v1, v9, s[4:7], s3 offen"))
     s.extend(EXTRA)
     s.extend(WMMA)
     return s
@@ -122,6 +130,8 @@ def fmt(b):
         return "VGLOBAL", (d0 >> 14) & 0xFF
     if d0 >> 26 == 0x34:
         return "VIMAGE", (d0 >> 14) & 0xFF
+    if d0 >> 26 == 0x31:
+        return "VBUFFER", (d0 >> 14) & 0xFF
     return "UNK", d0 >> 24
 
 

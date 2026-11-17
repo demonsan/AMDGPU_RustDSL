@@ -69,6 +69,8 @@ pub fn probe_g1250_tdm_with(raw: Option<[u32; 3]>) -> Function {
         b.arg(&format!("d{k}"), DType::I32, 16 + 4 * k, 4);
     }
     b.arg_tensor("out", Ext::c(64 * 4));
+    // host contract: group 1 word 0 (kernarg offset 32) carries no multicast mask (low 16 bits zero): the data-size field only (docs/gfx1250-hang-rules.md GV-1250-MCAST)
+    b.ka_one_of(32, &[0, 0x10000, 0x20000, 0x30000]);
     b.lds(4096);
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let w: Vec<Opnd> = (0..12u32).map(|k| Opnd::Val(b.let_(Op::KernargI32 { offset: 16 + 4 * k }))).collect();
@@ -151,3 +153,208 @@ pub fn probe_g1250_wmma_f4() -> Function {
     probe_g1250_wmma_with("probe_g1250_wmma_f4", amdgpu_dsl::WmmaKind::ScaleF4_32x16x128, true)
 }
 
+/// Lane masks on wave32: `out[i] = a[i] > b[i] ? a[i] : 2 b[i]` and `out[i + 256] = (i & 1) ? 7 : -i` (compares into VCC and into an SGPR,
+/// `v_cndmask`), 256 work-items.
+pub fn probe_g1250_select() -> Function {
+    use amdgpu_dsl::{CmpPred, CmpTy};
+    let mut b = FnBuilder::new("probe_g1250_select", 256);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg_tensor("a", Ext::c(256 * 4));
+    b.arg_tensor("b", Ext::c(256 * 4));
+    b.arg_tensor("out", Ext::c(512 * 4));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let po = b.let_(Op::KernargPtr { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let qa = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) });
+    let qb = b.let_(Op::PtrAdd { base: Opnd::Val(pb), byte_off: Opnd::Val(off) });
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(off) });
+    let x = b.load_global(qa, 0, MemTy::B32);
+    let y = b.load_global(qb, 0, MemTy::B32);
+    let xf = b.let_(Op::BitcastF32(Opnd::Val(x)));
+    let yf = b.let_(Op::BitcastF32(Opnd::Val(y)));
+    let y2 = b.add_f32(yf, yf);
+    let c = b.cmp(CmpPred::Gt, CmpTy::F32, xf, yf);
+    let s = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(c), a: Opnd::Val(xf), b: Opnd::Val(y2) });
+    b.store_global(qo, 0, s, MemTy::B32, false);
+    let odd = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(1)));
+    let c2 = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
+    let neg = b.bin(amdgpu_dsl::BinOp::SubU32, Opnd::I32(0), tid);
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::I32(7), b: Opnd::Val(neg) });
+    b.store_global(qo, 1024, s2, MemTy::B32, false);
+    b.finish()
+}
+
+/// Buffers on gfx1250 (the 57-bit-base / 45-bit-num_records V#): `out[i] = 3 * a[i] + b[i]` through buffer loads / stores with a
+/// constant and a kernarg-sized `num_records`, plus a returning buffer atomic add into `out[256]`; 256 work-items.
+pub fn probe_g1250_buffer() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_buffer", 256);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg("nb", DType::I32, 24, 4);
+    b.arg_tensor("a", Ext::c(256 * 4));
+    b.arg_tensor("b", Ext::c(256 * 4));
+    b.arg_tensor("out", Ext::c(257 * 4));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let po = b.let_(Op::KernargPtr { offset: 16 });
+    let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let ra = b.buffer_desc(pa, 1024);
+    let rb = b.buffer_desc_dyn(pb, nb);
+    let ro = b.buffer_desc(po, 1028);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.buffer_load_f32(ra, off, Opnd::I32(0), 0);
+    let y = b.buffer_load_f32(rb, off, Opnd::I32(0), 0);
+    let x3 = b.mul_f32(x, Opnd::F32(3.0));
+    let s = b.add_f32(x3, y);
+    b.buffer_store_f32(ro, off, Opnd::I32(0), 0, s);
+    let one = b.let_(Op::ConstI32(1));
+    let _r = b.buffer_atomic_add_ret(ro, Opnd::I32(0), Opnd::I32(0), 1024, one);
+    b.finish()
+}
+
+/// A 2-D TDM tile from the typed descriptor builder (`FnBuilder::tensor_desc_2d`): a 16 x 8 f32 tile of a row-major tensor, starting
+/// `off` bytes into `src`, with `dim0` / `dim1` the extents from the tile start (elements outside read as 0) and `pitch` elements per
+/// row; then every work-item copies one LDS dword to `out[tid]`. 128 work-items. Kernargs: src @0, out @8, dim0 @16, dim1 @20,
+/// pitch @24, off @28.
+pub fn probe_g1250_tdm2d() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_tdm2d", 128);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    for (k, n) in ["dim0", "dim1", "pitch", "off"].iter().enumerate() {
+        b.arg(n, DType::I32, 16 + 4 * k as u32, 4);
+    }
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.lds(128 * 4);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let d0 = b.let_(Op::KernargI32 { offset: 16 });
+    let d1 = b.let_(Op::KernargI32 { offset: 20 });
+    let pitch = b.let_(Op::KernargI32 { offset: 24 });
+    let off = b.let_(Op::KernargI32 { offset: 28 });
+    let t = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::Val(d0), Opnd::Val(d1)], stride0: Opnd::Val(pitch), tile: [16, 8], pad: None, wg_mask: 0 };
+    let (g0, g1) = b.tensor_desc_2d(&t, Opnd::Val(ps), Opnd::Val(off), Opnd::I32(0));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+    b.wait_tensor(0);
+    b.barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.load_lds(a, MemTy::B32);
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(qo, 0, x, MemTy::B32, false);
+    b.finish()
+}
+
+/// Named and cluster barriers (compile / encode coverage; the cluster barrier needs a cluster launch): every wave initialises and joins
+/// named barrier 1 (all 4 waves), signals / waits it, leaves it, then the cluster barrier; out[tid] = tid.
+pub fn probe_g1250_barriers() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_barriers", 128);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    b.barrier_init(1, 4);
+    b.barrier_join(1);
+    b.barrier_signal(1);
+    b.barrier_wait(1);
+    b.barrier_leave();
+    b.cluster_barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(q, 0, tid, MemTy::B32, false);
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f.kd.push(("named_barrier_count".into(), 1));
+    f
+}
+
+/// A 2-slot TDM ring (unrolled, K = 4 tiles of 16 x 8 f32 from a 32 x 16 row-major tensor): tile i+2 is issued into the slot tile i was
+/// read from once every wave has read it (barrier), tile i is consumed after `wait_tensor(1)` (the in-order TENSORcnt: only tile i+1 may
+/// still be in flight) and a barrier. out[tid] = sum over the 4 tiles of element tid. 128 work-items. Kernargs: src @0, out @8.
+pub fn probe_g1250_tdm_ring() -> Function {
+    tdm_ring_with(true, true)
+}
+
+/// The ring of `probe_g1250_tdm_ring` with its protocol markers (an `lds_ring` of 2 slots, `tile_produce` around each tensor load,
+/// `tile_consume` around each read), so the protocol verifier checks the tensor completion (`wait_tensor`) and the slot reuse (barriers).
+/// `wait`: the consumer's tensor wait; `reuse_barrier`: the barrier between the last read of a slot and the tensor load overwriting it
+/// (both true in the shipped probe; the mutation tests clear them).
+pub fn tdm_ring_with(wait: bool, reuse_barrier: bool) -> Function {
+    const K: usize = 4;
+    let mut b = FnBuilder::new("probe_g1250_tdm_ring", 128);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.lds(2 * 128 * 4);
+    b.lds_ring("ring", 0, 512, 2);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(16), Opnd::I32(8)], stride0: Opnd::I32(16), tile: [16, 8], pad: None, wg_mask: 0 };
+    let issue = |b: &mut FnBuilder, i: usize| {
+        let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::I32((i * 128 * 4) as i32), Opnd::I32(((i % 2) * 512) as i32));
+        b.tile_produce("ring", Opnd::I32((i % 2) as i32), Opnd::I32((i / 2) as i32));
+        b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+        b.tile_end();
+    };
+    issue(&mut b, 0);
+    issue(&mut b, 1);
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let mut acc = b.let_(Op::ConstF32(0.0));
+    for i in 0..K {
+        if wait {
+            b.wait_tensor(if i + 1 < K { 1 } else { 0 });
+        }
+        b.barrier();
+        let la = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(((i % 2) * 512) as i32)));
+        b.tile_consume("ring", Opnd::I32((i % 2) as i32), Opnd::I32((i / 2) as i32));
+        let x = b.load_lds(la, MemTy::B32);
+        b.tile_end();
+        let xf = b.let_(Op::BitcastF32(Opnd::Val(x)));
+        acc = b.add_f32(acc, xf);
+        if i + 2 < K {
+            b.wait_lds(0);
+            if reuse_barrier {
+                b.barrier();
+            }
+            issue(&mut b, i + 2);
+        }
+    }
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(qo, 0, acc, MemTy::B32, false);
+    b.finish()
+}
+
+/// A named barrier as the workgroup's synchronisation (hardware probe): 4 waves initialise / join named barrier 1 (4 members), every
+/// work-item writes `3 * tid` to LDS, releases its LDS writes (`wait_lds(0)`), signals / waits barrier 1, then reads the value of the
+/// work-item one wave further: out[tid] = 3 * ((tid + 32) % 128). Then it leaves the barrier. 128 work-items.
+pub fn probe_g1250_named() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_named", 128);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.lds(128 * 4);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    b.barrier_init(1, 4);
+    b.barrier_join(1);
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let v = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+    b.store_lds_b32(a, v);
+    b.wait_lds(0);
+    b.barrier_signal(1);
+    b.barrier_wait(1);
+    let a2 = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(128)));
+    let a3 = b.let_(Op::AndI32(Opnd::Val(a2), Opnd::I32(511)));
+    let x = b.load_lds(a3, MemTy::B32);
+    b.barrier_leave();
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(q, 0, x, MemTy::B32, false);
+    let mut f = b.finish();
+    f.kd.push(("named_barrier_count".into(), 1));
+    f
+}

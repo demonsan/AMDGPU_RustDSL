@@ -74,16 +74,18 @@ def mla(tree):
     if not (os.path.exists(host) and os.path.exists(co)):
         return []
     out = []
-    for (b, ctx) in [(1, 64), (4, 1000), (32, 2048), (128, 4096)]:
-        def build(side, b=b, ctx=ctx):
-            return Run([], ['{host:g1250_mla_host}', co, _vname(co), str(b), str(ctx), '16', '50', '20000'], {})
-        out.append(Case(id=f'mla/vendor/B{b}C{ctx}', family='mla', build=build, metric=['json_us', 'json_gbs'], line=r'^\{"host"', ok=r'"ok":\s*true', timeout=300))
+    # hot: the KV stays in L2 / MALL between launches (the decode-step working set of a small batch); flushed: every launch reads the KV from HBM (FLUSH=1, tests/gpu/g1250_timing.h)
+    for flush in (0, 1):
+        for (b, ctx) in [(1, 64), (4, 1000), (32, 2048), (128, 4096)]:
+            def build(side, b=b, ctx=ctx, flush=flush):
+                return Run([], ['{host:g1250_mla_host}', co, _vname(co), str(b), str(ctx), '16', '50', '20000'], dict(FLUSH=flush))
+            out.append(Case(id=f'mla/vendor/{"flushed" if flush else "hot"}/B{b}C{ctx}', family='mla', build=build, metric=['json_us', 'json_gbs'], line=r'^\{"host"', ok=r'"ok":\s*true', timeout=300))
     return out
 
 
 def cases(tree, args):
     out = []
-    for f in (smoke, f4gemm, mla):
+    for f in (smoke, f4gemm, mla, paired_floor):
         out += f(tree)
     # the --quick set: the first and the last case of every family
     groups = {}
@@ -92,4 +94,21 @@ def cases(tree, args):
     for cs in groups.values():
         cs[0].quick = True
         cs[-1].quick = True
+    return out
+
+
+def paired_floor(tree):
+    """Harness validation: the SAME vendor code object as old and new, timed paired (alternating blocks on the same buffers in one process). The ratio must be 1.000 within the pair spread whatever the
+    placement of the buffers: this is the noise floor of a paired A/B (the unpaired old / new pair of `mla/vendor/*` varies by tens of percent between processes)."""
+    out = []
+    mhost = os.path.join(tree, 'tests', 'gpu', 'g1250_mla_host.cpp')
+    mco = os.path.join(HSA, 'mla', 'mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co')
+    if os.path.exists(mhost) and os.path.exists(mco):
+        for (b, ctx) in [(1, 64), (4, 1000), (32, 2048), (128, 4096)]:
+            def build(side, b=b, ctx=ctx):
+                import shutil
+                os.makedirs(side.codir, exist_ok=True)
+                shutil.copy(mco, os.path.join(side.codir, 'mlaself.co'))   # a byte-identical copy per side: two loads of the same code at different addresses
+                return Run([], ['{host:g1250_mla_host}', '{oldco:mlaself}', _vname(mco), str(b), str(ctx), '16', '50', '20000'], dict(CO2='{co:mlaself}'))
+            out.append(Case(id=f'mla/paired-self/B{b}C{ctx}', family='paired', build=build, metric='json_us', line=r'"paired"', ok=r'"ok":\s*true', paired=True, timeout=300))
     return out

@@ -818,6 +818,52 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "hang-scan" => {
+            // amdc hang-scan [--show N] <file>...: the gfx1250 hang-safety asm rules (docs/gfx1250-hang-rules.md) over instruction text: our emitted asm or a disassembly of any
+            // code object (the disassembler's address / encoding comments are ignored). Prints the violations per rule; exit 1 when there are any.
+            let show: usize = args.windows(2).find(|w| w[0] == "--show").and_then(|w| w[1].parse().ok()).unwrap_or(5);
+            let mut files: Vec<&String> = Vec::new();
+            let mut it = args.iter().skip(1);
+            while let Some(a) = it.next() {
+                if a == "--show" {
+                    it.next();
+                } else if !a.starts_with("--") {
+                    files.push(a);
+                }
+            }
+            if files.is_empty() {
+                eprintln!("usage: amdc hang-scan [--show N] <asm-or-disassembly.txt>...");
+                return ExitCode::from(2);
+            }
+            let mut any = false;
+            for f in files {
+                let text = match std::fs::read_to_string(f) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{f}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let v = amdgpu_codegen::gpu_verify_1250::verify_asm(&text);
+                if v.is_empty() {
+                    println!("{f}: clean ({} lines)", text.lines().count());
+                    continue;
+                }
+                any = true;
+                let mut by: std::collections::BTreeMap<&str, Vec<&amdgpu_codegen::gpu_verify_1250::Violation>> = Default::default();
+                for x in &v {
+                    by.entry(x.rule).or_default().push(x);
+                }
+                println!("{f}: {} violation(s)", v.len());
+                for (rule, xs) in by {
+                    println!("  {rule}: {}", xs.len());
+                    for x in xs.iter().take(show) {
+                        println!("    {}", x.msg);
+                    }
+                }
+            }
+            return if any { ExitCode::from(1) } else { ExitCode::SUCCESS };
+        }
         "check-launch" => {
             // amdc check-launch <kernel> [--ka OFF=V,...] [--grid X,Y,Z] [--size ARG=BYTES,...] [--sym NAME=V,...]: the host contract of the
             // kernel (the facts its certificate assumes) evaluated for one concrete launch - for launchers that do not go through Python

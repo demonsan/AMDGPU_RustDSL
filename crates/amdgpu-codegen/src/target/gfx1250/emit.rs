@@ -79,6 +79,8 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "fp16_overflow", "group_segment_fixed_size", "kernarg_size",
     // not a descriptor field: the `s_code_end` words after the kernel's code (an exact replay's padding, as the author's toolchain wrote it)
     "code_end_pad",
+    // a launch fact for the hang-safety verifier (workgroups per cluster; `gpu_verify_1250`): accepted, not a descriptor field, never printed
+    "cluster_dims",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
@@ -116,6 +118,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str("    v_nop\n");
         out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
     }
+    // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
+    // exact mode: the author's waits and padding are verified (check.rs), never added to
+    let plan = if m.exact { super::waits::Plan::default() } else { super::waits::plan(m, a) };
+    // the gfx1250 software hazards (hazards.rs); the shared pass's s_nop wait states are not needed on gfx1250 (all other VALU dependencies
+    // interlock) and are dropped, except the author's in exact mode
+    let hz = if m.exact { super::hazards::Plan::default() } else { super::hazards::plan(m, a) };
     // exact mode: the author's block order (`Stmt::LayoutKey`); an unkeyed block stays right after the block before it
     let order: Vec<usize> = if m.exact && !m.reg_hints.layout_keys.is_empty() {
         let key: std::collections::HashMap<u32, u32> = m.reg_hints.layout_keys.iter().map(|(l, k)| (*l, *k)).collect();
@@ -162,19 +170,35 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         let b = &m.blocks[bi];
         let next_label = order.get(oi + 1).map(|&n| m.blocks[n].label);
         out.push_str(&format!("BB{}:\n", b.label));
-        for inst in &b.insts {
-            for line in inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? {
-                let line = if msb_window && inst.op != MOp::RawInst { vgpr_window(&line) } else { line };
-                // the author's words for this instruction (exact replay), our spelling as the comment
-                let line = match &inst.words {
-                    Some(w) => format!(".long {} // {line}", w.iter().map(|x| format!("{x:#010x}")).collect::<Vec<_>>().join(", ")),
-                    None => line,
-                };
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let lines = match plan.replace.get(&(bi, ii)) {
+                Some(r) => r.clone(),
+                None if inst.op == MOp::SNop && !m.exact => Vec::new(),
+                None => {
+                    let mut v = plan.before.get(&(bi, ii)).cloned().unwrap_or_default();
+                    v.extend(hz.before.get(&(bi, ii)).cloned().unwrap_or_default());
+                    let own = inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))?;
+                    for line in own {
+                        let line = if msb_window && inst.op != MOp::RawInst { vgpr_window(&line) } else { line };
+                        // the author's words for this instruction (exact replay), our spelling as the comment
+                        v.push(match &inst.words {
+                            Some(w) => format!(".long {} // {line}", w.iter().map(|x| format!("{x:#010x}")).collect::<Vec<_>>().join(", ")),
+                            None => line,
+                        });
+                    }
+                    v
+                }
+            };
+            for line in lines {
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
             }
         }
+        for line in plan.end.get(&bi).into_iter().flatten() {
+            out.push_str(&format!("    {line}\n"));
+        }
+
         let term = match &b.term {
             Term::Goto(t) => Term::Goto(fin(*t)),
             Term::CondGoto { on, target, fall } => {
@@ -251,7 +275,11 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str(&format!("    .amdhsa_system_vgpr_workitem_id {}\n", d("system_vgpr_workitem_id", 2)));
     out.push_str(&format!("    .amdhsa_next_free_vgpr {vgpr}\n"));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {sgpr}\n"));
-    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", 0)));
+    let named = m.blocks.iter().flat_map(|b| b.insts.iter()).filter_map(|i| match i.op {
+        MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierSignal | MOp::SBarrierWait => Some((i.imm & 0xffff) as i16 as i64),
+        _ => None,
+    }).filter(|id| *id > 0).max().unwrap_or(0);
+    out.push_str(&format!("    .amdhsa_named_barrier_count {}\n", d("named_barrier_count", named)));
     let (d32, d64, _ieee) = m.fp_mode.unwrap_or((3, 3, false));
     out.push_str(&format!("    .amdhsa_float_denorm_mode_32 {}\n", d("float_denorm_mode_32", d32 as i64)));
     out.push_str(&format!("    .amdhsa_float_denorm_mode_16_64 {}\n", d("float_denorm_mode_16_64", d64 as i64)));
@@ -329,6 +357,32 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         // the split barrier of the workgroup (id -1)
         MOp::SBarrier => vec!["s_barrier_signal -1".to_string(), "s_barrier_wait -1".to_string()],
         MOp::SWaitTensor => vec![format!("s_wait_tensorcnt {:#x}", inst.imm)],
+        // the gfx1250 V#: base [56:0], num_records [101:57] (bytes, 45 bits), stride 0, type 0 (buffer)
+        MOp::SBufferRsrc | MOp::SBufferRsrcDyn => {
+            let d = a.phys[inst.dst.ok_or("dst")? as usize];
+            let src = |k: usize| -> Result<u32, String> {
+                match inst.srcs.get(k) {
+                    Some(Src::Reg(r)) => Ok(a.phys[*r as usize]),
+                    _ => Err("buffer descriptor operand".into()),
+                }
+            };
+            let b = src(0)?;
+            let mut v = vec![format!("s_mov_b32 s{d}, s{b}"), format!("s_and_b32 s{}, s{}, 0x1ffffff", d + 1, b + 1)];
+            if inst.op == MOp::SBufferRsrc {
+                let n = inst.imm as u32 as u64;
+                if n & 0x7f != 0 {
+                    v.push(format!("s_or_b32 s{}, s{}, {:#x}", d + 1, d + 1, ((n & 0x7f) << 25) as u32));
+                }
+                v.push(format!("s_mov_b32 s{}, {:#x}", d + 2, (n >> 7) as u32));
+            } else {
+                let n = src(1)?;
+                v.push(format!("s_lshl_b32 s{}, s{n}, 25", d + 3));
+                v.push(format!("s_or_b32 s{}, s{}, s{}", d + 1, d + 1, d + 3));
+                v.push(format!("s_lshr_b32 s{}, s{n}, 7", d + 2));
+            }
+            v.push(format!("s_mov_b32 s{}, 0", d + 3));
+            v
+        }
         MOp::SWaitCtr => {
             const MN: [&str; 7] = ["s_wait_loadcnt", "s_wait_storecnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_xcnt", "s_wait_asynccnt", "s_wait_tensorcnt"];
             let c = (inst.imm >> 8) as usize;
@@ -336,6 +390,27 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         }
         MOp::SBarrierSignal => vec![format!("s_barrier_signal {}", inst.imm)],
         MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
+        MOp::SBarrierInit => vec![format!("s_mov_b32 m0, {:#x}", inst.imm), "s_barrier_init m0".to_string()],
+        MOp::SBarrierJoin => vec![format!("s_barrier_join {}", inst.imm)],
+        MOp::SSetSchedMode => vec![format!("s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), {}", inst.imm)],
+        MOp::SWaitAlu => vec![format!("s_wait_alu {:#x}", inst.imm)],
+        MOp::SBarrierLeave => vec!["s_barrier_leave".to_string(), "s_wait_kmcnt 0x0".to_string()],
+        // the cluster barrier (CDNA5 ISA section 5.6.6; LLVM's lowering): the first wave of each workgroup (isfirst on the workgroup barrier, SCC
+        // via KMcnt, read after the wait) signals the cluster barrier; every wave waits on it
+        MOp::SClusterBarrier => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let l = format!(".Lcluster_bar_{}", N.fetch_add(1, Ordering::Relaxed));
+            vec![
+                "s_barrier_signal_isfirst -1".to_string(),
+                "s_barrier_wait -1".to_string(),
+                "s_wait_kmcnt 0x0".to_string(),
+                format!("s_cbranch_scc0 {l}"),
+                "s_barrier_signal -3".to_string(),
+                format!("{l}:"),
+                "s_barrier_wait -3".to_string(),
+            ]
+        }
         MOp::SSetVgprMsb => vec![format!("s_set_vgpr_msb {:#x}", inst.imm)],
         MOp::SReadTtmp => vec![format!("s_mov_b32 {}, ttmp{}", d_s(), inst.imm)],
         MOp::VWmmaF32_16x16x64Fp8
@@ -423,15 +498,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         _ => {
             let mut v = Vec::new();
             for l in crate::target::gfx950::emit::inst_lines(a, inst) {
-                for r in respell(&l)? {
-                    // the address operands of a scalar / vector memory operation are read after issue (XCNT): until G2 tracks XCNT, every
-                    // such operation waits for its translation before anything can overwrite them
-                    let xlate = r.starts_with("s_load_") || r.starts_with("global_") || r.starts_with("buffer_") || r.starts_with("flat_");
-                    v.push(r);
-                    if xlate {
-                        v.push("s_wait_xcnt 0x0".to_string());
-                    }
-                }
+                // (the XCNT waits: waits.rs)
+                v.extend(respell(&l)?);
             }
             v
         }
@@ -470,6 +538,22 @@ const RENAMES: &[(&str, &str)] = &[
     ("ds_write_b128", "ds_store_b128"),
     ("ds_write_b16", "ds_store_b16"),
     ("ds_write_b8", "ds_store_b8"),
+    ("buffer_load_dword", "buffer_load_b32"),
+    ("buffer_load_dwordx2", "buffer_load_b64"),
+    ("buffer_load_dwordx3", "buffer_load_b96"),
+    ("buffer_load_dwordx4", "buffer_load_b128"),
+    ("buffer_load_ushort", "buffer_load_u16"),
+    ("buffer_load_sshort", "buffer_load_i16"),
+    ("buffer_load_ubyte", "buffer_load_u8"),
+    ("buffer_load_sbyte", "buffer_load_i8"),
+    ("buffer_store_dword", "buffer_store_b32"),
+    ("buffer_store_dwordx2", "buffer_store_b64"),
+    ("buffer_store_dwordx3", "buffer_store_b96"),
+    ("buffer_store_dwordx4", "buffer_store_b128"),
+    ("buffer_store_short", "buffer_store_b16"),
+    ("buffer_store_byte", "buffer_store_b8"),
+    ("buffer_atomic_add", "buffer_atomic_add_u32"),
+    ("buffer_atomic_add_f32", "buffer_atomic_add_f32"),
     ("v_add_u32_e32", "v_add_nc_u32_e32"),
     ("v_add_u32_e64", "v_add_nc_u32_e64"),
     ("v_sub_u32_e32", "v_sub_nc_u32_e32"),
@@ -499,6 +583,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
+    "v_mad_u64_u32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
@@ -522,8 +607,56 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // wave32 lane masks are one SGPR: an SGPR pair in a mask position is its low register; exec moves are 32-bit
+    let lo = |o: &str| -> String {
+        match o.strip_prefix("s[").and_then(|r| r.strip_suffix(']')).and_then(|r| r.split_once(':')) {
+            Some((a, _)) => format!("s{a}"),
+            None => o.to_string(),
+        }
+    };
+    let ops: Vec<&str> = if rest.is_empty() { vec![] } else { rest.split(", ").collect() };
+    if mn == "s_mov_b64" && ops.len() == 2 && (ops[0] == "exec" || ops[1] == "exec") {
+        let f = |o: &str| if o == "exec" { "exec_lo".to_string() } else { lo(o) };
+        return Ok(vec![format!("s_mov_b32 {}, {}", f(ops[0]), f(ops[1]))]);
+    }
+    if mn.starts_with("v_cmp_") && mn.ends_with("_e64") && !ops.is_empty() {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[0] = if o[0] == "vcc" { "vcc_lo".into() } else { lo(&o[0]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
+    if mn == "v_cndmask_b32_e64" && ops.len() == 4 {
+        let mut o: Vec<String> = ops.iter().map(|x| x.to_string()).collect();
+        o[3] = if o[3] == "vcc" { "vcc_lo".into() } else { lo(&o[3]) };
+        return Ok(vec![format!("{mn} {}", o.join(", "))]);
+    }
+    // memory operands: gfx950 cache-policy bits have no gfx1250 spelling yet (only an atomic's return); a buffer's immediate soffset 0 is
+    // NULL; the LDS-DMA forms do not exist (async loads instead)
+    let mem = mn.starts_with("buffer_") || mn.starts_with("global_");
+    if mem {
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        if toks.iter().any(|x| matches!(*x, "sc0" | "sc1" | "nt" | "lds")) && !(mn.starts_with("buffer_atomic") && toks.contains(&"sc0")) {
+            return Err(format!("`{line}`: a gfx950 cache policy / LDS-DMA form (no gfx1250 spelling in G1)"));
+        }
+    }
     if let Some((_, to)) = RENAMES.iter().find(|(f, _)| *f == mn) {
-        let rest = wave32(rest);
+        let mut rest = wave32(rest);
+        if mn.starts_with("buffer_") {
+            let mut ops: Vec<String> = rest.split(", ").map(|s| s.to_string()).collect();
+            if ops.len() >= 4 {
+                let mut tail: Vec<String> = ops[3].split_whitespace().map(|s| s.to_string()).collect();
+                if tail.first().map(|s| s == "0") == Some(true) {
+                    tail[0] = "null".into();
+                }
+                // an atomic with return: gfx950 sc0 (glc) -> TH_ATOMIC_RETURN
+                for x in tail.iter_mut() {
+                    if x == "sc0" || x == "glc" {
+                        *x = "th:TH_ATOMIC_RETURN".into();
+                    }
+                }
+                ops[3] = tail.join(" ");
+            }
+            rest = ops.join(", ");
+        }
         return Ok(vec![if rest.is_empty() { to.to_string() } else { format!("{to} {rest}") }]);
     }
     // VOPC e32 writes vcc (vcc_lo on wave32); v_add_co / v_sub_co carry through vcc

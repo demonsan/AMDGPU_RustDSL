@@ -795,7 +795,13 @@ impl FromIr for Stmt {
             "WaitCounter" => { v.expect_struct("WaitCounter")?; Ok(Stmt::WaitCounter { counter: FromIr::from_ir(v.field("counter")?)?, count: FromIr::from_ir(v.field("count")?)? }) }
             "BarrierSignal" => { v.expect_struct("BarrierSignal")?; Ok(Stmt::BarrierSignal { id: FromIr::from_ir(v.field("id")?)? }) }
             "BarrierWait" => { v.expect_struct("BarrierWait")?; Ok(Stmt::BarrierWait { id: FromIr::from_ir(v.field("id")?)? }) }
+            "BarrierInit" => { v.expect_struct("BarrierInit")?; Ok(Stmt::BarrierInit { id: FromIr::from_ir(v.field("id")?)?, members: FromIr::from_ir(v.field("members")?)? }) }
+            "BarrierJoin" => { v.expect_struct("BarrierJoin")?; Ok(Stmt::BarrierJoin { id: FromIr::from_ir(v.field("id")?)? }) }
+            "BarrierLeave" => { v.expect_unit("BarrierLeave")?; Ok(Stmt::BarrierLeave) }
+            "ClusterBarrier" => { v.expect_unit("ClusterBarrier")?; Ok(Stmt::ClusterBarrier) }
             "SetVgprMsb" => { v.expect_struct("SetVgprMsb")?; Ok(Stmt::SetVgprMsb { imm: FromIr::from_ir(v.field("imm")?)? }) }
+            "SetSchedMode" => { v.expect_struct("SetSchedMode")?; Ok(Stmt::SetSchedMode { mode: FromIr::from_ir(v.field("mode")?)? }) }
+            "WaitAlu" => { v.expect_struct("WaitAlu")?; Ok(Stmt::WaitAlu { imm: FromIr::from_ir(v.field("imm")?)? }) }
             "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
@@ -885,7 +891,13 @@ impl IrIds for Stmt {
             Stmt::WaitCounter { counter, count } => { IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*count), fv, fr); }
             Stmt::BarrierSignal { id } => { IrIds::ids(&mut (*id), fv, fr); }
             Stmt::BarrierWait { id } => { IrIds::ids(&mut (*id), fv, fr); }
+            Stmt::BarrierInit { id, members } => { IrIds::ids(&mut (*id), fv, fr); IrIds::ids(&mut (*members), fv, fr); }
+            Stmt::BarrierJoin { id } => { IrIds::ids(&mut (*id), fv, fr); }
+            Stmt::BarrierLeave => {}
+            Stmt::ClusterBarrier => {}
             Stmt::SetVgprMsb { imm } => { IrIds::ids(&mut (*imm), fv, fr); }
+            Stmt::SetSchedMode { mode } => { IrIds::ids(&mut (*mode), fv, fr); }
+            Stmt::WaitAlu { imm } => { IrIds::ids(&mut (*imm), fv, fr); }
             Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }

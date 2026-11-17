@@ -637,13 +637,24 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
                 }
             }
         }
-        for v in verify_final_with(&m, &m_phys, &a, false) {
-            let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
-            if waived {
-                used.insert(v.before_stmt - 1);
-                continue;
+        if crate::target::cur().name == "gfx1250" {
+            // gfx1250: the split counters, XCNT, the scheduling mode's dependency counters and the gfx1250 software hazards
+            for (stmt, msg) in crate::target::gfx1250::check::verify(&m, &a) {
+                if trusts.iter().any(|&t| stmt == t + 1) {
+                    used.insert(stmt - 1);
+                    continue;
+                }
+                errs.push(format!("exact: waits: {msg}"));
             }
-            errs.push(format!("exact: {v}"));
+        } else {
+            for v in verify_final_with(&m, &m_phys, &a, false) {
+                let waived = v.rule == "waits" && trusts.iter().any(|&t| v.before_stmt == t + 1);
+                if waived {
+                    used.insert(v.before_stmt - 1);
+                    continue;
+                }
+                errs.push(format!("exact: {v}"));
+            }
         }
         for t in trusts {
             if !used.contains(&t) {

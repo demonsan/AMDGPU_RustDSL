@@ -1352,6 +1352,24 @@ impl WaitCtr {
     }
 }
 
+/// A 1-D / 2-D tile of a gfx1250 tensor (the D# groups 0 and 1 of `FnBuilder::tensor_desc_2d`; CDNA5 ISA section 10.11.4). Sizes and
+/// strides in elements of `data_size` bytes; `tile[1]` = 0 or 1 for a 1-D tile.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorTile {
+    /// element bytes: 1, 2, 4 or 8
+    pub data_size: u8,
+    /// the tensor's extents (elements): dim0 (contiguous), dim1; out-of-bounds elements read as 0
+    pub tensor_dim: [Opnd; 2],
+    /// elements between consecutive dim1 rows (< 2^32 here)
+    pub stride0: Opnd,
+    /// the tile (elements): tile[0] along dim0, tile[1] rows
+    pub tile: [u16; 2],
+    /// LDS padding: (interval, amount) in dwords: `amount` dwords after every `interval` dwords (interval 2..256, a power of two; amount 1..128)
+    pub pad: Option<(u16, u16)>,
+    /// cluster multicast workgroup mask (0 outside a cluster)
+    pub wg_mask: u16,
+}
+
 /// Cache policy of a gfx1250 tensor operation: TH (temporal hint, 3 bits), SCOPE (2 bits), NV.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TdmCpol {
@@ -1448,8 +1466,24 @@ pub enum Stmt {
     BarrierSignal { id: i32 },
     /// gfx1250: `s_barrier_wait id`.
     BarrierWait { id: i32 },
+    /// gfx1250: initialise named barrier `id` (1..=16) with `members` waves (M0 = members << 16 | id; `s_barrier_init m0`).
+    BarrierInit { id: i32, members: u8 },
+    /// gfx1250: join named barrier `id` (a wave is a member of at most one named barrier at a time).
+    BarrierJoin { id: i32 },
+    /// gfx1250: leave the joined named barrier (decrements its member count).
+    BarrierLeave,
+    /// gfx1250: the cluster barrier idiom: the workgroup barrier picking one wave per workgroup (`isfirst`), that wave signals the cluster
+    /// barrier (-3), every wave waits on it. Needs a cluster launch (`kd` `cluster_dims` >= 2).
+    ClusterBarrier,
     /// gfx1250 exact mode: `s_set_vgpr_msb imm` as the author wrote it.
     SetVgprMsb { imm: u16 },
+    /// gfx1250: the wave's scheduling mode (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), mode`). Mode 2 (LLVM's "expert
+    /// scheduling mode 2") leaves the VALU-result -> non-VALU and the vector-memory-source -> overwrite dependencies to the program: exact
+    /// mode only, where the verifier then requires the author's `WaitAlu` for them (target/gfx1250/check.rs).
+    SetSchedMode { mode: u8 },
+    /// gfx1250: `s_wait_alu imm` (the dependency counters: va_vdst [15:12], vm_vsrc [4:2], va_sdst [11:9], va_ssrc [8], hold_cnt [7],
+    /// va_vcc [1], sa_sdst [0]; all-ones fields = no wait, 0xff9f).
+    WaitAlu { imm: u16 },
     /// gfx1250 TDM: `tensor_load_to_lds` with the descriptor groups g0 (4 SGPRs, `Rsrc`), g1 (8, `Sgpr8`) and the optional g2 / g3 (4 each;
     /// both or neither). `raw`: the instruction's three words as written by another assembler (exact replays; the operands still describe
     /// what it reads). Completion: TENSORcnt (`WaitTensor`).
@@ -3698,6 +3732,56 @@ impl FnBuilder {
 
     /// `s_barrier`.
     #[track_caller]
+    /// gfx1250: `s_barrier_signal id` (-1 work-group, -3 cluster, 1..=16 named); the verifier (`gpu_verify_1250`) checks the id.
+    /// gfx1250: `s_wait_<counter>cnt n`.
+    pub fn wait_counter(&mut self, counter: WaitCtr, count: u8) {
+        self.push_stmt(Stmt::WaitCounter { counter, count });
+    }
+
+    /// gfx1250 exact mode: the wave's scheduling mode (see `Stmt::SetSchedMode`).
+    pub fn set_sched_mode(&mut self, mode: u8) {
+        self.push_stmt(Stmt::SetSchedMode { mode });
+    }
+
+    /// gfx1250: `s_wait_alu imm` (see `Stmt::WaitAlu`).
+    pub fn wait_alu(&mut self, imm: u16) {
+        self.push_stmt(Stmt::WaitAlu { imm });
+    }
+
+    /// gfx1250 exact mode: `s_set_vgpr_msb imm`.
+    pub fn set_vgpr_msb(&mut self, imm: u16) {
+        self.push_stmt(Stmt::SetVgprMsb { imm });
+    }
+
+    /// gfx1250: initialise named barrier `id` for `members` waves.
+    pub fn barrier_init(&mut self, id: i32, members: u8) {
+        self.push_stmt(Stmt::BarrierInit { id, members });
+    }
+
+    /// gfx1250: join named barrier `id`.
+    pub fn barrier_join(&mut self, id: i32) {
+        self.push_stmt(Stmt::BarrierJoin { id });
+    }
+
+    /// gfx1250: leave the joined named barrier.
+    pub fn barrier_leave(&mut self) {
+        self.push_stmt(Stmt::BarrierLeave);
+    }
+
+    /// gfx1250: the cluster-wide barrier (see `Stmt::ClusterBarrier`).
+    pub fn cluster_barrier(&mut self) {
+        self.push_stmt(Stmt::ClusterBarrier);
+    }
+
+    pub fn barrier_signal(&mut self, id: i32) {
+        self.push_stmt(Stmt::BarrierSignal { id });
+    }
+
+    /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
+    pub fn barrier_wait(&mut self, id: i32) {
+        self.push_stmt(Stmt::BarrierWait { id });
+    }
+
     /// gfx1250: wait for the tensor operations of this wave (at most `count` outstanding).
     pub fn wait_tensor(&mut self, count: u8) {
         self.push_stmt(Stmt::WaitTensor { count });
@@ -3706,6 +3790,70 @@ impl FnBuilder {
     /// gfx1250: eight uniform words in consecutive SGPRs (a tensor descriptor's group 1).
     pub fn sgpr_cat8(&mut self, words: [Opnd; 8]) -> ValueId {
         self.let_(Op::SgprCat8 { words })
+    }
+
+    /// gfx1250: the tensor descriptor groups 0 and 1 of a 1-D / 2-D tile `t` whose first element is at `base + byte_off` (a uniform pointer
+    /// and offset) and lands at LDS byte `lds_addr` (uniform). Returns (g0, g1) for `tensor_load_to_lds` / `tensor_store_from_lds`.
+    /// Every word is a uniform scalar value; words of constants fold.
+    pub fn tensor_desc_2d(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd) -> (ValueId, ValueId) {
+        let ds = match t.data_size {
+            1 => 0u32,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            d => panic!("tensor data_size {d}: 1, 2, 4 or 8 bytes"),
+        };
+        let (pad_en, pi, pa) = match t.pad {
+            None => (0u32, 0u32, 0u32),
+            Some((iv, am)) => {
+                assert!(iv.is_power_of_two() && (2..=256).contains(&iv) && (1..=128).contains(&am), "tensor padding: interval 2..256 (power of two), amount 1..128 dwords");
+                (1, iv.trailing_zeros() - 1, am as u32 - 1)
+            }
+        };
+        // group 0: [1:0] count = 1, [63:32] lds_addr, [120:64] global_addr (57 bits), [127:126] type = 2
+        let p = self.let_(Op::PtrAdd { base, byte_off });
+        let lo = self.let_(Op::PtrLo(Opnd::Val(p)));
+        let hi = self.let_(Op::PtrHi(Opnd::Val(p)));
+        let hm = self.let_(Op::AndI32(Opnd::Val(hi), Opnd::I32(0x01ff_ffff)));
+        // (the fields of a word are disjoint: `+` is `|`, and stays in SALU)
+        let w3 = self.let_(Op::AddI32(Opnd::Val(hm), Opnd::I32(0x8000_0000u32 as i32)));
+        let g0 = self.let_(Op::RsrcCat { words: [Opnd::I32(1), lds_addr, Opnd::Val(lo), Opnd::Val(w3)] });
+        // group 1 (256 bits): see the field table of CDNA5 ISA Table 63
+        let w0 = t.wg_mask as u32 | ds << 16 | pad_en << 20 | pi << 22 | pa << 25;
+        let c = |x: Opnd| match x {
+            Opnd::I32(v) => Some(v as u32),
+            _ => None,
+        };
+        // a word = (a >> sa) | (b << sb), folded when both are constants
+        let mut word = |s: &mut Self, a: Option<(Opnd, u32)>, b: Option<(Opnd, u32)>, k: u32| -> Opnd {
+            let part = |s: &mut Self, x: Option<(Opnd, u32)>, left: bool| -> Option<Opnd> {
+                let (o, sh) = x?;
+                Some(match c(o) {
+                    Some(v) => Opnd::I32((if left { v << sh } else { v >> sh }) as i32),
+                    None if sh == 0 => o,
+                    None => Opnd::Val(if left { s.let_(Op::ShlI32(o, Opnd::I32(sh as i32))) } else { s.let_(Op::LshrI32(o, Opnd::I32(sh as i32))) }),
+                })
+            };
+            let pa = part(s, a, false);
+            let pb = part(s, b, true);
+            let mut acc = Opnd::I32(k as i32);
+            for x in [pa, pb].into_iter().flatten() {
+                acc = match (c(acc), c(x)) {
+                    (Some(u), Some(v)) => Opnd::I32((u | v) as i32),
+                    (Some(0), None) => x,
+                    _ => Opnd::Val(s.let_(Op::AddI32(acc, x))),
+                };
+            }
+            acc
+        };
+        let [d0, d1] = t.tensor_dim;
+        let w1 = word(self, None, Some((d0, 16)), 0);
+        let w2 = word(self, Some((d0, 16)), Some((d1, 16)), 0);
+        let w3g = word(self, Some((d1, 16)), None, (t.tile[0] as u32) << 16);
+        let w4 = Opnd::I32((t.tile[1] as u32) as i32);
+        let w5 = t.stride0;
+        let g1 = self.let_(Op::SgprCat8 { words: [Opnd::I32(w0 as i32), w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
+        (g0, g1)
     }
 
     /// gfx1250 TDM load (see `Stmt::TensorLoadToLds`).
@@ -4795,6 +4943,8 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::BarrierInit { .. } | Stmt::BarrierJoin { .. } | Stmt::BarrierLeave | Stmt::ClusterBarrier => {}
+            Stmt::SetSchedMode { .. } | Stmt::WaitAlu { .. } => {}
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {

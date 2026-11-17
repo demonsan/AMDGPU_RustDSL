@@ -204,6 +204,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         let f: Vec<&str> = h.split(',').map(|x| x.trim()).collect();
         let id = match f.first() {
             Some(&"HW_REG_WAVE_MODE") => 1u32,
+            Some(&"HW_REG_WAVE_SCHED_MODE") => 26u32,
             x => return Err(format!("`{t}`: hardware register {x:?}")),
         };
         let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
@@ -382,6 +383,38 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             let off = modv(&i, "offset").map(|v| parse_num(v).ok_or(format!("`{t}`: offset"))).transpose()?.unwrap_or(0);
             out.extend_from_slice(&d32(0xEE00_0000 | op << 14 | sa));
             out.extend_from_slice(&d32(if store { data << 23 } else { data } | scope << 18));
+            out.extend_from_slice(&d32(((off as u32) & 0x00ff_ffff) << 8 | va));
+        }
+        "VBUFFER" => {
+            // vdata, vaddr|off, s[rsrc:+3], soffset|null [offen|idxen] [offset:N] [th:TH_ATOMIC_RETURN]; FORMAT = 1 (untyped)
+            let data = vreg(op_at(&i, 0)?)?;
+            let (va, has_va) = match op_at(&i, 1)? {
+                Op::V(r, _) => (*r, true),
+                Op::Special(124) => (0, false),
+                x => return Err(format!("`{t}`: vaddr {x:?}")),
+            };
+            let rs = match op_at(&i, 2)? {
+                Op::S(r, 4) => *r,
+                x => return Err(format!("`{t}`: rsrc {x:?}")),
+            };
+            let so = match op_at(&i, 3)? {
+                Op::S(r, 1) => *r,
+                Op::Special(c) => *c,
+                x => return Err(format!("`{t}`: soffset {x:?}")),
+            };
+            let offen = i.mods.iter().any(|(m, _)| m == "offen") as u32;
+            let idxen = i.mods.iter().any(|(m, _)| m == "idxen") as u32;
+            if has_va && offen + idxen == 0 {
+                return Err(format!("`{t}`: a VGPR address needs offen / idxen"));
+            }
+            let th = match modv(&i, "th") {
+                None => 0,
+                Some("TH_ATOMIC_RETURN") => 1,
+                Some(x) => return Err(format!("`{t}`: th:{x}")),
+            };
+            let off = modv(&i, "offset").map(|v| parse_num(v).ok_or(format!("`{t}`: offset"))).transpose()?.unwrap_or(0);
+            out.extend_from_slice(&d32(0xC400_0000 | op << 14 | so));
+            out.extend_from_slice(&d32(idxen << 31 | offen << 30 | 1 << 23 | th << 20 | rs << 9 | data));
             out.extend_from_slice(&d32(((off as u32) & 0x00ff_ffff) << 8 | va));
         }
         "VDS" => {
