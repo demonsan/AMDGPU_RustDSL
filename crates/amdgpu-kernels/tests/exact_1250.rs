@@ -71,3 +71,47 @@ fn the_scheduling_mode_is_exact_only() {
     let e = compile(&f).err().expect("not exact");
     assert!(e.contains("exact-mode statement"), "{e}");
 }
+
+/// tid -> f32 (v1), rsq (v2, a TRANS), r + r (v3, a VALU reading the TRANS result right after it: the co-execution hazard wants one v_nop),
+/// stored through a buffer. `trust`: a TrustHazard before the add; `trust_elsewhere`: one before the store instead (waives nothing).
+fn trans(trust: bool, trust_elsewhere: bool) -> Function {
+    let mut b = FnBuilder::new("probe_exact_1250_trans", 32);
+    b.arg("o", DType::Ptr, 0x00, 8);
+    b.arg_tensor("o", Ext::c(32 * 4));
+    b.exact();
+    b.lower_opts(&["imm", "sgpr"]);
+    let po = b.let_(Op::KernargPtr { offset: 0x00 });
+    let tid = b.let_(Op::WorkitemId);
+    b.wait_counter(WaitCtr::Km, 0);
+    let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, tid);
+    let r = b.un(amdgpu_dsl::UnOp::RsqF32, x);
+    if trust {
+        b.trust_hazard("vendor omits the TRANS co-execution v_nop");
+    }
+    let s = b.add_f32(r, r);
+    let off = b.bind_i32(ev(tid) << 2);
+    let rs = b.buffer_rsrc_sized(po, 32 * 4);
+    if trust_elsewhere {
+        b.trust_hazard("misplaced");
+    }
+    b.buffer_store_f32(rs, off, Opnd::I32(0), 0, s);
+    b.pin_sgpr_at(RegRef::Val(po), 8);
+    b.pin_sgpr_at(RegRef::Val(rs), 12);
+    b.pin_vgpr_at(RegRef::Val(tid), 0);
+    b.pin_vgpr_at(RegRef::Val(x), 1);
+    b.pin_vgpr_at(RegRef::Val(r), 2);
+    b.pin_vgpr_at(RegRef::Val(s), 3);
+    b.pin_vgpr_at(RegRef::Val(off), 4);
+    b.finish()
+}
+
+#[test]
+fn a_trans_hazard_is_named_and_trust_hazard_waives_exactly_it() {
+    let e = compile(&trans(false, false)).err().expect("the add reads the TRANS result right after it");
+    assert!(e.contains("hazard") && e.contains("v_nop"), "{e}");
+    compile(&trans(true, false)).unwrap_or_else(|e| panic!("{e}"));
+    let e = compile(&trans(true, true)).err().expect("a TrustHazard before the store waives nothing");
+    assert!(e.contains("TrustHazard") && e.contains("waives nothing"), "{e}");
+    let rep = amdgpu_codegen::gpu_verify::verify_ir(&trans(true, false));
+    assert_eq!(rep.ledger().hazard_trust, 1, "counted in the certificate");
+}

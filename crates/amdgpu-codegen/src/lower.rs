@@ -683,6 +683,7 @@ impl Lowerer {
             cur_stmt: {
                 LAST_STMTS.with(|s| s.borrow_mut().clear());
                 LAST_TRUSTS.with(|s| s.borrow_mut().clear());
+        LAST_TRUST_HAZARDS.with(|s| s.borrow_mut().clear());
                 0
             },
             mir,
@@ -3033,6 +3034,7 @@ impl Lowerer {
                     self.push(MInst::new(MOp::SExecSet).imm(k));
                 }
                 Stmt::TrustWait { .. } => LAST_TRUSTS.with(|t| t.borrow_mut().push(self.cur_stmt)),
+                Stmt::TrustHazard { .. } => LAST_TRUST_HAZARDS.with(|t| t.borrow_mut().push(self.cur_stmt)),
                 Stmt::EncodeE64 => self.e64_next = true,
                 Stmt::WaitCnt { vm, lgkm } => self.push(MInst::new(MOp::SWaitCnt).imm(*vm as i64 | ((*lgkm as i64) << 8))),
                 Stmt::ExecRestore { sgpr } => self.push(MInst::new(MOp::SRestoreExec).imm(*sgpr as i64)),
@@ -6474,6 +6476,8 @@ thread_local! {
     static LAST_STMTS: std::cell::RefCell<Vec<Stmt>> = std::cell::RefCell::new(Vec::new());
     /// `TrustWait` statements of the last lowering (their `MInst::stmt` numbering): the next statement's waits check is waived
     static LAST_TRUSTS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+    /// `TrustHazard` statements of the last lowering: the next statement's gfx1250 software-hazard check is waived
+    static LAST_TRUST_HAZARDS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
     /// the function being lowered is exact (read by the cleanup passes that rewrite instructions)
     static EXACT_LOWERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
@@ -6488,6 +6492,11 @@ pub fn last_stmts() -> Vec<Stmt> {
 /// The `TrustWait` statements of the last lowering on this thread (`MInst::stmt` numbering).
 pub fn last_trusts() -> Vec<u32> {
     LAST_TRUSTS.with(|s| s.borrow().clone())
+}
+
+/// The `TrustHazard` statements of the last lowering on this thread (`MInst::stmt` numbering).
+pub fn last_trust_hazards() -> Vec<u32> {
+    LAST_TRUST_HAZARDS.with(|s| s.borrow().clone())
 }
 
 pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {

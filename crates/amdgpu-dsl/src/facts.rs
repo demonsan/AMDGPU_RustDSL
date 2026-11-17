@@ -358,7 +358,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.barrier = true;
             (ResClass::Sync, vec![], false)
         }
-        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {
+        Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::SNop { .. } | Stmt::SetM0 { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::TrustWait { .. } | Stmt::TrustHazard { .. } | Stmt::EncodeE64 => {
             e.directive = true;
             (ResClass::Sync, vec![], false)
         }
