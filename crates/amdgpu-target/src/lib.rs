@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gfx1250;
+pub mod gfx1250_co;
 pub mod gfx950;
 pub mod gfx950_co;
 
