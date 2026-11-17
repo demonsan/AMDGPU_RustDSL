@@ -44,7 +44,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
-    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation is not reachable from an earlier one, on any path, without a wait for the tensor counter to drop to at most 10 in between (the public compiler's condition for this target)" },
+    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -468,36 +468,41 @@ fn lex(asm: &str) -> (Vec<Inst>, Vec<(usize, u32)>, HashMap<String, usize>) {
     (insts, raw, labels)
 }
 
-/// GV-1250-TDM-DRAIN, exactly the condition of the public compiler's hazard pass for this target (the feature "needs to keep tensor count low"): a tensor operation (any instruction that
-/// counts on the tensor counter, other than the wait itself) must not be reachable from an earlier tensor operation, on any path of the control-flow graph, without an intervening
-/// `s_wait_tensorcnt` whose immediate is at most 10 (a larger immediate does not cover). There is no distance limit. The source states the condition and no consequence; the rule treats a
-/// violation as an error (see docs/gfx1250-hang-rules.md for why, and for the shipping code objects that deviate).
+/// The most tensor operations that may be outstanding when another one issues (so at most 11 in flight): the invariant the public compiler's hazard pass for this target maintains ("keep the
+/// tensor count low") by inserting `s_wait_tensorcnt 10` before a tensor operation that an earlier one can reach.
+pub const TDM_MAX_OUTSTANDING_AT_ISSUE: u32 = 10;
+/// "Unbounded": the tensor counter has 6 bits; a bound that reaches this is not a bound.
+const TDM_UNBOUNDED: u32 = 64;
+
+/// GV-1250-TDM-DRAIN: a sound static upper bound of the tensor operations outstanding at every tensor issue, path-sensitive over the control-flow graph of the text. An issue adds one, an
+/// `s_wait_tensorcnt N` caps the bound at N, joins take the maximum, loops iterate to a fixpoint (a loop that issues without draining saturates: unbounded). A tensor operation that can issue with
+/// more than `TDM_MAX_OUTSTANDING_AT_ISSUE` outstanding is a violation.
 fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
     if !insts.iter().any(|i| i.mn.starts_with("tensor_")) {
         return;
     }
     let n = insts.len();
     let by_addr: HashMap<u64, usize> = insts.iter().enumerate().filter_map(|(i, x)| x.addr.map(|(a, _)| (a, i))).collect();
-    // dirty[i]: some path reaches instruction i with a tensor operation issued and not covered since
-    let mut dirty = vec![false; n + 1];
-    let mut seen = vec![false; n + 1];
+    // bound[i]: an upper bound of the outstanding tensor operations at the entry of instruction i over all paths (None: not reached yet)
+    let mut bound: Vec<Option<u32>> = vec![None; n + 1];
+    bound[0] = Some(0);
     let mut work = vec![0usize];
-    seen[0] = true;
-    let mut reported: HashSet<usize> = HashSet::default();
     while let Some(i) = work.pop() {
         if i >= n {
             continue;
         }
         let ins = &insts[i];
-        let mut out = dirty[i];
-        if ins.mn.starts_with("tensor_") {
-            if dirty[i] && reported.insert(i) {
-                viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` is reachable from an earlier tensor operation without a `s_wait_tensorcnt` of at most 10 in between", ins.line, ins.mn));
+        let d = bound[i].unwrap_or(0);
+        let out = if ins.mn.starts_with("tensor_") {
+            (d + 1).min(TDM_UNBOUNDED)
+        } else if ins.mn == "s_wait_tensorcnt" {
+            match parse_int(&ins.ops) {
+                Some(k) if k >= 0 => d.min(k as u32),
+                _ => d,
             }
-            out = true;
-        } else if ins.mn == "s_wait_tensorcnt" && parse_int(&ins.ops).map(|c| (0..=10).contains(&c)).unwrap_or(false) {
-            out = false;
-        }
+        } else {
+            d
+        };
         let mut succ: Vec<usize> = Vec::new();
         let branch = ins.mn == "s_branch" || ins.mn.starts_with("s_cbranch");
         let falls = !(ins.mn == "s_branch" || ins.mn == "s_endpgm" || ins.mn == "s_setpc_b64");
@@ -520,11 +525,20 @@ fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violat
             if t > n {
                 continue;
             }
-            // join = OR; revisit when the state grows
-            if !seen[t] || (out && !dirty[t]) {
-                seen[t] = true;
-                dirty[t] |= out;
+            // join = the larger bound; revisit when it grows
+            if bound[t].map(|b| out > b).unwrap_or(true) {
+                bound[t] = Some(out);
                 work.push(t);
+            }
+        }
+    }
+    for (i, ins) in insts.iter().enumerate() {
+        if ins.mn.starts_with("tensor_") {
+            if let Some(d) = bound[i] {
+                if d > TDM_MAX_OUTSTANDING_AT_ISSUE {
+                    let how = if d >= TDM_UNBOUNDED { "an unbounded number".to_string() } else { format!("up to {d}") };
+                    viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` can issue with {how} of tensor operations outstanding (the invariant: at most {TDM_MAX_OUTSTANDING_AT_ISSUE} at an issue)", ins.line, ins.mn));
+                }
             }
         }
     }

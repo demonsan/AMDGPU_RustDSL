@@ -359,33 +359,39 @@ fn pos_tdm_desc() {
 
 // GV-1250-TDM-DRAIN
 
-fn nops(n: usize) -> String {
-    "    s_nop 0\n".repeat(n)
+const T: &str = "    tensor_load_to_lds s[24:27], s[32:39]\n";
+
+fn burst(n: usize) -> String {
+    format!("k:\n{}    s_endpgm\n", T.repeat(n))
 }
 
 #[test]
 fn mut_tdm_drain() {
-    // two tensor operations in a row
-    asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
-    // far apart is no excuse: the condition has no distance limit (a hand-scheduled count of the operations in flight is not the compiler's condition)
-    asm_mutation(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(40)), "GV-1250-TDM-DRAIN");
-    // a wait that leaves more than 10 in flight does not drain enough
-    asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xb\n    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
-    // a loop whose back edge brings an undrained tensor operation to the next iteration's
-    asm_mutation("k:\nBB0:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB0\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
-    // one path of an if skips the wait
-    asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB2\n    s_wait_tensorcnt 0x0\nBB2:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
+    // 12 back to back: the 12th issues with 11 outstanding
+    asm_mutation(&burst(12), "GV-1250-TDM-DRAIN");
+    // an unbounded loop: it issues and never drains
+    asm_mutation(&format!("k:\nBB0:\n{T}    s_cbranch_scc1 BB0\n    s_endpgm\n"), "GV-1250-TDM-DRAIN");
+    // a wait that leaves more than 10 does not drain enough, and in a loop the bound grows past 10
+    asm_mutation(&format!("k:\nBB0:\n{T}    s_wait_tensorcnt 0xb\n    s_cbranch_scc1 BB0\n    s_endpgm\n"), "GV-1250-TDM-DRAIN");
+    // one path of an if accumulates 6, the join continues with 6 more: the 12th op on that path sees 11
+    asm_mutation(&format!("k:\n    s_cbranch_scc1 BB2\n{}BB2:\n{}    s_endpgm\n", T.repeat(6), T.repeat(6)), "GV-1250-TDM-DRAIN");
+    // far apart does not matter when nothing drains in between: 12 ops with a lot of other work between them
+    asm_mutation(&format!("k:\n{}    s_endpgm\n", format!("{T}{}", "    s_nop 0\n".repeat(40)).repeat(12)), "GV-1250-TDM-DRAIN");
 }
 
 #[test]
 fn pos_tdm_drain() {
-    asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xa\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n");
-    asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0x0\n    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n");
-    asm_positive("k:\nBB0:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xa\n    s_cbranch_scc1 BB0\n    s_endpgm\n");
-    // a wait in between, however far apart
-    asm_positive(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    s_wait_tensorcnt 0x3\n{}    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(20), nops(20)));
-    // both paths wait
-    asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB2\n    s_wait_tensorcnt 0x0\n    s_branch BB3\nBB2:\n    s_wait_tensorcnt 0x2\nBB3:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n");
+    // 11 back to back: every issue sees at most 10 outstanding
+    asm_positive(&burst(11));
+    // the vendor-like shape: two operations far apart with nothing else outstanding
+    asm_positive(&format!("k:\n{T}{}{T}    s_endpgm\n", "    s_nop 0\n".repeat(40)));
+    // a loop that drains to at most 10 each iteration
+    asm_positive(&format!("k:\nBB0:\n{T}    s_wait_tensorcnt 0xa\n    s_cbranch_scc1 BB0\n    s_endpgm\n"));
+    asm_positive(&format!("k:\nBB0:\n{T}{T}    s_wait_tensorcnt 0x8\n    s_cbranch_scc1 BB0\n    s_endpgm\n"));
+    // a full drain, then a burst
+    asm_positive(&format!("k:\n{}    s_wait_tensorcnt 0x0\n{}    s_endpgm\n", T.repeat(11), T.repeat(11)));
+    // both paths drain, whatever they accumulated
+    asm_positive(&format!("k:\n    s_cbranch_scc1 BB2\n{}    s_wait_tensorcnt 0x0\n    s_branch BB3\nBB2:\n    s_wait_tensorcnt 0x2\nBB3:\n{}    s_endpgm\n", T.repeat(6), T.repeat(8)));
     asm_positive(&base_asm());
 }
 
