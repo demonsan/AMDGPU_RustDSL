@@ -312,3 +312,32 @@ pub fn probe_g1250_tdm_ring() -> Function {
     b.store_global(qo, 0, acc, MemTy::B32, false);
     b.finish()
 }
+
+/// A named barrier as the workgroup's synchronisation (hardware probe): 4 waves initialise / join named barrier 1 (4 members), every
+/// work-item writes `3 * tid` to LDS, releases its LDS writes (`wait_lds(0)`), signals / waits barrier 1, then reads the value of the
+/// work-item one wave further: out[tid] = 3 * ((tid + 32) % 128). Then it leaves the barrier. 128 work-items.
+pub fn probe_g1250_named() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_named", 128);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    b.lds(128 * 4);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    b.barrier_init(1, 4);
+    b.barrier_join(1);
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let v = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+    b.store_lds_b32(a, v);
+    b.wait_lds(0);
+    b.barrier_signal(1);
+    b.barrier_wait(1);
+    let a2 = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(128)));
+    let a3 = b.let_(Op::AndI32(Opnd::Val(a2), Opnd::I32(511)));
+    let x = b.load_lds(a3, MemTy::B32);
+    b.barrier_leave();
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(q, 0, x, MemTy::B32, false);
+    let mut f = b.finish();
+    f.kd.push(("named_barrier_count".into(), 1));
+    f
+}
