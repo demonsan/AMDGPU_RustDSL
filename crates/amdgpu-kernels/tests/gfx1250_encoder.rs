@@ -97,7 +97,9 @@ fn whole_probes_encode_like_clang() {
         let body: String = c.asm.lines().take_while(|l| !l.starts_with(".size")).collect::<Vec<_>>().join("\n");
         let got = amdgpu_codegen::amdgpu_target::gfx1250_co::encode_text(&body).unwrap_or_else(|e| panic!("{k}: {e}"));
         assert_eq!(got, want[..got.len().min(want.len())].to_vec(), "{k}: .text differs");
-        assert!(want[got.len()..].iter().all(|b| *b == 0), "{k}: clang has more code");
+        // after the function: the assembler's alignment padding (s_code_end = 0xbfb60000 words, or zeros) only
+        let tail = &want[got.len()..];
+        assert!(tail.chunks(4).all(|w| w == [0, 0, 0, 0] || w == [0x00, 0x00, 0xb6, 0xbf]), "{k}: clang has more code: {:02x?}", &tail[..tail.len().min(32)]);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
