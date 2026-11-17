@@ -473,3 +473,12 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
     }
 }
 
+/// Compiles `f` for the target named `target` (`--target`): gfx950 is `compile` (unchanged); another target runs its own pipeline with
+/// `target::cur()` set to it.
+pub fn compile_target(f: &amdgpu_dsl::Function, target: &str) -> Result<Compiled, String> {
+    let t = amdgpu_target::by_name(target).ok_or_else(|| format!("unknown target `{target}` (known: {})", amdgpu_target::TARGET_NAMES.join(", ")))?;
+    match t.name {
+        "gfx950" => compile(f),
+        _ => target::with_target(t, || target::gfx1250::compile(f)),
+    }
+}

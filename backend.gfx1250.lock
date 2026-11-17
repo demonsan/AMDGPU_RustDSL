@@ -1,0 +1,9 @@
+# backend.gfx1250.lock - the LLVM the gfx1250 pipeline (encoding oracle, LLVM tail) is validated against (docs/gfx1250-plan.md).
+# Pin: the MI450 nodes' ROCm 10.2.0 LLVM (AMD LLVM version 24.0.0git, ROCm/llvm-project c7ceccf9a5789b92fda4056b8501450d0b7a75de):
+# clang / llvm-mc / llvm-objdump from /opt/rocm/llvm/bin; llc built from llvm/tools/llc (llc.cpp + lib/llcdriver.cpp + lib/NewPMDriver.cpp
+# of the same commit) against its libLLVM.so: f01-2 /data/blyu/llvm-tools/rocm-10.2.0/bin (tools/llvm_build_llc.sh, driver-library layout).
+# Public upstream LLVM (llvm/test/MC/AMDGPU/gfx1250_*.s) is the cross-check of the encodings.
+target = gfx1250
+llvm_version = AMD LLVM version 24.0.0git
+llvm_commit = c7ceccf9a5789b92fda4056b8501450d0b7a75de
+rocm = 10.2.0

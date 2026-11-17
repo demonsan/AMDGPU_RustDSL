@@ -1353,6 +1353,33 @@ fn main() -> ExitCode {
                 usage();
                 return ExitCode::from(2);
             };
+            // `--target <name>` other than gfx950: that target's pipeline (docs/gfx1250-plan.md); gfx950 keeps the paths below unchanged
+            let target = args.windows(2).find(|w| w[0] == "--target").map(|w| w[1].clone()).or_else(|| args.iter().find_map(|a| a.strip_prefix("--target=").map(|s| s.to_string())));
+            if let Some(tn) = target.filter(|t| t != "gfx950") {
+                let (f, _spec) = match kernel_spec(name, &args) {
+                    Ok(x) => x,
+                    Err(c) => return c,
+                };
+                return match amdgpu_codegen::compile_target(&f, &tn) {
+                    Ok(c) => {
+                        match args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone()) {
+                            Some(p) => {
+                                if let Err(e) = std::fs::write(&p, &c.asm) {
+                                    eprintln!("{p}: {e}");
+                                    return ExitCode::from(1);
+                                }
+                                eprintln!("wrote {p} (target {tn})");
+                            }
+                            None => print!("{}", c.asm),
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("compile error:\n{e}");
+                        ExitCode::from(1)
+                    }
+                };
+            }
             // the JIT request (`--co` and `--info`): one compile, the certificate (cached, concurrent), assembly, code object and info JSON: `amdc::jitc`, the code `amdc serve` runs too
             if args.iter().any(|a| a == "--co") && args.iter().any(|a| a == "--info") && !args.iter().any(|a| a == "--time" || a == "--json" || a == "--mir-out") {
                 let val = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());

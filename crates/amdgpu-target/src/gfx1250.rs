@@ -1,5 +1,5 @@
-//! gfx1250: the description items that need the extension fields of docs/target-design.md section 4, as data. SPECIFICATION ONLY: no pass reads
-//! them and there is no gfx1250 pipeline (`amdc passes --target gfx1250`). Every value is taken from docs/target-gfx1250.md (public sources only:
+//! gfx1250: the description items that need the extension fields of docs/target-design.md section 4, as data, and the whole `GFX1250`
+//! target (selectable with `--target gfx1250`; the gfx1250 pipeline is built in stages G1-G3, docs/gfx1250-plan.md). Every value is taken from docs/target-gfx1250.md (public sources only:
 //! the CDNA5 ISA reference guide and upstream LLVM @274ab686); the section of that document is cited per item.
 
 use crate::*;
@@ -102,6 +102,63 @@ pub const WMMA_COEXEC: HazardRule = HazardRule {
     unit: Unit::IndependentValu,
     scope: Scope::Value,
     source: "target-gfx1250.md section 5.1; LLVM GCNHazardRecognizer.cpp fixWMMAHazards",
+};
+
+/// The gfx1250 target (G0: the description the passes will read once the gfx1250 pipeline exists; `amdc --target gfx1250`). Values from
+/// docs/target-gfx1250.md; the scheduler machine model is the LLVM speed model of section 5.2 mapped onto the weave fields (WMMA in the
+/// matrix-pipe slots), to be replaced by hardware measurements (G4).
+pub const GFX1250: Target = Target {
+    name: "gfx1250",
+    wave: Wave { lanes: 32 },
+    regs: RegFiles {
+        // v0 holds the packed workitem ids (section 3.2.1); the direct window is 256 (G1 allocates there only)
+        vgpr: RegFile { count: 1024, reserved: 1, alloc_granule: 16, window: VGPR.window },
+        agpr: None,
+        // s0:s1 kernarg pointer; workgroup ids are architected (TTMP7 / TTMP9), not user SGPRs (section 3.2.3)
+        sgpr: RegFile { count: 106, reserved: 2, alloc_granule: 0, window: None },
+        unified: None,
+        occupancy: OCCUPANCY,
+    },
+    lds: LDS,
+    counters: COUNTERS,
+    hazards: &[WMMA_COEXEC],
+    // VGPRs in blocks of 16, the SGPR count field is 0 (fixed file), code object v5 (section 7.1)
+    emit: Emission { sgpr_granule: 1, sgpr_cap: 106, sgpr_min: 0, vgpr_min: 16, vgpr_granule: 16, code_object_version: 5 },
+    latency: LatencyModel {
+        branch_taken: 24,
+        branch_uncond: 18,
+        branch_not_taken: 6,
+        vcc_to_branch: 16,
+        barrier: 12,
+        trans_separate_pipe: true,
+        slot_cycles: 32,
+        slot_budget: 28,
+        dma_latency_cycles: 512,
+        weave: WeaveMachine {
+            issue_gap: 1,
+            // WMMA 16x16x32 bf16 / f16: 8 / 4 passes (section 5.2), latency estimates until measured
+            mfma_cycles: 16,
+            mfma16_cycles: 8,
+            mfma_latency: 24,
+            mfma16_latency: 16,
+            valu_latency: 5,
+            ds_b128_latency: 144,
+            ds_tr_latency: 125,
+            ds_b32_latency: 64,
+            lds_queue_depth: 8,
+            lds_queue_penalty: 200,
+            dma_issue: 24,
+            branch_cost: 24,
+        },
+    },
+    llvm: LlvmTail {
+        triple: "amdgcn-amd-amdhsa",
+        llc_args: &["-mtriple=amdgcn-amd-amdhsa", "-mcpu=gfx1250", "-O2"],
+        asm_args: &["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx1250", "-mcode-object-version=5"],
+    },
+    mem: MEM,
+    sync: SYNC,
+    verify: VerifyLimits { vgpr_limit: 1024, sgpr_limit: 106, lds_limit: 327_680 },
 };
 
 #[cfg(test)]

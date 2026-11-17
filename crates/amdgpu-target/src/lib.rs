@@ -397,3 +397,15 @@ pub struct VerifyLimits {
     pub sgpr_limit: u32,
     pub lds_limit: u32,
 }
+
+/// The targets by their LLVM processor name (`--target`).
+pub fn by_name(name: &str) -> Option<&'static Target> {
+    match name {
+        "gfx950" => Some(&gfx950::GFX950),
+        "gfx1250" => Some(&gfx1250::GFX1250),
+        _ => None,
+    }
+}
+
+/// The names `by_name` knows.
+pub const TARGET_NAMES: &[&str] = &["gfx950", "gfx1250"];

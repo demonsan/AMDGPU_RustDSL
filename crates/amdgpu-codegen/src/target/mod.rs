@@ -5,9 +5,27 @@
 pub use amdgpu_target::Target;
 
 pub mod gfx950;
+pub mod gfx1250;
 
-/// The target every compilation uses (P0: gfx950).
+/// The gfx950 target (the passes that are not yet target-parameterized read it directly; gfx950 output must not change).
 pub const T: &Target = &amdgpu_target::gfx950::GFX950;
+
+thread_local! {
+    static CUR: std::cell::Cell<&'static Target> = const { std::cell::Cell::new(&amdgpu_target::gfx950::GFX950) };
+}
+
+/// The target of the compilation running on this thread (gfx950 unless `with_target` selected another).
+pub fn cur() -> &'static Target {
+    CUR.with(|c| c.get())
+}
+
+/// Runs `f` with `t` as this thread's compilation target (`cur`), restoring the previous one after.
+pub fn with_target<R>(t: &'static Target, f: impl FnOnce() -> R) -> R {
+    let prev = CUR.with(|c| c.replace(t));
+    let r = f();
+    CUR.with(|c| c.set(prev));
+    r
+}
 
 /// AGPRs per wave (0 without an AGPR segment).
 pub const fn agpr_count(t: &Target) -> u32 {
