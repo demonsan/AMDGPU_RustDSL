@@ -1459,6 +1459,9 @@ pub enum Stmt {
     /// Exact mode only: the code from here on is the author's basic block `key` (its position in the author's layout). The exact
     /// emission lays the blocks out in key order, whatever the structure's own order (a block boundary, no instruction).
     LayoutKey { key: u32 },
+    /// Exact mode only: the next statement's single instruction is emitted as these words (the author's encoding: its operands and
+    /// semantics are the statement's; only fields an assembler fills differently, such as an unused source, may differ from our encoding)
+    AuthorWords { words: Vec<u32> },
     /// Exact mode only: when `cond` holds, continue at the block of `LayoutKey { key }`. The target is FORWARD and in the same structured
     /// region (the same arm of the same `if`, the same loop body, or the top level): the blocks of a region with gotos form a DAG; loops
     /// stay structured (no goto into, out of, or around a loop's back edge). `verify` enforces both.
@@ -4765,7 +4768,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
-            Stmt::LayoutKey { .. } | Stmt::Goto { .. } => {
+            Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
                     errs.push(here("a layout key / goto outside exact mode".to_string()));
                 }

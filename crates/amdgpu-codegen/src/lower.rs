@@ -565,6 +565,8 @@ struct Lowerer {
     fold_ok: HashSet<ValueId>,
     /// exact mode: the block label of each layout key (gotos and `LayoutKey`)
     key_labels: HashMap<u32, u32>,
+    /// exact mode: the author's words for the next instruction (`Stmt::AuthorWords`)
+    author_words: Option<(Box<[u32]>, usize, usize)>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
     /// exact mode: the values the author pinned
@@ -686,6 +688,7 @@ impl Lowerer {
             scc_i1: HashSet::new(),
             fold_ok: HashSet::new(),
             key_labels: HashMap::new(),
+            author_words: None,
             m0_adds: HashSet::new(),
             e64_next: false,
             exact_pinned: HashSet::new(),
@@ -944,6 +947,9 @@ impl Lowerer {
         }
         if inst.stmt == 0 {
             inst.stmt = self.cur_stmt;
+        }
+        if let Some((w, _, _)) = self.author_words.take() {
+            inst.words = Some(w);
         }
         self.mir.blocks[self.cur].insts.push(inst);
     }
@@ -2329,6 +2335,18 @@ impl Lowerer {
 
     fn lower_stmt_inner(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         self.cur_stmt += 1;
+        // author words apply to the statement right after them, which must emit an instruction
+        if self.author_words.is_some() && !matches!(st, Stmt::AuthorWords { .. }) {
+            self.lower_stmt_inner2(f, st)?;
+            if self.author_words.take().is_some() {
+                return Err(format!("stmt {}: author words not taken: the statement emits no instruction", self.cur_stmt));
+            }
+            return Ok(());
+        }
+        self.lower_stmt_inner2(f, st)
+    }
+
+    fn lower_stmt_inner2(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         LAST_STMTS.with(|s| s.borrow_mut().push(st.clone()));
         {
             match st {
@@ -2913,6 +2931,12 @@ impl Lowerer {
                 self.mir.reg_hints.layout_keys.push((l, *key));
                 // the block may have several entries (gotos): no lowering cache of one path holds on another
                 self.converted.clear();
+            }
+            Stmt::AuthorWords { words } => {
+                if !self.exact {
+                    return Err("author words outside exact mode".into());
+                }
+                self.author_words = Some((words.clone().into_boxed_slice(), self.mir.blocks[self.cur].insts.len(), self.cur));
             }
             Stmt::GotoIf { cond, key } => {
                 if !self.exact {

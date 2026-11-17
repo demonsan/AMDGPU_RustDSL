@@ -358,6 +358,19 @@ def main():
     isa_lift.defs_uses = defs_uses
     isa_lift.RTY.update({'Wmma': None, 'SgprCat8': 'Sgpr8', 'KernargPreload': 'I32', 'WorkitemIdPacked': 'U32'})
     isa_lift.main()
+    # the kernel's argument layout (--args P,P,I,...: 8-byte pointers / 4-byte words in kernarg order): the code object's metadata lists every
+    # argument (a launcher sizes and copies the kernarg buffer by it), also those only the preload reads
+    if '--args' in sys.argv and '--out' in sys.argv:
+        out = sys.argv[sys.argv.index('--out') + 1]
+        txt = [l for l in open(out).read().split('\n') if not l.startswith('arg Arg ')]
+        lines, off = [], 0
+        for k in sys.argv[sys.argv.index('--args') + 1].split(','):
+            ty, sz = ('Ptr', 8) if k == 'P' else ('I32', 4)
+            lines.append(f'arg Arg {{ name: "ka_{off:x}", ty: {ty}, kernarg_offset: {off}, size: {sz} }}')
+            off += sz
+        k = next(i for i, l in enumerate(txt) if l.startswith('var_tys')) + 1
+        txt[k:k] = lines
+        open(out, 'w').write('\n'.join(txt))
     # the author's kernel-descriptor directives (--kd name=value,...): `kd "name" value` header lines after `exact`
     if '--kd' in sys.argv and '--out' in sys.argv:
         out = sys.argv[sys.argv.index('--out') + 1]

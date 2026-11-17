@@ -799,6 +799,7 @@ impl FromIr for Stmt {
             "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
+            "AuthorWords" => { v.expect_struct("AuthorWords")?; Ok(Stmt::AuthorWords { words: FromIr::from_ir(v.field("words")?)? }) }
             "GotoIf" => { v.expect_struct("GotoIf")?; Ok(Stmt::GotoIf { cond: FromIr::from_ir(v.field("cond")?)?, key: FromIr::from_ir(v.field("key")?)? }) }
             "Goto" => { v.expect_struct("Goto")?; Ok(Stmt::Goto { key: FromIr::from_ir(v.field("key")?)? }) }
             "TensorStoreFromLds" => { v.expect_struct("TensorStoreFromLds")?; Ok(Stmt::TensorStoreFromLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
@@ -888,6 +889,7 @@ impl IrIds for Stmt {
             Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }
+            Stmt::AuthorWords { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Stmt::GotoIf { cond, key } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*key), fv, fr); }
             Stmt::Goto { key } => { IrIds::ids(&mut (*key), fv, fr); }
             Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }

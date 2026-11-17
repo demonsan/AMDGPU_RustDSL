@@ -338,7 +338,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
         // gfx1250 TDM: an asynchronous global <-> LDS transfer (completion on TENSORcnt); its wait orders like a fence
         // a verbatim instruction: ordered like a fence (its effects are not modelled)
         Stmt::Raw { .. } => (ResClass::Sync, vec![], false),
-        Stmt::LayoutKey { .. } | Stmt::GotoIf { .. } | Stmt::Goto { .. } => (ResClass::Sync, vec![], false),
+        Stmt::LayoutKey { .. } | Stmt::GotoIf { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => (ResClass::Sync, vec![], false),
         Stmt::TensorLoadToLds { .. } => {
             e.dma = true;
             e.global_read = true;

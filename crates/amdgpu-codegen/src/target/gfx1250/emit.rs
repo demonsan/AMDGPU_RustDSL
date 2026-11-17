@@ -165,6 +165,11 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         for inst in &b.insts {
             for line in inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? {
                 let line = if msb_window && inst.op != MOp::RawInst { vgpr_window(&line) } else { line };
+                // the author's words for this instruction (exact replay), our spelling as the comment
+                let line = match &inst.words {
+                    Some(w) => format!(".long {} // {line}", w.iter().map(|x| format!("{x:#010x}")).collect::<Vec<_>>().join(", ")),
+                    None => line,
+                };
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');

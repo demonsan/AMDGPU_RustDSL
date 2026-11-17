@@ -674,6 +674,8 @@ pub struct MInst {
     pub neg: u8,
     /// exact mode: emit the VOP3 (`_e64`) encoding (the author's `encode_e64`)
     pub e64: bool,
+    /// exact replay: the author's instruction words for this instruction (`Stmt::AuthorWords`; fields an assembler fills differently)
+    pub words: Option<Box<[u32]>>,
 }
 
 /// Exact mode: an SGPR pin at this base is VCC (the lane-mask register `v_cmp_*_e32` writes and `v_cndmask_b32_e32` / `s_cbranch_vcc*` read).
@@ -753,7 +755,7 @@ pub fn cmp_names(code: i64, scalar: bool) -> (&'static str, &'static str) {
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0, neg: 0, e64: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, unit: 0, cpol: 0, origin: u32::MAX, stmt: 0, neg: 0, e64: false, words: None }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
