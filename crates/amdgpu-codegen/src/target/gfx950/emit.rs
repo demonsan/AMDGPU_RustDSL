@@ -1133,6 +1133,8 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SWaitVm => vec![format!("s_waitcnt vmcnt({})", inst.imm)],
         MOp::SWaitCnt => vec![format!("s_waitcnt vmcnt({}) lgkmcnt({})", inst.imm & 0xff, inst.imm >> 8)],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
+        // gfx1250 only: lowering rejects them for gfx950 (`tdm_target`); never reached
+        MOp::SWaitTensor | MOp::TensorLoadToLds | MOp::TensorStoreFromLds => vec![format!("; {:?}: gfx1250 only", inst.op)],
         MOp::LdsWriteB32 => vec![format!(
             "ds_write_b32 {}, {}{}",
             src1(a, inst.srcs[0]),
