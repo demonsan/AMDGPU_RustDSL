@@ -634,7 +634,7 @@ pub fn finalize(f: &amdgpu_dsl::Function, mut m: MFunction) -> Result<(MFunction
         }
         if crate::target::cur().name == "gfx1250" {
             // gfx1250: the split counters, XCNT, the scheduling mode's dependency counters and the gfx1250 software hazards
-            for (stmt, msg) in crate::target::gfx1250::check::verify(&m_phys, &a) {
+            for (stmt, msg) in crate::target::gfx1250::check::verify(&m, &a) {
                 if trusts.iter().any(|&t| stmt == t + 1) {
                     used.insert(stmt - 1);
                     continue;

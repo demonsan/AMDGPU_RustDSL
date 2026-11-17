@@ -46,7 +46,8 @@ fn an_authored_gfx1250_kernel_compiles_without_additions() {
 
 #[test]
 fn a_missing_split_counter_wait_is_named() {
-    let e = compile(&tiny(false, None, None)).err().expect("the kernarg pointer is read before its load returned");
+    let r = compile(&tiny(false, None, None));
+    let e = r.clone().err().unwrap_or_else(|| panic!("the kernarg pointer is read before its load returned:\n{}", r.unwrap()));
     assert!(e.contains("s_wait_kmcnt"), "{e}");
 }
 

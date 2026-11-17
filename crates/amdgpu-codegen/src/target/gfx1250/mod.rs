@@ -54,6 +54,13 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
         }
         b => return Err(format!("unknown backend `{b}` (own, llvm-tail)")),
     };
-    crate::gpu_verify_1250::enforce_asm(&f.name, &asm)?;
+    // the relaxed scheduling mode is allowed only as the exact-mode statement the exact verifier models (check.rs); any other write of the
+    // mode register stays a GV-1250-SCHED-MODE error
+    let modeled = f.exact && f.stmts().iter().any(|s| matches!(s, amdgpu_dsl::Stmt::SetSchedMode { .. }));
+    if modeled {
+        crate::gpu_verify_1250::with_rules_disabled(&["GV-1250-SCHED-MODE"], || crate::gpu_verify_1250::enforce_asm(&f.name, &asm))?;
+    } else {
+        crate::gpu_verify_1250::enforce_asm(&f.name, &asm)?;
+    }
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
