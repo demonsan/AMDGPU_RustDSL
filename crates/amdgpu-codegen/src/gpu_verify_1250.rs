@@ -19,7 +19,7 @@ use crate::fxhash::FxMap as HashMap;
 use crate::fxhash::FxSet as HashSet;
 use crate::mir::MFunction;
 use crate::regalloc::Alloc;
-use amdgpu_dsl::{Function, Op, Opnd, Stmt, ValueId, VarId};
+use amdgpu_dsl::{Function, Op, Opnd, Stmt, ValueId, VarId, CmpPred, CmpTy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
@@ -1060,6 +1060,339 @@ fn wave_succs(stmts: &[Stmt], sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) ->
     Ok(next)
 }
 
+// ---- trip counts: a small scalar-evolution proof that two loops wait on a barrier equally often --------------------------------------------------------------------------------
+
+/// Where a variable's value comes from at a statement along one wave's paths.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rd {
+    Unset,
+    At(usize),
+    Multi,
+}
+
+/// A loop's wait count as a function of its entry value, step, bound and exit phases (see `loop_sig`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TripSig {
+    ty: CmpTy,
+    /// canonical symbolic entry value of the counter + the exits' effective offsets: the first pass reaches the wait when `c0 + mb + 0 * step < bound`, a later pass `j` when
+    /// `c0 + eff + j * step < bound`
+    c0: String,
+    mb: i64,
+    eff: i64,
+    step: i64,
+    bound: String,
+}
+
+struct Scev<'a> {
+    stmts: &'a [Stmt],
+    sh: &'a Shape,
+    cx: &'a EvCtx<'a>,
+    uniform: &'a dyn Fn(&Opnd) -> bool,
+    defpos: HashMap<ValueId, usize>,
+    cache: std::cell::RefCell<HashMap<(i32, VarId), Vec<Rd>>>,
+}
+
+fn assigned_value(st: &Stmt, v: VarId) -> Option<Opnd> {
+    match st {
+        Stmt::SetVar { var, value } if *var == v => Some(*value),
+        Stmt::DeclareVars { vars, init } | Stmt::BeginLoop { vars, init } => vars.iter().position(|x| *x == v).and_then(|k| init.get(k).copied()),
+        _ => None,
+    }
+}
+
+/// The operand-erased text of an op (its operands' text replaced by `#k`, k = the operand's index among the distinct operands) and those operands.
+fn op_key(op: &Op) -> (String, Vec<Opnd>) {
+    let mut text = format!("{op:?}");
+    let mut ops: Vec<Opnd> = Vec::new();
+    for o in op.operands() {
+        if !ops.contains(&o) {
+            ops.push(o);
+        }
+    }
+    for (k, o) in ops.iter().enumerate() {
+        text = text.replace(&format!("{o:?}"), &format!("#{k}"));
+    }
+    (text, ops)
+}
+
+impl Scev<'_> {
+    fn reaching(&self, w: i32, v: VarId, at: usize) -> Rd {
+        let n = self.stmts.len();
+        if let Some(c) = self.cache.borrow().get(&(w, v)) {
+            return c[at];
+        }
+        // forward dataflow of the definition of `v` over the wave's paths (None = not reached)
+        let mut st: Vec<Option<Rd>> = vec![None; n + 1];
+        st[0] = Some(Rd::Unset);
+        let mut work = vec![0usize];
+        while let Some(i) = work.pop() {
+            if i >= n {
+                continue;
+            }
+            let cur = st[i].unwrap();
+            let out = if assigned_value(&self.stmts[i], v).is_some() { Rd::At(i) } else { cur };
+            let next = match wave_succs(self.stmts, self.sh, self.cx, self.uniform, w, i) {
+                Ok(x) => x,
+                Err(_) => {
+                    self.cache.borrow_mut().insert((w, v), vec![Rd::Multi; n + 1]);
+                    return Rd::Multi;
+                }
+            };
+            for t in next {
+                if t > n {
+                    continue;
+                }
+                let j = match st[t] {
+                    None => out,
+                    Some(o) if o == out => o,
+                    Some(_) => Rd::Multi,
+                };
+                if st[t] != Some(j) {
+                    st[t] = Some(j);
+                    work.push(t);
+                }
+            }
+        }
+        let v_: Vec<Rd> = st.into_iter().map(|x| x.unwrap_or(Rd::Unset)).collect();
+        let r = v_[at];
+        self.cache.borrow_mut().insert((w, v), v_);
+        r
+    }
+
+    /// Canonical symbolic text of an operand read at statement `at` by wave `w`; None when a variable's definition is not unique.
+    fn expand(&self, w: i32, o: &Opnd, at: usize, depth: u32) -> Option<String> {
+        if depth > 40 {
+            return None;
+        }
+        match o {
+            Opnd::I32(c) => Some(c.to_string()),
+            Opnd::F32(x) => Some(format!("f{}", x.to_bits())),
+            Opnd::Var(v) => match self.reaching(w, *v, at) {
+                Rd::At(s) => {
+                    let val = assigned_value(&self.stmts[s], *v)?;
+                    self.expand(w, &val, s, depth + 1)
+                }
+                Rd::Unset => Some(format!("undef{}", v.0)),
+                Rd::Multi => None,
+            },
+            Opnd::Val(x) => {
+                let op = self.cx.defs.get(x)?;
+                let d = *self.defpos.get(x)?;
+                let (text, ops) = op_key(op);
+                let mut kids = Vec::new();
+                for k in &ops {
+                    kids.push(self.expand(w, k, d, depth + 1)?);
+                }
+                Some(format!("{text}[{}]", kids.join(",")))
+            }
+        }
+    }
+
+    /// `base + k` form of an operand read at `at`: constants and `x + const` chains are folded.
+    fn affine(&self, w: i32, o: &Opnd, at: usize, depth: u32) -> Option<(String, i64)> {
+        if depth > 16 {
+            return None;
+        }
+        match o {
+            Opnd::I32(c) => Some((String::new(), *c as i64)),
+            Opnd::Val(x) => match self.cx.defs.get(x)? {
+                Op::AddK { a, k } => {
+                    let d = *self.defpos.get(x)?;
+                    let (b, c) = self.affine(w, a, d, depth + 1)?;
+                    Some((b, c + *k as i64))
+                }
+                Op::AddI32(a, Opnd::I32(k)) | Op::AddI32(Opnd::I32(k), a) => {
+                    let d = *self.defpos.get(x)?;
+                    let (b, c) = self.affine(w, a, d, depth + 1)?;
+                    Some((b, c + *k as i64))
+                }
+                _ => Some((self.expand(w, o, at, 0)?, 0)),
+            },
+            _ => Some((self.expand(w, o, at, 0)?, 0)),
+        }
+    }
+}
+
+/// The signature of loop `(begin, end)` for wave `w`: when does the pass reach the (single, top-level) `-3` wait.
+/// Every exit of the loop is `BreakIf` of `a >= bound` (the continue test `a < bound`), `a` = the counter `c` (or `c + k` read at a statement before / after the counter's single, top-level,
+/// constant-step update, which fixes its phase), the bound loop-invariant. With offsets `off_i = k_i + phase_i` the pass `j` reaches the wait iff `c0 + j * step + max(off_i of the exits before the wait)
+/// < bound` and (j >= 1) the previous pass's exits all continued: `c0 + (j - 1) * step + max(off_i of all exits) < bound`: two loops with the same (type, c0, step, bound, max-before, effective
+/// offset) wait equally often.
+fn loop_sig(sc: &Scev, w: i32, begin: usize, end: usize) -> Result<TripSig, String> {
+    macro_rules! t {
+        ($e:expr, $m:expr) => {
+            match $e {
+                Some(x) => x,
+                None => return Err($m.to_string()),
+            }
+        };
+    }
+    let stmts = sc.stmts;
+    // statements of this loop proper (not of nested loops), with their nesting depth of ifs
+    let mut own: Vec<(usize, u32)> = Vec::new();
+    let (mut nest_loop, mut depth_if) = (0u32, 0u32);
+    for i in begin + 1..end {
+        match &stmts[i] {
+            Stmt::BeginLoop { .. } => nest_loop += 1,
+            Stmt::EndLoop => nest_loop = nest_loop.saturating_sub(1),
+            Stmt::BeginIf { .. } if nest_loop == 0 => depth_if += 1,
+            Stmt::EndIf if nest_loop == 0 => depth_if = depth_if.saturating_sub(1),
+            _ => {}
+        }
+        if nest_loop == 0 {
+            own.push((i, depth_if));
+        }
+    }
+    // the single top-level wait
+    let waits: Vec<usize> = own.iter().filter(|(i, d)| matches!(stmts[*i], Stmt::BarrierWait { id: -3 }) && *d == 0).map(|(i, _)| *i).collect();
+    let all_waits = (begin + 1..end).filter(|&i| matches!(stmts[i], Stmt::BarrierWait { id: -3 })).count();
+    if waits.len() != 1 || all_waits != 1 {
+        return Err(format!("the loop at statement {begin} has {all_waits} wait(s) on -3, {} at its top level (one is required)", waits.len()));
+    }
+    let pw = waits[0];
+    // the exits: `if cond { BreakIf cond }` (the cond a value the loop computed), cond = not(a < bound) | a >= bound
+    let mut exits: Vec<(usize, Opnd, Opnd, CmpTy, usize)> = Vec::new();   // (BreakIf position, a, bound, ty, the compare's def position)
+    for &(i, _) in &own {
+        if let Stmt::BreakIf { cond: Opnd::Val(cv) } = &stmts[i] {
+            let (cmp, neg) = match t!(sc.cx.defs.get(cv), "exit condition without a definition") {
+                Op::NotI1(Opnd::Val(y)) => (t!(sc.cx.defs.get(y), "exit compare without a definition"), *y),
+                other => (other, *cv),
+            };
+            let cpos = t!(sc.defpos.get(&neg), "exit compare without a position").to_owned();
+            match cmp {
+                Op::Cmp { pred: CmpPred::Lt, ty, a, b } if matches!(sc.cx.defs.get(cv), Some(Op::NotI1(_))) => exits.push((i, *a, *b, *ty, cpos)),
+                Op::Cmp { pred: CmpPred::Ge, ty, a, b } if !matches!(sc.cx.defs.get(cv), Some(Op::NotI1(_))) => exits.push((i, *a, *b, *ty, cpos)),
+                other => return Err(format!("the loop at statement {begin}: an exit at statement {i} is not `a < bound` / `a >= bound` ({:.80?})", other)),
+            }
+        }
+    }
+    if exits.is_empty() {
+        return Err(format!("the loop at statement {begin} has no exit test"));
+    }
+    // the counter: the variable under every exit's `a`
+    let counter_of = |a: &Opnd, at: usize| -> Option<(VarId, i64, usize)> {
+        // (var, k, the position the variable was read at)
+        match a {
+            Opnd::Var(c) => Some((*c, 0, at)),
+            Opnd::Val(x) => match sc.cx.defs.get(x)? {
+                Op::AddK { a: Opnd::Var(c), k } => Some((*c, *k as i64, *sc.defpos.get(x)?)),
+                Op::AddI32(Opnd::Var(c), Opnd::I32(k)) => Some((*c, *k as i64, *sc.defpos.get(x)?)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let (c, _, _) = t!(counter_of(&exits[0].1, exits[0].4), format!("the loop at statement {begin}: the exit compares {:?}, which is not a counter (or counter + constant)", exits[0].1));
+    // the counter's updates, all at the top level of the body, each `c := c + constant` (the value computed from `c` after the previous update, no other update in between): the pass's total step is
+    // their sum, and a read at a position sees the increments of the updates before it (its phase)
+    let upd: Vec<usize> = (begin + 1..end).filter(|&i| matches!(&stmts[i], Stmt::SetVar { var, .. } if *var == c)).collect();
+    if upd.is_empty() {
+        return Err(format!("the loop at statement {begin}: its counter is never updated in the body"));
+    }
+    let mut incs: Vec<(usize, i64)> = Vec::new();   // (position, increment)
+    for &up in &upd {
+        if !own.iter().any(|(i, d)| *i == up && *d == 0) {
+            return Err(format!("the loop at statement {begin}: a counter update at statement {up} is not at the top level of the body"));
+        }
+        let (y, inc) = match &stmts[up] {
+            Stmt::SetVar { value: Opnd::Val(y), .. } => match t!(sc.cx.defs.get(y), "update without a definition") {
+                Op::AddK { a: Opnd::Var(cc), k } if *cc == c => (*y, *k as i64),
+                Op::AddI32(Opnd::Var(cc), Opnd::I32(k)) if *cc == c => (*y, *k as i64),
+                other => return Err(format!("the loop at statement {begin}: the counter update at statement {up} is not `c + constant` ({:.80?})", other)),
+            },
+            _ => return Err(format!("the loop at statement {begin}: the counter update at statement {up} is not `c + constant`")),
+        };
+        let dy = t!(sc.defpos.get(&y), "update value without a position").to_owned();
+        if dy > up || upd.iter().any(|&u2| u2 > dy && u2 < up) {
+            return Err(format!("the loop at statement {begin}: another counter update lies between the computation of the update at statement {up} and the update"));
+        }
+        if inc <= 0 {
+            return Err(format!("the loop at statement {begin}: a counter step {inc} is not positive"));
+        }
+        incs.push((up, inc));
+    }
+    let step: i64 = incs.iter().map(|x| x.1).sum();
+    let phase_of = |read: usize| -> i64 { incs.iter().filter(|(u, _)| *u < read).map(|x| x.1).sum() };
+    // the bound: one expression, loop-invariant (a variable the loop never assigns, or a value defined before the loop)
+    let bound0 = exits[0].2;
+    let invariant = |b: &Opnd| -> bool {
+        match b {
+            Opnd::I32(_) => true,
+            Opnd::Var(v) => !(begin + 1..end).any(|i| assigned_value(&stmts[i], *v).is_some()),
+            Opnd::Val(x) => sc.defpos.get(x).map(|d| *d < begin).unwrap_or(false),
+            _ => false,
+        }
+    };
+    let ty = exits[0].3;
+    let mut mb = i64::MIN / 4;
+    let mut ma = i64::MIN / 4;
+    for (pos, a, b, t, cpos) in &exits {
+        if *t != ty || *b != bound0 || !invariant(b) {
+            return Err(format!("the loop at statement {begin}: the exits do not share one loop-invariant bound / type (bound {:?} vs {:?})", b, bound0));
+        }
+        let (cc, k, read) = t!(counter_of(a, *cpos), "an exit compares something that is not the counter");
+        if cc != c {
+            return Err(format!("the loop at statement {begin}: the exits test different counters"));
+        }
+        let off = k + phase_of(read);
+        ma = ma.max(off);
+        if *pos < pw {
+            mb = mb.max(off);
+        }
+    }
+    let bound = t!(sc.expand(w, &bound0, begin, 0), format!("the loop at statement {begin}: the bound has no unique symbolic definition for wave {w}"));
+    // the entry value (the loop statement's own init for a loop variable, the reaching definition otherwise) as a closed symbolic base + constant
+    let entry = assigned_value(&stmts[begin], c).unwrap_or(Opnd::Var(c));
+    let (base, k0) = t!(sc.affine(w, &entry, begin, 0), format!("the loop at statement {begin}: the counter's entry value has no unique symbolic definition for wave {w}"));
+    let eff = mb.max(ma - step);
+    Ok(TripSig { ty, c0: base, mb: k0 + mb, eff: k0 + eff, step, bound })
+}
+
+/// The loops `(begin, end)` of the function.
+fn loop_spans(stmts: &[Stmt]) -> Vec<(usize, usize)> {
+    let mut st: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for (i, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::BeginLoop { .. } => st.push(i),
+            Stmt::EndLoop => {
+                if let Some(b) = st.pop() {
+                    out.push((b, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Do the loops the waves wait in (`pairs`: (wave, loop begin)) wait equally often? True only when every loop has a signature and all signatures are equal.
+fn trips_equal(f: &Function, sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) -> bool, pairs: &[(i32, usize)]) -> Result<(), String> {
+    let stmts = f.stmts();
+    let mut defpos: HashMap<ValueId, usize> = HashMap::default();
+    for (i, st) in stmts.iter().enumerate() {
+        if let Stmt::Let { dst, .. } = st {
+            defpos.insert(*dst, i);
+        }
+    }
+    let sc = Scev { stmts, sh, cx, uniform, defpos, cache: Default::default() };
+    let spans = loop_spans(stmts);
+    let mut first: Option<TripSig> = None;
+    for &(w, b) in pairs {
+        let Some(&(_, e)) = spans.iter().find(|(bb, _)| *bb == b) else { return Err("a loop without an end".to_string()) };
+        let sig = loop_sig(&sc, w, b, e)?;
+        match &first {
+            None => first = Some(sig),
+            Some(s0) => {
+                if *s0 != sig {
+                    return Err(format!("the loops' trip signatures differ: {s0:?} vs {sig:?} (loop at statement {b}, wave {w})"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GV-1250-BAR-COUNT: the cluster barrier (-3) is signalled by exactly one wave per work-group per wait, proved by ALTERNATION along every path.
 /// * the waves that can reach a signal of -3 (each wave's path decided by its own evaluable conditions): exactly one, the leader;
 /// * for the leader, a forward dataflow over the CFG (loop back edges included) with the state "signals since the last wait" in {0, 1, 2+} (a set of states per statement): at every wait the state
@@ -1160,7 +1493,19 @@ fn alternation(f: &Function) -> AltResult {
                 res.violations.push(format!("wave {w} reaches {top} wait(s) on the cluster barrier (-3) outside loops, the signalling wave {lw} reaches {ltop}: a wave that waits more often than the barrier completes never gets out"));
             }
             if loops != lloops && res.needs_trip_fact.is_none() {
-                res.needs_trip_fact = Some(format!("wave {w} waits on the cluster barrier in the loops at statements {:?}, the signalling wave {lw} in {:?}: the loops must iterate the same number of times", loops, lloops));
+                // try to prove the loops iterate alike (a scalar-evolution comparison of their entry value, step, bound and exit phases)
+                let mut pairs: Vec<(i32, usize)> = Vec::new();
+                for ww in 0..nw as usize {
+                    let (_, ls) = per(ww);
+                    for l in ls {
+                        pairs.push((ww as i32, l));
+                    }
+                }
+                let why = match trips_equal(f, &sh, &cx, &uniform, &pairs) {
+                    Ok(()) => continue,
+                    Err(why) => why,
+                };
+                res.needs_trip_fact = Some(format!("wave {w} waits on the cluster barrier in the loops at statements {:?}, the signalling wave {lw} in {:?}: the loops must iterate the same number of times (not proved: {why})", loops, lloops));
             }
         }
     }
