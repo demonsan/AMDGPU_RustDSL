@@ -31,6 +31,12 @@ pub fn emit(m: &MFunction, a: &Alloc) -> Result<String, String> {
     out.push_str(".p2align 8\n");
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
+    // the kernel prologue the gfx1250 assembler requires (s_mov_b64 / v_nop / global_prefetch_b8 first) and LLVM emits for every kernel, in
+    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only)
+    out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
+    out.push_str("    s_mov_b64 s[6:7], 0\n");
+    out.push_str("    v_nop\n");
+    out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));

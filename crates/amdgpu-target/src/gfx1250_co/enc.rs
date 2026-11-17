@@ -197,6 +197,23 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         }
         return Ok(v);
     }
+    // s_setreg_imm32_b32 hwreg(NAME, offset, size), imm (SOPK with a literal); only the registers the emitter writes
+    if let Some(rest) = t.strip_prefix("s_setreg_imm32_b32") {
+        let (h, imm) = rest.trim().rsplit_once(',').ok_or_else(|| format!("`{t}`"))?;
+        let h = h.trim().strip_prefix("hwreg(").and_then(|x| x.strip_suffix(')')).ok_or_else(|| format!("`{t}`: hwreg"))?;
+        let f: Vec<&str> = h.split(',').map(|x| x.trim()).collect();
+        let id = match f.first() {
+            Some(&"HW_REG_WAVE_MODE") => 1u32,
+            x => return Err(format!("`{t}`: hardware register {x:?}")),
+        };
+        let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+        let size = f.get(2).and_then(|x| x.parse::<u32>().ok()).unwrap_or(32);
+        let simm = id | off << 6 | (size - 1) << 11;
+        let (_, op) = lookup("s_setreg_imm32_b32").ok_or("s_setreg_imm32_b32 not in the tables")?;
+        let mut v = d32(0xB000_0000 | op << 23 | simm).to_vec();
+        v.extend_from_slice(&d32(parse_num(imm).ok_or_else(|| format!("`{t}`: value"))? as u32));
+        return Ok(v);
+    }
     let i = parse_inst(t)?;
     let base = i.mn.strip_suffix("_e32").or_else(|| i.mn.strip_suffix("_e64")).unwrap_or(&i.mn);
     let mut e64 = i.mn.ends_with("_e64");
@@ -345,13 +362,17 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             }
         }
         "VGLOBAL" => {
-            // loads: vD, vaddr, saddr|off; stores: vaddr, vdata, saddr|off
+            // loads: vD, vaddr, saddr|off; stores: vaddr, vdata, saddr|off; prefetch: vaddr, saddr|off
             let store = base.starts_with("global_store");
-            let (data, addr, saddr) = if store {
+            let (data, addr, saddr) = if base.starts_with("global_prefetch") {
+                (0, op_at(&i, 0)?, op_at(&i, 1)?)
+            } else if store {
                 (vreg(op_at(&i, 1)?)?, op_at(&i, 0)?, op_at(&i, 2)?)
             } else {
                 (vreg(op_at(&i, 0)?)?, op_at(&i, 1)?, op_at(&i, 2)?)
             };
+            const SC: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
+            let scope = modv(&i, "scope").map(|v| SC.iter().position(|x| *x == v).unwrap_or(0) as u32).unwrap_or(0);
             let va = vreg(addr)?;
             let sa = match saddr {
                 Op::Special(124) => 0x7C,
@@ -360,7 +381,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             };
             let off = modv(&i, "offset").map(|v| parse_num(v).ok_or(format!("`{t}`: offset"))).transpose()?.unwrap_or(0);
             out.extend_from_slice(&d32(0xEE00_0000 | op << 14 | sa));
-            out.extend_from_slice(&d32(if store { data << 23 } else { data }));
+            out.extend_from_slice(&d32(if store { data << 23 } else { data } | scope << 18));
             out.extend_from_slice(&d32(((off as u32) & 0x00ff_ffff) << 8 | va));
         }
         "VDS" => {

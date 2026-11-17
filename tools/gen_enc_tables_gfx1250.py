@@ -41,6 +41,8 @@ GLOBAL_STORE = [("global_store_b32", "v1"), ("global_store_b64", "v[2:3]"), ("gl
 DS_LOAD = [("ds_load_b32", "v1"), ("ds_load_b64", "v[2:3]"), ("ds_load_b128", "v[4:7]"), ("ds_load_u16", "v1"), ("ds_load_u8", "v1")]
 DS_STORE = [("ds_store_b32", "v1"), ("ds_store_b64", "v[2:3]"), ("ds_store_b128", "v[4:7]"), ("ds_store_b16", "v1"), ("ds_store_b8", "v1")]
 TDM = ["tensor_load_to_lds", "tensor_store_from_lds"]
+# the kernel prologue (see the gfx1250 emitter)
+EXTRA = [("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
 
 
 def samples():
@@ -78,6 +80,7 @@ def samples():
         s.append((m, f"{m} v9, {d} offset:16"))
     for m in TDM:
         s.append((m, f"{m} s[0:3], s[4:11]"))
+    s.extend(EXTRA)
     return s
 
 

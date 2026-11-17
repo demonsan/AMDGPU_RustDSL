@@ -57,6 +57,7 @@ fn the_emitted_lines_encode_like_llvm_mc() {
         "ds_store_b64 v9, v[2:3] offset:8", "tensor_load_to_lds s[0:3], s[4:11]", "tensor_store_from_lds s[8:11], s[16:23], s[24:27], s[28:31]",
         "tensor_load_to_lds s[0:3], s[4:11] th:TH_LOAD_BYPASS scope:SCOPE_SYS", "s_wait_tensorcnt 0x3", "s_barrier_signal -3", "s_barrier_wait -3",
         "s_wait_loadcnt_dscnt 0x0", "s_set_vgpr_msb 0x41", "v_readfirstlane_b32 s7, v3", "s_mov_b32 s1, ttmp7",
+        "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE", "global_load_b32 v1, v2, s[4:5] scope:SCOPE_SE",
     ] {
         lines.push(l.to_string());
     }
