@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """gfx1250 front end of the exact lifter (tools/isa_lift.py; docs/exact-mode.md): the node's `llvm-objdump --mcpu=gfx1250` text of one kernel
 -> the lifter's instruction list, then the same structured whole-kernel lift into DSL IR text (irv1).
 
@@ -27,7 +27,7 @@ TO_950 = {
     'ds_load_b32': 'ds_read_b32', 'ds_load_b64': 'ds_read_b64', 'ds_load_b128': 'ds_read_b128', 'ds_store_b32': 'ds_write_b32',
     'ds_store_b64': 'ds_write_b64', 'ds_store_b128': 'ds_write_b128', 'v_add_nc_u32': 'v_add_u32', 'v_sub_nc_u32': 'v_sub_u32',
     's_add_co_u32': 's_add_u32', 's_add_co_ci_u32': 's_addc_u32', 's_sub_co_u32': 's_sub_u32', 's_load_b32': 's_load_dword',
-    's_load_b64': 's_load_dwordx2', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
+    's_load_b64': 's_load_dwordx2', 's_addk_co_i32': 's_addk_i32', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
 }
 WAITS = {'s_wait_loadcnt': 'Load', 's_wait_storecnt': 'Store', 's_wait_dscnt': 'Ds', 's_wait_kmcnt': 'Km', 's_wait_xcnt': 'X',
          's_wait_asynccnt': 'Async', 's_wait_tensorcnt': 'Tensor'}
@@ -309,6 +309,37 @@ class Lifter(isa_lift.Lifter):
             self.stmt(f'SetSchedMode {{ mode: {int(w[1], 16)} }}')
             return True
         return False
+
+    def _salu(self, t, sop, ty='I32'):
+        a, b = self.src(t[1], 'I32' if ty == 'I32' else None), self.src(t[2], 'I32' if ty == 'I32' else None)
+        self.dst(t[0], ty, f'Salu {{ op: {sop}, a: {a}, b: {b} }}')
+        return True
+
+    def h_s_add_co_i32(self, t, m, op):
+        return self._salu(t, 'AddCoI32')
+
+    def h_s_sub_co_i32(self, t, m, op):
+        return self._salu(t, 'SubCoI32')
+
+    def h_s_bfe_u32(self, t, m, op):
+        if t[1].startswith('ttmp'):
+            return False
+        return self._salu(t, 'BfeU32')
+
+    def h_s_add_nc_u64(self, t, m, op):
+        return self._salu(t, 'AddNcU64', 'Ptr')
+
+    def _bitset(self, t, sop):
+        # in place: the destination's old value is the first operand
+        old, bit = self.src(t[0], 'I32'), self.src(t[1], 'I32')
+        self.dst(t[0], 'I32', f'Salu {{ op: {sop}, a: {old}, b: {bit} }}')
+        return True
+
+    def h_s_bitset0_b32(self, t, m, op):
+        return self._bitset(t, 'Bitset0')
+
+    def h_s_bitset1_b32(self, t, m, op):
+        return self._bitset(t, 'Bitset1')
 
     def h_v_swap_b32(self, t, m, op):
         # both registers in place: SwapA is the instruction (vA's new content), Permlane32SwapB names vB's
