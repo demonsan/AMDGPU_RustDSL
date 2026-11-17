@@ -27,7 +27,7 @@ TO_950 = {
     'ds_load_b32': 'ds_read_b32', 'ds_load_b64': 'ds_read_b64', 'ds_load_b128': 'ds_read_b128', 'ds_store_b32': 'ds_write_b32',
     'ds_store_b64': 'ds_write_b64', 'ds_store_b128': 'ds_write_b128', 'v_add_nc_u32': 'v_add_u32', 'v_sub_nc_u32': 'v_sub_u32',
     's_add_co_u32': 's_add_u32', 's_add_co_ci_u32': 's_addc_u32', 's_sub_co_u32': 's_sub_u32', 's_load_b32': 's_load_dword',
-    's_load_b64': 's_load_dwordx2', 's_addk_co_i32': 's_addk_i32', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
+    's_load_b64': 's_load_dwordx2', 's_addk_co_i32': 's_addk_i32', 'ds_load_tr8_b64': 'ds_read_b64_tr_b8', 'v_max3_num_f32': 'v_max3_f32', 'v_max_num_f32': 'v_max_f32', 'buffer_store_b32': 'buffer_store_dword', 'v_subrev_nc_u32': 'v_subrev_u32', 'global_load_b128': 'global_load_dwordx4', 'global_load_b32': 'global_load_dword',
 }
 WAITS = {'s_wait_loadcnt': 'Load', 's_wait_storecnt': 'Store', 's_wait_dscnt': 'Ds', 's_wait_kmcnt': 'Km', 's_wait_xcnt': 'X',
          's_wait_asynccnt': 'Async', 's_wait_tensorcnt': 'Tensor'}
@@ -80,7 +80,9 @@ def parse(path):
             if recs[j]['addr'] in targets:
                 break
             if o.startswith(scc_r):
-                scc_live.add(k)
+                # (a carry pair - s_add_co_u32 ... s_add_co_ci_u32 - is two DSL forms, the carry through SCC: not a branch condition)
+                if not (r['op'] == 's_add_co_u32' and o == 's_add_co_ci_u32'):
+                    scc_live.add(k)
                 break
             if (o.startswith(scc_w) and not o.startswith(('s_add_nc', 's_sub_nc'))) or o.startswith(('s_cmp', 's_branch', 's_endpgm')):
                 break
@@ -103,11 +105,17 @@ def parse(path):
                 and recs[i + 1]['addr'] not in targets):
             n = recs[i + 1]['args']
             lo, hi = isa_lift.reg(args[0]), isa_lift.reg(n[0])
-            blo, bhi = isa_lift.reg(args[1]), isa_lift.reg(n[2]) if len(n) > 2 else None
-            if (lo and hi and blo and bhi and n[1] == '0' and hi[1] == lo[1] + 1 and bhi[1] == blo[1] + 1 and lo[1] == blo[1]
-                    and lo[1] % 2 == 0):
+            bhi = isa_lift.reg(n[2]) if len(n) > 2 else None
+            # the base pair is the source whose register sits right below the carry's source (bhi); the other source is the offset
+            r1, r2 = isa_lift.reg(args[1]), isa_lift.reg(args[2])
+            blo, off_tok = None, None
+            if bhi and r1 and r1[0] == 's' and r1[1] == bhi[1] - 1:
+                blo, off_tok = r1, args[2]
+            elif bhi and r2 and r2[0] == 's' and r2[1] == bhi[1] - 1:
+                blo, off_tok = r2, args[1]
+            if (lo and hi and blo and n[1] == '0' and hi[1] == lo[1] + 1 and lo[1] % 2 == 0 and blo[1] % 2 == 0):
                 pw = '/'.join(f'{w:#x}' for w in r['words']) + ';' + '/'.join(f'{w:#x}' for w in recs[i + 1]['words'])
-                out.append((sec, 's_ptradd_zext', f's[{lo[1]}:{lo[1] + 1}], {args[2]} pwords:{pw}'))
+                out.append((sec, 's_ptradd_zext', f's[{lo[1]}:{lo[1] + 1}], s[{blo[1]}:{blo[1] + 1}], {off_tok} pwords:{pw}'))
                 i += 2
                 continue
         if op == 'v_wmma_ld_scale_paired_b32' and i + 1 < len(recs) and recs[i + 1]['op'] == 'raw':
@@ -116,7 +124,7 @@ def parse(path):
             words += recs[i + 1]['words']
             i += 1
         wops = sys.argv[sys.argv.index('--words-ops') + 1].split(',') if '--words-ops' in sys.argv else []
-        SYS = ('s_version', 's_wait_idle', 's_prefetch_inst', 'global_prefetch_b8', 's_getreg_b32', 's_get_pc_i64')
+        SYS = ('v_nop', 's_sleep', 's_version', 's_wait_idle', 's_prefetch_inst', 'global_prefetch_b8', 's_getreg_b32', 's_get_pc_i64')
         exec_w = op in ('s_mov_b32', 's_cselect_b32') and args and args[0] == 'exec_lo'
         if op.startswith(('v_wmma', 's_wait_alu', 's_setreg_imm32') + SYS) or exec_w or any(op == f or op.startswith(f + '_e') for f in wops):
             mods = mods + ['words:' + '/'.join(f'{w:#x}' for w in words)]
@@ -349,6 +357,79 @@ class Lifter(isa_lift.Lifter):
         self.stmt(f'Sys {{ op: {op}, imm: {imm}, imm2: {imm2}, reads: [{", ".join(reads)}] }}')
         return True
 
+    def h_v_add_nc_i32(self, t, m, op): return self.bin(t, 'Bin(AddNcI32, {a}, {b})', 'I32', 'I32')
+    def h_v_subrev_u32(self, t, m, op): return self.bin(t, 'Bin(SubrevU32, {a}, {b})', 'I32', 'I32')
+    def h_v_rcp_iflag_f32(self, t, m, op):
+        self.dst(t[0], 'F32', f'Un(RcpIflagF32, {self.src(t[1], "F32")})')
+        return True
+
+    def h_v_permlane16_swap_b32(self, t, m, op):
+        a, b = self.src(t[0], 'I32'), self.src(t[1], 'I32')
+        na = self.dst(t[0], 'U32', f'Permlane16SwapA {{ a: {a}, b: {b} }}')
+        self.dst(t[1], 'U32', f'Permlane32SwapB {{ swap: Val({na}) }}')
+        return True
+
+    def h_v_add_nc_u64(self, t, m, op):
+        a, b = self.src(t[1], 'Frag2'), self.src(t[2], 'Frag2')
+        self.dst(t[0], 'Frag2', f'VAddU64 {{ a: {a}, b: {b} }}')
+        return True
+
+    def h_s_buffer_load_b32(self, t, m, op):
+        off = next((int(x.split(':')[1], 0) for x in m if x.startswith('offset:')), 0)
+        rs, so = self.src(t[1], 'Rsrc'), self.src(t[2], 'I32')
+        self.dst(t[0], 'I32', f'SBufferLoad {{ rsrc: {rs}, soff: {so}, imm: {off} }}')
+        return True
+
+    def h_global_load_async_to_lds_b128(self, t, m, op):
+        off = next((int(x.split(':')[1], 0) for x in m if x.startswith('offset:')), 0)
+        self.stmt(f'LoadAsyncLds {{ lds: {self.src(t[0], "I32")}, vaddr: {self.src(t[1], "Frag2")}, imm: {off} }}')
+        return True
+
+    def h_v_cvt_pk_fp8_f32(self, t, m, op):
+        # a 16-bit half write (true16 `.l` / `.h`): the register's other half is kept
+        d = t[0]
+        hi = d.endswith('.h')
+        base = d[:-2] if d.endswith(('.l', '.h')) else d
+        r = isa_lift.reg(base)
+        # (a half the program never wrote: no old value - the other half is undefined)
+        old = self.src(base, 'I32') if ('v', r[1]) in self.state else None
+        a, b = self.src(t[1], 'F32'), self.src(t[2], 'F32')
+        self.dst(base, 'U32', f'CvtPkFp8Half {{ old: {"Some(" + old + ")" if old else "None"}, a: {a}, b: {b}, hi: {"true" if hi else "false"} }}')
+        return True
+
+    def h_s_mov_b64(self, t, m, op):
+        r0, r1 = isa_lift.reg(t[0]), isa_lift.reg(t[1]) if len(t) > 1 else None
+        if r0 and r1 and r0[0] == 's' and r1[0] == 's' and r0[2] == 2 and r1[2] == 2:
+            self.dst(t[0], 'Ptr', f'Salu {{ op: MovB64, a: {self.src(t[1], "Ptr")}, b: I32(0) }}')
+            return True
+        return super().h_s_mov_b64(t, m, op)
+
+    def h_v_nop(self, t, m, op):
+        return self._sys(list(t) + list(m), 'VNop', 0, 0, [])
+
+    def h_s_sleep(self, t, m, op):
+        return self._sys(m, 'Sleep', isa_lift.imm(t[0]) & 0xffff, 0, [])
+
+    def _ds_store(self, t, m, ty):
+        addr = self.lds_addr(['', t[0]], m)
+        self.stmt(f'StoreLdsN {{ addr: {addr}, value: {self.src(t[1], "I32" if ty == "B32" else None)}, ty: {ty}, hi: false }}')
+        return True
+
+    def h_ds_write_b32(self, t, m, op): return self._ds_store(t, m, 'B32')
+    def h_ds_write_b64(self, t, m, op): return self._ds_store(t, m, 'B64')
+    def h_v_mul_hi_u32(self, t, m, op): return self.bin(t, 'Bin(MulHiU32, {a}, {b})', 'I32', 'I32')
+    def h_v_cmp_le_u32(self, t, m, op): return self.cmp64(t, 'Le', 'U32')
+    def h_v_cvt_f32_u32(self, t, m, op):
+        self.dst(t[0], 'F32', f'Un(CvtF32U32, {self.src(t[1], "I32")})')
+        return True
+    def h_v_cvt_u32_f32(self, t, m, op):
+        self.dst(t[0], 'U32', f'Un(CvtU32F32, {self.src(t[1], "F32")})')
+        return True
+    def h_v_pk_add_f32(self, t, m, op):
+        a, b = self.src(t[1]), self.src(t[2])
+        self.dst(t[0], 'Frag2', f'PkAddF32({a}, {b})')
+        return True
+
     def h_s_version(self, t, m, op):
         w = next(x[6:].split('/') for x in m if x.startswith('words:'))
         return self._sys(m, 'Version', int(w[0], 16) & 0xffff, 0, [])
@@ -404,11 +485,27 @@ class Lifter(isa_lift.Lifter):
     def h_s_ptradd_zext(self, t, m, op):
         # the author's pair (s_add_co_u32 + s_add_co_ci_u32, constant-first) as one pointer add; each instruction keeps its words
         pw = next(x for x in m if x.startswith('pwords:'))[7:].split(';')
-        base, off = self.src(t[0], 'Ptr'), self.src(t[1], 'I32')
+        base, off = self.src(t[1], 'Ptr'), self.src(t[2], 'I32')
         for ws in pw:
             self.stmt('AuthorWords { words: [' + ', '.join(str(int(x, 16)) for x in ws.split('/')) + '] }')
         self.dst(t[0], 'Ptr', f'PtrAdd {{ base: {base}, byte_off: {off} }}')
         return True
+
+    def pair_ok(self, a, b):
+        # (the gfx950 lifter's s_add_u32 + s_addc_u32 pointer pairing probes registers with side effects; the gfx1250 front end pairs
+        # them itself: s_ptradd_zext, or the AddCoU32 / AddCoCiU32 forms)
+        return False
+
+    def h_s_add_u32(self, t, m, op):
+        # (the low word of a carry pair; m0 forms are the shared handler's)
+        if t[0] == 'm0':
+            return super().h_s_add_u32(t, m, op)
+        ok = self._salu(t, 'AddCoU32')
+        self.state.pop(('scc', 0), None)
+        return ok
+
+    def h_s_addc_u32(self, t, m, op):
+        return self._salu(t, 'AddCoCiU32')
 
     def _salu(self, t, sop, ty='I32'):
         a, b = self.src(t[1], 'I32' if ty == 'I32' else None), self.src(t[2], 'I32' if ty == 'I32' else None)
@@ -506,6 +603,9 @@ def defs_uses(op, args):
     """isa_lift.defs_uses for the gfx1250 forms (the verbatim text and the decoded modifiers are not operands)."""
     args = args.split(' ||| ', 1)[0]
     args = ' '.join(w for w in args.split(' ') if not w.startswith(('raw:', 'th:', 'scope:', 'words:', 'pwords:')) and w != 'scc_live')
+    # (a high-half write keeps the low half another write made: it reads the register; the low half comes first, from nothing)
+    half = bool(re.search(r'^v\d+\.h\b', args.strip()))
+    args = re.sub(r'(v\d+)\.[lh]\b', r'\1', args)
     t, m = isa_lift.toks(args)
     rr = lambda tok: [(r[0], r[1] + i) for r in [isa_lift.reg(tok)] if r for i in range(r[2])]
     if op.startswith(NO_DST_1250):
@@ -514,7 +614,10 @@ def defs_uses(op, args):
             u |= set(rr(x))
         return set(), u
     d, u = _defs_uses_950(op, args)
-    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk', 's_ptradd_zext')):
+    if op.startswith(('s_bitset0', 's_bitset1', 's_cmovk', 's_mulk')):
+        u |= d
+    if half:
+        # a 16-bit write keeps the register's other half: the destination is read too
         u |= d
     if op.startswith('v_swap') and len(t) > 1:
         d |= set(rr(t[1]))

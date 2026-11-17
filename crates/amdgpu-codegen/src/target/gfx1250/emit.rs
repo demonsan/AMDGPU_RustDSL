@@ -101,7 +101,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     let keyed = order.len() == m.blocks.len() && m.exact && !m.reg_hints.layout_keys.is_empty();
     // keyed layout: blocks without instructions that only jump on are not laid out; every edge goes to its final block
     let thru: std::collections::HashMap<u32, u32> = if keyed {
-        let has_key: std::collections::HashSet<u32> = m.reg_hints.layout_keys.iter().map(|(l, _)| *l).collect();
+        let has_key: std::collections::HashSet<u32> = m.reg_hints.author_branches.iter().copied().collect();
         m.blocks
             .iter()
             .filter_map(|b| match (&b.term, b.insts.is_empty() && !has_key.contains(&b.label)) {
@@ -178,7 +178,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         match &term {
             Term::Goto(t) => {
                 // (an author's block that is only its branch keeps it, even to the next block: the author wrote it)
-                let only_branch = keyed && b.insts.is_empty();
+                let only_branch = keyed && b.insts.is_empty() && m.reg_hints.author_branches.contains(&b.label);
                 if only_branch || !((m.elide_fallthrough || keyed) && next_label == Some(*t)) {
                     out.push_str(&format!("    s_branch BB{t}\n"))
                 }
@@ -436,25 +436,79 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
             }
             vec![l]
         }
-        MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 => {
+        MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::SMovB64Pair => {
             let s = |x: &Src| -> Result<String, String> {
                 match x {
                     Src::Reg(r) => {
                         let p = a.phys[*r as usize];
-                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
+                        Ok(if matches!(inst.op, MOp::SAddNcU64 | MOp::SMovB64Pair) { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
                     }
                     Src::Imm(k) => Ok(format!("{:#x}", *k as u32)),
                     _ => Err("scalar form: register or constant operands".into()),
                 }
             };
             let d = a.phys[inst.dst.ok_or("scalar form without a destination")? as usize];
-            let dn = if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", d, d + 1) } else { format!("s{d}") };
+            let dn = if matches!(inst.op, MOp::SAddNcU64 | MOp::SMovB64Pair) { format!("s[{}:{}]", d, d + 1) } else { format!("s{d}") };
             let mn = crate::op_attrs::attrs(inst.op).mnemonic;
             match inst.op {
                 // in place on the destination (= a's register): only the bit operand is written
                 MOp::SBitset0 | MOp::SBitset1 => vec![format!("{mn} {dn}, {}", s(&inst.srcs[1])?)],
+                MOp::SMovB64Pair => vec![format!("{mn} {dn}, {}", s(&inst.srcs[0])?)],
                 _ => vec![format!("{mn} {dn}, {}, {}", s(&inst.srcs[0])?, s(&inst.srcs[1])?)],
             }
+        }
+        MOp::VNop => vec!["v_nop".to_string()],
+        MOp::VCvtPkFp8F32Half => {
+            let p = |s: &Src| -> String {
+                match s {
+                    Src::Reg(r) if a.scalar.get(*r as usize).copied().unwrap_or(false) => sgpr_name(a.phys[*r as usize]),
+                    Src::Reg(r) => format!("v{}", a.phys[*r as usize]),
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".into(),
+                }
+            };
+            let d = a.phys[inst.dst.ok_or("v_cvt_pk_fp8_f32 without a destination")? as usize];
+            let hi = inst.imm & 1 != 0;
+            let n = inst.srcs.len();
+            vec![format!("v_cvt_pk_fp8_f32 v{d}.{}, {}, {}{}", if hi { "h" } else { "l" }, p(&inst.srcs[n - 2]), p(&inst.srcs[n - 1]), if hi { " op_sel:[0,0,1]" } else { "" })]
+        }
+        MOp::VAddNcI32 | MOp::VSubrevU32 | MOp::VRcpIflagF32 | MOp::VAddNcU64 | MOp::GlobalLoadAsyncLds | MOp::SBufferLoadB32 => {
+            let wide = inst.op == MOp::VAddNcU64;
+            let v = |x: &Src, pair: bool| -> String {
+                match x {
+                    Src::Reg(r) => {
+                        let p = a.phys[*r as usize];
+                        if a.scalar.get(*r as usize).copied().unwrap_or(false) {
+                            if pair { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) }
+                        } else if pair {
+                            format!("v[{}:{}]", p, p + 1)
+                        } else {
+                            format!("v{p}")
+                        }
+                    }
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".into(),
+                }
+            };
+            let mn = crate::op_attrs::attrs(inst.op).mnemonic;
+            let line = match inst.op {
+                MOp::GlobalLoadAsyncLds => {
+                    let off = if inst.imm != 0 { format!(" offset:{}", inst.imm) } else { String::new() };
+                    format!("{mn} {}, {}, off{off}", v(&inst.srcs[0], false), v(&inst.srcs[1], true))
+                }
+                MOp::SBufferLoadB32 => {
+                    let d = a.phys[inst.dst.ok_or("s_buffer_load without a destination")? as usize];
+                    let rs = match inst.srcs[0] { Src::Reg(r) => a.phys[r as usize], _ => 0 };
+                    format!("{mn} s{d}, s[{}:{}], {} offset:{:#x}", rs, rs + 3, v(&inst.srcs[1], false), inst.imm)
+                }
+                _ => {
+                    let d = a.phys[inst.dst.ok_or("VALU form without a destination")? as usize];
+                    let dn = if wide { format!("v[{}:{}]", d, d + 1) } else { format!("v{d}") };
+                    let ops: Vec<String> = inst.srcs.iter().map(|s| v(s, wide)).collect();
+                    format!("{mn} {dn}, {}", ops.join(", "))
+                }
+            };
+            vec![line]
         }
         MOp::SExecFromMask | MOp::SExecSelect => {
             let s = |x: &Src| -> String {
@@ -489,6 +543,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                     1 => format!("s_setreg_imm32_b32 {}, {k2:#x}", hw(k)),
                     2 => "s_wait_idle".to_string(),
                     3 => format!("s_prefetch_inst s[{}:{}], {k:#x}, s{}, {k2}", regs[0], regs[0] + 1, regs[1]),
+                    5 => "v_nop".to_string(),
+                    6 => format!("s_sleep {k}"),
                     _ => format!("global_prefetch_b8 v{}, s[{}:{}]{}", regs[0], regs[1], regs[1] + 1, if k != 0 { format!(" offset:{k}") } else { String::new() }),
                 }
             };

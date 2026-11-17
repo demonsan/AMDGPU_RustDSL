@@ -33,7 +33,7 @@ pub fn place_layout(m: &mut MFunction) -> usize {
 /// Retargets edges into blocks without instructions whose terminator is an unconditional jump.
 fn forward_empty_jumps(m: &mut MFunction) {
     // (an author's block (exact layout key) stays, even when it is only its branch: the author wrote that branch)
-    let keyed: std::collections::HashSet<u32> = m.reg_hints.layout_keys.iter().map(|(l, _)| *l).collect();
+    let keyed: std::collections::HashSet<u32> = m.reg_hints.author_branches.iter().copied().collect();
     let fwd: HashMap<u32, u32> = m.blocks.iter().filter(|b| b.insts.is_empty() && !keyed.contains(&b.label)).filter_map(|b| if let Term::Goto(t) = b.term { Some((b.label, t)) } else { None }).collect();
     let resolve = |mut l: u32| {
         let mut n = 0;

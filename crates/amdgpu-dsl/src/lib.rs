@@ -131,13 +131,13 @@ impl From<f32> for Opnd {
 
 /// Unary VALU ops (P1, docs/op-coverage-tileops.md). `SinF32` / `CosF32` take the angle in REVOLUTIONS (sin(2 pi x)), as the hardware does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3, Ffbl, Ffbh }
+pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3, Ffbl, Ffbh, RcpIflagF32 }
 
 /// Binary VALU ops. `AshrI32(a, b)` = a >> b (arithmetic); `MulHi*` = high 32 bits of the 64-bit product; `MulU32U24` = low 24 bits x low 24 bits;
 /// `MulI32I24` = the SIGNED low 24 bits of both operands multiplied (low 32 bits of the product; operands must fit in 24 signed bits);
 /// `Pk*F16` operate on two f16 halves of a dword (a `U32` container).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, MulI32I24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd }
+pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, MulI32I24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd, AddNcI32, SubrevU32 }
 
 /// Ternary VALU ops. `MadU32U24(a, b, c)` = a[23:0] * b[23:0] + c; `LshlAddU32(a, s, c)` = (a << s) + c; `Add3U32` = a + b + c;
 /// `BfeU32 / BfeI32(x, off, width)` = bit-field extract; `BfiB32(mask, a, b)` = (mask & a) | (!mask & b); `PkFmaF16` on f16 pairs.
@@ -653,7 +653,16 @@ pub enum Op {
     /// `v_swap_b32 vA, vB` (gfx1250) in place on two registers: the value is the new content of a's register (= b), `Permlane32SwapB`
     /// names the new content of b's register (= a).
     SwapA { a: Opnd, b: Opnd },
-    /// The second result of a `Permlane32SwapA` or a `SwapA` (no instruction of its own).
+    /// `v_permlane16_swap_b32 vA, vB` in place on two registers (as `Permlane32SwapA`; `Permlane32SwapB` names b's new content).
+    Permlane16SwapA { a: Opnd, b: Opnd },
+    /// gfx1250 `v_cvt_pk_fp8_f32 d.l / d.h, a, b`: `old` with its low (`hi` false) or high 16 bits replaced by the two fp8 of a, b
+    /// (the other half kept: a 16-bit write of the destination register; `old` None: the other half is undefined).
+    CvtPkFp8Half { old: Option<Opnd>, a: Opnd, b: Opnd, hi: bool },
+    /// gfx1250 `v_add_nc_u64 d, a, b`: the per-lane 64-bit sum of two register pairs (no carry out), a `Frag2`.
+    VAddU64 { a: Opnd, b: Opnd },
+    /// gfx1250 `s_buffer_load_b32 d, rsrc, soff offset:imm`: one dword of a buffer, uniform (KMcnt).
+    SBufferLoad { rsrc: Opnd, soff: Opnd, imm: u32 },
+    /// The second result of a `Permlane32SwapA` / `Permlane16SwapA` or a `SwapA` (no instruction of its own).
     Permlane32SwapB { swap: Opnd },
     /// Build a four-dword fragment from four 32-bit values.
     Frag4(Opnd, Opnd, Opnd, Opnd),
@@ -831,7 +840,7 @@ impl Op {
             Op::Raw { ty, .. } => *ty,
             Op::SysVal { op: SysValOp::GetPc, .. } => DType::Ptr,
             Op::SysVal { .. } => DType::I32,
-            Op::Salu { op: SaluOp::AddNcU64, .. } => DType::Ptr,
+            Op::Salu { op: SaluOp::AddNcU64 | SaluOp::MovB64, .. } => DType::Ptr,
             Op::Salu { .. } => DType::I32,
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
@@ -884,7 +893,10 @@ impl Op {
             Op::VarSlice8 { .. } => DType::Frag8,
             Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
-            Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::SwapA { .. } => DType::U32,
+            Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } => DType::U32,
+            Op::VAddU64 { .. } => DType::Frag2,
+            Op::CvtPkFp8Half { .. } => DType::U32,
+            Op::SBufferLoad { .. } => DType::I32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
@@ -1000,7 +1012,9 @@ impl Op {
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
             Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![Opnd::Var(*var)],
-            Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } | Op::SwapA { a, b } => vec![*a, *b],
+            Op::Permlane32Swap { a, b } | Op::Permlane32SwapA { a, b } | Op::SwapA { a, b } | Op::Permlane16SwapA { a, b } | Op::VAddU64 { a, b } => vec![*a, *b],
+            Op::SBufferLoad { rsrc, soff, .. } => vec![*rsrc, *soff],
+            Op::CvtPkFp8Half { old, a, b, .. } => old.iter().copied().chain([*a, *b]).collect(),
             Op::Permlane32SwapB { swap } => vec![*swap],
             Op::PtrLo(p) | Op::PtrHi(p) => vec![*p],
             Op::LoadScalar { base, .. } => vec![*base],
@@ -1512,6 +1526,9 @@ pub enum Stmt {
     /// gfx1250 wave-control instructions with no effect on the program's values or memory (`SysOp`): the version marker, a mode-register
     /// write, the idle wait, instruction / data prefetches. `reads`: the registers the instruction reads (prefetch addresses).
     Sys { op: SysOp, imm: u32, imm2: u32, reads: Vec<Opnd> },
+    /// gfx1250 `global_load_async_to_lds_b128 lds, vaddr, off offset:imm`: each lane copies 16 bytes from the 64-bit address `vaddr` (+imm)
+    /// to LDS byte `lds` (+imm), asynchronously (ASYNCcnt: `WaitCounter { Async }` completes it).
+    LoadAsyncLds { lds: Opnd, vaddr: Opnd, imm: u32 },
     /// wave32: EXEC = the lane mask `mask` (an I1 compare result held as a lane mask, e.g. in VCC) - `s_mov_b32 exec_lo, <mask>`
     ExecFromMask { mask: Opnd },
     /// wave32: EXEC = `cond` (a uniform I1 in SCC) ? `a` : `b` - `s_cselect_b32 exec_lo, a, b`
@@ -4376,6 +4393,10 @@ pub enum SysOp {
     WaitIdle,
     PrefetchInst,
     PrefetchGlobal,
+    /// `v_nop` (a VALU slot; the author's issue padding)
+    VNop,
+    /// `s_sleep imm`
+    Sleep,
 }
 
 /// `Op::SysVal`: `GetReg` (s_getreg_b32, imm = the hwreg simm16), `GetPc` (s_get_pc_i64).
@@ -4388,6 +4409,12 @@ pub enum SysValOp {
 /// The scalar forms of `Op::Salu` (gfx1250 SALU; each one instruction, wave-uniform operands).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SaluOp {
+    /// `s_mov_b64 d, a` (b unused): a copy of an SGPR pair
+    MovB64,
+    /// `s_add_co_u32 d, a, b`: the low word of a 64-bit add (a + b; SCC = the carry out, read by the `AddCoCiU32` it pairs with)
+    AddCoU32,
+    /// `s_add_co_ci_u32 d, a, b`: a + b + SCC, the carry of the `AddCoU32` before it (the lift pairs them: no other SCC writer between)
+    AddCoCiU32,
     /// `s_add_co_i32 d, a, b`: a + b (32-bit wrap; SCC = signed overflow)
     AddCoI32,
     /// `s_sub_co_i32 d, a, b`: a - b (32-bit wrap; SCC = signed overflow)
@@ -4422,6 +4449,10 @@ impl SaluOp {
             SaluOp::Bitset0 => (a32 & !(1u32 << (b32 & 31))) as u64,
             SaluOp::Bitset1 => (a32 | (1u32 << (b32 & 31))) as u64,
             SaluOp::AddNcU64 => a.wrapping_add(b),
+            SaluOp::MovB64 => a,
+            SaluOp::AddCoU32 => a32.wrapping_add(b32) as u64,
+            // (the carry-in is the paired AddCoU32's carry: `eval` of the high word alone assumes 0)
+            SaluOp::AddCoCiU32 => a32.wrapping_add(b32) as u64,
         }
     }
 }
@@ -5000,7 +5031,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
-            Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } => {}
+            Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } | Stmt::LoadAsyncLds { .. } => {}
             Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
                     errs.push(here("a layout key / goto outside exact mode".to_string()));
@@ -5522,6 +5553,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::Raw { reads, .. } => reads.clone(),
         Stmt::Sys { reads, .. } => reads.clone(),
         Stmt::ExecFromMask { mask } => vec![*mask],
+        Stmt::LoadAsyncLds { lds, vaddr, .. } => vec![*lds, *vaddr],
         Stmt::ExecSelect { cond, a, b } => vec![*cond, *a, *b],
         Stmt::GotoIf { cond, .. } => vec![*cond],
         Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
@@ -5666,7 +5698,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                         Op::Raw { scalar, .. } => *scalar,
                         Op::Wmma { .. } => false,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
-                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::SwapA { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
+                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } | Op::VAddU64 { .. } | Op::CvtPkFp8Half { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
                         | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
                         | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } | Op::AtomicAddU32 { .. }

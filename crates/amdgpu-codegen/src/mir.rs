@@ -135,6 +135,21 @@ pub enum MOp {
     SExecFromMask,
     /// wave32 `s_cselect_b32 exec_lo, a, b`: srcs = [scc value, a, b]
     SExecSelect,
+    /// gfx1250 VALU forms: `v_add_nc_i32`, `v_subrev_nc_u32`, `v_rcp_iflag_f32`, `v_add_nc_u64` (V2 = V2 + V2)
+    VAddNcI32,
+    VSubrevU32,
+    VRcpIflagF32,
+    VAddNcU64,
+    /// `global_load_async_to_lds_b128`: srcs = [lds address (V1), 64-bit address (V2)], imm = offset
+    GlobalLoadAsyncLds,
+    /// `s_buffer_load_b32 d, rsrc, soff offset:imm`: srcs = [rsrc (S4), soff (S1)]
+    SBufferLoadB32,
+    /// `s_mov_b64 d, a` (an SGPR pair copy; `SaluOp::MovB64`)
+    SMovB64Pair,
+    /// gfx1250 `v_cvt_pk_fp8_f32 d.l|d.h, a, b`: srcs = [d (in place), a, b]; imm 1 = the high half
+    VCvtPkFp8F32Half,
+    /// `v_nop` (`SysOp::VNop`): a VALU issue slot, counted by the gfx1250 hazard distances
+    VNop,
     VPkMulF32,
     VAddU32,
     VAddCoU32,
@@ -919,6 +934,9 @@ pub struct RegHints {
     pub raw_texts: Vec<String>,
     /// exact mode: (block label, the author's layout key) of the blocks a `Stmt::LayoutKey` started
     pub layout_keys: Vec<(u32, u32)>,
+    /// exact mode: the blocks ending in the author's own branch (`Stmt::Goto`): their branch is emitted even to the next block, and they are
+    /// never jump-threaded away (an empty keyed block without one is only a layout position)
+    pub author_branches: Vec<u32>,
     pub share: Vec<Vec<VReg>>,
     pub separate: Vec<Vec<VReg>>,
     /// (region name, arch VGPR cap, AGPR cap)

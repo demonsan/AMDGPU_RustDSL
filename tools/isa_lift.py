@@ -285,7 +285,7 @@ class Lifter:
             op = 'BitcastF32'
         elif want in ('I32', 'U32', 'I32s') and ty == 'F32':
             op = 'BitcastI32'
-        elif want == 'I32s' and ty == 'U32' and f == 'v':
+        elif want == 'I32s' and ty == 'U32':
             # an exact-typed operand (select arms): a zero-instruction view of the VGPR
             op = 'BitcastI32'
         else:
@@ -1448,7 +1448,7 @@ def emit_kernel(path, exact, plan=None):
             ENTRY_HW(L, live_in[0])
         if '--layout-keys' in sys.argv:
             # the author's block position (exact emission lays the blocks out in this order)
-            L.lines.append(f'LayoutKey {{ key: {s} }}')
+            L.lines.append(f'LayoutKey {{ key: {2 * s + 1} }}')
         body = ins[s:e]
         last = body[-1][1]
         run = body[:-1] if last.startswith(('s_cbranch', 's_branch')) else body
@@ -1595,12 +1595,16 @@ def emit_kernel(path, exact, plan=None):
                     items.append(('loop', lp, min(blocks_of([lp], set()))))
             else:
                 items.append(('block', b, b))
-        key = lambda b: bl[b][0]
+        # keys: 2s + 1 = the author's block starting at instruction s; 2s = the entry of the loop whose header starts at s (a layout position
+        # in front of `loop {`, the target of the gotos into that loop)
+        heads = {it[2] for it in items if it[0] == 'loop'}
+        key = lambda b: 2 * bl[b][0] + (0 if b in heads else 1)
         for k, it in enumerate(items):
             nxt_first = items[k + 1][2] if k + 1 < len(items) else None
             if it[0] == 'loop':
                 lp = it[1]
                 lb = blocks_of([lp], set())
+                L.lines.append(f'LayoutKey {{ key: {2 * bl[it[2]][0]} }}')
                 emit([lp], None)
                 exits = sorted({s for b in lb for s in succ.get(b, []) if s not in lb})
                 if len(exits) == 1 and exits[0] != nxt_first:

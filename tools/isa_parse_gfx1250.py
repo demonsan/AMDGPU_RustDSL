@@ -49,7 +49,7 @@ def split_args(s):
 
 def phys(tok):
     """(physical, encoded) register spelling of one operand token."""
-    m = re.match(r'^(?P<enc>\S+?)\s*/\*(?P<phys>[vsa]\[?[0-9:]+\]?)\*/$', tok)
+    m = re.match(r'^(?P<enc>\S+?)\s*/\*(?P<phys>[vsa]\[?[0-9:]+\]?(\.[lh])?)\*/$', tok)
     if m:
         return m.group('phys'), m.group('enc')
     m = re.match(r'^(?P<enc>\S+)/\*Invalid register.*\*/$', tok)
@@ -136,14 +136,14 @@ def parse(text):
     return out
 
 
-VREG = re.compile(r'^v(\d+)$|^v\[(\d+):(\d+)\]$')
+VREG = re.compile(r'^v(\d+)(\.[lh])?$|^v\[(\d+):(\d+)\]$')
 
 
 def _vbase(tok):
     m = VREG.match(tok)
     if not m:
         return None
-    return int(m.group(1)) if m.group(1) else int(m.group(2))
+    return int(m.group(1)) if m.group(1) else int(m.group(3))
 
 
 def _targets(out):
@@ -207,7 +207,7 @@ def fix_msb(out):
             bank = banks.pop()
             if bank:
                 m = VREG.match(e)
-                new[k] = f'v{pe + 256 * bank}' if m.group(1) else f'v[{pe + 256 * bank}:{int(m.group(3)) + 256 * bank}]'
+                new[k] = f'v{pe + 256 * bank}{m.group(2) or ""}' if m.group(1) else f'v[{pe + 256 * bank}:{int(m.group(4)) + 256 * bank}]'
         if new != r['args']:
             r['args'] = new
             r['msb_fixed'] = True
