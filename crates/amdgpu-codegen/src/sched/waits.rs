@@ -220,7 +220,8 @@ pub fn ring_independent(rm: &RingModel, ea: &Effects, a: &MInst, eb: &Effects, b
 
 fn ring_tokens_of(rm: &RingModel, e: &Effects, inst: &MInst) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>) {
     {
-        let dma = e.fence == Fence::Barrier && e.mem.is_some();
+        // (a gfx1250 tensor load is a ring producer like an LDS-DMA: its completion is TENSORcnt, the `tn` queue)
+        let dma = (e.fence == Fence::Barrier && e.mem.is_some()) || is_tensor(inst.op);
         let lds_read = e.fence == Fence::None && matches!(&e.mem, Some(a) if a.space == Space::Lds && !a.write);
         if dma {
             if let Some(ps) = rm.producers.get(&inst.unit) {
@@ -245,7 +246,7 @@ fn shift_tokens(st: &State) -> State {
         let c = c.borrow();
         let Some(rm) = c.as_ref() else { return st.clone() };
         let mut out = st.clone();
-        for q in [&mut out.vm, &mut out.lg] {
+        for q in [&mut out.vm, &mut out.lg, &mut out.tn] {
             let old = std::mem::take(&mut q.e);
             for (key, mut v) in old {
                 let mut rel_key = None;
@@ -340,12 +341,34 @@ impl Queue {
 struct State {
     vm: Queue,
     lg: Queue,
+    /// gfx1250: the wave's tensor operations of the plan's rings (TENSORcnt: in order among themselves, unordered with every other memory
+    /// operation, so never completed by a vmcnt / lgkmcnt wait); empty on every other target
+    tn: Queue,
 }
+
+/// A gfx1250 tensor (TDM) operation.
+fn is_tensor(op: MOp) -> bool {
+    matches!(op, MOp::TensorLoadToLds | MOp::TensorStoreFromLds)
+}
+
+/// TENSORcnt limit (6 bits)
+const TN_MAX: u32 = 63;
 
 fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mut Vec<MInst>>) -> usize {
     let mut inserted = 0;
+    // an explicit tensor wait completes the older tensor operations
+    if inst.op == MOp::SWaitTensor || (inst.op == MOp::SWaitCtr && inst.imm >> 8 == 6) {
+        st.tn.complete((inst.imm & 0xff) as u32);
+    }
     let (ring_vm, ring_lg, ring_issue) = ring_tokens(e, inst);
     if !ring_vm.is_empty() || !ring_lg.is_empty() || !ring_issue.is_empty() {
+        if let Some(n) = st.tn.need(&ring_vm) {
+            if let Some(o) = out {
+                o.push(MInst::new(MOp::SWaitTensor).imm(n as i64).auto());
+            }
+            st.tn.complete(n);
+            inserted += 1;
+        }
         if let Some(n) = st.vm.need(&ring_vm) {
             if let Some(o) = out {
                 o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
@@ -361,7 +384,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             st.lg.complete(n);
             inserted += 1;
         }
-        if e.fence == Fence::Barrier {
+        if e.fence == Fence::Barrier && (e.mem.is_some() || is_tensor(inst.op)) {
             // a ring DMA: operand waits as usual, then it enters the vm queue with its slot token
             let touched: Vec<Slot> = e.reads.clone();
             if let Some(n) = st.vm.need(&touched) {
@@ -380,7 +403,11 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
                 inserted += 1;
             }
             let key = ring_issue.first().and_then(|s| tok_parts(*s)).map_or(id, |x| ring_key(id, x.2));
-            st.vm.issue(key, ring_issue, false, VM_MAX);
+            if is_tensor(inst.op) {
+                st.tn.issue(key, ring_issue, false, TN_MAX);
+            } else {
+                st.vm.issue(key, ring_issue, false, VM_MAX);
+            }
             if let Some(o) = out {
                 o.push(inst.clone());
             }
@@ -536,7 +563,7 @@ pub fn insert_waits(m: &mut MFunction) -> usize {
                         changed = true;
                     }
                     Some(x) => {
-                        if x.vm.merge(&st.vm) | x.lg.merge(&st.lg) {
+                        if x.vm.merge(&st.vm) | x.lg.merge(&st.lg) | x.tn.merge(&st.tn) {
                             changed = true;
                         }
                     }
@@ -595,7 +622,7 @@ pub fn verify_waits(m: &MFunction) -> Result<(), String> {
                         return Err(format!("block {b} inst {ii} ({:?}) touches a register with a load in flight", inst.op));
                     }
                     let (rv, rl, _) = ring_tokens(&e, inst);
-                    if st.vm.need(&rv).is_some() {
+                    if st.vm.need(&rv).is_some() || st.tn.need(&rv).is_some() {
                         return Err(format!("block {b} inst {ii} ({:?}) reads a ring slot whose DMA is still in flight", inst.op));
                     }
                     if st.lg.need(&rl).is_some() {
@@ -612,7 +639,7 @@ pub fn verify_waits(m: &MFunction) -> Result<(), String> {
                         changed = true;
                     }
                     Some(x) => {
-                        if x.vm.merge(&st.vm) | x.lg.merge(&st.lg) {
+                        if x.vm.merge(&st.vm) | x.lg.merge(&st.lg) | x.tn.merge(&st.tn) {
                             changed = true;
                         }
                     }

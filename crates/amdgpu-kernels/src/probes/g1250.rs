@@ -1,6 +1,6 @@
 //! gfx1250 G1 probes (docs/gfx1250-plan.md): small wave32 kernels for the gfx1250 emitter / encoder / LLVM tail. They compile for gfx950 too.
 
-use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd};
+use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 
 /// `out[i] = a[i] + b[i]` (f32), one element per work-item, 256 work-items per workgroup: global loads / stores, the workgroup id, the
 /// workitem id, 64-bit address arithmetic.
@@ -357,4 +357,34 @@ pub fn probe_g1250_named() -> Function {
     let mut f = b.finish();
     f.kd.push(("named_barrier_count".into(), 1));
     f
+}
+
+/// More than 256 VGPRs (the MSB window): one wave loads `N` values per lane (`src[k * 32 + lane]`), all live until a sum in reverse order
+/// at the end: out[lane] = (((x[N-1] + x[N-2]) + ...) + x[0]). Kernargs: src @0, out @8.
+pub fn probe_g1250_wide() -> Function {
+    const N: usize = 320;
+    let mut b = FnBuilder::new("probe_g1250_wide", 32);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("src", Ext::c((N * 32 * 4) as i64));
+    b.arg_tensor("out", Ext::c(32 * 4));
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(ps), byte_off: Opnd::Val(a) });
+    let xs: Vec<ValueId> = (0..N)
+        .map(|k| {
+            let qk = b.let_(Op::PtrAdd { base: Opnd::Val(q), byte_off: Opnd::I32((k / 32 * 4096) as i32) });
+            b.load_global(qk, ((k % 32) * 128) as u32, MemTy::B32)
+        })
+        .collect();
+    let mut acc = b.let_(Op::BitcastF32(Opnd::Val(xs[N - 1])));
+    for k in (0..N - 1).rev() {
+        let f = b.let_(Op::BitcastF32(Opnd::Val(xs[k])));
+        acc = b.add_f32(acc, f);
+    }
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(qo, 0, acc, MemTy::B32, false);
+    b.finish()
 }
