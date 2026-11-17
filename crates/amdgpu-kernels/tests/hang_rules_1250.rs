@@ -253,7 +253,6 @@ fn mut_bar_id() {
     compile_mutation(&barrier_kernel(&[(true, 0), (false, 0)], &[]), "GV-1250-BAR-ID");     // the null barrier
     compile_mutation(&barrier_kernel(&[(true, 17), (false, 17)], &[]), "GV-1250-BAR-ID");   // beyond the named barriers
     compile_mutation(&barrier_kernel(&[(true, -5), (false, -5)], &[]), "GV-1250-BAR-ID");
-    compile_mutation(&barrier_kernel(&[(true, -3), (false, -3)], &[]), "GV-1250-BAR-ID");   // the cluster barrier outside a cluster launch
     compile_mutation(&named_kernel(|b| { init(b, 2, 2); b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 0, 0), "GV-1250-BAR-ID");     // a named barrier that is not allocated
     compile_mutation(&named_kernel(|b| { init(b, 3, 2); b.barrier_join(3); b.barrier_signal(3); b.barrier_wait(3); b.barrier_leave(); }, 2, 0), "GV-1250-BAR-ID");   // beyond the allocated count
 }
@@ -273,7 +272,6 @@ fn pos_bar_id_asm() {
 fn pos_bar_id() {
     compile_positive(&barrier_kernel(&[(true, -1), (false, -1)], &[]));
     compile_positive(&named_kernel(|b| { init(b, 2, 2); b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 2, 0));
-    compile_positive(&barrier_kernel(&[(true, -3), (false, -3)], &[("cluster_dims", 4)]));
 }
 
 #[test]
@@ -388,6 +386,87 @@ fn pos_bar_init() {
     ir_positive(&named_kernel(|b| { b.barrier_init(1, 2); b.barrier_signal(-1); b.barrier_wait(-1); b.barrier_join(1); b.barrier_signal(1); b.barrier_wait(1); b.barrier_leave(); }, 1, 0));
 }
 
+// GV-1250-BAR-COUNT
+
+/// A 4-wave kernel in a cluster launch; the body gets the wave id (tid / 32).
+fn wave_kernel(body: impl FnOnce(&mut FnBuilder, amdgpu_dsl::ValueId)) -> Function {
+    let mut b = FnBuilder::new("hr_cnt", 128);
+    b.arg("n", DType::I32, 0, 4);
+    let t = b.let_(Op::WorkitemId);
+    let w = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+    body(&mut b, w);
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 4));
+    f
+}
+
+/// `if cond(w) { signal(-3) }; wait(-3)`: the shape of a cluster barrier whose leader arm signals.
+fn leader_barrier(b: &mut FnBuilder, cond: Opnd) {
+    b.begin_if(cond);
+    b.barrier_signal(-3);
+    b.end_if();
+    b.barrier_wait(-3);
+}
+
+fn wave_is(b: &mut FnBuilder, w: amdgpu_dsl::ValueId, k: i32) -> Opnd {
+    Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(k)))
+}
+
+#[test]
+fn mut_bar_count() {
+    // no wave satisfies the leader condition (4 waves: ids 0..3): nobody signals, the cluster barrier never completes
+    ir_mutation(&wave_kernel(|b, w| { let c = wave_is(b, w, 7); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // two waves per work-group signal: the count runs ahead (a cluster-wide count by signals, not by waves)
+    ir_mutation(&wave_kernel(|b, w| { let c = Opnd::Val(b.cmp(CmpPred::Lt, CmpTy::I32, w, Opnd::I32(2))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // every wave signals
+    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal(-3); b.barrier_wait(-3); }), "GV-1250-BAR-COUNT");
+    // the leader's signal removed (the wait stays)
+    ir_mutation(&wave_kernel(|b, _| b.barrier_wait(-3)), "GV-1250-BAR-COUNT");
+    // a loop body whose leader arm signals twice per pass but waits once
+    ir_mutation(&wave_kernel(|b, w| {
+        let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let c0 = wave_is(b, w, 0);
+        b.begin_if(c0);
+        b.barrier_signal(-3);
+        b.barrier_signal(-3);
+        b.end_if();
+        b.barrier_wait(-3);
+        let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+        b.break_if(c);
+        b.end_loop();
+    }), "GV-1250-BAR-COUNT");
+    // a condition the verifier cannot evaluate (a kernarg) and no declared launch fact: not provable, not silently accepted
+    ir_mutation(&wave_kernel(|b, _| { let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // the fact itself must say 1 for the cluster barrier
+    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+}
+
+#[test]
+fn pos_bar_count() {
+    // the leader arm: exactly one wave per work-group signals (proved from the wave id)
+    ir_positive(&wave_kernel(|b, w| { let c = wave_is(b, w, 0); leader_barrier(b, c) }));
+    ir_positive(&wave_kernel(|b, w| { let c = wave_is(b, w, 3); leader_barrier(b, c) }));
+    // the same inside a loop body, one pass per wait
+    ir_positive(&wave_kernel(|b, w| {
+        let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let c0 = wave_is(b, w, 0);
+        leader_barrier(b, c0);
+        let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+        b.break_if(c);
+        b.end_loop();
+    }));
+    // a condition the verifier cannot evaluate, with the named launch fact: accepted, and listed as a trusted item
+    let f = wave_kernel(|b, _| { b.barrier_signal_count(-3, 1); let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) });
+    ir_positive(&f);
+    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(t[0].contains("barrier -3") && t[0].contains("declared launch fact"), "{t:?}");
+    // a proved kernel has no trusted items
+    assert!(amdgpu_codegen::gpu_verify_1250::trusted_items(&wave_kernel(|b, w| { let c = wave_is(b, w, 0); leader_barrier(b, c) })).is_empty());
+}
+
 // the exact-mode forward gotos: the blocks of a region form a DAG, and the rules join the facts of every path into a target
 
 /// An exact kernel whose body `f(b, c_div, c_uni)` gets a condition that differs between the waves (work-item id) and one every wave evaluates alike (a kernarg).
@@ -434,7 +513,7 @@ fn pos_bar_goto() {
     ir_positive(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.goto(2); b.layout_key(1); b.barrier_join(1); b.layout_key(2); b.barrier_leave(); }, 1));
     ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.goto(2); b.layout_key(1); b.barrier_signal(-1); b.layout_key(2); b.barrier_wait(-1); }, 0));
     // completion is count-based: a wave may wait on a barrier only OTHER waves signal (the cluster barrier: one signaller per workgroup, every wave waits), also behind a goto
-    let mut f = goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-3); b.layout_key(1); b.barrier_wait(-3); }, 0);
+    let mut f = goto_kernel(|b, _, cu| { b.barrier_signal_count(-3, 1); b.goto_if(cu, 1); b.barrier_signal(-3); b.layout_key(1); b.barrier_wait(-3); }, 0);
     f.kd.push(("cluster_dims".into(), 4));
     ir_positive(&f);
 }
@@ -668,6 +747,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-NBAR-COUNT", "nbar_count"),
     ("GV-1250-BAR-JOIN", "bar_join"),
     ("GV-1250-BAR-INIT", "bar_init"),
+    ("GV-1250-BAR-COUNT", "bar_count"),
     ("GV-1250-BAR-WAIT-IMM", "bar_wait_imm"),
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),

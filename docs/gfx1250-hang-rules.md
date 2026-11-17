@@ -17,6 +17,7 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 |---|---|---|
 | workgroups per cluster | `Function::kd` entry `cluster_dims` (accepted by the emitter, not a descriptor field) | `MCAST`, `BAR-ID` |
 | allocated named barriers | `Function::kd` entry `named_barrier_count` | `BAR-ID` |
+| signals per work-group of a barrier the verifier cannot count | `FnBuilder::barrier_signal_count(id, per_wg)` (a `g5:signals_per_wg:<id>` entry; trusted, listed by `trusted_items`) | `BAR-COUNT` |
 | host-built descriptor words | the host contract on a kernarg scalar (`FnBuilder::ka_one_of`) | `MCAST` |
 
 ## Rules
@@ -30,6 +31,7 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | `GV-1250-NBAR-COUNT` | IR | a named barrier whose member count is not a constant in the field's range (1..=63); completion is count-based, so the count is the number of signals per phase, joined or not (signal-only producers count) | `mut_nbar_count` | `pos_nbar_count` |
 | `GV-1250-BAR-JOIN` | IR | a break in the named-barrier join discipline: a second join before the leave (one joined barrier at a time), a leave with nothing joined, a wait on a named barrier while not joined to it (any wave may signal any barrier), paths of a branch or a loop body that end with different join states | `mut_bar_join` | `pos_bar_join` |
 | `GV-1250-BAR-INIT` | IR | a named barrier used before it is initialized, or used with no work-group barrier between its initialization and its first use (a wave that re-initializes after another wave signalled loses the count) | `mut_bar_init` | `pos_bar_init` |
+| `GV-1250-BAR-COUNT` | IR | the cluster barrier signalled by other than exactly one wave per work-group per wait: **proved** statically when the signalling condition is a function of the wave id (the guards are evaluated per wave: no wave, two waves, every wave, or a removed signal are rejected); otherwise (a condition the verifier cannot evaluate, signals outside the region, gotos) an explicit, named launch fact `barrier_signal_count(id, per_wg)` is required, which is counted as a **trusted item** (`gpu_verify_1250::trusted_items`) and never an implicit pass | `mut_bar_count` | `pos_bar_count` |
 | `GV-1250-BAR-WAIT-IMM` | asm | a barrier wait whose operand is not an inline constant | `mut_bar_wait_imm` | `pos_bar_wait_imm` |
 | `GV-1250-TRAP-BAR` | IR + asm | the barriers reserved for the trap handler used by a kernel | `mut_trap_bar` | `pos_trap_bar` |
 | `GV-1250-BAR-REACH` | IR | a barrier that not every wave of its group reaches: a barrier under a condition (a branch, a goto, a loop exit) that differs between waves with different barrier arrivals on its sides (path-sensitive over the control-flow graph, gotos included), and a wait on a barrier that nothing in the kernel signals (completion is count-based and any wave may signal, so the signals may come from other waves) | `mut_bar_reach`, `mut_bar_goto` | `pos_bar_reach`, `pos_bar_goto` |

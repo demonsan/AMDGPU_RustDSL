@@ -3785,6 +3785,12 @@ impl FnBuilder {
         self.push_stmt(Stmt::BarrierSignal { id });
     }
 
+    /// gfx1250 launch fact for the hang-safety verifier: barrier `id` is signalled by `per_wg` waves of every work-group per phase (e.g. the cluster barrier: exactly 1). A TRUSTED
+    /// item: the verifier proves the count itself when the signalling condition is a function of the wave id, and requires this declaration (listed by `trusted_items`) when it cannot.
+    pub fn barrier_signal_count(&mut self, id: i32, per_wg: u32) {
+        self.f.kd.push((format!("g5:signals_per_wg:{id}"), per_wg as i64));
+    }
+
     /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
     pub fn barrier_wait(&mut self, id: i32) {
         self.push_stmt(Stmt::BarrierWait { id });

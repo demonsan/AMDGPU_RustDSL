@@ -44,7 +44,7 @@ pub const KD_DIRECTIVES: &[&str] = &[
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
 pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String, String> {
     for (k, _) in kd {
-        if !KD_DIRECTIVES.contains(&k.as_str()) {
+        if !KD_DIRECTIVES.contains(&k.as_str()) && !k.starts_with("g5:") {
             return Err(format!("{}: kernel-descriptor directive `{k}` is not settable (known: {})", m.name, KD_DIRECTIVES.join(", ")));
         }
     }

@@ -43,6 +43,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant in the field's range (1..=63); completion is count-based, so the count is the number of signals per phase, joined or not" },
     Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
     Rule { id: "GV-1250-BAR-INIT", layer: Layer::Ir, what: "a named barrier is initialized before it is used, and a work-group barrier orders the initialization before the first use (a re-initialization after another wave signalled loses the count)" },
+    Rule { id: "GV-1250-BAR-COUNT", layer: Layer::Ir, what: "the cluster barrier is signalled by exactly one wave per work-group per phase: proved statically when the signalling condition is a function of the wave id, otherwise an explicit, named launch fact that is listed as a trusted item (never an implicit pass)" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -214,6 +215,8 @@ enum Ev {
 fn ev_of(st: &Stmt) -> Option<Ev> {
     match st {
         Stmt::Barrier => Some(Ev::Full),
+        // the cluster barrier is signalled by ONE wave per work-group (any of them): its signals are not arrivals every wave must make; GV-1250-BAR-COUNT counts them
+        Stmt::BarrierSignal { id: -3 } => None,
         Stmt::BarrierSignal { id } => Some(Ev::Signal(*id)),
         Stmt::BarrierWait { id } => Some(Ev::Wait(*id)),
         Stmt::BarrierJoin { id } => Some(Ev::Join(*id)),
@@ -645,6 +648,226 @@ fn bar_structure(f: &Function, v: &mut Vec<Violation>) {
     flow_checks(f, &sh, v);
 }
 
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// GV-1250-BAR-COUNT: per-work-group signal accounting of the cluster barrier
+
+/// The kernel's launch fact "barrier `id` is signalled by `per_wg` waves of every work-group per phase" (`FnBuilder::barrier_signal_count`): a TRUSTED item (see `trusted_items`).
+fn signal_count_fact(f: &Function, id: i32) -> Option<i64> {
+    let key = format!("g5:signals_per_wg:{id}");
+    f.kd.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+/// The value of an operand for the work-item `tid`, when it is a function of constants and the work-item id only (the wave id and lane arithmetic the guards of leader arms use).
+fn eval_i(o: &Opnd, defs: &HashMap<ValueId, Op>, tid: i32, depth: u32) -> Option<i64> {
+    if depth > 24 {
+        return None;
+    }
+    let go = |x: &Opnd| eval_i(x, defs, tid, depth + 1).map(|v| v as i32);
+    match o {
+        Opnd::I32(c) => Some(*c as i64),
+        Opnd::Val(v) => {
+            let r: i32 = match defs.get(v)? {
+                Op::ConstI32(c) => *c,
+                Op::WorkitemId => tid,
+                Op::AddI32(a, b) => go(a)?.wrapping_add(go(b)?),
+                Op::MulI32(a, b) => go(a)?.wrapping_mul(go(b)?),
+                Op::ShlI32(a, b) => ((go(a)? as u32).checked_shl(go(b)? as u32).unwrap_or(0)) as i32,
+                Op::LshrI32(a, b) => ((go(a)? as u32).checked_shr(go(b)? as u32).unwrap_or(0)) as i32,
+                Op::AndI32(a, b) => go(a)? & go(b)?,
+                Op::XorI32(a, b) => go(a)? ^ go(b)?,
+                Op::MinI32(a, b) => go(a)?.min(go(b)?),
+                Op::CmpLtI32(a, b) => (go(a)? < go(b)?) as i32,
+                Op::CmpGeI32(a, b) => (go(a)? >= go(b)?) as i32,
+                Op::NotI1(a) => (go(a)? == 0) as i32,
+                Op::Cmp { pred, ty, a, b } => {
+                    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+                    let (x, y) = (go(a)?, go(b)?);
+                    let (xu, yu) = (x as u32, y as u32);
+                    let r = match (ty, pred) {
+                        (T::I32, P::Lt) => x < y,
+                        (T::I32, P::Le) => x <= y,
+                        (T::I32, P::Gt) => x > y,
+                        (T::I32, P::Ge) => x >= y,
+                        (T::U32, P::Lt) => xu < yu,
+                        (T::U32, P::Le) => xu <= yu,
+                        (T::U32, P::Gt) => xu > yu,
+                        (T::U32, P::Ge) => xu >= yu,
+                        (T::I32 | T::U32, P::Eq) => x == y,
+                        (T::I32 | T::U32, P::Ne | P::Lg) => x != y,
+                        _ => return None,
+                    };
+                    r as i32
+                }
+                Op::Select { cond, a, b, .. } => {
+                    if go(cond)? != 0 {
+                        go(a)?
+                    } else {
+                        go(b)?
+                    }
+                }
+                _ => return None,
+            };
+            Some(r as i64)
+        }
+        _ => None,
+    }
+}
+
+/// The value for the wave `w` (work-items 32 w ..): every lane of the wave must agree, else not a wave-level fact.
+fn eval_wave(o: &Opnd, defs: &HashMap<ValueId, Op>, w: i32) -> Option<i64> {
+    let a = eval_i(o, defs, 32 * w, 0)?;
+    let b = eval_i(o, defs, 32 * w + 31, 0)?;
+    let c = eval_i(o, defs, 32 * w + 15, 0)?;
+    if a == b && b == c {
+        Some(a)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct CountItem {
+    region: usize,
+    id: i32,
+    /// signals per work-group per pass of the region when provable; None = depends on something the verifier cannot evaluate
+    proved: Option<i64>,
+    waits: i64,
+}
+
+fn count_items(f: &Function) -> Vec<CountItem> {
+    let stmts = f.stmts();
+    let defs = defs_of(f);
+    let nw = (f.workgroup_size / 32).max(1) as i32;
+    // guards of every statement (the enclosing ifs with their arm), the region (innermost loop) and whether gotos make the guards unknowable
+    let mut guards: Vec<Vec<(Opnd, bool)>> = Vec::with_capacity(stmts.len());
+    let mut region: Vec<usize> = Vec::with_capacity(stmts.len());
+    let mut cur: Vec<(Opnd, bool)> = Vec::new();
+    let mut stack: Vec<(bool, usize)> = Vec::new();   // (is_if, region start for loops)
+    let mut regions: Vec<usize> = vec![usize::MAX];
+    let mut keyed: HashSet<usize> = HashSet::default();   // regions that contain a LayoutKey / goto: path conditions are not modelled there
+    let mut unknown: Vec<bool> = Vec::with_capacity(stmts.len());
+    for (i, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::BeginIf { cond } => {
+                cur.push((*cond, true));
+                stack.push((true, 0));
+            }
+            Stmt::Else => {
+                if let Some(g) = cur.last_mut() {
+                    g.1 = false;
+                }
+            }
+            Stmt::EndIf => {
+                cur.pop();
+                stack.pop();
+            }
+            Stmt::BeginLoop { .. } => {
+                regions.push(i);
+                stack.push((false, i));
+            }
+            Stmt::EndLoop => {
+                regions.pop();
+                stack.pop();
+            }
+            Stmt::LayoutKey { .. } | Stmt::GotoIf { .. } | Stmt::Goto { .. } => {
+                keyed.insert(*regions.last().unwrap());
+            }
+            _ => {}
+        }
+        guards.push(cur.clone());
+        region.push(*regions.last().unwrap());
+        unknown.push(keyed.contains(regions.last().unwrap()));
+    }
+    let mut out: Vec<CountItem> = Vec::new();
+    let mut all_regions: Vec<usize> = region.clone();
+    all_regions.sort();
+    all_regions.dedup();
+    for r in all_regions {
+        for id in [-3] {
+            let sig: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierSignal { id: j } if j == id)).collect();
+            let wts: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierWait { id: j } if j == id)).collect();
+            if sig.is_empty() && wts.is_empty() {
+                continue;
+            }
+            // the waves that execute a statement: Some(set) when every guard is a wave-level fact
+            let executors = |i: usize| -> Option<Vec<bool>> {
+                if unknown[i] {
+                    return None;
+                }
+                let mut v = vec![true; nw as usize];
+                for (c, pol) in &guards[i] {
+                    for w in 0..nw {
+                        let val = eval_wave(c, &defs, w)?;
+                        if (val != 0) != *pol {
+                            v[w as usize] = false;
+                        }
+                    }
+                }
+                Some(v)
+            };
+            let mut proved: Option<i64> = Some(0);
+            for &i in &sig {
+                match (executors(i), proved) {
+                    (Some(e), Some(p)) => proved = Some(p + e.iter().filter(|x| **x).count() as i64),
+                    _ => proved = None,
+                }
+            }
+            // waits per wave (the most any wave executes)
+            let mut waits = 0i64;
+            for w in 0..nw {
+                let mut n = 0;
+                for &i in &wts {
+                    match executors(i) {
+                        Some(e) => n += e[w as usize] as i64,
+                        None => n += 1,
+                    }
+                }
+                waits = waits.max(n);
+            }
+            if sig.is_empty() {
+                proved = None;
+            }
+            out.push(CountItem { region: r, id, proved, waits });
+        }
+    }
+    out
+}
+
+fn bar_count(f: &Function, v: &mut Vec<Violation>) {
+    for it in count_items(f) {
+        if it.waits == 0 && it.proved.is_some() {
+            continue;
+        }
+        let where_ = if it.region == usize::MAX { "the top level".to_string() } else { format!("the loop at statement {}", it.region) };
+        match it.proved {
+            Some(n) if it.waits > 0 && n != it.waits => viol(v, "GV-1250-BAR-COUNT", format!("{where_}: barrier {} is signalled by {n} wave(s) per work-group and waited on {} time(s) per wave: the cluster barrier needs exactly one signalling wave per work-group per wait (the count is by signals, not by waves)", it.id, it.waits)),
+            Some(_) => {}
+            None => {
+                if it.waits > 0 && signal_count_fact(f, it.id).is_none() {
+                    viol(v, "GV-1250-BAR-COUNT", format!("{where_}: cannot prove how many waves per work-group signal barrier {} for its {} wait(s) (the signalling condition is not a function of the wave id, or the signals sit outside this region): declare the launch fact with `barrier_signal_count({}, per_wg)` (a trusted item), or restructure so the verifier can count", it.id, it.waits, it.id));
+                } else if let Some(k) = signal_count_fact(f, it.id) {
+                    if it.id == -3 && k != 1 {
+                        viol(v, "GV-1250-BAR-COUNT", format!("the launch fact says {k} signal(s) per work-group for the cluster barrier: exactly 1 is required"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
+pub fn trusted_items(f: &Function) -> Vec<String> {
+    let mut v = Vec::new();
+    for it in count_items(f) {
+        if it.proved.is_none() && it.waits > 0 {
+            if let Some(k) = signal_count_fact(f, it.id) {
+                v.push(format!("barrier {}: {k} signalling wave(s) per work-group per phase (declared launch fact, not proved)", it.id));
+            }
+        }
+    }
+    v
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
@@ -704,6 +927,7 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
         }
     }
     bar_structure(f, &mut v);
+    bar_count(f, &mut v);
     v
 }
 
