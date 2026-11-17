@@ -40,8 +40,9 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-SLEEP", layer: Layer::Asm, what: "no indefinite sleep: a wave that sleeps forever may never wake" },
     Rule { id: "GV-1250-MCAST", layer: Layer::Ir, what: "a tensor operation's multicast mask is provably zero unless the launch declares a cluster of at least two workgroups" },
     Rule { id: "GV-1250-BAR-ID", layer: Layer::Ir, what: "barrier ids are in range and allocated (work-group, cluster only in a cluster launch, named ones within the declared count)" },
-    Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant between 1 and the number of waves that can join it (a count above that never completes)" },
-    Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, signal / wait on a named barrier only while joined to it" },
+    Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant in the field's range (1..=63); completion is count-based, so the count is the number of signals per phase, joined or not" },
+    Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
+    Rule { id: "GV-1250-BAR-INIT", layer: Layer::Ir, what: "a named barrier is initialized before it is used, and a work-group barrier orders the initialization before the first use (a re-initialization after another wave signalled loses the count)" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -381,9 +382,9 @@ fn bar_join(f: &Function, v: &mut Vec<Violation>) {
                 }
                 state = None;
             }
-            Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } if (1..=16).contains(id) => {
+            Stmt::BarrierWait { id } if (1..=16).contains(id) => {
                 if state != Some(*id) {
-                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: named barrier {id} signalled / waited on while {}", match state { Some(j) => format!("joined to barrier {j}"), None => "not joined".to_string() }));
+                    viol(v, "GV-1250-BAR-JOIN", format!("statement {pos}: wait on named barrier {id} while {} (a wave waits only on the named barrier it joined; signalling any barrier is allowed)", match state { Some(j) => format!("joined to barrier {j}"), None => "not joined".to_string() }));
                 }
             }
             Stmt::BeginIf { .. } => stack.push((state, None)),
@@ -418,6 +419,30 @@ fn bar_join(f: &Function, v: &mut Vec<Violation>) {
     }
 }
 
+/// GV-1250-BAR-INIT: every named barrier is initialized before its first use, with a work-group barrier between the initialization and the first use (a linear scan: the init and the
+/// barrier that orders it are straight-line code in practice).
+fn bar_init(f: &Function, v: &mut Vec<Violation>) {
+    let mut inited: HashSet<i32> = HashSet::default();
+    let mut unordered: HashSet<i32> = HashSet::default();
+    for (pos, st) in f.stmts().iter().enumerate() {
+        match st {
+            Stmt::BarrierInit { id, .. } => {
+                inited.insert(*id);
+                unordered.insert(*id);
+            }
+            Stmt::Barrier | Stmt::BarrierWait { id: -1 } => unordered.clear(),
+            Stmt::BarrierJoin { id } | Stmt::BarrierSignal { id } | Stmt::BarrierWait { id } if (1..=16).contains(id) => {
+                if !inited.contains(id) {
+                    viol(v, "GV-1250-BAR-INIT", format!("statement {pos}: named barrier {id} used with no initialization before it (its member count is unset: it never completes)"));
+                } else if unordered.contains(id) {
+                    viol(v, "GV-1250-BAR-INIT", format!("statement {pos}: named barrier {id} used with no work-group barrier after its initialization (another wave may still be initializing it)"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
@@ -441,9 +466,8 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
                 if !(1..=16).contains(id) || (*id as i64) > named {
                     viol(&mut v, "GV-1250-BAR-ID", format!("statement {pos}: barrier init of id {id}: named barriers are 1..=16 and must be allocated (named_barrier_count = {named})"));
                 }
-                let waves = f.workgroup_size.div_ceil(32) as i64;
-                if !(1..=63).contains(&(*members as i64)) || (*members as i64) > waves {
-                    viol(&mut v, "GV-1250-NBAR-COUNT", format!("statement {pos}: named barrier {id} with {members} members in a work-group of {waves} wave(s): the count must be between 1 and the number of waves that can join (a larger count never completes)"));
+                if !(1..=63).contains(&(*members as i64)) {
+                    viol(&mut v, "GV-1250-NBAR-COUNT", format!("statement {pos}: named barrier {id} with member count {members}: the count must be between 1 and 63"));
                 }
             }
             Stmt::BarrierJoin { id } => {
@@ -479,6 +503,7 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
     }
     bar_reach(f, &mut v);
     bar_join(f, &mut v);
+    bar_init(f, &mut v);
     v
 }
 
