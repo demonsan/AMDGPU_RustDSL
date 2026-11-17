@@ -3712,7 +3712,8 @@ impl FnBuilder {
         let lo = self.let_(Op::PtrLo(Opnd::Val(p)));
         let hi = self.let_(Op::PtrHi(Opnd::Val(p)));
         let hm = self.let_(Op::AndI32(Opnd::Val(hi), Opnd::I32(0x01ff_ffff)));
-        let w3 = self.bin(BinOp::OrB32, hm, Opnd::I32(0x8000_0000u32 as i32));
+        // (the fields of a word are disjoint: `+` is `|`, and stays in SALU)
+        let w3 = self.let_(Op::AddI32(Opnd::Val(hm), Opnd::I32(0x8000_0000u32 as i32)));
         let g0 = self.let_(Op::RsrcCat { words: [Opnd::I32(1), lds_addr, Opnd::Val(lo), Opnd::Val(w3)] });
         // group 1 (256 bits): see the field table of CDNA5 ISA Table 63
         let w0 = t.wg_mask as u32 | ds << 16 | pad_en << 20 | pi << 22 | pa << 25;
@@ -3737,7 +3738,7 @@ impl FnBuilder {
                 acc = match (c(acc), c(x)) {
                     (Some(u), Some(v)) => Opnd::I32((u | v) as i32),
                     (Some(0), None) => x,
-                    _ => Opnd::Val(s.bin(BinOp::OrB32, acc, x)),
+                    _ => Opnd::Val(s.let_(Op::AddI32(acc, x))),
                 };
             }
             acc
