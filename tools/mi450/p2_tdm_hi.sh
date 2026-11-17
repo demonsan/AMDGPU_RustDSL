@@ -2,6 +2,8 @@
 set -u
 cd "$SRC"
 O="$W/p2"; rm -rf "$O"; mkdir -p "$O"
+echo RUNNING > "$O/STATUS"
+[ -z "${IDLE_GPU:-}" ] && { echo NOGPU > "$O/STATUS"; echo "NO-IDLE-GPU"; exit 251; }
 [ "${IDLE_GPU:-none}" = "3" ] && { echo "REFUSE: GPU 3"; exit 9; }
 cargo build --release --bin amdc -j 64 2>&1 | tail -1
 A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
@@ -16,6 +18,7 @@ for k in probe_g1250_tdm_hi_4096 probe_g1250_tdm_hi_70000 probe_g1250_tdm_hi_130
   echo "--- tdm_hi $k"
   gpurun $O/host tdm_hi $O/$k.co $k
   rc=$?
-  if [ $rc -ne 0 ]; then echo "STOP: rc=$rc on $k"; exit $rc; fi
+  if [ $rc -ne 0 ]; then echo "FAIL $rc" > "$O/STATUS"; echo "STOP: rc=$rc on $k"; exit $rc; fi
 done
 echo "P2-OK"
+grep -q "^RUNNING" "$O/STATUS" && echo DONE > "$O/STATUS"
