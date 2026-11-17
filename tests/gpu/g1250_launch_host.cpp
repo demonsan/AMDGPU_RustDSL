@@ -104,5 +104,7 @@ int main(int argc, char** argv) {
     float ms = 0;
     HC(hipEventElapsedTime(&ms, e0, e1));
     std::printf("LAUNCH_OK us=%.3f\n", 1e3 * ms / iters);
+    std::printf("{\"host\":\"g1250_launch\",\"kernel\":\"%s\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"cluster\":[%u,%u,%u],\"us\":%.3f,\"ok\":true}\n",
+                kn, g[0], g[1], g[2], b[0], b[1], b[2], c[0], c[1], c[2], 1e3 * ms / iters);
     return 0;
 }

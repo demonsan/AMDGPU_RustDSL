@@ -192,5 +192,8 @@ int main(int argc, char** argv) {
     const double us = 1e3 * ms / iters;
     std::printf("f4gemm M=%d N=%d K=%d: %.2f us %.1f TF/s check rows=%d checked=%ld bad=%ld max_rel=%.3e %s\n", M, N, K, us,
                 2.0 * M * N * (double)K / (us * 1e-6) / 1e12, cr, checked, bad, maxe, bad ? "F4GEMM_FAIL" : "F4GEMM_OK");
+    std::printf("{\"host\":\"g1250_f4gemm\",\"kernel\":\"%s\",\"shape\":{\"M\":%d,\"N\":%d,\"K\":%d},\"grid\":[%u,%u,1],\"cluster\":[%d,%d,1],"
+                "\"us\":%.3f,\"tflops\":%.2f,\"bad\":%ld,\"ok\":%s}\n", kn, M, N, K, gdx, gdy, cx, cy, us, 2.0 * M * N * (double)K / (us * 1e-6) / 1e12, bad,
+                bad ? "false" : "true");
     return bad ? 3 : 0;
 }
