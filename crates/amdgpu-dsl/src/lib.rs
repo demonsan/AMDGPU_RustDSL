@@ -1351,9 +1351,9 @@ pub enum Stmt {
     /// gfx1250: `s_wait_<counter>cnt count` (an explicit wait on one split counter).
     WaitCounter { counter: WaitCtr, count: u8 },
     /// gfx1250: `s_barrier_signal id` (-1 workgroup, -3 cluster, 1..16 named).
-    BarrierSignal { id: i8 },
+    BarrierSignal { id: i32 },
     /// gfx1250: `s_barrier_wait id`.
-    BarrierWait { id: i8 },
+    BarrierWait { id: i32 },
     /// gfx1250 exact mode: `s_set_vgpr_msb imm` as the author wrote it.
     SetVgprMsb { imm: u16 },
     /// gfx1250 TDM: `tensor_load_to_lds` with the descriptor groups g0 (4 SGPRs, `Rsrc`), g1 (8, `Sgpr8`) and the optional g2 / g3 (4 each;
