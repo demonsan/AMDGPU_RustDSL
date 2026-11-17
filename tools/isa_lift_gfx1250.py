@@ -116,6 +116,8 @@ def parse(path):
         e64 = op.endswith('_e64')
         op = TO_950.get(base, base) + ('_e64' if e64 else '')
         args = [f's{108 + int(x[4:])}' if re.fullmatch(r'ttmp\d+', x) else x for x in args]
+        # wave32: the lane mask is one register; the lifter's mask model names it vcc / exec (the emitter writes vcc_lo / exec_lo)
+        args = [{'vcc_lo': 'vcc', 'exec_lo': 'exec'}.get(x, x) for x in args]
         # (branches carry their target label only: the CFG reads it)
         text = '' if op in BRANCHES else r.get('text', '')
         if text and '--raw-text' not in sys.argv:
@@ -310,6 +312,16 @@ class Lifter(isa_lift.Lifter):
             self.stmt(f'SetSchedMode {{ mode: {int(w[1], 16)} }}')
             return True
         return False
+
+    def h_v_mul_u32_u24(self, t, m, op):
+        # (a literal operand: the lowering has no e64-literal form yet - stays verbatim)
+        if any((isa_lift.imm(x) is not None and not -16 <= isa_lift.imm(x) <= 64) for x in t[1:3]):
+            return False
+        return self.bin(t, 'Bin(MulU32U24, {a}, {b})', 'I32', 'I32')
+    def h_v_mul_lo_u32(self, t, m, op): return self.bin(t, 'MulI32({a}, {b})', 'I32', 'I32')
+    def h_v_max_i32(self, t, m, op): return self.bin(t, 'Bin(MaxI32, {a}, {b})', 'I32', 'I32')
+    def h_v_sub_u32(self, t, m, op): return self.bin(t, 'Bin(SubU32, {a}, {b})', 'I32', 'I32')
+    def h_v_cmp_gt_u32(self, t, m, op): return self.cmp64(t, 'Gt', 'U32')
 
     def _salu(self, t, sop, ty='I32'):
         a, b = self.src(t[1], 'I32' if ty == 'I32' else None), self.src(t[2], 'I32' if ty == 'I32' else None)
