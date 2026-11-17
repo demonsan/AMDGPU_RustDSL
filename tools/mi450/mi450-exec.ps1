@@ -15,6 +15,8 @@ param(
     [string]$Payload = '',
     [string]$PayloadFile = '',
     [switch]$Sync,
+    [string[]]$Env = @(),   # extra environment of the payload: 'K=V' (single quotes in V are not allowed)
+    [switch]$Bundle,   # with -Sync: also ship the git history (a bundle of HEAD and origin/Main, about 8 MB) so $SRC is a git repo: perf_ab-style A/B runs can add worktrees of other commits
     [int]$TimeoutSec = 600,
     [int]$GpuTimeoutSec = 120,
     [int]$GpuIdx = -1,
@@ -71,8 +73,16 @@ if ($Sync) {
     $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null
     $scprc = $LASTEXITCODE; $ErrorActionPreference = $eap2
+    if ($Bundle) {
+        Push-Location $Repo; $bun = Join-Path $env:TEMP ("mi450-" + [guid]::NewGuid().ToString('N') + '.bundle'); $headSha = (git rev-parse HEAD).Trim(); & git bundle create $bun HEAD origin/Main 2>&1 | Out-Null; Pop-Location
+        $ErrorActionPreference = 'Continue'; & scp @scpArgs $bun ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.bundle") 2>&1 | Out-Null; $ErrorActionPreference = $eap2; Remove-Item $bun -ErrorAction SilentlyContinue
+    }
     if ($scprc -ne 0) { Write-Error "scp failed ($scprc)"; exit 250 }
-    $ok = Invoke-Remote ("W=$wsdir; cd `$W && rm -rf src.new src.old && mkdir src.new && tar -xzf src.tgz -C src.new && { [ -d src ] && mv src src.old; mv src.new src; rm -rf src.old src.tgz; echo SYNCED; }") -Wrap
+    $ok = Invoke-Remote ("W=$wsdir; cd `$W && rm -rf src.new src.old && mkdir src.new && tar -xzf src.tgz -C src.new && { find src.new -type f \( -name '*.sh' -o -name '*.py' -o -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.txt' -o -name '*.lock' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' -o -name '*.asm' -o -name '*.tbl' -o -name '*.json' -o -name '*.yml' -o -name '*.tsv' -o -name '.gitignore' -o -name '.gitattributes' -o -name '*.ps1' -o -name '*.irv1' -o -name '*.s' \) -print0 | xargs -0 -r sed -i 's/\r$//'; [ -d src ] && mv src src.old; mv src.new src; rm -rf src.old src.tgz; echo SYNCED; }") -Wrap
+    if ($Bundle) {
+        $okb = Invoke-Remote ("W=$wsdir; cd `$W/src && rm -rf .git && git init -q && git fetch -q ../src.bundle '+refs/remotes/origin/*:refs/remotes/origin/*' HEAD:refs/b/head && git update-ref --no-deref HEAD `$(git rev-parse refs/b/head) && git reset -q && rm -f ../src.bundle && echo BUNDLED `$(git rev-parse --short HEAD)") -Wrap
+        if ($okb -ne 0) { Write-Error 'bundle step failed'; exit 250 }
+    }
     Remove-Item $list, $tgz -ErrorAction SilentlyContinue
     if ($ok -ne 0) { Write-Error 'sync failed'; exit 250 }
 }
@@ -82,6 +92,7 @@ if (-not $Payload.Trim()) { if ($Sync) { exit 0 } else { Write-Error 'no payload
 
 $lockCmd = if ($cfg.lock) { '/usr/local/bin/gpu-lock ' } else { '' }
 $noGpuFlag = if ($NoGpu) { 1 } else { 0 }
+$envLines = ($Env | ForEach-Object { $kv = $_ -split '=', 2; "export $($kv[0])='$($kv[1])'" }) -join "`n"
 $boot = @"
 export BASE=$($cfg.work)
 export W=`$BASE/ws/$Tag
@@ -115,6 +126,9 @@ for g in d:
   fi
 fi
 export IDLE_GPU
+if [ -n "`$IDLE_GPU" ]; then export HIP_VISIBLE_DEVICES=`$IDLE_GPU; fi
+export PERF_AB_GPU_WRAP="${lockCmd}timeout -s KILL `$GPU_TIMEOUT"
+$envLines
 gpurun() {
   if [ -z "`$IDLE_GPU" ]; then echo "NO-IDLE-GPU: refusing to run `$*" >&2; return 251; fi
   HIP_VISIBLE_DEVICES=`$IDLE_GPU ${lockCmd}timeout -s KILL `$GPU_TIMEOUT "`$@"
