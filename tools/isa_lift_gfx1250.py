@@ -86,6 +86,39 @@ def parse(path):
                 break
             if (o.startswith(scc_w) and not o.startswith(('s_add_nc', 's_sub_nc'))) or o.startswith(('s_cmp', 's_branch', 's_endpgm')):
                 break
+    # --fix-trans-coexec: the v_nop LLVM inserts between a TRANS instruction and the next VALU instruction when that one reads the TRANS
+    # result (RAW) or writes its source (WAR) (GCNHazardRecognizer::fixVALUTransCoexecutionHazards, gfx1250). The vendor omits it; with the
+    # option the replay adds it, one named deviation per site (listed in --deviations FILE)
+    TRANS = ('v_exp_f32', 'v_log_f32', 'v_rcp_f32', 'v_rsq_f32', 'v_sqrt_f32', 'v_sin_f32', 'v_cos_f32', 'v_rcp_iflag_f32', 'v_exp_f16',
+             'v_log_f16', 'v_rcp_f16', 'v_rsq_f16', 'v_sqrt_f16', 'v_sin_f16', 'v_cos_f16')
+    trans_fix = set()
+    if '--fix-trans-coexec' in sys.argv:
+        def vregs(tok):
+            r = isa_lift.reg(re.sub(r'\.[lh]$', '', tok))
+            return set(range(r[1], r[1] + r[2])) if r and r[0] == 'v' else set()
+        prev = None
+        for k, r in enumerate(recs):
+            if r['addr'] in targets:
+                prev = None
+            o = r['op']
+            if not o.startswith('v_') or r.get('raw'):
+                continue
+            base = re.sub(r'_e(32|64)$', '', o)
+            if prev is not None and not base.startswith(TRANS) and o != 'v_nop':
+                pd, ps = prev
+                args = r['args']
+                rd = vregs(args[0]) if args else set()
+                rs = set().union(*[vregs(x) for x in args[1:]]) if len(args) > 1 else set()
+                if (rs & pd) or (rd & ps):
+                    trans_fix.add(k)
+            if base.startswith(TRANS) and r['args']:
+                prev = (vregs(r['args'][0]), set().union(*[vregs(x) for x in r['args'][1:]]))
+            else:
+                prev = None
+    if '--deviations' in sys.argv:
+        with open(sys.argv[sys.argv.index('--deviations') + 1], 'w') as f:
+            for k in sorted(trans_fix):
+                f.write(f"{recs[k]['addr']:#x} v_nop before {recs[k]['op']}: TRANS co-execution (vendor omits it; LLVM inserts one)\n")
     out, sec, msb = [], 'entry', 0
     i = 0
     while i < len(recs):
@@ -93,6 +126,8 @@ def parse(path):
         if r['addr'] in targets:
             sec = f'L{r["addr"]:x}'
         op, args, mods = r['op'], list(r['args']), list(r['mods'])
+        if i in trans_fix:
+            out.append((sec, 'v_nop', 'words:0x7e000000'))
         if op == 's_code_end':
             # the toolchain's padding after the code: kd "code_end_pad", not instructions of the kernel
             i += 1
