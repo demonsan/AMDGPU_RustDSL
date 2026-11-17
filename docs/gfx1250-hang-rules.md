@@ -5,7 +5,7 @@ waiting forever as an **error**: the kernel is not emitted. There is no warning 
 
 The rules live in [`crates/amdgpu-codegen/src/gpu_verify_1250.rs`](../crates/amdgpu-codegen/src/gpu_verify_1250.rs) and run inside `gfx1250::compile_with` for both tails (own and LLVM):
 
-- the **IR layer** (`verify_ir`) reads the kernel IR right after lowering and allocation: tensor descriptors built from constants or kernarg words, barrier operations and the control flow around them, and the launch facts the kernel declares;
+- the **IR layer** (`verify_ir`) reads the kernel IR right after lowering and allocation: tensor descriptors built from constants or kernarg words, barrier operations (including init / join / leave and the cluster-barrier form) and the control flow around them, and the launch facts the kernel declares;
 - the **asm layer** (`verify_asm`) reads the final instruction text the assembler will see, whatever produced it (the own emitter, the LLVM tail, an exact replay with raw words);
 - `enforce` / `enforce_asm` turn any violation into a compile error naming the rule id (`GV-1250-*`).
 
@@ -26,7 +26,9 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | `GV-1250-TDM-CLAUSE` | asm | a tensor operation inside an instruction clause | `mut_tdm_clause` | `pos_tdm_clause` |
 | `GV-1250-SLEEP` | asm | an indefinite sleep (including the raw-word encoding): a wave that sleeps forever may never wake | `mut_sleep` | `pos_sleep` |
 | `GV-1250-MCAST` | IR | a tensor operation whose multicast mask is not provably zero in a launch that declares no cluster of at least two workgroups | `mut_mcast` | `pos_mcast` |
-| `GV-1250-BAR-ID` | IR | a barrier id out of range, the cluster barrier outside a cluster launch, a named barrier beyond the allocated count (an unallocated barrier is silently a no-op, so the synchronization is missing) | `mut_bar_id` | `pos_bar_id` |
+| `GV-1250-BAR-ID` | IR + asm | a barrier id out of range, the cluster barrier (or the cluster-barrier form) outside a cluster launch, a named barrier beyond the allocated count in a signal / wait / init / join (an unallocated barrier is silently a no-op, so the synchronization is missing), the first-arriver form on the cluster barrier | `mut_bar_id`, `mut_bar_id_forms`, `mut_bar_id_asm` | `pos_bar_id`, `pos_bar_id_forms`, `pos_bar_id_asm` |
+| `GV-1250-NBAR-COUNT` | IR | a named barrier whose member count is not a constant between 1 and the number of waves that can join it (a larger count never completes) | `mut_nbar_count` | `pos_nbar_count` |
+| `GV-1250-BAR-JOIN` | IR | a break in the named-barrier join discipline: a second join before the leave (one joined barrier at a time), a leave with nothing joined, a signal / wait on a named barrier while not joined to it, paths of a branch or a loop body that end with different join states | `mut_bar_join` | `pos_bar_join` |
 | `GV-1250-BAR-WAIT-IMM` | asm | a barrier wait whose operand is not an inline constant | `mut_bar_wait_imm` | `pos_bar_wait_imm` |
 | `GV-1250-TRAP-BAR` | IR + asm | the barriers reserved for the trap handler used by a kernel | `mut_trap_bar` | `pos_trap_bar` |
 | `GV-1250-BAR-REACH` | IR | a barrier that not every wave of its group reaches: a barrier under a condition that differs between waves with unequal arrivals in the arms, a barrier in a loop whose exit differs between waves, a wait with no signal of that barrier | `mut_bar_reach` | `pos_bar_reach` |
@@ -72,7 +74,6 @@ These rules are staged after the typed tensor descriptor, the named-barrier oper
 
 | planned rule | what it will keep from happening |
 |---|---|
-| `GV-1250-NBAR-COUNT` | a named-barrier member count that is not larger than the signals already counted, or not a constant in range |
 | `GV-1250-TDM-DESC` | tensor descriptors with inconsistent paired fields, misaligned fields, a tile extent outside the LDS allocation or the tensor outside the declared buffer, a gather with unordered indices |
 | `GV-1250-TDM-OUTSTANDING` | (the in-flight limit itself is `GV-1250-TDM-DRAIN` above) a wait that depends on an operation queued behind a stalled issue, and the async-copy counterpart |
 | `GV-1250-TDM-RING` | reuse of an LDS ring slot before both the producer's completion and the consumers' release |

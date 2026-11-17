@@ -156,6 +156,20 @@ fn barrier_kernel(ops: &[(bool, i32)], kd: &[(&str, i64)]) -> Function {
     f
 }
 
+/// A kernel whose body is `body` (the named-barrier forms), a 64-work-item group (two waves), `named` allocated named barriers and `cluster` workgroups per cluster.
+fn named_kernel(body: impl FnOnce(&mut FnBuilder), named: i64, cluster: i64) -> Function {
+    let mut b = FnBuilder::new("hr_named", 64);
+    body(&mut b);
+    let mut f = b.finish();
+    if named > 0 {
+        f.kd.push(("named_barrier_count".into(), named));
+    }
+    if cluster > 0 {
+        f.kd.push(("cluster_dims".into(), cluster));
+    }
+    f
+}
+
 fn base_asm() -> String {
     compile_positive(&tdm_kernel(0x20000, 0))
 }
@@ -234,8 +248,8 @@ fn mut_bar_id() {
     compile_mutation(&barrier_kernel(&[(true, 17), (false, 17)], &[]), "GV-1250-BAR-ID");   // beyond the named barriers
     compile_mutation(&barrier_kernel(&[(true, -5), (false, -5)], &[]), "GV-1250-BAR-ID");
     compile_mutation(&barrier_kernel(&[(true, -3), (false, -3)], &[]), "GV-1250-BAR-ID");   // the cluster barrier outside a cluster launch
-    compile_mutation(&barrier_kernel(&[(true, 2), (false, 2)], &[]), "GV-1250-BAR-ID");     // a named barrier that is not allocated
-    compile_mutation(&barrier_kernel(&[(true, 3), (false, 3)], &[("named_barrier_count", 2)]), "GV-1250-BAR-ID");   // beyond the allocated count
+    compile_mutation(&named_kernel(|b| { b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 0, 0), "GV-1250-BAR-ID");     // a named barrier that is not allocated
+    compile_mutation(&named_kernel(|b| { b.barrier_join(3); b.barrier_signal(3); b.barrier_wait(3); b.barrier_leave(); }, 2, 0), "GV-1250-BAR-ID");   // beyond the allocated count
 }
 
 #[test]
@@ -252,8 +266,97 @@ fn pos_bar_id_asm() {
 #[test]
 fn pos_bar_id() {
     compile_positive(&barrier_kernel(&[(true, -1), (false, -1)], &[]));
-    compile_positive(&barrier_kernel(&[(true, 2), (false, 2)], &[("named_barrier_count", 2)]));
+    compile_positive(&named_kernel(|b| { b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 2, 0));
     compile_positive(&barrier_kernel(&[(true, -3), (false, -3)], &[("cluster_dims", 4)]));
+}
+
+#[test]
+fn mut_bar_id_forms() {
+    // the cluster barrier in a launch that declares no cluster
+    compile_mutation(&named_kernel(|b| b.cluster_barrier(), 0, 0), "GV-1250-BAR-ID");
+    compile_mutation(&named_kernel(|b| b.cluster_barrier(), 0, 1), "GV-1250-BAR-ID");
+    // an init / join of a barrier that is not allocated
+    ir_mutation(&named_kernel(|b| b.barrier_init(2, 2), 1, 0), "GV-1250-BAR-ID");
+    ir_mutation(&named_kernel(|b| b.barrier_join(3), 2, 0), "GV-1250-BAR-ID");
+    // the first-arriver form on the cluster barrier
+    asm_mutation(&inject("tensor_load_to_lds", &["s_barrier_signal_isfirst -3"]), "GV-1250-BAR-ID");
+}
+
+#[test]
+fn pos_bar_id_forms() {
+    compile_positive(&named_kernel(|b| b.cluster_barrier(), 0, 4));
+    ir_positive(&named_kernel(|b| { b.barrier_init(2, 2); b.barrier_join(2); b.barrier_leave(); }, 2, 0));
+    asm_positive(&inject("tensor_load_to_lds", &["s_barrier_signal_isfirst -1"]));
+}
+
+// GV-1250-NBAR-COUNT
+
+#[test]
+fn mut_nbar_count() {
+    ir_mutation(&named_kernel(|b| b.barrier_init(1, 3), 1, 0), "GV-1250-NBAR-COUNT");    // 3 members, 2 waves can join
+    ir_mutation(&named_kernel(|b| b.barrier_init(1, 0), 1, 0), "GV-1250-NBAR-COUNT");    // no members
+    ir_mutation(&named_kernel(|b| b.barrier_init(1, 64), 1, 0), "GV-1250-NBAR-COUNT");   // beyond the field
+}
+
+#[test]
+fn pos_nbar_count() {
+    ir_positive(&named_kernel(|b| b.barrier_init(1, 2), 1, 0));
+    ir_positive(&named_kernel(|b| b.barrier_init(1, 1), 1, 0));
+}
+
+// GV-1250-BAR-JOIN
+
+#[test]
+fn mut_bar_join() {
+    ir_mutation(&named_kernel(|b| { b.barrier_join(1); b.barrier_join(2); b.barrier_leave(); }, 2, 0), "GV-1250-BAR-JOIN");   // two joined at once
+    ir_mutation(&named_kernel(|b| b.barrier_leave(), 1, 0), "GV-1250-BAR-JOIN");                                              // leave with nothing joined
+    ir_mutation(&named_kernel(|b| { b.barrier_signal(1); b.barrier_wait(1); }, 1, 0), "GV-1250-BAR-JOIN");                    // signal / wait while not joined
+    ir_mutation(&named_kernel(|b| { b.barrier_join(1); b.barrier_signal(2); b.barrier_leave(); }, 2, 0), "GV-1250-BAR-JOIN"); // joined to another barrier
+    // the paths of a branch end differently joined (uniform condition)
+    let mut b = FnBuilder::new("hr_join_if", 64);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, n, Opnd::I32(0));
+    b.begin_if(c);
+    b.barrier_join(1);
+    b.end_if();
+    let mut f = b.finish();
+    f.kd.push(("named_barrier_count".into(), 1));
+    ir_mutation(&f, "GV-1250-BAR-JOIN");
+    // a loop body that joins every iteration without leaving
+    let mut b = FnBuilder::new("hr_join_loop", 64);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+    b.break_if(c);
+    b.barrier_join(1);
+    b.end_loop();
+    let mut f = b.finish();
+    f.kd.push(("named_barrier_count".into(), 1));
+    ir_mutation(&f, "GV-1250-BAR-JOIN");
+}
+
+#[test]
+fn pos_bar_join() {
+    ir_positive(&named_kernel(|b| { b.barrier_join(1); b.barrier_signal(1); b.barrier_wait(1); b.barrier_leave(); }, 1, 0));
+    // join, use, leave, join another
+    ir_positive(&named_kernel(|b| { b.barrier_join(1); b.barrier_signal(1); b.barrier_wait(1); b.barrier_leave(); b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); }, 2, 0));
+    // a loop that joins and leaves inside its body
+    let mut b = FnBuilder::new("hr_join_loop_ok", 64);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, vars[0], n);
+    b.break_if(c);
+    b.barrier_join(1);
+    b.barrier_signal(1);
+    b.barrier_wait(1);
+    b.barrier_leave();
+    b.end_loop();
+    let mut f = b.finish();
+    f.kd.push(("named_barrier_count".into(), 1));
+    ir_positive(&f);
 }
 
 // GV-1250-TRAP-BAR
@@ -334,7 +437,7 @@ fn pos_bar_reach() {
     ir_positive(&b.finish());
     // signal early, wait late
     ir_positive(&barrier_kernel(&[(true, -1), (false, -1)], &[]));
-    ir_positive(&barrier_kernel(&[(true, 2), (true, 3), (false, 2), (false, 3)], &[("named_barrier_count", 3)]));
+    ir_positive(&named_kernel(|b| { b.barrier_join(2); b.barrier_signal(2); b.barrier_wait(2); b.barrier_leave(); b.barrier_join(3); b.barrier_signal(3); b.barrier_wait(3); b.barrier_leave(); }, 3, 0));
 }
 
 // GV-1250-TDM-DESC
@@ -482,6 +585,8 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-SLEEP", "sleep"),
     ("GV-1250-MCAST", "mcast"),
     ("GV-1250-BAR-ID", "bar_id"),
+    ("GV-1250-NBAR-COUNT", "nbar_count"),
+    ("GV-1250-BAR-JOIN", "bar_join"),
     ("GV-1250-BAR-WAIT-IMM", "bar_wait_imm"),
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),

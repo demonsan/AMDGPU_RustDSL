@@ -73,8 +73,8 @@ if ($Sync) {
     $rcMk = Invoke-Remote ("mkdir -p " + $wsdir.Replace('$HOME', '~')) -Wrap
     $scpArgs = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh")
     $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null
-    $scprc = $LASTEXITCODE; $ErrorActionPreference = $eap2
+    $scprc = 1; for ($try = 0; $try -lt 3 -and $scprc -ne 0; $try++) { if ($try -gt 0) { Start-Sleep 5 }; & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null; $scprc = $LASTEXITCODE }
+    $ErrorActionPreference = $eap2
     if ($Bundle) {
         Push-Location $Repo; $bun = Join-Path $env:TEMP ("mi450-" + [guid]::NewGuid().ToString('N') + '.bundle'); $headSha = (git rev-parse HEAD).Trim(); & git bundle create $bun HEAD origin/Main 2>&1 | Out-Null; Pop-Location
         $ErrorActionPreference = 'Continue'; & scp @scpArgs $bun ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.bundle") 2>&1 | Out-Null; $ErrorActionPreference = $eap2; Remove-Item $bun -ErrorAction SilentlyContinue
