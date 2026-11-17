@@ -134,14 +134,123 @@ fn const_of(o: &Opnd, defs: &HashMap<ValueId, Op>) -> Option<i64> {
     }
 }
 
+/// Known-zero bits (a set bit = provably 0 on every execution) of every value and variable: a forward fixpoint over the statements. Constants are exact; `and` clears (the union of the operands'
+/// known zeros), `or` / `xor` keep what both operands have, shifts move the facts, `bitset1` / `bitset0` set / clear one bit, a sum or product keeps its low zero bits, a variable is the meet
+/// (intersection) of everything assigned to it (an undefined initial value constrains nothing). Everything else (loads, kernargs, ...) is unknown.
+struct KnownZero {
+    vals: HashMap<ValueId, u32>,
+    vars: HashMap<VarId, u32>,
+}
+
+impl KnownZero {
+    fn of(&self, o: &Opnd) -> u32 {
+        match o {
+            Opnd::I32(c) => !(*c as u32),
+            Opnd::Val(v) => self.vals.get(v).copied().unwrap_or(0),
+            Opnd::Var(v) => self.vars.get(v).copied().unwrap_or(0),
+            Opnd::F32(_) => 0,
+        }
+    }
+    fn tz(&self, o: &Opnd) -> u32 {
+        self.of(o).trailing_ones()
+    }
+    fn low(n: u32) -> u32 {
+        if n >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << n) - 1
+        }
+    }
+    fn op(&self, op: &Op) -> u32 {
+        let k = |o: &Opnd| if let Opnd::I32(c) = o { Some(*c as u32) } else { None };
+        match op {
+            Op::ConstI32(c) => !(*c as u32),
+            Op::AndI32(a, b) => self.of(a) | self.of(b),
+            Op::XorI32(a, b) | Op::Bin(amdgpu_dsl::BinOp::OrB32, a, b) => self.of(a) & self.of(b),
+            Op::ShlI32(a, b) => match k(b) {
+                Some(n) if n < 32 => (self.of(a) << n) | Self::low(n),
+                _ => 0,
+            },
+            Op::LshrI32(a, b) => match k(b) {
+                Some(n) if n < 32 => (self.of(a) >> n) | !(u32::MAX >> n),
+                _ => 0,
+            },
+            Op::AddI32(a, b) | Op::Salu { op: amdgpu_dsl::SaluOp::AddCoI32 | amdgpu_dsl::SaluOp::SubCoI32, a, b } => Self::low(self.tz(a).min(self.tz(b))),
+            Op::MulI32(a, b) => Self::low(self.tz(a) + self.tz(b)),
+            Op::MovS { a, .. } | Op::MovV { a, .. } => self.of(a),
+            Op::Select { a, b, .. } => self.of(a) & self.of(b),
+            Op::Salu { op: amdgpu_dsl::SaluOp::Bitset1, a, b } => match k(b) {
+                Some(n) => self.of(a) & !(1u32 << (n & 31)),
+                None => 0,
+            },
+            Op::Salu { op: amdgpu_dsl::SaluOp::Bitset0, a, b } => match k(b) {
+                Some(n) => self.of(a) | (1u32 << (n & 31)),
+                None => 0,
+            },
+            Op::Salu { op: amdgpu_dsl::SaluOp::BfeU32, a, b } => match k(b) {
+                Some(bw) => {
+                    let (off, w) = (bw & 31, (bw >> 16) & 0x7f);
+                    if w == 0 {
+                        u32::MAX
+                    } else if w >= 32 {
+                        (self.of(a) >> off) | !(u32::MAX >> off)
+                    } else {
+                        ((self.of(a) >> off) & Self::low(w)) | !Self::low(w)
+                    }
+                }
+                None => 0,
+            },
+            _ => 0,
+        }
+    }
+}
+
+fn known_zero(f: &Function, defs: &HashMap<ValueId, Op>) -> KnownZero {
+    let asg = var_assignments(f);
+    let mut kz = KnownZero { vals: HashMap::default(), vars: asg.keys().map(|v| (*v, u32::MAX)).collect() };
+    let undef = |o: &Opnd| matches!(o, Opnd::Val(u) if matches!(defs.get(u), Some(Op::Undef { .. })));
+    for _ in 0..16 {
+        // values in statement order with the current variable estimates
+        for st in f.stmts() {
+            if let Stmt::Let { dst, op } = st {
+                let z = kz.op(op);
+                kz.vals.insert(*dst, z);
+            }
+        }
+        // variables: the meet of their assignments
+        let mut changed = false;
+        for (v, list) in &asg {
+            let mut z = u32::MAX;
+            for a in list {
+                if !undef(a) {
+                    z &= kz.of(a);
+                }
+            }
+            let old = kz.vars[v];
+            if z != old {
+                kz.vars.insert(*v, z & old);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    kz
+}
+
 /// The multicast mask (group 1, word 0, bits 15:0) of a tensor operation's group-1 operand.
-fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, g1: &Opnd) -> Mask {
+fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, kz: &KnownZero, g1: &Opnd) -> Mask {
     let Opnd::Val(v) = g1 else { return Mask::Unknown };
     let Some(Op::SgprCat8 { words }) = defs.get(v) else { return Mask::Unknown };
     let w0 = &words[0];
     if let Some(c) = const_of(w0, defs) {
         let m = (c as u32) & 0xffff;
         return if m == 0 { Mask::Zero } else { Mask::Const(m) };
+    }
+    // known-zero bits: every operation that built the word either clears bits or sets bits above 15 (bits 15:0 are the multicast mask)
+    if kz.of(w0) & 0xffff == 0xffff {
+        return Mask::Zero;
     }
     // a word the host supplies in the kernarg segment: provable only through the host contract (a fixed value / a set of values whose low 16 bits are zero)
     if let Opnd::Val(x) = w0 {
@@ -1004,13 +1113,14 @@ pub fn trusted_items(f: &Function) -> Vec<String> {
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
     let defs = defs_of(f);
+    let kz = known_zero(f, &defs);
     let cluster = cluster_wgs(f);
     let named = kd_val(f, "named_barrier_count");
     for (pos, st) in f.stmts().iter().enumerate() {
         match st {
             Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
-                let m = mcast_mask(f, &defs, g1);
+                let m = mcast_mask(f, &defs, &kz, g1);
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {
                         Mask::Const(c) => format!("the multicast mask is {c:#x}"),

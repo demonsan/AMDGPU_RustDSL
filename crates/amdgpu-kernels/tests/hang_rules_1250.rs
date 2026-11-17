@@ -246,6 +246,38 @@ fn pos_mcast() {
     ir_positive(&tdm_host_kernel(&[0x10000, 0x20000]));   // the host contract: the low 16 bits are zero
 }
 
+/// The scope word the vendor builds (a variable cleared / set bit by bit): group 1 word 0 = a loop-carried variable starting at 0 and updated `x = (x & 0x1ffffff) | or_const`.
+fn tdm_var_kernel(or_const: i32) -> Function {
+    let mut b = FnBuilder::new("hr_tdm_var", 64);
+    b.lds(4096);
+    b.arg("n", DType::I32, 0, 4);
+    let n = b.let_(Op::KernargI32 { offset: 0 });
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+    let a = b.let_(Op::AndI32(Opnd::Var(vars[0]), Opnd::I32(0x01ff_ffff)));
+    let o = b.bin(amdgpu_dsl::BinOp::OrB32, a, Opnd::I32(or_const));
+    b.set_var(vars[0], o);
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::I32(0), Opnd::I32(0), Opnd::I32((2u32 << 30) as i32)] });
+    let g1 = b.sgpr_cat8([Opnd::Var(vars[0]), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64), Opnd::I32(0), Opnd::I32(0)]);
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    let c = b.cmp(CmpPred::Gt, CmpTy::I32, o, n);
+    b.break_if(c);
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn mut_mcast_known_bits() {
+    // the loop sets a bit inside the mask (bit 1): the word is no longer provably mask-free
+    ir_mutation(&tdm_var_kernel(0x0600_0002), "GV-1250-MCAST");
+}
+
+#[test]
+fn pos_mcast_known_bits() {
+    // every write clears bits or sets bits >= 16 starting from 0: bits 15:0 are provably zero on every path, no cluster needed
+    ir_positive(&tdm_var_kernel(0x0600_0000));
+    ir_positive(&tdm_var_kernel(0x0018_0000));
+}
+
 // GV-1250-BAR-ID
 
 #[test]
