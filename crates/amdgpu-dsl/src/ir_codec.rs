@@ -502,6 +502,24 @@ impl IrIds for WgWinner {
     }
 }
 
+impl FromIr for TdmCpol {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("TdmCpol")?;
+        Ok(TdmCpol {
+            th: FromIr::from_ir(v.field("th")?)?,
+            scope: FromIr::from_ir(v.field("scope")?)?,
+            nv: FromIr::from_ir(v.field("nv")?)?,
+        })
+    }
+}
+impl IrIds for TdmCpol {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.th, fv, fr);
+        IrIds::ids(&mut self.scope, fv, fr);
+        IrIds::ids(&mut self.nv, fv, fr);
+    }
+}
+
 impl FromIr for Contract {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         v.expect_struct("Contract")?;

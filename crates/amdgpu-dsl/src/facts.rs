@@ -145,7 +145,7 @@ pub fn dwords(t: DType) -> u32 {
         DType::Frag4 => 4,
         DType::Frag8 => 8,
         DType::Frag16 => 16,
-        DType::I1 | DType::Rsrc => 0,
+        DType::I1 | DType::Rsrc | DType::Sgpr8 => 0,
     }
 }
 
@@ -158,7 +158,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::MovV { .. } => ResClass::Valu,
         Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,
         // (s) zero-instruction views / assemblies of SGPR words
-        Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } => ResClass::Marker,
+        Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } | Op::SgprCat8 { .. } => ResClass::Marker,
         Op::LoadScalar { .. } => ResClass::Salu,
         Op::MemTimeLo { .. } => {
             e.directive = true;
@@ -328,6 +328,22 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
         }
         Stmt::WaitVm { count } => {
             e.wait_vm = Some(*count);
+            (ResClass::Sync, vec![], false)
+        }
+        // gfx1250 TDM: an asynchronous global <-> LDS transfer (completion on TENSORcnt); its wait orders like a fence
+        Stmt::TensorLoadToLds { .. } => {
+            e.dma = true;
+            e.global_read = true;
+            e.lds_write = true;
+            (ResClass::Dma, vec![], false)
+        }
+        Stmt::TensorStoreFromLds { .. } => {
+            e.dma = true;
+            e.global_write = true;
+            (ResClass::Dma, vec![], false)
+        }
+        Stmt::WaitTensor { .. } => {
+            e.fence = true;
             (ResClass::Sync, vec![], false)
         }
         Stmt::WaitCnt { vm, lgkm } => {

@@ -4501,6 +4501,8 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
+            // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
+            Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
