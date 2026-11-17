@@ -277,18 +277,29 @@ pub fn probe_g1250_barriers() -> Function {
 /// read from once every wave has read it (barrier), tile i is consumed after `wait_tensor(1)` (the in-order TENSORcnt: only tile i+1 may
 /// still be in flight) and a barrier. out[tid] = sum over the 4 tiles of element tid. 128 work-items. Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_ring() -> Function {
+    tdm_ring_with(true, true)
+}
+
+/// The ring of `probe_g1250_tdm_ring` with its protocol markers (an `lds_ring` of 2 slots, `tile_produce` around each tensor load,
+/// `tile_consume` around each read), so the protocol verifier checks the tensor completion (`wait_tensor`) and the slot reuse (barriers).
+/// `wait`: the consumer's tensor wait; `reuse_barrier`: the barrier between the last read of a slot and the tensor load overwriting it
+/// (both true in the shipped probe; the mutation tests clear them).
+pub fn tdm_ring_with(wait: bool, reuse_barrier: bool) -> Function {
     const K: usize = 4;
     let mut b = FnBuilder::new("probe_g1250_tdm_ring", 128);
     b.arg("src", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     b.arg_tensor("out", Ext::c(128 * 4));
     b.lds(2 * 128 * 4);
+    b.lds_ring("ring", 0, 512, 2);
     let ps = b.let_(Op::KernargPtr { offset: 0 });
     let po = b.let_(Op::KernargPtr { offset: 8 });
     let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(16), Opnd::I32(8)], stride0: Opnd::I32(16), tile: [16, 8], pad: None, wg_mask: 0 };
-    let mut issue = |b: &mut FnBuilder, i: usize| {
+    let issue = |b: &mut FnBuilder, i: usize| {
         let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::I32((i * 128 * 4) as i32), Opnd::I32(((i % 2) * 512) as i32));
+        b.tile_produce("ring", Opnd::I32((i % 2) as i32), Opnd::I32((i / 2) as i32));
         b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+        b.tile_end();
     };
     issue(&mut b, 0);
     issue(&mut b, 1);
@@ -296,15 +307,21 @@ pub fn probe_g1250_tdm_ring() -> Function {
     let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
     let mut acc = b.let_(Op::ConstF32(0.0));
     for i in 0..K {
-        b.wait_tensor(if i + 1 < K { 1 } else { 0 });
+        if wait {
+            b.wait_tensor(if i + 1 < K { 1 } else { 0 });
+        }
         b.barrier();
         let la = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(((i % 2) * 512) as i32)));
+        b.tile_consume("ring", Opnd::I32((i % 2) as i32), Opnd::I32((i / 2) as i32));
         let x = b.load_lds(la, MemTy::B32);
+        b.tile_end();
         let xf = b.let_(Op::BitcastF32(Opnd::Val(x)));
         acc = b.add_f32(acc, xf);
         if i + 2 < K {
             b.wait_lds(0);
-            b.barrier();
+            if reuse_barrier {
+                b.barrier();
+            }
             issue(&mut b, i + 2);
         }
     }
