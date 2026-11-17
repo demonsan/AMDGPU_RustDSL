@@ -456,6 +456,23 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 _ => vec![format!("{mn} {dn}, {}, {}", s(&inst.srcs[0])?, s(&inst.srcs[1])?)],
             }
         }
+        MOp::SExecFromMask | MOp::SExecSelect => {
+            let s = |x: &Src| -> String {
+                match x {
+                    Src::Reg(r) => {
+                        let p = a.phys[*r as usize];
+                        if p == crate::mir::VCC_PIN { "vcc_lo".to_string() } else { sgpr_name(p) }
+                    }
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".to_string(),
+                }
+            };
+            if inst.op == MOp::SExecFromMask {
+                vec![format!("s_mov_b32 exec_lo, {}", s(&inst.srcs[0]))]
+            } else {
+                vec![format!("s_cselect_b32 exec_lo, {}, {}", s(&inst.srcs[1]), s(&inst.srcs[2]))]
+            }
+        }
         MOp::SSys | MOp::SSysVal => {
             let (op, k, k2) = (inst.imm & 0xff, ((inst.imm >> 8) & 0xffff) as u32, ((inst.imm >> 24) & 0xffff_ffff) as u32);
             let hw = |s: u32| format!("hwreg({}, {}, {})", s & 0x3f, (s >> 6) & 0x1f, ((s >> 11) & 0x1f) + 1);

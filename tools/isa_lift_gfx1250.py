@@ -377,8 +377,11 @@ class Lifter(isa_lift.Lifter):
         # wave32 EXEC writes (the author's words: the shared lowering spells the 64-bit forms)
         if t[0] == 'exec':
             if t[1] == 'vcc':
-                # (exec = the VCC lane mask: no DSL form yet - verbatim)
-                return False
+                if ('vcc', 0) not in self.state:
+                    return False
+                self._words(m)
+                self.stmt(f'ExecFromMask {{ mask: Val({self.state[("vcc", 0)][0]}) }}')
+                return True
             k = isa_lift.imm(t[1])
             if k is not None:
                 self._words(m)
@@ -386,6 +389,17 @@ class Lifter(isa_lift.Lifter):
                 return True
             return False
         return super().h_s_mov_b32(t, m, op)
+
+    def h_s_cselect_b32(self, t, m, op):
+        if t[0] == 'exec':
+            if ('scc', 0) not in self.state:
+                return False
+            c = self.state[('scc', 0)][0]
+            a, b = self.src(t[1], 'I32'), self.src(t[2], 'I32')
+            self._words(m)
+            self.stmt(f'ExecSelect {{ cond: Val({c}), a: {a}, b: {b} }}')
+            return True
+        return super().h_s_cselect_b32(t, m, op)
 
     def h_s_ptradd_zext(self, t, m, op):
         # the author's pair (s_add_co_u32 + s_add_co_ci_u32, constant-first) as one pointer add; each instruction keeps its words
@@ -512,7 +526,7 @@ def entry_hw(L, live):
     """gfx1250 entry: v0 = the packed workitem ids (x [9:0], y [19:10], z [29:20]), s[0:1] = the kernarg segment, s2.. = preloaded kernarg
     dwords."""
     # (until the IR has the hardware-initialised forms: ghost definitions, no instruction)
-    L.new('v', 0, 1, 'U32', 'Raw { text: "", reads: [], ty: U32, scalar: false, dwords: 1 }')
+    L.new('v', 0, 1, 'U32', 'WorkitemIdPacked')
     L.new('s', 0, 2, 'Ptr', 'KernargSegment')
     n = int(sys.argv[sys.argv.index('--preload') + 1]) if '--preload' in sys.argv else 0
     for k in range(n):

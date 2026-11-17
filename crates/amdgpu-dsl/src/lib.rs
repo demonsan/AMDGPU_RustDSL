@@ -547,6 +547,8 @@ pub enum Op {
     /// stamp in program order (it is a fence for the scheduler) and drains `lgkmcnt` right after it (SMEM result): place stamps where the kernel already waits.
     MemTimeLo { id: u32 },
     WorkitemId,
+    /// gfx1250 (`system_vgpr_workitem_id 2`): v0 as the hardware writes it, the packed work-item ids x [9:0], y [19:10], z [29:20]
+    WorkitemIdPacked,
     WorkgroupIdX,
     WorkgroupIdY,
     WorkgroupIdZ,
@@ -872,7 +874,7 @@ impl Op {
                 _ => DType::Frag4,
             },
             Op::CvtF32ToF16(..) => DType::I32,
-            Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
+            Op::WorkitemId | Op::WorkitemIdPacked | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
             Op::Max3F32(..) => DType::F32,
             Op::Select { ty, .. } => *ty,
@@ -922,7 +924,7 @@ impl Op {
     pub fn operands(&self) -> Vec<Opnd> {
         match self {
             Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
-            | Op::KernargPtr { .. } | Op::KernargSegment | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
+            | Op::KernargPtr { .. } | Op::KernargSegment | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkitemIdPacked | Op::WorkgroupIdX | Op::WorkgroupIdY
             | Op::WorkgroupIdZ | Op::Undef { .. } => vec![],
             Op::AddI32(a, b)
             | Op::MulI32(a, b)
@@ -1510,6 +1512,10 @@ pub enum Stmt {
     /// gfx1250 wave-control instructions with no effect on the program's values or memory (`SysOp`): the version marker, a mode-register
     /// write, the idle wait, instruction / data prefetches. `reads`: the registers the instruction reads (prefetch addresses).
     Sys { op: SysOp, imm: u32, imm2: u32, reads: Vec<Opnd> },
+    /// wave32: EXEC = the lane mask `mask` (an I1 compare result held as a lane mask, e.g. in VCC) - `s_mov_b32 exec_lo, <mask>`
+    ExecFromMask { mask: Opnd },
+    /// wave32: EXEC = `cond` (a uniform I1 in SCC) ? `a` : `b` - `s_cselect_b32 exec_lo, a, b`
+    ExecSelect { cond: Opnd, a: Opnd, b: Opnd },
     /// Exact mode only: the next statement's single instruction is emitted as these words (the author's encoding: its operands and
     /// semantics are the statement's; only fields an assembler fills differently, such as an unused source, may differ from our encoding)
     AuthorWords { words: Vec<u32> },
@@ -4994,7 +5000,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
-            Stmt::Sys { .. } => {}
+            Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } => {}
             Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
                     errs.push(here("a layout key / goto outside exact mode".to_string()));
@@ -5515,6 +5521,8 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
         Stmt::Raw { reads, .. } => reads.clone(),
         Stmt::Sys { reads, .. } => reads.clone(),
+        Stmt::ExecFromMask { mask } => vec![*mask],
+        Stmt::ExecSelect { cond, a, b } => vec![*cond, *a, *b],
         Stmt::GotoIf { cond, .. } => vec![*cond],
         Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
             let mut v = vec![*g0, *g1];

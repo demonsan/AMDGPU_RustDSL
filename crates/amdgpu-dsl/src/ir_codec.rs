@@ -86,6 +86,7 @@ impl FromIr for Op {
             "KernargPtr" => { v.expect_struct("KernargPtr")?; Ok(Op::KernargPtr { offset: FromIr::from_ir(v.field("offset")?)? }) }
             "MemTimeLo" => { v.expect_struct("MemTimeLo")?; Ok(Op::MemTimeLo { id: FromIr::from_ir(v.field("id")?)? }) }
             "WorkitemId" => { v.expect_unit("WorkitemId")?; Ok(Op::WorkitemId) }
+            "WorkitemIdPacked" => { v.expect_unit("WorkitemIdPacked")?; Ok(Op::WorkitemIdPacked) }
             "WorkgroupIdX" => { v.expect_unit("WorkgroupIdX")?; Ok(Op::WorkgroupIdX) }
             "WorkgroupIdY" => { v.expect_unit("WorkgroupIdY")?; Ok(Op::WorkgroupIdY) }
             "WorkgroupIdZ" => { v.expect_unit("WorkgroupIdZ")?; Ok(Op::WorkgroupIdZ) }
@@ -228,6 +229,7 @@ impl IrIds for Op {
             Op::KernargPtr { offset } => { IrIds::ids(&mut (*offset), fv, fr); }
             Op::MemTimeLo { id } => { IrIds::ids(&mut (*id), fv, fr); }
             Op::WorkitemId => {}
+            Op::WorkitemIdPacked => {}
             Op::WorkgroupIdX => {}
             Op::WorkgroupIdY => {}
             Op::WorkgroupIdZ => {}
@@ -880,6 +882,8 @@ impl FromIr for Stmt {
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
             "Sys" => { v.expect_struct("Sys")?; Ok(Stmt::Sys { op: FromIr::from_ir(v.field("op")?)?, imm: FromIr::from_ir(v.field("imm")?)?, imm2: FromIr::from_ir(v.field("imm2")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
+            "ExecFromMask" => { v.expect_struct("ExecFromMask")?; Ok(Stmt::ExecFromMask { mask: FromIr::from_ir(v.field("mask")?)? }) }
+            "ExecSelect" => { v.expect_struct("ExecSelect")?; Ok(Stmt::ExecSelect { cond: FromIr::from_ir(v.field("cond")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "AuthorWords" => { v.expect_struct("AuthorWords")?; Ok(Stmt::AuthorWords { words: FromIr::from_ir(v.field("words")?)? }) }
             "GotoIf" => { v.expect_struct("GotoIf")?; Ok(Stmt::GotoIf { cond: FromIr::from_ir(v.field("cond")?)?, key: FromIr::from_ir(v.field("key")?)? }) }
             "Goto" => { v.expect_struct("Goto")?; Ok(Stmt::Goto { key: FromIr::from_ir(v.field("key")?)? }) }
@@ -977,6 +981,8 @@ impl IrIds for Stmt {
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }
             Stmt::Sys { op, imm, imm2, reads } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*imm2), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
+            Stmt::ExecFromMask { mask } => { IrIds::ids(&mut (*mask), fv, fr); }
+            Stmt::ExecSelect { cond, a, b } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Stmt::AuthorWords { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Stmt::GotoIf { cond, key } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*key), fv, fr); }
             Stmt::Goto { key } => { IrIds::ids(&mut (*key), fv, fr); }

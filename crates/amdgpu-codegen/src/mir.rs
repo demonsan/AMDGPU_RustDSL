@@ -131,6 +131,10 @@ pub enum MOp {
     SSys,
     /// gfx1250 `Op::SysVal`: imm = op [7:0] | simm16 [23:8]; dst S1 (GetReg) / S2 (GetPc)
     SSysVal,
+    /// wave32 `s_mov_b32 exec_lo, <mask lo>`: srcs = [the lane-mask register (pair)]
+    SExecFromMask,
+    /// wave32 `s_cselect_b32 exec_lo, a, b`: srcs = [scc value, a, b]
+    SExecSelect,
     VPkMulF32,
     VAddU32,
     VAddCoU32,

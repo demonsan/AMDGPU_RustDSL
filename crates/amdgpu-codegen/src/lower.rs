@@ -3048,6 +3048,26 @@ impl Lowerer {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
                 }
+                Stmt::ExecFromMask { mask } => {
+                    tdm_target()?;
+                    let Opnd::Val(v) = mask else { return Err("exec_from_mask: the mask is a value".into()) };
+                    let r = *self.val.get(v).ok_or("exec_from_mask: mask not lowered")?;
+                    self.touch(&[Src::Reg(r)]);
+                    let mut inst = MInst::new(MOp::SExecFromMask).srcreg(r);
+                    inst.pin = true;
+                    self.push(inst);
+                }
+                Stmt::ExecSelect { cond, a, b } => {
+                    tdm_target()?;
+                    let Opnd::Val(c) = cond else { return Err("exec_select: the condition is a value".into()) };
+                    let rc = *self.val.get(c).ok_or("exec_select: condition not lowered")?;
+                    let (sa, sb) = (self.s_operand(*a)?, self.s_operand(*b)?);
+                    let regs: Vec<Src> = [Src::Reg(rc), sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
+                    self.touch(&regs);
+                    let mut inst = MInst::new(MOp::SExecSelect).srcreg(rc).src(sa).src(sb);
+                    inst.pin = true;
+                    self.push(inst);
+                }
                 Stmt::Sys { op, imm, imm2, reads } => {
                     tdm_target()?;
                     let mut inst = MInst::new(MOp::SSys).imm((*op as i64) | ((*imm as i64 & 0xffff) << 8) | ((*imm2 as i64) << 24));
@@ -3479,7 +3499,7 @@ impl Lowerer {
                 self.pending_smem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::WorkitemId => {
+            Op::WorkitemId | Op::WorkitemIdPacked => {
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VReadPhys).def(d).imm(0));
                 self.val.insert(dst, d);
