@@ -44,6 +44,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
+    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "two tensor operations issued closer together than a measured window need a wait for the tensor counter to drop to at most 10 between them, on every path" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -403,6 +404,20 @@ struct Inst {
     line: usize,
     mn: String,
     ops: String,
+    /// byte address and size when the text is a disassembly (`// 000000001400: D0710001 7C000000 ...`)
+    addr: Option<(u64, u64)>,
+}
+
+/// `// 0000000000001400: BFA20003` -> (address, bytes of the encoding)
+fn disasm_addr(comment: &str) -> Option<(u64, u64)> {
+    let c = comment.trim();
+    let (a, rest) = c.split_once(':')?;
+    let addr = u64::from_str_radix(a.trim(), 16).ok()?;
+    let words = rest.split_whitespace().filter(|w| w.len() == 8 && w.chars().all(|c| c.is_ascii_hexdigit())).count() as u64;
+    if words == 0 {
+        return None;
+    }
+    Some((addr, 4 * words))
 }
 
 fn parse_int(s: &str) -> Option<i64> {
@@ -415,12 +430,22 @@ fn parse_int(s: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-fn lex(asm: &str) -> (Vec<Inst>, Vec<(usize, u32)>) {
+fn lex(asm: &str) -> (Vec<Inst>, Vec<(usize, u32)>, HashMap<String, usize>) {
     let mut insts = Vec::new();
     let mut raw = Vec::new();
+    let mut labels: HashMap<String, usize> = HashMap::default();
     for (i, l) in asm.lines().enumerate() {
-        let l = l.split("//").next().unwrap_or("").trim();
-        if l.is_empty() || l.ends_with(':') {
+        let (l, comment) = match l.split_once("//") {
+            Some((a, b)) => (a.trim(), b),
+            None => (l.trim(), ""),
+        };
+        if l.is_empty() {
+            continue;
+        }
+        if l.ends_with(':') {
+            // a label (a disassembler prints `<name>:` or `address <name>:`): the index of the next instruction
+            let name = l.trim_end_matches(':').rsplit(|c: char| c == '<' || c == '>' || c.is_whitespace()).find(|x| !x.is_empty()).unwrap_or("");
+            labels.insert(name.to_string(), insts.len());
             continue;
         }
         if let Some(r) = l.strip_prefix(".long") {
@@ -438,9 +463,79 @@ fn lex(asm: &str) -> (Vec<Inst>, Vec<(usize, u32)>) {
             Some((a, b)) => (a, b.trim()),
             None => (l, ""),
         };
-        insts.push(Inst { line: i + 1, mn: mn.to_string(), ops: ops.to_string() });
+        insts.push(Inst { line: i + 1, mn: mn.to_string(), ops: ops.to_string(), addr: disasm_addr(comment) });
     }
-    (insts, raw)
+    (insts, raw, labels)
+}
+
+/// Tensor operations closer together than this many instructions (on some path) need a drain wait between them. Measured, not derived: in the 91 vendor code objects of the target (828 consecutive
+/// tensor-operation pairs) every pair closer than 10 instructions has a `s_wait_tensorcnt <= 10` between it and the closest pair without one is 33 instructions apart; the window sits inside that gap
+/// (a conservative 32: a kernel the window rejects is a kernel closer than anything shipping).
+pub const TDM_DRAIN_WINDOW: u32 = 32;
+
+/// GV-1250-TDM-DRAIN over the control-flow graph of the text: a tensor operation reachable on some path from an earlier one, fewer than `TDM_DRAIN_WINDOW` instructions behind it, without an
+/// intervening `s_wait_tensorcnt <= 10`.
+fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
+    if !insts.iter().any(|i| i.mn.starts_with("tensor_")) {
+        return;
+    }
+    const FAR: u32 = u32::MAX;
+    let n = insts.len();
+    let by_addr: HashMap<u64, usize> = insts.iter().enumerate().filter_map(|(i, x)| x.addr.map(|(a, _)| (a, i))).collect();
+    // dist[i]: the fewest instructions between an undrained tensor operation and instruction i over all paths reaching it (FAR: none within the window)
+    let mut dist = vec![FAR; n + 1];
+    let mut seen = vec![false; n + 1];
+    let mut work = vec![0usize];
+    seen[0] = true;
+    let mut reported: HashSet<usize> = HashSet::default();
+    while let Some(i) = work.pop() {
+        if i >= n {
+            continue;
+        }
+        let ins = &insts[i];
+        let d = dist[i];
+        let out = if ins.mn.starts_with("tensor_") {
+            if d != FAR && d < TDM_DRAIN_WINDOW && reported.insert(i) {
+                viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` is {d} instruction(s) behind an earlier tensor operation with no `s_wait_tensorcnt` of at most 10 in between (closer than {TDM_DRAIN_WINDOW})", ins.line, ins.mn));
+            }
+            0
+        } else if ins.mn == "s_wait_tensorcnt" && parse_int(&ins.ops).map(|c| (0..=10).contains(&c)).unwrap_or(false) {
+            FAR
+        } else if d == FAR || d + 1 >= TDM_DRAIN_WINDOW {
+            FAR
+        } else {
+            d + 1
+        };
+        let mut succ: Vec<usize> = Vec::new();
+        let branch = ins.mn == "s_branch" || ins.mn.starts_with("s_cbranch");
+        let falls = !(ins.mn == "s_branch" || ins.mn == "s_endpgm" || ins.mn == "s_setpc_b64");
+        if falls {
+            succ.push(i + 1);
+        }
+        if branch {
+            let target = ins.ops.split(',').next().unwrap_or("").trim();
+            if let Some(t) = labels.get(target) {
+                succ.push(*t);
+            } else if let (Some(off), Some((a, size))) = (parse_int(target), ins.addr) {
+                // a disassembly: the branch offset counts 4-byte words from the next instruction
+                let dest = (a + size) as i64 + off * 4;
+                if let Some(t) = by_addr.get(&(dest as u64)) {
+                    succ.push(*t);
+                }
+            }
+        }
+        for t in succ {
+            if t > n {
+                continue;
+            }
+            // join = the smaller distance; revisit when it shrinks
+            if !seen[t] || out < dist[t] {
+                seen[t] = true;
+                dist[t] = dist[t].min(out);
+                work.push(t);
+            }
+        }
+    }
 }
 
 fn is_dpp(ops: &str) -> bool {
@@ -502,8 +597,9 @@ const BARRIER_MNEMONICS: &[&str] = &["s_barrier_signal", "s_barrier_signal_isfir
 
 /// The final-instruction-stream rules (the text of a kernel as the assembler will see it).
 pub fn verify_asm(asm: &str) -> Vec<Violation> {
-    let (insts, raw) = lex(asm);
+    let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
+    tdm_drain(&insts, &labels, &mut v);
     // clauses: the N + 1 instructions after `s_clause N`
     let mut remaining = 0usize;
     for (k, ins) in insts.iter().enumerate() {
