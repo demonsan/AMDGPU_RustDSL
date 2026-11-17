@@ -463,7 +463,7 @@ pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
 }
 
 /// TRANS co-execution (hardware evidence for the gfx1250 TRANS -> VALU rule): per lane, 8 independent chains x 16 steps; each step is a
-/// TRANS op (exp / rcp / sqrt / rsq / log rotating) whose result the next VALU (add / mul / fma / pk_add pattern) reads right away, so the
+/// TRANS op (rsq / sqrt / sin / cos rotating) whose result the next VALU (add / mul / fma / pk_add pattern) reads right away, so the
 /// compiled code has a TRANS directly followed by its reader at many sites (the emitter puts one v_nop there; the test removes them in a
 /// copy and compares bit for bit). out[tid * 8 + c] = chain c. 512 work-items. Kernargs: out @0.
 pub fn probe_g1250_trans() -> Function {
@@ -474,7 +474,7 @@ pub fn probe_g1250_trans() -> Function {
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
     let tf = b.un(UnOp::CvtF32I32, tid);
-    let ops = [UnOp::ExpF32, UnOp::RcpF32, UnOp::SqrtF32, UnOp::RsqF32, UnOp::LogF32];
+    let ops = [UnOp::RsqF32, UnOp::SqrtF32, UnOp::SinF32, UnOp::CosF32, UnOp::SqrtF32];
     let mut ch: Vec<ValueId> = (0..8).map(|c| b.add_f32(tf, Opnd::F32(1.5 + c as f32 * 0.37))).collect();
     for s in 0..16 {
         for c in 0..8 {
