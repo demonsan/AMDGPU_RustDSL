@@ -58,3 +58,36 @@ pub fn probe_g1250_math() -> Function {
     b.store_global(qo, 0, w, MemTy::B32, false);
     b.finish()
 }
+
+/// TDM: the 12 descriptor words (groups 0 and 1) come from the kernarg segment (offset 16..64, built by the host), one
+/// `tensor_load_to_lds`, its completion wait, the workgroup barrier, then every work-item copies one LDS dword to `out`. `raw`: the same
+/// load as three verbatim instruction words (exact-replay form).
+pub fn probe_g1250_tdm_with(raw: Option<[u32; 3]>) -> Function {
+    let mut b = FnBuilder::new(if raw.is_some() { "probe_g1250_tdm_raw" } else { "probe_g1250_tdm" }, 64);
+    b.arg("out", DType::Ptr, 0, 8);
+    for k in 0..12u32 {
+        b.arg(&format!("d{k}"), DType::I32, 16 + 4 * k, 4);
+    }
+    b.arg_tensor("out", Ext::c(64 * 4));
+    b.lds(4096);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let w: Vec<Opnd> = (0..12u32).map(|k| Opnd::Val(b.let_(Op::KernargI32 { offset: 16 + 4 * k }))).collect();
+    let g0 = b.let_(Op::RsrcCat { words: [w[0], w[1], w[2], w[3]] });
+    let g1 = b.sgpr_cat8([w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]]);
+    match raw {
+        Some(r) => b.tensor_op_raw(true, Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default(), r),
+        None => b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default()),
+    }
+    b.wait_tensor(0);
+    b.barrier();
+    let tid = b.let_(Op::WorkitemId);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let x = b.load_lds(a, MemTy::B32);
+    let qo = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(a) });
+    b.store_global(qo, 0, x, MemTy::B32, false);
+    b.finish()
+}
+
+pub fn probe_g1250_tdm() -> Function {
+    probe_g1250_tdm_with(None)
+}

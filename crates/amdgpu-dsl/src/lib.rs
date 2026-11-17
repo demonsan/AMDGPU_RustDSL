@@ -3541,6 +3541,16 @@ impl FnBuilder {
         self.push_stmt(Stmt::TensorLoadToLds { g0, g1, g2: g23.map(|x| x.0), g3: g23.map(|x| x.1), cpol, raw: None });
     }
 
+    /// gfx1250 TDM load / store whose instruction words are given verbatim (an exact replay; the groups still name what it reads).
+    pub fn tensor_op_raw(&mut self, load: bool, g0: Opnd, g1: Opnd, g23: Option<(Opnd, Opnd)>, cpol: TdmCpol, raw: [u32; 3]) {
+        let (g2, g3) = (g23.map(|x| x.0), g23.map(|x| x.1));
+        self.push_stmt(if load {
+            Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw: Some(raw) }
+        } else {
+            Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw: Some(raw) }
+        });
+    }
+
     /// gfx1250 TDM store (see `Stmt::TensorStoreFromLds`).
     pub fn tensor_store_from_lds(&mut self, g0: Opnd, g1: Opnd, g23: Option<(Opnd, Opnd)>, cpol: TdmCpol) {
         self.push_stmt(Stmt::TensorStoreFromLds { g0, g1, g2: g23.map(|x| x.0), g3: g23.map(|x| x.1), cpol, raw: None });

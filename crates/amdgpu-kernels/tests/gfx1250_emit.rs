@@ -3,7 +3,7 @@
 
 use std::process::Command;
 
-const PROBES: &[&str] = &["probe_g1250_add", "probe_g1250_math"];
+const PROBES: &[&str] = &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm"];
 
 fn clang() -> Option<String> {
     let c = std::env::var("GFX1250_CLANG").unwrap_or_else(|_| "/opt/rocm/llvm/bin/clang".into());
@@ -45,4 +45,23 @@ fn the_probes_assemble_for_gfx1250() {
         assert!(out.status.success(), "{k}:\n{}\n{}", String::from_utf8_lossy(&out.stderr), c.asm);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tensor_ops_are_gfx1250_only() {
+    let f = amdgpu_kernels::kernel_by_name("probe_g1250_tdm").unwrap();
+    let e = amdgpu_codegen::compile(&f).err().expect("gfx950 has no TDM");
+    assert!(e.contains("gfx1250"), "{e}");
+}
+
+/// The exact-replay form: the vendor assembler's words (DMASK / DIM / VADDR4 zero, TH 2) are emitted verbatim; the named form is the node
+/// assembler's spelling of the same operands.
+#[test]
+fn a_raw_tensor_op_is_emitted_verbatim() {
+    let f = amdgpu_kernels::probes::g1250::probe_g1250_tdm_with(Some([0xd0310000, 0x0020_0000, 0x7c7c_2420]));
+    let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap();
+    assert!(c.asm.contains(".long 0xd0310000, 0x00200000, 0x7c7c2420"), "{}", c.asm);
+    let n = amdgpu_codegen::compile_target(&amdgpu_kernels::kernel_by_name("probe_g1250_tdm").unwrap(), "gfx1250").unwrap();
+    assert!(n.asm.lines().any(|l| l.trim_start().starts_with("tensor_load_to_lds s[")), "{}", n.asm);
+    assert!(n.asm.contains("s_wait_tensorcnt 0x0") && n.asm.contains("s_barrier_signal -1"), "{}", n.asm);
 }
