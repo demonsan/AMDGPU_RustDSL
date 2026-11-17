@@ -8,6 +8,7 @@
 // selection), WARMUP (5). Prints `F4GEMM_OK` / `F4GEMM_FAIL ...`, the time and TF/s. Hang safety: every wait is a polled event with a deadline;
 // on expiry the process exits 124 WITHOUT touching the device again (no synchronize / free / reset).
 #include <hip/hip_runtime.h>
+#include "g1250_timing.h"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -136,6 +137,13 @@ int main(int argc, char** argv) {
     hipFunction_t f;
     HC(hipModuleLoad(&mod, co));
     HC(hipModuleGetFunction(&f, mod, kn));
+    // PAIRED mode: CO2 [KERNEL2] = a second kernel of the same ABI, timed alternately with the first on the same buffers (tests/gpu/g1250_timing.h)
+    hipFunction_t f2 = nullptr;
+    if (const char* co2 = getenv("CO2")) {
+        hipModule_t mod2;
+        HC(hipModuleLoad(&mod2, co2));
+        HC(hipModuleGetFunction(&f2, mod2, getenv("KERNEL2") ? getenv("KERNEL2") : kn));
+    }
     hipStream_t s;
     HC(hipStreamCreate(&s));
     HIP_LAUNCH_CONFIG lc{};
@@ -181,15 +189,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    const int warm = envi("WARMUP", 5);
-    for (int i = 0; i < warm; i++) HC(hipDrvLaunchKernelEx(&lc, f, nullptr, cfg));
-    HC(hipEventRecord(e0, s));
-    for (int i = 0; i < iters; i++) HC(hipDrvLaunchKernelEx(&lc, f, nullptr, cfg));
-    HC(hipEventRecord(e1, s));
-    wait_deadline(e1, deadline + (long)iters * 1000, "timed launches");
-    float ms = 0;
-    HC(hipEventElapsedTime(&ms, e0, e1));
-    const double us = 1e3 * ms / iters;
+    // timing: median of SAMPLES samples of back-to-back launches (>= MIN_SAMPLE_MS each), FLUSH=1 evicts the caches before every launch (tests/gpu/g1250_timing.h); `iters` is kept for the command line and ignored
+    (void)iters;
+    const G1250Timing tmg = g1250_time([&](hipStream_t st) { HIP_LAUNCH_CONFIG l2 = lc; l2.hStream = st; HC(hipDrvLaunchKernelEx(&l2, f, nullptr, cfg)); }, s, wait_deadline, deadline);
+    const double us = tmg.median_us;
+    if (f2) {
+        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { HIP_LAUNCH_CONFIG l2 = lc; l2.hStream = st; HC(hipDrvLaunchKernelEx(&l2, f, nullptr, cfg)); }, [&](hipStream_t st) { HIP_LAUNCH_CONFIG l2 = lc; l2.hStream = st; HC(hipDrvLaunchKernelEx(&l2, f2, nullptr, cfg)); }, s, wait_deadline, deadline);
+        std::printf("{\"host\":\"g1250_f4gemm\",\"paired\":true,\"kernel\":\"%s\",\"us\":%.3f,\"us2\":%.3f,\"ratio\":%.4f,\"pair_spread\":%.4f,\"ok\":true}\n", kn, pr.a_us, pr.b_us, pr.ratio_ba, pr.spread_ratio);
+    }
     std::printf("f4gemm M=%d N=%d K=%d: %.2f us %.1f TF/s check rows=%d checked=%ld bad=%ld max_rel=%.3e %s\n", M, N, K, us,
                 2.0 * M * N * (double)K / (us * 1e-6) / 1e12, cr, checked, bad, maxe, bad ? "F4GEMM_FAIL" : "F4GEMM_OK");
     std::printf("{\"host\":\"g1250_f4gemm\",\"kernel\":\"%s\",\"shape\":{\"M\":%d,\"N\":%d,\"K\":%d},\"grid\":[%u,%u,1],\"cluster\":[%d,%d,1],"
