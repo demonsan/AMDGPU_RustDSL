@@ -17,7 +17,10 @@ pub struct Alloc {
     pub scalar: Vec<bool>,
 }
 
-const VGPR_COUNT: usize = crate::target::T.regs.vgpr.count as usize;
+/// VGPRs of the compilation's target (gfx950 256; gfx1250 1024, above v255 through the VGPR MSBs the gfx1250 emitter sets)
+fn vgpr_count() -> usize {
+    crate::target::cur().regs.vgpr.count as usize
+}
 /// AGPRs per wave (a0..a255); arch VGPR + AGPR together must fit the unified 512-register file.
 const AGPR_COUNT: usize = crate::target::agpr_count(crate::target::T) as usize;
 pub const UNIFIED_FILE: u32 = crate::target::unified_total(crate::target::T);
@@ -236,7 +239,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     let plan = Plan::new(m);
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
-    let mut used_v = vec![false; VGPR_COUNT];
+    let mut used_v = vec![false; vgpr_count()];
     let mut used_s = vec![false; SGPR_COUNT];
     for i in 0..V_RESERVED {
         used_v[i] = true;
@@ -263,7 +266,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     if matches!(policy, Policy::TwoPhase) {
         // Per physical register: the (start, end) intervals already placed on it. Wide tuples first (widest, then longest),
         // every placement checked for overlap in time, so a single may sit in a register between two phases of a tuple.
-        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); VGPR_COUNT];
+        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); vgpr_count()];
         for i in 0..V_RESERVED {
             occ[i].push((0, usize::MAX));
         }
@@ -285,7 +288,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut found = None;
             let mut i = lo;
-            while i + width <= VGPR_COUNT {
+            while i + width <= vgpr_count() {
                 let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i);
                 // tuple alignment: the allocator's own rule is width alignment; an explicit pin needs only the ISA's even alignment (gfx90a+:
                 // 64-bit aligned VGPR tuples; the vendor FMHA keeps its S tiles at v[52:67])
@@ -336,7 +339,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                         at = p;
                     }
                 }
-                format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {VGPR_COUNT})")
+                format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {})", vgpr_count())
             })?;
             for k in 0..width {
                 occ[slot + k].extend(my_dw[k].iter().copied());
@@ -1320,12 +1323,12 @@ impl Plan {
     /// VGPR slots `r` (live [s, e]) may not use: other pins live at the same time, assigned separate partners.
     #[allow(clippy::too_many_arguments)]
     fn forbidden(&self, r: VReg, s: usize, e: usize, start: &[usize], end: &[usize], phys: &[u32], m: &MFunction) -> Vec<bool> {
-        let mut f = vec![false; VGPR_COUNT];
+        let mut f = vec![false; vgpr_count()];
         if !self.active {
             return f;
         }
         let mut block = |base: u32, w: u32| {
-            for k in base..(base + w).min(VGPR_COUNT as u32) {
+            for k in base..(base + w).min(vgpr_count() as u32) {
                 f[k as usize] = true;
             }
         };
@@ -1351,11 +1354,11 @@ impl Plan {
         let forbid = self.forbidden(r, s, e, start, end, phys, m);
         let mask: Vec<bool> = used.iter().zip(&forbid).map(|(a, b)| *a || *b).collect();
         let w = c.dwords() as usize;
-        let free = |i: usize| i % w == 0 && i + w <= VGPR_COUNT && (i..i + w).all(|k| !mask[k]);
+        let free = |i: usize| i % w == 0 && i + w <= vgpr_count() && (i..i + w).all(|k| !mask[k]);
         if let Some(b) = self.pins.get(&r) {
             let b = *b as usize;
             // an explicit pin needs only the ISA's even tuple alignment (see the TwoPhase path)
-            if b % 2 == 0 && b + w <= VGPR_COUNT && (b..b + w).all(|k| !mask[k]) {
+            if b % 2 == 0 && b + w <= vgpr_count() && (b..b + w).all(|k| !mask[k]) {
                 return Ok(Some(b));
             }
             return Err(format!("register plan: pin of {} ({c:?}) at v{b} cannot be honoured: the registers are taken by a value live at the same time or by a separate partner", self.name(r)));
