@@ -44,7 +44,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
-    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "two tensor operations issued closer together than a measured window need a wait for the tensor counter to drop to at most 10 between them, on every path" },
+    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation is not reachable from an earlier one, on any path, without a wait for the tensor counter to drop to at most 10 in between (the public compiler's condition for this target)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -468,22 +468,18 @@ fn lex(asm: &str) -> (Vec<Inst>, Vec<(usize, u32)>, HashMap<String, usize>) {
     (insts, raw, labels)
 }
 
-/// Tensor operations closer together than this many instructions (on some path) need a drain wait between them. Measured, not derived: in the 91 vendor code objects of the target (828 consecutive
-/// tensor-operation pairs) every pair closer than 10 instructions has a `s_wait_tensorcnt <= 10` between it and the closest pair without one is 33 instructions apart; the window sits inside that gap
-/// (a conservative 32: a kernel the window rejects is a kernel closer than anything shipping).
-pub const TDM_DRAIN_WINDOW: u32 = 32;
-
-/// GV-1250-TDM-DRAIN over the control-flow graph of the text: a tensor operation reachable on some path from an earlier one, fewer than `TDM_DRAIN_WINDOW` instructions behind it, without an
-/// intervening `s_wait_tensorcnt <= 10`.
+/// GV-1250-TDM-DRAIN, exactly the condition of the public compiler's hazard pass for this target (the feature "needs to keep tensor count low"): a tensor operation (any instruction that
+/// counts on the tensor counter, other than the wait itself) must not be reachable from an earlier tensor operation, on any path of the control-flow graph, without an intervening
+/// `s_wait_tensorcnt` whose immediate is at most 10 (a larger immediate does not cover). There is no distance limit. The source states the condition and no consequence; the rule treats a
+/// violation as an error (see docs/gfx1250-hang-rules.md for why, and for the shipping code objects that deviate).
 fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
     if !insts.iter().any(|i| i.mn.starts_with("tensor_")) {
         return;
     }
-    const FAR: u32 = u32::MAX;
     let n = insts.len();
     let by_addr: HashMap<u64, usize> = insts.iter().enumerate().filter_map(|(i, x)| x.addr.map(|(a, _)| (a, i))).collect();
-    // dist[i]: the fewest instructions between an undrained tensor operation and instruction i over all paths reaching it (FAR: none within the window)
-    let mut dist = vec![FAR; n + 1];
+    // dirty[i]: some path reaches instruction i with a tensor operation issued and not covered since
+    let mut dirty = vec![false; n + 1];
     let mut seen = vec![false; n + 1];
     let mut work = vec![0usize];
     seen[0] = true;
@@ -493,19 +489,15 @@ fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violat
             continue;
         }
         let ins = &insts[i];
-        let d = dist[i];
-        let out = if ins.mn.starts_with("tensor_") {
-            if d != FAR && d < TDM_DRAIN_WINDOW && reported.insert(i) {
-                viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` is {d} instruction(s) behind an earlier tensor operation with no `s_wait_tensorcnt` of at most 10 in between (closer than {TDM_DRAIN_WINDOW})", ins.line, ins.mn));
+        let mut out = dirty[i];
+        if ins.mn.starts_with("tensor_") {
+            if dirty[i] && reported.insert(i) {
+                viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` is reachable from an earlier tensor operation without a `s_wait_tensorcnt` of at most 10 in between", ins.line, ins.mn));
             }
-            0
+            out = true;
         } else if ins.mn == "s_wait_tensorcnt" && parse_int(&ins.ops).map(|c| (0..=10).contains(&c)).unwrap_or(false) {
-            FAR
-        } else if d == FAR || d + 1 >= TDM_DRAIN_WINDOW {
-            FAR
-        } else {
-            d + 1
-        };
+            out = false;
+        }
         let mut succ: Vec<usize> = Vec::new();
         let branch = ins.mn == "s_branch" || ins.mn.starts_with("s_cbranch");
         let falls = !(ins.mn == "s_branch" || ins.mn == "s_endpgm" || ins.mn == "s_setpc_b64");
@@ -528,10 +520,10 @@ fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violat
             if t > n {
                 continue;
             }
-            // join = the smaller distance; revisit when it shrinks
-            if !seen[t] || out < dist[t] {
+            // join = OR; revisit when the state grows
+            if !seen[t] || (out && !dirty[t]) {
                 seen[t] = true;
-                dist[t] = dist[t].min(out);
+                dirty[t] |= out;
                 work.push(t);
             }
         }

@@ -367,11 +367,11 @@ fn nops(n: usize) -> String {
 fn mut_tdm_drain() {
     // two tensor operations in a row
     asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
-    // close together (inside the window), no wait
-    asm_mutation(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(20)), "GV-1250-TDM-DRAIN");
+    // far apart is no excuse: the condition has no distance limit (a hand-scheduled count of the operations in flight is not the compiler's condition)
+    asm_mutation(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(40)), "GV-1250-TDM-DRAIN");
     // a wait that leaves more than 10 in flight does not drain enough
     asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xb\n    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
-    // a loop whose back edge brings an undrained tensor operation close to the next iteration's
+    // a loop whose back edge brings an undrained tensor operation to the next iteration's
     asm_mutation("k:\nBB0:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB0\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
     // one path of an if skips the wait
     asm_mutation("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB2\n    s_wait_tensorcnt 0x0\nBB2:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", "GV-1250-TDM-DRAIN");
@@ -382,8 +382,8 @@ fn pos_tdm_drain() {
     asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xa\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n");
     asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0x0\n    tensor_store_from_lds s[24:27], s[32:39]\n    s_endpgm\n");
     asm_positive("k:\nBB0:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_wait_tensorcnt 0xa\n    s_cbranch_scc1 BB0\n    s_endpgm\n");
-    // far enough apart without a wait (the vendor kernels keep their own count): 33 instructions
-    asm_positive(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(33)));
+    // a wait in between, however far apart
+    asm_positive(&format!("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n{}    s_wait_tensorcnt 0x3\n{}    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n", nops(20), nops(20)));
     // both paths wait
     asm_positive("k:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_cbranch_scc1 BB2\n    s_wait_tensorcnt 0x0\n    s_branch BB3\nBB2:\n    s_wait_tensorcnt 0x2\nBB3:\n    tensor_load_to_lds s[24:27], s[32:39]\n    s_endpgm\n");
     asm_positive(&base_asm());
