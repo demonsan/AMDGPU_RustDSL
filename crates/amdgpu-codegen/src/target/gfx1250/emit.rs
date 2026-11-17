@@ -61,14 +61,19 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     }
     // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
     let plan = super::waits::plan(m, a);
+    // the gfx1250 software hazards (hazards.rs); the shared pass's s_nop wait states are not needed on gfx1250 (all other VALU dependencies
+    // interlock) and are dropped, except the author's in exact mode
+    let hz = super::hazards::plan(m, a);
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
         for (ii, inst) in b.insts.iter().enumerate() {
             let lines = match plan.replace.get(&(bi, ii)) {
                 Some(r) => r.clone(),
+                None if inst.op == MOp::SNop && !m.exact => Vec::new(),
                 None => {
                     let mut v = plan.before.get(&(bi, ii)).cloned().unwrap_or_default();
+                    v.extend(hz.before.get(&(bi, ii)).cloned().unwrap_or_default());
                     v.extend(inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))?);
                     v
                 }
