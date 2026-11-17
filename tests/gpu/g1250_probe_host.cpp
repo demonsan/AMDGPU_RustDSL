@@ -264,10 +264,37 @@ static int run_tdm2d(Kernel& k, const char* kn) {
     return bad_all == 0 ? 0 : 3;
 }
 
+// probe_g1250_tdm_ring: 4 tiles of 16 x 8 f32 (a 32 x 16 tensor) through a 2-slot TDM ring; out[t] = sum over the tiles of element t.
+static int run_tdm_ring(Kernel& k, const char* kn) {
+    std::vector<float> src(4 * 128);
+    for (int i = 0; i < 4 * 128; ++i) src[i] = (float)((i * 37) % 101) - 50.f;
+    float* dsrc;
+    float* dout;
+    HC(hipMalloc(&dsrc, src.size() * 4));
+    HC(hipMalloc(&dout, 128 * 4));
+    HC(hipMemcpy(dsrc, src.data(), src.size() * 4, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0xee, 128 * 4));
+    std::vector<uint8_t> args(16, 0);
+    put64(args, 0, dsrc);
+    put64(args, 8, dout);
+    k.launch(1, 128, args, kn);
+    std::vector<float> o(128);
+    HC(hipMemcpy(o.data(), dout, 128 * 4, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int t = 0; t < 128; ++t) {
+        float ref = 0.f;
+        for (int i = 0; i < 4; ++i) ref += src[i * 128 + t];
+        bad += o[t] != ref;
+    }
+    printf("tdm_ring: 4 tiles, 2 slots: out[0]=%g out[127]=%g bad=%ld %s\n", o[0], o[127], bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"tiles\":4,\"slots\":2},\"bad\":%ld,\"ok\":%s}\n", kn, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : mode == "tdm_ring" ? "probe_g1250_tdm_ring" : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -283,6 +310,7 @@ int main(int argc, char** argv) {
     if (mode == "select") return run_select(k, kn);
     if (mode == "buffer") return run_buffer(k, kn);
     if (mode == "tdm2d") return run_tdm2d(k, kn);
+    if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
