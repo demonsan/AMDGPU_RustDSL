@@ -159,6 +159,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Undef { .. } | Op::Permlane32SwapB { .. } => ResClass::Marker,
         // (s) zero-instruction views / assemblies of SGPR words
         Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } | Op::SgprCat8 { .. } => ResClass::Marker,
+        Op::ReadTtmp { .. } => ResClass::Salu,
         Op::LoadScalar { .. } => ResClass::Salu,
         Op::MemTimeLo { .. } => {
             e.directive = true;
@@ -342,7 +343,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.global_write = true;
             (ResClass::Dma, vec![], false)
         }
-        Stmt::WaitTensor { .. } => {
+        Stmt::WaitTensor { .. } | Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {
             e.fence = true;
             (ResClass::Sync, vec![], false)
         }

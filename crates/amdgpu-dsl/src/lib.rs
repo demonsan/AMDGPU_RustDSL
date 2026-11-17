@@ -719,6 +719,8 @@ pub enum Op {
     RsrcCat { words: [Opnd; 4] },
     /// Eight uniform 32-bit words in consecutive SGPRs (gfx1250: a tensor descriptor's group 1).
     SgprCat8 { words: [Opnd; 8] },
+    /// gfx1250: the trap temporary register `ttmp<idx>` (the architected workgroup / cluster ids: TTMP6 / 7 / 9).
+    ReadTtmp { idx: u8 },
 }
 
 impl Op {
@@ -817,6 +819,7 @@ impl Op {
             Op::PtrCat { .. } => DType::Ptr,
             Op::RsrcCat { .. } => DType::Rsrc,
             Op::SgprCat8 { .. } => DType::Sgpr8,
+            Op::ReadTtmp { .. } => DType::I32,
         }
     }
 
@@ -895,6 +898,7 @@ impl Op {
             Op::PtrCat { lo, hi } => vec![*lo, *hi],
             Op::RsrcCat { words } => words.to_vec(),
             Op::SgprCat8 { words } => words.to_vec(),
+            Op::ReadTtmp { .. } => vec![],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
@@ -1228,6 +1232,32 @@ impl StageContract {
     pub const ANY_PHASE: u32 = u32::MAX;
 }
 
+/// The split dependency counters of gfx1250 (`Stmt::WaitCounter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WaitCtr {
+    Load,
+    Store,
+    Ds,
+    Km,
+    X,
+    Async,
+    Tensor,
+}
+
+impl WaitCtr {
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            WaitCtr::Load => "s_wait_loadcnt",
+            WaitCtr::Store => "s_wait_storecnt",
+            WaitCtr::Ds => "s_wait_dscnt",
+            WaitCtr::Km => "s_wait_kmcnt",
+            WaitCtr::X => "s_wait_xcnt",
+            WaitCtr::Async => "s_wait_asynccnt",
+            WaitCtr::Tensor => "s_wait_tensorcnt",
+        }
+    }
+}
+
 /// Cache policy of a gfx1250 tensor operation: TH (temporal hint, 3 bits), SCOPE (2 bits), NV.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TdmCpol {
@@ -1318,6 +1348,14 @@ pub enum Stmt {
     WaitVm { count: u8 },
     /// gfx1250: wait until at most `count` tensor operations (TENSORcnt) of this wave are outstanding.
     WaitTensor { count: u8 },
+    /// gfx1250: `s_wait_<counter>cnt count` (an explicit wait on one split counter).
+    WaitCounter { counter: WaitCtr, count: u8 },
+    /// gfx1250: `s_barrier_signal id` (-1 workgroup, -3 cluster, 1..16 named).
+    BarrierSignal { id: i8 },
+    /// gfx1250: `s_barrier_wait id`.
+    BarrierWait { id: i8 },
+    /// gfx1250 exact mode: `s_set_vgpr_msb imm` as the author wrote it.
+    SetVgprMsb { imm: u16 },
     /// gfx1250 TDM: `tensor_load_to_lds` with the descriptor groups g0 (4 SGPRs, `Rsrc`), g1 (8, `Sgpr8`) and the optional g2 / g3 (4 each;
     /// both or neither). `raw`: the instruction's three words as written by another assembler (exact replays; the operands still describe
     /// what it reads). Completion: TENSORcnt (`WaitTensor`).
@@ -4513,6 +4551,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
+            Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {

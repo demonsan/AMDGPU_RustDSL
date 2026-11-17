@@ -153,6 +153,15 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         // the split barrier of the workgroup (id -1)
         MOp::SBarrier => vec!["s_barrier_signal -1".to_string(), "s_barrier_wait -1".to_string()],
         MOp::SWaitTensor => vec![format!("s_wait_tensorcnt {:#x}", inst.imm)],
+        MOp::SWaitCtr => {
+            const MN: [&str; 7] = ["s_wait_loadcnt", "s_wait_storecnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_xcnt", "s_wait_asynccnt", "s_wait_tensorcnt"];
+            let c = (inst.imm >> 8) as usize;
+            vec![format!("{} {:#x}", MN.get(c).ok_or("bad counter")?, inst.imm & 0xff)]
+        }
+        MOp::SBarrierSignal => vec![format!("s_barrier_signal {}", inst.imm)],
+        MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
+        MOp::SSetVgprMsb => vec![format!("s_set_vgpr_msb {:#x}", inst.imm)],
+        MOp::SReadTtmp => vec![format!("s_mov_b32 {}, ttmp{}", d_s(), inst.imm)],
         MOp::TensorLoadToLds | MOp::TensorStoreFromLds => {
             let mn = if inst.op == MOp::TensorLoadToLds { "tensor_load_to_lds" } else { "tensor_store_from_lds" };
             let regs: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();

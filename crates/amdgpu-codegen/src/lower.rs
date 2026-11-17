@@ -2891,6 +2891,22 @@ impl Lowerer {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SWaitTensor).imm(*count as i64));
                 }
+                Stmt::WaitCounter { counter, count } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SWaitCtr).imm(((*counter as i64) << 8) | *count as i64));
+                }
+                Stmt::BarrierSignal { id } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SBarrierSignal).imm(*id as i64));
+                }
+                Stmt::BarrierWait { id } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SBarrierWait).imm(*id as i64));
+                }
+                Stmt::SetVgprMsb { imm } => {
+                    tdm_target()?;
+                    self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
+                }
                 Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => {
                     tdm_target()?;
                     let load = matches!(st, Stmt::TensorLoadToLds { .. });
@@ -4082,6 +4098,13 @@ impl Lowerer {
             Op::SgprCat8 { words } => {
                 let d = self.new_vreg(RClass::S8);
                 self.sgpr_words(d, words)?;
+                self.val.insert(dst, d);
+            }
+            Op::ReadTtmp { idx } => {
+                tdm_target()?;
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SReadTtmp).def(d).imm(*idx as i64));
+                self.uniform.insert(dst);
                 self.val.insert(dst, d);
             }
             Op::MovS { a, .. } => {

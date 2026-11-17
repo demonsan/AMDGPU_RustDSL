@@ -603,6 +603,15 @@ pub enum MOp {
     SWaitLgkm,
     /// gfx1250: `s_wait_tensorcnt imm`
     SWaitTensor,
+    /// gfx1250: imm = counter (WaitCtr index) << 8 | count
+    SWaitCtr,
+    /// gfx1250: imm = barrier id
+    SBarrierSignal,
+    SBarrierWait,
+    /// gfx1250: `s_set_vgpr_msb imm`
+    SSetVgprMsb,
+    /// gfx1250: dst = ttmp<imm>
+    SReadTtmp,
     /// gfx1250 TDM: srcs = g0 (S4), g1 (S8)[, g2 (S4), g3 (S4)][, Imm raw word x 3]; imm = cpol (TH bits 0..2, SCOPE bits 3..4, NV bit 5) | RAW_TDM
     TensorLoadToLds,
     TensorStoreFromLds,
