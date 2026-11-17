@@ -4576,6 +4576,39 @@ impl Lowerer {
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
             }
+            Op::Salu { op, a, b } => {
+                tdm_target()?;
+                let wide = *op == amdgpu_dsl::SaluOp::AddNcU64;
+                let opnd = |me: &mut Self, o: Opnd| -> Result<Src, String> {
+                    if wide {
+                        let r = me.s_tuple(o, RClass::S2)?;
+                        Ok(Src::Reg(r))
+                    } else {
+                        me.s_operand(o)
+                    }
+                };
+                let (sa, sb) = (opnd(self, *a)?, opnd(self, *b)?);
+                let regs: Vec<Src> = [sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
+                self.touch(&regs);
+                let d = self.new_vreg(if wide { RClass::S2 } else { RClass::S1 });
+                let mop = match op {
+                    amdgpu_dsl::SaluOp::AddCoI32 => MOp::SAddCoI32,
+                    amdgpu_dsl::SaluOp::SubCoI32 => MOp::SSubCoI32,
+                    amdgpu_dsl::SaluOp::BfeU32 => MOp::SBfeU32,
+                    amdgpu_dsl::SaluOp::Bitset0 => MOp::SBitset0,
+                    amdgpu_dsl::SaluOp::Bitset1 => MOp::SBitset1,
+                    amdgpu_dsl::SaluOp::AddNcU64 => MOp::SAddNcU64,
+                };
+                if matches!(op, amdgpu_dsl::SaluOp::Bitset0 | amdgpu_dsl::SaluOp::Bitset1) {
+                    // in place: the result register starts as a (a copy that vanishes when the author pinned both at one register)
+                    self.push(MInst::new(MOp::SMovB32).def(d).src(sa));
+                    self.push(MInst::new(mop).def(d).srcreg(d).src(sb));
+                } else {
+                    self.push(MInst::new(mop).def(d).src(sa).src(sb));
+                }
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::SwapA { a, b } => {
                 // in place on two registers (as Permlane32SwapA): copies into the result registers vanish when the author pinned them there
                 tdm_target()?;
@@ -5687,6 +5720,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
                         // gfx1250: a preloaded kernarg word, a trap-temporary read; exact: a verbatim SALU instruction
                         Op::KernargPreload { .. } | Op::ReadTtmp { .. } => true,
+                        Op::Salu { a, b, .. } => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
                         Op::Raw { scalar, ty, .. } => {
                             if *scalar && *ty == DType::I1 {
                                 // an SCC result: a uniform condition

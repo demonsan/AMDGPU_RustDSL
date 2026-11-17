@@ -24,10 +24,10 @@ VOPC = ["v_cmp_lt_f32", "v_cmp_le_f32", "v_cmp_gt_f32", "v_cmp_ge_f32", "v_cmp_e
         "v_cmp_neq_f32", "v_cmp_nlt_f32", "v_cmp_nle_f32", "v_cmp_ngt_f32", "v_cmp_nge_f32", "v_cmp_lt_i32", "v_cmp_le_i32", "v_cmp_gt_i32",
         "v_cmp_ge_i32", "v_cmp_eq_i32", "v_cmp_ne_i32", "v_cmp_lt_u32", "v_cmp_le_u32", "v_cmp_gt_u32", "v_cmp_ge_u32", "v_cmp_eq_u32",
         "v_cmp_ne_u32"]
-SOP1 = ["s_mov_b32", "s_mov_b64", "s_barrier_signal", "s_not_b32"]
+SOP1 = ["s_mov_b32", "s_mov_b64", "s_barrier_signal", "s_not_b32", "s_bitset0_b32", "s_bitset1_b32"]
 SOP2 = ["s_add_co_u32", "s_add_co_ci_u32", "s_sub_co_u32", "s_sub_co_ci_u32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32",
         "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32", "s_max_i32", "s_min_u32", "s_max_u32", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32",
-        "s_lshl_b64", "s_lshr_b64", "s_add_co_i32"]
+        "s_lshl_b64", "s_lshr_b64", "s_add_co_i32", "s_sub_co_i32", "s_add_nc_u64"]
 SOPC = ["s_cmp_eq_u32", "s_cmp_lg_u32", "s_cmp_gt_u32", "s_cmp_ge_u32", "s_cmp_lt_u32", "s_cmp_le_u32", "s_cmp_eq_i32", "s_cmp_lg_i32",
         "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32"]
 SOPP = ["s_nop", "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz",
@@ -70,7 +70,7 @@ def samples():
     for m in SOP1:
         s.append((m, "s_barrier_signal -1" if m == "s_barrier_signal" else (f"{m} s[2:3], s[4:5]" if m.endswith("b64") else f"{m} s1, s2")))
     for m in SOP2:
-        s.append((m, f"{m} s[2:3], s[4:5], 1" if m.endswith("b64") else f"{m} s1, s2, s3"))
+        s.append((m, f"{m} s[2:3], s[4:5], 1" if m.endswith("b64") else (f"{m} s[2:3], s[4:5], s[6:7]" if m.endswith("u64") else f"{m} s1, s2, s3")))
     for m in SOPC:
         s.append((m, f"{m} s1, s2"))
     for m in SOPP:

@@ -161,6 +161,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::PtrLo(_) | Op::PtrHi(_) | Op::PtrCat { .. } | Op::RsrcCat { .. } | Op::SgprCat8 { .. } => ResClass::Marker,
         Op::ReadTtmp { .. } => ResClass::Salu,
         Op::Raw { scalar: true, .. } => ResClass::Salu,
+        Op::Salu { .. } => ResClass::Salu,
         Op::Raw { .. } => ResClass::Valu,
         Op::KernargPreload { .. } => ResClass::Marker,
         Op::LoadScalar { .. } => ResClass::Salu,

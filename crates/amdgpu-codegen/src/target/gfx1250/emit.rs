@@ -436,6 +436,26 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
             }
             vec![l]
         }
+        MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 => {
+            let s = |x: &Src| -> Result<String, String> {
+                match x {
+                    Src::Reg(r) => {
+                        let p = a.phys[*r as usize];
+                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { format!("s{p}") })
+                    }
+                    Src::Imm(k) => Ok(format!("{:#x}", *k as u32)),
+                    _ => Err("scalar form: register or constant operands".into()),
+                }
+            };
+            let d = a.phys[inst.dst.ok_or("scalar form without a destination")? as usize];
+            let dn = if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", d, d + 1) } else { format!("s{d}") };
+            let mn = crate::op_attrs::attrs(inst.op).mnemonic;
+            match inst.op {
+                // in place on the destination (= a's register): only the bit operand is written
+                MOp::SBitset0 | MOp::SBitset1 => vec![format!("{mn} {dn}, {}", s(&inst.srcs[1])?)],
+                _ => vec![format!("{mn} {dn}, {}, {}", s(&inst.srcs[0])?, s(&inst.srcs[1])?)],
+            }
+        }
         MOp::VSwapB32 => {
             let r: Vec<u32> = inst.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(a.phys[*r as usize]) } else { None }).collect();
             if r.len() != 2 {

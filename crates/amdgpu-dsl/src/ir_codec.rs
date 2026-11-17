@@ -139,6 +139,7 @@ impl FromIr for Op {
             "VarSlice4" => { v.expect_struct("VarSlice4")?; Ok(Op::VarSlice4 { var: FromIr::from_ir(v.field("var")?)?, idx: FromIr::from_ir(v.field("idx")?)? }) }
             "Permlane32Swap" => { v.expect_struct("Permlane32Swap")?; Ok(Op::Permlane32Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Permlane32SwapA" => { v.expect_struct("Permlane32SwapA")?; Ok(Op::Permlane32SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "Salu" => { v.expect_struct("Salu")?; Ok(Op::Salu { op: FromIr::from_ir(v.field("op")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "SwapA" => { v.expect_struct("SwapA")?; Ok(Op::SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Permlane32SwapB" => { v.expect_struct("Permlane32SwapB")?; Ok(Op::Permlane32SwapB { swap: FromIr::from_ir(v.field("swap")?)? }) }
             "Frag4" => { v.expect_tuple("Frag4", 4)?; Ok(Op::Frag4(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
@@ -279,6 +280,7 @@ impl IrIds for Op {
             Op::VarSlice4 { var, idx } => { fr(&mut (*var)); IrIds::ids(&mut (*idx), fv, fr); }
             Op::Permlane32Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Permlane32SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::Salu { op, a, b } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Permlane32SwapB { swap } => { IrIds::ids(&mut (*swap), fv, fr); }
             Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
@@ -391,6 +393,32 @@ impl IrIds for WmmaScale {
         IrIds::ids(&mut self.sa, fv, fr);
         IrIds::ids(&mut self.sb, fv, fr);
         IrIds::ids(&mut self.b_row1, fv, fr);
+    }
+}
+
+impl FromIr for SaluOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "AddCoI32" => { v.expect_unit("AddCoI32")?; Ok(SaluOp::AddCoI32) }
+            "SubCoI32" => { v.expect_unit("SubCoI32")?; Ok(SaluOp::SubCoI32) }
+            "BfeU32" => { v.expect_unit("BfeU32")?; Ok(SaluOp::BfeU32) }
+            "Bitset0" => { v.expect_unit("Bitset0")?; Ok(SaluOp::Bitset0) }
+            "Bitset1" => { v.expect_unit("Bitset1")?; Ok(SaluOp::Bitset1) }
+            "AddNcU64" => { v.expect_unit("AddNcU64")?; Ok(SaluOp::AddNcU64) }
+            other => Err(v.err(format!("unknown SaluOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for SaluOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            SaluOp::AddCoI32 => {}
+            SaluOp::SubCoI32 => {}
+            SaluOp::BfeU32 => {}
+            SaluOp::Bitset0 => {}
+            SaluOp::Bitset1 => {}
+            SaluOp::AddNcU64 => {}
+        }
     }
 }
 

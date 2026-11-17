@@ -120,6 +120,13 @@ pub enum MOp {
     VPermlane32Swap,
     /// gfx1250 `v_swap_b32 vA, vB`: srcs = [a, b]; writes both (dst = a's register; b's register in place)
     VSwapB32,
+    /// gfx1250 `Op::Salu` forms: srcs = [a, b] (Bitset0/1: the destination is a's register, b the bit; AddNcU64: SGPR pairs)
+    SAddCoI32,
+    SSubCoI32,
+    SBfeU32,
+    SBitset0,
+    SBitset1,
+    SAddNcU64,
     VPkMulF32,
     VAddU32,
     VAddCoU32,

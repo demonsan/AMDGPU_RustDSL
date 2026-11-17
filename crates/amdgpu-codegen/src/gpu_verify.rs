@@ -2748,6 +2748,23 @@ impl<'a> An<'a> {
             },
             Op::MovV { a, .. } | Op::MovS { a, .. } => self.av_of(a),
             Op::AddK { a, k } => AV::Int(self.int_of(a).add(&Itv::konst(*k as i128))),
+            // gfx1250 scalar forms: the add / sub as integers, a bit field in [0, 2^width), a bit set / cleared: any value; a 64-bit add of
+            // a pointer: the pointer at an unknown offset
+            Op::Salu { op, a, b } => match op {
+                amdgpu_dsl::SaluOp::AddCoI32 => AV::Int(self.int_of(a).add(&self.int_of(b))),
+                amdgpu_dsl::SaluOp::BfeU32 => match b {
+                    Opnd::I32(k) => {
+                        let w = ((*k as u32) >> 16) & 0x7f;
+                        AV::Int(if w < 32 { Itv { lo: Itv::konst(0).lo, hi: Itv::konst((1i128 << w) - 1).hi } } else { Itv::top() })
+                    }
+                    _ => AV::Int(Itv::top()),
+                },
+                amdgpu_dsl::SaluOp::AddNcU64 => match self.av_of(a) {
+                    AV::Ptr { arg, .. } => AV::Ptr { arg, off: Itv::top() },
+                    _ => AV::Ptr { arg: None, off: Itv::top() },
+                },
+                _ => AV::Int(Itv::top()),
+            },
             // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
             Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),
             // a clock reading: any 32-bit value

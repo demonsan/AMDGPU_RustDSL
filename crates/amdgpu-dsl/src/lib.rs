@@ -643,6 +643,8 @@ pub enum Op {
     /// `v_permlane32_swap_b32 vA, vB` in place on two separate registers (exact mode): the value is the new content of a's register;
     /// `Permlane32SwapB` names the new content of b's register (the same instruction).
     Permlane32SwapA { a: Opnd, b: Opnd },
+    /// gfx1250 scalar forms with their own semantics (`SaluOp`): one SALU instruction, the result in an SGPR (a pair for `AddNcU64`).
+    Salu { op: SaluOp, a: Opnd, b: Opnd },
     /// `v_swap_b32 vA, vB` (gfx1250) in place on two registers: the value is the new content of a's register (= b), `Permlane32SwapB`
     /// names the new content of b's register (= a).
     SwapA { a: Opnd, b: Opnd },
@@ -822,6 +824,8 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Wmma { kind, .. } => kind.acc_ty(),
             Op::Raw { ty, .. } => *ty,
+            Op::Salu { op: SaluOp::AddNcU64, .. } => DType::Ptr,
+            Op::Salu { .. } => DType::I32,
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
@@ -969,6 +973,7 @@ impl Op {
                 v
             }
             Op::Raw { reads, .. } => reads.clone(),
+            Op::Salu { a, b, .. } => vec![*a, *b],
             Op::Wmma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
@@ -4342,6 +4347,47 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
     }
     for (u, _, at) in units {
         errs.push(format!("stmt {at}: unit {u} is never closed"));
+    }
+}
+
+/// The scalar forms of `Op::Salu` (gfx1250 SALU; each one instruction, wave-uniform operands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SaluOp {
+    /// `s_add_co_i32 d, a, b`: a + b (32-bit wrap; SCC = signed overflow)
+    AddCoI32,
+    /// `s_sub_co_i32 d, a, b`: a - b (32-bit wrap; SCC = signed overflow)
+    SubCoI32,
+    /// `s_bfe_u32 d, a, b`: (a >> b[4:0]) & ((1 << b[22:16]) - 1) (width 0 = 0; SCC = result != 0)
+    BfeU32,
+    /// `s_bitset0_b32 d, b` with d = a in place: a & !(1 << (b & 31))
+    Bitset0,
+    /// `s_bitset1_b32 d, b` with d = a in place: a | (1 << (b & 31))
+    Bitset1,
+    /// `s_add_nc_u64 d, a, b`: 64-bit a + b (no carry out; SCC unchanged)
+    AddNcU64,
+}
+
+impl SaluOp {
+    /// The 32-bit semantics (`AddNcU64`: the 64-bit sum of the zero-extended operands, truncated).
+    pub fn eval(self, a: u64, b: u64) -> u64 {
+        let (a32, b32) = (a as u32, b as u32);
+        match self {
+            SaluOp::AddCoI32 => a32.wrapping_add(b32) as u64,
+            SaluOp::SubCoI32 => a32.wrapping_sub(b32) as u64,
+            SaluOp::BfeU32 => {
+                let (off, w) = (b32 & 31, (b32 >> 16) & 0x7f);
+                if w == 0 {
+                    0
+                } else if w >= 32 {
+                    (a32 >> off) as u64
+                } else {
+                    ((a32 >> off) & ((1u32 << w) - 1)) as u64
+                }
+            }
+            SaluOp::Bitset0 => (a32 & !(1u32 << (b32 & 31))) as u64,
+            SaluOp::Bitset1 => (a32 | (1u32 << (b32 & 31))) as u64,
+            SaluOp::AddNcU64 => a.wrapping_add(b),
+        }
     }
 }
 
