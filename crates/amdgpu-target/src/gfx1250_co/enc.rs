@@ -63,8 +63,16 @@ fn parse_num(t: &str) -> Option<i64> {
         Some(r) => (true, r),
         None => (false, t),
     };
-    let v = if let Some(h) = b.strip_prefix("0x") { i64::from_str_radix(h, 16).ok()? } else { b.parse::<i64>().ok()? };
-    Some(if neg { -v } else { v })
+    if let Some(h) = b.strip_prefix("0x") {
+        let v = i64::from_str_radix(h, 16).ok()?;
+        return Some(if neg { -v } else { v });
+    }
+    if let Ok(v) = b.parse::<i64>() {
+        return Some(if neg { -v } else { v });
+    }
+    // a float operand: its f32 bit pattern
+    let f = b.parse::<f32>().ok()?;
+    Some((if neg { -f } else { f }).to_bits() as i64)
 }
 
 fn parse_inst(line: &str) -> Result<Inst, String> {
@@ -191,8 +199,14 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
     }
     let i = parse_inst(t)?;
     let base = i.mn.strip_suffix("_e32").or_else(|| i.mn.strip_suffix("_e64")).unwrap_or(&i.mn);
-    let e64 = i.mn.ends_with("_e64");
+    let mut e64 = i.mn.ends_with("_e64");
     let (fmt, op) = lookup(base).ok_or_else(|| format!("`{t}`: mnemonic not in the gfx1250 encoder tables"))?;
+    // no explicit suffix: the e32 form when the operands allow it (VOP2 / VOPC: the second source a VGPR, no negation), else VOP3
+    if !e64 && !i.mn.ends_with("_e32") && matches!(fmt, "VOP2" | "VOPC") {
+        let srcs: Vec<&(Op, bool)> = i.ops.iter().filter(|o| o.0 != Op::Special(106)).collect();
+        let k = if fmt == "VOP2" { 2 } else { 1 };
+        e64 = srcs.iter().any(|o| o.1) || !matches!(srcs.get(k).map(|o| &o.0), Some(Op::V(..)));
+    }
     let mut out = Vec::new();
     match fmt {
         "SOP1" => {
@@ -306,7 +320,8 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                 }, i.ops[1..].to_vec())
             };
             let sd = if vop3b { sdst(op_at(&i, 1)?)? } else { 0 };
-            let mut enc = [0u32; 3];
+            // (an unused source field holds the inline constant 0)
+            let mut enc = [128u32; 3];
             let mut neg = 0u32;
             let mut lit = None;
             for (k, (o, n)) in srcs.iter().enumerate().take(3) {
