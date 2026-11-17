@@ -72,3 +72,31 @@ fn the_emitted_lines_encode_like_llvm_mc() {
     }
     assert!(bad.is_empty(), "{} of {} lines differ:\n{}", bad.len(), lines.len(), bad.join("\n"));
 }
+
+/// Whole functions: the encoder's bytes of each probe equal the `.text` section clang assembles from the same text (branches and labels
+/// included; the code object itself is clang's for now).
+#[test]
+fn whole_probes_encode_like_clang() {
+    let Some(mc) = mc() else { return };
+    let bin = std::path::Path::new(&mc).parent().unwrap().to_path_buf();
+    let dir = std::env::temp_dir().join(format!("g1250_enc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for k in amdgpu_kernels::gfx1250_kernel_names() {
+        let f = amdgpu_kernels::kernel_by_name(k).unwrap();
+        let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap();
+        let (s, o, t) = (dir.join(format!("{k}.s")), dir.join(format!("{k}.o")), dir.join(format!("{k}.text")));
+        std::fs::write(&s, &c.asm).unwrap();
+        let st = Command::new(bin.join("clang"))
+            .args(["-x", "assembler", "-target", "amdgcn-amd-amdhsa", "-mcpu=gfx1250", "-c"])
+            .arg(&s).arg("-o").arg(&o).status().unwrap();
+        assert!(st.success(), "{k}: clang");
+        let st = Command::new(bin.join("llvm-objcopy")).args(["-O", "binary", "--only-section=.text"]).arg(&o).arg(&t).status().unwrap();
+        assert!(st.success(), "{k}: objcopy");
+        let want = std::fs::read(&t).unwrap();
+        let body: String = c.asm.lines().take_while(|l| !l.starts_with(".size")).collect::<Vec<_>>().join("\n");
+        let got = amdgpu_codegen::amdgpu_target::gfx1250_co::encode_text(&body).unwrap_or_else(|e| panic!("{k}: {e}"));
+        assert_eq!(got, want[..got.len().min(want.len())].to_vec(), "{k}: .text differs");
+        assert!(want[got.len()..].iter().all(|b| *b == 0), "{k}: clang has more code");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
