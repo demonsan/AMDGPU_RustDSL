@@ -3,7 +3,6 @@
 
 use std::process::Command;
 
-const PROBES: &[&str] = &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm"];
 
 fn clang() -> Option<String> {
     let c = std::env::var("GFX1250_CLANG").unwrap_or_else(|_| "/opt/rocm/llvm/bin/clang".into());
@@ -16,7 +15,7 @@ fn clang() -> Option<String> {
 
 #[test]
 fn the_probes_compile_for_gfx1250() {
-    for k in PROBES {
+    for k in amdgpu_kernels::gfx1250_kernel_names() {
         let f = amdgpu_kernels::kernel_by_name(k).unwrap();
         let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(c.asm.contains(".amdhsa_wavefront_size32 1"), "{k}");
@@ -29,7 +28,7 @@ fn the_probes_assemble_for_gfx1250() {
     let Some(cl) = clang() else { return };
     let dir = std::env::temp_dir().join(format!("g1250_emit_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for k in PROBES {
+    for k in amdgpu_kernels::gfx1250_kernel_names() {
         let f = amdgpu_kernels::kernel_by_name(k).unwrap();
         let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap();
         let s = dir.join(format!("{k}.s"));

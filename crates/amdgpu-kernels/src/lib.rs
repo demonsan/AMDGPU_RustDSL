@@ -26,4 +26,4 @@ pub mod compose_facts_gen;
 pub mod ladder_hints;
 pub mod reachable;
 
-pub use registry::{kernel_by_name, kernel_names};
+pub use registry::{gfx1250_kernel_names, kernel_by_name, kernel_names};
