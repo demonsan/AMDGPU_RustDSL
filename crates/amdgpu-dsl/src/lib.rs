@@ -1456,6 +1456,16 @@ pub enum Stmt {
     TensorLoadToLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
     /// Exact mode only: one instruction emitted verbatim that defines no value (see `Op::Raw`); `reads` for the analyses.
     Raw { text: String, reads: Vec<Opnd> },
+    /// Exact mode only: the code from here on is the author's basic block `key` (its position in the author's layout). The exact
+    /// emission lays the blocks out in key order, whatever the structure's own order (a block boundary, no instruction).
+    LayoutKey { key: u32 },
+    /// Exact mode only: when `cond` holds, continue at the block of `LayoutKey { key }`. The target is FORWARD and in the same structured
+    /// region (the same arm of the same `if`, the same loop body, or the top level): the blocks of a region with gotos form a DAG; loops
+    /// stay structured (no goto into, out of, or around a loop's back edge). `verify` enforces both.
+    GotoIf { cond: Opnd, key: u32 },
+    /// Exact mode only: continue at the block of `LayoutKey { key }` (forward, same region; see `GotoIf`). The code after it up to the
+    /// next `LayoutKey` is reached only through a goto.
+    Goto { key: u32 },
     /// gfx1250 TDM: `tensor_store_from_lds` (operands as `TensorLoadToLds`).
     TensorStoreFromLds { g0: Opnd, g1: Opnd, g2: Option<Opnd>, g3: Option<Opnd>, cpol: TdmCpol, raw: Option<[u32; 3]> },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
@@ -2491,6 +2501,19 @@ impl FnBuilder {
     /// `begin_if` whose then-branch is rarely taken (a rollback / overflow path): the hint lets the back end lay the branch out of the hot
     /// path (lowering token `coldlayout`); without the token it changes nothing.
     /// Exact authored mode for the whole kernel (docs/exact-mode.md).
+    /// Exact mode: the author's block `key` starts here (`Stmt::LayoutKey`).
+    pub fn layout_key(&mut self, key: u32) {
+        self.push_stmt(Stmt::LayoutKey { key });
+    }
+    /// Exact mode: a forward goto to the block of `key` when `cond` holds (`Stmt::GotoIf`).
+    pub fn goto_if(&mut self, cond: impl Into<Opnd>, key: u32) {
+        self.push_stmt(Stmt::GotoIf { cond: cond.into(), key });
+    }
+    /// Exact mode: a forward goto to the block of `key` (`Stmt::Goto`).
+    pub fn goto(&mut self, key: u32) {
+        self.push_stmt(Stmt::Goto { key });
+    }
+
     pub fn exact(&mut self) {
         self.f.exact = true;
     }
@@ -4168,12 +4191,59 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
     }
 }
 
+/// The exact-mode gotos (`Stmt::GotoIf` / `Stmt::Goto`): each target `LayoutKey` exists once, lies AFTER the goto and in the same
+/// structured region (same arm of the same if, same loop body, or the top level). So a region's blocks form a DAG and loops stay structured.
+pub fn check_gotos(f: &Function) -> Vec<String> {
+    let stmts = f.stmts();
+    // region of each statement: (the opening statement of the innermost if / loop, the arm); the top level is (usize::MAX, 0)
+    let mut stack: Vec<(usize, u8)> = vec![(usize::MAX, 0)];
+    let mut keys: std::collections::HashMap<u32, (usize, (usize, u8))> = std::collections::HashMap::new();
+    let mut gotos: Vec<(usize, u32, (usize, u8))> = Vec::new();
+    let mut errs = Vec::new();
+    for (i, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::BeginIf { .. } | Stmt::BeginLoop { .. } => stack.push((i, 0)),
+            Stmt::Else => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 = 1;
+                }
+            }
+            Stmt::EndIf | Stmt::EndLoop => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            Stmt::LayoutKey { key } => {
+                if keys.insert(*key, (i, *stack.last().unwrap())).is_some() {
+                    errs.push(format!("stmt {i}: layout key {key} declared twice"));
+                }
+            }
+            Stmt::GotoIf { key, .. } | Stmt::Goto { key } => gotos.push((i, *key, *stack.last().unwrap())),
+            _ => {}
+        }
+    }
+    for (i, key, region) in gotos {
+        match keys.get(&key) {
+            None => errs.push(format!("stmt {i}: goto to layout key {key}, which no LayoutKey declares")),
+            Some(&(t, _)) if t <= i => errs.push(format!("stmt {i}: goto to layout key {key} (stmt {t}) is backward: only forward gotos (a loop is a structured loop)")),
+            Some(&(t, r)) if r != region => {
+                errs.push(format!("stmt {i}: goto to layout key {key} (stmt {t}) leaves its structured region (into / out of an if arm or a loop body)"))
+            }
+            _ => {}
+        }
+    }
+    errs
+}
+
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
     check_var_slices(f, &mut errs);
     check_undef_reads(f, &mut errs);
     check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
+    if f.exact {
+        errs.extend(check_gotos(f));
+    }
     if let Some(p) = &f.plan {
         errs.extend(plan::verify(p));
     }
@@ -4695,6 +4765,21 @@ pub fn verify(f: &Function) -> Vec<String> {
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
             Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
+            Stmt::LayoutKey { .. } | Stmt::Goto { .. } => {
+                if !f.exact {
+                    errs.push(here("a layout key / goto outside exact mode".to_string()));
+                }
+            }
+            Stmt::GotoIf { cond, .. } => {
+                if !f.exact {
+                    errs.push(here("a goto outside exact mode".to_string()));
+                }
+                match opnd_ty(f, *cond) {
+                    Ok(DType::I1) => {}
+                    Ok(t) => errs.push(here(format!("goto condition: expected i1, found {}", t.name()))),
+                    Err(e) => errs.push(here(e)),
+                }
+            }
             Stmt::Raw { text, reads } => {
                 if !f.exact {
                     errs.push(here(format!("raw instruction `{text}` outside exact mode")));
@@ -5197,6 +5282,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } | Stmt::DeclareVars { init, .. } => init.clone(),
         Stmt::Raw { reads, .. } => reads.clone(),
+        Stmt::GotoIf { cond, .. } => vec![*cond],
         Stmt::TensorLoadToLds { g0, g1, g2, g3, .. } | Stmt::TensorStoreFromLds { g0, g1, g2, g3, .. } => {
             let mut v = vec![*g0, *g1];
             v.extend(g2.iter().copied());

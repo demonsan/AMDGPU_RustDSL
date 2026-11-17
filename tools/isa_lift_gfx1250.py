@@ -91,6 +91,10 @@ def parse(path):
         if r['addr'] in targets:
             sec = f'L{r["addr"]:x}'
         op, args, mods = r['op'], list(r['args']), list(r['mods'])
+        if op == 's_code_end':
+            # the toolchain's padding after the code: kd "code_end_pad", not instructions of the kernel
+            i += 1
+            continue
         if op == 's_set_vgpr_msb':
             msb = int(args[0], 0) & 0xFF
         words = list(r['words'])

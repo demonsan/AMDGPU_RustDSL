@@ -563,6 +563,8 @@ struct Lowerer {
     scc_i1: HashSet<ValueId>,
     /// exact mode: unpinned adds whose readers may evaluate them in place (offset folding through a variable operand)
     fold_ok: HashSet<ValueId>,
+    /// exact mode: the block label of each layout key (gotos and `LayoutKey`)
+    key_labels: HashMap<u32, u32>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
     /// exact mode: the values the author pinned
@@ -683,6 +685,7 @@ impl Lowerer {
             mask_vcc: HashSet::new(),
             scc_i1: HashSet::new(),
             fold_ok: HashSet::new(),
+            key_labels: HashMap::new(),
             m0_adds: HashSet::new(),
             e64_next: false,
             exact_pinned: HashSet::new(),
@@ -1974,6 +1977,16 @@ impl Lowerer {
         r
     }
 
+    /// (exact) The block label of the author's block `key` (allocated at its first goto or at its `LayoutKey`).
+    fn key_label(&mut self, key: u32) -> u32 {
+        if let Some(l) = self.key_labels.get(&key) {
+            return *l;
+        }
+        let l = self.fresh_label();
+        self.key_labels.insert(key, l);
+        l
+    }
+
     /// (exact) A verbatim instruction: its text in the function's table, its reads as sources (registers only; constants are part of the
     /// text), pinned in program order.
     fn raw_inst(&mut self, text: &str, reads: &[Opnd]) -> Result<MInst, String> {
@@ -2888,6 +2901,39 @@ impl Lowerer {
                 let n = self.anchor_ids.len() as u32;
                 let id = *self.anchor_ids.entry(anchor.clone()).or_insert(n);
                 self.next_if_place = Some(id);
+            }
+            Stmt::LayoutKey { key } => {
+                if !self.exact {
+                    return Err("a layout key outside exact mode".into());
+                }
+                // a block boundary: the author's block `key` (a goto's target has its label already)
+                let l = self.key_label(*key);
+                self.set_term(Term::Goto(l));
+                self.start_block(l);
+                self.mir.reg_hints.layout_keys.push((l, *key));
+                // the block may have several entries (gotos): no lowering cache of one path holds on another
+                self.converted.clear();
+            }
+            Stmt::GotoIf { cond, key } => {
+                if !self.exact {
+                    return Err("a goto outside exact mode".into());
+                }
+                let (on, srcs) = self.lower_condition(*cond, false)?;
+                self.touch(&srcs);
+                let target = self.key_label(*key);
+                let fall = self.fresh_label();
+                self.set_term(Term::CondGoto { on, target, fall });
+                self.start_block(fall);
+            }
+            Stmt::Goto { key } => {
+                if !self.exact {
+                    return Err("a goto outside exact mode".into());
+                }
+                let target = self.key_label(*key);
+                self.set_term(Term::Goto(target));
+                // the code up to the next layout key is reached by a goto only (or not at all)
+                let dead = self.fresh_label();
+                self.start_block(dead);
             }
             Stmt::LayoutAnchor { name } => {
                 // a block boundary (no instruction: the edge falls through) where the anchored out-of-line branches are laid out

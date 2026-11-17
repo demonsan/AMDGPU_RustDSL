@@ -116,8 +116,51 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str("    v_nop\n");
         out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
     }
-    for (bi, b) in m.blocks.iter().enumerate() {
-        let next_label = m.blocks.get(bi + 1).map(|n| n.label);
+    // exact mode: the author's block order (`Stmt::LayoutKey`); an unkeyed block stays right after the block before it
+    let order: Vec<usize> = if m.exact && !m.reg_hints.layout_keys.is_empty() {
+        let key: std::collections::HashMap<u32, u32> = m.reg_hints.layout_keys.iter().map(|(l, k)| (*l, *k)).collect();
+        let mut cur = (0u32, 0u32);
+        let mut ks: Vec<((u32, u32), usize)> = Vec::new();
+        for (i, b) in m.blocks.iter().enumerate() {
+            cur = match key.get(&b.label) {
+                // (sub-key 1: an unkeyed block before it - the entry - stays first; the unkeyed blocks after it follow with 2, 3, ..)
+                Some(k) => (*k, 1),
+                None => (cur.0, cur.1 + 1),
+            };
+            ks.push((cur, i));
+        }
+        ks.sort_by_key(|x| x.0);
+        ks.into_iter().map(|x| x.1).collect()
+    } else {
+        (0..m.blocks.len()).collect()
+    };
+    let keyed = order.len() == m.blocks.len() && m.exact && !m.reg_hints.layout_keys.is_empty();
+    // keyed layout: blocks without instructions that only jump on are not laid out; every edge goes to its final block
+    let thru: std::collections::HashMap<u32, u32> = if keyed {
+        let has_key: std::collections::HashSet<u32> = m.reg_hints.layout_keys.iter().map(|(l, _)| *l).collect();
+        m.blocks
+            .iter()
+            .filter_map(|b| match (&b.term, b.insts.is_empty() && !has_key.contains(&b.label)) {
+                (Term::Goto(t), true) => Some((b.label, *t)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    let fin = |mut l: u32| {
+        for _ in 0..64 {
+            match thru.get(&l) {
+                Some(&n) if n != l => l = n,
+                _ => break,
+            }
+        }
+        l
+    };
+    let order: Vec<usize> = order.into_iter().filter(|&i| !thru.contains_key(&m.blocks[i].label)).collect();
+    for (oi, &bi) in order.iter().enumerate() {
+        let b = &m.blocks[bi];
+        let next_label = order.get(oi + 1).map(|&n| m.blocks[n].label);
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? {
@@ -127,9 +170,23 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                 out.push('\n');
             }
         }
-        match &b.term {
+        let term = match &b.term {
+            Term::Goto(t) => Term::Goto(fin(*t)),
+            Term::CondGoto { on, target, fall } => {
+                let (tg, fl) = (fin(*target), fin(*fall));
+                if tg == fl {
+                    Term::Goto(tg)
+                } else {
+                    Term::CondGoto { on: *on, target: tg, fall: fl }
+                }
+            }
+            x => x.clone(),
+        };
+        match &term {
             Term::Goto(t) => {
-                if !(m.elide_fallthrough && next_label == Some(*t)) {
+                // (an author's block that is only its branch keeps it, even to the next block: the author wrote it)
+                let only_branch = keyed && b.insts.is_empty();
+                if only_branch || !((m.elide_fallthrough || keyed) && next_label == Some(*t)) {
                     out.push_str(&format!("    s_branch BB{t}\n"))
                 }
             }
@@ -140,9 +197,20 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                     Pred::Vccnz => "s_cbranch_vccnz",
                     Pred::Vccz => "s_cbranch_vccz",
                 };
-                out.push_str(&format!("    {br} BB{target}\n"));
-                if !(m.elide_fallthrough && next_label == Some(*fall)) {
-                    out.push_str(&format!("    s_branch BB{fall}\n"));
+                if keyed && next_label == Some(*target) && next_label != Some(*fall) {
+                    // the author's layout puts the taken side next: the inverse branch to the other side, nothing else
+                    let inv = match on {
+                        Pred::Scc0 => "s_cbranch_scc1",
+                        Pred::Scc1 => "s_cbranch_scc0",
+                        Pred::Vccnz => "s_cbranch_vccz",
+                        Pred::Vccz => "s_cbranch_vccnz",
+                    };
+                    out.push_str(&format!("    {inv} BB{fall}\n"));
+                } else {
+                    out.push_str(&format!("    {br} BB{target}\n"));
+                    if !((m.elide_fallthrough || keyed) && next_label == Some(*fall)) {
+                        out.push_str(&format!("    s_branch BB{fall}\n"));
+                    }
                 }
             }
             Term::Endpgm => out.push_str("    s_endpgm\n"),

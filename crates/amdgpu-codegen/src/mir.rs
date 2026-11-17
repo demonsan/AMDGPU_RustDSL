@@ -884,6 +884,8 @@ pub struct RegHints {
     pub pins_s: Vec<(VReg, u32)>,
     /// exact mode: the texts of the verbatim instructions (`MOp::RawInst`, by its `imm`)
     pub raw_texts: Vec<String>,
+    /// exact mode: (block label, the author's layout key) of the blocks a `Stmt::LayoutKey` started
+    pub layout_keys: Vec<(u32, u32)>,
     pub share: Vec<Vec<VReg>>,
     pub separate: Vec<Vec<VReg>>,
     /// (region name, arch VGPR cap, AGPR cap)

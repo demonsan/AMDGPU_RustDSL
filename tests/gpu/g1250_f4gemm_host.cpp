@@ -159,6 +159,13 @@ int main(int argc, char** argv) {
     wait_deadline(e1, deadline, "first launch");
     std::vector<uint16_t> D((size_t)M * N);
     HC(hipMemcpy(D.data(), dD, D.size() * 2, hipMemcpyDeviceToHost));
+    // a hash of the whole output (FNV-1a 64): two code objects on the same inputs give the same hash exactly when every output bit agrees
+    uint64_t dhash = 1469598103934665603ull;
+    for (uint16_t x : D) {
+        dhash = (dhash ^ (x & 0xff)) * 1099511628211ull;
+        dhash = (dhash ^ (x >> 8)) * 1099511628211ull;
+    }
+    std::printf("output hash %016llx\n", (unsigned long long)dhash);
 
     // reference on sampled rows (fp32)
     const int cr = std::min(M, envi("CHECK_ROWS", 16));

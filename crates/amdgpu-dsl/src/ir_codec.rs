@@ -798,6 +798,9 @@ impl FromIr for Stmt {
             "SetVgprMsb" => { v.expect_struct("SetVgprMsb")?; Ok(Stmt::SetVgprMsb { imm: FromIr::from_ir(v.field("imm")?)? }) }
             "TensorLoadToLds" => { v.expect_struct("TensorLoadToLds")?; Ok(Stmt::TensorLoadToLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
+            "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
+            "GotoIf" => { v.expect_struct("GotoIf")?; Ok(Stmt::GotoIf { cond: FromIr::from_ir(v.field("cond")?)?, key: FromIr::from_ir(v.field("key")?)? }) }
+            "Goto" => { v.expect_struct("Goto")?; Ok(Stmt::Goto { key: FromIr::from_ir(v.field("key")?)? }) }
             "TensorStoreFromLds" => { v.expect_struct("TensorStoreFromLds")?; Ok(Stmt::TensorStoreFromLds { g0: FromIr::from_ir(v.field("g0")?)?, g1: FromIr::from_ir(v.field("g1")?)?, g2: FromIr::from_ir(v.field("g2")?)?, g3: FromIr::from_ir(v.field("g3")?)?, cpol: FromIr::from_ir(v.field("cpol")?)?, raw: FromIr::from_ir(v.field("raw")?)? }) }
             "LoadGlobalLds" => { v.expect_struct("LoadGlobalLds")?; Ok(Stmt::LoadGlobalLds { base: FromIr::from_ir(v.field("base")?)?, lds_addr: FromIr::from_ir(v.field("lds_addr")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "SetVar" => { v.expect_struct("SetVar")?; Ok(Stmt::SetVar { var: FromIr::from_ir(v.field("var")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
@@ -884,6 +887,9 @@ impl IrIds for Stmt {
             Stmt::SetVgprMsb { imm } => { IrIds::ids(&mut (*imm), fv, fr); }
             Stmt::TensorLoadToLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
+            Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }
+            Stmt::GotoIf { cond, key } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*key), fv, fr); }
+            Stmt::Goto { key } => { IrIds::ids(&mut (*key), fv, fr); }
             Stmt::TensorStoreFromLds { g0, g1, g2, g3, cpol, raw } => { IrIds::ids(&mut (*g0), fv, fr); IrIds::ids(&mut (*g1), fv, fr); IrIds::ids(&mut (*g2), fv, fr); IrIds::ids(&mut (*g3), fv, fr); IrIds::ids(&mut (*cpol), fv, fr); IrIds::ids(&mut (*raw), fv, fr); }
             Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*lds_addr), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Stmt::SetVar { var, value } => { fr(&mut (*var)); IrIds::ids(&mut (*value), fv, fr); }

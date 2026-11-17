@@ -1446,6 +1446,9 @@ def emit_kernel(path, exact, plan=None):
         L.lgkm = []
         if b == 0:
             ENTRY_HW(L, live_in[0])
+        if '--layout-keys' in sys.argv:
+            # the author's block position (exact emission lays the blocks out in this order)
+            L.lines.append(f'LayoutKey {{ key: {s} }}')
         body = ins[s:e]
         last = body[-1][1]
         run = body[:-1] if last.startswith(('s_cbranch', 's_branch')) else body
@@ -1544,7 +1547,85 @@ def emit_kernel(path, exact, plan=None):
                 if f'exit_if_{name}' in anchors:
                     L.lines.append(f'LayoutAnchor {{ name: "exit_if_{name}" }}')
             i += 1
-    emit(tree)
+    def loops_of(nodes, out):
+        # the outermost loop nodes of a tree
+        for nd in nodes:
+            if nd[0] == 'loop':
+                out.append(nd)
+            elif nd[0] == 'if':
+                loops_of(nd[2], out)
+                loops_of(nd[3], out)
+            elif nd[0] in ('exit_if', 'cold_if'):
+                loops_of(nd[2], out)
+                if len(nd) > 3 and nd[3]:
+                    loops_of(nd[3], out)
+        return out
+
+    def blocks_of(nodes, out):
+        for nd in nodes:
+            if nd[0] == 'block':
+                out.add(nd[1])
+            elif nd[0] == 'loop':
+                out.add(nd[1])
+                blocks_of(nd[2], out)
+            elif nd[0] == 'if':
+                blocks_of(nd[2], out)
+                blocks_of(nd[3], out)
+            elif nd[0] in ('exit_if', 'cold_if'):
+                blocks_of(nd[2], out)
+                if len(nd) > 3 and nd[3]:
+                    blocks_of(nd[3], out)
+        return out
+
+    def emit_dag(tree):
+        """Exact mode, --dag: the blocks outside loops in the author's order with forward gotos (Stmt::GotoIf / Goto, one structured region:
+        the top level); each outermost loop as its structured node."""
+        loops = loops_of(tree, [])
+        in_loop = {}
+        for lp in loops:
+            for b in blocks_of([lp], set()):
+                in_loop[b] = lp
+        items = []
+        seen_loops = set()
+        for b in range(nb):
+            if b in in_loop:
+                lp = in_loop[b]
+                if id(lp) not in seen_loops:
+                    seen_loops.add(id(lp))
+                    items.append(('loop', lp, min(blocks_of([lp], set()))))
+            else:
+                items.append(('block', b, b))
+        key = lambda b: bl[b][0]
+        for k, it in enumerate(items):
+            nxt_first = items[k + 1][2] if k + 1 < len(items) else None
+            if it[0] == 'loop':
+                lp = it[1]
+                lb = blocks_of([lp], set())
+                emit([lp], None)
+                exits = sorted({s for b in lb for s in succ.get(b, []) if s not in lb})
+                if len(exits) == 1 and exits[0] != nxt_first:
+                    L.lines.append(f'Goto {{ key: {key(exits[0])} }}')
+                elif len(exits) > 1:
+                    L.notes[f'loop with {len(exits)} exit targets (structured exits only)'] += 1
+                continue
+            b = it[1]
+            body = block(b)
+            last = body[-1][1]
+            ss = succ.get(b, [])
+            if last.startswith('s_cbranch') and ss:
+                c = cond_for(L, body, True)
+                L.lines.append(f'GotoIf {{ cond: {c}, key: {key(ss[0])} }}')
+                if len(ss) > 1 and ss[1] != nxt_first:
+                    L.lines.append(f'Goto {{ key: {key(ss[1])} }}')
+            elif last == 's_branch' and ss:
+                L.lines.append(f'Goto {{ key: {key(ss[0])} }}')
+            elif ss and ss[0] != nxt_first:
+                L.lines.append(f'Goto {{ key: {key(ss[0])} }}')
+
+    if '--dag' in sys.argv:
+        emit_dag(tree)
+    else:
+        emit(tree)
     # out-of-line cold blocks: at the end of the kernel's hot code
     for a in anchors:
         if a.startswith('cold_if') and a not in placed:
