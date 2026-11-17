@@ -166,6 +166,25 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str("    .sgpr_spill_count: 0\n");
     out.push_str("    .vgpr_spill_count: 0\n");
     out.push_str("    .args:\n");
+    // every kernarg byte must be covered by an `.args` entry: the runtime copies a launch's arguments entry by entry (a word read only through
+    // the kernarg preload, or skipped by the DSL's args, would otherwise arrive as garbage): gaps get by-value padding entries
+    let ksize = round_up(m.kernarg_size.max(kdv("kernarg_size").unwrap_or(0) as u32), 4);
+    let mut cover: Vec<(u32, u32)> = m.args.iter().map(|x| (x.offset, x.offset + x.size)).collect();
+    cover.sort();
+    let mut gaps = Vec::new();
+    let mut at = 0u32;
+    for (s, e) in &cover {
+        if *s > at {
+            gaps.push((at, *s));
+        }
+        at = at.max(*e);
+    }
+    if at < ksize {
+        gaps.push((at, ksize));
+    }
+    for (k, (s, e)) in gaps.iter().enumerate() {
+        out.push_str(&format!("      - .name: \"pad{k}\"\n        .offset: {s}\n        .size: {}\n        .value_kind: by_value\n", e - s));
+    }
     for arg in &m.args {
         out.push_str(&format!("      - .name: \"{}\"\n", arg.name));
         out.push_str(&format!("        .offset: {}\n", arg.offset));
