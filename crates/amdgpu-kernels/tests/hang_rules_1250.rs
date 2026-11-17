@@ -9,7 +9,7 @@
 
 use amdgpu_codegen::gpu_verify_1250::{verify_asm, verify_ir, with_rules_disabled, RULES};
 use amdgpu_codegen::compile_target;
-use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Function, Op, Opnd, TdmCpol};
+use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol};
 
 fn gfx1250(f: &Function) -> Result<String, String> {
     compile_target(f, "gfx1250").map(|c| c.asm)
@@ -436,10 +436,12 @@ fn mut_bar_count() {
         b.break_if(c);
         b.end_loop();
     }), "GV-1250-BAR-COUNT");
-    // a condition the verifier cannot evaluate (a kernarg) and no declared launch fact: not provable, not silently accepted
+    // a uniform condition the verifier cannot evaluate (a kernarg): every resolution is checked, and with every wave signalling under it neither passes
     ir_mutation(&wave_kernel(|b, _| { let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    // a condition that is neither evaluable nor wave-uniform (a per-lane loaded value) and no declared launch fact: not provable, not silently accepted
+    ir_mutation(&wave_kernel(|b, _| { let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
     // the fact itself must say 1 for the cluster barrier
-    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
+    ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
 }
 
 #[test]
@@ -457,8 +459,8 @@ fn pos_bar_count() {
         b.break_if(c);
         b.end_loop();
     }));
-    // a condition the verifier cannot evaluate, with the named launch fact: accepted, and listed as a trusted item
-    let f = wave_kernel(|b, _| { b.barrier_signal_count(-3, 1); let n = b.let_(Op::KernargI32 { offset: 0 }); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, n, Opnd::I32(0))); leader_barrier(b, c) });
+    // a condition that is neither evaluable nor wave-uniform (a per-lane loaded value), with the named launch fact: accepted, and listed as a trusted item
+    let f = wave_kernel(|b, _| { b.barrier_signal_count(-3, 1); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) });
     ir_positive(&f);
     let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
     assert_eq!(t.len(), 1, "{t:?}");
@@ -513,7 +515,19 @@ fn pos_bar_goto() {
     ir_positive(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.goto(2); b.layout_key(1); b.barrier_join(1); b.layout_key(2); b.barrier_leave(); }, 1));
     ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.goto(2); b.layout_key(1); b.barrier_signal(-1); b.layout_key(2); b.barrier_wait(-1); }, 0));
     // completion is count-based: a wave may wait on a barrier only OTHER waves signal (the cluster barrier: one signaller per workgroup, every wave waits), also behind a goto
-    let mut f = goto_kernel(|b, _, cu| { b.barrier_signal_count(-3, 1); b.goto_if(cu, 1); b.barrier_signal(-3); b.layout_key(1); b.barrier_wait(-3); }, 0);
+    // every path signals once, from the leader wave only (a uniform goto picks the path): proved, no fact needed
+    let mut f = goto_kernel(|b, _, cu| {
+        let t = b.let_(Op::WorkitemId);
+        let w = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(5)));
+        let lead = |b: &mut FnBuilder| { let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(0))); b.begin_if(c); b.barrier_signal(-3); b.end_if(); };
+        b.goto_if(cu, 1);
+        lead(b);
+        b.goto(2);
+        b.layout_key(1);
+        lead(b);
+        b.layout_key(2);
+        b.barrier_wait(-3);
+    }, 0);
     f.kd.push(("cluster_dims".into(), 4));
     ir_positive(&f);
 }
