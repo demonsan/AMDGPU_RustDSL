@@ -199,6 +199,7 @@ impl FromIr for Op {
             "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
+            "Wmma" => { v.expect_struct("Wmma")?; Ok(Op::Wmma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
             "KernargSegment" => { v.expect_unit("KernargSegment")?; Ok(Op::KernargSegment) }
             "AddK" => { v.expect_struct("AddK")?; Ok(Op::AddK { a: FromIr::from_ir(v.field("a")?)?, k: FromIr::from_ir(v.field("k")?)? }) }
             "LoadScalar" => { v.expect_struct("LoadScalar")?; Ok(Op::LoadScalar { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)? }) }
@@ -335,6 +336,7 @@ impl IrIds for Op {
             Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
+            Op::Wmma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
             Op::KernargSegment => {}
             Op::AddK { a, k } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*k), fv, fr); }
             Op::LoadScalar { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
@@ -345,6 +347,44 @@ impl IrIds for Op {
             Op::SgprCat8 { words } => { IrIds::ids(&mut (*words), fv, fr); }
             Op::ReadTtmp { idx } => { IrIds::ids(&mut (*idx), fv, fr); }
         }
+    }
+}
+
+impl FromIr for WmmaKind {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Fp8_16x16x64" => { v.expect_unit("Fp8_16x16x64")?; Ok(WmmaKind::Fp8_16x16x64) }
+            "Fp8_16x16x128" => { v.expect_unit("Fp8_16x16x128")?; Ok(WmmaKind::Fp8_16x16x128) }
+            "ScaleF4_32x16x128" => { v.expect_unit("ScaleF4_32x16x128")?; Ok(WmmaKind::ScaleF4_32x16x128) }
+            other => Err(v.err(format!("unknown WmmaKind variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for WmmaKind {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            WmmaKind::Fp8_16x16x64 => {}
+            WmmaKind::Fp8_16x16x128 => {}
+            WmmaKind::ScaleF4_32x16x128 => {}
+        }
+    }
+}
+
+impl FromIr for WmmaScale {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("WmmaScale")?;
+        Ok(WmmaScale {
+            sa: FromIr::from_ir(v.field("sa")?)?,
+            sb: FromIr::from_ir(v.field("sb")?)?,
+            b_row1: FromIr::from_ir(v.field("b_row1")?)?,
+        })
+    }
+}
+impl IrIds for WmmaScale {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.sa, fv, fr);
+        IrIds::ids(&mut self.sb, fv, fr);
+        IrIds::ids(&mut self.b_row1, fv, fr);
     }
 }
 

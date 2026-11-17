@@ -615,6 +615,15 @@ pub enum MOp {
     /// gfx1250 TDM: srcs = g0 (S4), g1 (S8)[, g2 (S4), g3 (S4)][, Imm raw word x 3]; imm = cpol (TH bits 0..2, SCOPE bits 3..4, NV bit 5) | RAW_TDM
     TensorLoadToLds,
     TensorStoreFromLds,
+    /// gfx1250 WMMA (wave32): def D; srcs = A, B, C (the `Z` forms: A, B; C is the inline constant 0)
+    VWmmaF32_16x16x64Fp8,
+    VWmmaF32_16x16x64Fp8Z,
+    VWmmaF32_16x16x128Fp8,
+    VWmmaF32_16x16x128Fp8Z,
+    /// gfx1250 block-scaled WMMA (VOP3PX2, E8M0 block 32): srcs = A, B, C, scale A, scale B (`Z`: A, B, scale A, scale B); imm bit 0 = B's
+    /// scales from lanes 16..31 (`matrix_b_scale:MATRIX_SCALE_ROW1`)
+    VWmmaScaleF32_32x16x128F4,
+    VWmmaScaleF32_32x16x128F4Z,
     SEndpgm,
 }
 

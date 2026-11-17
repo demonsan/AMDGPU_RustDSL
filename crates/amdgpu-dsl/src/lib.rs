@@ -188,6 +188,76 @@ pub struct MmaScale {
     pub opsel: u8,
 }
 
+/// gfx1250 (wave32) WMMA forms (`amdgpu_isa::gfx1250` atoms, CDNA5 ISA 7.12). Not lowerable for gfx950.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WmmaKind {
+    /// `v_wmma_f32_16x16x64_fp8_fp8`: A / B 8 dwords, C / D 8 dwords per lane
+    Fp8_16x16x64,
+    /// `v_wmma_f32_16x16x128_fp8_fp8`: A / B 16 dwords, C / D 8 dwords
+    Fp8_16x16x128,
+    /// `v_wmma_scale_f32_32x16x128_f4` (VOP3PX2; block 32, E8M0 scales in one VGPR each): A 16 dwords, B 8 dwords, C / D 16 dwords
+    ScaleF4_32x16x128,
+}
+
+impl WmmaKind {
+    pub const fn a_dwords(self) -> u32 {
+        match self {
+            WmmaKind::Fp8_16x16x64 => 8,
+            WmmaKind::Fp8_16x16x128 | WmmaKind::ScaleF4_32x16x128 => 16,
+        }
+    }
+    pub const fn b_dwords(self) -> u32 {
+        match self {
+            WmmaKind::Fp8_16x16x64 | WmmaKind::ScaleF4_32x16x128 => 8,
+            WmmaKind::Fp8_16x16x128 => 16,
+        }
+    }
+    pub const fn c_dwords(self) -> u32 {
+        match self {
+            WmmaKind::Fp8_16x16x64 | WmmaKind::Fp8_16x16x128 => 8,
+            WmmaKind::ScaleF4_32x16x128 => 16,
+        }
+    }
+    pub const fn scaled(self) -> bool {
+        matches!(self, WmmaKind::ScaleF4_32x16x128)
+    }
+    /// issue repeat (MI450 rates: fp8 16x16x64 = 4, 16x16x128 = 8, f4 32x16x128 = 8)
+    pub const fn passes(self) -> u8 {
+        match self {
+            WmmaKind::Fp8_16x16x64 => 4,
+            WmmaKind::Fp8_16x16x128 | WmmaKind::ScaleF4_32x16x128 => 8,
+        }
+    }
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            WmmaKind::Fp8_16x16x64 => "v_wmma_f32_16x16x64_fp8_fp8",
+            WmmaKind::Fp8_16x16x128 => "v_wmma_f32_16x16x128_fp8_fp8",
+            WmmaKind::ScaleF4_32x16x128 => "v_wmma_scale_f32_32x16x128_f4",
+        }
+    }
+    /// the fragment type of an operand of `n` dwords
+    pub const fn frag(n: u32) -> DType {
+        if n == 16 {
+            DType::Frag16
+        } else {
+            DType::Frag8
+        }
+    }
+    pub const fn acc_ty(self) -> DType {
+        WmmaKind::frag(self.c_dwords())
+    }
+}
+
+/// The E8M0 block scales of a block-scaled WMMA: one VGPR each. `b_row1`: B's scales come from lanes 16..31 (`matrix_b_scale:MATRIX_SCALE_ROW1`;
+/// A's 32 x 128 scales use all 32 lanes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WmmaScale {
+    pub sa: Opnd,
+    pub sb: Opnd,
+    pub b_row1: bool,
+}
+
 impl MmaKind {
     pub const fn new(shape: MmaShape, ty: MmaTy) -> MmaKind {
         MmaKind { shape, a: ty, b: ty, scaled: false }
@@ -701,6 +771,8 @@ pub enum Op {
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
+    /// gfx1250: D = A x B + C (`c: None`: zero accumulator) of the WMMA `kind`; result `kind.acc_ty()`; `scale` exactly for the scaled kinds
+    Wmma { kind: WmmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<WmmaScale> },
     // ---- (s) SGPR words of pointers / buffer descriptors (exact mode; owner kernel-opt): zero-instruction views / assemblies ----
     /// dword 0 (low address bits) of a pointer pair, read in place
     /// The kernarg segment pointer itself (hardware `s[0:1]` at entry; no instruction). `KernargPtr` loads a pointer stored in it.
@@ -735,6 +807,7 @@ impl Op {
             Op::LoadLds2 { b64, .. } => if *b64 { DType::Frag4 } else { DType::Frag2 },
             Op::LoadLdsTrB16 { .. } => DType::Frag2,
             Op::Mfma { kind, .. } => kind.acc_ty(),
+            Op::Wmma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
@@ -873,6 +946,15 @@ impl Op {
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
             Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Mfma { a, b, c, scale, .. } => {
+                let mut v = vec![*a, *b];
+                v.extend(c.iter().copied());
+                if let Some(s) = scale {
+                    v.push(s.sa);
+                    v.push(s.sb);
+                }
+                v
+            }
+            Op::Wmma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
                 if let Some(s) = scale {
@@ -2840,6 +2922,14 @@ impl FnBuilder {
     // ---- P1-d MFMA ----
     /// D = A x B + C (`c: None`: zero accumulator).
     #[track_caller]
+    /// gfx1250 WMMA (unscaled kinds).
+    pub fn wmma(&mut self, kind: WmmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
+        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: None })
+    }
+    /// gfx1250 block-scaled WMMA.
+    pub fn wmma_scaled(&mut self, kind: WmmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>, s: WmmaScale) -> ValueId {
+        self.let_(Op::Wmma { kind, a: a.into(), b: b.into(), c, scale: Some(s) })
+    }
     pub fn mfma(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
         self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: None })
     }
@@ -3799,6 +3889,32 @@ fn check_mfma(f: &Function, kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, sc
     e
 }
 
+fn check_wmma(f: &Function, kind: WmmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<&WmmaScale>) -> Vec<String> {
+    let mut e = Vec::new();
+    if scale.is_some() != kind.scaled() {
+        e.push(format!("wmma {kind:?}: scale operands {} for a {}scaled kind", if scale.is_some() { "given" } else { "missing" }, if kind.scaled() { "" } else { "non-" }));
+    }
+    let mut ops = vec![("A", a, WmmaKind::frag(kind.a_dwords())), ("B", b, WmmaKind::frag(kind.b_dwords()))];
+    if let Some(c) = c {
+        ops.push(("C", c, kind.acc_ty()));
+    }
+    for (what, o, want) in ops {
+        match opnd_ty(f, o) {
+            Ok(t) if t == want => {}
+            Ok(t) => e.push(format!("wmma {what}: expected {}, found {}", want.name(), t.name())),
+            Err(x) => e.push(x),
+        }
+    }
+    if let Some(s) = scale {
+        for (what, o) in [("scale A", s.sa), ("scale B", s.sb)] {
+            if let Err(x) = expect_int(f, o, &format!("wmma {what}")) {
+                e.push(x);
+            }
+        }
+    }
+    e
+}
+
 /// Type / range checks of the P1 memory loads.
 fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
     let mut e = Vec::new();
@@ -3813,6 +3929,7 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::Wmma { kind, a, b, c, scale } => e.extend(check_wmma(f, *kind, *a, *b, *c, scale.as_ref())),
         Op::AtomicLds { addr, value, op } => {
             if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
                 e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));

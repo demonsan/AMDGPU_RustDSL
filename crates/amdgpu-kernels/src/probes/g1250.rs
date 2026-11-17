@@ -91,3 +91,63 @@ pub fn probe_g1250_tdm_with(raw: Option<[u32; 3]>) -> Function {
 pub fn probe_g1250_tdm() -> Function {
     probe_g1250_tdm_with(None)
 }
+
+/// One wave32 WMMA (amdgpu-isa `gfx1250` atoms): every lane loads its A / B (/ C) fragment dwords from per-lane-contiguous buffers
+/// (`a[lane * na + j]`, the host arranges the operand tiles by the atom layouts), runs the WMMA and stores D the same way. The scaled kind also
+/// loads one scale dword per lane for A and for B. `with_c: false`: the zero-accumulator form.
+pub fn probe_g1250_wmma_with(name: &str, kind: amdgpu_dsl::WmmaKind, with_c: bool) -> Function {
+    let mut b = FnBuilder::new(name, 32);
+    let (na, nb, nc) = (kind.a_dwords(), kind.b_dwords(), kind.c_dwords());
+    let names = ["a", "b", "c", "d", "sa", "sb"];
+    for (k, n) in names.iter().enumerate() {
+        b.arg(n, DType::Ptr, 8 * k as u32, 8);
+    }
+    for (n, dw) in [("a", na), ("b", nb), ("c", nc), ("d", nc), ("sa", 1), ("sb", 1)] {
+        b.arg_tensor(n, Ext::c(32 * 4 * dw as i64));
+    }
+    let lane = b.let_(Op::WorkitemId);
+    let ptr = |b: &mut FnBuilder, k: u32, dw: u32| {
+        let p = b.let_(Op::KernargPtr { offset: 8 * k });
+        let off = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(4 * dw as i32)));
+        b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) })
+    };
+    let frag = |b: &mut FnBuilder, k: u32, dw: u32| {
+        let q = ptr(b, k, dw);
+        let parts: Vec<Opnd> = (0..dw / 4).map(|i| Opnd::Val(b.load_global(q, 16 * i, MemTy::B128))).collect();
+        b.let_(Op::FragCat { parts, dwords: dw as u8 })
+    };
+    let fa = frag(&mut b, 0, na);
+    let fb = frag(&mut b, 1, nb);
+    let fc = if with_c { Some(Opnd::Val(frag(&mut b, 2, nc))) } else { None };
+    let d = if kind.scaled() {
+        let qa = ptr(&mut b, 4, 1);
+        let qb = ptr(&mut b, 5, 1);
+        let sa = b.load_global(qa, 0, MemTy::B32);
+        let sb = b.load_global(qb, 0, MemTy::B32);
+        b.wmma_scaled(kind, fa, fb, fc, amdgpu_dsl::WmmaScale { sa: Opnd::Val(sa), sb: Opnd::Val(sb), b_row1: false })
+    } else {
+        b.wmma(kind, fa, fb, fc)
+    };
+    let qd = ptr(&mut b, 3, nc);
+    for i in 0..nc / 4 {
+        let s = b.let_(Op::FragSlice { frag: Opnd::Val(d), start: (4 * i) as u8, n: 4 });
+        b.store_global(qd, 16 * i, s, MemTy::B128, false);
+    }
+    b.finish()
+}
+
+/// `v_wmma_f32_16x16x64_fp8_fp8` with an accumulator.
+pub fn probe_g1250_wmma_fp8() -> Function {
+    probe_g1250_wmma_with("probe_g1250_wmma_fp8", amdgpu_dsl::WmmaKind::Fp8_16x16x64, true)
+}
+
+/// `v_wmma_f32_16x16x128_fp8_fp8`, zero accumulator.
+pub fn probe_g1250_wmma_fp8_k128() -> Function {
+    probe_g1250_wmma_with("probe_g1250_wmma_fp8_k128", amdgpu_dsl::WmmaKind::Fp8_16x16x128, false)
+}
+
+/// `v_wmma_scale_f32_32x16x128_f4` (E8M0 block 32) with an accumulator.
+pub fn probe_g1250_wmma_f4() -> Function {
+    probe_g1250_wmma_with("probe_g1250_wmma_f4", amdgpu_dsl::WmmaKind::ScaleF4_32x16x128, true)
+}
+
