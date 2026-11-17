@@ -143,6 +143,16 @@ pub fn gemm_tdm_fp8(kt: usize) -> Function {
     f
 }
 
+/// Group 0 of a tensor descriptor (valid, LDS address, the 57-bit global address of `base + byte_off`, type 2): the same words `FnBuilder::tensor_desc_2d` builds, without its group 1.
+fn group0(b: &mut FnBuilder, base: ValueId, byte_off: ValueId, lds: i32) -> ValueId {
+    let p = b.let_(Op::PtrAdd { base: Opnd::Val(base), byte_off: Opnd::Val(byte_off) });
+    let lo = b.let_(Op::PtrLo(Opnd::Val(p)));
+    let hi = b.let_(Op::PtrHi(Opnd::Val(p)));
+    let hm = b.let_(Op::AndI32(Opnd::Val(hi), Opnd::I32(0x01ff_ffff)));
+    let w3 = b.let_(Op::AddI32(Opnd::Val(hm), Opnd::I32(0x8000_0000u32 as i32)));
+    b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::I32(lds), Opnd::Val(lo), Opnd::Val(w3)] })
+}
+
 /// The kernel of the looped form: K = 192 x `passes` bytes (three 64-byte tiles per pass, the ring's three slots addressed statically inside the pass).
 pub const LOOP_NAME: &str = "gemm_g1250_tdm_fp8";
 
