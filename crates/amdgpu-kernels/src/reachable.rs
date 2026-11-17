@@ -160,5 +160,9 @@ pub fn manifest_names() -> BTreeSet<String> {
     n.extend(python_op_names());
     n.extend(crate::kernel_names().iter().map(|s| s.to_string()));
     n.extend(registered_literal_names());
+    // (the gfx1250 probes compile for --target gfx1250 only: not part of the gfx950 manifests)
+    for g in crate::gfx1250_kernel_names() {
+        n.remove(*g);
+    }
     n
 }
