@@ -417,8 +417,8 @@ fn mut_bar_goto() {
     ir_mutation(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.layout_key(1); b.barrier_leave(); }, 1), "GV-1250-BAR-JOIN");
     // initialized on one path only, used after the meeting point
     ir_mutation(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); init(b, 1, 2); b.layout_key(1); b.barrier_join(1); b.barrier_leave(); }, 1), "GV-1250-BAR-INIT");
-    // signalled on one path only, waited on after the meeting point
-    ir_mutation(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.layout_key(1); b.barrier_wait(-1); }, 0), "GV-1250-BAR-REACH");
+    // a wait on a barrier nothing signals, behind a goto
+    ir_mutation(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.layout_key(1); b.barrier_wait(-3); }, 0), "GV-1250-BAR-REACH");
     // an if arm with a wave-divergent goto inside it
     ir_mutation(&goto_kernel(|b, cd, cu| { b.begin_if(cu); b.goto_if(cd, 3); b.barrier(); b.layout_key(3); b.end_if(); }, 0), "GV-1250-BAR-REACH");
 }
@@ -433,6 +433,10 @@ fn pos_bar_goto() {
     // both paths join / initialize / signal
     ir_positive(&goto_kernel(|b, _, cu| { init(b, 1, 2); b.goto_if(cu, 1); b.barrier_join(1); b.goto(2); b.layout_key(1); b.barrier_join(1); b.layout_key(2); b.barrier_leave(); }, 1));
     ir_positive(&goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-1); b.goto(2); b.layout_key(1); b.barrier_signal(-1); b.layout_key(2); b.barrier_wait(-1); }, 0));
+    // completion is count-based: a wave may wait on a barrier only OTHER waves signal (the cluster barrier: one signaller per workgroup, every wave waits), also behind a goto
+    let mut f = goto_kernel(|b, _, cu| { b.goto_if(cu, 1); b.barrier_signal(-3); b.layout_key(1); b.barrier_wait(-3); }, 0);
+    f.kd.push(("cluster_dims".into(), 4));
+    ir_positive(&f);
 }
 
 // GV-1250-TRAP-BAR

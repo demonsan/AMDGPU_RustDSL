@@ -407,8 +407,6 @@ struct Flow {
     inited: std::collections::BTreeSet<i32>,
     /// named barriers initialized on SOME path with no work-group barrier since
     unordered: std::collections::BTreeSet<i32>,
-    /// barriers signalled on EVERY path
-    signalled: std::collections::BTreeSet<i32>,
 }
 
 /// Joins two path states; `.1` is true when the join states of the two paths differ.
@@ -417,7 +415,6 @@ fn flow_merge(a: &Flow, b: &Flow) -> (Flow, bool) {
         joined: a.joined,
         inited: a.inited.intersection(&b.inited).copied().collect(),
         unordered: a.unordered.union(&b.unordered).copied().collect(),
-        signalled: a.signalled.intersection(&b.signalled).copied().collect(),
     };
     (r, a.joined != b.joined)
 }
@@ -432,15 +429,12 @@ fn flow_step(st: &Stmt, f: &Flow) -> Flow {
         Stmt::Barrier | Stmt::BarrierWait { id: -1 } => r.unordered.clear(),
         Stmt::BarrierJoin { id } => r.joined = Some(*id),
         Stmt::BarrierLeave => r.joined = None,
-        Stmt::BarrierSignal { id } => {
-            r.signalled.insert(*id);
-        }
         _ => {}
     }
     r
 }
 
-/// GV-1250-BAR-JOIN, GV-1250-BAR-INIT and the wait-needs-a-signal part of GV-1250-BAR-REACH: a forward dataflow over the CFG (merges join the facts of every incoming path, so a goto's target
+/// GV-1250-BAR-JOIN, GV-1250-BAR-INIT and the wait-on-an-unsignalled-barrier part of GV-1250-BAR-REACH: a forward dataflow over the CFG (merges join the facts of every incoming path, so a goto's target
 /// sees the facts of the fall-through and of every goto naming it).
 fn flow_checks(f: &Function, sh: &Shape, v: &mut Vec<Violation>) {
     let stmts = f.stmts();
@@ -473,8 +467,13 @@ fn flow_checks(f: &Function, sh: &Shape, v: &mut Vec<Violation>) {
     for t in at {
         viol(v, "GV-1250-BAR-JOIN", format!("statement {t}: control-flow paths meet with different named-barrier join states (a branch, a goto target or a loop back edge that joins / leaves on one path only)"));
     }
-    // loop extents, for a pipelined signal that sits later in the loop body than its wait
-    let loops: Vec<(usize, usize)> = sh.loop_end.iter().map(|(b, e)| (*b, *e)).collect();
+    let mut all_signals: HashSet<i32> = stmts.iter().filter_map(|s| if let Stmt::BarrierSignal { id } = s { Some(*id) } else { None }).collect();
+    if stmts.iter().any(|s| matches!(s, Stmt::ClusterBarrier | Stmt::Barrier)) {
+        all_signals.insert(-1);
+    }
+    if stmts.iter().any(|s| matches!(s, Stmt::ClusterBarrier)) {
+        all_signals.insert(-3);
+    }
     for (i, st) in stmts.iter().enumerate() {
         let Some(fl) = &state[i] else { continue };
         match st {
@@ -508,9 +507,10 @@ fn flow_checks(f: &Function, sh: &Shape, v: &mut Vec<Violation>) {
             }
         }
         if let Stmt::BarrierWait { id } = st {
-            let later_in_loop = loops.iter().any(|&(b, e)| b < i && i < e && stmts[i + 1..e].iter().any(|s| matches!(s, Stmt::BarrierSignal { id: j } if j == id)));
-            if !fl.signalled.contains(id) && !later_in_loop {
-                viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a wait on barrier {id} that is not preceded by a signal of that barrier on every path (or later in its loop): the wait never completes on the path without one"));
+            // completion is count-based and any wave may signal: the signals can come from other waves (a cluster barrier is signalled by one wave per workgroup, waited on by all), so the
+            // only provable hang is a barrier that NOTHING in the kernel signals
+            if !all_signals.contains(id) {
+                viol(v, "GV-1250-BAR-REACH", format!("statement {i}: a wait on barrier {id}, which no statement of the kernel signals: the wait never completes"));
             }
         }
     }
