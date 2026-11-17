@@ -373,7 +373,12 @@ pub fn probe_g1250_wide() -> Function {
     let tid = b.let_(Op::WorkitemId);
     let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(ps), byte_off: Opnd::Val(a) });
-    let xs: Vec<ValueId> = (0..N).map(|k| b.load_global(q, (k * 128) as u32, MemTy::B32)).collect();
+    let xs: Vec<ValueId> = (0..N)
+        .map(|k| {
+            let qk = b.let_(Op::PtrAdd { base: Opnd::Val(q), byte_off: Opnd::I32((k / 32 * 4096) as i32) });
+            b.load_global(qk, ((k % 32) * 128) as u32, MemTy::B32)
+        })
+        .collect();
     let mut acc = b.let_(Op::BitcastF32(Opnd::Val(xs[N - 1])));
     for k in (0..N - 1).rev() {
         let f = b.let_(Op::BitcastF32(Opnd::Val(xs[k])));
