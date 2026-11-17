@@ -223,10 +223,51 @@ static int run_buffer(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_tdm2d: a 16 x 8 f32 tile from the typed descriptor builder. The tensor is rows x cols (row-major); the tile starts at (r0, c0);
+// dim0 / dim1 are the extents from the tile start (cols - c0, rows - r0), so a tile reaching past the tensor reads zeros there. Cases:
+// inside, and clipped on both axes.
+static int run_tdm2d(Kernel& k, const char* kn) {
+    const int rows = 20, cols = 40;
+    std::vector<float> src(rows * cols);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) src[r * cols + c] = 1000.f * r + c;
+    float* dsrc;
+    float* dout;
+    HC(hipMalloc(&dsrc, src.size() * 4));
+    HC(hipMalloc(&dout, 128 * 4));
+    HC(hipMemcpy(dsrc, src.data(), src.size() * 4, hipMemcpyHostToDevice));
+    long bad_all = 0;
+    const int cases[3][2] = {{0, 0}, {5, 9}, {15, 30}};
+    for (auto& cs : cases) {
+        const int r0 = cs[0], c0 = cs[1];
+        HC(hipMemset(dout, 0xee, 128 * 4));
+        std::vector<uint8_t> args(32, 0);
+        put64(args, 0, dsrc);
+        put64(args, 8, dout);
+        put32(args, 16, (uint32_t)(cols - c0));
+        put32(args, 20, (uint32_t)(rows - r0));
+        put32(args, 24, (uint32_t)cols);
+        put32(args, 28, (uint32_t)((r0 * cols + c0) * 4));
+        k.launch(1, 128, args, kn);
+        std::vector<float> o(128);
+        HC(hipMemcpy(o.data(), dout, 128 * 4, hipMemcpyDeviceToHost));
+        long bad = 0;
+        for (int i = 0; i < 128; ++i) {
+            const int tr = i / 16, tc = i % 16;
+            const float ref = (r0 + tr < rows && c0 + tc < cols) ? src[(r0 + tr) * cols + c0 + tc] : 0.f;
+            bad += o[i] != ref;
+        }
+        printf("tdm2d: tile at (%d, %d): out[0]=%g out[127]=%g bad=%ld %s\n", r0, c0, o[0], o[127], bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+        bad_all += bad;
+    }
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"tile\":[16,8]},\"bad\":%ld,\"ok\":%s}\n", kn, bad_all, bad_all == 0 ? "true" : "false");
+    return bad_all == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
-    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : "probe_g1250_tdm");
+    const char* kn = argc > 3 ? argv[3] : (mode == "add" ? "probe_g1250_add" : mode == "math" ? "probe_g1250_math" : mode == "select" ? "probe_g1250_select" : mode == "buffer" ? "probe_g1250_buffer" : mode == "tdm2d" ? "probe_g1250_tdm2d" : "probe_g1250_tdm");
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
@@ -241,6 +282,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);
     if (mode == "select") return run_select(k, kn);
     if (mode == "buffer") return run_buffer(k, kn);
+    if (mode == "tdm2d") return run_tdm2d(k, kn);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }

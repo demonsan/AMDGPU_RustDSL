@@ -4256,8 +4256,9 @@ impl Lowerer {
             }
             // exact mode: a wave-uniform pointer add on an SGPR pair stays scalar (`s_add_u32` + `s_addc_u32`), e.g. a buffer descriptor base
             // built from a kernarg pointer plus a uniform offset (the vendor's form)
+            // (gfx1250: also outside exact mode, e.g. a tensor descriptor's global address)
             Op::PtrAdd { base: base @ (Opnd::Val(_) | Opnd::Var(_)), byte_off }
-                if self.exact
+                if (self.exact || (crate::target::cur().name == "gfx1250" && self.uniform.contains(&dst)))
                     && self.s2_of(*base).is_some()
                     && (self.sgpr_src(*byte_off).is_some() || self.const_bits(*byte_off).is_some()) =>
             {

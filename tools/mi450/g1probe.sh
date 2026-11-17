@@ -6,7 +6,7 @@ O="$W/g1probe"; rm -rf "$O"; mkdir -p "$O"
 cargo build --release --bin amdc -j 64 2>&1 | tail -2
 A="$CARGO_TARGET_DIR/release/amdc"
 CL=/opt/rocm/llvm/bin/clang
-for k in probe_g1250_add probe_g1250_math probe_g1250_tdm probe_g1250_select probe_g1250_buffer; do
+for k in probe_g1250_add probe_g1250_math probe_g1250_tdm probe_g1250_select probe_g1250_buffer probe_g1250_tdm2d; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.emit.log 2>&1 || { echo "EMIT-FAIL $k"; tail -5 $O/$k.emit.log; exit 4; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s 2> $O/$k.asm.log || { echo "ASM-FAIL $k"; tail -5 $O/$k.asm.log; exit 5; }
   echo "$k: $(wc -l < $O/$k.s) asm lines, $(stat -c %s $O/$k.co) bytes"
@@ -14,7 +14,7 @@ done
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_probe_host.cpp -o $O/g1250_probe_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || { echo "HOST-BUILD-FAIL"; exit 6; }
 echo "GPU: ${IDLE_GPU:-none}"
 export PROBE_WATCHDOG_S=${PROBE_WATCHDOG_S:-10}
-for step in "tdm $O/probe_g1250_tdm.co probe_g1250_tdm 4" "add $O/probe_g1250_add.co probe_g1250_add 4096" "math $O/probe_g1250_math.co probe_g1250_math" "select $O/probe_g1250_select.co probe_g1250_select" "buffer $O/probe_g1250_buffer.co probe_g1250_buffer" "tdm $O/probe_g1250_tdm.co probe_g1250_tdm 64"; do
+for step in "tdm $O/probe_g1250_tdm.co probe_g1250_tdm 4" "add $O/probe_g1250_add.co probe_g1250_add 4096" "math $O/probe_g1250_math.co probe_g1250_math" "select $O/probe_g1250_select.co probe_g1250_select" "buffer $O/probe_g1250_buffer.co probe_g1250_buffer" "tdm $O/probe_g1250_tdm.co probe_g1250_tdm 64" "tdm2d $O/probe_g1250_tdm2d.co probe_g1250_tdm2d"; do
   echo "--- g1250_probe_host $step"
   gpurun $O/g1250_probe_host $step
   rc=$?
