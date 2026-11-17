@@ -2,7 +2,7 @@
 
 #[test]
 fn the_targets_are_known_by_name() {
-    let t = amdgpu_target::by_name("gfx1250").expect("gfx1250");
+    let t = amdgpu_codegen::target::by_name("gfx1250").expect("gfx1250");
     assert_eq!(t.name, "gfx1250");
     assert_eq!(t.wave.lanes, 32);
     assert_eq!(t.regs.vgpr.count, 1024);
@@ -10,7 +10,7 @@ fn the_targets_are_known_by_name() {
     assert_eq!(t.lds.bytes_per_workgroup, 327_680);
     assert_eq!(t.counters.counters.len(), 7);
     assert!(t.llvm.llc_args.contains(&"-mcpu=gfx1250"));
-    assert!(amdgpu_target::by_name("gfx9999").is_none());
+    assert!(amdgpu_codegen::target::by_name("gfx9999").is_none());
 }
 
 #[test]

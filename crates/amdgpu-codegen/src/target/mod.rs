@@ -2,7 +2,7 @@
 //! turns `T` into the compilation's target (carried by the `MFunction`). The per-instruction tables that name `MOp` live under
 //! `target/<name>/`.
 
-pub use amdgpu_target::Target;
+pub use amdgpu_target::{by_name, Target, TARGET_NAMES};
 
 pub mod gfx950;
 pub mod gfx1250;
