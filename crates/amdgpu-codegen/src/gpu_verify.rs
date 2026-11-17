@@ -39,11 +39,13 @@ pub struct Ledger {
     pub asm_opaque: usize,
     /// exact mode `TrustWait`: a read the wait counters do not guarantee complete (a stated timing reliance, GV-TRUST-TIMING)
     pub timing_trust: usize,
+    /// exact mode `TrustHazard`: an instruction exempt from the gfx1250 software-hazard check (a stated vendor reliance, GV-TRUST-HAZARD)
+    pub hazard_trust: usize,
 }
 
 impl Ledger {
     pub fn total(&self) -> usize {
-        self.assume_trusted + self.tile_trust + self.region_trust + self.asm_opaque + self.timing_trust
+        self.assume_trusted + self.tile_trust + self.region_trust + self.asm_opaque + self.timing_trust + self.hazard_trust
     }
 }
 
@@ -108,6 +110,10 @@ impl Report {
             }
             if f.code == "GV-TRUST-TIMING" {
                 l.timing_trust += 1;
+                continue;
+            }
+            if f.code == "GV-TRUST-HAZARD" {
+                l.hazard_trust += 1;
                 continue;
             }
             if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") {
@@ -3593,6 +3599,10 @@ impl<'a> An<'a> {
                 self.exec_saved.insert(*sgpr, self.exec_lanes);
             }
             Stmt::ExecRestore { sgpr } => self.exec_lanes = self.exec_saved.get(sgpr).copied().unwrap_or(64),
+            Stmt::TrustHazard { reason } => {
+                let sev = if f.exact { Severity::Warn } else { Severity::Error };
+                self.rep.add("GV-TRUST-HAZARD", sev, format!("stmt {}: TRUSTED hazard (the next instruction relies on a vendor guarantee the public hazard rules do not give): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));
+            }
             Stmt::TrustWait { reason } => {
                 let sev = if f.exact { Severity::Warn } else { Severity::Error };
                 self.rep.add("GV-TRUST-TIMING", sev, format!("stmt {}: TRUSTED timing (the next read is not guaranteed by the wait counters): {reason}{}", self.idx, if f.exact { "" } else { " - only exact (non-dispatched) kernels may state it" }));

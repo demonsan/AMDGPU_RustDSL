@@ -938,6 +938,7 @@ impl FromIr for Stmt {
             "ExecSet" => { v.expect_struct("ExecSet")?; Ok(Stmt::ExecSet { mask: FromIr::from_ir(v.field("mask")?)? }) }
             "ExecRestore" => { v.expect_struct("ExecRestore")?; Ok(Stmt::ExecRestore { sgpr: FromIr::from_ir(v.field("sgpr")?)? }) }
             "TrustWait" => { v.expect_struct("TrustWait")?; Ok(Stmt::TrustWait { reason: FromIr::from_ir(v.field("reason")?)? }) }
+            "TrustHazard" => { v.expect_struct("TrustHazard")?; Ok(Stmt::TrustHazard { reason: FromIr::from_ir(v.field("reason")?)? }) }
             "EncodeE64" => { v.expect_unit("EncodeE64")?; Ok(Stmt::EncodeE64) }
             "BranchPlace" => { v.expect_struct("BranchPlace")?; Ok(Stmt::BranchPlace { anchor: FromIr::from_ir(v.field("anchor")?)? }) }
             "LayoutAnchor" => { v.expect_struct("LayoutAnchor")?; Ok(Stmt::LayoutAnchor { name: FromIr::from_ir(v.field("name")?)? }) }
@@ -1038,6 +1039,7 @@ impl IrIds for Stmt {
             Stmt::ExecSet { mask } => { IrIds::ids(&mut (*mask), fv, fr); }
             Stmt::ExecRestore { sgpr } => { IrIds::ids(&mut (*sgpr), fv, fr); }
             Stmt::TrustWait { reason } => { IrIds::ids(&mut (*reason), fv, fr); }
+            Stmt::TrustHazard { reason } => { IrIds::ids(&mut (*reason), fv, fr); }
             Stmt::EncodeE64 => {}
             Stmt::BranchPlace { anchor } => { IrIds::ids(&mut (*anchor), fv, fr); }
             Stmt::LayoutAnchor { name } => { IrIds::ids(&mut (*name), fv, fr); }

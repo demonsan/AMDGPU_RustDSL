@@ -13,7 +13,7 @@ fn the_compilers_own_output_verifies() {
         let Ok((m, a)) = amdgpu_codegen::compile_mir_alloc(&f) else { continue };
         n += 1;
         // layer rule: a stated timing reliance (exact mode `TrustWait`) never ships
-        if f.stmts().iter().any(|s| matches!(s, amdgpu_dsl::Stmt::TrustWait { .. })) {
+        if f.stmts().iter().any(|s| matches!(s, amdgpu_dsl::Stmt::TrustWait { .. } | amdgpu_dsl::Stmt::TrustHazard { .. })) {
             bad.push(format!("{k}: a dispatch-reachable kernel states a TrustWait"));
         }
         let strict = m.elide_fallthrough; // the scheduled path (cfg cleanup ran)
