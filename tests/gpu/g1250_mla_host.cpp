@@ -9,6 +9,7 @@
 // Env: SEED (1), CHECK_B (4 sequences checked against an fp32 CPU reference), SCALE (softmax scale, default 1/sqrt(576)), WARMUP (5).
 // Prints `MLA_OK` / `MLA_FAIL`, time and KV bandwidth. Hang safety: polled deadlines; on expiry exit 124 without touching the device again.
 #include <hip/hip_runtime.h>
+#include "g1250_timing.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -116,6 +117,13 @@ int main(int argc, char** argv) {
     hipFunction_t f;
     HC(hipModuleLoad(&mod, co));
     HC(hipModuleGetFunction(&f, mod, kn));
+    // PAIRED mode: CO2 [KERNEL2] = a second kernel of the same ABI, timed alternately with the first on the same buffers (tests/gpu/g1250_timing.h)
+    hipFunction_t f2 = nullptr;
+    if (const char* co2 = getenv("CO2")) {
+        hipModule_t mod2;
+        HC(hipModuleLoad(&mod2, co2));
+        HC(hipModuleGetFunction(&f2, mod2, getenv("KERNEL2") ? getenv("KERNEL2") : kn));
+    }
     hipStream_t s;
     HC(hipStreamCreate(&s));
     const unsigned gdx = (H + H - 1) / H;  // sub_Q = gqa * sq = H for one query per sequence
@@ -181,15 +189,14 @@ int main(int argc, char** argv) {
             }
         }
     }
-    const int warm = envi("WARMUP", 5);
-    for (int i = 0; i < warm; i++) HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, s, nullptr, cfg));
-    HC(hipEventRecord(e0, s));
-    for (int i = 0; i < iters; i++) HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, s, nullptr, cfg));
-    HC(hipEventRecord(e1, s));
-    wait_deadline(e1, deadline + (long)iters * 1000, "timed launches");
-    float ms = 0;
-    HC(hipEventElapsedTime(&ms, e0, e1));
-    const double us = 1e3 * ms / iters;
+    // timing: median of SAMPLES samples of back-to-back launches (>= MIN_SAMPLE_MS each), FLUSH=1 evicts the caches before every launch (tests/gpu/g1250_timing.h); `iters` is kept for the command line and ignored
+    (void)iters;
+    const G1250Timing tmg = g1250_time([&](hipStream_t st) { HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
+    const double us = tmg.median_us;
+    if (f2) {
+        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, [&](hipStream_t st) { HC(hipModuleLaunchKernel(f2, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
+        std::printf("{\"host\":\"g1250_mla\",\"paired\":true,\"kernel\":\"%s\",\"us\":%.3f,\"us2\":%.3f,\"ratio\":%.4f,\"pair_spread\":%.4f,\"ok\":true}\n", kn, pr.a_us, pr.b_us, pr.ratio_ba, pr.spread_ratio);
+    }
     const double cosd = 1 - 2 * dot / std::max(nn, 1e-12);
     const bool ok = bad <= checked / 20 && cosd < 1e-3;
     std::printf("mla B=%d H=%d ctx=%d: %.2f us %.1f GB/s (KV bytes) checked=%ld bad=%ld max_abs=%.3e cos_diff=%.2e %s\n", B, H, ctx, us,
