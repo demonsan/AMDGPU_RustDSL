@@ -566,7 +566,7 @@ struct Lowerer {
     /// exact mode: the block label of each layout key (gotos and `LayoutKey`)
     key_labels: HashMap<u32, u32>,
     /// exact mode: the author's words for the next instruction (`Stmt::AuthorWords`)
-    author_words: Option<(Box<[u32]>, usize, usize)>,
+    author_words: std::collections::VecDeque<Box<[u32]>>,
     /// exact mode: the next statement is encoded `_e64` (`Stmt::EncodeE64`)
     e64_next: bool,
     /// exact mode: the values the author pinned
@@ -688,7 +688,7 @@ impl Lowerer {
             scc_i1: HashSet::new(),
             fold_ok: HashSet::new(),
             key_labels: HashMap::new(),
-            author_words: None,
+            author_words: Default::default(),
             m0_adds: HashSet::new(),
             e64_next: false,
             exact_pinned: HashSet::new(),
@@ -948,7 +948,7 @@ impl Lowerer {
         if inst.stmt == 0 {
             inst.stmt = self.cur_stmt;
         }
-        if let Some((w, _, _)) = self.author_words.take() {
+        if let Some(w) = self.author_words.pop_front() {
             inst.words = Some(w);
         }
         self.mir.blocks[self.cur].insts.push(inst);
@@ -2336,9 +2336,9 @@ impl Lowerer {
     fn lower_stmt_inner(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         self.cur_stmt += 1;
         // author words apply to the statement right after them, which must emit an instruction
-        if self.author_words.is_some() && !matches!(st, Stmt::AuthorWords { .. }) {
+        if !self.author_words.is_empty() && !matches!(st, Stmt::AuthorWords { .. }) {
             self.lower_stmt_inner2(f, st)?;
-            if self.author_words.take().is_some() {
+            if !std::mem::take(&mut self.author_words).is_empty() {
                 return Err(format!("stmt {}: author words not taken: the statement emits no instruction", self.cur_stmt));
             }
             return Ok(());
@@ -2936,7 +2936,8 @@ impl Lowerer {
                 if !self.exact {
                     return Err("author words outside exact mode".into());
                 }
-                self.author_words = Some((words.clone().into_boxed_slice(), self.mir.blocks[self.cur].insts.len(), self.cur));
+                // (several in a row: the next statement's instructions take them in order)
+                self.author_words.push_back(words.clone().into_boxed_slice());
             }
             Stmt::GotoIf { cond, key } => {
                 if !self.exact {

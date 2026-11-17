@@ -441,7 +441,7 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 match x {
                     Src::Reg(r) => {
                         let p = a.phys[*r as usize];
-                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { format!("s{p}") })
+                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
                     }
                     Src::Imm(k) => Ok(format!("{:#x}", *k as u32)),
                     _ => Err("scalar form: register or constant operands".into()),
@@ -579,6 +579,7 @@ const RENAMES: &[(&str, &str)] = &[
     ("s_addc_u32", "s_add_co_ci_u32"),
     ("s_sub_u32", "s_sub_co_u32"),
     ("s_subb_u32", "s_sub_co_ci_u32"),
+    ("s_addk_i32", "s_addk_co_i32"),
 ];
 
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
@@ -597,8 +598,31 @@ const SAME_PREFIX: &[&str] = &[
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
+/// An SGPR operand's name: s<n>, or ttmp<n - 108> for the trap temporaries an exact kernel reads in place (`mir::TTMP_PIN`).
+fn sgpr_name(p: u32) -> String {
+    if (crate::mir::TTMP_PIN..crate::mir::TTMP_PIN + 16).contains(&p) {
+        format!("ttmp{}", p - crate::mir::TTMP_PIN)
+    } else {
+        format!("s{p}")
+    }
+}
+
+/// `s108`..`s123` operands (the shared emitter's spelling of a ttmp pin) as `ttmp0`..`ttmp15`.
+fn ttmp_names(line: &str) -> String {
+    let Some(i) = line.find(' ') else { return line.to_string() };
+    let ops: Vec<String> = line[i + 1..]
+        .split(", ")
+        .map(|o| match o.strip_prefix('s').and_then(|n| n.parse::<u32>().ok()) {
+            Some(n) if (crate::mir::TTMP_PIN..crate::mir::TTMP_PIN + 16).contains(&n) => sgpr_name(n),
+            _ => o.to_string(),
+        })
+        .collect();
+    format!("{} {}", &line[..i], ops.join(", "))
+}
+
 pub fn respell(line: &str) -> Result<Vec<String>, String> {
-    let line = line.trim();
+    let owned = ttmp_names(line.trim());
+    let line = owned.as_str();
     if line.is_empty() || line.starts_with("//") || line.starts_with(';') {
         return Ok(vec![line.to_string()]);
     }
