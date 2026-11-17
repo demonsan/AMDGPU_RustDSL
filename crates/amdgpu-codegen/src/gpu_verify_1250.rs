@@ -43,6 +43,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
+    Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -154,6 +155,46 @@ fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, g1: &Opnd) -> Mask {
         }
     }
     Mask::Unknown
+}
+
+/// The compile-time-known words of a descriptor group (`None` per word the host / the program supplies).
+fn group_words(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Option<u32>> {
+    let Opnd::Val(v) = o else { return Vec::new() };
+    match defs.get(v) {
+        Some(Op::RsrcCat { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
+        Some(Op::SgprCat8 { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// GV-1250-TDM-DESC: the fields of a tensor descriptor that are constants must be valid for a kernel (group 0: bits 1:0 valid count 0 / 1, bits 2 / 3 / 4 context-restore / store / volatile
+/// zero, bits 127:126 type 2; the tile written to LDS fits in the declared LDS).
+fn desc_check(f: &Function, defs: &HashMap<ValueId, Op>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
+    let w0 = group_words(defs, g0);
+    let w1 = group_words(defs, g1);
+    if let Some(Some(x)) = w0.first() {
+        if x & 3 > 1 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: descriptor group 0 valid count {} (must be 0 or 1)", x & 3));
+        }
+        if x & 0b11100 != 0 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: descriptor group 0 context-restore / store / volatile bits {:#x} must be zero in a kernel", x & 0b11100));
+        }
+    }
+    if let Some(Some(x)) = w0.get(3) {
+        if x >> 30 != 2 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: descriptor group 0 type field {} (must be 2)", x >> 30));
+        }
+    }
+    // the tile (no padding, 1..3 dimensions) in LDS
+    if let (Some(Some(lds)), true, Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w0.get(1), w1.len() == 8, w1.first(), w1.get(3), w1.get(4)) {
+        let pad_enable = a0 >> 20 & 1 != 0;
+        let esize = 1u64 << (a0 >> 16 & 3);
+        let (t0, t1, t2) = ((a3 >> 16) as u64, (a4 & 0xffff) as u64, (a4 >> 16) as u64);
+        let elems = t0 * t1.max(1) * t2.max(1);
+        if !pad_enable && t0 > 0 && f.lds_bytes > 0 && (*lds as u64) + elems * esize > f.lds_bytes as u64 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the tile ({elems} elements of {esize} bytes at LDS address {lds}) does not fit in the declared {} bytes of LDS", f.lds_bytes));
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -319,7 +360,8 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let named = kd_val(f, "named_barrier_count");
     for (pos, st) in f.stmts().iter().enumerate() {
         match st {
-            Stmt::TensorLoadToLds { g1, .. } | Stmt::TensorStoreFromLds { g1, .. } => {
+            Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
+                desc_check(f, &defs, pos, g0, g1, &mut v);
                 let m = mcast_mask(f, &defs, g1);
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {
