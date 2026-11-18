@@ -501,3 +501,76 @@ pub fn probe_g1250_trans() -> Function {
     }
     b.finish()
 }
+
+/// TRANS co-execution, all combinations: every TRANS op (exp2 / log2 / rcp / rsq / sqrt / sin / cos) read right away by every reader class
+/// and operand position: VOP2 add (src0 / src1), mul, VOP3 fma (src0 / src1 / src2), max, VOP3P packed f32 add (the TRANS result one
+/// half of a packed pair). 8 chains x 21 steps per lane; combination k = (step * 8 + chain) mod 49 (each about 3 times). The script removes
+/// the emitter's v_nop per reader class and compares bit for bit. out[(wg * 512 + tid) * 8 + chain]. 512 work-items. Kernargs: out @0.
+pub fn probe_g1250_trans_all() -> Function {
+    use amdgpu_dsl::UnOp;
+    let mut b = FnBuilder::new("probe_g1250_trans_all", 512);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(1 << 26));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let tf = b.un(UnOp::CvtF32I32, tid);
+    let tf = b.mul_f32(tf, Opnd::F32(1.0 / 512.0));
+    let mut ch: Vec<ValueId> = (0..8).map(|c| b.add_f32(tf, Opnd::F32(0.5 + c as f32 * 0.0625))).collect();
+    for s in 0..21 {
+        for c in 0..8 {
+            let k = (s * 8 + c) % 49;
+            let (tr_i, rd) = (k % 7, k / 7);
+            let x = ch[c];
+            // the TRANS argument in (1, 2): safe for every op
+            let xa = b.mul_f32(x, Opnd::F32(0.03125));
+            let xa = b.add_f32(xa, Opnd::F32(1.125));
+            let tr = match tr_i {
+                0 => b.let_(Op::Exp2F32(Opnd::Val(xa))),
+                1 => b.let_(Op::Log2F32(Opnd::Val(xa))),
+                2 => b.let_(Op::RcpF32(Opnd::Val(xa))),
+                3 => b.un(UnOp::RsqF32, xa),
+                4 => b.un(UnOp::SqrtF32, xa),
+                5 => b.un(UnOp::SinF32, xa),
+                _ => b.un(UnOp::CosF32, xa),
+            };
+            // keep |y| bounded: every reader mixes the TRANS result with x scaled down
+            let y = match rd {
+                0 => b.add_f32(tr, x),
+                1 => b.add_f32(x, tr),
+                2 => b.mul_f32(tr, Opnd::F32(0.75)),
+                3 => b.let_(Op::FmaF32(Opnd::Val(tr), Opnd::F32(0.5), Opnd::Val(x))),
+                4 => b.let_(Op::FmaF32(Opnd::F32(0.5), Opnd::Val(tr), Opnd::Val(x))),
+                5 => b.let_(Op::FmaF32(Opnd::Val(x), Opnd::F32(0.5), Opnd::Val(tr))),
+                _ => {
+                    let pr = b.frag_cat(&[Opnd::Val(tr), Opnd::Val(x)]);
+                    let q = b.frag_cat(&[Opnd::Val(x), Opnd::F32(0.25)]);
+                    let sum = b.let_(Op::PkAddF32(Opnd::Val(pr), Opnd::Val(q)));
+                    let lo = b.frag_slice(sum, 0, 1);
+                    let lo = b.bitcast_f32(lo);
+                    let hi = b.frag_slice(sum, 1, 1);
+                    let hi = b.bitcast_f32(hi);
+                    b.add_f32(lo, hi)
+                }
+            };
+            // the max reader: on odd steps the chain value also goes through max(tr', y) with a fresh TRANS
+            let y = if s % 3 == 1 {
+                let t2 = b.un(UnOp::SqrtF32, xa);
+                b.let_(Op::MaxF32(Opnd::Val(t2), Opnd::Val(y)))
+            } else {
+                y
+            };
+            // renormalise: y / 4 + 0.5 (stays in a small range over 21 steps)
+            ch[c] = b.let_(Op::FmaF32(Opnd::Val(y), Opnd::F32(0.25), Opnd::F32(0.5)));
+        }
+    }
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wg9 = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(9)));
+    let gt = b.let_(Op::AddI32(Opnd::Val(wg9), Opnd::Val(tid)));
+    let a = b.let_(Op::ShlI32(Opnd::Val(gt), Opnd::I32(5)));
+    for c in 0..8 {
+        let o = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * c as i32)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+        b.store_global(q, 0, ch[c], MemTy::B32, false);
+    }
+    b.finish()
+}
