@@ -104,9 +104,13 @@ fn parse_inst(line: &str) -> Result<Inst, String> {
     parts.push(cur.trim().to_string());
     parts.retain(|s| !s.is_empty());
     if let Some(last) = parts.pop() {
-        let mut toks = last.split_whitespace();
-        if let Some(first) = toks.next() {
-            parts.push(first.to_string());
+        let mut toks = last.split_whitespace().peekable();
+        // (an instruction without operands may start with a modifier: `global_wb scope:SCOPE_DEV`)
+        if let Some(first) = toks.peek().copied() {
+            if !(first.contains(':') && parse_reg(first).is_none()) {
+                parts.push(first.to_string());
+                toks.next();
+            }
         }
         for m in toks {
             let (k, v) = m.split_once(':').unwrap_or((m, ""));
