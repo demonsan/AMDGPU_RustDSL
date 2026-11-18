@@ -5,7 +5,7 @@ cd "$SRC"
 O="$W/mla"
 [ -z "${IDLE_GPU:-}" ] && { echo "NO-IDLE-GPU"; exit 251; }
 [ "${IDLE_GPU:-none}" = "3" ] && { echo "REFUSE: GPU 3"; exit 9; }
-CL=/opt/rocm/llvm/bin/clang; k=mla_g1250_qh16
+CL=/opt/rocm/llvm/bin/clang; k=${KERNEL:-mla_g1250_qh16}
 for v in a b; do $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$v.co $O/$v.s || exit 5; done
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_mla_host.cpp -o $O/host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 VCO=$BASE/vendor/gfx1250/mla/mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co; VK=_ZN5aiter34mla_a8w8_qh16_1tg_16mx1_32nx4_np_3pE
