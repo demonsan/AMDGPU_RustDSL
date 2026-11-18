@@ -26,7 +26,7 @@ All bit-exact against the CPU reference (E8M0 scales 2^-2 .. 2^2, random fp4). T
 ## Steps toward it (each measured with `f4vs.sh` on the same GPU, bit-exactness checked every time)
 
 1. **Cooperative loads** (done): `ReadFirstLane`-uniform wave slice, one barrier. Needed no new compiler feature.
-2. **Bigger CTA tile / wave tile** (done up to 128 x 128): more WMMAs per barrier and per fragment load. The 256 x 128 tile (`..._256x128_repro`) is blocked by the back end: a scaled WMMA's scale operand must be in v0..v255 while the accumulators move above v255. *Compiler feature 1: a register constraint / copy for the scale operands of `v_wmma_scale_*` (and VGPR-MSB windows around them).*
+2. **Bigger CTA tile / wave tile** (done up to 128 x 128): more WMMAs per barrier and per fragment load. The 256 x 128 tile (`..._256x128`) needed the back end's low-window register class for the scale operands of `v_wmma_scale_*` (accumulators above v255); it now compiles (640 VGPRs) but flips the VGPR MSBs before almost every WMMA (757 `s_set_vgpr_msb`): *compiler feature 1 (done) and 1b: window-aware placement of operands and accumulators.*
 3. **Software-pipelined fragments** (next): window(t) issues the fragment loads of tile t + 1 (the body reads `t.next`, already complete because the pipeline completes tile t + 1 one window earlier) and loop-carries the fragment registers; K sub-steps per slot (`ks`) give more WMMAs per barrier without more registers. Blocked today by the `ks = 2` wrong-result case (bisect in progress, see `tools/mi450/f4bisect.sh`). *Compiler feature 2: schedule ds loads of the next group ahead of the WMMAs of the current group (B5 Free phase).*
 4. **Relax the waits**: `stage_complete` is a `wait_tensor(0)` at the end of each window; with the producer at iteration offset 2 the ring allows `wait_tensor(2)`. *Compiler feature 3: the auto `s_wait_tensorcnt` from the ring slot tokens (B5) replacing the conservative IR wait.*
 5. **Split barrier**: signal after the last read of a slot, wait right before the slot's reuse (`barrier_signal` / `barrier_wait`), instead of the full barrier at the end of the window. Verified by G5 (alternation, named barriers).
@@ -46,4 +46,4 @@ Only after the ks = 2 wrong-result case is understood; one idle GPU, hard timeou
 | `gemm_g1250_tdm_stage_f4_256x64` | 256 x 64, 4 | 65,280 |
 | `gemm_g1250_tdm_stage_f4_ks2`, `_ks2_grouped` (bisect only) | 128 x 64, 4, ks = 2 | 78,336 / 103,936 |
 
-Not to be run: the 8-wave variant that hung (not registered), and `..._256x128_repro` (does not compile).
+Not to be run: the 8-wave variant that hung (not registered). `..._256x128` (78,336 B) only after the ks = 2 / dscnt verification.
