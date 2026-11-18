@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
         }
     }
     double us = 0, tflops = 0;
-    if (iters > 0 && bad == 0) {
+    // SKIPCHECK=1: time even when the result is wrong (profiling kernels with parts removed from the assembly; never for a kernel that is supposed to be correct)
+    if (iters > 0 && (bad == 0 || getenv("SKIPCHECK"))) {
         hipEvent_t e0, e1;
         HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
         const unsigned gx = N / BN, gy = M / BM;

@@ -89,6 +89,9 @@ pub trait PipeBody {
     fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `RegStaged`: between the top-of-tile waits and the barrier (work that touches no LDS / VMEM, e.g. MMAs of the register tile)
     fn post_wait(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `OneWindow`: the ring depth the driver runs with (`Pipeline::slots`), told to the body before anything is emitted: a body that waits for "all but the stages still in flight" needs it
+    /// (`slots - 2` stages stay in flight at the end of a window).
+    fn set_ring_depth(&mut self, _slots: u8) {}
     /// After the pipeline's last window: drain what the stages left in flight (the last steady iteration stages a clamped tile nothing waits for). A body whose stages are asynchronous writes
     /// into LDS (tensor loads) must wait for them here: a wave must not end with a copy into LDS outstanding (`GV-1250-TDM-DRAIN`).
     fn finish(&mut self, _b: &mut FnBuilder, _role: Role) {}
@@ -131,12 +134,15 @@ pub struct Pipeline {
     /// `TwoPhaseOffset`: two tiles per loop pass with STATIC ring slots (0 then 1, the vendor kernel's unrolled pair; docs/fmha-replica.md R3 step
     /// 2): an exit after each tile, `idx` records which half the loop left from and the peeled last tile runs in slot `idx`
     pub unroll2: bool,
+    /// `OneWindow`: the ring depth (>= 3, default 3). The producer runs `slots - 1` tiles ahead: iteration t stages tile t + slots - 1 into the slot of tile t - 1, and the prologue stages tiles
+    /// 0 .. slots - 2. The body's ring must have `slots` slots (a deeper ring hides more tensor-load latency: `slots - 2` windows). The slot index cycles modulo `slots`.
+    pub slots: u8,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3 }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -144,6 +150,11 @@ impl Pipeline {
 
     /// Emits the whole pipeline for one role (call it inside `Roles::each`, or once with `Role::All`), then the body's drain (`PipeBody::finish`).
     pub fn run(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
+        assert!(self.slots >= 3 || self.cadence != Cadence::OneWindow, "Pipeline: OneWindow needs at least 3 ring slots");
+        assert!(self.slots == 3 || self.cadence == Cadence::OneWindow, "Pipeline: `slots` is a OneWindow parameter");
+        if self.cadence == Cadence::OneWindow {
+            body.set_ring_depth(self.slots);
+        }
         self.run_stages(b, role, body);
         body.finish(b, role);
     }
@@ -154,7 +165,7 @@ impl Pipeline {
             cur: SlotIdx::new(0, 0),
             next: SlotIdx::new(1, 1),
             n2: match self.cadence {
-                Cadence::OneWindow => Some(SlotIdx::new(2, 2)),
+                Cadence::OneWindow => Some(SlotIdx::new(self.slots as i32 - 1, self.slots as i32 - 1)),
                 Cadence::RegStaged => Some(SlotIdx::new(0, self.rs_depth as i32)),
                 Cadence::TwoPhaseOffset => None,
             },
@@ -171,12 +182,14 @@ impl Pipeline {
             body.stage_complete(b, role, &s0);
         }
         if self.cadence == Cadence::OneWindow {
-            // tile 1 (clamped to the last tile: a one-tile sequence re-stages tile 0 as generation 1)
-            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
-            let s1 = SlotIdx::new(1, 1);
-            body.stage(b, role, &key1, &s1);
-            b.wait_vm(0);
-            body.stage_complete(b, role, &s1);
+            // tiles 1 .. slots - 2 (each clamped to the last tile: a one-tile sequence re-stages tile 0 as generation k)
+            for k in 1..(self.slots as i32 - 1) {
+                let key = b.let_i32(ev(self.nkv).gt(k).select_i32(k, ev(self.nkv) - 1) << self.lg());
+                let sk = SlotIdx::new(k, k);
+                body.stage(b, role, &key, &sk);
+                b.wait_vm(0);
+                body.stage_complete(b, role, &sk);
+            }
         }
         if self.ahead2 {
             assert!(self.cadence == Cadence::TwoPhaseOffset && self.unroll2, "ahead2: TwoPhaseOffset with unroll2");
@@ -499,10 +512,12 @@ impl Pipeline {
             // RegStaged runs two tiles per pass with static slots (`iter_rs`)
             Cadence::RegStaged => unreachable!("Pipeline: RegStaged iterations are emitted by iter_rs"),
             Cadence::OneWindow => {
-                let i1 = b.bind_i32(varx(idx).lt(2).select_i32(varx(idx) + 1, 0));
-                let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2));
+                let d = self.slots as i32;
+                let i1 = b.bind_i32(varx(idx).lt(d - 1).select_i32(varx(idx) + 1, 0));
+                let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, d - 1));
                 let it_p1 = b.let_i32(varx(it) + 1);
-                let it_p2 = b.let_i32(varx(it) + 2);
+                // the tile staged in this iteration: t + slots - 1 (t + 2 in the default 3-slot ring), into the slot of t - 1
+                let it_p2 = b.let_i32(varx(it) + (d - 1));
                 let t = TileIt {
                     it: Opnd::Var(it),
                     cur: SlotIdx::new(idx, it),

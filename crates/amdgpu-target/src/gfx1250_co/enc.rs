@@ -247,8 +247,17 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
     let mut out = Vec::new();
     match fmt {
         "SOP1" => {
-            let (d, s) = if i.ops.len() == 1 { (0, op_at(&i, 0)?) } else { (sdst(op_at(&i, 0)?)?, op_at(&i, 1)?) };
-            let (s0, lit) = src9(s)?;
+            // one operand: a source (s_setpc_b64 ..), except the destination-only forms (s_get_pc_i64: SDST, SSRC0 = 0; llvm-mc)
+            let dst_only = matches!(base, "s_get_pc_i64" | "s_getpc_b64");
+            let (d, s0, lit) = if i.ops.len() == 1 && dst_only {
+                (sdst(op_at(&i, 0)?)?, 0, None)
+            } else if i.ops.len() == 1 {
+                let (s0, lit) = src9(op_at(&i, 0)?)?;
+                (0, s0, lit)
+            } else {
+                let (s0, lit) = src9(op_at(&i, 1)?)?;
+                (sdst(op_at(&i, 0)?)?, s0, lit)
+            };
             out.extend_from_slice(&d32(0xBE80_0000 | d << 16 | op << 8 | (s0 & 0xff)));
             if let Some(l) = lit {
                 out.extend_from_slice(&d32(l));
@@ -283,6 +292,29 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                 Some(x) => return Err(format!("`{t}`: {x:?}")),
             };
             out.extend_from_slice(&d32(0xBF80_0000 | op << 16 | simm));
+        }
+        // the prefetch form: SBASE pair, offset, SOFFSET (an SGPR or null), count (in the SDATA field) (llvm-mc:
+        // `s_prefetch_inst s[36:37], 0x100, s38, 3` = f40480d2 4c000100)
+        "SMEM" if base.starts_with("s_prefetch") => {
+            let b = match op_at(&i, 0)? {
+                Op::S(r, 2) => *r,
+                x => return Err(format!("`{t}`: base {x:?}")),
+            };
+            let off = match op_at(&i, 1)? {
+                Op::Imm(v) => *v,
+                x => return Err(format!("`{t}`: offset {x:?}")),
+            };
+            let so = match op_at(&i, 2)? {
+                Op::S(r, 1) => *r,
+                Op::Special(124) => 0x7C,
+                x => return Err(format!("`{t}`: soffset {x:?}")),
+            };
+            let cnt = match op_at(&i, 3)? {
+                Op::Imm(v) => *v as u32 & 0x7f,
+                x => return Err(format!("`{t}`: count {x:?}")),
+            };
+            out.extend_from_slice(&d32(0xF400_0000 | op << 13 | cnt << 6 | (b >> 1)));
+            out.extend_from_slice(&d32(so << 25 | (off as u32 & 0x00ff_ffff)));
         }
         "SMEM" => {
             let d = sdst(op_at(&i, 0)?)?;
