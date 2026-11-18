@@ -161,6 +161,8 @@ int main(int argc, char** argv) {
     // fp32 reference: logits = (q qs) . (k ks) * scale over 576 dims, softmax over ctx, out = p . (v ks) over the first 512 dims
     const int cb = std::min(B, envi("CHECK_B", 4));
     long bad = 0, checked = 0;
+    // BADMAP=1: which (head, 16-dim tile) of sequence 0 hold the bad elements (a debugging aid for the per-register layout)
+    static int badmap[64][64] = {};
     double maxe = 0, dot = 0, nn = 0;
     std::vector<double> lg(ctx);
     for (int bi = 0; bi < cb; bi++) {
@@ -201,7 +203,7 @@ int main(int argc, char** argv) {
                 // rounds P to fp8 for the PV product), plus the cosine difference
                 const double err = std::fabs(got - o);
                 maxe = std::max(maxe, err);
-                if (!(err <= 6e-2 + 6e-2 * std::fabs(o))) bad++;
+                if (!(err <= 6e-2 + 6e-2 * std::fabs(o))) { bad++; if (b == 0) badmap[h][d / 16]++; }
                 dot += got * o;
                 nn += got * got + o * o;
                 checked++;
@@ -217,6 +219,13 @@ int main(int argc, char** argv) {
         std::printf("{\"host\":\"g1250_mla\",\"paired\":true,\"kernel\":\"%s\",\"us\":%.3f,\"us2\":%.3f,\"ratio\":%.4f,\"pair_spread\":%.4f,\"ok\":true}\n", kn, pr.a_us, pr.b_us, pr.ratio_ba, pr.spread_ratio);
     }
     const double cosd = 1 - 2 * dot / std::max(nn, 1e-12);
+    if (getenv("BADMAP")) {
+        for (int h = 0; h < H && h < 64; ++h) {
+            std::printf("badmap h%2d ", h);
+            for (int x = 0; x < 32; ++x) std::printf("%c", badmap[h][x] == 0 ? '.' : (badmap[h][x] < 8 ? '+' : '#'));
+            std::printf("\n");
+        }
+    }
     const bool ok = bad <= checked / 20 && cosd < 1e-3;
     std::printf("mla B=%d H=%d ctx=%d: %.2f us %.1f GB/s (KV bytes) checked=%ld bad=%ld max_abs=%.3e cos_diff=%.2e %s\n", B, H, ctx, us,
                 (double)B * ctx * D / (us * 1e-6) / 1e9, checked, bad, maxe, cosd, ok ? "MLA_OK" : "MLA_FAIL");
