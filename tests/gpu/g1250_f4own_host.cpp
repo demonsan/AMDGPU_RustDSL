@@ -97,11 +97,20 @@ int main(int argc, char** argv) {
     HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SB.data(), SB.size(), hipMemcpyHostToDevice));
     HC(hipMemset(dC, 0xff, (size_t)M * N * (bf16 ? 2 : 4)));
 
-    struct { void *a, *b, *sa, *sb, *c; int k, n; } ka{dA, dB, dSA, dSB, dC, K, N};
-    size_t ksz = sizeof(ka);
+    // PERSIST=G: a persistent kernel (a tile loop inside): G workgroups (a multiple of the tile columns N / BN), each takes the tile column
+    // w % (N / BN) and the rows w / (N / BN), + G / (N / BN), ..; extra kernargs: tile rows M / BM @48, log2(N / BN) @52, the row step @56.
+    // The first (smoke) launch is one workgroup per tile column (row step 1).
+    const int persist = getenv("PERSIST") ? atoi(getenv("PERSIST")) : 0;
+    const int tx = N / BN, ty = M / BM;
+    int lgx = 0;
+    while ((1 << lgx) < tx) ++lgx;
+    if (persist && ((1 << lgx) != tx || persist % tx || persist > tx * ty)) { fprintf(stderr, "PERSIST=%d: N / BN = %d must be a power of two dividing it, at most %d tiles\n", persist, tx, tx * ty); return 1; }
+    struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1};
+    size_t ksz = persist ? sizeof(ka) : 48;
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
-        const unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
+        unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
+        if (persist) { gx = stage == 0 ? tx : persist; gy = 1; ka.ystep = gx / tx; }
         if (stage == 1 && gx == 1 && gy == 1) break;
         hipEvent_t e;
         HC(hipEventCreate(&e));
@@ -155,7 +164,8 @@ int main(int argc, char** argv) {
     if (iters > 0 && (bad == 0 || getenv("SKIPCHECK"))) {
         hipEvent_t e0, e1;
         HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
-        const unsigned gx = N / BN, gy = M / BM;
+        unsigned gx = N / BN, gy = M / BM;
+        if (persist) { gx = persist; gy = 1; ka.ystep = persist / tx; }
         for (int w = 0; w < 3; ++w) HC(launch(fn, gx, gy, THR, cfg));
         HC(hipEventRecord(e0, nullptr));
         for (int i = 0; i < iters; ++i) HC(launch(fn, gx, gy, THR, cfg));
