@@ -1276,6 +1276,38 @@ impl Lowerer {
     /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
+    /// gfx1250: retarget the matrix op producing `v` (in the current block, its only result use is this assignment) to write the variable
+    /// `var` directly. Legal when the op's result register is a plain tuple of the variable's class and no instruction after the op in this
+    /// block reads or writes the variable or its views (the op itself may read it: that is the accumulation D = C).
+    fn wmma_in_place(&mut self, v: ValueId, var: VReg) -> bool {
+        let Some(&r) = self.val.get(&v) else { return false };
+        if self.mir.vreg_class(r) != self.mir.vreg_class(var) || self.mir.alias.contains_key(&r) || self.mir.alias.values().any(|(t, _)| *t == r) {
+            return false;
+        }
+        let cur = self.cur;
+        let insts = &self.mir.blocks[cur].insts;
+        let Some(pi) = insts.iter().rposition(|i| i.dst == Some(r)) else { return false };
+        if crate::op_attrs::attrs(insts[pi].op).cost.pipe != crate::sched::model::Pipe::Mfma {
+            return false;
+        }
+        // r defined once (here), read nowhere else in the function
+        let elsewhere = self.mir.blocks.iter().enumerate().any(|(bi, b)| b.insts.iter().enumerate().any(|(ii, i)| (bi, ii) != (cur, pi) && (i.dst == Some(r) || i.srcs.iter().any(|s| matches!(s, Src::Reg(q) if *q == r)))));
+        if elsewhere {
+            return false;
+        }
+        let touches_var = |i: &MInst, m: &MFunction| -> bool {
+            let hit = |q: VReg| q == var || m.alias.get(&q).map_or(false, |(t, _)| *t == var);
+            i.dst.map_or(false, hit) || i.srcs.iter().any(|s| matches!(s, Src::Reg(q) if hit(*q)))
+        };
+        if insts[pi + 1..].iter().any(|i| touches_var(i, &self.mir)) {
+            return false;
+        }
+        self.mir.blocks[cur].insts[pi].dst = Some(var);
+        self.val.insert(v, var);
+        self.touch(&[Src::Reg(var)]);
+        true
+    }
+
     fn retarget_producer(&mut self, v: ValueId, new_dst: VReg) -> bool {
         self.retarget_producer_inner(v, new_dst)
     }
@@ -2516,6 +2548,15 @@ impl Lowerer {
                             }
                             if std::env::var("AMDC_COALESCE_DEBUG").map_or(false, |v| !v.is_empty()) {
                                 eprintln!("set_var(v{v}): not in place (uses {:?}, def {:?})", self.use_counts.get(v), self.defs.get(v).map(|o| format!("{o:?}").chars().take(40).collect::<String>()));
+                            }
+                        }
+                    }
+                    // gfx1250 accumulate in place: set_var(acc, wmma(.., acc)) where the matrix op's result is used only here, was produced in this
+                    // block, and nothing after it reads the variable: the matrix op writes the variable's registers (D = C), no loop-carried copy
+                    if crate::target::cur().name == "gfx1250" && matches!(class, RClass::V8 | RClass::V16) {
+                        if let Opnd::Val(v) = value {
+                            if self.use_counts.get(v).copied() == Some(1) && self.wmma_in_place(*v, dst) {
+                                return Ok(());
                             }
                         }
                     }
