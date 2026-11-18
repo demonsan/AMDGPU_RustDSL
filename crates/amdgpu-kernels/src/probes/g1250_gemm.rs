@@ -486,6 +486,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let persistent = ring.persistent;
     assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
     if persistent {
+        // the outermost loop is the persistent tile loop (G5 verifies one tile body ending quiescent)
+        b.persistent_tile_loop();
         b.arg("tiles_y", DType::I32, 48, 4);
         b.arg("lg_tiles_x", DType::I32, 52, 4);
         b.arg("ystep", DType::I32, 56, 4);
@@ -667,6 +669,11 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
     pipe.run(&mut b, Role::All, &mut body);
+    if persistent {
+        // the next tile's first stage overwrites slot 0: every wave has finished reading the last window first
+        b.wait_lds(0);
+        b.barrier();
+    }
 
     // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
     let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
