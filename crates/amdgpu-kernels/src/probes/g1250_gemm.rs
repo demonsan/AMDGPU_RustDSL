@@ -548,7 +548,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let epi = ring.epilogue_lds;
     assert!(epi == 0 || (!sh.bf16 && sh.cx * sh.cy == 1), "the LDS epilogue: f32, no cluster");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
-    let epi_rs = wcols * 4 + 16;
+    // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
+    // so its staging rows are unpadded)
+    let epi_rs = if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
@@ -788,7 +790,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             }
         } else {
             // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
-            let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: Some((wcols as u16, 4)), wg_mask: 0 };
+            let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
             // (the origin and the LDS base are wave-uniform: scalar descriptor words)
             let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
             let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
