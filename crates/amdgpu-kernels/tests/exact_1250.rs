@@ -133,3 +133,22 @@ fn a_wait_beyond_the_counter_width_is_a_compile_error() {
     let f = b.finish();
     amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// A cluster launch's TTMP9 / TTMP7 are cluster ids: the plain workgroup-id ops are a compile error in a kernel that declares a cluster,
+/// and keep their lowering without one.
+#[test]
+fn workgroup_ids_in_a_cluster_launch_are_refused() {
+    for op in [Op::WorkgroupIdX, Op::WorkgroupIdY] {
+        let mut b = FnBuilder::new("probe_cluster_wgid", 32);
+        b.arg("out", DType::Ptr, 0, 8);
+        b.arg_tensor("out", Ext::c(64));
+        let p = b.let_(Op::KernargPtr { offset: 0 });
+        let g = b.let_(op.clone());
+        b.store_global(p, 0, g, amdgpu_dsl::MemTy::B32, false);
+        let mut f = b.finish();
+        amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("no cluster: {e}"));
+        f.kd.push(("cluster_dims".into(), 4));
+        let e = amdgpu_codegen::compile_target(&f, "gfx1250").err().expect("refused in a cluster launch");
+        assert!(e.contains("cluster launch"), "{e}");
+    }
+}
