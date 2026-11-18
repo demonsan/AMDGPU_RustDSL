@@ -72,6 +72,7 @@ pub fn probe_g1250_tdm_with(raw: Option<[u32; 3]>) -> Function {
     // host contract: group 1 word 0 (kernarg offset 32) carries no multicast mask (low 16 bits zero): the data-size field only (docs/gfx1250-hang-rules.md GV-1250-MCAST)
     b.ka_one_of(32, &[0, 0x10000, 0x20000, 0x30000]);
     b.lds(4096);
+    b.tdm_host_descriptor();   // the evidence kernel of raw / host-built descriptors: the host owns the global address
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let w: Vec<Opnd> = (0..12u32).map(|k| Opnd::Val(b.let_(Op::KernargI32 { offset: 16 + 4 * k }))).collect();
     let g0 = b.let_(Op::RsrcCat { words: [w[0], w[1], w[2], w[3]] });
@@ -230,6 +231,8 @@ pub fn probe_g1250_tdm2d() -> Function {
         b.arg(n, DType::I32, 16 + 4 * k as u32, 4);
     }
     b.arg_tensor("out", Ext::c(128 * 4));
+    // host contract: `src` holds the tile (16 x 8 f32, `pitch` elements per row) `off` bytes in
+    b.arg_tensor("src", Ext::ka(28) + Ext::c(7 * 4) * Ext::ka(24) + Ext::c(64));
     b.lds(128 * 4);
     let ps = b.let_(Op::KernargPtr { offset: 0 });
     let po = b.let_(Op::KernargPtr { offset: 8 });
@@ -291,6 +294,7 @@ pub fn tdm_ring_with(wait: bool, reuse_barrier: bool) -> Function {
     b.arg("src", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     b.arg_tensor("out", Ext::c(128 * 4));
+    b.arg_tensor("src", Ext::c(K as i64 * 128 * 4));
     b.lds(2 * 128 * 4);
     b.lds_ring("ring", 0, 512, 2);
     let ps = b.let_(Op::KernargPtr { offset: 0 });
@@ -401,7 +405,7 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     let rows = bytes / 1024;
     let mut b = FnBuilder::new(&format!("probe_g1250_lds_{bytes}"), 256);
     b.arg("out", DType::Ptr, 0, 8);
-    b.arg_tensor("out", Ext::c(1 << 26));
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(1024));   // one KiB per workgroup
     b.lds(bytes);
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
@@ -443,6 +447,7 @@ pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
     b.arg("src", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     b.arg_tensor("out", Ext::c(4096));
+    b.arg_tensor("src", Ext::c(4096));
     b.lds(163_840);
     let ps = b.let_(Op::KernargPtr { offset: 0 });
     let po = b.let_(Op::KernargPtr { offset: 8 });
@@ -472,7 +477,7 @@ pub fn probe_g1250_trans() -> Function {
     use amdgpu_dsl::UnOp;
     let mut b = FnBuilder::new("probe_g1250_trans", 512);
     b.arg("out", DType::Ptr, 0, 8);
-    b.arg_tensor("out", Ext::c(1 << 26));
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(16384));   // 16 KiB per workgroup
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
     let tf = b.un(UnOp::CvtF32I32, tid);

@@ -69,6 +69,7 @@ fn asm_positive(asm: &str) {
 /// One tensor load with constant descriptor words: group 1 word 0 = `w0` (multicast mask in its low 16 bits), cluster launch of `cluster` workgroups (0 = none), a barrier after the wait.
 fn tdm_kernel(w0: i32, cluster: i64) -> Function {
     let mut b = FnBuilder::new("hr_tdm", 64);
+    b.tdm_host_descriptor();   // these kernels exercise the other rules with hand-built descriptor words (tests/tdm_bounds.rs covers the bounds rule)
     b.lds(4096);
     let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::I32(0), Opnd::I32(0), Opnd::I32((2u32 << 30) as i32)] });
     let g1 = b.sgpr_cat8([Opnd::I32(w0), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(64), Opnd::I32(0), Opnd::I32(0)]);
@@ -85,6 +86,7 @@ fn tdm_kernel(w0: i32, cluster: i64) -> Function {
 /// A tensor load with every descriptor word given: group 0 = (`g0w0`, LDS address `lds`, 0, `g0w3`), group 1 = (`w0`, dims, `tile0`, `tile1`), LDS of `lds_bytes`.
 fn tdm_desc_kernel(g0w0: i32, g0w3: i32, lds: i32, w0: i32, tile0: i32, tile1: i32, lds_bytes: u32) -> Function {
     let mut b = FnBuilder::new("hr_desc", 64);
+    b.tdm_host_descriptor();   // these kernels exercise the other rules with hand-built descriptor words (tests/tdm_bounds.rs covers the bounds rule)
     b.lds(lds_bytes);
     let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(g0w0), Opnd::I32(lds), Opnd::I32(0), Opnd::I32(g0w3)] });
     let g1 = b.sgpr_cat8([Opnd::I32(w0), Opnd::I32(4096 << 16), Opnd::I32(0), Opnd::I32(tile0 << 16), Opnd::I32(tile1), Opnd::I32(4096), Opnd::I32(0), Opnd::I32(0)]);
@@ -99,6 +101,7 @@ const TYPE2: i32 = (2u32 << 30) as i32;
 /// The group-1 word 0 comes from the kernarg segment (the host builds the descriptor); `host_values` is the host contract on it (empty: none).
 fn tdm_host_kernel(host_values: &[i64]) -> Function {
     let mut b = FnBuilder::new("hr_tdm_host", 64);
+    b.tdm_host_descriptor();   // these kernels exercise the other rules with hand-built descriptor words (tests/tdm_bounds.rs covers the bounds rule)
     b.lds(4096);
     b.arg("d0", DType::I32, 0, 4);
     if !host_values.is_empty() {

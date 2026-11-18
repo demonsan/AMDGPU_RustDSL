@@ -2157,6 +2157,111 @@ impl<'a> An<'a> {
         }
     }
 
+    /// The constant part of a descriptor word: an immediate, a constant value, or `const + computed field` (the multicast mask is added to the constant fields).
+    fn tdm_const_part(&self, o: &Opnd) -> Option<u32> {
+        match self.word_root(o) {
+            Opnd::I32(c) => Some(c as u32),
+            Opnd::Val(v) => match self.defs.get(&v) {
+                Some(Op::ConstI32(c)) => Some(*c as u32),
+                Some(Op::AddI32(Opnd::I32(c), _)) | Some(Op::AddI32(_, Opnd::I32(c))) => Some(*c as u32),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// GV-TDM-PROV / GV-GLB-*: the global tile of a tensor operation must come from a kernarg pointer with a declared extent and lie inside it. The descriptor's address words must be the two
+    /// halves of ONE pointer value (a constant, an unrelated register, or the halves of different pointers cannot be traced to a buffer); the tile's footprint is the last row's end,
+    /// `(rows - 1) x row stride + row bytes`, from the constant dimension words and the (symbolic) row stride; it is proven inside the extent over every wave, workgroup and loop iteration the
+    /// pointer's offset ranges over (the same prover as the global loads: `GV-GLB-PROV`, `GV-GLB-NOEXT`, `GV-GLB-OOB`). Lifted vendor kernels (exact mode) get warnings.
+    fn check_tdm(&mut self, what: &str, g0: &Opnd, g1: &Opnd, store: bool) {
+        if self.rep.quiet > 0 {
+            return;
+        }
+        // a kernel whose descriptors the HOST builds (an evidence / probe kernel) names that as a launch fact: a trusted item, never silent
+        if self.f.kd.iter().any(|(k, v)| k == "g5:tdm_host_descriptor" && *v != 0) {
+            return;
+        }
+        let sev = if self.f.exact { Severity::Warn } else { Severity::Error };
+        let at = self.idx;
+        macro_rules! fail {
+            ($($arg:tt)*) => {{
+                let m = format!("stmt {at}: {what}: {}", format!($($arg)*));
+                self.rep.add("GV-TDM-PROV", sev, m);
+                return;
+            }};
+        }
+        let words0 = match g0 {
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::RsrcCat { words }) => *words,
+                _ => fail!("group 0 is not a descriptor built from a pointer value: the tile's source buffer is unknown"),
+            },
+            _ => fail!("group 0 is not a descriptor built from a pointer value: the tile's source buffer is unknown"),
+        };
+        let Some(p) = self.ptr_of_word(&words0[2]) else {
+            fail!("the descriptor's global-address low word is not the low half of a pointer value (a constant or an unrelated register): the tile's source buffer is unknown")
+        };
+        // the high word: `(PtrHi(p) & 0x1ffffff) + 0x80000000` (or the bare high half) of the SAME pointer
+        let hi_ok = {
+            let r = self.word_root(&words0[3]);
+            let hi_of = |o: &Opnd| -> Option<Opnd> {
+                let Opnd::Val(h) = self.word_root(o) else { return None };
+                match self.defs.get(&h) {
+                    Some(Op::PtrHi(q)) => Some(*q),
+                    Some(Op::AndI32(a, Opnd::I32(0x01ff_ffff))) | Some(Op::AndI32(Opnd::I32(0x01ff_ffff), a)) => {
+                        let Opnd::Val(h2) = self.word_root(a) else { return None };
+                        match self.defs.get(&h2) {
+                            Some(Op::PtrHi(q)) => Some(*q),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            match r {
+                Opnd::Val(v) => match self.defs.get(&v) {
+                    Some(Op::AddI32(a, Opnd::I32(_))) | Some(Op::AddI32(Opnd::I32(_), a)) => hi_of(a) == Some(p),
+                    _ => hi_of(&r) == Some(p),
+                },
+                _ => false,
+            }
+        };
+        if !hi_ok {
+            fail!("the descriptor's global-address high word is not built from the same pointer as its low word")
+        }
+        // the footprint from group 1: data size (word 0 bits 17:16), tile (word 3 bits 31:16 x word 4 bits 15:0), row stride (word 5, elements)
+        let words1 = match g1 {
+            Opnd::Val(v) => match self.defs.get(v) {
+                Some(Op::SgprCat8 { words }) => *words,
+                _ => fail!("group 1 is not a constant-shaped descriptor (SgprCat8): the tile's size is unknown"),
+            },
+            _ => fail!("group 1 is not a constant-shaped descriptor (SgprCat8): the tile's size is unknown"),
+        };
+        let (Some(w0), Some(w3), Some(w4)) = (self.tdm_const_part(&words1[0]), self.tdm_const_part(&words1[3]), self.tdm_const_part(&words1[4])) else {
+            fail!("the tile's data size / dimensions are not constants: the footprint cannot be bounded")
+        };
+        let esz = 1i128 << ((w0 >> 16) & 3);
+        let (t0, t1, t2) = ((w3 >> 16) as i128, (w4 & 0xffff) as i128, (w4 >> 16) as i128);
+        if t0 == 0 || t1 == 0 || t2 > 1 {
+            fail!("unsupported tile shape (tile dims {t0} x {t1} x {t2}): only 1-D / 2-D tiles are bounded")
+        }
+        let row_bytes = t0 * esz;
+        let stride = self.int_of(&words1[5]).scale(Q::int(esz));
+        let base = self.av_of(&p);
+        let arms = match base {
+            AV::Either(a) => a,
+            one => vec![one],
+        };
+        for arm in arms {
+            let AV::Ptr { arg, off } = arm else {
+                self.check_global(what, &arm, 0, row_bytes, store);
+                continue;
+            };
+            let end = Itv { lo: off.lo.clone(), hi: off.add(&stride.scale(Q::int(t1 - 1))).hi };
+            self.check_global(what, &AV::Ptr { arg, off: end }, 0, row_bytes, store);
+        }
+    }
+
     fn check_global(&mut self, what: &str, base: &AV, imm: i128, size: i128, store: bool) {
         if self.rep.quiet > 0 {
             return; // quiet (a loop fixpoint round): every effect below is a report, and reports are dropped
@@ -2743,6 +2848,8 @@ impl<'a> An<'a> {
                 (Some((pl, false)), None) if self.masked_hi_of(hi).map_or(false, |ph| self.same_ptr(&pl, &ph)) => self.av_of(&pl),
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
+            // a tensor-descriptor group 0 ([count = 1, lds address, global address lo, hi]): not a buffer descriptor; its global base is checked at the tensor operation (check_tdm)
+            Op::RsrcCat { words } if matches!(self.word_root(&words[0]), Opnd::I32(1)) || self.f.kd.iter().any(|(k, v)| k == "g5:tdm_host_descriptor" && *v != 0) => AV::Other,
             Op::RsrcCat { words } => match self.rsrc_words(words) {
                 Ok((p, nr)) => match self.av_of(&p) {
                     AV::Ptr { arg, off } => AV::Rsrc { arg, num: Some(self.int_of(&nr)), base: off },
@@ -3612,6 +3719,8 @@ impl<'a> An<'a> {
                 self.tag_stmt = self.idx;
             }
             Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
+            Stmt::TensorLoadToLds { g0, g1, .. } => self.check_tdm("tensor_load_to_lds", g0, g1, false),
+            Stmt::TensorStoreFromLds { g0, g1, .. } => self.check_tdm("tensor_store_from_lds", g0, g1, true),
             Stmt::StoreU16 { base, byte_off, .. } => {
                 self.record_global_store(base, *byte_off as i128, 2);
                 let b = self.av_of(base);

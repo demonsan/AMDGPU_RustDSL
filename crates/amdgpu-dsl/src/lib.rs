@@ -3837,6 +3837,12 @@ impl FnBuilder {
         self.f.kd.push((format!("g5:signals_per_wg:{id}"), per_wg as i64));
     }
 
+    /// gfx1250 launch fact for the hang-safety verifier: the tensor descriptors of this kernel are built by the HOST (kernarg words), so their global base and extent cannot be proved
+    /// (GV-TDM-PROV / GV-GLB-*). A TRUSTED item, listed by `trusted_items`; for evidence / probe kernels only.
+    pub fn tdm_host_descriptor(&mut self) {
+        self.f.kd.push(("g5:tdm_host_descriptor".to_string(), 1));
+    }
+
     /// gfx1250 launch fact for the hang-safety verifier (`GV-1250-BAR-COUNT`): every wave waits on barrier `id` the same number of times per phase even though the waves wait in different loops
     /// (different wave paths that iterate the same trip count). A TRUSTED item (listed by `trusted_items`): the verifier cannot compare loop trip counts.
     pub fn barrier_wait_trips_match(&mut self, id: i32) {

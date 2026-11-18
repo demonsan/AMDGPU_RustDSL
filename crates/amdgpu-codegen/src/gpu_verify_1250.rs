@@ -1574,6 +1574,9 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
 /// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
 pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
+    if kd_val(f, "g5:tdm_host_descriptor") != 0 {
+        v.push("tensor descriptors built by the host (launch fact g5:tdm_host_descriptor): their global base / extent are not proved".to_string());
+    }
     if alternation(f).needs_trip_fact.is_some() && kd_val(f, "g5:wait_trips_match:-3") != 0 {
         v.push("barrier -3: the loops the waves wait in iterate the same number of times (declared launch fact g5:wait_trips_match:-3, not proved)".to_string());
     }
