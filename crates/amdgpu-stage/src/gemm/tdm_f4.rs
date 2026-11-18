@@ -110,6 +110,10 @@ impl PipeBody for TdmF4Body {
         rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
     }
 
+    fn finish(&mut self, b: &mut FnBuilder, _role: Role) {
+        b.wait_tensor(0);   // the last steady iteration's clamped stage is still in flight
+    }
+
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
         if self.sh.cx * self.sh.cy > 1 {
             // multicast: this workgroup's slices land in the other workgroups' LDS and theirs in ours. Our own loads complete (tensor wait), every wave of the workgroup is done (reads of the previous

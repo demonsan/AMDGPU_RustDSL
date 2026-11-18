@@ -587,13 +587,25 @@ pub fn probe_g1250_trans_all() -> Function {
 /// byte 2048 x slice (wave 0 issues, cache policy `th` / `scope`), waits for its own tensor completion, a workgroup barrier, the cluster barrier; then every work-item copies the whole 4096-byte LDS
 /// to `out[position]`. With mask 0b11 each workgroup must see both slices; mask 0 (no multicast) only its own. Kernargs: src @0 (4096 bytes), out @8 (8192 bytes). 64 work-items.
 pub fn probe_g1250_mcast_with(name: &str, th: u8, scope: u8, mask: u16) -> Function {
+    probe_g1250_mcast_lds(name, th, scope, mask, 4096)
+}
+
+/// `probe_g1250_mcast_with` declaring `lds_bytes` of LDS (hypothesis: a multicast lands at the SAME LDS address in every destination, which is only the same location when every workgroup's LDS
+/// base is equal, e.g. when each workgroup owns the whole LDS).
+pub fn probe_g1250_mcast_lds(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32) -> Function {
+    probe_g1250_mcast_full(name, th, scope, mask, lds_bytes, false, 0)
+}
+
+/// The full multicast probe. `wm24`: the issuing wave first sets WAVE_MODE bit 24 (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1`), which the vendor's GEMM kernel does in its wave 0 only
+/// (the wave that issues the tensor loads of its workgroup), before any tensor operation.
+pub fn probe_g1250_mcast_full(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32, wm24: bool, delay: u32) -> Function {
     use amdgpu_dsl::ev;
     let mut b = FnBuilder::new(name, 64);
     b.arg("src", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     b.arg_tensor("src", Ext::c(4096));
     b.arg_tensor("out", Ext::c(8192));
-    b.lds(4096);
+    b.lds(lds_bytes);
     let ps = b.let_(Op::KernargPtr { offset: 0 });
     let po = b.let_(Op::KernargPtr { offset: 8 });
     let t6 = b.let_(Op::ReadTtmp { idx: 6 });
@@ -607,11 +619,24 @@ pub fn probe_g1250_mcast_with(name: &str, th: u8, scope: u8, mask: u16) -> Funct
     let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
     let lead = b.bind_cond(ev(w).eq(0));
     b.begin_if(Opnd::Val(lead));
+    if wm24 {
+        b.set_reg_imm(1, 24, 1, 1);   // HW_REG_WAVE_MODE (id 1), bit 24
+    }
     b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol { th, scope, nv: false });
     b.end_if();
     b.wait_tensor(0);
     b.barrier();
     b.cluster_barrier();
+    if delay > 0 {
+        // a delay of about `delay` workgroup barriers before the copy: separates "the peer's slice arrives late" from "never"
+        let v = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        b.barrier();
+        let nx = b.add_i32(v[0], Opnd::I32(1));
+        b.set_var(v[0], nx);
+        let c = b.cmp(amdgpu_dsl::CmpPred::Ge, amdgpu_dsl::CmpTy::I32, nx, Opnd::I32(delay as i32));
+        b.break_if(c);
+        b.end_loop();
+    }
     let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(12)));
     for k in 0..16i32 {
         let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));

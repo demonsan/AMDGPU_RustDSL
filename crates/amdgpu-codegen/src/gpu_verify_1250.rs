@@ -48,7 +48,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
-    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
+    Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -1742,12 +1742,53 @@ const TDM_UNBOUNDED: u32 = 64;
 /// `s_wait_tensorcnt N` caps the bound at N, joins take the maximum, loops iterate to a fixpoint (a loop that issues without draining saturates: unbounded). A tensor operation that can issue with
 /// more than `TDM_MAX_OUTSTANDING_AT_ISSUE` outstanding is a violation.
 fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
-    if !insts.iter().any(|i| i.mn.starts_with("tensor_")) {
+    // the tensor counter (issue: tensor_*, wait: s_wait_tensorcnt) and the async counter (issue: the async copies to LDS, wait: s_wait_asynccnt)
+    let is_tensor = |i: &Inst| i.mn.starts_with("tensor_");
+    let is_async = |i: &Inst| i.mn.contains("_async_") || i.mn.starts_with("async_");
+    let any_t = insts.iter().any(|i| is_tensor(i));
+    let any_a = insts.iter().any(|i| is_async(i));
+    if !any_t && !any_a {
         return;
     }
+    if any_t {
+        let bound = outstanding_bounds(insts, labels, &is_tensor, "s_wait_tensorcnt");
+        for (i, ins) in insts.iter().enumerate() {
+            if is_tensor(ins) {
+                if let Some(d) = bound[i] {
+                    if d > TDM_MAX_OUTSTANDING_AT_ISSUE {
+                        let how = if d >= TDM_UNBOUNDED { "an unbounded number".to_string() } else { format!("up to {d}") };
+                        viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` can issue with {how} of tensor operations outstanding (the invariant: at most {TDM_MAX_OUTSTANDING_AT_ISSUE} at an issue)", ins.line, ins.mn));
+                    }
+                }
+            }
+        }
+        endpgm_check(insts, &bound, "tensor", "s_wait_tensorcnt 0", v);
+    }
+    if any_a {
+        let bound = outstanding_bounds(insts, labels, &is_async, "s_wait_asynccnt");
+        endpgm_check(insts, &bound, "async LDS", "s_wait_asynccnt 0", v);
+    }
+}
+
+/// A wave that ends with a copy into LDS in flight lets that write land in LDS the next workgroup of the CU may already own.
+fn endpgm_check(insts: &[Inst], bound: &[Option<u32>], what: &str, wait: &str, v: &mut Vec<Violation>) {
+    for (i, ins) in insts.iter().enumerate() {
+        if ins.mn == "s_endpgm" {
+            if let Some(d) = bound[i] {
+                if d > 0 {
+                    let how = if d >= TDM_UNBOUNDED { "an unbounded number".to_string() } else { format!("up to {d}") };
+                    viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `s_endpgm` can be reached with {how} of {what} operations outstanding: drain them (`{wait}`) on every path to the end", ins.line));
+                }
+            }
+        }
+    }
+}
+
+/// bound[i]: a sound upper bound of the operations of one counter outstanding at the entry of instruction i over all paths (None: not reached). An issue adds one, `wait N` caps it at N, joins take
+/// the maximum, loops iterate to a fixpoint (a loop that issues without draining saturates).
+fn outstanding_bounds(insts: &[Inst], labels: &HashMap<String, usize>, issue: &dyn Fn(&Inst) -> bool, wait: &str) -> Vec<Option<u32>> {
     let n = insts.len();
     let by_addr: HashMap<u64, usize> = insts.iter().enumerate().filter_map(|(i, x)| x.addr.map(|(a, _)| (a, i))).collect();
-    // bound[i]: an upper bound of the outstanding tensor operations at the entry of instruction i over all paths (None: not reached yet)
     let mut bound: Vec<Option<u32>> = vec![None; n + 1];
     bound[0] = Some(0);
     let mut work = vec![0usize];
@@ -1757,9 +1798,9 @@ fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violat
         }
         let ins = &insts[i];
         let d = bound[i].unwrap_or(0);
-        let out = if ins.mn.starts_with("tensor_") {
+        let out = if issue(ins) {
             (d + 1).min(TDM_UNBOUNDED)
-        } else if ins.mn == "s_wait_tensorcnt" {
+        } else if ins.mn == wait {
             match parse_int(&ins.ops) {
                 Some(k) if k >= 0 => d.min(k as u32),
                 _ => d,
@@ -1796,16 +1837,7 @@ fn tdm_drain(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violat
             }
         }
     }
-    for (i, ins) in insts.iter().enumerate() {
-        if ins.mn.starts_with("tensor_") {
-            if let Some(d) = bound[i] {
-                if d > TDM_MAX_OUTSTANDING_AT_ISSUE {
-                    let how = if d >= TDM_UNBOUNDED { "an unbounded number".to_string() } else { format!("up to {d}") };
-                    viol(v, "GV-1250-TDM-DRAIN", format!("line {}: `{}` can issue with {how} of tensor operations outstanding (the invariant: at most {TDM_MAX_OUTSTANDING_AT_ISSUE} at an issue)", ins.line, ins.mn));
-                }
-            }
-        }
-    }
+    bound
 }
 
 fn is_dpp(ops: &str) -> bool {

@@ -8,7 +8,7 @@ CL=/opt/rocm/llvm/bin/clang
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_mcast_host.cpp -o $O/mcast_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"
 export PROBE_WATCHDOG_S=10
-for k in ${NAMES:-probe_g1250_mcast_m0 probe_g1250_mcast_th0 probe_g1250_mcast_th2 probe_g1250_mcast_th5}; do
+for k in ${NAMES:-probe_g1250_mcast_wm24 probe_g1250_mcast_slow}; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL: $(tail -2 $O/$k.log | tr '\n' ' ' | cut -c1-300)"; continue; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s || continue
   kdc=$($A print-ir $k 2>/dev/null | grep -m1 '^kd "cluster_dims"' | awk '{print $3}')

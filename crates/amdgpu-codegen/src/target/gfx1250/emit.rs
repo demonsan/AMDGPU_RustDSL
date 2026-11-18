@@ -661,7 +661,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                     ops.push(g(regs[2], 4));
                     ops.push(g(regs[3], 4));
                 }
-                const TH: [&str; 8] = ["", "TH_LOAD_NT", "TH_LOAD_HT", "TH_LOAD_BYPASS", "TH_LOAD_LU", "TH_LOAD_NT_RT", "TH_LOAD_RT_NT", "TH_LOAD_NT_HT"];
+                // (llvm-mc: NT_RT encodes as 4, RT_NT as 5; LU is the same code as BYPASS, 3)
+                const TH: [&str; 8] = ["", "TH_LOAD_NT", "TH_LOAD_HT", "TH_LOAD_BYPASS", "TH_LOAD_NT_RT", "TH_LOAD_RT_NT", "TH_LOAD_NT_HT", "TH_LOAD_NT_HT"];
                 const TH_ST: [&str; 8] = ["", "TH_STORE_NT", "TH_STORE_HT", "TH_STORE_BYPASS", "TH_STORE_LU", "TH_STORE_NT_RT", "TH_STORE_RT_NT", "TH_STORE_NT_HT"];
                 const SCOPE: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
                 let th = (inst.imm & 7) as usize;
