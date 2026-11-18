@@ -130,6 +130,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 | [`docs/l1-graph.md`](docs/l1-graph.md) | **L1 图层**：算子词表、融合规则（rmsnorm+quant、add+rmsnorm(+quant)、silu_mul+quant、qknorm+rope(+kvcache)…）、多 kernel 计划（attention split→combine、MoE、GEMM split-K）、`amdc graph plan`、golden 计划与数值检查 |
 | [`docs/python-jit.md`](docs/python-jit.md) | **Python JIT 入口**：amdc 子进程编译 + 磁盘缓存 + 形状特化（默认开）、kernarg 打包与主机合同校验、GEMM / FMHA 高层算子（含出厂路径选择） |
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
+| [`docs/gfx1250-status.md`](docs/gfx1250-status.md) | **gfx1250（MI450）现状**：后端支持（编码器、wait / hazard、TDM / barrier / cluster、VGPR 窗口）、hang 规则、两个 1:1 复刻、自研 MXFP4 GEMM 与 MLA 对照厂商（配对实测）、优化记录、事故与待办 |
 | [`docs/op-coverage-design.md`](docs/op-coverage-design.md) / [`docs/op-coverage-membound.md`](docs/op-coverage-membound.md) / [`docs/op-coverage-memtemplates.md`](docs/op-coverage-memtemplates.md) / [`docs/op-coverage-tileops.md`](docs/op-coverage-tileops.md) | **aiter 基础算子覆盖**：迁移设计与批次状态（§7：GEMM / attention / MoE / 反向 / 卷积）/ 访存受限算子实测与 aiter 覆盖表 / 访存模板 T1–T7 / TIRx 式 tile-op 覆盖矩阵 |
 | [`docs/diagnostics.md`](docs/diagnostics.md) | **结构化诊断**：`--json` 发现（code / 语句 / 区域 / Rust 源码位置 / 修复建议）、`amdc summary`、`amdc srcmap` |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
@@ -175,7 +176,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 
 ## 边界与已知限制
 
-- 基于 `gfx950`；`gfx1250` 只在架构层面预留（未验证）。
+- 基于 `gfx950`；`gfx1250`（MI450）已有可用后端与在硬件上验证过的 kernel，见 [`docs/gfx1250-status.md`](docs/gfx1250-status.md)。
 - `llvm20` 方言的表行是 `llvm24` 的拷贝，仅 pinned `llvm24` 的 `llc` 做过机器验证。
 - DMA / LDS 直达 / `buffer_load … lds` 等为 own-only；使用它们的 kernel 自动选 own 后端。
 - 编译策略按 kernel profile 固定（`crates/amdgpu-codegen/src/lib.rs`）；实验开关、别名 kernel 与负结果变体已在 2026-11 整理中删除（结论在 `docs/archive/`，实验分支归档为 `archive/*` tag）。
