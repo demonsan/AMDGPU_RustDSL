@@ -38,7 +38,9 @@ pub fn cse(m: &mut MFunction) -> usize {
         let aliased: std::collections::HashSet<VReg> = m.alias.keys().copied().chain(m.alias.values().map(|x| x.0)).collect();
         let plain = |r: VReg| ndefs.get(&r).copied() == Some(1) && !aliased.contains(&r);
         let mut rename: HashMap<VReg, VReg> = HashMap::new();
-        for b in m.blocks.iter_mut() {
+        // every register each instruction writes (the destination and the second results of swaps / permutes), by the effects model
+        let writes: Vec<Vec<Vec<u32>>> = m.blocks.iter().map(|b| b.insts.iter().map(|i| crate::sched::effects::effects(m, i).writes).collect()).collect();
+        for (bi, b) in m.blocks.iter_mut().enumerate() {
             let mut seen: HashMap<(String, i64), VReg> = HashMap::new();
             // the version of every register in this block (bumped at each write of it or of its tuple): equal operands in equal versions
             // hold equal values, whether or not the register is defined once (loop variables are not)
@@ -66,10 +68,11 @@ pub fn cse(m: &mut MFunction) -> usize {
                 if let (true, Some(d)) = (pure, inst.dst) {
                     let srcs_ok = true;
                     if plain(d) && srcs_ok && !rename.contains_key(&d) {
-                        // a copy of a single-definition register of the same class: the register itself
+                        // a copy of a single-definition register of the same class: the register itself (the source must be defined once
+                        // as well: a copy of a loop variable or of a register written in place keeps the value of the moment of the copy)
                         if matches!(inst.op, MOp::SMovB32 | MOp::VMovB32) && inst.srcs.len() == 1 {
                             if let Src::Reg(x) = inst.srcs[0] {
-                                if m.vregs.get(x as usize) == m.vregs.get(d as usize) {
+                                if plain(x) && m.vregs.get(x as usize) == m.vregs.get(d as usize) {
                                     rename.insert(d, x);
                                     removed += 1;
                                     continue;
@@ -88,8 +91,14 @@ pub fn cse(m: &mut MFunction) -> usize {
                         seen.insert(key, d);
                     }
                 }
+                // every register the instruction writes (its destination, and the second results of swaps / permutes) gets a new version
                 if let Some(d) = inst.dst {
                     *ver.entry(canon_of(&m.alias, d)).or_insert(0) += 1;
+                }
+                for &s in &writes[bi][k] {
+                    if s < u32::MAX - 1 {
+                        *ver.entry(canon_of(&m.alias, s / 16)).or_insert(0) += 1;
+                    }
                 }
                 keep.push(inst);
             }
