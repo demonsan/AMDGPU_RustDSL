@@ -1,12 +1,12 @@
-# window-aware > 256 VGPR placement A/B on the 256x128 MXFP4 kernel (A = AMDC_NO_ACCWIN, the previous rule); smallest shape first,
+# window-aware > 256 VGPR placement A/B on the 256x128 MXFP4 kernel (A = the default, B = AMDC_ACCWIN); smallest shape first,
 # every run checked, stop at the first failure; then 3 alternating pairs at 4096 / 8192.
 set -u
 cd $SRC; A=$CARGO_TARGET_DIR/release/amdc; CL=/opt/rocm/llvm/bin/clang; O=$W/f4acc; rm -rf $O; mkdir -p $O
 [ -z "${IDLE_GPU:-}" ] && { echo NO-IDLE-GPU; exit 251; }
 cargo build -q --release -j 64 --bin amdc 2>&1 | grep -E "^error" | head -3
 k=${KERNEL:-gemm_g1250_tdm_stage_f4_256x128}; BM=${BM:-256}; BN=${BN:-128}
-$A emit $k --target gfx1250 --backend=own --out $O/b.s || exit 4
-AMDC_NO_ACCWIN=1 $A emit $k --target gfx1250 --backend=own --out $O/a.s || exit 4
+AMDC_ACCWIN=1 $A emit $k --target gfx1250 --backend=own --out $O/b.s || exit 4
+$A emit $k --target gfx1250 --backend=own --out $O/a.s || exit 4
 echo "msb a: $(grep -c s_set_vgpr_msb $O/a.s) b: $(grep -c s_set_vgpr_msb $O/b.s)"
 for v in a b; do $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$v.co $O/$v.s || exit 5; done
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_f4own_host.cpp -o $O/host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6

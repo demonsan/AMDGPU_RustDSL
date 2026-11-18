@@ -335,12 +335,13 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     vregs.sort_by_key(|x| (x.0, x.1));
     let low_only = low_window_values(m);
     let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
-    // the window plan of the retry: the matrix accumulators (D / C of the matrix ops) above v255, everything else from v0 up, so a matrix op
-    // reads its A / B fragments in the low window and its accumulator in a high one with one MSB setting for all of them
-    // (`AMDC_NO_ACCWIN`: the previous rule, every tuple of 8+ dwords high, for A/B)
+    // the window plan of the retry: wide tuples above v255; with `AMDC_ACCWIN` only the matrix accumulators (D / C of the matrix ops), so a
+    // matrix op reads its A / B fragments in the low window and its accumulator in a high one with one MSB setting for all of them
+    // opt-in (`AMDC_ACCWIN`): measured neutral on the 256x128 MXFP4 kernel (a08-1: 4096^3 1614 vs 1619, 8192^3 2097 vs 2136 TFLOPS) despite
+    // 14 -> 3 MSB switches per loop; the default stays every tuple of 8+ dwords high
     let acc = if !wide_high {
         std::collections::HashSet::new()
-    } else if std::env::var("AMDC_NO_ACCWIN").is_ok() {
+    } else if std::env::var("AMDC_ACCWIN").is_err() {
         m.vregs.iter().enumerate().filter(|(_, c)| c.is_vector() && c.dwords() >= 8).map(|(r, _)| r as VReg).collect()
     } else {
         matrix_accumulators(m)
