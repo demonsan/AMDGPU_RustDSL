@@ -170,6 +170,7 @@ fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
     b.var_scale_lane(o, 0, Opnd::F32(2.0));
     b.store_global(p, 0, copy, amdgpu_dsl::MemTy::B32, false);
     let one = b.let_(Op::ConstI32(1));
+    let one = b.cmp(amdgpu_dsl::CmpPred::Gt, amdgpu_dsl::CmpTy::I32, one, Opnd::I32(0));
     b.break_if(Opnd::Val(one));
     b.end_loop();
     let f = b.finish();
