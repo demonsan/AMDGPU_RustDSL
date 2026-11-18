@@ -823,6 +823,10 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
     };
+    // v_cvt_pk_fp8_f32 (a 16-bit half write: op_sel:[0,0,1] = the high half) keeps the 32-bit operand spelling the assembler accepts
+    if mn == "v_cvt_pk_fp8_f32" {
+        return Ok(vec![line.to_string()]);
+    }
     // a 64-bit lane mask is a 32-bit one on wave32: vcc -> vcc_lo, exec -> exec_lo
     let wave32 = |s: &str| -> String {
         s.split(", ")

@@ -43,6 +43,9 @@ enum Item {
     Tensor,
     /// gfx1250 `s_wait_tensorcnt count`: completes the tensor operations of this wave except the `count` most recent ones
     WaitTensor { ord: u32, count: u8 },
+    /// gfx1250 async global -> LDS load (`global_load_async_to_lds_*`: completes on ASYNCcnt, in order)
+    AsyncLd,
+    WaitAsync { ord: u32, count: u8 },
     /// `fence_release`: waits vmcnt(0)/lgkmcnt(0) (completion) and, with `wb`, writes L2 back (device-scope visibility of plain stores)
     Release { ord: u32 },
     /// `fence_acquire`: `inv` invalidates the non-coherent caches
@@ -63,6 +66,8 @@ struct Ev {
     ds: bool,
     /// gfx1250: the event's accesses are tensor operations (TDM: an LDS write for a load, an LDS read for a store)
     tensor: bool,
+    /// the event's writes include async global -> LDS loads (complete on ASYNCcnt)
+    asyncld: bool,
     n_acc: usize,
     /// a global-memory region event (stores / loads), not LDS
     global: bool,
@@ -405,7 +410,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, n_acc: 0, global, coherent: true, outer: self.outer };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -444,6 +449,25 @@ impl<'a> Sim<'a> {
                                 ev.coherent = false;
                             }
                         }
+                    }
+                }
+            }
+            // gfx1250 async global -> LDS loads: they write the LDS tile (complete on ASYNCcnt)
+            if let Stmt::LoadAsyncLds { .. } = st {
+                match self.open {
+                    Some(e) if !self.evs[e].global && self.evs[e].produce => {
+                        self.items.push(Item::AsyncLd);
+                        let pos = self.items.len() - 1;
+                        let ev = &mut self.evs[e];
+                        ev.last = pos;
+                        ev.n_acc += 1;
+                        ev.asyncld = true;
+                    }
+                    Some(e) => {
+                        self.diag("GV-TILE-KIND", Severity::Error, i, format!("stmt {i}: an async LDS load is issued under a non tile_produce marker (stmt {})", self.evs[e].stmt));
+                    }
+                    None => {
+                        self.untagged.insert(i);
                     }
                 }
             }
@@ -523,6 +547,7 @@ impl<'a> Sim<'a> {
                 Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
                 Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
                 Stmt::WaitTensor { count } | Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Tensor, count } => self.items.push(Item::WaitTensor { ord: self.ord, count: *count }),
+            Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Async, count } => self.items.push(Item::WaitAsync { ord: self.ord, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
                 // the combined s_waitcnt (exact mode): both counters
                 Stmt::WaitCnt { vm, lgkm } => {
@@ -724,7 +749,7 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
     let ord_of = |it: &Item, dflt: u32| match it {
-        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } | Item::WaitTensor { ord, .. } => *ord,
+        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } | Item::WaitTensor { ord, .. } | Item::WaitAsync { ord, .. } => *ord,
         _ => dflt,
     };
     // the event's DS accesses are complete at the first wait_lds(0) after its last access. Barriers in between do not matter for completion (the access
@@ -754,8 +779,28 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
         }
         None
     };
+    // async LDS loads complete at the first s_wait_asynccnt(n) after which at least n LATER async loads of this wave are in flight
+    let async_done = || -> Option<usize> {
+        let mut later = 0usize;
+        for (k, it) in items.iter().enumerate().skip(after) {
+            match it {
+                Item::AsyncLd => later += 1,
+                Item::WaitAsync { count, .. } if later >= *count as usize => return Some(k),
+                _ => {}
+            }
+        }
+        None
+    };
     if ev.produce {
-        let done = if ev.tensor {
+        let done = if ev.asyncld {
+            match (async_done(), ev.tensor.then(tensor_done), ev.ds) {
+                (Some(a), None, false) => Some(a),
+                (Some(a), Some(Some(t)), false) => Some(a.max(t)),
+                (Some(a), None, true) => ds_done().map(|b| a.max(b)),
+                (Some(a), Some(Some(t)), true) => ds_done().map(|b| a.max(b).max(t)),
+                _ => None,
+            }
+        } else if ev.tensor {
             match (tensor_done(), ev.ds) {
                 (Some(a), true) => ds_done().map(|b| a.max(b)),
                 (x, _) => x,
@@ -2013,7 +2058,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {

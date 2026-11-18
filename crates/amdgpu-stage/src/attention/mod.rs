@@ -4,3 +4,4 @@
 pub mod attn3;
 pub mod block3;
 pub mod state;
+pub mod mla;
