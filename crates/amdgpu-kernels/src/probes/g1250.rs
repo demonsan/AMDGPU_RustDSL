@@ -524,15 +524,16 @@ pub fn probe_g1250_trans_all() -> Function {
             // the TRANS argument in (1, 2): safe for every op
             let xa = b.mul_f32(x, Opnd::F32(0.03125));
             let xa = b.add_f32(xa, Opnd::F32(1.125));
-            let tr = match tr_i {
-                0 => b.let_(Op::Exp2F32(Opnd::Val(xa))),
-                1 => b.let_(Op::Log2F32(Opnd::Val(xa))),
-                2 => b.let_(Op::RcpF32(Opnd::Val(xa))),
-                3 => b.un(UnOp::RsqF32, xa),
-                4 => b.un(UnOp::SqrtF32, xa),
-                5 => b.un(UnOp::SinF32, xa),
-                _ => b.un(UnOp::CosF32, xa),
+            let trans = |b: &mut FnBuilder, i: usize, v: ValueId| match i {
+                0 => b.let_(Op::Exp2F32(Opnd::Val(v))),
+                1 => b.let_(Op::Log2F32(Opnd::Val(v))),
+                2 => b.let_(Op::RcpF32(Opnd::Val(v))),
+                3 => b.un(UnOp::RsqF32, v),
+                4 => b.un(UnOp::SqrtF32, v),
+                5 => b.un(UnOp::SinF32, v),
+                _ => b.un(UnOp::CosF32, v),
             };
+            let tr = if rd == 6 { xa } else { trans(&mut b, tr_i, xa) };
             // keep |y| bounded: every reader mixes the TRANS result with x scaled down
             let y = match rd {
                 0 => b.add_f32(tr, x),
@@ -544,7 +545,8 @@ pub fn probe_g1250_trans_all() -> Function {
                 _ => {
                     // both halves written by TRANS ops (the second one right before the packed reader), read as a packed pair
                     let t0 = b.un(UnOp::SqrtF32, x);
-                    let pr = b.frag_cat(&[Opnd::Val(t0), Opnd::Val(tr)]);
+                    let t1 = trans(&mut b, tr_i, xa);
+                    let pr = b.frag_cat(&[Opnd::Val(t0), Opnd::Val(t1)]);
                     let sum = b.let_(Op::PkAddF32(Opnd::Val(pr), Opnd::Val(pr)));
                     let lo = b.frag_slice(sum, 0, 1);
                     let lo = b.bitcast_f32(lo);
@@ -555,7 +557,7 @@ pub fn probe_g1250_trans_all() -> Function {
             };
             // the max reader: on odd steps the chain value also goes through max(tr', y) with a fresh TRANS
             let y = if s % 3 == 1 {
-                let t2 = b.un(UnOp::SqrtF32, xa);
+                let t2 = trans(&mut b, (tr_i + 3) % 7, xa);
                 b.let_(Op::MaxF32(Opnd::Val(t2), Opnd::Val(y)))
             } else {
                 y
