@@ -184,3 +184,37 @@ fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
         assert!(!mul_dst.contains(s), "the stored copy reads the in-place scaled register {s}:\n{asm}");
     }
 }
+
+/// Two booleans materialised in one block (`v_cndmask d, 0, 1, vcc` after VCC was taken by another compare) stay two values: a select
+/// on the first must not test the second's register (the 2026-11-18 MLA `_wsbr` miscompile: value numbering merged the two
+/// materialisations, whose only difference is the implicit VCC input).
+#[test]
+fn two_materialised_booleans_stay_distinct() {
+    let mut b = FnBuilder::new("probe_two_bools", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(1 << 12));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let lane = b.let_(Op::AndI32(Opnd::Val(t), Opnd::I32(31)));
+    let half = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
+    let odd = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(1)));
+    let c1 = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, half, Opnd::I32(0));
+    let c2 = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, odd, Opnd::I32(0));
+    // c1 used after c2 (VCC holds c2): both are materialised; then each is used again
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::I32(3), b: Opnd::I32(4) });
+    let s1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c1), a: Opnd::I32(1), b: Opnd::I32(2) });
+    let s2b = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c2), a: Opnd::I32(5), b: Opnd::I32(6) });
+    let s1b = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c1), a: Opnd::I32(7), b: Opnd::I32(8) });
+    for (k, v) in [s1, s2, s1b, s2b].into_iter().enumerate() {
+        b.store_global(p, 4 * k as u32, v, amdgpu_dsl::MemTy::B32, false);
+    }
+    let f = b.finish();
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}")).asm;
+    if std::env::var("SHOW_ASM").is_ok() {
+        eprintln!("{asm}");
+    }
+    // every vcc-reading v_cndmask that materialises a boolean (0 / 1 operands) writes its own register
+    let mats: Vec<&str> = asm.lines().filter(|l| l.contains("v_cndmask_b32") && l.contains("vcc_lo")).collect();
+    let dsts: std::collections::HashSet<String> = mats.iter().filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
+    assert!(dsts.len() >= 4, "the four selects need four results (or two materialised booleans): {mats:?}\n{asm}");
+}
