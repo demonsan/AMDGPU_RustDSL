@@ -107,6 +107,11 @@ pub fn cse(m: &mut MFunction) -> usize {
         if rename.is_empty() {
             break;
         }
+        // the soundness invariant of every rename (checked on every compile): the register a use is redirected to is defined exactly once
+        // (SSA), so the value it holds at the use is the one it held where the renamed register was defined
+        for (&d, &x) in &rename {
+            assert!(ndefs.get(&canon_of(&m.alias, x)).copied().unwrap_or(0) == 1 && !aliased.contains(&x), "cse: r{d} renamed to r{x}, which is not a single-definition register");
+        }
         let res = |mut r: VReg| {
             while let Some(&x) = rename.get(&r) {
                 r = x;

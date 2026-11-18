@@ -152,3 +152,33 @@ fn workgroup_ids_in_a_cluster_launch_are_refused() {
         assert!(e.contains("cluster launch"), "{e}");
     }
 }
+
+/// A copy of a loop-carried accumulator lane taken before the lane is scaled in place keeps the old value: the gfx1250 value numbering
+/// must not redirect the copy's reads to the lane register itself (they would read the scaled value).
+#[test]
+fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
+    let mut b = FnBuilder::new("probe_copy_inplace", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(1 << 12));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let z = b.let_(Op::FragZero { ty: DType::Frag8 });
+    let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(z))]);
+    let o = vars[0];
+    let lane = b.frag_slice(Opnd::Var(o), 0, 1);
+    // the copy (lane + 0: lowered as a move after folding)
+    let copy = b.let_(Op::AddI32(Opnd::Val(lane), Opnd::I32(0)));
+    b.var_scale_lane(o, 0, Opnd::F32(2.0));
+    b.store_global(p, 0, copy, amdgpu_dsl::MemTy::B32, false);
+    let one = b.let_(Op::ConstI32(1));
+    b.break_if(Opnd::Val(one));
+    b.end_loop();
+    let f = b.finish();
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    // the store's data register is not the register the in-place multiply writes
+    let mul_dst: Vec<String> = asm.lines().filter(|l| l.trim_start().starts_with("v_mul_f32")).filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
+    let store_data: Vec<String> = asm.lines().filter(|l| l.trim_start().starts_with("global_store_b32")).filter_map(|l| l.split_whitespace().nth(2).map(|s| s.trim_end_matches(',').to_string())).collect();
+    assert!(!mul_dst.is_empty() && !store_data.is_empty(), "{asm}");
+    for s in &store_data {
+        assert!(!mul_dst.contains(s), "the stored copy reads the in-place scaled register {s}:\n{asm}");
+    }
+}
