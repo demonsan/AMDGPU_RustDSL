@@ -47,15 +47,20 @@ const MAX_PAGES: i32 = 1024;
 /// sequence per work-group. The stage body is `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline (3 pages in flight through
 /// the tensor data mover). Output: bf16 R [B][16][512], the natural-log LSE [B][16].
 pub fn mla_g1250_qh16() -> Function {
-    mla_g1250_qh16_with(MLA_NAME, false)
+    mla_g1250_qh16_with(MLA_NAME, false, 3)
 }
 
 /// The MLA decode with the KV pages loaded by per-lane async 16-byte copies instead of the tensor data mover (`async_kv`).
 pub fn mla_g1250_qh16_async() -> Function {
-    mla_g1250_qh16_with("mla_g1250_qh16_async", true)
+    mla_g1250_qh16_with("mla_g1250_qh16_async", true, 3)
 }
 
-fn mla_g1250_qh16_with(name: &str, async_kv: bool) -> Function {
+/// The MLA decode with a 4-slot ring (the producer runs 3 tiles ahead).
+pub fn mla_g1250_qh16_s4() -> Function {
+    mla_g1250_qh16_with("mla_g1250_qh16_s4", false, 4)
+}
+
+fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8) -> Function {
     use amdgpu_dsl::{ev, TensorTile, WmmaKind};
     use amdgpu_stage::attention::mla::{MlaBody, PageLayout, DV as DVB, PAGES, PAGE_BYTES, PAGE_TOKENS, QUARTER, ROPE_OFF};
     let layout = PageLayout::plan();
@@ -84,7 +89,7 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool) -> Function {
     b.arg_tensor("KV", Ext::sym("P") * Ext::c(PAGE_BYTES as i64));
     b.arg_tensor("LTD", Ext::sym("NPG") * Ext::c(4));
     let mut lds = LdsPlan::new();
-    let kv = lds.ring("KV", (PAGES * layout.slot_bytes) as i64, 3, Layout::Linear);
+    let kv = lds.ring("KV", (PAGES * layout.slot_bytes) as i64, slots as u32, Layout::Linear);
     let red = lds.tile("RED", 512, Layout::Linear);
     let pbuf = lds.tile("PBUF", 1024 * PAGES as i64, Layout::Linear);
     let abuf = lds.tile("ABUF", 256, Layout::Linear);
@@ -182,10 +187,11 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool) -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
-    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, async_kv, tid, vars: Vec::new() };
+    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, async_kv, tid, depth: slots, vars: Vec::new() };
     // one pipeline tile = PAGES pages (the last one possibly partial: its clamped pages are masked by ctx)
     let ntiles = b.bind_i32((ev(npages) + (PAGES - 1)) >> PAGES.trailing_zeros() as i32);
-    let pipe = Pipeline::new(Cadence::OneWindow, ntiles, ctx, PAGE_TOKENS * PAGES, Ext::c(1 << 16));
+    let mut pipe = Pipeline::new(Cadence::OneWindow, ntiles, ctx, PAGE_TOKENS * PAGES, Ext::c(1 << 16));
+    pipe.slots = slots;
     pipe.run(&mut b, Role::All, &mut body);
     // drain the tensor data mover: the last steady iteration leaves one (clamped, re-staged) page load in flight. A tensor write that lands after
     // s_endpgm writes LDS the next work-group on this CU may already own (its page table: a wild page id, an illegal access). The vendor ends with s_wait_idle.

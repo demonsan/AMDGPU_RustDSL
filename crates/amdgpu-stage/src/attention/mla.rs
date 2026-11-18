@@ -129,6 +129,8 @@ pub struct MlaBody {
     pub async_kv: bool,
     /// the thread id (async loads: lane offset 16 tid of each 2 KB chunk)
     pub tid: ValueId,
+    /// the pipeline's ring depth (`Pipeline::slots`): `depth - 2` staged tiles stay in flight at the end of a window
+    pub depth: u8,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
     pub vars: Vec<VarId>,
 }
@@ -178,12 +180,19 @@ impl PipeBody for MlaBody {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        // the counters are in order: at most the tile just staged (t + 2) stays in flight; t + 1 is complete
+        // the counters are in order: the tiles staged after the next one (depth - 2 of them) stay in flight; t + 1 is complete
+        let ahead = self.depth as i32 - 2;
         if self.async_kv {
-            b.wait_counter(amdgpu_dsl::WaitCtr::Async, (PAGES * PAGE_BYTES / 2048) as u8);
+            let n = ahead * PAGES * PAGE_BYTES / 2048;
+            assert!(n <= 63, "MLA async KV: {n} loads in flight exceed ASYNCcnt (6 bits): use a shallower ring");
+            b.wait_counter(amdgpu_dsl::WaitCtr::Async, n as u8);
         } else {
-            b.wait_tensor(PAGES as u8);
+            b.wait_tensor((ahead * PAGES) as u8);
         }
+    }
+
+    fn set_ring_depth(&mut self, slots: u8) {
+        self.depth = slots;
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
