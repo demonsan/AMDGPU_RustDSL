@@ -159,3 +159,54 @@ fn a_paged_pool_without_a_declared_extent_is_rejected() {
     let e = amdgpu_codegen::compile_target(&paged_kernel(false, true, false), "gfx1250").err().expect("must be rejected");
     assert!(e.contains("GV-GLB-NOEXT") || e.contains("GV-GLB-OOB"), "{e}");
 }
+
+// ---- the async global -> LDS copy (`global_load_async_to_lds_b128`): 16 bytes per lane, proven like a global load, and its LDS side inside the declared segment ----
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Async {
+    Legal,
+    /// the source extent (512) is smaller than what 64 lanes x 16 bytes read (1024)
+    PastExtent,
+    /// the address is not derived from a kernarg pointer
+    NoProvenance,
+    /// the LDS segment (512) is smaller than the lanes' LDS addresses (up to 1024)
+    LdsPast,
+}
+
+fn async_kernel(c: Async) -> Function {
+    let mut b = FnBuilder::new("tb_async", 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg_tensor("src", Ext::c(if c == Async::PastExtent { 512 } else { 1024 }));
+    b.lds(if c == Async::LdsPast { 512 } else { 1024 });
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(4)));
+    let base = if c == Async::NoProvenance { b.let_(Op::KernargSegment) } else { b.let_(Op::KernargPtr { offset: 0 }) };
+    let va = b.let_(Op::PtrAdd { base: Opnd::Val(base), byte_off: Opnd::Val(off) });
+    b.load_async_lds_b128(Opnd::Val(off), Opnd::Val(va), 0);
+    b.wait_counter(amdgpu_dsl::WaitCtr::Async, 0);
+    b.barrier();
+    b.finish()
+}
+
+#[test]
+fn an_async_load_inside_its_extent_and_segment_compiles() {
+    amdgpu_codegen::compile_target(&async_kernel(Async::Legal), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn an_async_load_past_its_extent_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&async_kernel(Async::PastExtent), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-OOB"), "{e}");
+}
+
+#[test]
+fn an_async_load_without_pointer_provenance_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&async_kernel(Async::NoProvenance), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-PROV"), "{e}");
+}
+
+#[test]
+fn an_async_load_into_lds_past_the_segment_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&async_kernel(Async::LdsPast), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-LDS-OOB"), "{e}");
+}
