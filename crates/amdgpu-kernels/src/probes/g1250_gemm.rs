@@ -392,8 +392,8 @@ pub fn gemm_tdm_stage_f4() -> Function {
 pub const F4_128X128: &str = "gemm_g1250_tdm_stage_f4_128x128";
 /// 256 x 64 tile (4 waves, each 4 x 2 WMMAs).
 pub const F4_256X64: &str = "gemm_g1250_tdm_stage_f4_256x64";
-/// 256 x 128 tile (4 waves, each 4 x 4 WMMAs): the back end currently rejects it (a scaled WMMA's scale operand must live in v0..v255 while the accumulators go above); registered for lookup only
-/// (`amdc emit`), not part of the compiled kernel sets, and it declares the LDS-above-64 KiB evidence fact so the guard does not hide the back-end failure.
+/// 256 x 128 tile (4 waves, each 4 x 4 WMMAs): the back end currently rejects it (a scaled WMMA's scale operand must live in v0..v255 while the accumulators go above). NOT registered (a failing
+/// kernel cannot be in the compiled / reachable sets); `tests/g1250_repros.rs` (`--ignored`) compiles it and shows the error.
 pub const F4_256X128_REPRO: &str = "gemm_g1250_tdm_stage_f4_256x128_repro";
 
 pub fn gemm_tdm_stage_f4_128x128() -> Function {
@@ -408,8 +408,8 @@ pub fn gemm_tdm_stage_f4_256x128_repro() -> Function {
     gemm_tdm_stage_f4_with(F4_256X128_REPRO, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1 }, true, false)
 }
 
-/// Bisect repros of the ks = 2 wrong-result case (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original failing build (the four parts interleaved per slot by
-/// `ring_group`, declared 103,936 bytes), `_ks2` the same kernel with four separate rings (78,336 bytes). Looked up by `amdc emit`, not in the compiled sets.
+/// The ks = 2 kernels (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original wrong-result build (the four parts interleaved per slot by `ring_group`, declared 103,936
+/// bytes), `_ks2` the same kernel with four separate rings (78,336 bytes). They returned wrong data until the wait pass used the gfx1250 DScnt range; now regression kernels of that bug.
 pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
 pub const F4_KS2: &str = "gemm_g1250_tdm_stage_f4_ks2";
 
