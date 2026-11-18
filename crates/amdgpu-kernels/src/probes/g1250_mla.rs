@@ -152,6 +152,9 @@ pub fn mla_g1250_qh16() -> Function {
     let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, cscale, vars: Vec::new() };
     let pipe = Pipeline::new(Cadence::OneWindow, npages, ctx, PAGE_TOKENS, Ext::c(1 << 16));
     pipe.run(&mut b, Role::All, &mut body);
+    // drain the tensor data mover: the last steady iteration leaves one (clamped, re-staged) page load in flight. A tensor write that lands after
+    // s_endpgm writes LDS the next work-group on this CU may already own (its page table: a wild page id, an illegal access). The vendor ends with s_wait_idle.
+    b.wait_tensor(0);
     let vars = body.vars.clone();
     let _ = WmmaKind::Fp8_16x16x64;
     // ---- epilogue: the row sums (8 partials per head) through LDS, O / L * ks to bf16, LSE ----
