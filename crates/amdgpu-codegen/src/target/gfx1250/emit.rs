@@ -782,7 +782,7 @@ const SAME_PREFIX: &[&str] = &[
     "v_mul_u32_u24", "v_mul_i32_i24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_bfe_u32", "v_bfe_i32",
     "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_xad_u32", "v_add3_u32", "v_exp_f32", "v_log_f32",
     "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_sin_f32", "v_cos_f32", "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
-    "v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pk_bf16_f32", "v_readfirstlane_b32", "v_med3_f32", "v_med3_i32", "v_min_i32", "v_max_i32",
+    "v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pk_bf16_f32", "v_readfirstlane_b32", "v_readlane_b32", "v_med3_f32", "v_med3_i32", "v_min_i32", "v_max_i32",
     "v_min_u32", "v_max_u32", "v_min3_i32", "v_max3_i32", "v_perm_b32", "v_alignbit_b32", "v_bfi_b32", "v_cndmask_b32_e64", "s_mov_b32",
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
