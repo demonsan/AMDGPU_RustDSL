@@ -1,5 +1,8 @@
 # 当前状态总览（authoritative snapshot）
 
+> **gfx1250（MI450）**：后端、hang 规则、复刻、自研 MXFP4 GEMM / MLA 对照厂商的配对数字、优化记录与事故见 [`gfx1250-status.md`](gfx1250-status.md)。
+
+
 本文件是仓库的**唯一权威当前状态快照**（v11，Main `a65de21a`：在 v10 四层重构之上，本轮按 [`two-weavers-plan.md`](two-weavers-plan.md) 建成“四层 + 两个 Weaver”结构，
 并做了 W4 性能基线、W5 厂商 FMHA 复刻与 W6 落后族优化，见 §1.0；v9.2 的记录保留在 §1.1）。数字来自 MI355X / gfx950（`mi355-gpu-53`）上的同轮硬件测量，复现命令见 §8。
 厂商事实在 [`vendor-spec.md`](vendor-spec.md)，设计规格在 [`design.md`](design.md)；历史逐轮记录与各代设计研究在
