@@ -179,6 +179,11 @@ pub fn mla_g1250_qh16_wssp() -> Function {
     mla_ws_with("mla_g1250_qh16_wssp", false, 64 | 128, false)
 }
 
+/// `_wssp` with full pairs in the loop and the odd last page after it.
+pub fn mla_g1250_qh16_wsst() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsst", false, 64 | 128 | 256, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -201,7 +206,7 @@ pub fn mla_g1250_qh16_wsd() -> Function {
     mla_ws_with("mla_g1250_qh16_wsd", true, 0, false)
 }
 
-fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function {
+fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Function {
     // bit 4 of `branchless`: the intra-page form (`_wsi`); bit 5: the KV split across work-groups (`_wsk`: partials to a workspace, `_cmb` combines)
     let intra = branchless & 16 != 0;
     let split = branchless & 32 != 0;
@@ -209,6 +214,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let sload = branchless & 64 != 0;
     // bit 7: prefetch the kernel's code into the instruction cache at entry (s_prefetch_inst, 12 x 4 KB)
     let ipf = branchless & 128 != 0;
+    // bit 8: full page pairs in the loop, an odd last page after it (no masked re-read of a pad page)
+    let tail = branchless & 256 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -659,7 +666,42 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
-    if !pipe {
+    if !pipe && tail {
+        let npairs = b.bind_i32(ev(nw) >> 1);
+        let z0 = b.c_i32(0);
+        // the generation (local index) of the odd last page: a counter stepped by + 2 per pass
+        let gl = b.declare_vars(&[(DType::I32, Opnd::Val(z0))])[0];
+        let any_pair = b.cmp(CmpPred::Gt, CmpTy::I32, npairs, Opnd::I32(0));
+        b.begin_if(any_pair);
+        let z = b.c_i32(0);
+        let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+        let kp2 = pv2[0];
+        b.assume(kp2, Ext::c(0), Ext::c((MAX_PAGES / 8) as i64));
+        let l0 = b.bind_i32(amdgpu_dsl::varx(kp2) * 2);
+        let l1 = b.bind_i32(ev(l0) + 1);
+        let l2 = b.bind_i32(ev(l0) + 2);
+        stage(&mut b, 1, ev(l1));
+        b.wait_tensor(1);
+        compute(&mut b, 0, ev(l0));
+        stage(&mut b, 0, ev(l2));
+        b.wait_tensor(1);
+        compute(&mut b, 1, ev(l1));
+        let g2 = b.bind_i32(amdgpu_dsl::varx(gl) + 2);
+        b.set_var(gl, Opnd::Val(g2));
+        let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
+        b.set_var(kp2, Opnd::Val(kn));
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
+        b.break_if(fin);
+        b.end_loop();
+        b.end_if();
+        // an odd count: the last page (staged into slot 0 by the prologue or the last pass)
+        let odd = b.bind_i32(ev(nw) & 1);
+        let is_odd = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
+        b.begin_if(is_odd);
+        b.wait_tensor(0);
+        compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
+        b.end_if();
+    } else if !pipe {
         let npairs = b.bind_i32((ev(nw) + 1) >> 1);
         let z = b.c_i32(0);
         let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
