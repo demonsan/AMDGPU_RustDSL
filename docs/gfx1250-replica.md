@@ -260,3 +260,10 @@ Paired on MI450 (a08-1), all MLA_OK with the same error as the vendor:
 Short sequences stay slower: a wave's pages run back to back with one wave per SIMD, so the per-page latency is exposed. The loop now
 spends 3 `s_set_vgpr_msb` per WMMA (the accumulators are spread over the 1024-VGPR banks: an allocator item) and about 12 VALU per WMMA.
 
+Later rounds (all paired on a08-1): a timestamp profile (`FnBuilder::shader_cycles`, the debug variant `mla_g1250_qh16_wsstd` writing
+wave 0's stamps over the LSE) showed the cross-wave merge at 41 % of a one-page kernel: its 256 LDS stores per lane recomputed their
+addresses with `v_mul_lo_u32`. With the lane base hoisted and the constants in the DS offset field (1551 -> 290 instructions), plus scalar
+loads for the sequence bounds / page ids and an odd tail page instead of a masked pad page, the default `_ws` is at 2.67 / 1.34 / 1.35 /
+**0.97** / 1.12 / 1.11 x the vendor for B x ctx = 1 x 64, 4 x 1000, 32 x 2048, 128 x 4096, 128 x 8192, 512 x 8192. Rejected on
+measurement: the branch-free rescale (0 %), the cross-page and intra-page interleave forms (slower in authored order), a KV split across
+work-groups with a combine kernel (slower: the fixed per-work-group cost is paid per split).

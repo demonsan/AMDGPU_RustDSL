@@ -53,13 +53,14 @@ reference, error equal to the vendor's):
 
 | B x ctx | first kernel (`mla_g1250_qh16`) / vendor | wave-split (`mla_g1250_qh16_ws`) / vendor |
 |---|---|---|
-| 4 x 1000 | 1.65 | 1.98 |
-| 32 x 2048 | 1.90 | 1.82 |
-| 128 x 4096 | 1.38 | **1.14** |
-| 128 x 8192 | 1.65 | **1.23** |
-| 512 x 8192 | 1.34 | **1.14** |
+| 1 x 64 | - | 2.67 |
+| 4 x 1000 | 1.65 | **1.34** |
+| 32 x 2048 | 1.90 | **1.35** |
+| 128 x 4096 | 1.38 | **0.97** |
+| 128 x 8192 | 1.65 | **1.12** |
+| 512 x 8192 | 1.34 | **1.11** |
 
-`_ws` is the default; the first kernel is kept (it is better for short sequences). Structure of both: [`gfx1250-replica.md`](gfx1250-replica.md) §9.
+`_ws` is the default. Structure of both: [`gfx1250-replica.md`](gfx1250-replica.md) §9.
 
 **MXFP4 GEMM** (all bit-exact against the CPU reference; ours f32 output with natural row-major A / B / scales, the vendor's bf16
 output with preshuffled B, 4 x 4 cluster, persistent grid):
@@ -103,6 +104,12 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
 | **wave-split restructure** (each wave its own pages, private ring, final merge) | -16 .. -25 % at large shapes | no barrier and no cross-wave exchange in the loop |
 | interleaving the 4 S chains, V fragments one group ahead | -10 % | one wave per SIMD: only in-order ILP hides latency |
 | dims split across wave pairs (`_wsd`) | +24 .. +39 % (worse) | S computed twice and twice as many pages per wave outweigh the smaller register footprint |
+| branch-free rescale (after the I1 select fix in the back end) | 0 | the lazy branch was already cheap |
+| cross-page form: page i's softmax with page i - 1's PV (`_wsp`) | +12 .. +31 % (worse) | with two private slots per wave the next page's load can only start after PV(i - 1): exposed load latency |
+| intra-page interleave regions (`_wsi`, authored order) | +2 .. +10 % (worse) | the always-on rescale; kept as the back-end Weaver's (B4) baseline |
+| KV split across work-groups + a combine kernel (`_wsk` + `_cmb`) | slower (0.52 - 0.84 x) | every split pays the fixed per-work-group cost again, plus a second launch |
+| **timestamp profile (`shader_cycles`) -> the cross-wave merge's LDS addresses hoisted (DS offset field)** | **-10 .. -48 %** | the merge's 256 stores per lane recomputed their addresses with `v_mul_lo_u32`: 1551 -> 290 instructions; the merge was 41 % of a one-page kernel |
+| scalar loads for the sequence bounds / scales / page ids (no LDS page table, no prologue barrier); full page pairs + an odd tail page | -3 .. -8 % | a shorter dependent prologue; no masked pad page |
 
 ## 6. Incidents
 
