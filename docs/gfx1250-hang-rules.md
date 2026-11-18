@@ -19,6 +19,9 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | allocated named barriers | `Function::kd` entry `named_barrier_count` | `BAR-ID` |
 | signals per work-group of a barrier the verifier cannot count | `FnBuilder::barrier_signal_count(id, per_wg)` (a `g5:signals_per_wg:<id>` entry; trusted, listed by `trusted_items`) | `BAR-COUNT` |
 | host-built descriptor words | the host contract on a kernarg scalar (`FnBuilder::ka_one_of`) | `MCAST` |
+| tensor descriptors built by the host (evidence / probe kernels) | `FnBuilder::tdm_host_descriptor()` (`g5:tdm_host_descriptor`; trusted, listed by `trusted_items`) | `GV-TDM-PROV`, `GV-GLB-*` |
+| the outermost loop is the tile loop of a persistent kernel | `FnBuilder::persistent_tile_loop()` (`g5:persistent_tile_loop`; CHECKED, not trusted: the tile body is simulated once and must end with every tensor operation drained and a barrier after its last LDS access) | tile protocol (`GV-TILE-UNSUPPORTED` when the body is not quiescent) |
+| wave-uniform runtime ifs inside loops hold markers / waits | `FnBuilder::loop_ifs_explored()` (`g5:loop_ifs_explored`; trusted and listed: each occurrence in each simulated iteration is a decision, at most 6 per path, only the simulated iterations are covered) | tile protocol (`GV-TILE-UNSUPPORTED` without it) |
 
 ## Rules
 
@@ -75,13 +78,11 @@ pattern, or from a distance window inferred from the corpus, would have been a t
 
 ## Planned (needs the forms G3 introduces)
 
-These rules are staged after the typed tensor descriptor, the named-barrier operations and the async-LDS forms exist; each lands with its mutation test and positive twin.
+These rules are staged after the forms they need exist; each lands with its mutation test and positive twin. (Implemented since this list was written: the tensor-descriptor checks are `GV-1250-TDM-DESC` / `GV-TDM-PROV` / `GV-GLB-*` above, and LDS ring-slot reuse before the producer's completion and the consumers' release is the tile protocol, `GV-TILE-*`.)
 
 | planned rule | what it will keep from happening |
 |---|---|
-| `GV-1250-TDM-DESC` | tensor descriptors with inconsistent paired fields, misaligned fields, a tile extent outside the LDS allocation or the tensor outside the declared buffer, a gather with unordered indices |
 | `GV-1250-TDM-OUTSTANDING` | (the in-flight limit itself is `GV-1250-TDM-DRAIN` above) a wait that depends on an operation queued behind a stalled issue, and the async-copy counterpart |
-| `GV-1250-TDM-RING` | reuse of an LDS ring slot before both the producer's completion and the consumers' release |
 | `GV-1250-BLOCK-LOAD` | a block load into its own source registers; a transpose load with a partial exec mask |
 | `GV-1250-SCALAR-ALIGN` | scalar memory data operands wider than 32 bits that are not aligned; a scaled matrix multiply in a clause that is too short or ends badly |
 

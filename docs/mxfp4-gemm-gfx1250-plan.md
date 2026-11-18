@@ -52,3 +52,24 @@ Only after the ks = 2 wrong-result case is understood; one idle GPU, hard timeou
 | `gemm_g1250_tdm_stage_f4_ks2`, `_ks2_grouped` (bisect only) | 128 x 64, 4, ks = 2 | 78,336 / 103,936 |
 
 Not to be run: the 8-wave variant that hung (not registered). `..._256x128` (78,336 B) only after the ks = 2 / dscnt verification.
+
+## Best kernels and the relaxed-wait dispatch (a08-1, bit-exact, f32 output)
+
+`gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles_relax` (256 x 256 tile, ks 2, TDM row pad, LDS-staged TDM-store epilogue, wave roles A / B, relaxed tensor wait) reaches 9.3 PF/s at 8192^3 and 10.0 PF/s at 8192 x 8192 x 16384; `..._epit_roles` (the same without the relaxed wait) is the better choice for K in about 3840 - 4608. Measured, PF/s (M = N = 4096 unless noted):
+
+| K | `epit_roles` | `epit_roles_relax` |
+|---:|---:|---:|
+| 2048 | 4.50 | 5.02 |
+| 3328 | 5.76 | 6.24 |
+| 3584 | 6.02 | 6.54 |
+| 3840 | 5.52 | 4.65 |
+| 4096 | 6.25 | 5.30 |
+| 4352 | 5.00 | 4.61 |
+| 4608 | 5.28 | 5.06 |
+| 5120 | 6.01 | 6.22 |
+| 6144 | 5.84 | 6.25 |
+| 8192 | 7.79 | 8.54 |
+| 8192 (M = N = 8192) | 8.47 | 9.28 |
+| 16384 (M = N = 8192) | 8.27 | 10.06 |
+
+The dependence on K is not monotonic and is not explained by a power-of-two row stride (K = 3840 and 4352 lose as well) nor by tile order: a tile-order swizzle (`RingOpts::swizzle`, host `SWIZZLE=G`, G = 4, 8) changes nothing measurable. Cluster multicast on the same kernel (`_epit_c2x2_lock`, `_epit_c4x4_lock`) is slower (6.5 / 7.4 PF/s at 8192^3 against 8.3). Dispatch rule until the K dependence is understood: relaxed for K <= 3584 or K >= 5120, not relaxed for 3840 <= K <= 4608.
