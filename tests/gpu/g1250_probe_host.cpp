@@ -333,6 +333,26 @@ static int run_named(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_tr8: ds_load_tr8_b64 lane mapping. LDS byte i = i (i < 256), lane l reads at (l % 16) * 16 + (l / 16) * 8; prints, per lane, the 8 memory
+// bytes (= addresses) it received, and the decoded (row, col) of a 16 x 16 byte tile (row = addr / 16, col = addr % 16).
+static int run_tr8(Kernel& k, const char* kn) {
+    uint32_t* dout;
+    HC(hipMalloc(&dout, 64 * 4));
+    HC(hipMemset(dout, 0xee, 64 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(1, 32, args, kn);
+    std::vector<uint8_t> o(256);
+    HC(hipMemcpy(o.data(), dout, 256, hipMemcpyDeviceToHost));
+    for (int l = 0; l < 32; ++l) {
+        printf("lane %2d:", l);
+        for (int j = 0; j < 8; ++j) printf(" (%2d,%2d)", o[l * 8 + j] / 16, o[l * 8 + j] % 16);
+        printf("\n");
+    }
+    printf("tr8: PROBE_OK (mapping printed)\n");
+    return 0;
+}
+
 // probe_g1250_barriers: named barrier 1 (init / join / signal / wait / leave) then the cluster barrier, out[tid] = tid. Launched ONLY as a
 // cluster (CLUSTER, default 2 workgroups along x; a cluster barrier needs a cluster id), GRID workgroups (default 64), 20 repetitions.
 static int run_barriers(Kernel& k, const char* kn) {
@@ -471,6 +491,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
     if (mode == "barriers") return run_barriers(k, kn);
+    if (mode == "tr8") return run_tr8(k, kn);
     if (mode == "wide") return run_wide(k, kn);
     if (mode == "trans") return run_trans(k, kn, atoi(argv[4]), atoi(argv[5]), argv[6]);
     if (mode == "tdm_hi") return run_tdm_hi(k, kn);
