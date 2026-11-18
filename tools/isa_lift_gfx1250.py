@@ -372,7 +372,9 @@ class Lifter(isa_lift.Lifter):
 
     def h_s_setreg_imm32_b32(self, t, m, op):
         # the scheduling mode (WAVE_SCHED_MODE bits [1:0]) is a statement the exact checker models; other fields stay verbatim
-        if 'HW_REG_WAVE_SCHED_MODE' in t[0] and t[0].replace(' ', '').endswith(',0,2)'):
+        # (toks() splits `hwreg(ID, off, size)` at its commas: the field is read from the joined operand text)
+        hw = ','.join(t).replace(' ', '')
+        if 'HW_REG_WAVE_SCHED_MODE,0,2)' in hw:
             w = next(x[6:].split('/') for x in m if x.startswith('words:'))
             self.stmt(f'SetSchedMode {{ mode: {int(w[1], 16)} }}')
             return True
