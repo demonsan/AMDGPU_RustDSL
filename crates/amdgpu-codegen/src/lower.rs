@@ -3053,10 +3053,18 @@ impl Lowerer {
                 }
                 Stmt::WaitTensor { count } => {
                     tdm_target()?;
+                    if *count as u32 > 63 {
+                        return Err(format!("wait_tensor({count}): exceeds the counter's maximum 63 (a wait that never blocks)"));
+                    }
                     self.push(MInst::new(MOp::SWaitTensor).imm(*count as i64));
                 }
                 Stmt::WaitCounter { counter, count } => {
                     tdm_target()?;
+                    // the counter's width (load / store / ds / x / async / tensor 6 bits, km 5): a larger immediate never blocks
+                    let max: u32 = if (*counter as u8) == 3 { 31 } else { 63 };
+                    if *count as u32 > max {
+                        return Err(format!("wait_counter({counter:?}, {count}): exceeds the counter's maximum {max} (a wait that never blocks)"));
+                    }
                     self.push(MInst::new(MOp::SWaitCtr).imm(((*counter as i64) << 8) | *count as i64));
                 }
                 Stmt::BarrierSignal { id } => {

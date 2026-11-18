@@ -186,3 +186,48 @@ Concrete compiler gaps, in the order they cost:
 An MLA decode compiled by us does not exist for gfx1250 yet; the vendor MLA's loop profile (per WMMA: 3.2 LDS reads incl.
 `ds_load_tr8_b64`, 2.6 VALU incl. 0.5 transcendental, 2.2 `v_nop`, 0.12 async global → LDS loads, TDM 0.06) lists the forms such a kernel
 needs, all of which the DSL now has (§3).
+
+## 9. Our own MLA decode on gfx1250 (`mla_g1250_qh16`)
+
+Same ABI and device layouts as the vendor qh16 kernel (120-byte kernarg, grid (1, B, 1), block 128), so `g1250_mla_host` runs both and
+pairs them. Stage body `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline, one window = two KV pages (128 tokens):
+
+- KV ring: 3 slots of two pages (64 tokens x 576 B each); every wave TDM-loads a quarter of each page; the LDS layout is padded by the TDM
+  with the pad `amdgpu_dsl::tdm_pad::plan` chooses from the window's declared K and V read patterns (`PageLayout`); the sequence's page
+  ids are staged once in LDS. The pipeline is drained (`s_wait_tensorcnt 0`) before the epilogue.
+- S^T = K Q^T: wave w computes tokens 16 w .. +15 of each page against the 16 heads (9 fp8 WMMA 16x16x64 per page; inside a WMMA the K
+  order is free as long as A and B agree, so each lane half reads 32 contiguous bytes: two `ds_load_b128`).
+- base-2 online softmax; the tile maximum through LDS (8 partials per head); P to fp8 through LDS, laid out so that the bytes a lane reads
+  back are the A fragment of P for the PV WMMA; lazy rescale (the O rescale only when some head's maximum grew: an any-lane branch).
+- PV: wave w owns 128 of the 512 V dims, O accumulates in place (D = C = the loop variable); the B fragments come from `ds_load_tr8_b64`.
+  Its lane mapping, measured by `probe_g1250_tr8`: fetch lane f supplies 8 contiguous bytes; byte b lands in lane
+  `b + 8 ((f >> 2) & 1) + 16 (f >> 4)`, byte `(f & 3) + 4 ((f >> 3) & 1)`. So for a 16-dims x 16-tokens fragment, fetch lane f reads
+  token `8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1)`, dims `+ 8 ((f >> 2) & 1)`.
+- epilogue: the row sums through LDS; O / L * ks to bf16 through LDS (over the dead KV ring), 16-byte global stores; the natural-log LSE.
+- bounds: every global access is proved; the paged KV pool and the page table use the trusted host contract (page id < P, the page table's
+  entries < NPG), which the host validates.
+
+Correct on MI450 against the fp32 reference on every shape tried (B x ctx up to 512 x 8192), with the same error as the vendor. Paired
+against the vendor (a08-1):
+
+| B x ctx | ours (µs) | ours / vendor |
+|---|---|---|
+| 4 x 1000 | 15.7 | 1.72 |
+| 32 x 2048 | 25.1 | 1.98 |
+| 128 x 4096 | 48.8 | 1.44 |
+| 128 x 8192 | 87.5 | 1.70 |
+| 512 x 8192 | 200 | 1.36 |
+
+What moved it, which is also the compiler / template gap list for MLA:
+
+1. **LDS layout vs the read pattern** (2.5x): token rows at a 512-byte stride put the 16 rows a K read covers, and the 8 rows of a
+   transposing V read, in the same banks. Now planned (`tdm_pad`) from the declared read patterns.
+2. **Template loads were per wave**: "every wave issues the same loads" is 4x the KV traffic; the slice per wave is in the body.
+3. **Accumulator copies**: the rebuilt O fragments and the loop-carried copies (~155 `v_mov` per page) are gone with the in-place
+   rescale and D = C accumulation.
+4. **Barriers and exchanges per token**: two pages per window halve them (-18 %); lazy rescale skips most O rescales.
+5. **Register reuse serialised the fragment reads** (read, wait 0, WMMA, nine times); issuing the reads first gives counted waits.
+6. **Open**: per tile 569 instructions for 34 WMMA (16.7 per WMMA, the vendor's density is 15.6), so the remaining gap is latency, not
+   instruction count. 43 `v_add_nc_u32` per tile are addresses the compiler does not fold into the DS offset field (the multi-address
+   `tr8 x4` / `b128 x2` reads); no software pipelining across tiles (the vendor's loop body covers about 12 pages); a fixed prologue of
+   dependent global loads (sequence bounds, page table) that costs about 4 µs at B = 1.
