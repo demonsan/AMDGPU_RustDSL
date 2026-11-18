@@ -290,6 +290,12 @@ pub fn gemm_tdm_stage_f4_128x128_ks2() -> Function {
     gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
+/// The vendor-shaped tile: 256 x 256 per workgroup, 4 waves (2 x 2) of 128 x 128 (4 x 8 WMMAs of 32 x 16 each per K step), ks = 2.
+pub const F4_256X256_KS2: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2";
+pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
+    gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
+}
+
 pub fn gemm_tdm_stage_f4_128x128_ks4() -> Function {
     gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1 }, true, false)
 }
