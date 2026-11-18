@@ -292,6 +292,12 @@ pub fn gemm_tdm_stage_f4_128x128_ks2() -> Function {
 
 /// The vendor-shaped tile: 256 x 256 per workgroup, 4 waves (2 x 2) of 128 x 128 (4 x 8 WMMAs of 32 x 16 each per K step), ks = 2.
 pub const F4_256X256_KS2: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2";
+pub const F4_256X256_KS2_HB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_hb";
+/// `gemm_tdm_stage_f4_256x256_ks2` with the tile origins hoisted out of the pipeline (`gemm_tdm_stage_f4_opts`).
+pub fn gemm_tdm_stage_f4_256x256_ks2_hb() -> Function {
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, true)
+}
+
 pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
     gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
@@ -351,6 +357,12 @@ pub fn gemm_tdm_stage_f4_ks2() -> Function {
 /// two scale tiles) are separate rings (`grouped`: interleaved per slot by `ring_group`, the original layout, which declares `base of the last part + slots x stride` bytes), so the declared LDS is
 /// exactly `slots x (A + B + scales)` bytes.
 pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool) -> Function {
+    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false)
+}
+
+/// `gemm_tdm_stage_f4_with`; `hoist_base`: the per-wave global tile origins (`pointer + row origin`, 64-bit) are formed once before the
+/// pipeline, so a stage adds only its K byte offset (the descriptor address advances by the K offset alone; no per-stage origin add).
+pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool) -> Function {
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
@@ -501,6 +513,13 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let nkv = b.bind_i32(ev(kk).lshr(lgk));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128 * sh.ks as i64), "nkv = K / (128 ks) >= 1 (a K that is a multiple of the slot's K)");
     let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128 * sh.ks, Ext::ka(40).ceil_div(128 * sh.ks as i64));
+    let (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org) = if hoist_base {
+        let base = |b: &mut FnBuilder, p: ValueId, o: ValueId| b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
+        let z = b.let_(Op::ConstI32(0));
+        (base(&mut b, pa, a_org), base(&mut b, pb, b_org), base(&mut b, psa, sa_org), base(&mut b, psb, sb_org), z, z, z, z)
+    } else {
+        (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
+    };
     let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader };
     if clustered {
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
