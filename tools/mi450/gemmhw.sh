@@ -5,7 +5,7 @@ O="$W/gemmhw"; rm -rf "$O"; mkdir -p "$O"
 cargo build --release --bin amdc -j 64 2>&1 | grep -E "^error|Finished" | head -3
 A="$CARGO_TARGET_DIR/release/amdc"
 CL=/opt/rocm/llvm/bin/clang
-for k in gemm_g1250_tdm_fp8_k192 gemm_g1250_tdm_fp8 gemm_g1250_tdm_stage_fp8; do
+for k in gemm_g1250_tdm_fp8_k192 gemm_g1250_tdm_stage_fp8; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.emit.log 2>&1 || { echo "EMIT-FAIL $k"; tail -5 $O/$k.emit.log; exit 4; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s 2> $O/$k.asm.log || { echo "ASM-FAIL $k"; tail -5 $O/$k.asm.log; exit 5; }
   echo "$k: $(wc -l < $O/$k.s) asm lines"

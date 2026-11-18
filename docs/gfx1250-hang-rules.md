@@ -88,3 +88,24 @@ These rules are staged after the typed tensor descriptor, the named-barrier oper
 1. Add the rule to `RULES` (id, layer, one generic sentence) and implement it in `verify_ir` or `verify_asm`, reporting through `viol` so `with_rules_disabled` can switch it off in tests.
 2. Add `mut_<stem>` and `pos_<stem>` to `hang_rules_1250.rs` and the line to `COVERAGE`; `every_rule_is_covered` enforces the pair.
 3. Never run the faulty kernel on a GPU: the mutation test must stop at the compiler.
+
+## An incident: a device hang during kernel development, and what it taught
+
+What ran. While a GEMM kernel family was being tuned, a sweep of kernel shapes ran on one idle GPU. Some shapes (a second K sub-step per ring slot) returned wrong results; a later shape, an 8-wave variant that had already run correctly once that day, then left the process blocked inside the driver (a register-write wait of the micro-engine scheduler) and the device unusable until an administrator reset it. All runs used hard polled timeouts, which cannot fire once a process is blocked in the driver.
+
+What was found. The wrong results were a **code-generation bug**: the shared wait pass used the previous architecture's counter range (15) for the gfx1250 LDS counter (63), so with many LDS loads in flight the oldest ones were treated as complete and their WMMA readers received no `s_wait_dscnt`. Bisecting one work-group with a per-K-tile mask (`ONLY_K`) showed exactly the loop-body windows wrong, and the compile now carries the missing waits (an independent re-check of the final waits with the gfx1250 counters turns such a drop into a compile error). The LDS-above-64-KiB hypothesis was tested separately by micro-probes and is not the cause (an interim guard rule was added and retired).
+
+What is not known. The hang itself was **not reproduced**: the same 8-wave kernel, rebuilt with the fixed waits, runs correctly from one work-group to the full grid. The most likely reading is a device-state effect of the preceding runs that consumed garbage operands, but this is not established, and the kernel is kept as a regression kernel (`gemm_g1250_tdm_stage_f4_8w_256x64`): it is run on one work-group first, watchdogged, whenever the back end's wait or ring handling changes. No data-dependent loop or branch exists in it, so wrong data alone cannot steer control flow.
+
+What changed in the process. Sweeps of experimental kernels run only on GPUs and shapes cleared in advance, one work-group before the grid, and a kernel family whose results are wrong is not run again until the cause is found; the verifier gap (a wait model shared by the generator and its own checker) was closed by an independent check, and the rules in this document keep their mutation tests.
+
+## Tensor bounds (global provenance and extent of every tensor descriptor)
+
+A tensor operation reads (or writes) a global tile whose address sits in the descriptor's group 0. A descriptor built from zeroed or unrelated registers points at no buffer and can hang the device (an incident: a code-generation bug zeroed the pointer registers of a GEMM's descriptors). Every `tensor_load_to_lds` / `tensor_store_from_lds` of a kernel that is not an exact replay is therefore checked, as a **compile error**, by the global-bounds prover that also checks the plain loads and stores:
+
+- **Provenance** (`GV-TDM-PROV`): the descriptor's address words are the low and high halves of one pointer value that derives from a kernarg pointer by additions; a constant, an unrelated register or the halves of two pointers are rejected (`GV-GLB-PROV` for a pointer without kernarg provenance).
+- **Extent** (`GV-GLB-NOEXT`): that kernarg pointer has a declared extent in bytes, written in terms of the launch contract (kernarg ranges and definitions, grid dimensions, free symbols): `arg_tensor`.
+- **Range** (`GV-GLB-OOB`): the tile's last byte, `offset + (rows - 1) x row stride + row bytes`, is proven inside the extent, and its first byte not before it, over every wave (cooperative and multicast slices), workgroup, cluster position and loop iteration the offset ranges over; the facts used are the contract's (and the counted trusted ones such as a cluster position lying inside the declared cluster). A tile the prover cannot bound is rejected.
+- A kernel whose descriptors are **built by the host** (an evidence / probe kernel) names that as the launch fact `g5:tdm_host_descriptor` (`FnBuilder::tdm_host_descriptor`): a trusted item listed by `trusted_items`, never silent. Exact replays of vendor kernels get the findings as warnings.
+
+Tests: `crates/amdgpu-kernels/tests/tdm_bounds.rs` (a constant base, unrelated registers, halves of different pointers, no declared extent, a tile past the extent, an unbounded offset: all rejected; a legal tile and a contract-bounded offset compile), and every shipped gfx1250 kernel passes the rule in `gfx1250_emit`.

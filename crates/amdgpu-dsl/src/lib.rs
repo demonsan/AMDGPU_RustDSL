@@ -3837,6 +3837,12 @@ impl FnBuilder {
         self.f.kd.push((format!("g5:signals_per_wg:{id}"), per_wg as i64));
     }
 
+    /// gfx1250 launch fact for the hang-safety verifier: the tensor descriptors of this kernel are built by the HOST (kernarg words), so their global base and extent cannot be proved
+    /// (GV-TDM-PROV / GV-GLB-*). A TRUSTED item, listed by `trusted_items`; for evidence / probe kernels only.
+    pub fn tdm_host_descriptor(&mut self) {
+        self.f.kd.push(("g5:tdm_host_descriptor".to_string(), 1));
+    }
+
     /// gfx1250 launch fact for the hang-safety verifier (`GV-1250-BAR-COUNT`): every wave waits on barrier `id` the same number of times per phase even though the waves wait in different loops
     /// (different wave paths that iterate the same trip count). A TRUSTED item (listed by `trusted_items`): the verifier cannot compare loop trip counts.
     pub fn barrier_wait_trips_match(&mut self, id: i32) {
@@ -3862,6 +3868,13 @@ impl FnBuilder {
     /// and offset) and lands at LDS byte `lds_addr` (uniform). Returns (g0, g1) for `tensor_load_to_lds` / `tensor_store_from_lds`.
     /// Every word is a uniform scalar value; words of constants fold.
     pub fn tensor_desc_2d(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd) -> (ValueId, ValueId) {
+        self.tensor_desc_2d_m(t, base, byte_off, lds_addr, None)
+    }
+
+    /// `tensor_desc_2d` with a COMPUTED workgroup (multicast) mask: group 1 word 0 = the constant fields | `mask` (a uniform value whose bits 15:0 are the mask, bits above must be zero: `and` it with
+    /// 0xffff so the verifier can see it). `t.wg_mask` must be 0.
+    pub fn tensor_desc_2d_m(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd, mask: Option<Opnd>) -> (ValueId, ValueId) {
+        assert!(mask.is_none() || t.wg_mask == 0, "a computed multicast mask replaces the static one");
         let ds = match t.data_size {
             1 => 0u32,
             2 => 1,
@@ -3886,6 +3899,11 @@ impl FnBuilder {
         let g0 = self.let_(Op::RsrcCat { words: [Opnd::I32(1), lds_addr, Opnd::Val(lo), Opnd::Val(w3)] });
         // group 1 (256 bits): see the field table of CDNA5 ISA Table 63
         let w0 = t.wg_mask as u32 | ds << 16 | pad_en << 20 | pi << 22 | pa << 25;
+        let w0o = match mask {
+            None => Opnd::I32(w0 as i32),
+            // (the fields are disjoint: `+` is `|` and stays in SALU)
+            Some(m) => Opnd::Val(self.let_(Op::AddI32(Opnd::I32(w0 as i32), m))),
+        };
         let c = |x: Opnd| match x {
             Opnd::I32(v) => Some(v as u32),
             _ => None,
@@ -3918,7 +3936,7 @@ impl FnBuilder {
         let w3g = word(self, Some((d1, 16)), None, (t.tile[0] as u32) << 16);
         let w4 = Opnd::I32((t.tile[1] as u32) as i32);
         let w5 = t.stride0;
-        let g1 = self.let_(Op::SgprCat8 { words: [Opnd::I32(w0 as i32), w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
+        let g1 = self.let_(Op::SgprCat8 { words: [w0o, w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
         (g0, g1)
     }
 
@@ -5198,9 +5216,18 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::VarScaleLane { var, .. } => {
-                if !matches!(f.var_ty(*var), Some(DType::Frag16) | Some(DType::Frag4)) {
-                    errs.push(here(format!("var{var} must be a frag16 or frag4")));
+            Stmt::VarScaleLane { var, index, .. } => {
+                let lanes = match f.var_ty(*var) {
+                    Some(DType::Frag16) => 16,
+                    Some(DType::Frag8) => 8,
+                    Some(DType::Frag4) => 4,
+                    Some(DType::Frag2) => 2,
+                    _ => 0,
+                };
+                if lanes == 0 {
+                    errs.push(here(format!("var{var} must be a frag16, frag8, frag4 or frag2")));
+                } else if *index as usize >= lanes {
+                    errs.push(here(format!("var{var}: lane {index} of a {lanes}-dword fragment")));
                 }
             }
             Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. } => {
@@ -5482,6 +5509,7 @@ pub mod units;
 pub use facts::Captured;
 pub mod ir_text;
 pub mod plan;
+pub mod tdm_pad;
 mod ir_codec;
 pub mod specialize;
 pub use expr::{ev, ox, varx};

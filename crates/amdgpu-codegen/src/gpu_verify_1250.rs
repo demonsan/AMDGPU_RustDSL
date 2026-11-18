@@ -175,6 +175,8 @@ impl KnownZero {
                 Some(n) if n < 32 => (self.of(a) >> n) | !(u32::MAX >> n),
                 _ => 0,
             },
+            // a sum of values whose possibly-set bits are disjoint is their `or` (the fields of a descriptor word)
+            Op::AddI32(a, b) if !self.of(a) & !self.of(b) == 0 => self.of(a) & self.of(b),
             Op::AddI32(a, b) | Op::Salu { op: amdgpu_dsl::SaluOp::AddCoI32 | amdgpu_dsl::SaluOp::SubCoI32, a, b } => Self::low(self.tz(a).min(self.tz(b))),
             Op::MulI32(a, b) => Self::low(self.tz(a) + self.tz(b)),
             Op::MovS { a, .. } | Op::MovV { a, .. } => self.of(a),
@@ -409,14 +411,18 @@ fn desc_check(f: &Function, defs: &HashMap<ValueId, Op>, pos: usize, g0: &Opnd, 
             viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: descriptor group 0 type field {} (must be 2)", x >> 30));
         }
     }
-    // the tile (no padding, 1..3 dimensions) in LDS
+    // the tile (1..3 dimensions, padding included) in LDS
     if let (Some(Some(lds)), true, Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w0.get(1), w1.len() == 8, w1.first(), w1.get(3), w1.get(4)) {
         let pad_enable = a0 >> 20 & 1 != 0;
         let esize = 1u64 << (a0 >> 16 & 3);
         let (t0, t1, t2) = ((a3 >> 16) as u64, (a4 & 0xffff) as u64, (a4 >> 16) as u64);
         let elems = t0 * t1.max(1) * t2.max(1);
-        if !pad_enable && t0 > 0 && f.lds_bytes > 0 && (*lds as u64) + elems * esize > f.lds_bytes as u64 {
-            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the tile ({elems} elements of {esize} bytes at LDS address {lds}) does not fit in the declared {} bytes of LDS", f.lds_bytes));
+        // the padded footprint (amdgpu_dsl::tdm_pad::footprint: `amount` dwords after every full `interval`; interval field v = 2^(v+1)
+        // dwords, amount field v = v + 1 dwords)
+        let pad = pad_enable.then(|| (1u16 << ((a0 >> 22 & 7) + 1), ((a0 >> 25 & 0x7f) + 1) as u16));
+        let bytes = amdgpu_dsl::tdm_pad::footprint((elems * esize).min(u32::MAX as u64) as u32, pad) as u64;
+        if t0 > 0 && f.lds_bytes > 0 && (*lds as u64) + bytes > f.lds_bytes as u64 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the tile ({elems} elements of {esize} bytes{} at LDS address {lds}) does not fit in the declared {} bytes of LDS", if pad.is_some() { format!(", {bytes} bytes padded") } else { String::new() }, f.lds_bytes));
         }
     }
 }
@@ -958,6 +964,8 @@ fn eval_i(o: &Opnd, cx: &EvCtx, tid: i32, depth: u32) -> Option<i64> {
                     };
                     r as i32
                 }
+                // a wave-uniform read of a per-lane value: the value of the wave (eval_wave requires every lane of the wave to agree)
+                Op::ReadFirstLane(x) | Op::MovS { a: x, .. } | Op::MovV { a: x, .. } => go(x)?,
                 Op::Select { cond, a, b, .. } => {
                     if go(cond)? != 0 {
                         go(a)?
@@ -1570,6 +1578,9 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
 /// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
 pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
+    if kd_val(f, "g5:tdm_host_descriptor") != 0 {
+        v.push("tensor descriptors built by the host (launch fact g5:tdm_host_descriptor): their global base / extent are not proved".to_string());
+    }
     if alternation(f).needs_trip_fact.is_some() && kd_val(f, "g5:wait_trips_match:-3") != 0 {
         v.push("barrier -3: the loops the waves wait in iterate the same number of times (declared launch fact g5:wait_trips_match:-3, not proved)".to_string());
     }

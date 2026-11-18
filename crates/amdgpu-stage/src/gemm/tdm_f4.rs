@@ -25,6 +25,13 @@ pub struct F4Shape {
     pub tn: i32,
     /// K sub-steps of 128 per ring slot (a slot holds `ks x 128` K elements: A / B rows of `64 ks` bytes, scale rows of `4 ks` bytes)
     pub ks: i32,
+    /// relaxed tensor waits: in the steady state each window completes the tile staged in the PREVIOUS window (`wait_tensor(4)`, the four loads of the stage just issued stay in flight), so a
+    /// stage has two windows of latency instead of one; the prologue still drains
+    pub relax: bool,
+    /// the cluster of workgroups (cx x cy, workgroup index x fastest): every workgroup loads a slice of the A tile it shares with its cluster row and of the B tile it shares with its cluster
+    /// column, multicast to them; 1 x 1 = no cluster
+    pub cx: i32,
+    pub cy: i32,
 }
 
 impl F4Shape {
@@ -71,6 +78,10 @@ pub struct TdmF4Body {
     pub wl: [ValueId; 4],
     /// the loop-carried accumulators, tm x tn (bound by `bind_state`)
     pub acc: Vec<VarId>,
+    /// set once the loop is being emitted (`bind_state`): the prologue's stages complete fully, the steady-state ones as `sh.relax` says
+    pub steady: bool,
+    /// the condition "this is wave 0 of the workgroup" (wave-uniform): the one wave per workgroup that signals the cluster barrier
+    pub leader: ValueId,
 }
 
 impl PipeBody for TdmF4Body {
@@ -100,7 +111,21 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        b.wait_tensor(0);
+        if self.sh.cx * self.sh.cy > 1 {
+            // multicast: this workgroup's slices land in the other workgroups' LDS and theirs in ours. Our own loads complete (tensor wait), every wave of the workgroup is done (reads of the previous
+            // tile included: the barrier), then one wave signals the cluster barrier and all wait: when it completes, every slice of the tile is in place everywhere and no workgroup still reads the
+            // slot the next stage overwrites.
+            b.wait_tensor(0);
+            b.wait_lds(0);
+            b.barrier();
+            b.begin_if(Opnd::Val(self.leader));
+            b.barrier_signal(-3);
+            b.end_if();
+            b.barrier_wait(-3);
+            return;
+        }
+        // the four loads of a stage (A, B and the two scale tiles) are the only operations a stage leaves outstanding: with `relax` the loads of the stage just issued may stay in flight
+        b.wait_tensor(if self.sh.relax && self.steady { 4 } else { 0 });
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
@@ -117,6 +142,7 @@ impl PipeBody for TdmF4Body {
 
     fn bind_state(&mut self, vars: &[VarId]) {
         self.acc = vars.to_vec();
+        self.steady = true;
     }
 
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
