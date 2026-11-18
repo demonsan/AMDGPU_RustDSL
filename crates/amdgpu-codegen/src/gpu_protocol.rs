@@ -2015,7 +2015,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
