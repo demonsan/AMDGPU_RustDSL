@@ -396,7 +396,15 @@ pub fn gemm_tdm_stage_f4_ks2() -> Function {
 /// two scale tiles) are separate rings (`grouped`: interleaved per slot by `ring_group`, the original layout, which declares `base of the last part + slots x stride` bytes), so the declared LDS is
 /// exactly `slots x (A + B + scales)` bytes.
 pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool) -> Function {
-    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, false)
+    // the planner's TDM row padding by default (conflict-free fragment reads: 256x256 ks2 +85 % at 4096^3, +87 % at 8192^3, a08-1);
+    // `gemm_tdm_stage_f4_opts(.., pad = false)` keeps the unpadded layout (`_nopad` kernel) for A/B
+    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, true)
+}
+
+pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
+/// The unpadded LDS layout (8-way bank conflicts on the fragment reads), for A/B against the default.
+pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_NOPAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, false)
 }
 
 /// The A / B row padding (bytes) that makes the fragment reads conflict-free: the TDM pads every `64 ks`-byte row (interval = the row's
