@@ -1,6 +1,6 @@
 //! gfx1250 MLA decode pieces: the `ds_load_tr8_b64` lane-mapping probe (the ISA gives the mapping only as diagrams).
 
-use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd};
+use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 
 /// `ds_load_tr8_b64` mapping probe (one wave): LDS bytes 0..512 hold their own address (byte i = i mod 256 + 256 * (i >= 256) is not
 /// needed: the probe reads within the first 256 bytes), lane l reads at `(l % 16) * 16 + (l / 16) * 8` (8 contiguous bytes of memory row l % 16,
@@ -35,5 +35,144 @@ pub fn probe_g1250_tr8() -> Function {
     let x1 = b.frag_slice(Opnd::Val(x), 1, 1);
     b.store_global(q, 0, x0, MemTy::B32, false);
     b.store_global(q, 4, x1, MemTy::B32, false);
+    b.finish()
+}
+
+/// The MLA decode name (qh16, one split, the aiter gfx1250 ABI: the 120-byte kernarg of tests/gpu/g1250_mla_host.cpp).
+pub const MLA_NAME: &str = "mla_g1250_qh16";
+
+/// MLA decode, 16 query heads, fp8 Q / KV with per-tensor scales, page size 64, one KV split: grid (1, B, 1), block 128 (4 waves), one
+/// sequence per work-group. The stage body is `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline (3 pages in flight through
+/// the tensor data mover). Output: bf16 R [B][16][512], the natural-log LSE [B][16].
+pub fn mla_g1250_qh16() -> Function {
+    use amdgpu_dsl::{ev, TensorTile, WmmaKind};
+    use amdgpu_stage::attention::mla::{MlaBody, PAGE_BYTES, PAGE_TOKENS};
+    use amdgpu_stage::{Cadence, Pipeline};
+    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::shared::{Layout, LdsPlan};
+    let mut b = FnBuilder::new(MLA_NAME, 128);
+    let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
+    for (i, n) in names.iter().enumerate() {
+        b.arg(n, DType::Ptr, 8 * i as u32, 8);
+    }
+    for (i, n) in ["out16", "scalar", "qlens", "passes", "stride_page", "log2_page", "stride_q", "flags"].iter().enumerate() {
+        b.arg(n, DType::I32, 88 + 4 * i as u32, 4);
+    }
+    b.arg_tensor("R", Ext::c(1 << 30));
+    b.arg_tensor("LSE", Ext::c(1 << 28));
+    let mut lds = LdsPlan::new();
+    let kv = lds.ring("KV", PAGE_BYTES as i64, 3, Layout::Linear);
+    let red = lds.tile("RED", 512, Layout::Linear);
+    let pbuf = lds.tile("PBUF", 1024, Layout::Linear);
+    let abuf = lds.tile("ABUF", 256, Layout::Linear);
+    lds.commit(&mut b);
+    let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
+    let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
+    let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
+    let tid = b.let_(Op::WorkitemId);
+    let bidx = b.let_(Op::WorkgroupIdY);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
+    let wv = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.read_first_lane(wv);
+    let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
+    let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
+    // uniform scalars of the sequence
+    let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
+        let v = b.load_global(q, 0, MemTy::B32);
+        b.read_first_lane(v)
+    };
+    let bo = b.let_(Op::ShlI32(Opnd::Val(bidx), Opnd::I32(2)));
+    let kv0 = ld(&mut b, pltp, bo);
+    let bo4 = b.add_i32(bo, Opnd::I32(4));
+    let kv1 = ld(&mut b, pltp, bo4);
+    let last = ld(&mut b, pltl, bo);
+    let npages = b.bind_i32(ev(kv1) - ev(kv0));
+    b.assume_trusted(npages, Ext::c(1), Ext::c(1 << 16), "host contract: every sequence has 1 .. 65536 pages");
+    b.assume_trusted(last, Ext::c(1), Ext::c(PAGE_TOKENS as i64), "host contract: the last page holds 1 .. 64 tokens");
+    let full = b.add_i32(npages, Opnd::I32(-1));
+    let ctx0 = b.let_(Op::ShlI32(Opnd::Val(full), Opnd::I32(6)));
+    let ctx = b.add_i32(ctx0, last);
+    let zero = b.c_i32(0);
+    let qs = ld(&mut b, pqs, zero);
+    let ks = ld(&mut b, pks, zero);
+    let qsf = b.let_(Op::BitcastF32(Opnd::Val(qs)));
+    let ksf = b.let_(Op::BitcastF32(Opnd::Val(ks)));
+    let sc = b.let_(Op::KernargI32 { offset: 92 });
+    let scf = b.let_(Op::BitcastF32(Opnd::Val(sc)));
+    let c1 = b.mul_f32(qsf, ksf);
+    let c2 = b.mul_f32(c1, scf);
+    let log2e = b.c_f32(std::f32::consts::LOG2_E);
+    let cscale = b.mul_f32(c2, log2e);
+    // Q fragments: head m (row 768 bytes, sequence stride 16 rows), dims 64 c + 8 g + 16 j
+    let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 8);
+    let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
+    let q: Vec<ValueId> = (0..9u32)
+        .map(|c| {
+            let parts: Vec<Opnd> = (0..4u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B64))).collect();
+            b.frag_cat(&parts)
+        })
+        .collect();
+    // one page = one 2D tile of 576 rows x 64 bytes (contiguous)
+    let tile = TensorTile { data_size: 1, tensor_dim: [Opnd::I32(64), Opnd::I32(576)], stride0: Opnd::I32(64), tile: [64, 576], pad: None, wg_mask: 0 };
+    let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
+    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, pltd, kv0, ctx, g1, w, m, g, lane, q, cscale, vars: Vec::new() };
+    let pipe = Pipeline::new(Cadence::OneWindow, npages, ctx, PAGE_TOKENS, Ext::c(1 << 16));
+    pipe.run(&mut b, Role::All, &mut body);
+    let vars = body.vars.clone();
+    let _ = WmmaKind::Fp8_16x16x64;
+    // ---- epilogue: the row sums (8 partials per head) through LDS, O / L * ks to bf16, LSE ----
+    b.wait_lds(0);
+    b.barrier();
+    let rw = b.bind_i32(ev(w) * 128 + ev(g) * 64 + ev(m) * 4 + red.base as i32);
+    b.store_lds(rw, Opnd::Var(vars[1]), MemTy::B32, false);
+    b.wait_lds(0);
+    b.barrier();
+    let sum_head = |b: &mut FnBuilder, head: amdgpu_dsl::I32| -> ValueId {
+        let mut acc: Option<ValueId> = None;
+        for k in 0..8 {
+            let a = b.bind_i32(head.clone() * 4 + (k * 64 + red.base as i32));
+            let v = b.load_lds(a, MemTy::B32);
+            let vf = b.let_(Op::BitcastF32(Opnd::Val(v)));
+            acc = Some(match acc {
+                None => vf,
+                Some(s) => b.add_f32(s, vf),
+            });
+        }
+        acc.unwrap()
+    };
+    let inv: Vec<ValueId> = (0..8)
+        .map(|r| {
+            let l = sum_head(&mut b, ev(g) * 8 + r);
+            let rl = b.rcp_f32(l);
+            b.mul_f32(rl, ksf)
+        })
+        .collect();
+    for nt in 0..8u32 {
+        let o = vars[2 + nt as usize];
+        for r in 0..8u8 {
+            let e = b.frag_slice(Opnd::Var(o), r, 1);
+            let ef = b.let_(Op::BitcastF32(Opnd::Val(e)));
+            let y = b.mul_f32(ef, inv[r as usize]);
+            let h = b.cvt_pk_bf16_f32(y, y);
+            // R[b][8 g + r][128 w + 16 nt + m]
+            let off = b.bind_i32(((ev(bidx) * 16 + ev(g) * 8 + r as i32) * 512 + ev(w) * 128 + (16 * nt as i32) + ev(m)) * 2);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(off) });
+            b.store_u16(pa, 0, h);
+        }
+    }
+    // LSE (natural log) of head m
+    // (wave 0: both lane halves write the same value of head m)
+    let lt = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, w, Opnd::I32(0));
+    b.begin_if(lt);
+    let l = sum_head(&mut b, ev(m));
+    let lg = b.log2_f32(l);
+    let s2 = b.add_f32(Opnd::Var(vars[0]), lg);
+    let ln2 = b.c_f32(std::f32::consts::LN_2);
+    let lse = b.mul_f32(s2, ln2);
+    let off = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+    let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(off) });
+    b.store_global(pl, 0, lse, MemTy::B32, false);
+    b.end_if();
     b.finish()
 }
