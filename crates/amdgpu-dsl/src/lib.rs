@@ -5482,6 +5482,7 @@ pub mod units;
 pub use facts::Captured;
 pub mod ir_text;
 pub mod plan;
+pub mod tdm_pad;
 mod ir_codec;
 pub mod specialize;
 pub use expr::{ev, ox, varx};

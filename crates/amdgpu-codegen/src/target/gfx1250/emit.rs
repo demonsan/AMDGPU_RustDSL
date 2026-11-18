@@ -62,13 +62,16 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
     // the kernel prologue the gfx1250 assembler requires (s_mov_b64 / v_nop / global_prefetch_b8 first) and LLVM emits for every kernel, in
-    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only). Exact mode: the author's
-    // instructions are the prologue (none added).
+    // LLVM's form, v0 the packed workitem ids (read only). Its scratch SGPR pair is the first even pair after the kernarg pointer and the
+    // preloaded kernarg dwords (s[2 .. 2 + n) hold the preload until their copies: writing one of them here would replace a kernel argument;
+    // nothing else is live at entry). Exact mode: the author's instructions are the prologue (none added).
     if !m.exact {
+        let p = (2 + super::preload_n()).next_multiple_of(2).max(6);
+        abi_inputs_intact(m, a, p, super::preload_n())?;
         out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
-        out.push_str("    s_mov_b64 s[6:7], 0\n");
+        out.push_str(&format!("    s_mov_b64 s[{p}:{}], 0\n", p + 1));
         out.push_str("    v_nop\n");
-        out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+        out.push_str(&format!("    global_prefetch_b8 v0, s[{p}:{}] scope:SCOPE_SE\n", p + 1));
     }
     // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
     // exact mode: the author's waits and padding are verified (check.rs), never added to
@@ -293,7 +296,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
 
     let vgpr = kdv("next_free_vgpr").map(|v| v as u32).unwrap_or_else(|| round_up(a.max_v.max(1), t.emit.vgpr_granule));
     let sgpr = kdv("next_free_sgpr").map(|v| v as u32).unwrap_or(a.max_s.max(1));
-    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(0);
+    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(super::preload_n() as i64);
     let d = |k: &str, dflt: i64| kdv(k).unwrap_or(dflt);
     // (the kernel descriptor's alignment padding goes into .text; an exact replay pads with the author's s_code_end instead)
     out.push_str(if kdv("code_end_pad").is_some() { "\n" } else { "\n.p2align 6\n" });
@@ -759,6 +762,8 @@ const RENAMES: &[(&str, &str)] = &[
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
 /// the node's assembler (crates/amdgpu-kernels/tests/gfx1250_emit.rs assembles the probes).
 const SAME_PREFIX: &[&str] = &[
+    // (the packed f32 forms are spelled alike on gfx1250: MC gfx1250_asm_vop3p.s)
+    "v_pk_add_f32", "v_pk_mul_f32", "v_pk_fma_f32",
     "v_mov_b32", "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fma_f32", "v_fmac_f32", "v_mul_lo_u32", "v_mul_hi_u32", "v_mad_u32_u24",
     "v_mul_u32_u24", "v_mul_i32_i24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_bfe_u32", "v_bfe_i32",
     "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_xad_u32", "v_add3_u32", "v_exp_f32", "v_log_f32",
@@ -911,4 +916,40 @@ mod tests {
         assert!(respell("v_mfma_f32_32x32x16_bf16 a[0:15], v[0:3], v[4:7], a[0:15]").is_err());
         assert!(respell("s_and_saveexec_b64 s[10:11], vcc").is_err());
     }
+}
+
+/// The kernel's ABI input registers - the kernarg pointer s[0:1], the preloaded kernarg dwords s[2 .. 2 + preload) - hold their launch
+/// values until the copies that read them (`SReadPhys`): neither the start sequence's scratch pair s[pair : pair + 1] nor any instruction
+/// before such a copy (layout order, which is the execution order up to the copies at the entry) writes one of them. A write there replaces
+/// a kernel argument (the hang of 2026-11-18: the start sequence's `s_mov_b64 s[6:7], 0` zeroed preloaded dwords 4-5).
+pub fn abi_inputs_intact(m: &MFunction, a: &Alloc, pair: u32, preload: u32) -> Result<(), String> {
+    let abi = 0..2 + preload;
+    let reads: Vec<u32> = m.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| i.op == MOp::SReadPhys).map(|i| i.imm as u32).collect();
+    for r in [pair, pair + 1] {
+        if abi.contains(&r) && reads.contains(&r) {
+            return Err(format!("{}: the kernel start sequence writes s{r}, an ABI input (kernarg pointer / preloaded kernarg dword) read later", m.name));
+        }
+    }
+    let mut written: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for b in &m.blocks {
+        for i in &b.insts {
+            if i.op == MOp::SReadPhys && written.contains(&(i.imm as u32)) {
+                return Err(format!("{}: s{} (an ABI input) is overwritten before its copy", m.name, i.imm));
+            }
+            if let Some(d) = i.dst {
+                let (t, off) = { let mut t = d; let mut off = 0u32; while let Some(&(u, k)) = m.alias.get(&t) { off += k as u32; t = u; } (t, off) };
+                if a.scalar.get(t as usize).copied().unwrap_or(false) {
+                    if let Some(&ph) = a.phys.get(t as usize) {
+                        let w = m.vreg_class(d).dwords() as u32;
+                        for k in 0..w {
+                            if abi.contains(&(ph + off + k)) {
+                                written.insert(ph + off + k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
