@@ -50,6 +50,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
     Rule { id: "GV-1250-TDM-STORE-PAD", layer: Layer::Ir, what: "a tensor store from LDS has no LDS padding: the hardware reads a store's LDS source contiguously (MI450: a padded source came out shifted from its second row on), so a store descriptor whose pad-enable bit is set, or not known to be clear at compile time, is an error; lay out the staging rows unpadded" },
+    Rule { id: "GV-1250-GETREG-IDLE", layer: Layer::Asm, what: "an s_getreg_b32 of STATUS / STATE_PRIV / EXCP_FLAG_* / SCRATCH_BASE / XNACK state without a wait-idle directly before: the instruction does not wait for idle and returns a stale value" },
     Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
@@ -1977,6 +1978,16 @@ fn wait_range(insts: &[Inst], v: &mut Vec<Violation>) {
     }
 }
 
+/// The hwreg operand of an `s_getreg_b32` names a register the instruction does not wait for idle on.
+fn getreg_needs_idle(ops: &str) -> bool {
+    let Some(a) = ops.find("hwreg(") else { return false };
+    let inner = &ops[a + 6..];
+    let first = inner.split(|c| c == ',' || c == ')').next().unwrap_or("").trim();
+    const IDS: [i64; 8] = [2, 4, 17, 18, 20, 21, 33, 34];
+    const NAMES: [&str; 9] = ["HW_REG_STATUS", "HW_REG_STATE_PRIV", "HW_REG_EXCP_FLAG_PRIV", "HW_REG_EXCP_FLAG_USER", "HW_REG_SCRATCH_BASE_LO", "HW_REG_SCRATCH_BASE_HI", "HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI", "HW_REG_XNACK_STATE_PRIV"];
+    NAMES.contains(&first) || first == "HW_REG_XNACK_MASK" || parse_int(first).map_or(false, |x| IDS.contains(&x))
+}
+
 fn is_dpp(ops: &str) -> bool {
     ["quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror", "row_bcast", "row_share", "row_xmask", "row_newbcast", "wave_shl", "wave_shr", "wave_rol", "wave_ror", "dpp8", "dpp16"].iter().any(|k| ops.contains(k))
 }
@@ -2087,6 +2098,14 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
             }
             if ins.mn.contains("_u64") || ins.mn.contains("_i64") || ins.mn.contains("_b64") {
                 viol(&mut v, "GV-1250-DPP", format!("line {}: `{}`: a DPP modifier on a 64-bit integer operation", ins.line, ins.mn));
+            }
+        }
+        // s_getreg_b32 does not wait for idle: of these registers it needs a wait-idle right before (ids from LLVM SIDefines.h, Hwreg::ID_*: STATUS 2, STATE_PRIV 4, EXCP_FLAG_PRIV 17,
+        // EXCP_FLAG_USER 18, SCRATCH_BASE_LO / _HI 20 / 21 (the gfx12 FLAT_SCR ids), XNACK_STATE_PRIV 33, XNACK_MASK 34; names as AMDGPUAsmUtils.cpp prints them)
+        if ins.mn == "s_getreg_b32" && getreg_needs_idle(&ins.ops) {
+            let idle = k > 0 && (insts[k - 1].mn == "s_wait_idle" || (insts[k - 1].mn == "s_wait_alu" && parse_int(&insts[k - 1].ops) == Some(0)));
+            if !idle {
+                viol(&mut v, "GV-1250-GETREG-IDLE", format!("line {}: `{} {}`: this register is read without waiting for idle (needs `s_wait_idle` or `s_wait_alu 0` directly before)", ins.line, ins.mn, ins.ops));
             }
         }
         // hazards that stall
