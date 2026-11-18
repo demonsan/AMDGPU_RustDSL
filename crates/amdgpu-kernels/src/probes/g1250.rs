@@ -542,9 +542,10 @@ pub fn probe_g1250_trans_all() -> Function {
                 4 => b.let_(Op::FmaF32(Opnd::F32(0.5), Opnd::Val(tr), Opnd::Val(x))),
                 5 => b.let_(Op::FmaF32(Opnd::Val(x), Opnd::F32(0.5), Opnd::Val(tr))),
                 _ => {
-                    let pr = b.frag_cat(&[Opnd::Val(tr), Opnd::Val(x)]);
-                    let q = b.frag_cat(&[Opnd::Val(x), Opnd::F32(0.25)]);
-                    let sum = b.let_(Op::PkAddF32(Opnd::Val(pr), Opnd::Val(q)));
+                    // both halves written by TRANS ops (the second one right before the packed reader), read as a packed pair
+                    let t0 = b.un(UnOp::SqrtF32, x);
+                    let pr = b.frag_cat(&[Opnd::Val(t0), Opnd::Val(tr)]);
+                    let sum = b.let_(Op::PkAddF32(Opnd::Val(pr), Opnd::Val(pr)));
                     let lo = b.frag_slice(sum, 0, 1);
                     let lo = b.bitcast_f32(lo);
                     let hi = b.frag_slice(sum, 1, 1);
