@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
     if (M % BM || N % BN || K % 128) { fprintf(stderr, "M %% %d, N %% %d, K %% 128 required\n", BM, BN); return 1; }
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     if (const char* cl = getenv("CLUSTER")) std::sscanf(cl, "%d,%d", &g_cx, &g_cy);
+    // the cluster the kernel was compiled for (its kd cluster_dims, exported by the payload): refuse any other launch shape
+    if (const char* ex = getenv("EXPECT_CLUSTER")) {
+        if (atoi(ex) != g_cx * g_cy) { fprintf(stderr, "the kernel declares a cluster of %s workgroups, the launch asks for %d x %d: refused\n", ex, g_cx, g_cy); return 1; }
+    }
     if (g_cx * g_cy > 1 && ((N / BN) % g_cx || (M / BM) % g_cy)) { fprintf(stderr, "the grid (%d x %d) must divide by the cluster (%d x %d)\n", N / BN, M / BM, g_cx, g_cy); return 1; }
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));

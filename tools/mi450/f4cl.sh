@@ -11,11 +11,12 @@ export PROBE_WATCHDOG_S=10 CHECK_ROWS=64
 for k in ${NAMES:-gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1 gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2 gemm_g1250_tdm_stage_f4_128x128_ks2_c2x2}; do
   case $k in *_c2x2) cl=2,2;; *_c2x1) cl=2,1;; *_c1x2) cl=1,2;; *) cl=1,1;; esac
   cx=${cl%,*}; cy=${cl#*,}
+  kdc=$($A print-ir $k 2>/dev/null | grep -m1 '^kd "cluster_dims"' | awk '{print $3}'); [ "${kdc:-0}" = "$((cx*cy))" ] || { echo "[$k] REFUSED: kd cluster_dims=${kdc:-none}, launch $cl"; continue; }
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -2 $O/$k.log; continue; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s || continue
   echo "== $k cluster $cl  $(grep -m1 amdhsa_group_segment_fixed_size $O/$k.s | tr -s ' ')  $(grep -m1 vgpr_count $O/$k.s | tr -d ' ')  tensor_loads=$(grep -c tensor_load_to_lds $O/$k.s) cluster_signals=$(grep -c 's_barrier_signal -3' $O/$k.s)"
   for sh in "$((128*cy)) $((128*cx)) 512 0" "$((128*cy)) $((128*cx)) 1024 0" "$((256*cy)) $((256*cx)) 1024 0" "1024 1024 1024 0" "4096 4096 4096 10" "8192 8192 8192 5"; do
-    out=$(CLUSTER=$cl gpurun $O/own_host $O/$k.co $k $sh 128 128 128 2>&1 | grep -E '^\{"host"|HANG|FAIL|mismatch|must divide' | head -1)
+    out=$(EXPECT_CLUSTER=$kdc CLUSTER=$cl gpurun $O/own_host $O/$k.co $k $sh 128 128 128 2>&1 | grep -E '^\{"host"|HANG|FAIL|mismatch|must divide' | head -1)
     echo "   $sh: $(echo "$out" | sed -E 's/.*"bad":([0-9]+),"maxrel":([0-9.e+-]+),"us":([0-9.]+),"tflops":([0-9.]+).*/bad=\1 maxrel=\2 us=\3 tflops=\4/')"
     case "$out" in *'"ok":true'*) ;; *) echo "   STOP $k"; break;; esac
   done
