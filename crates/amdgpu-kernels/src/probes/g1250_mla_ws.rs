@@ -23,9 +23,21 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
+    mla_ws_with(MLA_WS_NAME, false)
+}
+
+/// The wave-split MLA with the V dims split as well: wave pair q = w / 2 takes pages q, q + 2, ..; the pair's two waves compute the same
+/// S / softmax and own 256 V dims each (16 accumulators: O fits in 128 VGPRs).
+pub fn mla_g1250_qh16_wsd() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsd", true)
+}
+
+fn mla_ws_with(name: &str, dsplit: bool) -> Function {
+    let ntw: usize = if dsplit { NT / 2 } else { NT };
+    let ngrp: i32 = if dsplit { 2 } else { 4 };
     let layout = PageLayout::plan();
     let slot = layout.slot_bytes as i64;
-    let mut b = FnBuilder::new(MLA_WS_NAME, 128);
+    let mut b = FnBuilder::new(name, 128);
     let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
     for (i, n) in names.iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
@@ -62,6 +74,10 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let w = b.read_first_lane(wv);
     let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
+    // the page group of the wave (its pages: grp, grp + ngrp, ..) and, with the dim split, its half of the V dims
+    let grp = if dsplit { b.bind_i32(ev(w) >> 1) } else { w };
+    let hd = b.bind_i32(ev(w) & 1);
+    let db = if dsplit { b.bind_i32(ev(hd) * 256) } else { b.c_i32(0) };
     let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
         let v = b.load_global(q, 0, MemTy::B32);
@@ -105,7 +121,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     // lane offsets in a page slot (tile j = tokens 16 j ..): K nope / rope rows, the V tr8 fetch address; the constant parts as checked deltas
     let kofs = layout.at_expr(&mut b, ev(m) * DV + ev(g) * 32);
     let rofs = layout.at_expr(&mut b, ev(m) * 64 + ev(g) * 32 + ROPE_OFF);
-    let vofs = layout.at_expr(&mut b, (((ev(lane) >> 4) << 3) + (ev(lane) & 3) + (((ev(lane) >> 3) & 1) << 2)) * DV + (((ev(lane) >> 2) & 1) << 3));
+    let vofs = layout.at_expr(&mut b, (((ev(lane) >> 4) << 3) + (ev(lane) & 3) + (((ev(lane) >> 3) & 1) << 2)) * DV + (((ev(lane) >> 2) & 1) << 3) + ev(db));
     let kb: Vec<i32> = (0..32).map(|l| (l & 15) * DV + (l >> 4) * 32).collect();
     let rb: Vec<i32> = (0..32).map(|l| (l & 15) * 64 + (l >> 4) * 32 + ROPE_OFF).collect();
     let vb: Vec<i32> = (0..32).map(|f| (8 * (f >> 4) + (f & 3) + 4 * ((f >> 3) & 1)) * DV + 8 * ((f >> 2) & 1)).collect();
@@ -139,7 +155,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let neg = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
     let mut inits = vec![(DType::F32, Opnd::Val(neg)), (DType::F32, Opnd::Val(zf))];
-    for _ in 0..NT {
+    for _ in 0..ntw {
         let z = b.frag_cat(&[Opnd::I32(0); 8]);
         inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
     }
@@ -148,7 +164,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let ov: Vec<VarId> = st[2..].to_vec();
     let ptab_rd = |b: &mut FnBuilder, local: amdgpu_dsl::I32| -> ValueId {
         // past the sequence (the waves run the same trip count): the last page again, all its tokens masked
-        let pg = b.bind_i32(local * 4 + ev(w));
+        let pg = b.bind_i32(local * ngrp + ev(grp));
         let lastp = b.bind_i32(ev(npages) - 1);
         let pc = b.let_(Op::MinI32(Opnd::Val(pg), Opnd::Val(lastp)));
         let a = b.bind_i32((ev(pc) << 2) + ptab.base as i32);
@@ -170,7 +186,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     // one page from private slot s (generation `local`): S, online softmax, PV into the O variables
     let compute = |b: &mut FnBuilder, s: usize, local: amdgpu_dsl::I32| {
         let gen = b.bind_i32(local.clone());
-        let page = b.bind_i32(local * 4 + ev(w));
+        let page = b.bind_i32(local * ngrp + ev(grp));
         let mine = kw[s].mine(w);
         let sb = b.bind_i32(mine.base());
         let nrow = b.bind_i32(ev(sb) + ev(kofs));
@@ -272,7 +288,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
                 b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(g0c), a: Opnd::Val(a0), b: Opnd::Val(a1) })
             })
             .collect();
-        for nt in 0..NT {
+        for nt in 0..ntw {
             for r in 0..8u8 {
                 b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
@@ -291,8 +307,8 @@ pub fn mla_g1250_qh16_ws() -> Function {
                     .collect()
             };
             let mut cur = vgrp(b, 0);
-            for grp in 0..NT / 4 {
-                let next = if grp + 1 < NT / 4 { vgrp(b, grp + 1) } else { Vec::new() };
+            for grp in 0..ntw / 4 {
+                let next = if grp + 1 < ntw / 4 { vgrp(b, grp + 1) } else { Vec::new() };
                 for k in 0..4 {
                     let o = ov[4 * grp + k];
                     let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, cur[k], Some(Opnd::Var(o)));
@@ -308,7 +324,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     };
     // the wave's own pages: nw = ceil((npages - w) / 4), in pairs (an odd last pair re-reads the last page, fully masked); a wave without a
     // page (npages <= w) skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
-    let nw = b.bind_i32((ev(npages) - ev(w) + 3) >> 2);
+    let nw = if dsplit { b.bind_i32((ev(npages) - ev(grp) + 1) >> 1) } else { b.bind_i32((ev(npages) - ev(w) + 3) >> 2) };
     let npairs = b.bind_i32((ev(nw) + 1) >> 1);
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
@@ -347,11 +363,11 @@ pub fn mla_g1250_qh16_ws() -> Function {
         mlw(b, al, Opnd::Var(vl));
     });
     mo.at(&t0).write(&mut b, |b| {
-        for nt in 0..NT {
+        for nt in 0..ntw {
             for r in 0..8u8 {
                 let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
-                // O_w [head 8 g + r][dim 16 nt + m]
-                let a = b.bind_i32(ev(w) * 32768 + ((ev(g) * 8 + r as i32) * 512 + (16 * nt as i32) + ev(m)) * 4 + mo.base as i32);
+                // O_w [head 8 g + r][dim db + 16 nt + m]
+                let a = b.bind_i32(ev(w) * 32768 + ((ev(g) * 8 + r as i32) * 512 + ev(db) + (16 * nt as i32) + ev(m)) * 4 + mo.base as i32);
                 b.store_lds(a, e, MemTy::B32, false);
             }
         }
@@ -361,26 +377,34 @@ pub fn mla_g1250_qh16_ws() -> Function {
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);
+    // the waves holding this thread's dims: all four, or (dim split) the two of the dim half d0 / 256 (one per page group)
+    let wl: Vec<ValueId> = if dsplit {
+        let hh = b.bind_i32(ev(d0) >> 8);
+        vec![hh, b.bind_i32(ev(hh) + 2)]
+    } else {
+        (0..4).map(|k| b.c_i32(k)).collect()
+    };
+    let nwl = wl.len();
     let (mx, lt) = ml.at(&t0).read(&mut b, |b| {
-        let mw: Vec<ValueId> = (0..4)
+        let mw: Vec<ValueId> = (0..nwl)
             .map(|wi| {
-                let a = b.bind_i32(ev(h) * 4 + (wi * 64 + ml.base as i32));
+                let a = b.bind_i32(ev(h) * 4 + ev(wl[wi]) * 64 + ml.base as i32);
                 let v = b.load_lds(a, MemTy::B32);
                 f32_of(b, v)
             })
             .collect();
         let mut mx = mw[0];
-        for wi in 1..4 {
+        for wi in 1..nwl {
             mx = b.max_f32(mx, mw[wi]);
         }
         let mut sc = Vec::new();
         let mut lt: Option<ValueId> = None;
-        for wi in 0..4usize {
+        for wi in 0..nwl {
             let d = b.sub_f32(mw[wi], mx);
             let s = b.exp2_f32(d);
             sc.push(s);
             for gg in 0..2 {
-                let a = b.bind_i32(ev(h) * 4 + (256 + (wi as i32 * 2 + gg) * 64 + ml.base as i32));
+                let a = b.bind_i32(ev(h) * 4 + (ev(wl[wi]) * 2 + gg) * 64 + (256 + ml.base as i32));
                 let v = b.load_lds(a, MemTy::B32);
                 let vf = f32_of(b, v);
                 let t = b.mul_f32(vf, s);
@@ -398,9 +422,9 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();
     let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
         let mut acc: Vec<Option<ValueId>> = vec![None; 64];
-        for wi in 0..4 {
+        for wi in 0..nwl {
             for k in 0..16 {
-                let a = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + (wi * 32768 + 16 * k + mo.base as i32));
+                let a = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + (16 * k + mo.base as i32));
                 let v4 = b.load_lds_b128(a);
                 for e in 0..4u8 {
                     let x = b.frag_slice(Opnd::Val(v4), e, 1);
