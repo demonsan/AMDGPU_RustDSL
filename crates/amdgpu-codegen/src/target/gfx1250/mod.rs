@@ -10,6 +10,18 @@ pub mod hazards;
 pub mod msb;
 pub mod waits;
 
+thread_local! {
+    static XNACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the kernel runs with XNACK (translation-fault replay) enabled: `kd` fact `xnack` (default off, as our code objects declare it).
+/// The address-translation counter (XCNT) only matters then: a replayed memory operation re-reads its operand registers, so they may not
+/// be overwritten before its translation is done. LLVM's SIInsertWaitcnts tracks XCNT and waits on it only when
+/// `ST.hasWaitXcnt() && ST.isXNACKEnabled()` (the VMEM_GROUP / SMEM_GROUP events are generated only with XNACK).
+pub fn xnack() -> bool {
+    XNACK.with(|c| c.get())
+}
+
 /// Compiles `f` for gfx1250 (G1: the shared lowering / scheduling / allocation, then the gfx1250 emitter; wave32 kernels without
 /// divergent control flow, v0..v255, no AGPRs; the waits are the gfx950 ones mapped conservatively onto the split counters).
 pub fn compile(f: &Function) -> Result<crate::Compiled, String> {
@@ -27,6 +39,14 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     if f.workgroup_size > 1024 {
         return Err(format!("{}: workgroup size {} (gfx1250: at most 1024 work-items)", f.name, f.workgroup_size));
     }
+    let xn = f.kd.iter().rev().find(|(k, _)| k == "xnack").map_or(false, |(_, v)| *v != 0);
+    let old = XNACK.with(|c| c.replace(xn));
+    let r = compile_inner(f, backend);
+    XNACK.with(|c| c.set(old));
+    r
+}
+
+fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String> {
     let (m, alloc) = crate::lower_and_allocate(f)?;
     // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
     crate::gpu_verify_1250::enforce(f, &m, &alloc)?;
@@ -36,6 +56,14 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     let errs: Vec<String> = proto.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
     if !errs.is_empty() {
         return Err(format!("{}: tile protocol: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
+    }
+    // the compiler's waits, checked with the gfx1250 counters themselves (independent of the shared pass's model)
+    if backend == "own" && !m.exact {
+        let plan = waits::plan(&m, &alloc);
+        let errs = check::verify_planned(&m, &alloc, &plan);
+        if !errs.is_empty() {
+            return Err(format!("{}: gfx1250 wait self-check: {} missing wait(s) in the compiler's own output\n  {}", f.name, errs.len(), errs.join("\n  ")));
+        }
     }
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,

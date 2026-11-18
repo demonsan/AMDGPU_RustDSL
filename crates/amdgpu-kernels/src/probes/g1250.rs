@@ -472,7 +472,7 @@ pub fn probe_g1250_trans() -> Function {
     use amdgpu_dsl::UnOp;
     let mut b = FnBuilder::new("probe_g1250_trans", 512);
     b.arg("out", DType::Ptr, 0, 8);
-    b.arg_tensor("out", Ext::c(512 * 8 * 4));
+    b.arg_tensor("out", Ext::c(1 << 26));
     let po = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
     let tf = b.un(UnOp::CvtF32I32, tid);
@@ -489,7 +489,11 @@ pub fn probe_g1250_trans() -> Function {
             ch[c] = y;
         }
     }
-    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(5)));
+    // out[(wg * 512 + tid) * 8 + c]
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wg9 = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(9)));
+    let gt = b.let_(Op::AddI32(Opnd::Val(wg9), Opnd::Val(tid)));
+    let a = b.let_(Op::ShlI32(Opnd::Val(gt), Opnd::I32(5)));
     for c in 0..8 {
         let o = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * c as i32)));
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });

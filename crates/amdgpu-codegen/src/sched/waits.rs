@@ -279,8 +279,15 @@ fn is_back_edge(m: &MFunction, from: usize, to: usize) -> bool {
     m.loops.iter().any(|&(h, l)| h == tl && l == fl)
 }
 
-const VM_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max;
-const LG_MAX: u32 = crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max;
+// The counter ranges of the COMPILATION's target: an operation with `max` younger ones on its counter is complete only because the counter
+// cannot count further (gfx950 lgkmcnt: 15). On gfx1250 DScnt counts 63 LDS operations: assuming the gfx950 range there drops LDS reads
+// that are still in flight after 15 younger ones, and their readers get no wait.
+fn vm_max() -> u32 {
+    crate::target::cur().counters.of(amdgpu_target::MemClass::VmemLoad).max
+}
+fn lg_max() -> u32 {
+    crate::target::cur().counters.of(amdgpu_target::MemClass::Lds).max
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Ent {
@@ -406,7 +413,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             if is_tensor(inst.op) {
                 st.tn.issue(key, ring_issue, false, TN_MAX);
             } else {
-                st.vm.issue(key, ring_issue, false, VM_MAX);
+                st.vm.issue(key, ring_issue, false, vm_max());
             }
             if let Some(o) = out {
                 o.push(inst.clone());
@@ -493,7 +500,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
     if e.fence != Fence::None {
         // (not tracked in the queues: a DMA writes no register, and counting it would only loosen the partial waits of the shipped kernels)
         if e.smem {
-            st.lg.issue(id, e.writes.clone(), true, LG_MAX); // the s_memtime stamp: an SMEM result that the next reader waits for
+            st.lg.issue(id, e.writes.clone(), true, lg_max()); // the s_memtime stamp: an SMEM result that the next reader waits for
         }
         if let Some(o) = out {
             o.push(inst.clone());
@@ -505,11 +512,11 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         let mut slots = e.writes.clone();
         slots.extend(ring_issue);
         match a.space {
-            Space::Global => st.vm.issue(key, slots, false, VM_MAX),
-            Space::Lds => st.lg.issue(key, slots, false, LG_MAX),
+            Space::Global => st.vm.issue(key, slots, false, vm_max()),
+            Space::Lds => st.lg.issue(key, slots, false, lg_max()),
         }
     } else if e.smem {
-        st.lg.issue(id, e.writes.clone(), true, LG_MAX);
+        st.lg.issue(id, e.writes.clone(), true, lg_max());
     }
     if let Some(o) = out {
         o.push(inst.clone());
