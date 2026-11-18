@@ -85,12 +85,6 @@ pub fn mla_g1250_qh16() -> Function {
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
     let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
-    // the instruction cache: prefetch the kernel's first 16 KB (4 x 32 lines of 128 B), as the vendor does at entry
-    let pc = b.get_pc();
-    let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
-    for k in 0..4u32 {
-        b.prefetch_inst(pc, 0x1000 * k, nl);
-    }
     let tid = b.let_(Op::WorkitemId);
     let bidx = b.let_(Op::WorkgroupIdY);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
