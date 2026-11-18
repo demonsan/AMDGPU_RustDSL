@@ -77,6 +77,16 @@ int main(int argc, char** argv) {
     for (int i = 0; i < npages; i++) page_idx[i] = perm[i];
     for (int b = 0; b < B; b++) last[b] = ctx - PS * (pages_per - 1);
 
+    // the kernels' host contract (mla_g1250_qh16's trusted facts): every page id < P (the pool's page count), LTP monotone with
+    // LTP[B] <= NPG (the page table's entries), 1 .. 1024 pages per sequence
+    {
+        const long P = npages, NPG = (long)page_idx.size();
+        for (int i = 0; i < npages; i++) if (page_idx[i] < 0 || page_idx[i] >= P) FAIL("contract: page id %d out of [0, %ld)", page_idx[i], P);
+        for (int b = 0; b < B; b++) {
+            const int n = kv_indptr[b + 1] - kv_indptr[b];
+            if (kv_indptr[b] < 0 || n < 1 || n > 1024 || kv_indptr[b + 1] > NPG) FAIL("contract: sequence %d pages [%d, %d)", b, kv_indptr[b], kv_indptr[b + 1]);
+        }
+    }
     HC(hipSetDevice(0));
     auto up = [](const void* h, size_t n) { void* d; HC(hipMalloc(&d, n)); HC(hipMemcpy(d, h, n, hipMemcpyHostToDevice)); return d; };
     // device layouts (aiter op_tests/test_mla_decode_pagesize64.py): Q heads padded to a 768-byte row ([nope 512][rope 64][zero 192]);
