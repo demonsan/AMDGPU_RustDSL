@@ -455,7 +455,14 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
         MOp::SWaitCtr => {
             const MN: [&str; 7] = ["s_wait_loadcnt", "s_wait_storecnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_xcnt", "s_wait_asynccnt", "s_wait_tensorcnt"];
             let c = (inst.imm >> 8) as usize;
-            vec![format!("{} {:#x}", MN.get(c).ok_or("bad counter")?, inst.imm & 0xff)]
+            let mn = MN.get(c).ok_or("bad counter")?;
+            let n = inst.imm & 0xff;
+            if let Some(mx) = amdgpu_target::gfx1250_co::enc::wait_counter_max(mn) {
+                if n > mx as i64 {
+                    return Err(format!("{mn} {n}: exceeds the counter's maximum {mx} (a wait that never blocks)"));
+                }
+            }
+            vec![format!("{} {:#x}", mn, n)]
         }
         MOp::SBarrierSignal => vec![format!("s_barrier_signal {}", inst.imm)],
         MOp::SBarrierWait => vec![format!("s_barrier_wait {}", inst.imm)],
