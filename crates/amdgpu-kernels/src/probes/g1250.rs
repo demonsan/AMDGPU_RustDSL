@@ -582,3 +582,46 @@ pub fn probe_g1250_trans_all() -> Function {
     }
     b.finish()
 }
+
+/// Multicast probe (cluster of 2 workgroups in x): every workgroup loads ITS slice of `src` (2048 bytes, slice = its position in the cluster) with the group-1 multicast mask `mask` into LDS at
+/// byte 2048 x slice (wave 0 issues, cache policy `th` / `scope`), waits for its own tensor completion, a workgroup barrier, the cluster barrier; then every work-item copies the whole 4096-byte LDS
+/// to `out[position]`. With mask 0b11 each workgroup must see both slices; mask 0 (no multicast) only its own. Kernargs: src @0 (4096 bytes), out @8 (8192 bytes). 64 work-items.
+pub fn probe_g1250_mcast_with(name: &str, th: u8, scope: u8, mask: u16) -> Function {
+    use amdgpu_dsl::ev;
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("src", Ext::c(4096));
+    b.arg_tensor("out", Ext::c(8192));
+    b.lds(4096);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+    let pos = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
+    b.assume_trusted(pos, Ext::c(0), Ext::c(1), "cluster position x < the cluster's 2 workgroups (TTMP6[3:0])");
+    let off = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11)));
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: mask };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::Val(off));
+    let tid = b.let_(Op::WorkitemId);
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let lead = b.bind_cond(ev(w).eq(0));
+    b.begin_if(Opnd::Val(lead));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol { th, scope, nv: false });
+    b.end_if();
+    b.wait_tensor(0);
+    b.barrier();
+    b.cluster_barrier();
+    let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(12)));
+    for k in 0..16i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let x = b.load_lds(la, MemTy::B32);
+        let go = b.let_(Op::AddI32(Opnd::Val(pbase), Opnd::Val(la)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(go) });
+        b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f
+}
