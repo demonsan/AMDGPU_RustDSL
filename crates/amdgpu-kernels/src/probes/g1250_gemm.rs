@@ -473,6 +473,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_lazy(name: &str, relax: bool, roles: b
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, lazy: true, ..RingOpts::default() })
 }
 
+/// The best 256 x 256 kernel with an instruction prefetch of `n` x 4 KiB at the start.
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bool, n: u8) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, iprefetch: n, ..RingOpts::default() })
+}
+
 /// The best 256 x 256 kernel on a persistent grid (host PERSIST=G): no cross-tile overlap (the LDS-staged epilogue uses the whole LDS), only the tile loop.
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_persist(name: &str, relax: bool, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
@@ -533,11 +538,14 @@ pub struct RingOpts {
     pub swizzle: u8,
     /// `Pipeline::lazy_prologue`: wait only for tile 0 before the loop
     pub lazy: bool,
+    /// instruction prefetch at the kernel start: this many `s_prefetch_inst` of 32 lines each from the kernel's first instruction (0 = none): the first iteration of the loop then finds its
+    /// code in the instruction cache instead of fetching it line by line from L2
+    pub iprefetch: u8,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0 }
     }
 }
 
@@ -806,6 +814,13 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     } else {
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
+    if ring.iprefetch > 0 {
+        let pc = b.get_pc();
+        let zero = b.c_i32(0);
+        for k in 0..ring.iprefetch as u32 {
+            b.prefetch_inst_len(pc, k * 4096, zero, 31);
+        }
+    }
     if clustered {
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
