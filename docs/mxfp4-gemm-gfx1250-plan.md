@@ -2,17 +2,22 @@
 
 Kernel: `gemm_g1250_tdm_stage_f4*` in `crates/amdgpu-kernels/src/probes/g1250_gemm.rs`, body `amdgpu_stage::gemm::tdm_f4::TdmF4Body` driven by `Pipeline` with `Cadence::OneWindow` (3-slot ring, producer at iteration offset 2). Host `tests/gpu/g1250_f4own_host.cpp` (CPU reference on sampled rows, polled waits, `ONLY_K` bisect aid), payloads `tools/mi450/f4hw.sh`, `f4vs.sh`, `f4bisect.sh`, `f4variants.sh`.
 
-## Where we are (one GPU, f32 output, natural row-major A / B / scales, 8192^3)
+## Where we are (one GPU, f32 output, natural row-major A / B / scales; all bit-exact against the CPU reference)
 
-| kernel (tile, waves) | declared LDS | TFLOP/s | note |
-|---|---:|---:|---|
-| `gemm_g1250_tdm_stage_f4` (128 x 64, 4 waves, every wave loads the whole tile) | 39 KiB | 0.98 | first version |
-| the same with cooperative loads (each wave loads a slice, one barrier publishes) | 39 KiB | 1.42 | step 1 |
-| `..._128x128` (wave tile 2 x 4 WMMAs) | 51 KiB | 1.73 | step 2 |
-| `..._256x64` (wave tile 4 x 2) | 64 KiB | 1.66 | step 2 |
-| vendor `f4gemm` 256 x 256, 4 x 4 cluster, persistent, bf16 output | 320 KiB | 10 - 11.4 | the target |
+| kernel (tile, waves) | declared LDS | VGPRs | 4096^3 | 8192^3 (TFLOP/s) | note |
+|---|---:|---:|---:|---:|---|
+| `gemm_g1250_tdm_stage_f4` (128 x 64, every wave loads the whole tile) | 39 KiB | 160 | - | 0.98 | first version |
+| the same, cooperative loads (a slice per wave, one barrier publishes) | 39 KiB | 160 | 0.99 | 1.37 | step 1 |
+| `..._128x128` (wave tile 2 x 4 WMMAs) | 51 KiB | 240 | 1.55 | 1.70 | step 2 |
+| `..._256x64`, `..._8w_256x64` (8 waves) | 64 / 85 KiB | 256 | 1.16 / 1.06 | 1.66 / 1.60 | |
+| `..._256x128` (wave tile 4 x 4, 757 `s_set_vgpr_msb`) | 76 KiB | 640 | 1.58 | 1.94 | needed the scale-operand register class |
+| `..._128x128_ks2` (two K sub-steps per slot) | 102 KiB | 304 | 1.71 | **2.44** | needed the DScnt wait-range fix |
+| `..._128x128_ks2_relax` (`wait_tensor(4)`: two windows of load latency) | 102 KiB | 304 | 1.73 | 2.44 | no gain: not latency bound |
+| `..._256x128_ks2` | 153 KiB | 736 | 1.86 | 2.22 | |
+| `..._128x128_ks4` | 204 KiB | 544 | 1.04 | 1.16 | register pressure / window flips |
+| vendor `f4gemm` 256 x 256, 4 x 4 cluster, persistent, bf16 output | 320 KiB | 1024 | 9.0 - 9.2 | 10 - 11.4 | the target |
 
-All bit-exact against the CPU reference (E8M0 scales 2^-2 .. 2^2, random fp4). The gap is about 6x.
+The gap is about 4x. The replica comparison (kernel-opt, `docs/gfx1250-replica.md` on the replica branch) puts the instruction overhead at 57 instructions per WMMA against the vendor's 4.3 (accumulator copies and their `v_nop`s, about 95 SALU per K step for descriptors and ring slots, 4 LDS reads per WMMA against 1.5), and the operand traffic at about 9.5 TB/s of L2 -> LDS for the 128 x 128 tile: both limit us, which is why a relaxed tensor wait changed nothing.
 
 ## What the vendor kernel does (read from the public code object and kernel-opt's exact lift)
 

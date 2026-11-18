@@ -25,6 +25,9 @@ pub struct F4Shape {
     pub tn: i32,
     /// K sub-steps of 128 per ring slot (a slot holds `ks x 128` K elements: A / B rows of `64 ks` bytes, scale rows of `4 ks` bytes)
     pub ks: i32,
+    /// relaxed tensor waits: in the steady state each window completes the tile staged in the PREVIOUS window (`wait_tensor(4)`, the four loads of the stage just issued stay in flight), so a
+    /// stage has two windows of latency instead of one; the prologue still drains
+    pub relax: bool,
 }
 
 impl F4Shape {
@@ -71,6 +74,8 @@ pub struct TdmF4Body {
     pub wl: [ValueId; 4],
     /// the loop-carried accumulators, tm x tn (bound by `bind_state`)
     pub acc: Vec<VarId>,
+    /// set once the loop is being emitted (`bind_state`): the prologue's stages complete fully, the steady-state ones as `sh.relax` says
+    pub steady: bool,
 }
 
 impl PipeBody for TdmF4Body {
@@ -100,7 +105,8 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        b.wait_tensor(0);
+        // the four loads of a stage (A, B and the two scale tiles) are the only operations a stage leaves outstanding: with `relax` the loads of the stage just issued may stay in flight
+        b.wait_tensor(if self.sh.relax && self.steady { 4 } else { 0 });
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
@@ -117,6 +123,7 @@ impl PipeBody for TdmF4Body {
 
     fn bind_state(&mut self, vars: &[VarId]) {
         self.acc = vars.to_vec();
+        self.steady = true;
     }
 
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
