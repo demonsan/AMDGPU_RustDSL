@@ -451,8 +451,15 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             // prefix (VOP3P op 0x35: scale A, scale B, the inline 0; matrix_b_scale:MATRIX_SCALE_ROW1 sets its op_sel_hi bit 0), then the
             // matrix instruction with op_sel_hi[2] (d0 bit 14) set
             let d = vreg(op_at(&i, 0)?)?;
+            // the packed f32 forms (v_pk_add / mul / fma_f32): op_sel_hi = 1 for all three sources (d0 bit 14 + d1 [28:27]); a missing
+            // src2 is the inline 0 (llvm-mc: `v_pk_add_f32 v[20:21], v[16:17], v[16:17]` = cc294014 1a022110)
+            let packed = i.mn.starts_with("v_pk_");
             let mut enc = [0u32; 3];
             for k in 0..3 {
+                if packed && k == 2 && op_at(&i, 3).is_err() {
+                    enc[2] = 128;
+                    continue;
+                }
                 let (c, l) = src9(op_at(&i, k + 1)?)?;
                 if l.is_some() {
                     return Err(format!("`{t}`: a literal in a matrix operand"));
@@ -466,7 +473,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                 out.extend_from_slice(&d32(0xCC00_0000 | 0x35 << 16));
                 out.extend_from_slice(&d32((row1 as u32) << 27 | 128 << 18 | sb << 9 | sa));
             }
-            let px2 = (fmt == "VOP3PX2") as u32;
+            let px2 = (fmt == "VOP3PX2" || packed) as u32;
             out.extend_from_slice(&d32(0xCC00_0000 | op << 16 | px2 << 14 | d));
             out.extend_from_slice(&d32(3 << 27 | enc[2] << 18 | enc[1] << 9 | enc[0]));
         }

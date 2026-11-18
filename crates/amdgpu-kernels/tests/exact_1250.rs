@@ -72,7 +72,7 @@ fn the_scheduling_mode_is_exact_only() {
     assert!(e.contains("exact-mode statement"), "{e}");
 }
 
-/// tid -> f32 (v1), rsq (v2, a TRANS), r + r (v3, a VALU reading the TRANS result right after it: the co-execution hazard wants one v_nop),
+/// tid -> f32 (v1), rsq (v2, a TRANS), cvt_i32(r) (v3, a VALU reading the TRANS result right after it: the co-execution hazard wants one v_nop),
 /// stored through a buffer. `trust`: a TrustHazard before the add; `trust_elsewhere`: one before the store instead (waives nothing).
 fn trans(trust: bool, trust_elsewhere: bool) -> Function {
     let mut b = FnBuilder::new("probe_exact_1250_trans", 32);
@@ -88,7 +88,9 @@ fn trans(trust: bool, trust_elsewhere: bool) -> Function {
     if trust {
         b.trust_hazard("vendor omits the TRANS co-execution v_nop");
     }
-    let s = b.add_f32(r, r);
+    // a conversion: a reader class not proven exempt on hardware (docs/gfx1250-hazards.md), so the v_nop rule applies
+    let s = b.un(amdgpu_dsl::UnOp::CvtI32F32, r);
+    let s = b.bitcast_f32(s);
     let off = b.bind_i32(ev(tid) << 2);
     let rs = b.buffer_rsrc_sized(po, 32 * 4);
     if trust_elsewhere {
