@@ -3792,6 +3792,12 @@ impl FnBuilder {
         self.push_stmt(Stmt::WaitCounter { counter, count });
     }
 
+    /// gfx1250: `s_setreg_imm32_b32 hwreg(id, offset, size), value` (a mode / state register field; see `SysOp::SetRegImm`).
+    pub fn set_reg_imm(&mut self, id: u32, offset: u32, size: u32, value: u32) {
+        assert!(id < 64 && offset < 32 && (1..=32).contains(&size));
+        self.push_stmt(Stmt::Sys { op: SysOp::SetRegImm, imm: id | offset << 6 | (size - 1) << 11, imm2: value, reads: Vec::new() });
+    }
+
     /// gfx1250 exact mode: the wave's scheduling mode (see `Stmt::SetSchedMode`).
     pub fn set_sched_mode(&mut self, mode: u8) {
         self.push_stmt(Stmt::SetSchedMode { mode });

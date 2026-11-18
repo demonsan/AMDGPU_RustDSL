@@ -582,3 +582,129 @@ pub fn probe_g1250_trans_all() -> Function {
     }
     b.finish()
 }
+
+/// Multicast probe (cluster of 2 workgroups in x): every workgroup loads ITS slice of `src` (2048 bytes, slice = its position in the cluster) with the group-1 multicast mask `mask` into LDS at
+/// byte 2048 x slice (wave 0 issues, cache policy `th` / `scope`), waits for its own tensor completion, a workgroup barrier, the cluster barrier; then every work-item copies the whole 4096-byte LDS
+/// to `out[position]`. With mask 0b11 each workgroup must see both slices; mask 0 (no multicast) only its own. Kernargs: src @0 (4096 bytes), out @8 (8192 bytes). 64 work-items.
+pub fn probe_g1250_mcast_with(name: &str, th: u8, scope: u8, mask: u16) -> Function {
+    probe_g1250_mcast_lds(name, th, scope, mask, 4096)
+}
+
+/// `probe_g1250_mcast_with` declaring `lds_bytes` of LDS (hypothesis: a multicast lands at the SAME LDS address in every destination, which is only the same location when every workgroup's LDS
+/// base is equal, e.g. when each workgroup owns the whole LDS).
+pub fn probe_g1250_mcast_lds(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32) -> Function {
+    probe_g1250_mcast_full(name, th, scope, mask, lds_bytes, false, 0)
+}
+
+/// The full multicast probe. `wm24`: the issuing wave first sets WAVE_MODE bit 24 (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1`), which the vendor's GEMM kernel does in its wave 0 only
+/// (the wave that issues the tensor loads of its workgroup), before any tensor operation.
+pub fn probe_g1250_mcast_full(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32, wm24: bool, delay: u32) -> Function {
+    probe_g1250_mcast_same(name, th, scope, mask, lds_bytes, wm24, delay, false)
+}
+
+/// `same`: every workgroup issues the SAME request (the slice 0 of `src` to LDS byte 0, the same mask): the cluster multicast is a rendezvous of identical requests (the ISA: one wave per
+/// workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have asked). Expected with mask 0b11: both workgroups hold slice 0 at byte 0.
+pub fn probe_g1250_mcast_same(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32, wm24: bool, delay: u32, same: bool) -> Function {
+    use amdgpu_dsl::ev;
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("src", Ext::c(4096));
+    b.arg_tensor("out", Ext::c(8192));
+    b.lds(lds_bytes);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+    let pos = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
+    b.assume_trusted(pos, Ext::c(0), Ext::c(1), "cluster position x < the cluster's 2 workgroups (TTMP6[3:0])");
+    let off = if same { b.let_(Op::AddI32(Opnd::I32(0), Opnd::I32(0))) } else { b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11))) };
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: mask };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::Val(off));
+    let tid = b.let_(Op::WorkitemId);
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let lead = b.bind_cond(ev(w).eq(0));
+    b.begin_if(Opnd::Val(lead));
+    if wm24 {
+        b.set_reg_imm(1, 24, 1, 1);   // HW_REG_WAVE_MODE (id 1), bit 24
+    }
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol { th, scope, nv: false });
+    b.end_if();
+    b.wait_tensor(0);
+    b.barrier();
+    b.cluster_barrier();
+    if delay > 0 {
+        // a delay of about `delay` workgroup barriers before the copy: separates "the peer's slice arrives late" from "never"
+        let v = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        b.barrier();
+        let nx = b.add_i32(v[0], Opnd::I32(1));
+        b.set_var(v[0], nx);
+        let c = b.cmp(amdgpu_dsl::CmpPred::Ge, amdgpu_dsl::CmpTy::I32, nx, Opnd::I32(delay as i32));
+        b.break_if(c);
+        b.end_loop();
+    }
+    let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(12)));
+    for k in 0..16i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let x = b.load_lds(la, MemTy::B32);
+        let go = b.let_(Op::AddI32(Opnd::Val(pbase), Opnd::Val(la)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(go) });
+        b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f
+}
+
+/// Multicast landing-place scan (cluster of 2): both workgroups fill 64 KiB of LDS with a marker, join the cluster barrier, wave 0 of each loads its 2048-byte slice of `src` with mask 0b11 at LDS byte
+/// 2048 x position, then own wait, workgroup barrier, cluster barrier, and every work-item dumps the whole 64 KiB to `out[position]`. The host looks for the slices' dwords everywhere in both dumps, to
+/// find where a multicast lands (if anywhere). Kernargs: src @0 (4096 bytes), out @8 (131072 bytes). 64 work-items.
+pub fn probe_g1250_mcast_scan(name: &str, mask: u16) -> Function {
+    use amdgpu_dsl::ev;
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("src", Ext::c(4096));
+    b.arg_tensor("out", Ext::c(131072));
+    b.lds(65536);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+    let pos = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
+    b.assume_trusted(pos, Ext::c(0), Ext::c(1), "cluster position x < the cluster's 2 workgroups (TTMP6[3:0])");
+    let tid = b.let_(Op::WorkitemId);
+    for k in 0..256i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let v = b.let_(Op::XorI32(Opnd::I32(0x7EED_0000u32 as i32), Opnd::Val(la)));
+        b.store_lds_b32(la, v);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.cluster_barrier();
+    let off = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11)));
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: mask };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::Val(off));
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let lead = b.bind_cond(ev(w).eq(0));
+    b.begin_if(Opnd::Val(lead));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+    b.end_if();
+    b.wait_tensor(0);
+    b.barrier();
+    b.cluster_barrier();
+    let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(16)));
+    for k in 0..256i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let x = b.load_lds(la, MemTy::B32);
+        let go = b.let_(Op::AddI32(Opnd::Val(pbase), Opnd::Val(la)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(go) });
+        b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f
+}

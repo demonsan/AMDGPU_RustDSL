@@ -89,6 +89,9 @@ pub trait PipeBody {
     fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `RegStaged`: between the top-of-tile waits and the barrier (work that touches no LDS / VMEM, e.g. MMAs of the register tile)
     fn post_wait(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// After the pipeline's last window: drain what the stages left in flight (the last steady iteration stages a clamped tile nothing waits for). A body whose stages are asynchronous writes
+    /// into LDS (tensor loads) must wait for them here: a wave must not end with a copy into LDS outstanding (`GV-1250-TDM-DRAIN`).
+    fn finish(&mut self, _b: &mut FnBuilder, _role: Role) {}
 }
 
 /// The pipeline over `nkv` tiles of `tile_rows` rows (the last one possibly partial: `kv_len` rows in total).
@@ -139,8 +142,13 @@ impl Pipeline {
         self.tile_rows.trailing_zeros() as i32
     }
 
-    /// Emits the whole pipeline for one role (call it inside `Roles::each`, or once with `Role::All`).
+    /// Emits the whole pipeline for one role (call it inside `Roles::each`, or once with `Role::All`), then the body's drain (`PipeBody::finish`).
     pub fn run(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
+        self.run_stages(b, role, body);
+        body.finish(b, role);
+    }
+
+    fn run_stages(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
         let t0 = TileIt {
             it: Opnd::I32(0),
             cur: SlotIdx::new(0, 0),

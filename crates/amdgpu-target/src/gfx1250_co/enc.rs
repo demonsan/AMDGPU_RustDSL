@@ -205,6 +205,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         let id = match f.first() {
             Some(&"HW_REG_WAVE_MODE") => 1u32,
             Some(&"HW_REG_WAVE_SCHED_MODE") => 26u32,
+            Some(n) if n.parse::<u32>().is_ok() => n.parse::<u32>().unwrap(),   // a numeric register id (`hwreg(1, 24, 1)`)
             x => return Err(format!("`{t}`: hardware register {x:?}")),
         };
         let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
@@ -434,7 +435,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                     Some(x) => Err(format!("`{t}`: group {x:?}")),
                 }
             };
-            const TH: [&str; 8] = ["", "NT", "HT", "BYPASS", "LU", "NT_RT", "RT_NT", "NT_HT"];
+            const TH: [&str; 8] = ["", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_HT"];
             const SC: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
             let th = modv(&i, "th").map(|v| {
                 let v = v.trim_start_matches("TH_LOAD_").trim_start_matches("TH_STORE_");
