@@ -29,7 +29,12 @@ const SGPR_COUNT: usize = crate::target::T.regs.sgpr.count as usize;
 
 /// Reserved: v0 holds workitem id; s0:s1 kernarg pointer; s2..s4 workgroup ids.
 const V_RESERVED: usize = crate::target::T.regs.vgpr.reserved as usize;
-const S_RESERVED: usize = crate::target::T.regs.sgpr.reserved as usize;
+/// SGPRs the allocator never hands out: the target's reserved ones (gfx950: the ABI inputs) and, on gfx1250, the kernarg dwords the
+/// hardware preloads after the kernarg pointer (s[2 .. 2 + n], read by `SReadPhys` copies).
+fn s_reserved() -> usize {
+    let t = crate::target::cur();
+    t.regs.sgpr.reserved as usize + if t.name == "gfx1250" { crate::target::gfx1250::preload_n() as usize } else { 0 }
+}
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     let a = allocate_any(m)?;
@@ -289,7 +294,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     for i in 0..V_RESERVED {
         used_v[i] = true;
     }
-    for i in 0..S_RESERVED {
+    for i in 0..s_reserved() {
         used_s[i] = true;
     }
 
@@ -663,7 +668,7 @@ fn find_slot(used: &[bool], c: RClass, singles_from_top: bool) -> Option<usize> 
             width
         }
     } else {
-        S_RESERVED
+        s_reserved()
     };
     let n = used.len();
     if singles_from_top && c.is_vector() && width < 16 {

@@ -8,7 +8,7 @@ pub fn kernel_names() -> &'static [&'static str] {
 /// The gfx1250 probes (docs/gfx1250-plan.md): compiled with `--target gfx1250` only, so they are not in `kernel_names` (whose sweeps and
 /// golden manifests are gfx950's).
 pub fn gfx1250_kernel_names() -> &'static [&'static str] {
-    &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm", "probe_g1250_select", "probe_g1250_buffer", "probe_g1250_tdm2d", "probe_g1250_barriers", "probe_g1250_tdm_ring", "probe_g1250_named", "probe_g1250_wide", "probe_g1250_wmma_fp8", "probe_g1250_wmma_fp8_k128", "probe_g1250_wmma_f4", "gemm_g1250_tdm_fp8_k128", "gemm_g1250_tdm_fp8_k192", "gemm_g1250_tdm_stage_fp8", "gemm_g1250_tdm_stage_f4", "gemm_g1250_tdm_stage_f4_128x128", "gemm_g1250_tdm_stage_f4_256x64", "gemm_g1250_tdm_stage_f4_256x128", "gemm_g1250_tdm_stage_f4_128x128_ks2", "gemm_g1250_tdm_stage_f4_128x128_ks4", "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x2", "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1", "gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2", "gemm_g1250_tdm_stage_f4_128x128_ks2_relax", "gemm_g1250_tdm_stage_f4_256x128_ks2", "gemm_g1250_tdm_stage_f4_8w_256x64", "gemm_g1250_tdm_stage_f4_ks2", "gemm_g1250_tdm_stage_f4_ks2_grouped", "probe_g1250_lds_86784", "probe_g1250_lds_163840", "probe_g1250_lds_61440", "probe_g1250_tdm_hi_4096", "probe_g1250_tdm_hi_70000", "probe_g1250_tdm_hi_130000", "probe_g1250_trans"]
+    &["probe_g1250_add", "probe_g1250_math", "probe_g1250_tdm", "probe_g1250_select", "probe_g1250_buffer", "probe_g1250_tdm2d", "probe_g1250_barriers", "probe_g1250_tdm_ring", "probe_g1250_named", "probe_g1250_wide", "probe_g1250_wmma_fp8", "probe_g1250_wmma_fp8_k128", "probe_g1250_wmma_f4", "gemm_g1250_tdm_fp8_k128", "gemm_g1250_tdm_fp8_k192", "gemm_g1250_tdm_stage_fp8", "gemm_g1250_tdm_stage_f4", "gemm_g1250_tdm_stage_f4_128x128", "gemm_g1250_tdm_stage_f4_256x64", "gemm_g1250_tdm_stage_f4_256x128", "gemm_g1250_tdm_stage_f4_8w_256x64", "gemm_g1250_tdm_stage_f4_ks2", "gemm_g1250_tdm_stage_f4_ks2_grouped", "probe_g1250_lds_86784", "probe_g1250_lds_163840", "probe_g1250_lds_61440", "probe_g1250_tdm_hi_4096", "probe_g1250_tdm_hi_70000", "probe_g1250_tdm_hi_130000", "probe_g1250_trans", "probe_g1250_trans_all", "gemm_g1250_tdm_stage_f4_128x128_ks2", "gemm_g1250_tdm_stage_f4_128x128_ks4", "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x2", "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1", "gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2", "gemm_g1250_tdm_stage_f4_128x128_ks2_relax", "gemm_g1250_tdm_stage_f4_256x128_ks2"]
 }
 
 /// The kernel `name` with its compile-time ladder hint (`crate::ladder_hints`); `kernel_by_name_raw` is the kernel as built.
@@ -49,6 +49,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_g1250_named" => Some(crate::probes::g1250::probe_g1250_named()),
         "probe_g1250_wide" => Some(crate::probes::g1250::probe_g1250_wide()),
         "probe_g1250_trans" => Some(crate::probes::g1250::probe_g1250_trans()),
+        "probe_g1250_trans_all" => Some(crate::probes::g1250::probe_g1250_trans_all()),
         "probe_g1250_lds_86784" => Some(crate::probes::g1250::probe_g1250_lds_big(86784)),
         "probe_g1250_lds_163840" => Some(crate::probes::g1250::probe_g1250_lds_big(163840)),
         "probe_g1250_lds_61440" => Some(crate::probes::g1250::probe_g1250_lds_big(61440)),

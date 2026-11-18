@@ -298,6 +298,19 @@ fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
             eprintln!("bweave {}: {fell_back} interleave hint(s) kept their order (a dependence forbids the merge)", cx.f.name);
         }
     }
+    // gfx1250, opt-in (token matorder; measured neutral on the MXFP4 kernel, whose bound is the per-iteration tensor drain): each matrix op's operand loads right before it (target/gfx1250/matorder.rs); the lowering's automatic waits are recomputed
+    // for the new order (on the scheduled path they are already stripped and recomputed after the list scheduler)
+    if crate::target::cur().name == "gfx1250" && !s.m.exact && (cx.f.lower_opts.iter().any(|o| o == "matorder") || std::env::var("AMDC_MATORDER").is_ok()) && std::env::var("AMDC_NO_MATORDER").is_err() {
+        let had_auto = s.m.blocks.iter().any(|b| b.insts.iter().any(|i| i.auto));
+        let mut probe = s.m.clone();
+        sched::waits::strip_auto_waits(&mut probe);
+        if crate::target::gfx1250::matorder::order_for_matrix(&mut probe) {
+            if had_auto {
+                sched::waits::with_ring_model(ring_model(cx), || sched::waits::insert_waits(&mut probe));
+            }
+            s.m = probe;
+        }
+    }
     Ok(())
 }
 fn run_soft_clause(s: &mut MirState, _: &PassCtx) -> Result<(), String> {

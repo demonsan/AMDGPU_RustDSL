@@ -7,11 +7,20 @@ use amdgpu_dsl::Function;
 pub mod check;
 pub mod emit;
 pub mod hazards;
+pub mod matorder;
 pub mod msb;
 pub mod waits;
 
 thread_local! {
     static XNACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRELOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The kernarg dwords the hardware preloads into s[2 ..] for the kernel being compiled (`.amdhsa_user_sgpr_kernarg_preload_length`; LLVM
+/// does the same for `inreg` kernel arguments on gfx1250, no compatibility prologue): the kernel's kernarg reads at those offsets become
+/// SGPR copies instead of scalar loads. Up to 16 dwords (the user SGPRs are s[0:1] + the preload).
+pub fn preload_n() -> u32 {
+    PRELOAD.with(|c| c.get())
 }
 
 /// Whether the kernel runs with XNACK (translation-fault replay) enabled: `kd` fact `xnack` (default off, as our code objects declare it).
@@ -41,7 +50,12 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     }
     let xn = f.kd.iter().rev().find(|(k, _)| k == "xnack").map_or(false, |(_, v)| *v != 0);
     let old = XNACK.with(|c| c.replace(xn));
+    // the kernarg preload: the author's (exact: kd `user_sgpr_kernarg_preload_length`, read through `KernargPreload`) or, for the own
+    // tail, every kernarg dword up to 16
+    let pre = if f.exact || backend != "own" || f.kd.iter().any(|(k, _)| k == "user_sgpr_kernarg_preload_length") { 0 } else { f.kernarg_size.div_ceil(4).min(16) };
+    let oldp = PRELOAD.with(|c| c.replace(pre));
     let r = compile_inner(f, backend);
+    PRELOAD.with(|c| c.set(oldp));
     XNACK.with(|c| c.set(old));
     r
 }
@@ -107,4 +121,16 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
         crate::gpu_verify_1250::enforce_asm(&f.name, &asm)?;
     }
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
+}
+
+/// Test hook: the ABI-input check of `f` compiled with the own tail's preload, with the start sequence's scratch pair `pair` (None: the
+/// emitter's choice). The mutation tests pass the pair of the 2026-11-18 hang.
+pub fn start_sequence_check(f: &Function, pair: Option<u32>) -> Result<(), String> {
+    crate::target::with_target(crate::target::by_name("gfx1250").ok_or("gfx1250")?, || {
+        let pre = f.kernarg_size.div_ceil(4).min(16);
+        let oldp = PRELOAD.with(|c| c.replace(pre));
+        let r = crate::lower_and_allocate(f).and_then(|(m, a)| emit::abi_inputs_intact(&m, &a, pair.unwrap_or((2 + pre).next_multiple_of(2).max(6)), pre));
+        PRELOAD.with(|c| c.set(oldp));
+        r
+    })
 }
