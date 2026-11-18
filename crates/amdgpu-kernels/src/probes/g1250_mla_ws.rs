@@ -23,21 +23,32 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
-    mla_ws_with(MLA_WS_NAME, false, false)
+    mla_ws_with(MLA_WS_NAME, false, 0)
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
 pub fn mla_g1250_qh16_wsb() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsb", false, true)
+    mla_ws_with("mla_g1250_qh16_wsb", false, 3)
+}
+
+/// bisect aids: only the mask (`_wsbm`) / only the rescale (`_wsbr`) branch-free
+pub fn mla_g1250_qh16_wsbm() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbm", false, 1)
+}
+
+pub fn mla_g1250_qh16_wsbr() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbr", false, 2)
 }
 
 /// The wave-split MLA with the V dims split as well: wave pair q = w / 2 takes pages q, q + 2, ..; the pair's two waves compute the same
 /// S / softmax and own 256 V dims each (16 accumulators: O fits in 128 VGPRs).
 pub fn mla_g1250_qh16_wsd() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsd", true, false)
+    mla_ws_with("mla_g1250_qh16_wsd", true, 0)
 }
 
-fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
+fn mla_ws_with(name: &str, dsplit: bool, branchless: u8) -> Function {
+    // bit 0: the mask branch-free; bit 1: the rescale branch-free
+    let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     let ntw: usize = if dsplit { NT / 2 } else { NT };
     let ngrp: i32 = if dsplit { 2 } else { 4 };
     let layout = PageLayout::plan();
@@ -240,7 +251,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
         let okvars = b.declare_vars(&okv0.iter().map(|&v| (DType::I1, Opnd::Val(v))).collect::<Vec<_>>());
         // the mask: a uniform branch around it (only a page reaching past ctx), or branch-free (select on every page)
         let partial = b.cmp(CmpPred::Lt, CmpTy::I32, tok_lim, Opnd::I32(64));
-        if !branchless {
+        if !bl_mask {
             b.begin_if(partial);
         }
         for j in 0..4 {
@@ -253,7 +264,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
                 b.set_var(okvars[k], Opnd::Val(ok));
             }
         }
-        if !branchless {
+        if !bl_mask {
             b.end_if();
         }
         let x: Vec<Opnd> = xv.iter().map(|&v| Opnd::Var(v)).collect();
@@ -288,7 +299,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
         let grew = b.cmp(CmpPred::Lt, CmpTy::F32, alpha, Opnd::F32(1.0));
         let any = b.let_(Op::AnyLane(Opnd::Val(grew)));
         // lazy (only when some head's max grew: a uniform branch) or branch-free (every page)
-        if !branchless {
+        if !bl_rescale {
             b.begin_if(any);
         }
         // the alpha of row 8 g + r: lane 8 g + r holds head 8 g + r (v_readlane, then the lane half's choice)
@@ -306,7 +317,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
                 b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
         }
-        if !branchless {
+        if !bl_rescale {
             b.end_if();
         }
         // PV: 32 dim tiles, V fragments in groups of 4
