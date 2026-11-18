@@ -169,6 +169,11 @@ pub fn mla_g1250_qh16_cmb() -> Function {
     b.finish()
 }
 
+/// `_ws` with scalar loads for the sequence bounds, scales and page ids (no LDS page table, no prologue barrier).
+pub fn mla_g1250_qh16_wss() -> Function {
+    mla_ws_with("mla_g1250_qh16_wss", false, 64, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -195,6 +200,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     // bit 4 of `branchless`: the intra-page form (`_wsi`); bit 5: the KV split across work-groups (`_wsk`: partials to a workspace, `_cmb` combines)
     let intra = branchless & 16 != 0;
     let split = branchless & 32 != 0;
+    // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
+    let sload = branchless & 64 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -264,8 +271,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let db = if dsplit { b.bind_i32(ev(hd) * 256) } else { b.c_i32(0) };
     let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
-        let v = b.load_global(q, 0, MemTy::B32);
-        b.read_first_lane(v)
+        if sload {
+            b.let_(Op::LoadScalar { base: Opnd::Val(q), byte_off: 0 })
+        } else {
+            let v = b.load_global(q, 0, MemTy::B32);
+            b.read_first_lane(v)
+        }
     };
     let bo = b.let_(Op::ShlI32(Opnd::Val(bidx), Opnd::I32(2)));
     let kv0 = ld(&mut b, pltp, bo);
@@ -312,7 +323,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     // kd[j][c]: chunk c (< 8 nope, 8 rope) of S tile j; vd[jj][nt]: token chunk jj, dim tile nt
     let kd: Vec<Vec<i32>> = (0..4).map(|j| (0..9).map(|c| if c < 8 { layout.delta(&kb, 16 * j * DV + 64 * c) } else { layout.delta(&rb, 16 * j * 64) }).collect()).collect();
     let vd: Vec<Vec<i32>> = (0..4).map(|jj| (0..NT as i32).map(|nt| layout.delta(&vb, 16 * jj * DV + 16 * nt)).collect()).collect();
-    // the page table into LDS (shared, read-only after the barrier)
+    // the page table into LDS (shared, read-only after the barrier); with scalar loads the page ids are read straight from the table
+    if !sload {
     let nch = b.bind_i32((ev(npages) + 127) >> 7);
     let k0 = b.c_i32(0);
     let lv = b.begin_loop(&[(DType::I32, Opnd::Val(k0))]);
@@ -334,6 +346,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
+    }
 
     // ---- the wave's pages: w, w + 4, ..: nw of them (0 for a short sequence) ----
     let neg = b.c_f32(-1.0e30);
@@ -351,9 +364,19 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
         let pg = b.bind_i32(local * ev(gstride) + ev(gbase));
         let lastp = b.bind_i32(ev(npages) - 1);
         let pc = b.let_(Op::MinI32(Opnd::Val(pg), Opnd::Val(lastp)));
-        let a = b.bind_i32((ev(pc) << 2) + ptab.base as i32);
-        let v = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(a, MemTy::B32));
-        let pid = b.read_first_lane(v);
+        let pid = if sload {
+            // the entry kv0 + page, clamped to the sequence's last entry (kv_end - 1 < NPG)
+            let er = b.bind_i32(ev(kv0) + ev(pg));
+            let el = b.bind_i32(ev(kv_end) - 1);
+            let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+            let eo = b.bind_i32(ev(ec) * 4);
+            let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+            b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 })
+        } else {
+            let a = b.bind_i32((ev(pc) << 2) + ptab.base as i32);
+            let v = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(a, MemTy::B32));
+            b.read_first_lane(v)
+        };
         b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
         pid
     };
