@@ -759,6 +759,8 @@ const RENAMES: &[(&str, &str)] = &[
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
 /// the node's assembler (crates/amdgpu-kernels/tests/gfx1250_emit.rs assembles the probes).
 const SAME_PREFIX: &[&str] = &[
+    // (the packed f32 forms are spelled alike on gfx1250: MC gfx1250_asm_vop3p.s)
+    "v_pk_add_f32", "v_pk_mul_f32", "v_pk_fma_f32",
     "v_mov_b32", "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fma_f32", "v_fmac_f32", "v_mul_lo_u32", "v_mul_hi_u32", "v_mad_u32_u24",
     "v_mul_u32_u24", "v_mul_i32_i24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_bfe_u32", "v_bfe_i32",
     "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_xad_u32", "v_add3_u32", "v_exp_f32", "v_log_f32",

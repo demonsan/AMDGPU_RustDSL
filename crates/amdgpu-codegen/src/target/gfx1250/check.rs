@@ -36,6 +36,8 @@ type Key = (Ctr, (usize, usize), u8);
 #[derive(Clone, Debug, PartialEq)]
 struct Item {
     younger: u32,
+    /// younger operations of the same counter AND event class (in order with this one)
+    same: u32,
     class: u8,
     dst: Vec<u32>,
     src: Vec<u32>,
@@ -113,10 +115,24 @@ fn issue(st: &mut State, c: Ctr, at: (usize, usize), class: u8, dst: Vec<u32>, s
     for (k, v) in st.items.iter_mut() {
         if k.0 == c {
             v.younger = (v.younger + weight).min(64);
+            if v.class == class {
+                v.same = (v.same + weight).min(64);
+            }
         }
     }
+    // counter saturation: the hardware counter holds at most `max` outstanding operations, and an event class completes in order, so an
+    // operation followed by `max` younger operations of its own class cannot still be outstanding (va_vdst 4 bits / vm_vsrc 3 bits: LLVM
+    // AMDGPUWaitcntUtils VaVdstMax 15, VmVsrcMax 7; the memory counters 6 bits). Not for the out-of-order scalar loads.
+    let max = match c {
+        Ctr::VaVdst => 15,
+        Ctr::VmVsrc => 7,
+        Ctr::Load | Ctr::Store | Ctr::Ds => 63,
+        Ctr::X if class == 0 => 63,
+        _ => u32::MAX,
+    };
+    st.items.retain(|kk, v| !(kk.0 == c && v.class == class && v.same >= max));
     let k = (c, at, class);
-    let it = Item { younger: 0, class, dst, src };
+    let it = Item { younger: 0, same: 0, class, dst, src };
     st.items.insert(k, it);
 }
 
@@ -124,7 +140,10 @@ fn merge(a: &State, b: &State) -> State {
     let mut r = a.clone();
     for (k, v) in &b.items {
         match r.items.get_mut(k) {
-            Some(x) => x.younger = x.younger.min(v.younger),
+            Some(x) => {
+                x.younger = x.younger.min(v.younger);
+                x.same = x.same.min(v.same);
+            }
             None => {
                 r.items.insert(*k, v.clone());
             }
