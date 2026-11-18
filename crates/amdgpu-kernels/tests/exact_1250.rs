@@ -165,8 +165,8 @@ fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
     let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(z))]);
     let o = vars[0];
     let lane = b.frag_slice(Opnd::Var(o), 0, 1);
-    // the copy (lane + 0: lowered as a move after folding)
-    let copy = b.let_(Op::AddI32(Opnd::Val(lane), Opnd::I32(0)));
+    // the copy (a VGPR move)
+    let copy = b.let_(Op::MovV { ty: DType::I32, a: Opnd::Val(lane) });
     b.var_scale_lane(o, 0, Opnd::F32(2.0));
     b.store_global(p, 0, copy, amdgpu_dsl::MemTy::B32, false);
     let one = b.let_(Op::ConstI32(1));
