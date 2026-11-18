@@ -138,3 +138,51 @@ amdc emit --from-ir <file.ir> --target gfx1250 --backend own --out <file.s>
 
 Hosts: `tests/gpu/g1250_f4gemm_host.cpp`, `tests/gpu/g1250_mla_host.cpp` (both print `output hash`; `CO2` / `KERNEL2` = paired timing),
 `tests/gpu/g1250_probe_host.cpp barriers` (cluster launch). Every HW run goes through the node's GPU lock with a hard timeout.
+
+## 8. First round: what the replica says about our own MXFP4 GEMM
+
+`tools/isa_loop_profile.py` (instruction classes of a kernel and of its hot loops, counts only) on the vendor GEMM and on our
+`gemm_g1250_tdm_stage_f4` (sched's TDM stage template, emitted from Main 2e68d3ef). Both use the same WMMA
+(`v_wmma_scale_f32_32x16x128_f4`, 4 waves).
+
+| per hot-loop body | vendor (192 x 256 tile, cluster 4 x 4) | ours (128 x 64 tile, no cluster) |
+|---|---|---|
+| K steps per body (unroll) | 12 | 1 |
+| WMMA per body / per wave per K step | 288 / 24 | 4 / 4 |
+| instructions per WMMA (all classes) | 4.3 | 57 |
+| VALU per WMMA | **0** | 20 (16 of them `v_mov_b32`: accumulator copies) |
+| SALU per WMMA | 0.19 | 23.8 (descriptor / ring-slot / address recomputation each step) |
+| LDS reads per WMMA | 1.5 (b128 operands + b32 scales) | 4 |
+| hazard `v_nop` per WMMA | 0 | 4 |
+| memory waits per WMMA | 0.09 (19 `s_wait_dscnt N` + 6 `s_wait_tensorcnt N` per body, fine-grained) | 1.5 (load all, wait, compute) |
+| TDM per K step | 1 (cluster multicast) | 4 (A, B, SA, SB per work-group) |
+| barriers per K step | ~0.6 (incl. the cluster barrier) | 1 |
+| `s_set_vgpr_msb` per WMMA | 1.2 (1024 VGPRs: 24 accumulators x 8 per wave) | 0 (≤ 256 VGPRs) |
+
+Concrete compiler gaps, in the order they cost:
+
+1. **Loop-carried accumulator copies** (wave / register structure): every WMMA result is copied with 8 `v_mov_b32` back into the
+   loop variable, and the copies' read of the WMMA result costs the 4 `v_nop`. The vendor accumulates in place (D = C, same registers
+   across iterations). Needed: tie the loop-carried `Frag` variable to the WMMA's D = C registers (coalesce the phi copy), so the loop
+   body has no VALU at all.
+2. **Per-step address and descriptor arithmetic in the loop** (SALU 95 per K step): the vendor keeps LDS operand addresses fixed per
+   slot (offsets folded into `ds_load` immediates, slots unrolled) and advances one 64-bit global pointer per TDM (`s_add_nc_u64`).
+   Needed: unroll the ring (slots × K steps) so slot addresses are constants, and strength-reduce the descriptor update to one pointer add.
+3. **Tile / wave structure**: 24 WMMAs per wave per K step (vs 4) gives the vendor 1.5 LDS reads per WMMA (operand reuse across the
+   2D WMMA grid of a wave) and needs > 256 VGPRs. Needed: larger per-wave WMMA grids in the stage template, and the allocator's use of
+   the MSB windows (the replay proves the emitter and checker handle 1024 VGPRs; our allocator stays below 256).
+4. **WMMA / LDS-read interleave and wait placement**: the vendor issues the next WMMA's operand reads between WMMAs and waits with
+   `s_wait_dscnt N` (N > 0) right before the consumer; ours loads everything, waits to 0, then runs the WMMAs. Needed: the scheduler's
+   in-loop software pipelining of DS reads against WMMAs with counted waits (sched's cross-block work).
+5. **TDM issue split and cluster multicast**: one TDM per K step per cluster member, multicast to the 4 x 4 cluster (`workgroup_mask`),
+   with a cluster barrier for slot reuse; ours issues 4 TDMs per work-group. Needed: multicast TDM in the stage template (the cluster
+   barrier is now validated on HW, §2), and the A / B / scales packed into fewer descriptors.
+6. **Wave roles**: the vendor runs two loop copies (waves 0 / 2 and 1 / 3), with only wave 0 signalling the cluster barrier; our
+   template has one role. Needed when 5 is in: a producer / consumer split by `waveIDinGroup` (`Salu BfeU32` of TTMP8, already a DSL form).
+7. **Epilogue**: the vendor converts to bf16 and writes through LDS with one `tensor_store_from_lds`; ours stores f32 with 64
+   `global_store_b32` per wave. Needed for the bf16 output: a TDM store epilogue.
+8. **Kernarg preload**: the vendor preloads 20 kernarg dwords into SGPRs (no `s_load` in the prologue); ours loads them (7 `s_load`).
+
+An MLA decode compiled by us does not exist for gfx1250 yet; the vendor MLA's loop profile (per WMMA: 3.2 LDS reads incl.
+`ds_load_tr8_b64`, 2.6 VALU incl. 0.5 transcendental, 2.2 `v_nop`, 0.35 async global → LDS loads, TDM 0.06) lists the forms such a kernel
+needs, all of which the DSL now has (§3).
