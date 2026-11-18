@@ -73,6 +73,9 @@ pub fn cse(m: &mut MFunction) -> usize {
                         if matches!(inst.op, MOp::SMovB32 | MOp::VMovB32) && inst.srcs.len() == 1 {
                             if let Src::Reg(x) = inst.srcs[0] {
                                 if plain(x) && m.vregs.get(x as usize) == m.vregs.get(d as usize) {
+                                    if std::env::var("AMDC_CSE_DEBUG").is_ok() {
+                                        eprintln!("cse copy: r{d} -> r{x} (defs of x {:?}, aliased {})", ndefs.get(&x), aliased.contains(&x));
+                                    }
                                     rename.insert(d, x);
                                     removed += 1;
                                     continue;
@@ -83,6 +86,9 @@ pub fn cse(m: &mut MFunction) -> usize {
                         let key = (format!("{:?} {:?}", inst.op, vs), inst.imm);
                         if let Some(&e) = seen.get(&key) {
                             if m.vregs.get(e as usize) == m.vregs.get(d as usize) {
+                                if std::env::var("AMDC_CSE_DEBUG").is_ok() {
+                                    eprintln!("cse merge: r{d} -> r{e} ({:?})", inst.op);
+                                }
                                 rename.insert(d, e);
                                 removed += 1;
                                 continue;
