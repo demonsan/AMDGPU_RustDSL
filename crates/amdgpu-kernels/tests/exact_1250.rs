@@ -213,8 +213,9 @@ fn two_materialised_booleans_stay_distinct() {
     if std::env::var("SHOW_ASM").is_ok() {
         eprintln!("{asm}");
     }
-    // every vcc-reading v_cndmask that materialises a boolean (0 / 1 operands) writes its own register
-    let mats: Vec<&str> = asm.lines().filter(|l| l.contains("v_cndmask_b32") && l.contains("vcc_lo")).collect();
-    let dsts: std::collections::HashSet<String> = mats.iter().filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
-    assert!(dsts.len() >= 4, "the four selects need four results (or two materialised booleans): {mats:?}\n{asm}");
+    // both compares are materialised as 0 / 1 (`v_cndmask d, 0, 1, vcc`), each in its own register
+    let mats: Vec<String> = asm.lines().filter(|l| l.contains("v_cndmask_b32") && l.contains(", 0, ")).filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
+    let distinct: std::collections::HashSet<&String> = mats.iter().collect();
+    assert!(distinct.len() >= 2, "two booleans, one materialisation: {mats:?}\n{asm}");
+}\n{asm}");
 }
