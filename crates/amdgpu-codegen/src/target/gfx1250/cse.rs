@@ -40,6 +40,22 @@ pub fn cse(m: &mut MFunction) -> usize {
         let mut rename: HashMap<VReg, VReg> = HashMap::new();
         // every register each instruction writes (the destination and the second results of swaps / permutes), by the effects model
         let writes: Vec<Vec<Vec<u32>>> = m.blocks.iter().map(|b| b.insts.iter().map(|i| crate::sched::effects::effects(m, i).writes).collect()).collect();
+        // instructions that read a register their operand list does not name (VCC: `v_cndmask`, the carry-in adds; any other implicit
+        // input): two of them with equal operands need not compute the same value, so they are never merged (the 2026-11-18 MLA bug: two
+        // boolean materialisations `v_cndmask d, 0, 1, vcc` of DIFFERENT conditions were merged into one)
+        let implicit: Vec<Vec<bool>> = m
+            .blocks
+            .iter()
+            .map(|b| {
+                b.insts
+                    .iter()
+                    .map(|i| {
+                        let named: std::collections::HashSet<u32> = i.srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(canon_of(&m.alias, *r)) } else { None }).collect();
+                        crate::sched::effects::effects(m, i).reads.iter().any(|&s| s >= u32::MAX - 1 || !named.contains(&canon_of(&m.alias, s / 16)))
+                    })
+                    .collect()
+            })
+            .collect();
         for (bi, b) in m.blocks.iter_mut().enumerate() {
             let mut seen: HashMap<(String, i64), VReg> = HashMap::new();
             // the version of every register in this block (bumped at each write of it or of its tuple): equal operands in equal versions
@@ -64,7 +80,7 @@ pub fn cse(m: &mut MFunction) -> usize {
                 .collect();
             for (k, inst) in insts.into_iter().enumerate() {
                 let at = crate::op_attrs::attrs(inst.op);
-                let pure = matches!(at.dce, crate::op_attrs::Dce::Pure) && (!at.scc_write || scc_dead[k]) && !at.scc_read && at.mem.is_none() && !at.smem && !inst.pin;
+                let pure = matches!(at.dce, crate::op_attrs::Dce::Pure) && (!at.scc_write || scc_dead[k]) && !at.scc_read && at.mem.is_none() && !at.smem && !inst.pin && !implicit[bi][k];
                 if let (true, Some(d)) = (pure, inst.dst) {
                     let srcs_ok = true;
                     if plain(d) && srcs_ok && !rename.contains_key(&d) {
