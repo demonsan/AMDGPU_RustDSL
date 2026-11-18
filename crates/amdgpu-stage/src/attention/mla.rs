@@ -219,9 +219,14 @@ impl PipeBody for MlaBody {
                 let si = b.frag_slice(Opnd::Val(s), r, 1);
                 let sf = f32_of(b, si);
                 let v = b.mul_f32(sf, self.cscale);
-                let tok = b.add_i32(tok0, Opnd::I32(r as i32));
-                let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, self.ctx);
-                x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                if t.masked {
+                    // the pipeline's peeled last (partial) tile: tokens at or beyond ctx get -inf; the other windows need no mask
+                    let tok = b.add_i32(tok0, Opnd::I32(r as i32));
+                    let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, self.ctx);
+                    x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                } else {
+                    x.push(v);
+                }
             }
         }
         let mut mx = x[0];
