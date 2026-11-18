@@ -44,7 +44,7 @@ pub const KD_DIRECTIVES: &[&str] = &[
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
 pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String, String> {
     for (k, _) in kd {
-        if !KD_DIRECTIVES.contains(&k.as_str()) && !k.starts_with("g5:") && k != "xnack" {
+        if !KD_DIRECTIVES.contains(&k.as_str()) && !k.starts_with("g5:") && k != "xnack" && k != "wmma_reuse" {
             return Err(format!("{}: kernel-descriptor directive `{k}` is not settable (known: {})", m.name, KD_DIRECTIVES.join(", ")));
         }
     }
@@ -288,6 +288,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
             }
             Term::Endpgm => out.push_str("    s_endpgm\n"),
         }
+    }
+    // operand reuse, opt-in (kd entry `wmma_reuse` = 1 or `AMDC_WMMA_REUSE`; measured neutral on the MXFP4 GEMM, a08-1): a WMMA whose very
+    // next instruction is a WMMA reading the same A (B) registers tells the matrix core to keep them (`matrix_a_reuse` / `matrix_b_reuse`,
+    // as the vendor kernels do). Not in exact mode (the author's bits).
+    if !m.exact && (kdv("wmma_reuse").unwrap_or(0) != 0 || std::env::var("AMDC_WMMA_REUSE").is_ok()) {
+        out = wmma_reuse(&out);
     }
     for _ in 0..kdv("code_end_pad").unwrap_or(0) {
         out.push_str("    s_code_end\n");
@@ -946,4 +952,43 @@ pub fn abi_inputs_intact(m: &MFunction, a: &Alloc, pair: u32, preload: u32) -> R
         }
     }
     Ok(())
+}
+
+/// The A / B operand texts of a WMMA line (operands 1 and 2), None for other lines.
+fn wmma_ab(line: &str) -> Option<(&str, String, String)> {
+    let t = line.trim();
+    let (mn, rest) = t.split_once(' ')?;
+    if !mn.starts_with("v_wmma_") || mn.starts_with("v_wmma_ld_") {
+        return None;
+    }
+    let ops: Vec<&str> = rest.split(", ").collect();
+    if ops.len() < 3 {
+        return None;
+    }
+    Some((mn, ops[1].trim().to_string(), ops[2].split_whitespace().next().unwrap_or("").to_string()))
+}
+
+/// Sets `matrix_a_reuse` / `matrix_b_reuse` on every WMMA whose immediately following line is a WMMA of the same kind reading the same A /
+/// B registers (the same text: no `s_set_vgpr_msb` or other line in between, so the registers are the same).
+pub fn wmma_reuse(asm: &str) -> String {
+    let lines: Vec<&str> = asm.lines().collect();
+    let mut out = String::with_capacity(asm.len() + 1024);
+    for (k, l) in lines.iter().enumerate() {
+        let mut s = l.to_string();
+        if let (Some((mn, a, b)), Some(next)) = (wmma_ab(l), lines.get(k + 1)) {
+            if let Some((mn2, a2, b2)) = wmma_ab(next) {
+                if mn == mn2 {
+                    if a == a2 {
+                        s.push_str(" matrix_a_reuse");
+                    }
+                    if b == b2 {
+                        s.push_str(" matrix_b_reuse");
+                    }
+                }
+            }
+        }
+        out.push_str(&s);
+        out.push('\n');
+    }
+    out
 }
