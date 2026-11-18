@@ -476,6 +476,113 @@ fn mut_bar_count() {
     ir_mutation(&wave_kernel(|b, _| { b.barrier_signal_count(-3, 2); let pa = b.let_(Op::KernargPtr { offset: 8 }); let t = b.let_(Op::WorkitemId); let off = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2))); let pl = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off) }); let x = b.load_global(pl, 0, MemTy::B32); let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, x, Opnd::I32(0))); leader_barrier(b, c) }), "GV-1250-BAR-COUNT");
 }
 
+/// The replica's shape: a switch on the wave id; wave 0 (and 2) run loop A, whose leader arm signals and which waits once per pass; waves 1 and 3 run loop B, which only waits. `fact`: the named
+/// launch fact that the two loops iterate alike.
+fn two_loop_kernel(fact: bool) -> Function {
+    wave_kernel(|b, w| {
+        if fact {
+            b.barrier_wait_trips_match(-3);
+        }
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let odd = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1)));
+        let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, odd, Opnd::I32(0)));
+        b.begin_if(c);
+        // loop A: the leader arm signals, everyone waits
+        let va = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let c0 = wave_is(b, w, 0);
+        leader_barrier(b, c0);
+        let ca = b.cmp(CmpPred::Gt, CmpTy::I32, va[0], n);
+        b.break_if(ca);
+        b.end_loop();
+        b.else_();
+        // loop B: only waits
+        let vb = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        b.barrier_wait(-3);
+        let cb = b.cmp(CmpPred::Gt, CmpTy::I32, vb[0], n);
+        b.break_if(cb);
+        b.end_loop();
+        b.end_if();
+    })
+}
+
+/// The replica's two loops with their different counter phases: loop A (waves 0 and 2): the leader arm signals, the counter is bumped by 256 BEFORE the exit test `i < n`; loop B (waves 1, 3):
+/// the exit test reads `i + step_b + off_b` BEFORE the counter's update (by `step_b`), only waits. Variants: 0 = equal trip counts; 1 = off by one (`off_b` 1); 2 = a different step (128);
+/// 3 = the bound is a variable the loop writes.
+fn trip_kernel(variant: u8) -> Function {
+    wave_kernel(|b, w| {
+        let n = b.let_(Op::KernargI32 { offset: 0 });
+        let odd = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1)));
+        let c = Opnd::Val(b.cmp(CmpPred::Eq, CmpTy::I32, odd, Opnd::I32(0)));
+        b.begin_if(c);
+        let va = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
+        let c0 = wave_is(b, w, 0);
+        b.begin_if(c0);
+        b.barrier_signal(-3);
+        b.end_if();
+        let ia = b.add_i32(va[0], Opnd::I32(256));
+        b.set_var(va[0], ia);
+        let ta = b.cmp(CmpPred::Lt, CmpTy::I32, va[0], n);
+        let na = b.let_(Op::NotI1(Opnd::Val(ta)));
+        b.break_if(na);
+        b.barrier_wait(-3);
+        b.end_loop();
+        b.else_();
+        let (step_b, off_b) = match variant {
+            1 => (256, 1),
+            2 => (128, 0),
+            _ => (256, 0),
+        };
+        let vb = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::Val(n))]);
+        let bound = if variant == 3 { Opnd::Var(vb[1]) } else { Opnd::Val(n) };
+        let tb = b.add_i32(vb[0], Opnd::I32(step_b + off_b));
+        let cb = b.cmp(CmpPred::Lt, CmpTy::I32, tb, bound);
+        let nb = b.let_(Op::NotI1(Opnd::Val(cb)));
+        b.break_if(nb);
+        b.barrier_wait(-3);
+        let ib = b.add_i32(vb[0], Opnd::I32(step_b));
+        b.set_var(vb[0], ib);
+        if variant == 3 {
+            let nb2 = b.add_i32(vb[1], Opnd::I32(0));
+            b.set_var(vb[1], nb2);
+        }
+        b.end_loop();
+        b.end_if();
+    })
+}
+
+#[test]
+fn pos_bar_count_scev() {
+    // different counter phases, the same trip count: proved from the entry value, step, bound and exit offsets, no fact
+    let f = trip_kernel(0);
+    let v = verify_ir(&f);
+    assert!(!has(&v, "GV-1250-BAR-COUNT"), "{v:?}");
+    assert!(amdgpu_codegen::gpu_verify_1250::trusted_items(&f).is_empty());
+}
+
+#[test]
+fn mut_bar_count_scev() {
+    // each of these changes the trip count of one loop (or hides it): the proof fails and, without the named fact, the kernel is rejected
+    ir_mutation(&trip_kernel(1), "GV-1250-BAR-COUNT");   // off by one
+    ir_mutation(&trip_kernel(2), "GV-1250-BAR-COUNT");   // a different step
+    ir_mutation(&trip_kernel(3), "GV-1250-BAR-COUNT");   // a bound the loop writes
+}
+
+#[test]
+fn mut_bar_count_trips() {
+    // waits in a loop no signal sits in: without the named fact the trip counts are not provable
+    ir_mutation(&two_loop_kernel(false), "GV-1250-BAR-COUNT");
+}
+
+#[test]
+fn pos_bar_count_trips() {
+    // the same kernel with the launch fact: accepted, and listed as a trusted item
+    let f = two_loop_kernel(true);
+    let v = verify_ir(&f);
+    assert!(!has(&v, "GV-1250-BAR-COUNT"), "{v:?}");
+    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
+    assert!(t.iter().any(|x| x.contains("iterate the same number of times")), "{t:?}");
+}
+
 #[test]
 fn pos_bar_count() {
     // the leader arm: exactly one wave per work-group signals (proved from the wave id)
@@ -750,6 +857,35 @@ fn pos_tdm_lds_extent() {
     ir_positive(&tdm_lds_kernel(4096, 3, 1024, 1024, 0, 1024));
 }
 
+// GV-1250-LDS-64K
+
+fn lds_kernel_decl(lds: u32, fact: bool) -> Function {
+    let mut b = FnBuilder::new("hr_lds", 64);
+    b.lds(lds);
+    if fact {
+        b.lds_above_64k(1);
+    }
+    let _ = b.let_(Op::WorkitemId);
+    b.finish()
+}
+
+#[test]
+fn mut_lds_64k() {
+    ir_mutation(&lds_kernel_decl(65537, false), "GV-1250-LDS-64K");
+    ir_mutation(&lds_kernel_decl(103936, false), "GV-1250-LDS-64K");
+}
+
+#[test]
+fn pos_lds_64k() {
+    ir_positive(&lds_kernel_decl(65536, false));   // exactly 64 KiB is inside
+    ir_positive(&lds_kernel_decl(51968, false));
+    // above 64 KiB with the named evidence fact: accepted and listed as a trusted item
+    let f = lds_kernel_decl(103936, true);
+    ir_positive(&f);
+    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
+    assert!(t.iter().any(|x| x.contains("LDS above 64 KiB")), "{t:?}");
+}
+
 // GV-1250-DPP
 
 #[test]
@@ -845,6 +981,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),
     ("GV-1250-TDM-DESC", "tdm_desc"),
+    ("GV-1250-LDS-64K", "lds_64k"),
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),

@@ -1591,6 +1591,10 @@ pub enum Stmt {
     /// guarantee complete (a vendor timing reliance, docs/exact-mode.md section 5.2). Counted in the certificate (GV-TRUST-TIMING); rejected
     /// in every dispatch-reachable kernel; a waiver that waives nothing is an error.
     TrustWait { reason: String },
+    /// Exact mode (gfx1250), NON-DISPATCHED kernels only: the next statement's instruction is exempt from the gfx1250 software-hazard check
+    /// (a vendor reliance the public rules do not grant, e.g. no `v_nop` between a TRANS and its VALU reader). Counted in the certificate
+    /// (GV-TRUST-HAZARD); a waiver that waives nothing is an error.
+    TrustHazard { reason: String },
     /// Exact mode: the next statement's VALU instruction(s) use the VOP3 (`_e64`) encoding even where the VOP2 / VOPC one would encode
     /// (the author's encoding).
     EncodeE64,
@@ -2596,6 +2600,12 @@ impl FnBuilder {
     #[track_caller]
     pub fn trust_wait(&mut self, reason: &str) {
         self.push_stmt(Stmt::TrustWait { reason: reason.to_string() });
+    }
+
+    /// Exact mode (gfx1250), non-dispatched kernels only: waive the software-hazard check of the next statement (see `Stmt::TrustHazard`).
+    #[track_caller]
+    pub fn trust_hazard(&mut self, reason: &str) {
+        self.push_stmt(Stmt::TrustHazard { reason: reason.to_string() });
     }
 
     /// Exact mode: the next statement is encoded `_e64` (see `Stmt::EncodeE64`).
@@ -3804,6 +3814,18 @@ impl FnBuilder {
     /// item: the verifier proves the count itself when the signalling condition is a function of the wave id, and requires this declaration (listed by `trusted_items`) when it cannot.
     pub fn barrier_signal_count(&mut self, id: i32, per_wg: u32) {
         self.f.kd.push((format!("g5:signals_per_wg:{id}"), per_wg as i64));
+    }
+
+    /// gfx1250 launch fact for the hang-safety verifier (`GV-1250-BAR-COUNT`): every wave waits on barrier `id` the same number of times per phase even though the waves wait in different loops
+    /// (different wave paths that iterate the same trip count). A TRUSTED item (listed by `trusted_items`): the verifier cannot compare loop trip counts.
+    pub fn barrier_wait_trips_match(&mut self, id: i32) {
+        self.f.kd.push((format!("g5:wait_trips_match:{id}"), 1));
+    }
+
+    /// gfx1250 launch fact for the hang-safety verifier (`GV-1250-LDS-64K`): the kernel uses more than 64 KiB of LDS and this is the hardware evidence it relies on (a trusted item, listed by
+    /// `trusted_items`; the `evidence` number is the author's reference).
+    pub fn lds_above_64k(&mut self, evidence: u32) {
+        self.f.kd.push(("g5:lds_above_64k".to_string(), evidence.max(1) as i64));
     }
 
     /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
@@ -5036,7 +5058,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             Stmt::BarrierInit { .. } | Stmt::BarrierJoin { .. } | Stmt::BarrierLeave | Stmt::ClusterBarrier => {}
             Stmt::SetSchedMode { .. } | Stmt::WaitAlu { .. } => {}
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::EncodeE64 => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd | Stmt::RegionMark { .. } | Stmt::UnitMark { .. } | Stmt::BranchHint { .. } | Stmt::SNop { .. } | Stmt::BranchPlace { .. } | Stmt::LayoutAnchor { .. } | Stmt::ExecSave { .. } | Stmt::ExecAll | Stmt::ExecSet { .. } | Stmt::ExecRestore { .. } | Stmt::WaitCnt { .. } | Stmt::TrustWait { .. } | Stmt::TrustHazard { .. } | Stmt::EncodeE64 => {}
             Stmt::SetM0 { value } => {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {
