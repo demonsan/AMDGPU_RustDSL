@@ -92,13 +92,17 @@ pub struct TdmF4Body {
     /// LDS padding bytes after every A / B row of a slot (the TDM's pad: `row_pad / 4` dwords after each `64 ks`-byte row), 0 = none; the
     /// A / B row stride in LDS is `64 ks + row_pad`
     pub row_pad: i32,
+    /// the scales in the vendor's preshuffled layout (aiter `shuffle_scale_f4`: [rows / 32][K / 128][32 rows][4 bytes]): a stage's scale
+    /// slice is rows / 32 TDM rows of 128 ks contiguous bytes (instead of rows of 4 ks bytes); in LDS [row block][k tile][32][4]
+    pub scale_shuf: bool,
 }
 
 impl PipeBody for TdmF4Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
         // `key0`: the K element offset of the tile (tile_rows = 128: tile << 7); bytes of an fp4 row: / 2; of a scale row: / 32
         let kb = b.bind_i32(key0.clone().lshr(1));
-        let ks = b.bind_i32(key0.clone().lshr(5));
+        // the scales' K byte offset: K / 32 bytes per row, or (preshuffled) K / 128 tiles of 128 bytes = K bytes
+        let ks = if self.scale_shuf { b.bind_i32(key0.clone()) } else { b.bind_i32(key0.clone().lshr(5)) };
         let oa = b.add_i32(self.a_org, kb);
         let ob = b.add_i32(self.b_org, kb);
         let osa = b.add_i32(self.sa_org, ks);
@@ -192,7 +196,8 @@ impl PipeBody for TdmF4Body {
             });
             rsa.read(b, |b| {
                 for i in 0..sh.tm {
-                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + 4 * s);
+                    let st = if self.scale_shuf { 128 * s } else { 4 * s };
+                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + st);
                     f.sa.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });
@@ -208,7 +213,9 @@ impl PipeBody for TdmF4Body {
             });
             rsb.read(b, |b| {
                 for j in 0..sh.tn {
-                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + j * 16 * srow_bytes + 4 * s);
+                    // preshuffled: B block j covers rows 16 j .. of the 32-row block j / 2 (lanes m at 16 (j % 2) + m)
+                    let (jt, st) = if self.scale_shuf { ((j / 2) * 32 * srow_bytes + (j % 2) * 64, 128 * s) } else { (j * 16 * srow_bytes, 4 * s) };
+                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + jt + st);
                     f.sb.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });

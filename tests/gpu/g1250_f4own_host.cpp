@@ -94,7 +94,20 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); const bool bf16 = getenv("OUT_BF16") != nullptr;   // the kernel writes bf16 (RNE), M x N x 2 bytes
     HC(hipMalloc(&dC, (size_t)M * N * (bf16 ? 2 : 4)));
     HC(hipMemcpy(dA, A.data(), A.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, B.data(), B.size(), hipMemcpyHostToDevice));
-    HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SB.data(), SB.size(), hipMemcpyHostToDevice));
+    // SCALE_SHUF=1: the scales in the vendor's preshuffled layout (aiter shuffle_scale_f4: [rows / 32][K / 128][32 rows][4 bytes]; rows and
+    // K / 32 here are multiples of 32 and 4); the reference below keeps reading the row-major SA / SB
+    auto shuf_scale = [](const std::vector<uint8_t>& s, int rows, int cols) {
+        std::vector<uint8_t> out(s.size());
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++) out[(((size_t)(r / 32) * (cols / 4) + c / 4) * 32 + r % 32) * 4 + c % 4] = s[(size_t)r * cols + c];
+        return out;
+    };
+    if (getenv("SCALE_SHUF")) {
+        const std::vector<uint8_t> sa2 = shuf_scale(SA, M, K / 32), sb2 = shuf_scale(SB, N, K / 32);
+        HC(hipMemcpy(dSA, sa2.data(), sa2.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, sb2.data(), sb2.size(), hipMemcpyHostToDevice));
+    } else {
+        HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SB.data(), SB.size(), hipMemcpyHostToDevice));
+    }
     HC(hipMemset(dC, 0xff, (size_t)M * N * (bf16 ? 2 : 4)));
 
     // PERSIST=G: a persistent kernel (a tile loop inside): G workgroups (a multiple of the tile columns N / BN), each takes the tile column
