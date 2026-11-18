@@ -48,7 +48,8 @@ const MAX_PAGES: i32 = 1024;
 /// the tensor data mover). Output: bf16 R [B][16][512], the natural-log LSE [B][16].
 pub fn mla_g1250_qh16() -> Function {
     use amdgpu_dsl::{ev, TensorTile, WmmaKind};
-    use amdgpu_stage::attention::mla::{MlaBody, LDS_ROPE, LDS_ROW, PAGE_TOKENS, SLOT_BYTES};
+    use amdgpu_stage::attention::mla::{MlaBody, PageLayout, DV as DVB, PAGE_BYTES, PAGE_TOKENS, QUARTER, ROPE_OFF};
+    let layout = PageLayout::plan();
     use amdgpu_stage::{Cadence, Pipeline};
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
@@ -60,10 +61,21 @@ pub fn mla_g1250_qh16() -> Function {
     for (i, n) in ["out16", "scalar", "qlens", "passes", "stride_page", "log2_page", "stride_q", "flags"].iter().enumerate() {
         b.arg(n, DType::I32, 88 + 4 * i as u32, 4);
     }
-    b.arg_tensor("R", Ext::c(1 << 30));
-    b.arg_tensor("LSE", Ext::c(1 << 28));
+    // the buffers of grid (1, B, 1): one sequence of 16 heads per work-group row
+    b.arg_tensor("R", Ext::grid_y() * Ext::c(16 * 512 * 2));
+    b.arg_tensor("LSE", Ext::grid_y() * Ext::c(16 * 4));
+    b.arg_tensor("Q", Ext::grid_y() * Ext::c(16 * 768));
+    b.arg_tensor("LTP", (Ext::grid_y() + Ext::c(1)) * Ext::c(4));
+    b.arg_tensor("LTL", Ext::grid_y() * Ext::c(4));
+    b.arg_tensor("QS", Ext::c(4));
+    b.arg_tensor("KS", Ext::c(4));
+    // the paged KV pool (P pages) and the page table (NPG entries): free symbols, the host contract on the loaded indices below
+    b.sym_range("P", 1, 1 << 24);
+    b.sym_range("NPG", 1, 1 << 26);
+    b.arg_tensor("KV", Ext::sym("P") * Ext::c(PAGE_BYTES as i64));
+    b.arg_tensor("LTD", Ext::sym("NPG") * Ext::c(4));
     let mut lds = LdsPlan::new();
-    let kv = lds.ring("KV", SLOT_BYTES as i64, 3, Layout::Linear);
+    let kv = lds.ring("KV", layout.slot_bytes as i64, 3, Layout::Linear);
     let red = lds.tile("RED", 512, Layout::Linear);
     let pbuf = lds.tile("PBUF", 1024, Layout::Linear);
     let abuf = lds.tile("ABUF", 256, Layout::Linear);
@@ -96,6 +108,9 @@ pub fn mla_g1250_qh16() -> Function {
     let last = ld(&mut b, pltl, bo);
     let npages = b.bind_i32(ev(kv1) - ev(kv0));
     b.assume_trusted(npages, Ext::c(1), Ext::c(MAX_PAGES as i64), "host contract: every sequence has 1 .. 1024 pages (ctx <= 65536)");
+    b.assume_trusted(kv0, Ext::c(0), Ext::sym("NPG") - Ext::c(1), "host contract: LTP is monotone and LTP[B] <= NPG, the page table's entry count");
+    let kv_end = b.bind_i32(ev(kv0) + ev(npages));
+    b.assume_trusted(kv_end, Ext::c(1), Ext::sym("NPG"), "host contract: LTP[b + 1] <= NPG (a sequence's entries lie inside the page table)");
     b.assume_trusted(last, Ext::c(1), Ext::c(PAGE_TOKENS as i64), "host contract: the last page holds 1 .. 64 tokens");
     let full = b.add_i32(npages, Opnd::I32(-1));
     let ctx0 = b.let_(Op::ShlI32(Opnd::Val(full), Opnd::I32(6)));
@@ -121,24 +136,32 @@ pub fn mla_g1250_qh16() -> Function {
         })
         .collect();
     // one page = 576 rows x 64 bytes (contiguous); each wave loads a quarter (144 rows)
-    let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(1152), Opnd::I32(1)], stride0: Opnd::I32(1152), tile: [1152, 1], pad: Some((128, 4)), wg_mask: 0 };
+    let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(1152), Opnd::I32(1)], stride0: Opnd::I32(1152), tile: [1152, 1], pad: layout.pad, wg_mask: 0 };
     let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
     // loop-invariant lane offsets inside a page slot
-    let kofs = b.bind_i32((ev(w) * 16 + ev(m)) * LDS_ROW + ev(g) * 32);
-    let rrow = b.bind_i32(ev(w) * 16 + ev(m));
-    let rofs = b.bind_i32(ev(rrow) * 64 + ((ev(rrow) >> 3) << 4) + ev(g) * 32 + LDS_ROPE);
+    // lane bases as logical page offsets, mapped to the planned LDS layout (the quarter split: a quarter is a whole number of pad intervals)
+    let kofs = layout.at_expr(&mut b, (ev(w) * 16 + ev(m)) * DVB + ev(g) * 32);
+    let rofs = layout.at_expr(&mut b, (ev(w) * 16 + ev(m)) * 64 + ev(g) * 32 + ROPE_OFF);
     // V tr8: fetch lane f reads 8 dims at token 8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1) of a 16-token chunk, dims + 8 ((f >> 2) & 1)
-    let vofs = b.bind_i32((((ev(lane) >> 4) << 3) + (ev(lane) & 3) + (((ev(lane) >> 3) & 1) << 2)) * LDS_ROW + (((ev(lane) >> 2) & 1) << 3) + ev(w) * 128);
+    let vofs = layout.at_expr(&mut b, (((ev(lane) >> 4) << 3) + (ev(lane) & 3) + (((ev(lane) >> 3) & 1) << 2)) * DVB + (((ev(lane) >> 2) & 1) << 3) + ev(w) * 128);
+    // the constant parts' LDS deltas, checked uniform over every lane and wave base
+    let kbases: Vec<i32> = (0..128).map(|t| (t / 32 * 16 + (t & 15)) * DVB + ((t & 31) >> 4) * 32).collect();
+    let kdelta: Vec<i32> = (0..8).map(|c| layout.delta(&kbases, 64 * c)).collect();
+    let vbases: Vec<i32> = (0..128).map(|t| { let f = t & 31; (8 * (f >> 4) + (f & 3) + 4 * ((f >> 3) & 1)) * DVB + 8 * ((f >> 2) & 1) + (t / 32) * 128 }).collect();
+    let vdelta: Vec<i32> = (0..32).map(|i| layout.delta(&vbases, 16 * (i / 8) * DVB + 16 * (i % 8))).collect();
+    let _ = QUARTER;
     // the sequence's page ids into LDS: 128 per pass (indices clamped to the last page)
     let nch = b.bind_i32((ev(npages) + 127) >> 7);
     let k0 = b.c_i32(0);
     let lv = b.begin_loop(&[(DType::I32, Opnd::Val(k0))]);
     let kk = lv[0];
+    b.assume(kk, Ext::c(0), Ext::c((MAX_PAGES / 128 - 1) as i64));
     let idx = b.bind_i32(amdgpu_dsl::varx(kk) * 128 + ev(tid));
-    let last_i = b.bind_i32(ev(npages) - 1);
-    let lt = b.cmp(amdgpu_dsl::CmpPred::Lt, amdgpu_dsl::CmpTy::I32, idx, last_i);
-    let ci = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt), a: Opnd::Val(idx), b: Opnd::Val(last_i) });
-    let eo = b.bind_i32((ev(kv0) + ev(ci)) * 4);
+    // the entry kv0 + idx, clamped to the sequence's last entry (kv_end - 1 < NPG)
+    let e_raw = b.bind_i32(ev(kv0) + ev(idx));
+    let e_last = b.bind_i32(ev(kv_end) - 1);
+    let ci = b.let_(Op::MinI32(Opnd::Val(e_raw), Opnd::Val(e_last)));
+    let eo = b.bind_i32(ev(ci) * 4);
     let pv = ld_v(&mut b, pltd, eo);
     let sa = b.bind_i32(ev(idx) * 4 + ptab.base as i32);
     ptab.at(&amdgpu_tile::shared::SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).write(&mut b, |b| b.store_lds(sa, pv, MemTy::B32, false));
@@ -149,7 +172,7 @@ pub fn mla_g1250_qh16() -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
-    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, cscale, vars: Vec::new() };
+    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, vars: Vec::new() };
     let pipe = Pipeline::new(Cadence::OneWindow, npages, ctx, PAGE_TOKENS, Ext::c(1 << 16));
     pipe.run(&mut b, Role::All, &mut body);
     // drain the tensor data mover: the last steady iteration leaves one (clamped, re-staged) page load in flight. A tensor write that lands after

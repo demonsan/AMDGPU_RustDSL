@@ -25,12 +25,68 @@ pub const DV: i32 = 512;
 pub const PAGE_BYTES: i32 = PAGE_TOKENS * D;
 /// byte offset of the rope plane inside a page (global layout)
 pub const ROPE_OFF: i32 = PAGE_TOKENS * DV;
-/// LDS layout of a page: the TDM pads 16 bytes after every 512 (a nope row: row stride 528, so the 16 K rows a wave reads and the 8 token
-/// rows of a transposing V read hit distinct banks)
-pub const LDS_ROW: i32 = 528;
-pub const SLOT_BYTES: i32 = PAGE_BYTES / 512 * LDS_ROW;
-/// LDS offset of the rope plane (rope row r at LDS_ROPE + 64 r + 16 (r / 8))
-pub const LDS_ROPE: i32 = ROPE_OFF / 512 * LDS_ROW;
+/// bytes of a page one wave loads (a quarter)
+pub const QUARTER: i32 = PAGE_BYTES / 4;
+
+/// The LDS layout of a page slot: the TDM padding (`amdgpu_dsl::tdm_pad`) planned from the window's read patterns, so the K reads and the
+/// transposing V reads are bank-conflict free. Each wave's quarter is padded on its own (the padding restarts per tensor op), so the plan's
+/// interval must divide a quarter: then a logical page offset maps with one formula.
+#[derive(Clone, Copy, Debug)]
+pub struct PageLayout {
+    pub pad: Option<(u16, u16)>,
+    /// LDS bytes of a quarter / a slot
+    pub quarter_lds: i32,
+    pub slot_bytes: i32,
+}
+
+impl PageLayout {
+    pub fn plan() -> PageLayout {
+        use amdgpu_dsl::tdm_pad::{footprint, plan, LaneRead};
+        let mut reads = Vec::new();
+        // K (wave 0; the other waves differ by whole 512-byte rows): lane (m, g) reads 2 x 16 bytes at row m, 64 c + 32 g
+        for c in 0..8u32 {
+            for h in 0..2u32 {
+                reads.push(LaneRead { bytes: 16, lanes: (0..32u32).map(|l| Some((l & 15) * DV as u32 + 64 * c + 32 * (l >> 4) + 16 * h)).collect() });
+            }
+        }
+        // V: ds_load_tr8_b64, fetch lane f at token 8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1), dims 8 ((f >> 2) & 1) (+ 16 nt)
+        for nt in 0..8u32 {
+            reads.push(LaneRead {
+                bytes: 8,
+                lanes: (0..32u32).map(|f| Some((8 * (f >> 4) + (f & 3) + 4 * ((f >> 3) & 1)) * DV as u32 + 8 * ((f >> 2) & 1) + 16 * nt)).collect(),
+            });
+        }
+        let p = plan(QUARTER as u32, &reads);
+        if let Some((iv, _)) = p.pad {
+            assert!(QUARTER as u32 % (4 * iv as u32) == 0, "MLA page layout: pad interval {iv} dwords does not divide a quarter page");
+        }
+        let q = footprint(QUARTER as u32, p.pad) as i32;
+        PageLayout { pad: p.pad, quarter_lds: q, slot_bytes: 4 * q }
+    }
+    /// LDS offset (in the slot) of logical page offset `off` (a constant)
+    pub fn at(&self, off: i32) -> i32 {
+        amdgpu_dsl::tdm_pad::padded(off as u32, self.pad) as i32
+    }
+    /// LDS offset of a logical page offset expression: off + (off >> log2(4 interval)) * 4 amount
+    pub fn at_expr(&self, b: &mut FnBuilder, off: amdgpu_dsl::I32) -> ValueId {
+        match self.pad {
+            None => b.bind_i32(off),
+            Some((iv, am)) => {
+                let s = (4 * iv as u32).trailing_zeros() as i32;
+                b.bind_i32(off.clone() + ((off >> s) * (4 * am as i32)))
+            }
+        }
+    }
+    /// The LDS delta of adding the constant `k` to every lane base `bases` (logical offsets): the same for all lanes, or panics (the read
+    /// pattern would cross a padding boundary differently per lane).
+    pub fn delta(&self, bases: &[i32], k: i32) -> i32 {
+        let d = self.at(bases[0] + k) - self.at(bases[0]);
+        for &x in bases {
+            assert_eq!(self.at(x + k) - self.at(x), d, "MLA page layout: offset {k} crosses a padding boundary unevenly (base {x})");
+        }
+        d
+    }
+}
 
 pub struct MlaBody {
     /// the KV ring (one slot = one page)
@@ -55,10 +111,14 @@ pub struct MlaBody {
     /// Q fragments (B operand of S^T): 9 x Frag8, head m, dims 64 c + 32 g .. + 32 (the K order inside a WMMA is free as long as A and B
     /// agree: lane half g holds 32 contiguous bytes of each 64-byte chunk, two b128 reads)
     pub q: Vec<ValueId>,
-    /// lane offsets inside a slot (loop-invariant): K nope row (token 16 w + m, + 32 g), K rope row, the V tr8 fetch address of the wave's dims
+    /// lane offsets inside a slot (loop-invariant, LDS layout): K nope row (token 16 w + m, + 32 g), K rope row, the V tr8 fetch address of
+    /// the wave's dims; the LDS deltas of the constant parts (K chunk c; V chunk jj, tile nt: index 8 jj + nt), the page layout
     pub kofs: ValueId,
     pub rofs: ValueId,
     pub vofs: ValueId,
+    pub kdelta: Vec<i32>,
+    pub vdelta: Vec<i32>,
+    pub layout: PageLayout,
     /// qs * ks * softmax scale * log2(e)
     pub cscale: ValueId,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
@@ -79,10 +139,11 @@ impl PipeBody for MlaBody {
         let ta = b.bind_i32(((key0.clone() >> 6) << 2) + self.ptab.base as i32);
         let pidv = self.ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
         let pid = b.read_first_lane(pidv);
+        b.assume_trusted(pid, amdgpu_dsl::Ext::c(0), amdgpu_dsl::Ext::sym("P") - amdgpu_dsl::Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
         // each wave loads its quarter of the page (144 of the 576 rows of 64 bytes): one copy of the page per work-group
-        let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * (PAGE_BYTES / 4));
+        let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * QUARTER);
         let r = self.kv.at(slot);
-        let lds = b.bind_i32(r.base() + ev(self.w) * (SLOT_BYTES / 4));
+        let lds = b.bind_i32(r.base() + ev(self.w) * self.layout.quarter_lds);
         let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
         let g1 = self.g1;
         r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
@@ -125,7 +186,7 @@ impl PipeBody for MlaBody {
             // all nine K fragments first (distinct registers: the reads overlap), then the WMMA chain
             let fa: Vec<ValueId> = (0..9)
                 .map(|c| {
-                    let lo = if c < 8 { b.bind_i32(ev(nope_row) + 64 * c) } else { b.bind_i32(ev(rope_row)) };
+                    let lo = if c < 8 { b.bind_i32(ev(nope_row) + self.kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
                     let hi = b.bind_i32(ev(lo) + 16);
                     b.load_lds_b128x2(lo, hi)
                 })
@@ -220,12 +281,13 @@ impl PipeBody for MlaBody {
         // ---- O = alpha O + P V; wave w owns dims 128 w .. ; the V fragment by ds_load_tr8_b64 ----
         // fetch lane f reads 8 dims at token 8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1) of a 16-token chunk, dims + 8 ((f >> 2) & 1)
         let vrow = b.bind_i32(ev(sb) + ev(self.vofs));
+        let vd = self.vdelta.clone();
         let vars = self.vars.clone();
         kv.read(b, |b| {
             // all eight V fragments first, then the rescale + WMMA per tile
             let fvs: Vec<ValueId> = (0..8)
                 .map(|nt| {
-                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + (16 * jj * LDS_ROW + 16 * nt as i32))).collect();
+                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[8 * jj as usize + nt as usize])).collect();
                     b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
                 })
                 .collect();
