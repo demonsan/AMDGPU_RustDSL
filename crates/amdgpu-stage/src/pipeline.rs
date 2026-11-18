@@ -89,6 +89,14 @@ pub trait PipeBody {
     fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `RegStaged`: between the top-of-tile waits and the barrier (work that touches no LDS / VMEM, e.g. MMAs of the register tile)
     fn post_wait(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `OneWindow`: told right before every `stage` of the steady loop whether the tile it stages exists (`live`: the wave-uniform condition `t + slots - 1 < nkv`; false in the last `slots - 2`
+    /// iterations, whose stage re-reads the clamped last tile). A body may give such a stage an EMPTY extent (a tensor extent of zero rows: the transfer reads nothing, the markers and the
+    /// protocol stay unchanged) instead of re-reading the last tile; the default ignores it. The prologue's stages are always live.
+    fn stage_live(&mut self, _b: &mut FnBuilder, _live: ValueId) {}
+    /// Whether the body uses `stage_live` (the driver computes the condition only then: no cost, no IR change for the others).
+    fn wants_stage_live(&self) -> bool {
+        false
+    }
     /// `OneWindow`: the ring depth the driver runs with (`Pipeline::slots`), told to the body before anything is emitted: a body that waits for "all but the stages still in flight" needs it
     /// (`slots - 2` stages stay in flight at the end of a window).
     fn set_ring_depth(&mut self, _slots: u8) {}
@@ -532,9 +540,14 @@ impl Pipeline {
                 // rotated weave: the staging of tile t+2 and its completion run two iterations ahead (`iter` +2)
                 let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
                 let (lg, vm) = (self.lg(), self.vm_inflight);
+                let body_wants_live = body.wants_stage_live();
                 rotate(b, &ONE_WINDOW_PARTS, stage_sel, None, &mut |b, i| match i {
                     0 => {
                         let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << lg);
+                        if body_wants_live {
+                            let live = b.bind_cond(it_p2.lt(&nkv));
+                            body.stage_live(b, live);
+                        }
                         body.stage(b, role, &key_n2, &n2);
                     }
                     1 => body.window(b, role, &t),
