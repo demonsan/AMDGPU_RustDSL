@@ -140,6 +140,12 @@ impl PipeBody for TdmF4Body {
         }
     }
 
+    fn stage_complete_keep(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx, keep: u8) {
+        // tile 0 done, the `keep` later stages (this wave's tensor loads per stage each) still in flight
+        let per_stage = if self.roles { 2 } else { 4 };
+        b.wait_tensor(per_stage * keep);
+    }
+
     fn set_ring_depth(&mut self, slots: u8) {
         self.depth = slots;
     }

@@ -89,6 +89,11 @@ pub trait PipeBody {
     fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `RegStaged`: between the top-of-tile waits and the barrier (work that touches no LDS / VMEM, e.g. MMAs of the register tile)
     fn post_wait(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `OneWindow` with `Pipeline::lazy_prologue`: complete the prologue's tile 0 while the stages of the next `keep` tiles stay in flight (the tiles after it complete at the end of the first
+    /// window: the strict wait there covers them, the relaxed one leaves only the stage just issued). The default is the full completion (every tile), which is always safe.
+    fn stage_complete_keep(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx, _keep: u8) {
+        self.stage_complete(b, role, slot);
+    }
     /// `OneWindow`: told right before every `stage` of the steady loop whether the tile it stages exists (`live`: the wave-uniform condition `t + slots - 1 < nkv`; false in the last `slots - 2`
     /// iterations, whose stage re-reads the clamped last tile). A body may give such a stage an EMPTY extent (a tensor extent of zero rows: the transfer reads nothing, the markers and the
     /// protocol stay unchanged) instead of re-reading the last tile; the default ignores it. The prologue's stages are always live.
@@ -145,12 +150,15 @@ pub struct Pipeline {
     /// `OneWindow`: the ring depth (>= 3, default 3). The producer runs `slots - 1` tiles ahead: iteration t stages tile t + slots - 1 into the slot of tile t - 1, and the prologue stages tiles
     /// 0 .. slots - 2. The body's ring must have `slots` slots (a deeper ring hides more tensor-load latency: `slots - 2` windows). The slot index cycles modulo `slots`.
     pub slots: u8,
+    /// `OneWindow`: issue the prologue's stages back to back and wait only for tile 0 (`PipeBody::stage_complete_keep`): one serialized memory round trip fewer before the loop. The later
+    /// prologue tiles are completed by the end of the first window, which waits for everything older than the stage it issued.
+    pub lazy_prologue: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3 }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -184,12 +192,21 @@ impl Pipeline {
         // ---- prologue ----
         let s0 = SlotIdx::new(0, 0);
         body.stage(b, role, &I32::c(0), &s0);
-        if self.cadence != Cadence::RegStaged {
+        let lazy = self.lazy_prologue && self.cadence == Cadence::OneWindow;
+        if self.cadence != Cadence::RegStaged && !lazy {
             // (RegStaged bodies do not use stage_complete: tile 0 completes at the prologue wait, overlapped with the stores)
             b.wait_vm(0);
             body.stage_complete(b, role, &s0);
         }
-        if self.cadence == Cadence::OneWindow {
+        if lazy {
+            // tiles 1 .. slots - 2 issued back to back behind tile 0; only tile 0 is waited for here
+            for k in 1..(self.slots as i32 - 1) {
+                let key = b.let_i32(ev(self.nkv).gt(k).select_i32(k, ev(self.nkv) - 1) << self.lg());
+                body.stage(b, role, &key, &SlotIdx::new(k, k));
+            }
+            b.wait_vm(0);
+            body.stage_complete_keep(b, role, &s0, self.slots - 2);
+        } else if self.cadence == Cadence::OneWindow {
             // tiles 1 .. slots - 2 (each clamped to the last tile: a one-tile sequence re-stages tile 0 as generation k)
             for k in 1..(self.slots as i32 - 1) {
                 let key = b.let_i32(ev(self.nkv).gt(k).select_i32(k, ev(self.nkv) - 1) << self.lg());
