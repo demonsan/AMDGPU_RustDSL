@@ -3860,6 +3860,12 @@ impl FnBuilder {
         self.f.kd.push((format!("g5:signals_per_wg:{id}"), per_wg as i64));
     }
 
+    /// gfx1250 launch fact for the tile-protocol verifier: the outermost loop of this kernel is the TILE LOOP of a persistent kernel, whose body (the K pipeline and the epilogue) is self-contained:
+    /// the verifier simulates the body once and CHECKS that it ends quiescent (every tensor operation drained, a barrier after the last LDS access) instead of unrolling the loop.
+    pub fn persistent_tile_loop(&mut self) {
+        self.f.kd.push(("g5:persistent_tile_loop".to_string(), 1));
+    }
+
     /// gfx1250 launch fact for the hang-safety verifier: the tensor descriptors of this kernel are built by the HOST (kernarg words), so their global base and extent cannot be proved
     /// (GV-TDM-PROV / GV-GLB-*). A TRUSTED item, listed by `trusted_items`; for evidence / probe kernels only.
     pub fn tdm_host_descriptor(&mut self) {

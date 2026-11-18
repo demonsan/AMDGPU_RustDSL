@@ -139,8 +139,13 @@ fn matrix_accumulators(m: &MFunction) -> std::collections::HashSet<VReg> {
 
 fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     let r = allocate_policy_once(m, policy);
-    // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first
-    if r.is_err() && !WIDE_HIGH.with(|c| c.get()) && !low_window_values(m).is_empty() {
+    if let (Err(e), true) = (&r, std::env::var("AMDC_RA_PEAK").is_ok()) {
+        eprintln!("RA-FIRST-ATTEMPT {}: {}", m.name, e.chars().take(160).collect::<String>());
+    }
+    // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first (only for a
+    // VGPR failure: an SGPR shortage is not helped by moving vector tuples, it only spreads them)
+    let vgpr_failure = matches!(&r, Err(e) if !e.contains("out of SGPRs"));
+    if vgpr_failure && !WIDE_HIGH.with(|c| c.get()) && !low_window_values(m).is_empty() {
         WIDE_HIGH.with(|c| c.set(true));
         let r2 = allocate_policy_once(m, policy);
         WIDE_HIGH.with(|c| c.set(false));
@@ -333,6 +338,31 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         }
     }
     vregs.sort_by_key(|x| (x.0, x.1));
+    // (debug, `AMDC_RA_PEAK`: the VGPR values live at the point of the highest interval pressure, with their defining op and range)
+    if std::env::var("AMDC_RA_PEAK").is_ok() {
+        let span = vregs.iter().map(|x| x.1).max().unwrap_or(0) + 1;
+        let mut pr = vec![0usize; span + 1];
+        for (s, e, _, c) in &vregs {
+            for k in *s..=(*e).min(span) {
+                pr[k] += c.dwords() as usize;
+            }
+        }
+        let (at, peak) = pr.iter().enumerate().max_by_key(|x| *x.1).map(|(i, v)| (i, *v)).unwrap_or((0, 0));
+        let mut defop: HashMap<VReg, String> = HashMap::new();
+        for b in &m.blocks {
+            for i in &b.insts {
+                if let Some(d) = i.dst {
+                    defop.entry(m.canon(d)).or_insert_with(|| format!("{:?}", i.op));
+                }
+            }
+        }
+        eprintln!("RA-PEAK {}: {peak} VGPR dwords at {at}", m.name);
+        let mut live: Vec<_> = vregs.iter().filter(|(s, e, _, _)| *s <= at && at <= *e).collect();
+        live.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), x.0));
+        for (s, e, r, c) in live {
+            eprintln!("RA-PEAK   r{r} {c:?} {s}..{e} def {}", defop.get(r).map(|x| x.as_str()).unwrap_or("-"));
+        }
+    }
     let low_only = low_window_values(m);
     let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
     // the window plan of the retry: wide tuples above v255; with `AMDC_ACCWIN` only the matrix accumulators (D / C of the matrix ops), so a
@@ -361,6 +391,20 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         let mut order: Vec<(usize, usize, VReg, RClass)> = vregs.clone();
         // pinned values first (their registers are fixed: placing them before the free values keeps the pin honourable), then wide tuples
         order.sort_by_key(|x| (plan.pin(x.2).is_none(), std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
+        // gfx1250 (`AMDC_RA_FIRSTFIT` for the old rule): the unpinned single dwords are packed after every tuple by start time, each into the
+        // register whose earlier occupancy ends closest before it (best fit), the interval-graph order that leaves the fewest unusable holes
+        // around the fixed tuples; first fit by length could leave no register free for a long single although the peak is far below the
+        // file (256x256 ks2 persistent: 806 live dwords of 1024)
+        let best_fit = crate::target::cur().name == "gfx1250" && std::env::var("AMDC_RA_FIRSTFIT").is_err();
+        let mut singles: Vec<(usize, usize, VReg, RClass)> = Vec::new();
+        if best_fit {
+            let (rest, s1): (Vec<_>, Vec<_>) = order.into_iter().partition(|x| x.3.dwords() > 1 || plan.pin(x.2).is_some() || low_only.contains(&x.2));
+            order = rest;
+            singles = s1;
+            singles.sort_by_key(|x| (x.0, x.1));
+            // the values that must sit below v256 (the WMMA scale operands) before the tuples, which would otherwise fill the low window
+            order.sort_by_key(|x| (plan.pin(x.2).is_none(), !low_only.contains(&x.2), std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
+        }
         for (s, e, r, c) in order {
             let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
@@ -445,6 +489,36 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             }
             phys[r as usize] = slot as u32;
             max_v = max_v.max(slot + width);
+        }
+        for (s, e, r, _c) in singles {
+            let my: Vec<(usize, usize)> = match slot_segs.get(r as usize * 16) {
+                Some(sg) if m.ra_dword && !segs[r as usize].is_empty() => sg.clone(),
+                _ if segs[r as usize].is_empty() => vec![(s, e)],
+                _ => segs[r as usize].clone(),
+            };
+            let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
+            let mut best: Option<(usize, usize)> = None; // (slack, register)
+            for i in V_RESERVED..vgpr_count() {
+                if forbid[i] || !occ[i].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os)) {
+                    continue;
+                }
+                // slack: the gap since the register's last occupancy before this value (a never-used register counts as the worst fit, so
+                // used registers are reused first and the file stays compact)
+                let prev = occ[i].iter().filter(|(_, oe)| *oe < s).map(|(_, oe)| *oe).max();
+                let slack = match prev {
+                    Some(pe) => s - pe,
+                    None => usize::MAX / 2 + i,
+                };
+                if best.map_or(true, |(bs, _)| slack < bs) {
+                    best = Some((slack, i));
+                }
+            }
+            let Some((_, slot)) = best else {
+                return Err(format!("out of VGPRs allocating r{r} (V1, live {s}..{e}) in the two-phase packing (best fit)"));
+            };
+            occ[slot].extend(my.iter().copied());
+            phys[r as usize] = slot as u32;
+            max_v = max_v.max(slot + 1);
         }
         for (i, o) in occ.iter().enumerate() {
             if !o.is_empty() {
