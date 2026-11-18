@@ -111,6 +111,18 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
 | **timestamp profile (`shader_cycles`) -> the cross-wave merge's LDS addresses hoisted (DS offset field)** | **-10 .. -48 %** | the merge's 256 stores per lane recomputed their addresses with `v_mul_lo_u32`: 1551 -> 290 instructions; the merge was 41 % of a one-page kernel |
 | scalar loads for the sequence bounds / scales / page ids (no LDS page table, no prologue barrier); full page pairs + an odd tail page | -3 .. -8 % | a shorter dependent prologue; no masked pad page |
 
+### Profiling inside a kernel: shader-clock stamps
+
+`FnBuilder::shader_cycles()` reads the 64-bit shader-clock counter (`s_get_shader_cycles_u64`; `s_getreg` of the older SHADER_CYCLES
+register reads 0 on this architecture). A debug variant stores one wave's stamps at chosen checkpoints over an output it does not need
+(the MLA's `mla_g1250_qh16_wsstd` writes wave 0's stamps over the LSE; `g1250_mla_host` prints them with `PRINT_LSE=1`). The stamps give
+the phase split of one work-group (prologue, page loop, cross-wave merge, final reduce); at one page the merge was 41 % of the kernel,
+which no instruction count of the loop had pointed to. The variant stays out of the registry (its timing instruction has no in-process
+encoding yet) and is built on demand.
+
+Two more debugging aids in the same host: `DUMP=<file>` writes the raw output (to diff two kernels element by element; it located the
+I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which (head, 16-dim tile) blocks exceed the tolerance.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
@@ -132,8 +144,8 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
   window-aware placement of accumulators vs streamed operands (back end).
 - **Single-wave scheduling**: with one wave per SIMD, the remaining MLA gap is latency inside a wave (softmax VALU / TRANS against the
   WMMAs); in progress in the back end: an instruction-level software pipeline of page i's softmax under page i - 1's PV WMMAs.
-- **Short sequences** (MLA at small B x ctx: 1.8 - 2 x the vendor): a wave's pages run back to back, plus a fixed prologue chain
-  (sequence bounds -> page table -> first tensor load).
+- **Short sequences** (MLA 1.34 x the vendor at 4 x 1000, 2.7 x at 1 x 64): per the stamps, one page on one wave (~55 % of a one-page
+  kernel) and the final cross-wave reduce (~25 %); next step: exchange the wave maxima first so each wave stores its O already scaled.
 - **Workgroup ids in a cluster launch**: the lowering of the workgroup-id ops reads TTMP9 / TTMP7, which hold the cluster ids in a
   cluster launch; cluster kernels compute their tile ids by hand (TTMP6 position + cluster id x dims). Planned: lower them that way when
   the kernel declares cluster dims, or reject the plain op there.
