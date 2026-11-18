@@ -177,6 +177,9 @@ def parse(path):
         args = [f's{108 + int(x[4:])}' if re.fullmatch(r'ttmp\d+', x) else x for x in args]
         # wave32: the lane mask is one register; the lifter's mask model names it vcc / exec (the emitter writes vcc_lo / exec_lo)
         args = [{'vcc_lo': 'vcc', 'exec_lo': 'exec'}.get(x, x) for x in args]
+        # a buffer access's NULL soffset is the value 0 (the author's words keep its encoding)
+        if op.startswith('buffer_'):
+            args = ['0' if x == 'null' else x for x in args]
         # (branches carry their target label only: the CFG reads it)
         text = '' if op in BRANCHES else r.get('text', '')
         if text and '--raw-text' not in sys.argv:
