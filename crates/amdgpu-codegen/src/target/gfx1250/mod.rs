@@ -5,6 +5,7 @@
 use amdgpu_dsl::Function;
 
 pub mod check;
+pub mod cse;
 pub mod emit;
 pub mod hazards;
 pub mod matorder;

@@ -298,6 +298,11 @@ fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
             eprintln!("bweave {}: {fell_back} interleave hint(s) kept their order (a dependence forbids the merge)", cx.f.name);
         }
     }
+    // gfx1250: value numbering of the per-load address arithmetic (target/gfx1250/cse.rs; off with AMDC_NO_CSE for A/B)
+    if crate::target::cur().name == "gfx1250" && !s.m.exact && std::env::var("AMDC_NO_CSE").is_err() {
+        crate::target::gfx1250::cse::fold_zero_adds(&mut s.m);
+        crate::target::gfx1250::cse::cse(&mut s.m);
+    }
     // gfx1250, opt-in (token matorder; measured neutral on the MXFP4 kernel, whose bound is the per-iteration tensor drain): each matrix op's operand loads right before it (target/gfx1250/matorder.rs); the lowering's automatic waits are recomputed
     // for the new order (on the scheduled path they are already stripped and recomputed after the list scheduler)
     if crate::target::cur().name == "gfx1250" && !s.m.exact && (cx.f.lower_opts.iter().any(|o| o == "matorder") || std::env::var("AMDC_MATORDER").is_ok()) && std::env::var("AMDC_NO_MATORDER").is_err() {
