@@ -399,7 +399,10 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // the planner's TDM row padding by default for ks >= 2 (conflict-free fragment reads; a08-1 at 4096^3: 256x256 ks2 2.79 -> 5.17 PF/s,
     // 128x128 ks2 1.57 -> 3.75, 128x64 ks2 1.52 -> 2.26; the ks = 1 kernels measured flat (0.97 / 1.62 vs 0.99 / 1.64) and stay unpadded);
     // `gemm_tdm_stage_f4_opts(.., pad = false)` keeps the unpadded layout (`_nopad` kernel) for A/B
-    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, sh.ks >= 2)
+    // and the C epilogue through LDS + one tensor store per wave for the f32, non-cluster kernels (256x256 ks2: +22 % at 4096^3, +27 % at
+    // 8192^3, a08-1); `_256x256_ks2_epi(.., 0)` / RingOpts::epilogue_lds = 0 keep the direct stores
+    let epi = if !sh.bf16 && sh.cx * sh.cy == 1 { 2 } else { 0 };
+    gemm_tdm_stage_f4_ring(name, sh, coop, grouped, false, sh.ks >= 2, RingOpts { epilogue_lds: epi, ..RingOpts::default() })
 }
 
 pub const F4_256X256_KS2_PERSIST: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_persist";
