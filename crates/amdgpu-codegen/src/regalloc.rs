@@ -402,6 +402,8 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             order = rest;
             singles = s1;
             singles.sort_by_key(|x| (x.0, x.1));
+            // the values that must sit below v256 (the WMMA scale operands) before the tuples, which would otherwise fill the low window
+            order.sort_by_key(|x| (plan.pin(x.2).is_none(), !low_only.contains(&x.2), std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
         }
         for (s, e, r, c) in order {
             let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
