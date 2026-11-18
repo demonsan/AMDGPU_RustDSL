@@ -46,6 +46,22 @@ def main():
     sites = []   # (index of the v_nop, class)
     i = 0
     while i < len(L):
+        if TRANS.match(L[i]) and i + 1 < len(L) and L[i + 1].strip() != 'v_nop':
+            # a TRANS whose reader is further away: give it a v_nop (the reference) when its first reader can be moved up
+            _, td0, ts0 = split(L[i])
+            mid0 = []
+            for j0 in range(i + 1, min(len(L), i + 15)):
+                s0 = L[j0].strip()
+                if not s0.startswith('v_') or s0.startswith('v_nop'):
+                    break
+                mn0, d0, sr0 = split(L[j0])
+                if sr0 & td0:
+                    if all(not (sr0 & md) and not (d0 & (ms | md)) for (_, md, ms) in mid0) and not (d0 & ts0):
+                        L.insert(i + 1, '    v_nop')
+                    break
+                if d0 & td0:
+                    break
+                mid0.append((mn0, d0, sr0))
         if TRANS.match(L[i]) and i + 1 < len(L) and L[i + 1].strip() == 'v_nop':
             tmn, td, ts = split(L[i])
             # the first reader of the TRANS result within the next 14 instructions (same block)
