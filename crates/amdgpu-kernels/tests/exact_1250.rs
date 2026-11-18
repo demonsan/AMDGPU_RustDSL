@@ -217,5 +217,4 @@ fn two_materialised_booleans_stay_distinct() {
     let mats: Vec<String> = asm.lines().filter(|l| l.contains("v_cndmask_b32") && l.contains(", 0, ")).filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
     let distinct: std::collections::HashSet<&String> = mats.iter().collect();
     assert!(distinct.len() >= 2, "two booleans, one materialisation: {mats:?}\n{asm}");
-}\n{asm}");
 }
