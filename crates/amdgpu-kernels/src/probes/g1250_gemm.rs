@@ -455,6 +455,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epi_opts(name: &str, epi: u8, relax: bool, 
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
 }
 
+/// The best 256 x 256 kernel with the tile-order swizzle (host SWIZZLE=G, G = `swizzle` tile rows per group).
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_swz(name: &str, relax: bool, roles: bool, swizzle: u8) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, swizzle, ..RingOpts::default() })
+}
+
 /// The padded 256 x 256 kernel with the TDM-store epilogue in a cluster of `cx` x `cy` workgroups, lockstep (one cluster barrier per K tile).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_cluster(name: &str, cx: i32, cy: i32) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { epilogue_lds: 2, ..RingOpts::default() })
@@ -504,11 +509,15 @@ pub struct RingOpts {
     /// into the dead ring (`ds_store_b32`, rows padded by 16 bytes), then reads rows back as b128 and stores them with `global_store_b128`
     /// (512 coalesced bytes per instruction); 2 = the same staging, then one `tensor_store_from_lds` per wave
     pub epilogue_lds: u8,
+    /// tile order: the workgroup's linear tile id (row-major, the hardware dispatch order) is remapped so that the workgroups running together cover a block of `swizzle` tile rows x all tile
+    /// columns in column-major order inside the block (0 = off): the A rows and B columns of concurrently running workgroups overlap, so the L2 serves them instead of DRAM. Host contract: tile
+    /// columns N / BN a power of two (kernarg `lgx` @52 = its log2), tile rows a multiple of `swizzle` (a power of two)
+    pub swizzle: u8,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0 }
     }
 }
 
@@ -636,6 +645,30 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         persist_var = Some(vy);
         let gy = b.let_(Op::AddI32(Opnd::Var(vy), Opnd::I32(0)));
         b.assume_trusted(gy, Ext::c(0), Ext::sym("TY") - Ext::c(1), "persistent launch: the loop runs while the tile row < TY (the first row w >> lg_tiles_x < TY: at most TX * TY workgroups)");
+        (gx, gy, gx, gy)
+    } else if ring.swizzle > 0 {
+        assert!(ring.swizzle.is_power_of_two(), "the swizzle group (tile rows) a power of two");
+        let lgg = ring.swizzle.trailing_zeros() as i32;
+        b.arg("lgx", DType::I32, 52, 4);
+        let gx0 = b.let_(Op::WorkgroupIdX);
+        let gy0 = b.let_(Op::WorkgroupIdY);
+        let lgx = b.let_(Op::KernargI32 { offset: 52 });
+        let one = b.c_i32(1);
+        let tx = b.let_(Op::ShlI32(Opnd::Val(one), Opnd::Val(lgx)));
+        let lin0 = b.mul_i32(gy0, tx);
+        let lin = b.add_i32(lin0, gx0);
+        let span_lg = b.add_i32(lgx, Opnd::I32(lgg));
+        let span = b.let_(Op::ShlI32(Opnd::Val(one), Opnd::Val(span_lg)));
+        let spm = b.add_i32(span, Opnd::I32(-1));
+        let grp = b.let_(Op::LshrI32(Opnd::Val(lin), Opnd::Val(span_lg)));
+        let r = b.let_(Op::AndI32(Opnd::Val(lin), Opnd::Val(spm)));
+        let rg = b.let_(Op::AndI32(Opnd::Val(r), Opnd::I32(ring.swizzle as i32 - 1)));
+        let rowbase = b.let_(Op::ShlI32(Opnd::Val(grp), Opnd::I32(lgg)));
+        let gy = b.add_i32(rowbase, rg);
+        let gx = b.let_(Op::LshrI32(Opnd::Val(r), Opnd::I32(lgg)));
+        // a permutation of the grid's tiles (host contract: the grid is N / BN = 2^lgx tile columns by a multiple of `swizzle` tile rows): the remapped tile lies inside the grid
+        b.assume_trusted(gx, Ext::c(0), Ext::grid_x() - Ext::c(1), "tile swizzle: a permutation of the grid's tiles (tile columns = 2^lgx, tile rows a multiple of the group)");
+        b.assume_trusted(gy, Ext::c(0), Ext::grid_y() - Ext::c(1), "tile swizzle: a permutation of the grid's tiles (tile columns = 2^lgx, tile rows a multiple of the group)");
         (gx, gy, gx, gy)
     } else {
         let gx = b.let_(Op::WorkgroupIdX);
