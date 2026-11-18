@@ -23,16 +23,21 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
-    mla_ws_with(MLA_WS_NAME, false)
+    mla_ws_with(MLA_WS_NAME, false, false)
+}
+
+/// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
+pub fn mla_g1250_qh16_wsb() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsb", false, true)
 }
 
 /// The wave-split MLA with the V dims split as well: wave pair q = w / 2 takes pages q, q + 2, ..; the pair's two waves compute the same
 /// S / softmax and own 256 V dims each (16 accumulators: O fits in 128 VGPRs).
 pub fn mla_g1250_qh16_wsd() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsd", true)
+    mla_ws_with("mla_g1250_qh16_wsd", true, false)
 }
 
-fn mla_ws_with(name: &str, dsplit: bool) -> Function {
+fn mla_ws_with(name: &str, dsplit: bool, branchless: bool) -> Function {
     let ntw: usize = if dsplit { NT / 2 } else { NT };
     let ngrp: i32 = if dsplit { 2 } else { 4 };
     let layout = PageLayout::plan();
@@ -233,8 +238,11 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
         let one = b.c_i32(1);
         let okv0: Vec<ValueId> = (0..32).map(|_| b.cmp(CmpPred::Eq, CmpTy::I32, one, Opnd::I32(1))).collect();
         let okvars = b.declare_vars(&okv0.iter().map(|&v| (DType::I1, Opnd::Val(v))).collect::<Vec<_>>());
+        // the mask: a uniform branch around it (only a page reaching past ctx), or branch-free (select on every page)
         let partial = b.cmp(CmpPred::Lt, CmpTy::I32, tok_lim, Opnd::I32(64));
-        b.begin_if(partial);
+        if !branchless {
+            b.begin_if(partial);
+        }
         for j in 0..4 {
             for r in 0..8u8 {
                 let k = 8 * j + r as usize;
@@ -245,7 +253,9 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 b.set_var(okvars[k], Opnd::Val(ok));
             }
         }
-        b.end_if();
+        if !branchless {
+            b.end_if();
+        }
         let x: Vec<Opnd> = xv.iter().map(|&v| Opnd::Var(v)).collect();
         let mut mx = b.max_f32(x[0], x[1]);
         for r in 2..32 {
@@ -277,7 +287,10 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
         // lazy rescale of O: the alpha of row 8 g + r through the wave's private hop
         let grew = b.cmp(CmpPred::Lt, CmpTy::F32, alpha, Opnd::F32(1.0));
         let any = b.let_(Op::AnyLane(Opnd::Val(grew)));
-        b.begin_if(any);
+        // lazy (only when some head's max grew: a uniform branch) or branch-free (every page)
+        if !branchless {
+            b.begin_if(any);
+        }
         // the alpha of row 8 g + r: lane 8 g + r holds head 8 g + r (v_readlane, then the lane half's choice)
         let sa: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(alpha, h)).collect();
         let g0c = b.cmp(CmpPred::Eq, CmpTy::I32, g, Opnd::I32(0));
@@ -293,7 +306,9 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
         }
-        b.end_if();
+        if !branchless {
+            b.end_if();
+        }
         // PV: 32 dim tiles, V fragments in groups of 4
         mine.read_back(b, gen, |b| {
             // V fragments one group of 4 tiles ahead of the WMMAs that use them
