@@ -48,7 +48,6 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         "mla_g1250_qh16_wsb" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wsb()),
         "mla_g1250_qh16_wss" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wss()),
         "mla_g1250_qh16_wsst" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wsst()),
-        "mla_g1250_qh16_wsstd" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wsstd()),
         "mla_g1250_qh16_wssp" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wssp()),
         "mla_g1250_qh16_wsk" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_wsk()),
         "mla_g1250_qh16_cmb" => Some(crate::probes::g1250_mla_ws::mla_g1250_qh16_cmb()),
