@@ -12,7 +12,7 @@ for k in ${NAMES:-gemm_g1250_tdm_stage_f4_256x256_ks2 gemm_g1250_tdm_stage_f4_25
   case $k in *_c2x2) cl=2,2;; *_c2x1) cl=2,1;; *_c1x2) cl=1,2;; *_c4x4) cl=4,4;; *) cl=1,1;; esac
   case $k in *256x256*) bm=256; bn=256;; *) bm=128; bn=128;; esac
   cx=${cl%,*}; cy=${cl#*,}
-  kdc=$($A print-ir $k 2>/dev/null | grep -m1 '^kd "cluster_dims"' | awk '{print $3}'); [ "${kdc:-0}" = "$((cx*cy))" ] || { echo "[$k] REFUSED: kd cluster_dims=${kdc:-none}, launch $cl"; continue; }
+  kdc=$($A print-ir $k 2>/dev/null | grep -m1 '^kd "cluster_dims"' | awk '{print $3}'); [ "${kdc:-0}" = "$((cx*cy))" ] || { [ "$((cx*cy))" = 1 ] && [ -z "$kdc" ] && kdc=1; } || { echo "[$k] REFUSED: kd cluster_dims=${kdc:-none}, launch $cl"; continue; }
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -2 $O/$k.log; continue; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s || continue
   echo "== $k cluster $cl  $(grep -m1 amdhsa_group_segment_fixed_size $O/$k.s | tr -s ' ')  $(grep -m1 vgpr_count $O/$k.s | tr -d ' ')  tensor_loads=$(grep -c tensor_load_to_lds $O/$k.s) cluster_signals=$(grep -c 's_barrier_signal -3' $O/$k.s)"

@@ -2416,6 +2416,23 @@ impl FnBuilder {
         self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
     }
 
+    /// A PAGED buffer (a KV cache addressed through a page table): the buffer holds `pages_sym` pages of `page_bytes` bytes, where `pages_sym` is a free symbol (the pool's page count, not a kernarg)
+    /// with the declared range 1 ..= `max_pages`. The extent is `pages_sym x page_bytes`; the bounds proof of a tile at `index x page_bytes + offset` then needs the host contract of
+    /// `page_index_below` on the loaded index.
+    #[track_caller]
+    pub fn arg_tensor_paged(&mut self, name: &str, pages_sym: &str, page_bytes: i64, max_pages: i64) {
+        self.sym_range(pages_sym, 1, max_pages);
+        self.arg_tensor(name, Ext::sym(pages_sym) * Ext::c(page_bytes));
+    }
+
+    /// The host contract of a paged buffer: the page index `idx` (loaded from a page table) is below the pool's page count `pages_sym` (`arg_tensor_paged`). A TRUSTED, counted and listed fact: the
+    /// host validate must check every table entry (like the slot mapping of the gfx950 paged kernels).
+    #[track_caller]
+    pub fn page_index_below(&mut self, idx: impl Into<Opnd>, pages_sym: &str) {
+        let reason = format!("host contract: every page index loaded here is below the pool's page count `{pages_sym}` (checked by the host's validate)");
+        self.assume_trusted(idx, Ext::c(0), Ext::sym(pages_sym) - Ext::c(1), &reason);
+    }
+
     #[track_caller]
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
         self.f.args.push(Arg { name: name.to_string(), ty, kernarg_offset: offset, size });
