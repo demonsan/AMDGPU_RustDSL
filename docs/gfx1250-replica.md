@@ -231,3 +231,32 @@ What moved it, which is also the compiler / template gap list for MLA:
    instruction count. 43 `v_add_nc_u32` per tile are addresses the compiler does not fold into the DS offset field (the multi-address
    `tr8 x4` / `b128 x2` reads); no software pipelining across tiles (the vendor's loop body covers about 12 pages); a fixed prologue of
    dependent global loads (sequence bounds, page table) that costs about 4 µs at B = 1.
+
+### 9.1 Wave-split variant (`mla_g1250_qh16_ws`)
+
+The first kernel's limiter turned out to be the per-tile cross-wave synchronisation (two barriers, the max / P exchanges): a deeper ring
+(`Pipeline::slots` 4) changed nothing, a cross-tile prefetch window gave -2 %, async per-lane KV loads were 30 % slower than the TDM. So the
+wave-split variant removes the synchronisation instead (flash-decoding inside the work-group):
+
+- wave w takes pages w, w + 4, .. (its own trip count `ceil((npages - w) / 4)`, in pairs; a wave without a page skips the loop) through its own
+  private 2-slot ring (`lds.private`, one TDM per page): no barrier and no cross-wave LDS traffic in the loop;
+- S for a page = 4 WMMA tiles of 16 tokens; their lane layout is the A fragment of P for the page's 64 tokens, so P never leaves the
+  registers; the 4 S chains are interleaved chunk by chunk (independent accumulators: the WMMA and LDS latencies overlap);
+- the row maximum across the two lane halves with `v_permlane16_swap`; the rescale factor of the O rows (heads 8 g + r) by `v_readlane`;
+  O over all 512 dims per wave (32 accumulators, 560 VGPRs with the MSB windows); V fragments one group of 4 tiles ahead of their WMMAs;
+- the token mask only on a page reaching past ctx (a uniform, VALU-only branch);
+- one barrier and an LDS merge of the four (max, sum, O) partials over the dead rings at the end.
+
+Paired on MI450 (a08-1), all MLA_OK with the same error as the vendor:
+
+| B x ctx | ws (µs) | ws / first kernel | ws / vendor |
+|---|---|---|---|
+| 4 x 1000 | 18.0 | 1.17 | 1.98 |
+| 32 x 2048 | 23.0 | 0.96 | 1.82 |
+| 128 x 4096 | 38.7 | 0.83 | **1.14** |
+| 128 x 8192 | 62.5 | 0.75 | **1.23** |
+| 512 x 8192 | 172.9 | 0.84 | **1.14** |
+
+Short sequences stay slower: a wave's pages run back to back with one wave per SIMD, so the per-page latency is exposed. The loop now
+spends 3 `s_set_vgpr_msb` per WMMA (the accumulators are spread over the 1024-VGPR banks: an allocator item) and about 12 VALU per WMMA.
+
