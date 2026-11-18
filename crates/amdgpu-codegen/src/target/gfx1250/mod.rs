@@ -57,6 +57,14 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     if !errs.is_empty() {
         return Err(format!("{}: tile protocol: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
     }
+    // the compiler's waits, checked with the gfx1250 counters themselves (independent of the shared pass's model)
+    if backend == "own" && !m.exact {
+        let plan = waits::plan(&m, &alloc);
+        let errs = check::verify_planned(&m, &alloc, &plan);
+        if !errs.is_empty() {
+            return Err(format!("{}: gfx1250 wait self-check: {} missing wait(s) in the compiler's own output\n  {}", f.name, errs.len(), errs.join("\n  ")));
+        }
+    }
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {
