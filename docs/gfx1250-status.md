@@ -64,18 +64,22 @@ reference, error equal to the vendor's):
 **MXFP4 GEMM** (all bit-exact against the CPU reference; ours f32 output with natural row-major A / B / scales, the vendor's bf16
 output with preshuffled B, 4 x 4 cluster, persistent grid):
 
-| kernel | 4096^3 PF/s | 8192^3 PF/s |
-|---|---|---|
-| `gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles` (256 x 256, 4 waves, ks 2, TDM row padding, LDS-staged epilogue with a tensor store, wave roles) | **6.24** | 8.39 |
-| `..._256x256_ks2_epit_roles_relax` (the same, tensor wait relaxed to the next tile only) | 5.31 | **9.20** |
-| vendor MXFP4 GEMM | 11.1 | 12.9 |
+| kernel | 4096^3 PF/s | 8192^3 PF/s | 8192 x 8192 x 16384 PF/s |
+|---|---|---|---|
+| `gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles` (256 x 256, 4 waves, ks 2, TDM row padding, LDS-staged epilogue with a tensor store, wave roles) | **6.25** | 8.47 | 8.33 |
+| `..._256x256_ks2_epit_roles_relax` (the same, tensor wait relaxed to the next tile only) | 5.34 | **9.27** | **10.0** |
+| vendor MXFP4 GEMM | 11.1 | 12.9 | |
 
-That is about 56 % of the vendor at 4096^3 and 71 % at 8192^3. Progression at 8192^3: 0.98 (first stage-template kernel, 128 x 64) ->
-1.37 (cooperative loads) -> 2.44 (two K sub-steps per slot) -> 3.3 (256 x 256 tile) -> 6.7 (TDM row padding: 8-way LDS bank conflicts
-removed) -> 8.1 (LDS-staged epilogue with a tensor store) -> 9.2 (wave roles + relaxed wait). Did not help: cluster multicast on the
-unpadded tile (-7 .. -15 %: identical requests rendezvous; not re-measured on the padded kernel), preshuffled scales, a 4-slot ring, the
-persistent grid alone (+1 .. 2 %), the relaxed wait at 4096^3 (-15 %: a longer exposed prologue wait). A deletion profile puts the time in
-the tensor transfers and the work-group barriers, not in the WMMAs. Details: [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md).
+That is about 56 % of the vendor at 4096^3, 72 % at 8192^3 and 78 % of the vendor's 8192^3 rate at K = 16384. **Dispatch rule** (the
+relaxed wait's benefit depends irregularly on K; measured table in [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md)): the
+relaxed kernel for K <= 3584 or K >= 5120, the plain `epit_roles` for 3840 <= K <= 4608. Progression at 8192^3: 0.98 (first stage-template
+kernel, 128 x 64) -> 1.37 (cooperative loads) -> 2.44 (two K sub-steps per slot) -> 3.3 (256 x 256 tile) -> 6.7 (TDM row padding: 8-way
+LDS bank conflicts removed) -> 8.1 (LDS-staged epilogue with a tensor store) -> 9.3 (wave roles + relaxed wait). Did not help (all
+measured, opt-in or dropped): cluster multicast, free-running or in lockstep, 2 x 2 and 4 x 4, on the unpadded tile (-7 .. -15 %) and on
+the padded LDS-epilogue tile (-11 .. -22 %); the preshuffled scale layout (alone and composed); a 4-slot ring; a tile-order swizzle; the
+persistent grid (+0.5 % at best on the best kernel; a cross-tile overlap cannot fit beside the LDS-staged epilogue, which needs 264 of the
+320 KiB). A deletion profile of the padded kernel before the epilogue work put the time in the tensor transfers and the work-group barriers,
+not in the WMMAs. Details: [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md).
 
 ## 5. Optimisation log (MLA; what helped, what did not, and why)
 
@@ -126,6 +130,6 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
 - **Workgroup ids in a cluster launch**: the lowering of the workgroup-id ops reads TTMP9 / TTMP7, which hold the cluster ids in a
   cluster launch; cluster kernels compute their tile ids by hand (TTMP6 position + cluster id x dims). Planned: lower them that way when
   the kernel declares cluster dims, or reject the plain op there.
-- **MXFP4 GEMM**: the C epilogue is solved (LDS staging + one tensor store per wave is the default). Open: the per-operation tensor cost
-  (wave roles, the scale layout), the cross-tile overlap of the persistent loop (persistence alone measured +-1 %), multicast on the
-  padded kernel (not yet re-measured), the relaxed wait's longer prologue at short K.
+- **MXFP4 GEMM**: the C epilogue is solved (LDS staging + one tensor store per wave) and the remaining gap to the vendor (about 22 - 44 %
+  depending on the shape) is in the tensor transfers and the barrier coupling; the K dependence of the relaxed wait (above) is unexplained
+  (not a power-of-two stride, not tile order). Tried and dropped: multicast, scale layout, deeper ring, persistence.
