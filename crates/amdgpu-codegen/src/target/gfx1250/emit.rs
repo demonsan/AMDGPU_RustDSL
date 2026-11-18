@@ -809,12 +809,9 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
     };
-    // v_cvt_pk_fp8_f32 writes a 16-bit half of its destination on gfx1250 (true16): `vD.l` (word_sel 0) / `vD.h` (op_sel:[0,0,1])
-    if mn == "v_cvt_pk_fp8_f32" && !rest.contains(".l") && !rest.contains(".h") {
-        if let Some((d, srcs)) = rest.split_once(", ") {
-            let hi = srcs.contains("op_sel:[0,0,1]");
-            return Ok(vec![format!("v_cvt_pk_fp8_f32 {d}.{}, {srcs}", if hi { "h" } else { "l" })]);
-        }
+    // v_cvt_pk_fp8_f32 (a 16-bit half write: op_sel:[0,0,1] = the high half) keeps the 32-bit operand spelling the assembler accepts
+    if mn == "v_cvt_pk_fp8_f32" {
+        return Ok(vec![line.to_string()]);
     }
     // a 64-bit lane mask is a 32-bit one on wave32: vcc -> vcc_lo, exec -> exec_lo
     let wave32 = |s: &str| -> String {
