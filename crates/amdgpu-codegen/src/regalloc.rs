@@ -77,7 +77,52 @@ enum Policy {
     TwoPhase,
 }
 
+thread_local! {
+    /// gfx1250 retry: wide tuples (accumulators) first above v255, so the low window stays free for the operands that must be in v0..v255
+    static WIDE_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// gfx1250: the VGPR values an instruction reads WITHOUT the VGPR MSBs, so they must sit in v0..v255 (CDNA5 ISA section 3.3.2.3, section 7.12.6:
+/// the scale sources of `v_wmma_scale*`; LLVM `VCSrc_b32_Lo256`): the last two register sources of the scaled WMMA MOps (their tuple roots).
+fn low_window_values(m: &MFunction) -> std::collections::HashSet<VReg> {
+    let mut s = std::collections::HashSet::new();
+    if crate::target::cur().name != "gfx1250" {
+        return s;
+    }
+    let root = |mut r: VReg| {
+        while let Some(&(u, _)) = m.alias.get(&r) {
+            r = u;
+        }
+        r
+    };
+    for b in &m.blocks {
+        for i in &b.insts {
+            if matches!(i.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) {
+                let regs: Vec<VReg> = i.srcs.iter().filter_map(|x| if let Src::Reg(r) = x { Some(*r) } else { None }).collect();
+                for r in regs.iter().rev().take(2) {
+                    s.insert(root(*r));
+                }
+            }
+        }
+    }
+    s
+}
+
 fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
+    let r = allocate_policy_once(m, policy);
+    // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first
+    if r.is_err() && !WIDE_HIGH.with(|c| c.get()) && !low_window_values(m).is_empty() {
+        WIDE_HIGH.with(|c| c.set(true));
+        let r2 = allocate_policy_once(m, policy);
+        WIDE_HIGH.with(|c| c.set(false));
+        if r2.is_ok() {
+            return r2;
+        }
+    }
+    r
+}
+
+fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     let singles_from_top = matches!(policy, Policy::Scan { singles_from_top: true });
     let n = m.vregs.len();
     let mut start = vec![usize::MAX; n];
@@ -259,6 +304,8 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         }
     }
     vregs.sort_by_key(|x| (x.0, x.1));
+    let low_only = low_window_values(m);
+    let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
     let mut active: Vec<(usize, VReg, RClass)> = Vec::new();
     // Highest slot ever handed out, not just the ones still live at the end:
     // the descriptor must cover every register the code touches.
@@ -287,8 +334,19 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let lo = if width == 1 { V_RESERVED } else { width };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut found = None;
-            let mut i = lo;
-            while i + width <= vgpr_count() {
+            // gfx1250: v0..v255-only values search below 256; under the retry, wide tuples search above v255 first
+            let top = if low_only.contains(&r) { 256.min(vgpr_count()) } else { vgpr_count() };
+            let mut i = if wide_high && width >= 8 && !low_only.contains(&r) { 256 } else { lo };
+            let mut wrapped = !(wide_high && width >= 8 && !low_only.contains(&r));
+            loop {
+                if i + width > top {
+                    if wrapped {
+                        break;
+                    }
+                    wrapped = true;
+                    i = lo;
+                    continue;
+                }
                 let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i);
                 // tuple alignment: the allocator's own rule is width alignment; an explicit pin needs only the ISA's even alignment (gfx90a+:
                 // 64-bit aligned VGPR tuples; the vendor FMHA keeps its S tiles at v[52:67])
@@ -363,7 +421,11 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 true
             }
         });
-        let slot = if plan.active {
+        let slot = if low_only.contains(&r) {
+            find_slot(&used_v[..256.min(used_v.len())], c, false)
+        } else if wide_high && c.dwords() >= 8 {
+            find_slot(&used_v[256..], c, false).map(|x| x + 256).or_else(|| find_slot(&used_v, c, singles_from_top))
+        } else if plan.active {
             plan.slot(r, c, s, e, &used_v, &start, &end, &phys, m, singles_from_top)?
         } else {
             find_slot(&used_v, c, singles_from_top)
