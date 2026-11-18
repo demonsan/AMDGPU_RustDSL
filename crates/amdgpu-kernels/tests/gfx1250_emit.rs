@@ -16,7 +16,7 @@ fn clang() -> Option<String> {
 #[test]
 fn the_probes_compile_for_gfx1250() {
     for k in amdgpu_kernels::gfx1250_kernel_names() {
-        let f = amdgpu_kernels::kernel_by_name(k).unwrap();
+        let f = amdgpu_kernels::kernel_by_name(k).unwrap_or_else(|| panic!("{k}: not in the registry"));
         let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(c.asm.contains(".amdhsa_wavefront_size32 1"), "{k}");
         assert!(!c.asm.contains("s_waitcnt"), "{k}: a gfx950 wait");
@@ -29,7 +29,7 @@ fn the_probes_assemble_for_gfx1250() {
     let dir = std::env::temp_dir().join(format!("g1250_emit_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for k in amdgpu_kernels::gfx1250_kernel_names() {
-        let f = amdgpu_kernels::kernel_by_name(k).unwrap();
+        let f = amdgpu_kernels::kernel_by_name(k).unwrap_or_else(|| panic!("{k}: not in the registry"));
         let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap();
         let s = dir.join(format!("{k}.s"));
         let o = dir.join(format!("{k}.co"));
@@ -77,7 +77,7 @@ fn the_probes_compile_through_the_gfx1250_llvm_tail() {
     let dir = std::env::temp_dir().join(format!("g1250_tail_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for k in ["probe_g1250_add", "probe_g1250_math"] {
-        let f = amdgpu_kernels::kernel_by_name(k).unwrap();
+        let f = amdgpu_kernels::kernel_by_name(k).unwrap_or_else(|| panic!("{k}: not in the registry"));
         let c = amdgpu_codegen::compile_target_with(&f, "gfx1250", "llvm-tail").unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(c.asm.contains("global_prefetch_b8"), "{k}: LLVM's prologue\n{}", c.asm);
         let s = dir.join(format!("{k}.s"));
