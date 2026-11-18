@@ -139,8 +139,13 @@ fn matrix_accumulators(m: &MFunction) -> std::collections::HashSet<VReg> {
 
 fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     let r = allocate_policy_once(m, policy);
-    // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first
-    if r.is_err() && !WIDE_HIGH.with(|c| c.get()) && !low_window_values(m).is_empty() {
+    if let (Err(e), true) = (&r, std::env::var("AMDC_RA_PEAK").is_ok()) {
+        eprintln!("RA-FIRST-ATTEMPT {}: {}", m.name, e.chars().take(160).collect::<String>());
+    }
+    // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first (only for a
+    // VGPR failure: an SGPR shortage is not helped by moving vector tuples, it only spreads them)
+    let vgpr_failure = matches!(&r, Err(e) if !e.contains("out of SGPRs"));
+    if vgpr_failure && !WIDE_HIGH.with(|c| c.get()) && !low_window_values(m).is_empty() {
         WIDE_HIGH.with(|c| c.set(true));
         let r2 = allocate_policy_once(m, policy);
         WIDE_HIGH.with(|c| c.set(false));
