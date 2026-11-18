@@ -19,6 +19,9 @@ A kernel the rules reject is never run on a GPU: the mutation tests below stop a
 | allocated named barriers | `Function::kd` entry `named_barrier_count` | `BAR-ID` |
 | signals per work-group of a barrier the verifier cannot count | `FnBuilder::barrier_signal_count(id, per_wg)` (a `g5:signals_per_wg:<id>` entry; trusted, listed by `trusted_items`) | `BAR-COUNT` |
 | host-built descriptor words | the host contract on a kernarg scalar (`FnBuilder::ka_one_of`) | `MCAST` |
+| tensor descriptors built by the host (evidence / probe kernels) | `FnBuilder::tdm_host_descriptor()` (`g5:tdm_host_descriptor`; trusted, listed by `trusted_items`) | `GV-TDM-PROV`, `GV-GLB-*` |
+| the outermost loop is the tile loop of a persistent kernel | `FnBuilder::persistent_tile_loop()` (`g5:persistent_tile_loop`; CHECKED, not trusted: the tile body is simulated once and must end with every tensor operation drained and a barrier after its last LDS access) | tile protocol (`GV-TILE-UNSUPPORTED` when the body is not quiescent) |
+| wave-uniform runtime ifs inside loops hold markers / waits | `FnBuilder::loop_ifs_explored()` (`g5:loop_ifs_explored`; trusted and listed: each occurrence in each simulated iteration is a decision, at most 6 per path, only the simulated iterations are covered) | tile protocol (`GV-TILE-UNSUPPORTED` without it) |
 
 ## Rules
 
