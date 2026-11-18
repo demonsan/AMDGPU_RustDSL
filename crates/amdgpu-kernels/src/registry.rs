@@ -47,6 +47,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_g1250_barriers" => Some(crate::probes::g1250::probe_g1250_barriers()),
         "probe_g1250_tr8" => Some(crate::probes::g1250_mla::probe_g1250_tr8()),
         "mla_g1250_qh16" => Some(crate::probes::g1250_mla::mla_g1250_qh16()),
+        "mla_g1250_qh16_async" => Some(crate::probes::g1250_mla::mla_g1250_qh16_async()),
         "probe_g1250_tdm_ring" => Some(crate::probes::g1250::probe_g1250_tdm_ring()),
         "probe_g1250_named" => Some(crate::probes::g1250::probe_g1250_named()),
         "probe_g1250_wide" => Some(crate::probes::g1250::probe_g1250_wide()),

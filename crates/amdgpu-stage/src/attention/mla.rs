@@ -125,6 +125,10 @@ pub struct MlaBody {
     pub cscale: ValueId,
     /// the sequence's page count (the last tile's second page is clamped to the last page; its tokens are masked)
     pub npages: ValueId,
+    /// KV by per-lane async 16-byte loads (`global_load_async_to_lds_b128`, 18 per lane per page) instead of the tensor data mover
+    pub async_kv: bool,
+    /// the thread id (async loads: lane offset 16 tid of each 2 KB chunk)
+    pub tid: ValueId,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
     pub vars: Vec<VarId>,
 }
@@ -150,17 +154,36 @@ impl PipeBody for MlaBody {
             let pidv = self.ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
             let pid = b.read_first_lane(pidv);
             b.assume_trusted(pid, amdgpu_dsl::Ext::c(0), amdgpu_dsl::Ext::sym("P") - amdgpu_dsl::Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
-            let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * QUARTER);
-            let lds = b.bind_i32(r.base() + pg * self.layout.slot_bytes + ev(self.w) * self.layout.quarter_lds);
-            let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
-            let g1 = self.g1;
-            r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+            if self.async_kv {
+                // 18 chunks of 2 KB: thread t copies bytes 16 t .. of each (the padded LDS offset: the pad interval divides 2 KB)
+                let goff = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.tid) * 16);
+                let gp = b.let_(Op::PtrAdd { base: Opnd::Val(self.pkv), byte_off: Opnd::Val(goff) });
+                let lb = self.layout.at_expr(b, ev(self.tid) * 16);
+                let lds0 = b.bind_i32(r.base() + pg * self.layout.slot_bytes + ev(lb));
+                r.write(b, |b| {
+                    for k in 0..(PAGE_BYTES / 2048) {
+                        let ga = b.let_(Op::PtrAdd { base: Opnd::Val(gp), byte_off: Opnd::I32(2048 * k) });
+                        let la = b.bind_i32(ev(lds0) + self.layout.at(2048 * k));
+                        b.load_async_lds_b128(la, ga, 0);
+                    }
+                });
+            } else {
+                let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * QUARTER);
+                let lds = b.bind_i32(r.base() + pg * self.layout.slot_bytes + ev(self.w) * self.layout.quarter_lds);
+                let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
+                let g1 = self.g1;
+                r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+            }
         }
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        // TENSORcnt is in order: at most the tile just staged (t + 2, PAGES loads) stays in flight; t + 1 is complete
-        b.wait_tensor(PAGES as u8);
+        // the counters are in order: at most the tile just staged (t + 2) stays in flight; t + 1 is complete
+        if self.async_kv {
+            b.wait_counter(amdgpu_dsl::WaitCtr::Async, (PAGES * PAGE_BYTES / 2048) as u8);
+        } else {
+            b.wait_tensor(PAGES as u8);
+        }
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}

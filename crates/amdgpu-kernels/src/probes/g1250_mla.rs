@@ -47,13 +47,22 @@ const MAX_PAGES: i32 = 1024;
 /// sequence per work-group. The stage body is `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline (3 pages in flight through
 /// the tensor data mover). Output: bf16 R [B][16][512], the natural-log LSE [B][16].
 pub fn mla_g1250_qh16() -> Function {
+    mla_g1250_qh16_with(MLA_NAME, false)
+}
+
+/// The MLA decode with the KV pages loaded by per-lane async 16-byte copies instead of the tensor data mover (`async_kv`).
+pub fn mla_g1250_qh16_async() -> Function {
+    mla_g1250_qh16_with("mla_g1250_qh16_async", true)
+}
+
+fn mla_g1250_qh16_with(name: &str, async_kv: bool) -> Function {
     use amdgpu_dsl::{ev, TensorTile, WmmaKind};
     use amdgpu_stage::attention::mla::{MlaBody, PageLayout, DV as DVB, PAGES, PAGE_BYTES, PAGE_TOKENS, QUARTER, ROPE_OFF};
     let layout = PageLayout::plan();
     use amdgpu_stage::{Cadence, Pipeline};
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
-    let mut b = FnBuilder::new(MLA_NAME, 128);
+    let mut b = FnBuilder::new(name, 128);
     let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
     for (i, n) in names.iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
@@ -173,7 +182,7 @@ pub fn mla_g1250_qh16() -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
-    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, vars: Vec::new() };
+    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, async_kv, tid, vars: Vec::new() };
     // one pipeline tile = PAGES pages (the last one possibly partial: its clamped pages are masked by ctx)
     let ntiles = b.bind_i32((ev(npages) + (PAGES - 1)) >> PAGES.trailing_zeros() as i32);
     let pipe = Pipeline::new(Cadence::OneWindow, ntiles, ctx, PAGE_TOKENS * PAGES, Ext::c(1 << 16));
@@ -181,6 +190,7 @@ pub fn mla_g1250_qh16() -> Function {
     // drain the tensor data mover: the last steady iteration leaves one (clamped, re-staged) page load in flight. A tensor write that lands after
     // s_endpgm writes LDS the next work-group on this CU may already own (its page table: a wild page id, an illegal access). The vendor ends with s_wait_idle.
     b.wait_tensor(0);
+    b.wait_counter(amdgpu_dsl::WaitCtr::Async, 0);
     let vars = body.vars.clone();
     let _ = WmmaKind::Fp8_16x16x64;
     // ---- epilogue: the row sums (8 partials per head) through LDS, O / L * ks to bf16, LSE ----
