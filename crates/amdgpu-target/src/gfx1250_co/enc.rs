@@ -496,15 +496,19 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                 }
                 enc[k] = c;
             }
+            // operand reuse hints: d0 bit 13 (A), bit 14 (B) - of the scale prefix for the VOP3PX2 forms (llvm-mc)
+            let has = |k: &str| i.mods.iter().any(|(m, _)| m == k);
+            let reuse = (has("matrix_a_reuse") as u32) << 13 | (has("matrix_b_reuse") as u32) << 14;
             if fmt == "VOP3PX2" {
                 let (sa, _) = src9(op_at(&i, 4)?)?;
                 let (sb, _) = src9(op_at(&i, 5)?)?;
                 let row1 = modv(&i, "matrix_b_scale") == Some("MATRIX_SCALE_ROW1");
-                out.extend_from_slice(&d32(0xCC00_0000 | 0x35 << 16));
+                out.extend_from_slice(&d32(0xCC00_0000 | 0x35 << 16 | reuse));
                 out.extend_from_slice(&d32((row1 as u32) << 27 | 128 << 18 | sb << 9 | sa));
             }
             let px2 = (fmt == "VOP3PX2" || packed) as u32;
-            out.extend_from_slice(&d32(0xCC00_0000 | op << 16 | px2 << 14 | d));
+            let reuse_main = if fmt == "VOP3PX2" { 0 } else { reuse };
+            out.extend_from_slice(&d32(0xCC00_0000 | op << 16 | px2 << 14 | reuse_main | d));
             out.extend_from_slice(&d32(3 << 27 | enc[2] << 18 | enc[1] << 9 | enc[0]));
         }
         f => return Err(format!("`{t}`: format {f} not encoded")),
