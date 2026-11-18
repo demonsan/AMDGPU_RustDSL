@@ -9,7 +9,7 @@
 //! `[K 32 h .. +32)` and `[K 64 + 32 h .. +32)` of the row, i.e. bytes `16 h .. +16` and `32 + 16 h .. +16` of the 64-byte row; the A scale of lane `l` is row `l` of the 32-row block (4 bytes: one per
 //! 32 K), the B scale (lanes 0..15) row `l`; C / D dword v: row `v % 8 + 8 h + 16 (v / 8)`, column `m`.
 
-use amdgpu_dsl::{ev, DType, FnBuilder, Opnd, ValueId, VarId, WmmaKind, WmmaScale};
+use amdgpu_dsl::{ev, DType, FnBuilder, Op, Opnd, ValueId, VarId, WmmaKind, WmmaScale};
 use amdgpu_tile::lane::{Role, TileIt};
 use amdgpu_tile::shared::{Shared, SlotIdx};
 
@@ -95,6 +95,9 @@ pub struct TdmF4Body {
     /// wave roles: role A (waves 0, 1) issues only the A and SA loads, role B (waves 2, 3) only B and SB (2 tensor loads per wave per stage instead of 4: the per-operation cost of the tensor
     /// unit, not the bytes, is what the many tiny scale loads cost); `Role::All` issues all four
     pub roles: bool,
+    /// the scales in the vendor's preshuffled layout (aiter `shuffle_scale_f4`: [rows / 32][K / 128][32 rows][4 bytes]): a stage's scale
+    /// slice is rows / 32 TDM rows of 128 ks contiguous bytes (instead of rows of 4 ks bytes); in LDS [row block][k tile][32][4]
+    pub scale_shuf: bool,
 }
 
 impl PipeBody for TdmF4Body {
@@ -106,7 +109,8 @@ impl PipeBody for TdmF4Body {
         };
         // `key0`: the K element offset of the tile (tile_rows = 128: tile << 7); bytes of an fp4 row: / 2; of a scale row: / 32
         let kb = b.bind_i32(key0.clone().lshr(1));
-        let ks = b.bind_i32(key0.clone().lshr(5));
+        // the scales' K byte offset: K / 32 bytes per row, or (preshuffled) K / 128 tiles of 128 bytes = K bytes
+        let ks = if self.scale_shuf { b.bind_i32(key0.clone()) } else { b.bind_i32(key0.clone().lshr(5)) };
         let oa = b.add_i32(self.a_org, kb);
         let ob = b.add_i32(self.b_org, kb);
         let osa = b.add_i32(self.sa_org, ks);
@@ -168,7 +172,8 @@ impl PipeBody for TdmF4Body {
         let n = (self.sh.tm * self.sh.tn) as usize;
         (0..n)
             .map(|_| {
-                let z = b.frag_cat(&[Opnd::I32(0); 16]);
+                // a zero fragment value (the lowering's `zeroinit` writes the variable's own registers: no zero tuple kept live)
+                let z = b.let_(Op::FragZero { ty: DType::Frag16 });
                 (WmmaKind::ScaleF4_32x16x128.acc_ty(), Opnd::Val(z))
             })
             .collect()
@@ -208,7 +213,8 @@ impl PipeBody for TdmF4Body {
             });
             rsa.read(b, |b| {
                 for i in 0..sh.tm {
-                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + 4 * s);
+                    let st = if self.scale_shuf { 128 * s } else { 4 * s };
+                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + st);
                     f.sa.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });
@@ -224,7 +230,9 @@ impl PipeBody for TdmF4Body {
             });
             rsb.read(b, |b| {
                 for j in 0..sh.tn {
-                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + j * 16 * srow_bytes + 4 * s);
+                    // preshuffled: B block j covers rows 16 j .. of the 32-row block j / 2 (lanes m at 16 (j % 2) + m)
+                    let (jt, st) = if self.scale_shuf { ((j / 2) * 32 * srow_bytes + (j % 2) * 64, 128 * s) } else { (j * 16 * srow_bytes, 4 * s) };
+                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + jt + st);
                     f.sb.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });
