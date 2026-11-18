@@ -426,23 +426,17 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // cooperative loads: wave w loads rows [w * R / waves, ..) of each tile (R / waves rows)
     let nw = sh.waves();
     assert!(coop || !clustered, "a cluster needs cooperative loads");
-    let (diva, divb) = if coop { (nw * cx, nw * cy) } else { (1, 1) };
-    assert!(bm % diva == 0 && bn % divb == 0, "the tile splits evenly over the waves of the cluster row / column");
-    let (rpa, rpb) = (bm / diva, bn / divb);
+    // a cluster multicast is a rendezvous of IDENTICAL requests (the ISA: one wave per workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have
+    // asked): so the workgroups of a cluster row issue the very same slices of the A tile, those of a cluster column the same slices of the B tile, and the slices are per wave only, as without a cluster
+    let div = if coop { nw } else { 1 };
+    assert!(bm % div == 0 && bn % div == 0, "the tile splits evenly over the waves");
+    let (rpa, rpb) = (bm / div, bn / div);
     // the wave id is wave-uniform: read it into an SGPR so the slice offsets and descriptors stay scalar
     let wid = b.let_(Op::ReadFirstLane(Opnd::Val(w)));
     let wsl = if coop { wid } else { b.c_i32(0) };
     let leader = b.bind_cond(ev(wid).eq(0));
-    // the slice of the A tile (shared by the cluster row) this wave loads: slice index = (workgroup x in the cluster) x waves + wave; of the B tile (shared by the cluster column): (workgroup y) x waves + wave
-    let (sa_i, sb_i) = if clustered {
-        let xa = b.mul_i32(wg_x, Opnd::I32(nw));
-        let ya = b.mul_i32(wg_y, Opnd::I32(nw));
-        (b.add_i32(xa, wsl), b.add_i32(ya, wsl))
-    } else {
-        (wsl, wsl)
-    };
-    let rowa_w = b.mul_i32(sa_i, Opnd::I32(rpa));
-    let rowb_w = b.mul_i32(sb_i, Opnd::I32(rpb));
+    let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
+    let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
     let row0w = b.add_i32(row0, rowa_w);
     let col0w = b.add_i32(col0, rowb_w);
     let a_org = b.mul_i32(row0w, kb);

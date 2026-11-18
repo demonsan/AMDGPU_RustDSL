@@ -599,6 +599,12 @@ pub fn probe_g1250_mcast_lds(name: &str, th: u8, scope: u8, mask: u16, lds_bytes
 /// The full multicast probe. `wm24`: the issuing wave first sets WAVE_MODE bit 24 (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1`), which the vendor's GEMM kernel does in its wave 0 only
 /// (the wave that issues the tensor loads of its workgroup), before any tensor operation.
 pub fn probe_g1250_mcast_full(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32, wm24: bool, delay: u32) -> Function {
+    probe_g1250_mcast_same(name, th, scope, mask, lds_bytes, wm24, delay, false)
+}
+
+/// `same`: every workgroup issues the SAME request (the slice 0 of `src` to LDS byte 0, the same mask): the cluster multicast is a rendezvous of identical requests (the ISA: one wave per
+/// workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have asked). Expected with mask 0b11: both workgroups hold slice 0 at byte 0.
+pub fn probe_g1250_mcast_same(name: &str, th: u8, scope: u8, mask: u16, lds_bytes: u32, wm24: bool, delay: u32, same: bool) -> Function {
     use amdgpu_dsl::ev;
     let mut b = FnBuilder::new(name, 64);
     b.arg("src", DType::Ptr, 0, 8);
@@ -611,7 +617,7 @@ pub fn probe_g1250_mcast_full(name: &str, th: u8, scope: u8, mask: u16, lds_byte
     let t6 = b.let_(Op::ReadTtmp { idx: 6 });
     let pos = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
     b.assume_trusted(pos, Ext::c(0), Ext::c(1), "cluster position x < the cluster's 2 workgroups (TTMP6[3:0])");
-    let off = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11)));
+    let off = if same { b.let_(Op::AddI32(Opnd::I32(0), Opnd::I32(0))) } else { b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11))) };
     let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: mask };
     let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::Val(off));
     let tid = b.let_(Op::WorkitemId);
@@ -639,6 +645,58 @@ pub fn probe_g1250_mcast_full(name: &str, th: u8, scope: u8, mask: u16, lds_byte
     }
     let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(12)));
     for k in 0..16i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let x = b.load_lds(la, MemTy::B32);
+        let go = b.let_(Op::AddI32(Opnd::Val(pbase), Opnd::Val(la)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(go) });
+        b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 2));
+    f
+}
+
+/// Multicast landing-place scan (cluster of 2): both workgroups fill 64 KiB of LDS with a marker, join the cluster barrier, wave 0 of each loads its 2048-byte slice of `src` with mask 0b11 at LDS byte
+/// 2048 x position, then own wait, workgroup barrier, cluster barrier, and every work-item dumps the whole 64 KiB to `out[position]`. The host looks for the slices' dwords everywhere in both dumps, to
+/// find where a multicast lands (if anywhere). Kernargs: src @0 (4096 bytes), out @8 (131072 bytes). 64 work-items.
+pub fn probe_g1250_mcast_scan(name: &str, mask: u16) -> Function {
+    use amdgpu_dsl::ev;
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("src", Ext::c(4096));
+    b.arg_tensor("out", Ext::c(131072));
+    b.lds(65536);
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let po = b.let_(Op::KernargPtr { offset: 8 });
+    let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+    let pos = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
+    b.assume_trusted(pos, Ext::c(0), Ext::c(1), "cluster position x < the cluster's 2 workgroups (TTMP6[3:0])");
+    let tid = b.let_(Op::WorkitemId);
+    for k in 0..256i32 {
+        let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
+        let v = b.let_(Op::XorI32(Opnd::I32(0x7EED_0000u32 as i32), Opnd::Val(la)));
+        b.store_lds_b32(la, v);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.cluster_barrier();
+    let off = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(11)));
+    let tile = amdgpu_dsl::TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: mask };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::Val(off));
+    let w5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.let_(Op::ReadFirstLane(Opnd::Val(w5)));
+    let lead = b.bind_cond(ev(w).eq(0));
+    b.begin_if(Opnd::Val(lead));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+    b.end_if();
+    b.wait_tensor(0);
+    b.barrier();
+    b.cluster_barrier();
+    let pbase = b.let_(Op::ShlI32(Opnd::Val(pos), Opnd::I32(16)));
+    for k in 0..256i32 {
         let a = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(64 * k)));
         let la = b.let_(Op::ShlI32(Opnd::Val(a), Opnd::I32(2)));
         let x = b.load_lds(la, MemTy::B32);
