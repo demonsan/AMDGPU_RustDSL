@@ -293,8 +293,12 @@ pub fn mla_g1250_qh16_ws() -> Function {
         // the slot's reads are done before the next stage overwrites it
         b.wait_lds(0);
     };
-    // every wave runs the same number of page pairs (the longest wave's): pages past the sequence are re-reads of the last page, fully masked
-    let npairs = b.bind_i32((ev(npages) + 7) >> 3);
+    // the wave's own pages: nw = ceil((npages - w) / 4), in pairs (an odd last pair re-reads the last page, fully masked); a wave without a
+    // page (npages <= w) skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
+    let nw = b.bind_i32((ev(npages) - ev(w) + 3) >> 2);
+    let npairs = b.bind_i32((ev(nw) + 1) >> 1);
+    let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
+    b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
     let z = b.c_i32(0);
     let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
@@ -314,6 +318,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
     b.break_if(fin);
     b.end_loop();
+    b.end_if();
     b.wait_tensor(0);
 
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
