@@ -88,3 +88,13 @@ These rules are staged after the typed tensor descriptor, the named-barrier oper
 1. Add the rule to `RULES` (id, layer, one generic sentence) and implement it in `verify_ir` or `verify_asm`, reporting through `viol` so `with_rules_disabled` can switch it off in tests.
 2. Add `mut_<stem>` and `pos_<stem>` to `hang_rules_1250.rs` and the line to `COVERAGE`; `every_rule_is_covered` enforces the pair.
 3. Never run the faulty kernel on a GPU: the mutation test must stop at the compiler.
+
+## An incident: a device hang during kernel development, and what it taught
+
+What ran. While a GEMM kernel family was being tuned, a sweep of kernel shapes ran on one idle GPU. Some shapes (a second K sub-step per ring slot) returned wrong results; a later shape, an 8-wave variant that had already run correctly once that day, then left the process blocked inside the driver (a register-write wait of the micro-engine scheduler) and the device unusable until an administrator reset it. All runs used hard polled timeouts, which cannot fire once a process is blocked in the driver.
+
+What was found. The wrong results were a **code-generation bug**: the shared wait pass used the previous architecture's counter range (15) for the gfx1250 LDS counter (63), so with many LDS loads in flight the oldest ones were treated as complete and their WMMA readers received no `s_wait_dscnt`. Bisecting one work-group with a per-K-tile mask (`ONLY_K`) showed exactly the loop-body windows wrong, and the compile now carries the missing waits (an independent re-check of the final waits with the gfx1250 counters turns such a drop into a compile error). The LDS-above-64-KiB hypothesis was tested separately by micro-probes and is not the cause (an interim guard rule was added and retired).
+
+What is not known. The hang itself was **not reproduced**: the same 8-wave kernel, rebuilt with the fixed waits, runs correctly from one work-group to the full grid. The most likely reading is a device-state effect of the preceding runs that consumed garbage operands, but this is not established, and the kernel is kept as a regression kernel (`gemm_g1250_tdm_stage_f4_8w_256x64`): it is run on one work-group first, watchdogged, whenever the back end's wait or ring handling changes. No data-dependent loop or branch exists in it, so wrong data alone cannot steer control flow.
+
+What changed in the process. Sweeps of experimental kernels run only on GPUs and shapes cleared in advance, one work-group before the grid, and a kernel family whose results are wrong is not run again until the cause is found; the verifier gap (a wait model shared by the generator and its own checker) was closed by an independent check, and the rules in this document keep their mutation tests.
