@@ -177,8 +177,6 @@ pub fn mla_g1250_qh16_ws() -> Function {
         let rrow = b.bind_i32(ev(sb) + ev(rofs));
         let vrow = b.bind_i32(ev(sb) + ev(vofs));
         // S^T tiles j = 0..4 (tokens 16 j + 8 g + r of the page)
-        let mut x: Vec<ValueId> = Vec::with_capacity(32);
-        let mut okv: Vec<ValueId> = Vec::with_capacity(32);
         // valid tokens of this page (>= 64 except on the sequence's last page)
         let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
         // the 4 S tiles interleaved chunk by chunk: the 4 K fragments of chunk c are read before the 4 WMMAs of chunk c - 1 complete their
@@ -206,20 +204,35 @@ pub fn mla_g1250_qh16_ws() -> Function {
                 })
                 .collect()
         });
+        // logits; the mask (tokens at or beyond ctx) only on a page that reaches past ctx: a uniform branch around VALU only
+        let mut x: Vec<ValueId> = Vec::with_capacity(32);
         for j in 0..4 {
             for r in 0..8u8 {
                 let si = b.frag_slice(Opnd::Val(svals[j]), r, 1);
                 let sf = f32_of(b, si);
-                let v = b.mul_f32(sf, cscale);
-                // tokens beyond ctx (only on the sequence's last page): -inf
-                let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
-                let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
-                okv.push(ok);
-                x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                x.push(b.mul_f32(sf, cscale));
             }
         }
-        let mut mx = x[0];
-        for r in 1..32 {
+        let xv = b.declare_vars(&x.iter().map(|&v| (DType::F32, Opnd::Val(v))).collect::<Vec<_>>());
+        let one = b.c_i32(1);
+        let okv0: Vec<ValueId> = (0..32).map(|_| b.cmp(CmpPred::Eq, CmpTy::I32, one, Opnd::I32(1))).collect();
+        let okvars = b.declare_vars(&okv0.iter().map(|&v| (DType::I1, Opnd::Val(v))).collect::<Vec<_>>());
+        let partial = b.cmp(CmpPred::Lt, CmpTy::I32, tok_lim, Opnd::I32(64));
+        b.begin_if(partial);
+        for j in 0..4 {
+            for r in 0..8u8 {
+                let k = 8 * j + r as usize;
+                let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
+                let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
+                let xm = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Var(xv[k]), b: Opnd::Val(neg) });
+                b.set_var(xv[k], Opnd::Val(xm));
+                b.set_var(okvars[k], Opnd::Val(ok));
+            }
+        }
+        b.end_if();
+        let x: Vec<Opnd> = xv.iter().map(|&v| Opnd::Var(v)).collect();
+        let mut mx = b.max_f32(x[0], x[1]);
+        for r in 2..32 {
             mx = b.max_f32(mx, x[r]);
         }
         // the other lane half (same head m): v_permlane16_swap of (mx, mx)
@@ -238,7 +251,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
             let d = b.sub_f32(x[r], m_new);
             let e0 = b.exp2_f32(d);
             // a masked token contributes 0 (also when the whole page is masked: then x = m_new = -1e30)
-            let e = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(okv[r]), a: Opnd::Val(e0), b: Opnd::Val(zf) });
+            let e = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Var(okvars[r]), a: Opnd::Val(e0), b: Opnd::Val(zf) });
             lsum = b.add_f32(lsum, e);
             p.push(e);
         }
@@ -293,8 +306,12 @@ pub fn mla_g1250_qh16_ws() -> Function {
         // the slot's reads are done before the next stage overwrites it
         b.wait_lds(0);
     };
-    // every wave runs the same number of page pairs (the longest wave's): pages past the sequence are re-reads of the last page, fully masked
-    let npairs = b.bind_i32((ev(npages) + 7) >> 3);
+    // the wave's own pages: nw = ceil((npages - w) / 4), in pairs (an odd last pair re-reads the last page, fully masked); a wave without a
+    // page (npages <= w) skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
+    let nw = b.bind_i32((ev(npages) - ev(w) + 3) >> 2);
+    let npairs = b.bind_i32((ev(nw) + 1) >> 1);
+    let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
+    b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
     let z = b.c_i32(0);
     let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
@@ -314,6 +331,7 @@ pub fn mla_g1250_qh16_ws() -> Function {
     let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
     b.break_if(fin);
     b.end_loop();
+    b.end_if();
     b.wait_tensor(0);
 
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
