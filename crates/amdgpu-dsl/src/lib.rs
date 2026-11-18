@@ -3908,6 +3908,11 @@ impl FnBuilder {
         self.push_stmt(Stmt::Sys { op: SysOp::PrefetchInst, imm: offset, imm2: 0, reads: vec![pc.into(), count.into()] });
     }
 
+    /// gfx1250: `s_prefetch_inst pc, offset, null-offset, len`: fetch `len + 1` instruction-cache lines from `pc + offset` (`len` 0..=31; a hint: no effect on values or memory).
+    pub fn prefetch_inst_len(&mut self, pc: impl Into<Opnd>, offset: u32, zero: impl Into<Opnd>, len: u32) {
+        self.push_stmt(Stmt::Sys { op: SysOp::PrefetchInst, imm: offset, imm2: len, reads: vec![pc.into(), zero.into()] });
+    }
+
     /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
     pub fn barrier_wait(&mut self, id: i32) {
         self.push_stmt(Stmt::BarrierWait { id });
