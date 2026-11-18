@@ -706,8 +706,9 @@ fn name_of(m: &MFunction, r: VReg) -> String {
 pub fn physical_view(m: &MFunction, a: &crate::regalloc::Alloc) -> MFunction {
     let mut p = m.clone();
     let base = p.vregs.len() as u32;
-    // files: VGPR 0..512 (32 bases), AGPR 0..256 (16), SGPR 0..256 (16)
-    for _ in 0..64 {
+    // files: VGPR 0..max(512, the target's VGPRs) (gfx950 32 bases, gfx1250 64), then AGPR 0..256 (16), SGPR 0..256 (16)
+    let nv = (crate::target::cur().regs.vgpr.count.max(512) / 16) as u32;
+    for _ in 0..nv + 32 {
         p.vregs.push(RClass::V16);
     }
     let n = m.vregs.len() as u32;
@@ -718,9 +719,9 @@ pub fn physical_view(m: &MFunction, a: &crate::regalloc::Alloc) -> MFunction {
         };
         let scalar = a.scalar.get(r as usize).copied().unwrap_or(false);
         let (file, idx) = if scalar {
-            (48u32, ph)
+            (nv + 16, ph)
         } else if is_agpr_phys(ph) {
-            (32, ph - AGPR_TAG)
+            (nv, ph - AGPR_TAG)
         } else {
             (0, ph)
         };
