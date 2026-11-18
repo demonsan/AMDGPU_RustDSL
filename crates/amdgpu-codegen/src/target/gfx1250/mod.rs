@@ -55,7 +55,12 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     // tail, every kernarg dword up to 16
     let pre = if f.exact || backend != "own" || f.kd.iter().any(|(k, _)| k == "user_sgpr_kernarg_preload_length") { 0 } else { f.kernarg_size.div_ceil(4).min(16) };
     let oldp = PRELOAD.with(|c| c.replace(pre));
-    let r = compile_inner(f, backend);
+    let mut r = compile_inner(f, backend);
+    // the preloaded dwords are reserved SGPRs: a kernel that runs out of SGPRs compiles again without the preload (scalar loads instead)
+    if pre > 0 && matches!(&r, Err(e) if e.contains("out of SGPRs")) {
+        PRELOAD.with(|c| c.set(0));
+        r = compile_inner(f, backend);
+    }
     PRELOAD.with(|c| c.set(oldp));
     XNACK.with(|c| c.set(old));
     r
