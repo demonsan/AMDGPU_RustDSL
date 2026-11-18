@@ -458,6 +458,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epi_opts(name: &str, epi: u8, relax: bool, 
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
 }
 
+/// The 256 x 128 tile (4 waves of 128 x 64) with the TDM-store epilogue: twice the workgroups of the 256 x 256 tile (512 at 4096^3), for the shapes that fill the machine only once.
+pub fn gemm_tdm_stage_f4_256x128_ks2_epit_opts(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
+}
+
 /// The best 256 x 256 kernel with the tile-order swizzle (host SWIZZLE=G, G = `swizzle` tile rows per group).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_swz(name: &str, relax: bool, roles: bool, swizzle: u8) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, swizzle, ..RingOpts::default() })
