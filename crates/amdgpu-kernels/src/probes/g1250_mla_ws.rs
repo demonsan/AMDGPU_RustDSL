@@ -18,6 +18,8 @@ pub const MLA_WS_NAME: &str = "mla_g1250_qh16_ws";
 const MAX_PAGES: i32 = 1024;
 /// V dim tiles of 16 (the whole 512)
 const NT: usize = 32;
+/// workspace bytes per (sequence, split) of the KV-split form: O 16 x 512 f32, then the 16 maxima and the 16 sums
+pub const WS_BYTES: i64 = (16 * 512 + 32) * 4;
 
 fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
@@ -44,6 +46,129 @@ pub fn mla_g1250_qh16_wsi() -> Function {
     mla_ws_with("mla_g1250_qh16_wsi", false, 1 | 16, false)
 }
 
+/// The KV split across work-groups (grid (S, B)): partials to the workspace; `mla_g1250_qh16_cmb` combines them.
+pub fn mla_g1250_qh16_wsk() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsk", false, 1 | 32, false)
+}
+
+/// The combine of the KV-split partials: grid (1, B), thread t = head t / 8, dims 64 (t % 8) ..: max, rescaled sums, bf16 R and the LSE.
+pub fn mla_g1250_qh16_cmb() -> Function {
+    let mut b = FnBuilder::new("mla_g1250_qh16_cmb", 128);
+    let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
+    for (i, n) in names.iter().enumerate() {
+        b.arg(n, DType::Ptr, 8 * i as u32, 8);
+    }
+    for (i, n) in ["out16", "scalar", "qlens", "passes", "stride_page", "log2_page", "stride_q", "flags"].iter().enumerate() {
+        b.arg(n, DType::I32, 88 + 4 * i as u32, 4);
+    }
+    b.arg_tensor("R", Ext::grid_y() * Ext::c(16 * 512 * 2));
+    b.arg_tensor("LSE", Ext::grid_y() * Ext::c(16 * 4));
+    b.arg_tensor("KS", Ext::c(4));
+    b.ka_one_of(100, &[1, 2, 4, 8]);
+    b.arg_tensor("VSC", Ext::grid_y() * Ext::ka(100) * Ext::c(WS_BYTES));
+    let pr = b.let_(Op::KernargPtr { offset: 0 });
+    let plse = b.let_(Op::KernargPtr { offset: 8 });
+    let pks = b.let_(Op::KernargPtr { offset: 72 });
+    let pws = b.let_(Op::KernargPtr { offset: 80 });
+    let s_count = b.let_(Op::KernargI32 { offset: 100 });
+    let tid = b.let_(Op::WorkitemId);
+    let bidx = b.let_(Op::WorkgroupIdY);
+    let z = b.c_i32(0);
+    let kq = b.let_(Op::PtrAdd { base: Opnd::Val(pks), byte_off: Opnd::Val(z) });
+    let ksv = b.load_global(kq, 0, MemTy::B32);
+    let ks = b.read_first_lane(ksv);
+    let ksf = f32_of(&mut b, ks);
+    let h = b.bind_i32(ev(tid) >> 3);
+    let d0 = b.bind_i32((ev(tid) & 7) << 6);
+    // pass 1: the maximum over the splits
+    let neg = b.c_f32(-1.0e30);
+    let zf = b.c_f32(0.0);
+    let mut inits = vec![(DType::F32, Opnd::Val(neg)), (DType::F32, Opnd::Val(zf))];
+    for _ in 0..64 {
+        inits.push((DType::F32, Opnd::Val(zf)));
+    }
+    let st = b.declare_vars(&inits);
+    let (vmx, vl) = (st[0], st[1]);
+    let ov: Vec<VarId> = st[2..].to_vec();
+    let z0 = b.c_i32(0);
+    let lv = b.begin_loop(&[(DType::I32, Opnd::Val(z0))]);
+    let si = lv[0];
+    b.assume(si, Ext::c(0), Ext::c(7));
+    let smax = b.bind_i32(ev(s_count) - 1);
+    let sic = b.let_(Op::MinI32(Opnd::Var(si), Opnd::Val(smax)));
+    let wsb = b.bind_i32((ev(bidx) * ev(s_count) + ev(sic)) * WS_BYTES as i32);
+    let wm = b.bind_i32(ev(wsb) + (8192 + ev(h)) * 4);
+    let pwm = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm) });
+    let msv = b.load_global(pwm, 0, MemTy::B32);
+    let msf = f32_of(&mut b, msv);
+    let m2 = b.max_f32(Opnd::Var(vmx), msf);
+    b.set_var(vmx, Opnd::Val(m2));
+    let s1 = b.bind_i32(amdgpu_dsl::varx(si) + 1);
+    b.set_var(si, Opnd::Val(s1));
+    let f1 = b.cmp(CmpPred::Ge, CmpTy::I32, s1, s_count);
+    b.break_if(f1);
+    b.end_loop();
+    // pass 2: the rescaled sums and O
+    let z1 = b.c_i32(0);
+    let lv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z1))]);
+    let sj = lv2[0];
+    b.assume(sj, Ext::c(0), Ext::c(7));
+    let sjc = b.let_(Op::MinI32(Opnd::Var(sj), Opnd::Val(smax)));
+    let wsb2 = b.bind_i32((ev(bidx) * ev(s_count) + ev(sjc)) * WS_BYTES as i32);
+    let wm2 = b.bind_i32(ev(wsb2) + (8192 + ev(h)) * 4);
+    let pwm2 = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm2) });
+    let msv2 = b.load_global(pwm2, 0, MemTy::B32);
+    let lsv2 = b.load_global(pwm2, 64, MemTy::B32);
+    let msf2 = f32_of(&mut b, msv2);
+    let lsf2 = f32_of(&mut b, lsv2);
+    let dd = b.sub_f32(msf2, Opnd::Var(vmx));
+    let sc = b.exp2_f32(dd);
+    let lt = b.mul_f32(lsf2, sc);
+    let l2 = b.add_f32(Opnd::Var(vl), lt);
+    b.set_var(vl, Opnd::Val(l2));
+    let wo = b.bind_i32(ev(wsb2) + (ev(h) * 512 + ev(d0)) * 4);
+    let pwo = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wo) });
+    for k in 0..16u32 {
+        let v4 = b.load_global(pwo, 16 * k, MemTy::B128);
+        for e in 0..4u8 {
+            let x = b.frag_slice(Opnd::Val(v4), e, 1);
+            let xf = f32_of(&mut b, x);
+            let t = b.mul_f32(xf, sc);
+            let i = 4 * k as usize + e as usize;
+            let y = b.add_f32(Opnd::Var(ov[i]), t);
+            b.set_var(ov[i], Opnd::Val(y));
+        }
+    }
+    let s2 = b.bind_i32(amdgpu_dsl::varx(sj) + 1);
+    b.set_var(sj, Opnd::Val(s2));
+    let f2 = b.cmp(CmpPred::Ge, CmpTy::I32, s2, s_count);
+    b.break_if(f2);
+    b.end_loop();
+    let rl = b.rcp_f32(Opnd::Var(vl));
+    let inv = b.mul_f32(rl, ksf);
+    let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(d0) * 2);
+    let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
+    for k in 0..8u32 {
+        let parts: Vec<Opnd> = (0..4)
+            .map(|i| {
+                let a = b.mul_f32(Opnd::Var(ov[8 * k as usize + 2 * i]), inv);
+                let c = b.mul_f32(Opnd::Var(ov[8 * k as usize + 2 * i + 1]), inv);
+                Opnd::Val(b.cvt_pk_bf16_f32(a, c))
+            })
+            .collect();
+        let v = b.frag_cat(&parts);
+        b.store_global(prb, 16 * k, v, MemTy::B128, false);
+    }
+    let lg = b.log2_f32(Opnd::Var(vl));
+    let s3 = b.add_f32(Opnd::Var(vmx), lg);
+    let ln2 = b.c_f32(std::f32::consts::LN_2);
+    let lse = b.mul_f32(s3, ln2);
+    let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
+    let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+    b.store_global(pl, 0, lse, MemTy::B32, false);
+    b.finish()
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -67,8 +192,9 @@ pub fn mla_g1250_qh16_wsd() -> Function {
 }
 
 fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function {
-    // bit 4 of `branchless`: the intra-page form (`_wsi`)
+    // bit 4 of `branchless`: the intra-page form (`_wsi`); bit 5: the KV split across work-groups (`_wsk`: partials to a workspace, `_cmb` combines)
     let intra = branchless & 16 != 0;
+    let split = branchless & 32 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -92,6 +218,14 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     b.arg_tensor("LTL", Ext::grid_y() * Ext::c(4));
     b.arg_tensor("QS", Ext::c(4));
     b.arg_tensor("KS", Ext::c(4));
+    if split {
+        // KV split: grid (S, B), S = passes (kernarg 100) in {1, 2, 4, 8}, flags (116) = log2 S; the workspace (VSC slot) holds per (b, s) the
+        // un-normalised O (16 x 512 f32), then the max and the sum of the 16 heads
+        b.ka_one_of(100, &[1, 2, 4, 8]);
+        b.ka_pow2(116, Ext::ka(100));
+        b.grid_is(0, Ext::ka(100));
+        b.arg_tensor("VSC", Ext::grid_y() * Ext::ka(100) * Ext::c(WS_BYTES));
+    }
     b.sym_range("P", 1, 1 << 24);
     b.sym_range("NPG", 1, 1 << 26);
     b.arg_tensor("KV", Ext::sym("P") * Ext::c(PAGE_BYTES as i64));
@@ -116,6 +250,16 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
     // the page group of the wave (its pages: grp, grp + ngrp, ..) and, with the dim split, its half of the V dims
     let grp = if dsplit { b.bind_i32(ev(w) >> 1) } else { w };
+    // the page sequence of the wave: pages gbase + gstride k (split: the 4 S waves of the S work-groups interleave)
+    let (sid, lgs) = if split { (b.let_(Op::WorkgroupIdX), b.let_(Op::KernargI32 { offset: 116 })) } else { (b.c_i32(0), b.c_i32(0)) };
+    let gbase = if split { b.bind_i32(ev(sid) * 4 + ev(w)) } else { grp };
+    let gshift = if split { b.bind_i32(ev(lgs) + 2) } else { b.c_i32(if dsplit { 1 } else { 2 }) };
+    let gstride = if split {
+        let sc_ = b.let_(Op::KernargI32 { offset: 100 });
+        b.bind_i32(ev(sc_) * 4)
+    } else {
+        b.c_i32(if dsplit { 2 } else { 4 })
+    };
     let hd = b.bind_i32(ev(w) & 1);
     let db = if dsplit { b.bind_i32(ev(hd) * 256) } else { b.c_i32(0) };
     let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
@@ -204,7 +348,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let ov: Vec<VarId> = st[2..].to_vec();
     let ptab_rd = |b: &mut FnBuilder, local: amdgpu_dsl::I32| -> ValueId {
         // past the sequence (the waves run the same trip count): the last page again, all its tokens masked
-        let pg = b.bind_i32(local * ngrp + ev(grp));
+        let pg = b.bind_i32(local * ev(gstride) + ev(gbase));
         let lastp = b.bind_i32(ev(npages) - 1);
         let pc = b.let_(Op::MinI32(Opnd::Val(pg), Opnd::Val(lastp)));
         let a = b.bind_i32((ev(pc) << 2) + ptab.base as i32);
@@ -224,7 +368,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
         mine.write(b, gen, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
     };
     // the pieces of one page (private slot s, generation `local`): S; the softmax (logits, mask, max, P); the O rescale; PV
-    let page_of = |b: &mut FnBuilder, local: amdgpu_dsl::I32| b.bind_i32(local * ngrp + ev(grp));
+    let page_of = |b: &mut FnBuilder, local: amdgpu_dsl::I32| b.bind_i32(local * ev(gstride) + ev(gbase));
     let s_part = |b: &mut FnBuilder, s: usize, gen: ValueId| -> Vec<ValueId> {
         let mine = kw[s].mine(w);
         let sb = b.bind_i32(mine.base());
@@ -474,7 +618,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     };
     // the wave's own pages: nw = ceil((npages - w) / 4) (the page group's), in pairs (an odd last pair re-reads the last page, fully masked);
     // a wave without a page skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
-    let nw = if dsplit { b.bind_i32((ev(npages) - ev(grp) + 1) >> 1) } else { b.bind_i32((ev(npages) - ev(w) + 3) >> 2) };
+    let nw = b.bind_i32((ev(npages) - ev(gbase) + ev(gstride) - 1) >> ev(gshift));
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
@@ -631,6 +775,44 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
         ((mx, sc), lt.unwrap())
     });
     let (mx, sc) = mx;
+    if split {
+        // the partial of this work-group: O un-normalised (scaled to the merged max), the max and the sum of head h
+        let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+            let mut acc: Vec<Option<ValueId>> = vec![None; 64];
+            for wi in 0..nwl {
+                for k in 0..16 {
+                    let a = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + (16 * k + mo.base as i32));
+                    let v4 = b.load_lds_b128(a);
+                    for e in 0..4u8 {
+                        let x = b.frag_slice(Opnd::Val(v4), e, 1);
+                        let xf = f32_of(b, x);
+                        let t = b.mul_f32(xf, sc[wi as usize]);
+                        let i = 4 * k as usize + e as usize;
+                        acc[i] = Some(match acc[i] {
+                            None => t,
+                            Some(y) => b.add_f32(y, t),
+                        });
+                    }
+                }
+            }
+            acc.into_iter().map(|x| x.unwrap()).collect()
+        });
+        let pws = b.let_(Op::KernargPtr { offset: 80 });
+        let s_count = b.let_(Op::KernargI32 { offset: 100 });
+        let wsb = b.bind_i32((ev(bidx) * ev(s_count) + ev(sid)) * WS_BYTES as i32);
+        let wo = b.bind_i32(ev(wsb) + (ev(h) * 512 + ev(d0)) * 4);
+        let pwo = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wo) });
+        for k in 0..16u32 {
+            let parts: Vec<Opnd> = (0..4).map(|i| Opnd::Val(b.let_(Op::BitcastI32(Opnd::Val(outs[4 * k as usize + i]))))).collect();
+            let v = b.frag_cat(&parts);
+            b.store_global(pwo, 16 * k, v, MemTy::B128, false);
+        }
+        let wm = b.bind_i32(ev(wsb) + (8192 + ev(h)) * 4);
+        let pwm = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm) });
+        b.store_global(pwm, 0, mx, MemTy::B32, false);
+        b.store_global(pwm, 64, lt, MemTy::B32, false);
+        return b.finish();
+    }
     let rl = b.rcp_f32(lt);
     let inv = b.mul_f32(rl, ksf);
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();

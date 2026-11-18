@@ -123,6 +123,25 @@ int main(int argc, char** argv) {
     static_assert(sizeof(KA) == 120, "kernarg size");
     size_t ksz = sizeof(ka);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
+    // SPLITS=S (1, 2, 4, 8) + COMBINE_CO / COMBINE_K: the FIRST kernel is a KV-split kernel on grid (S, B) writing partials to a workspace (passed
+    // in the VSC slot; passes = S, flags = log2 S), followed by the combine kernel on grid (1, B); both are timed together as one launch
+    const unsigned S = (unsigned)envi("SPLITS", 1);
+    KA kas = ka;
+    void* cfgs[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &kas, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
+    hipFunction_t fc = nullptr;
+    if (getenv("COMBINE_CO")) {
+        void* dW;
+        HC(hipMalloc(&dW, (size_t)B * S * 8224 * 4));
+        kas.VSC = dW;
+        kas.passes = S;
+        unsigned l2 = 0;
+        while ((1u << l2) < S) l2++;
+        if ((1u << l2) != S || S > 8) FAIL("SPLITS must be 1, 2, 4 or 8");
+        kas.flags = l2;
+        hipModule_t modc;
+        HC(hipModuleLoad(&modc, getenv("COMBINE_CO")));
+        HC(hipModuleGetFunction(&fc, modc, getenv("COMBINE_K") ? getenv("COMBINE_K") : "mla_g1250_qh16_cmb"));
+    }
     hipModule_t mod;
     hipFunction_t f;
     HC(hipModuleLoad(&mod, co));
@@ -140,10 +159,18 @@ int main(int argc, char** argv) {
     hipEvent_t e0, e1;
     HC(hipEventCreate(&e0));
     HC(hipEventCreate(&e1));
-    std::printf("launch grid %ux%dx1 block 128\n", gdx, B);
+    auto launch1 = [&](hipStream_t st) {
+        if (fc) {
+            HC(hipModuleLaunchKernel(f, S, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
+            HC(hipModuleLaunchKernel(fc, 1, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
+        } else {
+            HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg));
+        }
+    };
+    std::printf("launch grid %ux%dx1 block 128%s\n", fc ? S : gdx, B, fc ? " + combine" : "");
     std::fflush(stdout);
     HC(hipEventRecord(e0, s));
-    HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, s, nullptr, cfg));
+    launch1(s);
     HC(hipEventRecord(e1, s));
     wait_deadline(e1, deadline, "first launch");
     std::vector<uint16_t> R((size_t)B * H * DV);
@@ -214,10 +241,10 @@ int main(int argc, char** argv) {
     }
     // timing: median of SAMPLES samples of back-to-back launches (>= MIN_SAMPLE_MS each), FLUSH=1 evicts the caches before every launch (tests/gpu/g1250_timing.h); `iters` is kept for the command line and ignored
     (void)iters;
-    const G1250Timing tmg = g1250_time([&](hipStream_t st) { HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
+    const G1250Timing tmg = g1250_time([&](hipStream_t st) { launch1(st); }, s, wait_deadline, deadline);
     const double us = tmg.median_us;
     if (f2) {
-        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, [&](hipStream_t st) { HC(hipModuleLaunchKernel(f2, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
+        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { launch1(st); }, [&](hipStream_t st) { HC(hipModuleLaunchKernel(f2, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
         std::printf("{\"host\":\"g1250_mla\",\"paired\":true,\"kernel\":\"%s\",\"us\":%.3f,\"us2\":%.3f,\"ratio\":%.4f,\"pair_spread\":%.4f,\"ok\":true}\n", kn, pr.a_us, pr.b_us, pr.ratio_ba, pr.spread_ratio);
     }
     const double cosd = 1 - 2 * dot / std::max(nn, 1e-12);
