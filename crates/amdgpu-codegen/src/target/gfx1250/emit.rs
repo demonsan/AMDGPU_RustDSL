@@ -293,7 +293,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
 
     let vgpr = kdv("next_free_vgpr").map(|v| v as u32).unwrap_or_else(|| round_up(a.max_v.max(1), t.emit.vgpr_granule));
     let sgpr = kdv("next_free_sgpr").map(|v| v as u32).unwrap_or(a.max_s.max(1));
-    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(super::preload_n() as i64);
+    let preload = kdv("user_sgpr_kernarg_preload_length").unwrap_or(0);
     let d = |k: &str, dflt: i64| kdv(k).unwrap_or(dflt);
     // (the kernel descriptor's alignment padding goes into .text; an exact replay pads with the author's s_code_end instead)
     out.push_str(if kdv("code_end_pad").is_some() { "\n" } else { "\n.p2align 6\n" });

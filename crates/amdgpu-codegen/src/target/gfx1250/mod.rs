@@ -12,14 +12,6 @@ pub mod waits;
 
 thread_local! {
     static XNACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static PRELOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// The kernarg dwords the hardware preloads into s[2 ..] for the kernel being compiled (`.amdhsa_user_sgpr_kernarg_preload_length`; LLVM
-/// does the same for `inreg` kernel arguments on gfx1250, no compatibility prologue): the kernel's kernarg reads at those offsets become
-/// SGPR copies instead of scalar loads. Up to 16 dwords (the user SGPRs are s[0:1] + the preload).
-pub fn preload_n() -> u32 {
-    PRELOAD.with(|c| c.get())
 }
 
 /// Whether the kernel runs with XNACK (translation-fault replay) enabled: `kd` fact `xnack` (default off, as our code objects declare it).
@@ -49,12 +41,7 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
     }
     let xn = f.kd.iter().rev().find(|(k, _)| k == "xnack").map_or(false, |(_, v)| *v != 0);
     let old = XNACK.with(|c| c.replace(xn));
-    // the kernarg preload: the author's (exact: kd `user_sgpr_kernarg_preload_length`, read through `KernargPreload`) or, for the own
-    // tail, every kernarg dword up to 16
-    let pre = if f.exact || backend != "own" || f.kd.iter().any(|(k, _)| k == "user_sgpr_kernarg_preload_length") { 0 } else { f.kernarg_size.div_ceil(4).min(16) };
-    let oldp = PRELOAD.with(|c| c.replace(pre));
     let r = compile_inner(f, backend);
-    PRELOAD.with(|c| c.set(oldp));
     XNACK.with(|c| c.set(old));
     r
 }
