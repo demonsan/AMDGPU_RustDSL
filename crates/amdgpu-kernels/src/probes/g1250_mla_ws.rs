@@ -267,19 +267,25 @@ pub fn mla_g1250_qh16_ws() -> Function {
         b.end_if();
         // PV: 32 dim tiles, V fragments in groups of 4
         mine.read_back(b, gen, |b| {
-            for grp in 0..NT / 4 {
-                let fvs: Vec<ValueId> = (0..4)
+            // V fragments one group of 4 tiles ahead of the WMMAs that use them
+            let vgrp = |b: &mut FnBuilder, grp: usize| -> Vec<ValueId> {
+                (0..4)
                     .map(|k| {
                         let nt = 4 * grp + k;
                         let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[jj][nt])).collect();
                         b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
                     })
-                    .collect();
+                    .collect()
+            };
+            let mut cur = vgrp(b, 0);
+            for grp in 0..NT / 4 {
+                let next = if grp + 1 < NT / 4 { vgrp(b, grp + 1) } else { Vec::new() };
                 for k in 0..4 {
                     let o = ov[4 * grp + k];
-                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fvs[k], Some(Opnd::Var(o)));
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, cur[k], Some(Opnd::Var(o)));
                     b.set_var(o, Opnd::Val(d));
                 }
+                cur = next;
             }
         });
         b.set_var(vm, Opnd::Val(m_new));
