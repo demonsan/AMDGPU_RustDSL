@@ -114,10 +114,15 @@ int main(int argc, char** argv) {
     // fp32 reference on sampled rows (all columns)
     const int nrows = getenv("CHECK_ROWS") ? atoi(getenv("CHECK_ROWS")) : 16;
     long bad = 0; double maxrel = 0;
+    // MISMAP=1: per checked row, the wrong elements per workgroup tile column (a bisect aid for cluster / multicast kernels: which operand slices never arrived)
+    const bool mismap = getenv("MISMAP") != nullptr;
+    std::vector<std::vector<int>> rowbad;
+    std::vector<int> rowid;
     for (int s = 0; s < std::min(nrows, M); ++s) {
         const int i = nrows >= M ? s : (int)((long)s * (M - 1) / std::max(1, nrows - 1));
         std::vector<float> arow(K);
         for (int k = 0; k < K; ++k) arow[k] = fp4(A[(size_t)i * KB + k / 2] >> (4 * (k & 1))) * e8m0(SA[(size_t)i * KS + k / 32]);
+        if (mismap) { rowid.push_back(i); rowbad.emplace_back(N / BN, 0); }
         for (int j = 0; j < N; ++j) {
             double ref = 0, scale = 0;
             for (int k = 0; k < K; ++k) {
@@ -127,8 +132,15 @@ int main(int argc, char** argv) {
             const double got = C[(size_t)i * N + j];
             const double err = std::fabs(got - ref);
             const bool ok = !std::isnan(got) && err <= 5e-4 * scale + 1e-3;
-            if (!ok) { if (bad < 8) printf("  mismatch C[%d][%d]: got %g ref %g\n", i, j, got, ref); ++bad; }
+            if (!ok) { if (bad < 8) printf("  mismatch C[%d][%d]: got %g ref %g\n", i, j, got, ref); ++bad; if (mismap) rowbad.back()[j / BN]++; }
             if (!std::isnan(err)) maxrel = std::max(maxrel, err / (scale + 1e-9));
+        }
+    }
+    if (mismap) {
+        for (size_t r = 0; r < rowid.size(); ++r) {
+            printf("  row %4d:", rowid[r]);
+            for (int c : rowbad[r]) printf(" %3d", c);
+            printf("\n");
         }
     }
     double us = 0, tflops = 0;
