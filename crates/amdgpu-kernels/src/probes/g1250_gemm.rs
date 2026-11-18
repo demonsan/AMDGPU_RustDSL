@@ -304,6 +304,12 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_pad() -> Function {
     gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, false, true)
 }
 
+pub const F4_256X256_KS2_PAD_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax";
+/// `_256x256_ks2_pad` with the relaxed tensor waits (each window completes the previous stage's tile; `F4Shape::relax`).
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_relax() -> Function {
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1 }, true, false, false, true)
+}
+
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
     gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, false, true)
