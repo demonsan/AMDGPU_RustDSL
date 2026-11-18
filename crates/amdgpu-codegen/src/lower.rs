@@ -2205,6 +2205,18 @@ impl Lowerer {
     /// (s) The words of an SGPR tuple `d`, one `s_mov_b32` each (an authored word: no instruction when pinned at its slot).
     fn sgpr_words(&mut self, d: VReg, words: &[Opnd]) -> Result<(), String> {
         for (i, w) in words.iter().enumerate() {
+            // gfx1250: a word computed in this block for this tuple only is written into the tuple by its producer (no s_mov)
+            if crate::target::cur().name == "gfx1250" {
+                if let Opnd::Val(v) = w {
+                    if self.read_counts.get(v).copied() == Some(1) {
+                        if let Some(&r) = self.val.get(v) {
+                            if self.mir.vreg_class(r) == RClass::S1 && self.retarget_def(r, d, i as u8, RClass::S1) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             let s = self.s_operand(*w)?;
             if let Src::Reg(x) = s {
                 self.touch(&[Src::Reg(x)]);
