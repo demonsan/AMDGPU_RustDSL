@@ -49,6 +49,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
+    Rule { id: "GV-1250-TDM-STORE-PAD", layer: Layer::Ir, what: "a tensor store from LDS has no LDS padding: the hardware reads a store's LDS source contiguously (MI450: a padded source came out shifted from its second row on), so a store descriptor whose pad-enable bit is set, or not known to be clear at compile time, is an error; lay out the staging rows unpadded" },
     Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
@@ -1715,6 +1716,14 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
         match st {
             Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
+                if matches!(st, Stmt::TensorStoreFromLds { .. }) {
+                    // GV-1250-TDM-STORE-PAD: group 1 word 0 bit 20 (pad enable) must be a compile-time 0
+                    match group_words(&defs, g1).first() {
+                        Some(Some(a0)) if a0 >> 20 & 1 == 0 => {}
+                        Some(Some(_)) => viol(&mut v, "GV-1250-TDM-STORE-PAD", format!("statement {pos}: a tensor store whose descriptor enables LDS padding: the store reads its LDS source unpadded (rows after the first would come from the wrong addresses)")),
+                        _ => viol(&mut v, "GV-1250-TDM-STORE-PAD", format!("statement {pos}: a tensor store whose LDS padding field is not a compile-time constant: it must be provably off")),
+                    }
+                }
                 lds_extent_check(f, &cxm, marker.as_ref().map(|(n, o)| (n.as_str(), o)), pos, g0, g1, &mut v);
                 let m = mcast_mask(f, &defs, &kz, g1);
                 if m != Mask::Zero {

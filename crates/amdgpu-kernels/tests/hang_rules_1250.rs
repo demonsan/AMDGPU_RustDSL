@@ -1024,6 +1024,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),
     ("GV-1250-TDM-DESC", "tdm_desc"),
+    ("GV-1250-TDM-STORE-PAD", "tdm_store_pad"),
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
@@ -1058,4 +1059,29 @@ fn the_probes_pass_the_rules() {
         let v = verify_asm(&asm);
         assert!(v.is_empty(), "{k}: {v:?}");
     }
+}
+
+// GV-1250-TDM-STORE-PAD
+
+/// A tensor store from LDS with group-1 word 0 `w0` (bit 20: pad enable).
+fn tdm_store_kernel(w0: i32) -> Function {
+    let mut b = FnBuilder::new("hr_store_pad", 64);
+    b.tdm_host_descriptor();
+    b.lds(8192);
+    let g0 = b.let_(Op::RsrcCat { words: [Opnd::I32(1), Opnd::I32(0), Opnd::I32(0), Opnd::I32(TYPE2)] });
+    let g1 = b.sgpr_cat8([Opnd::I32(w0), Opnd::I32(4096 << 16), Opnd::I32(0), Opnd::I32(64 << 16), Opnd::I32(1), Opnd::I32(4096), Opnd::I32(0), Opnd::I32(0)]);
+    b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.wait_tensor(0);
+    b.finish()
+}
+
+#[test]
+fn mut_tdm_store_pad() {
+    // pad enable (bit 20) with interval 128 dwords (field 6) and 4 dwords (field 3): the 2026-11-18 epilogue's first layout
+    ir_mutation(&tdm_store_kernel(0x20000 | 1 << 20 | 6 << 22 | 3 << 25), "GV-1250-TDM-STORE-PAD");
+}
+
+#[test]
+fn pos_tdm_store_pad() {
+    ir_positive(&tdm_store_kernel(0x20000));
 }

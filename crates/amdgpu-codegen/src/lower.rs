@@ -553,6 +553,8 @@ struct Lowerer {
     cur_stmt: u32,
     /// exact authored mode (docs/exact-mode.md): forms the author wrote (an MFMA reads its accumulator where it is, no copy into the result)
     exact: bool,
+    /// the kernel is launched in workgroup clusters (kd `cluster_dims`): TTMP9 / TTMP7 hold cluster ids there, not workgroup ids
+    clustered: bool,
     /// `Permlane32SwapA` value -> the register of its second result (`Permlane32SwapB`)
     swap_second: HashMap<ValueId, VReg>,
     /// exact mode: I1 values held as a lane mask in an SGPR pair
@@ -684,6 +686,7 @@ impl Lowerer {
         Lowerer {
             cur_origin: u32::MAX,
             exact: f.exact,
+            clustered: f.kd.iter().any(|(k, v)| k == "cluster_dims" && *v > 1),
             swap_second: HashMap::new(),
             mask_i1: HashSet::new(),
             mask_vcc: HashSet::new(),
@@ -3600,6 +3603,11 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             // gfx1250: the workgroup ids are architected (x = TTMP9, y = TTMP7[15:0], z = TTMP7[31:16]; no workgroup clusters)
+            Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ if crate::target::cur().name == "gfx1250" && self.clustered => {
+                return Err(format!(
+                    "{op:?} in a cluster launch: TTMP9 / TTMP7 hold the CLUSTER ids there; form the workgroup position from the cluster id x the cluster dims + the position in the cluster (ReadTtmp 6)"
+                ));
+            }
             Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ if crate::target::cur().name == "gfx1250" => {
                 let t = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SReadTtmp).def(t).imm(if matches!(op, Op::WorkgroupIdX) { 9 } else { 7 }));
