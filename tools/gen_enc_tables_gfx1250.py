@@ -58,7 +58,7 @@ EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("s_barrier_signal_isfirst", "s_bar
          ("v_add_nc_u64", "v_add_nc_u64_e32 v[2:3], v[4:5], v[6:7]"), ("v_cvt_pk_fp8_f32", "v_cvt_pk_fp8_f32 v1, v2, v3"),
          ("v_permlane16_swap_b32", "v_permlane16_swap_b32_e32 v1, v2"), ("v_pk_add_f32", "v_pk_add_f32 v[2:3], v[4:5], v[6:7]"),
          ("v_pk_fma_f32", "v_pk_fma_f32 v[2:3], v[4:5], v[6:7], v[8:9]"), ("v_pk_mul_f32", "v_pk_mul_f32 v[2:3], v[4:5], v[6:7]"),
-         ("v_rcp_iflag_f32", "v_rcp_iflag_f32_e32 v1, v2")]
+         ("v_rcp_iflag_f32", "v_rcp_iflag_f32_e32 v1, v2"), ("v_readlane_b32", "v_readlane_b32 s1, v2, 3")]
 
 
 def samples():

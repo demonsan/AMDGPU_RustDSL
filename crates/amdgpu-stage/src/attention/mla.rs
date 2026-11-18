@@ -131,6 +131,10 @@ pub struct MlaBody {
     pub tid: ValueId,
     /// the pipeline's ring depth (`Pipeline::slots`): `depth - 2` staged tiles stay in flight at the end of a window
     pub depth: u8,
+    /// cross-tile prefetch: the S^T of tile t + 1 is computed in window t (from `t.next`, published since window t - 1) and carried as loop state
+    pub prefetch: bool,
+    /// S^T of tile 0 (computed in `prologue_compute`: the initial value of the carried S)
+    pub s0: Vec<ValueId>,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
     pub vars: Vec<VarId>,
 }
@@ -141,6 +145,41 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 
 fn bits_of(b: &mut FnBuilder, v: ValueId) -> Opnd {
     Opnd::Val(b.let_(Op::BitcastI32(Opnd::Val(v))))
+}
+
+impl MlaBody {
+    /// S^T of the tile in `slot` (one Frag8 per page: lane (m, g) = head m, tokens 16 w + 8 g + r): all K fragments first, then the WMMA chain
+    fn s_tile(&self, b: &mut FnBuilder, slot: &SlotIdx) -> Vec<ValueId> {
+        let kv = self.kv.at(slot);
+        let sb = b.bind_i32(kv.base());
+        let q = self.q.clone();
+        let mut out = Vec::new();
+        for pg in 0..PAGES {
+            let pb = b.bind_i32(ev(sb) + pg * self.layout.slot_bytes);
+            let nope_row = b.bind_i32(ev(pb) + ev(self.kofs));
+            let rope_row = b.bind_i32(ev(pb) + ev(self.rofs));
+            let s = kv.read(b, |b| {
+                let fa: Vec<ValueId> = (0..9)
+                    .map(|c| {
+                        let lo = if c < 8 { b.bind_i32(ev(nope_row) + self.kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
+                        let hi = b.bind_i32(ev(lo) + 16);
+                        b.load_lds_b128x2(lo, hi)
+                    })
+                    .collect();
+                let mut acc: Option<Opnd> = None;
+                for c in 0..9 {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[c], q[c], acc);
+                    acc = Some(Opnd::Val(d));
+                }
+                match acc {
+                    Some(Opnd::Val(v)) => v,
+                    _ => unreachable!(),
+                }
+            });
+            out.push(s);
+        }
+        out
+    }
 }
 
 impl PipeBody for MlaBody {
@@ -180,8 +219,10 @@ impl PipeBody for MlaBody {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        // the counters are in order: the tiles staged after the next one (depth - 2 of them) stay in flight; t + 1 is complete
-        let ahead = self.depth as i32 - 2;
+        // the counters are in order: the tiles staged after the next one (depth - 2 of them) stay in flight; t + 1 is complete. With the
+        // cross-tile prefetch, window t + 1 also reads tile t + 2: one tile fewer in flight (depth - 3; the ring needs depth >= 4)
+        let ahead = self.depth as i32 - 2 - self.prefetch as i32;
+        assert!(ahead >= 1 || !self.prefetch, "MLA prefetch: needs a ring of at least 4 slots");
         if self.async_kv {
             let n = ahead * PAGES * PAGE_BYTES / 2048;
             assert!(n <= 63, "MLA async KV: {n} loads in flight exceed ASYNCcnt (6 bits): use a shallower ring");
@@ -195,7 +236,11 @@ impl PipeBody for MlaBody {
         self.depth = slots;
     }
 
-    fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
+    fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
+        if self.prefetch {
+            self.s0 = self.s_tile(b, &t0.cur);
+        }
+    }
 
     fn loop_state(&mut self, b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let neg = b.c_f32(-1.0e30);
@@ -204,6 +249,11 @@ impl PipeBody for MlaBody {
         for _ in 0..8 {
             let z = b.frag_cat(&[Opnd::I32(0); 8]);
             v.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
+        }
+        if self.prefetch {
+            for s in self.s0.clone() {
+                v.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(s)));
+            }
         }
         v
     }
@@ -221,34 +271,18 @@ impl PipeBody for MlaBody {
         let sb = b.bind_i32(kv.base());
         let q = self.q.clone();
         let neg = b.c_f32(-1.0e30);
-        // ---- S^T per page: A = K rows (token 16 w + m), B = Q; then the base-2 logits, masked beyond the sequence ----
+        // ---- S^T per page (carried from the previous window when prefetching); then the base-2 logits, masked in the peeled last tile ----
+        let svals: Vec<Opnd> = if self.prefetch {
+            (0..PAGES as usize).map(|pg| Opnd::Var(self.vars[10 + pg])).collect()
+        } else {
+            self.s_tile(b, &t.cur).into_iter().map(Opnd::Val).collect()
+        };
         let mut x: Vec<ValueId> = Vec::with_capacity(8 * PAGES as usize);
         for pg in 0..PAGES {
-            let pb = b.bind_i32(ev(sb) + pg * self.layout.slot_bytes);
-            let nope_row = b.bind_i32(ev(pb) + ev(self.kofs));
-            let rope_row = b.bind_i32(ev(pb) + ev(self.rofs));
-            let s = kv.read(b, |b| {
-                // all nine K fragments first (distinct registers: the reads overlap), then the WMMA chain
-                let fa: Vec<ValueId> = (0..9)
-                    .map(|c| {
-                        let lo = if c < 8 { b.bind_i32(ev(nope_row) + self.kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
-                        let hi = b.bind_i32(ev(lo) + 16);
-                        b.load_lds_b128x2(lo, hi)
-                    })
-                    .collect();
-                let mut acc: Option<Opnd> = None;
-                for c in 0..9 {
-                    let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[c], q[c], acc);
-                    acc = Some(Opnd::Val(d));
-                }
-                match acc {
-                    Some(Opnd::Val(v)) => v,
-                    _ => unreachable!(),
-                }
-            });
+            let s = svals[pg as usize];
             let tok0 = b.bind_i32(t.key0() + (64 * pg) + ev(w) * 16 + ev(g) * 8);
             for r in 0..8u8 {
-                let si = b.frag_slice(Opnd::Val(s), r, 1);
+                let si = b.frag_slice(s, r, 1);
                 let sf = f32_of(b, si);
                 let v = b.mul_f32(sf, self.cscale);
                 if t.masked {
@@ -343,6 +377,13 @@ impl PipeBody for MlaBody {
             }
         }
         b.end_if();
+        // ---- prefetch: S^T of tile t + 1 (published at the end of window t - 1), independent of this tile's PV below ----
+        if self.prefetch && t.staged {
+            let sn = self.s_tile(b, &t.next);
+            for pg in 0..PAGES as usize {
+                b.set_var(self.vars[10 + pg], Opnd::Val(sn[pg]));
+            }
+        }
         let vd = self.vdelta.clone();
         kv.read(b, |b| {
             for pg in 0..PAGES {

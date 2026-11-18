@@ -2311,5 +2311,6 @@ pub fn probe_mfma_scale_opsel() -> Function {
 pub mod g1250;
 pub mod g1250_gemm;
 pub mod g1250_mla;
+pub mod g1250_mla_ws;
 pub mod handoff;
 pub mod tileops;

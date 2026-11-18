@@ -226,6 +226,7 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("v_rcp_f32", "VOP1", 42),
     ("v_rcp_iflag_f32", "VOP1", 43),
     ("v_readfirstlane_b32", "VOP1", 2),
+    ("v_readlane_b32", "VOP3", 864),
     ("v_rndne_f32", "VOP1", 35),
     ("v_rsq_f32", "VOP1", 46),
     ("v_sin_f32", "VOP1", 53),

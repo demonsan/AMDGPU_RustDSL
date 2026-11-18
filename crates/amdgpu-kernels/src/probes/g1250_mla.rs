@@ -47,20 +47,25 @@ const MAX_PAGES: i32 = 1024;
 /// sequence per work-group. The stage body is `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline (3 pages in flight through
 /// the tensor data mover). Output: bf16 R [B][16][512], the natural-log LSE [B][16].
 pub fn mla_g1250_qh16() -> Function {
-    mla_g1250_qh16_with(MLA_NAME, false, 3)
+    mla_g1250_qh16_with(MLA_NAME, false, 3, false)
 }
 
 /// The MLA decode with the KV pages loaded by per-lane async 16-byte copies instead of the tensor data mover (`async_kv`).
 pub fn mla_g1250_qh16_async() -> Function {
-    mla_g1250_qh16_with("mla_g1250_qh16_async", true, 3)
+    mla_g1250_qh16_with("mla_g1250_qh16_async", true, 3, false)
 }
 
 /// The MLA decode with a 4-slot ring (the producer runs 3 tiles ahead).
 pub fn mla_g1250_qh16_s4() -> Function {
-    mla_g1250_qh16_with("mla_g1250_qh16_s4", false, 4)
+    mla_g1250_qh16_with("mla_g1250_qh16_s4", false, 4, false)
 }
 
-fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8) -> Function {
+/// The MLA decode with the cross-tile prefetch window: S of tile t + 1 is computed in window t (carried), overlapping tile t's PV.
+pub fn mla_g1250_qh16_pf() -> Function {
+    mla_g1250_qh16_with("mla_g1250_qh16_pf", false, 4, true)
+}
+
+fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8, prefetch: bool) -> Function {
     use amdgpu_dsl::{ev, TensorTile, WmmaKind};
     use amdgpu_stage::attention::mla::{MlaBody, PageLayout, DV as DVB, PAGES, PAGE_BYTES, PAGE_TOKENS, QUARTER, ROPE_OFF};
     let layout = PageLayout::plan();
@@ -187,7 +192,7 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8) -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
-    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, async_kv, tid, depth: slots, vars: Vec::new() };
+    let mut body = MlaBody { kv, red: red.clone(), pbuf, abuf, pkv, ptab, ctx, g1, w, m, g, lane, q, kofs, rofs, vofs, kdelta, vdelta, layout, cscale, npages, async_kv, tid, depth: slots, prefetch, s0: Vec::new(), vars: Vec::new() };
     // one pipeline tile = PAGES pages (the last one possibly partial: its clamped pages are masked by ctx)
     let ntiles = b.bind_i32((ev(npages) + (PAGES - 1)) >> PAGES.trailing_zeros() as i32);
     let mut pipe = Pipeline::new(Cadence::OneWindow, ntiles, ctx, PAGE_TOKENS * PAGES, Ext::c(1 << 16));
