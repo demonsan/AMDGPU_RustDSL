@@ -119,7 +119,10 @@ int main(int argc, char** argv) {
     while ((1 << lgx) < tx) ++lgx;
     if (persist && ((1 << lgx) != tx || persist % tx || persist > tx * ty)) { fprintf(stderr, "PERSIST=%d: N / BN = %d must be a power of two dividing it, at most %d tiles\n", persist, tx, tx * ty); return 1; }
     struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1};
-    size_t ksz = persist ? sizeof(ka) : 48;
+    // SWIZZLE=G: the kernel remaps the tile order (rows grouped by G); it needs the log2 of the tile columns (kernarg @52)
+    const int swizzle = getenv("SWIZZLE") ? atoi(getenv("SWIZZLE")) : 0;
+    if (swizzle && (((1 << lgx) != tx) || ty % swizzle)) { fprintf(stderr, "SWIZZLE=%d: N / BN = %d must be a power of two and the tile rows %d a multiple of it\n", swizzle, tx, ty); return 1; }
+    size_t ksz = (persist || swizzle) ? sizeof(ka) : 48;
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
         unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
