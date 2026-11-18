@@ -628,6 +628,7 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                 let d = a.phys[inst.dst.ok_or("a wave-state read without a destination")? as usize];
                 match op {
                     0 => format!("s_getreg_b32 s{d}, {}", hw(k)),
+                    2 => format!("s_get_shader_cycles_u64 s[{}:{}]", d, d + 1),
                     _ => format!("s_get_pc_i64 s[{}:{}]", d, d + 1),
                 }
             } else {

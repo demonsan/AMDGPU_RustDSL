@@ -840,7 +840,7 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Wmma { kind, .. } => kind.acc_ty(),
             Op::Raw { ty, .. } => *ty,
-            Op::SysVal { op: SysValOp::GetPc, .. } => DType::Ptr,
+            Op::SysVal { op: SysValOp::GetPc, .. } | Op::SysVal { op: SysValOp::ShaderCycles, .. } => DType::Ptr,
             Op::SysVal { .. } => DType::I32,
             Op::Salu { op: SaluOp::AddNcU64 | SaluOp::MovB64, .. } => DType::Ptr,
             Op::Salu { .. } => DType::I32,
@@ -3891,6 +3891,12 @@ impl FnBuilder {
         self.push_stmt(Stmt::LoadAsyncLds { lds: lds.into(), vaddr: vaddr.into(), imm });
     }
 
+    /// gfx1250: the shader-clock cycle counter (`s_get_shader_cycles_u64`), a wave-uniform 64-bit value (as a Ptr-typed pair; `PtrLo` gives
+    /// the low word). A debugging / timing aid.
+    pub fn shader_cycles(&mut self) -> ValueId {
+        self.let_(Op::SysVal { op: SysValOp::ShaderCycles, imm: 0 })
+    }
+
     /// gfx1250: the program counter (`s_get_pc_i64`), a wave-uniform 64-bit value.
     pub fn get_pc(&mut self) -> ValueId {
         self.let_(Op::SysVal { op: SysValOp::GetPc, imm: 0 })
@@ -4507,6 +4513,8 @@ pub enum SysOp {
 pub enum SysValOp {
     GetReg,
     GetPc,
+    /// `s_get_shader_cycles_u64`: the 64-bit shader-clock counter (gfx1250; a debugging / timing aid, no other effect)
+    ShaderCycles,
 }
 
 /// The scalar forms of `Op::Salu` (gfx1250 SALU; each one instruction, wave-uniform operands).

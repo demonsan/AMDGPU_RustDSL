@@ -270,7 +270,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
     let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
     let mut stamps: Vec<ValueId> = Vec::new();
-    let cyc = |b: &mut FnBuilder| b.let_(Op::SysVal { op: amdgpu_dsl::SysValOp::GetReg, imm: 29 | (19 << 11) });
+    let cyc = |b: &mut FnBuilder| {
+        let c = b.shader_cycles();
+        b.let_(Op::PtrLo(Opnd::Val(c)))
+    };
     if ipf {
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });

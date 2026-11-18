@@ -475,6 +475,7 @@ impl FromIr for SysValOp {
         match v.name()? {
             "GetReg" => { v.expect_unit("GetReg")?; Ok(SysValOp::GetReg) }
             "GetPc" => { v.expect_unit("GetPc")?; Ok(SysValOp::GetPc) }
+            "ShaderCycles" => { v.expect_unit("ShaderCycles")?; Ok(SysValOp::ShaderCycles) }
             other => Err(v.err(format!("unknown SysValOp variant `{other}`"))),
         }
     }
@@ -484,6 +485,7 @@ impl IrIds for SysValOp {
         match self {
             SysValOp::GetReg => {}
             SysValOp::GetPc => {}
+            SysValOp::ShaderCycles => {}
         }
     }
 }

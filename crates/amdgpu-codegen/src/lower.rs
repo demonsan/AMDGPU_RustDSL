@@ -4741,7 +4741,7 @@ impl Lowerer {
             }
             Op::SysVal { op, imm } => {
                 tdm_target()?;
-                let d = self.new_vreg(if *op == amdgpu_dsl::SysValOp::GetPc { RClass::S2 } else { RClass::S1 });
+                let d = self.new_vreg(if matches!(op, amdgpu_dsl::SysValOp::GetPc | amdgpu_dsl::SysValOp::ShaderCycles) { RClass::S2 } else { RClass::S1 });
                 let mut inst = MInst::new(MOp::SSysVal).def(d).imm((*op as i64) | ((*imm as i64 & 0xffff) << 8));
                 inst.pin = true;
                 self.push(inst);
