@@ -23,6 +23,21 @@
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); _exit(2); } } while (0)
 
 static double g_limit = 15.0;
+static int g_cx = 1, g_cy = 1;   // CLUSTER=cx,cy: launch with the cluster attribute (a multicast kernel); the grid must divide by it
+
+// one launch: plain, or with the cluster dimension attribute (hipDrvLaunchKernelEx)
+static hipError_t launch(hipFunction_t fn, unsigned gx, unsigned gy, unsigned thr, void** cfg) {
+    if (g_cx * g_cy <= 1) return hipModuleLaunchKernel(fn, gx, gy, 1, thr, 1, 1, 0, nullptr, nullptr, cfg);
+    HIP_LAUNCH_CONFIG lc{};
+    lc.gridDimX = gx; lc.gridDimY = gy; lc.gridDimZ = 1;
+    lc.blockDimX = thr; lc.blockDimY = 1; lc.blockDimZ = 1;
+    lc.sharedMemBytes = 0; lc.hStream = nullptr;
+    hipLaunchAttribute at{};
+    at.id = hipLaunchAttributeClusterDimension;
+    at.val.clusterDim.x = g_cx; at.val.clusterDim.y = g_cy; at.val.clusterDim.z = 1;
+    lc.attrs = &at; lc.numAttrs = 1;
+    return hipDrvLaunchKernelEx(&lc, fn, nullptr, cfg);
+}
 static void wait_polled(hipEvent_t ev, const char* what) {
     auto t0 = std::chrono::steady_clock::now();
     while (hipEventQuery(ev) == hipErrorNotReady) {
@@ -46,6 +61,8 @@ int main(int argc, char** argv) {
     const int BM = argc > 7 ? atoi(argv[7]) : 128, BN = argc > 8 ? atoi(argv[8]) : 64, THR = argc > 9 ? atoi(argv[9]) : 128;
     if (M % BM || N % BN || K % 128) { fprintf(stderr, "M %% %d, N %% %d, K %% 128 required\n", BM, BN); return 1; }
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
+    if (const char* cl = getenv("CLUSTER")) std::sscanf(cl, "%d,%d", &g_cx, &g_cy);
+    if (g_cx * g_cy > 1 && ((N / BN) % g_cx || (M / BM) % g_cy)) { fprintf(stderr, "the grid (%d x %d) must divide by the cluster (%d x %d)\n", N / BN, M / BM, g_cx, g_cy); return 1; }
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
     printf("device: %s  arch: %s  CUs: %d\n", prop.name, prop.gcnArchName, prop.multiProcessorCount);
@@ -79,11 +96,11 @@ int main(int argc, char** argv) {
     size_t ksz = sizeof(ka);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
-        const unsigned gx = stage == 0 ? 1 : N / BN, gy = stage == 0 ? 1 : M / BM;
+        const unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
         if (stage == 1 && gx == 1 && gy == 1) break;
         hipEvent_t e;
         HC(hipEventCreate(&e));
-        HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
+        HC(launch(fn, gx, gy, THR, cfg));
         HC(hipEventRecord(e, nullptr));
         wait_polled(e, kn);
     }
@@ -115,9 +132,9 @@ int main(int argc, char** argv) {
         hipEvent_t e0, e1;
         HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
         const unsigned gx = N / BN, gy = M / BM;
-        for (int w = 0; w < 3; ++w) HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
+        for (int w = 0; w < 3; ++w) HC(launch(fn, gx, gy, THR, cfg));
         HC(hipEventRecord(e0, nullptr));
-        for (int i = 0; i < iters; ++i) HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
+        for (int i = 0; i < iters; ++i) HC(launch(fn, gx, gy, THR, cfg));
         HC(hipEventRecord(e1, nullptr));
         wait_polled(e1, "timing");
         float ms = 0;

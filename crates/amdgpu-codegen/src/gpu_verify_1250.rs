@@ -175,6 +175,8 @@ impl KnownZero {
                 Some(n) if n < 32 => (self.of(a) >> n) | !(u32::MAX >> n),
                 _ => 0,
             },
+            // a sum of values whose possibly-set bits are disjoint is their `or` (the fields of a descriptor word)
+            Op::AddI32(a, b) if !self.of(a) & !self.of(b) == 0 => self.of(a) & self.of(b),
             Op::AddI32(a, b) | Op::Salu { op: amdgpu_dsl::SaluOp::AddCoI32 | amdgpu_dsl::SaluOp::SubCoI32, a, b } => Self::low(self.tz(a).min(self.tz(b))),
             Op::MulI32(a, b) => Self::low(self.tz(a) + self.tz(b)),
             Op::MovS { a, .. } | Op::MovV { a, .. } => self.of(a),
@@ -958,6 +960,8 @@ fn eval_i(o: &Opnd, cx: &EvCtx, tid: i32, depth: u32) -> Option<i64> {
                     };
                     r as i32
                 }
+                // a wave-uniform read of a per-lane value: the value of the wave (eval_wave requires every lane of the wave to agree)
+                Op::ReadFirstLane(x) | Op::MovS { a: x, .. } | Op::MovV { a: x, .. } => go(x)?,
                 Op::Select { cond, a, b, .. } => {
                     if go(cond)? != 0 {
                         go(a)?

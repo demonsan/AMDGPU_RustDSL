@@ -16,6 +16,7 @@ use amdgpu_codegen::DEFAULT_SCALAR;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol, TensorTile, ValueId, WmmaKind};
 use amdgpu_stage::gemm::tdm_f4::F4Shape;
 
+
 /// C tile rows / columns per workgroup, K bytes per tile, ring slots.
 pub const BM: i32 = 32;
 pub const BN: i32 = 32;
@@ -385,7 +386,7 @@ pub const F4_NAME: &str = "gemm_g1250_tdm_stage_f4";
 /// per 32 K (`sa` [M][K / 32] bytes, `sb` [N][K / 32] bytes), `v_wmma_scale_f32_32x16x128_f4`. A 128 x 64 C tile per workgroup (4 waves 2 x 2, each wave 2 x 2 WMMAs of 32 x 16), K tiles of
 /// 128, the 3-slot ring of the OneWindow cadence. Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40 (K elements, a multiple of 128), n @44. Grid (N / 64, M / 128).
 pub fn gemm_tdm_stage_f4() -> Function {
-    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 /// 128 x 128 tile (4 waves, each 2 x 4 WMMAs).
@@ -397,15 +398,15 @@ pub const F4_256X64: &str = "gemm_g1250_tdm_stage_f4_256x64";
 pub const F4_256X128: &str = "gemm_g1250_tdm_stage_f4_256x128";
 
 pub fn gemm_tdm_stage_f4_128x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 /// K sub-steps per ring slot (a slot holds `ks x 128` K elements: more WMMAs per barrier / tensor wait; the fragment loads of the next sub-step are issued before the WMMAs of the current one).
@@ -414,22 +415,32 @@ pub const F4_128X128_KS4: &str = "gemm_g1250_tdm_stage_f4_128x128_ks4";
 pub const F4_256X128_KS2: &str = "gemm_g1250_tdm_stage_f4_256x128_ks2";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_128x128_ks4() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 /// Relaxed tensor waits (`F4Shape::relax`): the 128 x 128 tile with 2 sub-steps per slot.
 pub const F4_128X128_KS2_RELAX: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_relax";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2_relax() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true, cx: 1, cy: 1 }, true, false)
+}
+
+/// Cluster multicast (docs/mxfp4-gemm-gfx1250-plan.md step 8): the 128 x 128 tile, 2 K sub-steps per slot, in a cluster of 2 x 2 / 2 x 1 / 1 x 2 workgroups (launch with the cluster attribute and
+/// a grid divisible by it).
+pub const F4_128X128_KS2_C2X2: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x2";
+pub const F4_128X128_KS2_C2X1: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1";
+pub const F4_128X128_KS2_C1X2: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2";
+
+pub fn gemm_tdm_stage_f4_128x128_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx, cy }, true, false)
 }
 
 /// The 8-wave 256 x 64 tile (4 x 2 waves, each 2 x 2 WMMAs, cooperative loads, the original interleaved ring layout): the configuration that hung a device on 2026-11-17 (declared LDS 86,784 B).
@@ -437,7 +448,7 @@ pub fn gemm_tdm_stage_f4_128x128_ks2_relax() -> Function {
 pub const F4_8W: &str = "gemm_g1250_tdm_stage_f4_8w_256x64";
 
 pub fn gemm_tdm_stage_f4_8w_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false }, true, true)
+    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, true)
 }
 
 /// The ks = 2 kernels (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original wrong-result build (the four parts interleaved per slot by `ring_group`, declared 103,936
@@ -446,11 +457,11 @@ pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
 pub const F4_KS2: &str = "gemm_g1250_tdm_stage_f4_ks2";
 
 pub fn gemm_tdm_stage_f4_ks2_grouped() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false }, true, true)
+    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1 }, true, true)
 }
 
 pub fn gemm_tdm_stage_f4_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
 /// The MXFP4 stage-template GEMM for a workgroup shape (`sh`) and the loading scheme (`coop`: every wave loads a slice of the tile; otherwise every wave loads all of it). The four rings (A, B and the
@@ -489,10 +500,31 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let kk = b.let_(Op::KernargI32 { offset: 40 });
     let nn = b.let_(Op::KernargI32 { offset: 44 });
     let tid = b.let_(Op::WorkitemId);
-    let wgx = b.let_(Op::WorkgroupIdX);
-    let wgy = b.let_(Op::WorkgroupIdY);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
     let w = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let (cx, cy) = (sh.cx, sh.cy);
+    let clustered = cx * cy > 1;
+    // the workgroup's tile coordinates and, in a cluster, its position inside the cluster (TTMP6[3:0] / [7:4]); in a cluster launch TTMP9 / TTMP7[15:0] are the CLUSTER ids
+    let (wgx, wgy, wg_x, wg_y) = if clustered {
+        let bfe = |b: &mut FnBuilder, v: ValueId, off: i32, wd: i32| {
+            let sh = if off == 0 { v } else { b.let_(Op::LshrI32(Opnd::Val(v), Opnd::I32(off))) };
+            b.let_(Op::AndI32(Opnd::Val(sh), Opnd::I32((1 << wd) - 1)))
+        };
+        let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+        let t7 = b.let_(Op::ReadTtmp { idx: 7 });
+        let t9 = b.let_(Op::ReadTtmp { idx: 9 });
+        let (wx, wy) = (bfe(&mut b, t6, 0, 4), bfe(&mut b, t6, 4, 4));
+        let cyid = b.let_(Op::AndI32(Opnd::Val(t7), Opnd::I32(0xffff)));
+        let gx0 = b.mul_i32(t9, Opnd::I32(cx));
+        let gx = b.add_i32(gx0, wx);
+        let gy0 = b.mul_i32(cyid, Opnd::I32(cy));
+        let gy = b.add_i32(gy0, wy);
+        (gx, gy, wx, wy)
+    } else {
+        let gx = b.let_(Op::WorkgroupIdX);
+        let gy = b.let_(Op::WorkgroupIdY);
+        (gx, gy, gx, gy)
+    };
     assert!((sh.wn as u32).is_power_of_two(), "wn a power of two");
     let wi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(sh.wn.trailing_zeros() as i32)));
     let wj = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(sh.wn - 1)));
@@ -505,12 +537,24 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
     // cooperative loads: wave w loads rows [w * R / waves, ..) of each tile (R / waves rows)
     let nw = sh.waves();
-    let div = if coop { nw } else { 1 };
-    let (rpa, rpb) = (bm / div, bn / div);
+    assert!(coop || !clustered, "a cluster needs cooperative loads");
+    let (diva, divb) = if coop { (nw * cx, nw * cy) } else { (1, 1) };
+    assert!(bm % diva == 0 && bn % divb == 0, "the tile splits evenly over the waves of the cluster row / column");
+    let (rpa, rpb) = (bm / diva, bn / divb);
     // the wave id is wave-uniform: read it into an SGPR so the slice offsets and descriptors stay scalar
-    let wsl = if coop { b.let_(Op::ReadFirstLane(Opnd::Val(w))) } else { b.c_i32(0) };
-    let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
-    let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
+    let wid = b.let_(Op::ReadFirstLane(Opnd::Val(w)));
+    let wsl = if coop { wid } else { b.c_i32(0) };
+    let leader = b.bind_cond(ev(wid).eq(0));
+    // the slice of the A tile (shared by the cluster row) this wave loads: slice index = (workgroup x in the cluster) x waves + wave; of the B tile (shared by the cluster column): (workgroup y) x waves + wave
+    let (sa_i, sb_i) = if clustered {
+        let xa = b.mul_i32(wg_x, Opnd::I32(nw));
+        let ya = b.mul_i32(wg_y, Opnd::I32(nw));
+        (b.add_i32(xa, wsl), b.add_i32(ya, wsl))
+    } else {
+        (wsl, wsl)
+    };
+    let rowa_w = b.mul_i32(sa_i, Opnd::I32(rpa));
+    let rowb_w = b.mul_i32(sb_i, Opnd::I32(rpb));
     let row0w = b.add_i32(row0, rowa_w);
     let col0w = b.add_i32(col0, rowb_w);
     let a_org = b.mul_i32(row0w, kb);
@@ -537,22 +581,37 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let sabase = b.mul_i32(a_row_l, Opnd::I32(4 * sh.ks));
     let sbbase = b.mul_i32(b_row_m, Opnd::I32(4 * sh.ks));
     // descriptor group 1 of the four tensors: [rows][K / 2] bytes (tile 64 bytes x rows), scales [rows][K / 128] dwords (tile 1 dword x rows)
-    let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16| -> ValueId {
+    let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16, mask: Option<Opnd>| -> ValueId {
         let tile = TensorTile { data_size: esz, tensor_dim: [dim0, Opnd::I32(rows)], stride0: stride, tile: [t0, rows as u16], pad: None, wg_mask: 0 };
         let z = b.add_i32(org, Opnd::I32(0));
-        b.tensor_desc_2d(&tile, Opnd::Val(base), Opnd::Val(z), Opnd::I32(0)).1
+        b.tensor_desc_2d_m(&tile, Opnd::Val(base), Opnd::Val(z), Opnd::I32(0), mask).1
+    };
+    // multicast masks (bit = the flat cluster-local workgroup index, x fastest): the A tile goes to the workgroups of this cluster row, the B tile to those of this cluster column
+    let (mask_row, mask_col) = if clustered {
+        let ysh = b.mul_i32(wg_y, Opnd::I32(cx));
+        let rowbits = b.let_(Op::ShlI32(Opnd::I32((1 << cx) - 1), Opnd::Val(ysh)));
+        let colpat: i32 = (0..cy).map(|j| 1 << (j * cx)).sum();
+        let colbits = b.let_(Op::ShlI32(Opnd::I32(colpat), Opnd::Val(wg_x)));
+        let ra_ = b.let_(Op::AndI32(Opnd::Val(rowbits), Opnd::I32(0xffff)));
+        let rb_ = b.let_(Op::AndI32(Opnd::Val(colbits), Opnd::I32(0xffff)));
+        (Some(Opnd::Val(ra_)), Some(Opnd::Val(rb_)))
+    } else {
+        (None, None)
     };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16);
-    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(sh.ks), rpa, Opnd::Val(k128), sh.ks as u16);
-    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(sh.ks), rpb, Opnd::Val(k128), sh.ks as u16);
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16, mask_row);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16, mask_col);
+    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(sh.ks), rpa, Opnd::Val(k128), sh.ks as u16, mask_row);
+    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(sh.ks), rpb, Opnd::Val(k128), sh.ks as u16, mask_col);
     let lgk = 7 + sh.ks.trailing_zeros() as i32;   // K elements per slot: 128 ks
     assert!(sh.ks.count_ones() == 1, "ks a power of two");
     let nkv = b.bind_i32(ev(kk).lshr(lgk));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128 * sh.ks as i64), "nkv = K / (128 ks) >= 1 (a K that is a multiple of the slot's K)");
     let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128 * sh.ks, Ext::ka(40).ceil_div(128 * sh.ks as i64));
-    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false };
+    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader };
+    if clustered {
+        b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
+    }
     pipe.run(&mut b, Role::All, &mut body);
 
     // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
@@ -584,5 +643,8 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
     let mut f = b.finish();
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
+    if clustered {
+        f.kd.push(("cluster_dims".into(), (cx * cy) as i64));   // the launch must declare the cluster (and divide the grid by it)
+    }
     f
 }

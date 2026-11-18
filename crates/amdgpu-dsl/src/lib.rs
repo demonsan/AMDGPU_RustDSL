@@ -3862,6 +3862,13 @@ impl FnBuilder {
     /// and offset) and lands at LDS byte `lds_addr` (uniform). Returns (g0, g1) for `tensor_load_to_lds` / `tensor_store_from_lds`.
     /// Every word is a uniform scalar value; words of constants fold.
     pub fn tensor_desc_2d(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd) -> (ValueId, ValueId) {
+        self.tensor_desc_2d_m(t, base, byte_off, lds_addr, None)
+    }
+
+    /// `tensor_desc_2d` with a COMPUTED workgroup (multicast) mask: group 1 word 0 = the constant fields | `mask` (a uniform value whose bits 15:0 are the mask, bits above must be zero: `and` it with
+    /// 0xffff so the verifier can see it). `t.wg_mask` must be 0.
+    pub fn tensor_desc_2d_m(&mut self, t: &TensorTile, base: Opnd, byte_off: Opnd, lds_addr: Opnd, mask: Option<Opnd>) -> (ValueId, ValueId) {
+        assert!(mask.is_none() || t.wg_mask == 0, "a computed multicast mask replaces the static one");
         let ds = match t.data_size {
             1 => 0u32,
             2 => 1,
@@ -3886,6 +3893,11 @@ impl FnBuilder {
         let g0 = self.let_(Op::RsrcCat { words: [Opnd::I32(1), lds_addr, Opnd::Val(lo), Opnd::Val(w3)] });
         // group 1 (256 bits): see the field table of CDNA5 ISA Table 63
         let w0 = t.wg_mask as u32 | ds << 16 | pad_en << 20 | pi << 22 | pa << 25;
+        let w0o = match mask {
+            None => Opnd::I32(w0 as i32),
+            // (the fields are disjoint: `+` is `|` and stays in SALU)
+            Some(m) => Opnd::Val(self.let_(Op::AddI32(Opnd::I32(w0 as i32), m))),
+        };
         let c = |x: Opnd| match x {
             Opnd::I32(v) => Some(v as u32),
             _ => None,
@@ -3918,7 +3930,7 @@ impl FnBuilder {
         let w3g = word(self, Some((d1, 16)), None, (t.tile[0] as u32) << 16);
         let w4 = Opnd::I32((t.tile[1] as u32) as i32);
         let w5 = t.stride0;
-        let g1 = self.let_(Op::SgprCat8 { words: [Opnd::I32(w0 as i32), w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
+        let g1 = self.let_(Op::SgprCat8 { words: [w0o, w1, w2, w3g, w4, w5, Opnd::I32(0), Opnd::I32(0)] });
         (g0, g1)
     }
 
