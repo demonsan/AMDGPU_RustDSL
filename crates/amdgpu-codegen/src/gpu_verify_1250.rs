@@ -49,6 +49,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
+    Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
@@ -1947,6 +1948,23 @@ fn outstanding_bounds(insts: &[Inst], labels: &HashMap<String, usize>, issue: &d
     bound
 }
 
+/// GV-1250-WAIT-RANGE: the immediate of a counter wait lies inside the counter's width (CDNA5 ISA §5.7.1, §15.5): SIMM16[5:0] for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, SIMM16[4:0]
+/// for KMcnt. A larger value does not wait for what it says (the field truncates); the issue stalls before a counter overflows, so a count above the width is never a way to "wait for more".
+fn wait_range(insts: &[Inst], v: &mut Vec<Violation>) {
+    for ins in insts {
+        let max = match ins.mn.as_str() {
+            "s_wait_loadcnt" | "s_wait_storecnt" | "s_wait_dscnt" | "s_wait_asynccnt" | "s_wait_tensorcnt" | "s_wait_xcnt" => 63,
+            "s_wait_kmcnt" => 31,
+            _ => continue,
+        };
+        if let Some(k) = parse_int(&ins.ops) {
+            if k < 0 || k > max {
+                viol(v, "GV-1250-WAIT-RANGE", format!("line {}: `{} {}`: the immediate does not fit the counter (at most {max})", ins.line, ins.mn, ins.ops));
+            }
+        }
+    }
+}
+
 fn is_dpp(ops: &str) -> bool {
     ["quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror", "row_bcast", "row_share", "row_xmask", "row_newbcast", "wave_shl", "wave_shr", "wave_rol", "wave_ror", "dpp8", "dpp16"].iter().any(|k| ops.contains(k))
 }
@@ -2009,6 +2027,7 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
     tdm_drain(&insts, &labels, &mut v);
+    wait_range(&insts, &mut v);
     // clauses: the N + 1 instructions after `s_clause N`
     let mut remaining = 0usize;
     for (k, ins) in insts.iter().enumerate() {

@@ -283,7 +283,15 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         "SOPP" => {
             let simm = match i.ops.first().map(|x| &x.0) {
                 None => 0,
-                Some(Op::Imm(v)) => (*v as u32) & 0xffff,
+                Some(Op::Imm(v)) => {
+                    // a split-counter wait beyond its counter's width can never block (the counter cannot exceed its maximum): rejected
+                    if let Some(mx) = wait_counter_max(base) {
+                        if *v < 0 || *v > mx as i64 {
+                            return Err(format!("`{t}`: {v} exceeds the counter's maximum {mx} (a wait that never blocks)"));
+                        }
+                    }
+                    (*v as u32) & 0xffff
+                }
                 Some(Op::Label(l)) => {
                     let tgt = label(l).ok_or_else(|| format!("`{t}`: unknown label {l}"))?;
                     let d = (tgt as i64 - (pc as i64 + 4)) / 4;
@@ -570,4 +578,16 @@ pub fn encode_text(asm: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// The largest meaningful immediate of a gfx1250 split-counter wait: the counter's width (LLVM AMDGPUBaseInfo: loadcnt / storecnt / dscnt /
+/// samplecnt / xcnt / asynccnt 6 bits, kmcnt 5, bvhcnt / expcnt 3). tensorcnt has no published width: held to the 6 bits of its sibling
+/// asynccnt. None for other instructions.
+pub fn wait_counter_max(mnemonic: &str) -> Option<u32> {
+    Some(match mnemonic {
+        "s_wait_loadcnt" | "s_wait_storecnt" | "s_wait_dscnt" | "s_wait_samplecnt" | "s_wait_xcnt" | "s_wait_asynccnt" | "s_wait_tensorcnt" => 63,
+        "s_wait_kmcnt" => 31,
+        "s_wait_bvhcnt" | "s_wait_expcnt" => 7,
+        _ => return None,
+    })
 }

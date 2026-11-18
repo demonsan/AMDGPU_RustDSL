@@ -117,3 +117,19 @@ fn a_trans_hazard_is_named_and_trust_hazard_waives_exactly_it() {
     let rep = amdgpu_codegen::gpu_verify::verify_ir(&trans(true, false));
     assert_eq!(rep.ledger().hazard_trust, 1, "counted in the certificate");
 }
+
+/// A wait immediate beyond the counter's width (6-bit asynccnt: 72) is a compile error, not a silently non-blocking wait.
+#[test]
+fn a_wait_beyond_the_counter_width_is_a_compile_error() {
+    for (c, n) in [(WaitCtr::Async, 72u8), (WaitCtr::Km, 32), (WaitCtr::Ds, 64)] {
+        let mut b = FnBuilder::new("probe_wait_range", 32);
+        b.wait_counter(c, n);
+        let f = b.finish();
+        let e = amdgpu_codegen::compile_target(&f, "gfx1250").err().unwrap_or_else(|| panic!("{c:?} {n} must be refused"));
+        assert!(e.contains("exceeds"), "{c:?} {n}: {e}");
+    }
+    let mut b = FnBuilder::new("probe_wait_range_ok", 32);
+    b.wait_counter(WaitCtr::Async, 63);
+    let f = b.finish();
+    amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}

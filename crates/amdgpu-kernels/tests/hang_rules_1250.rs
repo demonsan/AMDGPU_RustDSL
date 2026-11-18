@@ -848,6 +848,20 @@ fn mut_tdm_drain() {
 }
 
 #[test]
+fn mut_wait_range() {
+    asm_mutation("k:\n    s_wait_asynccnt 0x48\n    s_endpgm\n", "GV-1250-WAIT-RANGE");   // 72 > 63: the 6-bit field truncates it to 8
+    asm_mutation("k:\n    s_wait_tensorcnt 0x40\n    s_endpgm\n", "GV-1250-WAIT-RANGE");
+    asm_mutation("k:\n    s_wait_dscnt 100\n    s_endpgm\n", "GV-1250-WAIT-RANGE");
+    asm_mutation("k:\n    s_wait_loadcnt 0x40\n    s_endpgm\n", "GV-1250-WAIT-RANGE");
+    asm_mutation("k:\n    s_wait_kmcnt 0x20\n    s_endpgm\n", "GV-1250-WAIT-RANGE");   // KMcnt has 5 bits
+}
+
+#[test]
+fn pos_wait_range() {
+    asm_positive("k:\n    s_wait_asynccnt 0x3f\n    s_wait_tensorcnt 0x3f\n    s_wait_dscnt 0x3f\n    s_wait_loadcnt 0x3f\n    s_wait_storecnt 0x3f\n    s_wait_kmcnt 0x1f\n    s_wait_asynccnt 0x0\n    s_endpgm\n");
+}
+
+#[test]
 fn pos_tdm_drain() {
     // 11 back to back: every issue sees at most 10 outstanding
     asm_positive(&burst(11).replace("    s_endpgm", "    s_wait_tensorcnt 0x0\n    s_endpgm"));
@@ -1000,6 +1014,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-SLEEP", "sleep"),
     ("GV-1250-MCAST", "mcast"),
     ("GV-1250-MCAST-REQ", "mcast_req"),
+    ("GV-1250-WAIT-RANGE", "wait_range"),
     ("GV-1250-BAR-ID", "bar_id"),
     ("GV-1250-NBAR-COUNT", "nbar_count"),
     ("GV-1250-BAR-JOIN", "bar_join"),

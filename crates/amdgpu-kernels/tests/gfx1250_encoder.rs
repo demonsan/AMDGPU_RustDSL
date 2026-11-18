@@ -105,3 +105,17 @@ fn whole_probes_encode_like_clang() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A split-counter wait beyond the counter's width never blocks: the encoder refuses it (the `s_wait_asynccnt 72` of a replay; llvm-mc
+/// accepts any 16-bit value), the in-range forms encode.
+#[test]
+fn split_counter_waits_are_range_checked() {
+    use amdgpu_codegen::amdgpu_target::gfx1250_co::encode_line;
+    for bad in ["s_wait_asynccnt 72", "s_wait_kmcnt 32", "s_wait_dscnt 64", "s_wait_loadcnt 0x40", "s_wait_tensorcnt 64"] {
+        let e = encode_line(bad, 0, &|_| Some(0)).err().unwrap_or_else(|| panic!("{bad} must be refused"));
+        assert!(e.contains("exceeds"), "{bad}: {e}");
+    }
+    for ok in ["s_wait_asynccnt 63", "s_wait_kmcnt 31", "s_wait_dscnt 0", "s_wait_tensorcnt 4"] {
+        encode_line(ok, 0, &|_| Some(0)).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+}
