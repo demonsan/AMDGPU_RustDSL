@@ -14,12 +14,12 @@ VOP1 = ["v_mov_b32", "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt
         "v_cvt_i32_f32", "v_cvt_u32_f32", "v_cvt_f32_f16", "v_cvt_f16_f32", "v_not_b32", "v_readfirstlane_b32", "v_floor_f32", "v_ceil_f32",
         "v_trunc_f32", "v_rndne_f32", "v_fract_f32", "v_ffbl_b32", "v_ffbh_u32", "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1", "v_cvt_f32_ubyte2",
         "v_cvt_f32_ubyte3", "v_nop", "v_swap_b32"]
-VOP2 = ["v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fmac_f32", "v_mul_u32_u24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
+VOP2 = ["v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fmac_f32", "v_mul_u32_u24", "v_mul_i32_i24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
         "v_and_b32", "v_or_b32", "v_xor_b32", "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_max_num_f32", "v_min_num_f32", "v_min_i32",
         "v_max_i32", "v_min_u32", "v_max_u32", "v_cndmask_b32", "v_add_co_ci_u32", "v_sub_co_ci_u32"]
 VOP3 = ["v_mul_lo_u32", "v_mul_hi_u32", "v_mad_u32_u24", "v_fma_f32", "v_bfe_u32", "v_bfe_i32", "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32",
         "v_and_or_b32", "v_or3_b32", "v_xad_u32", "v_add3_u32", "v_med3_f32", "v_med3_i32", "v_min3_i32", "v_max3_i32", "v_perm_b32",
-        "v_alignbit_b32", "v_bfi_b32", "v_cvt_pk_bf16_f32", "v_add_co_u32", "v_sub_co_u32"]
+        "v_alignbit_b32", "v_bfi_b32", "v_max3_num_f32", "v_min3_num_f32", "v_cvt_pk_bf16_f32", "v_add_co_u32", "v_sub_co_u32"]
 VOPC = ["v_cmp_lt_f32", "v_cmp_le_f32", "v_cmp_gt_f32", "v_cmp_ge_f32", "v_cmp_eq_f32", "v_cmp_lg_f32", "v_cmp_u_f32", "v_cmp_o_f32",
         "v_cmp_neq_f32", "v_cmp_nlt_f32", "v_cmp_nle_f32", "v_cmp_ngt_f32", "v_cmp_nge_f32", "v_cmp_lt_i32", "v_cmp_le_i32", "v_cmp_gt_i32",
         "v_cmp_ge_i32", "v_cmp_eq_i32", "v_cmp_ne_i32", "v_cmp_lt_u32", "v_cmp_le_u32", "v_cmp_gt_u32", "v_cmp_ge_u32", "v_cmp_eq_u32",
@@ -38,7 +38,7 @@ GLOBAL_LOAD = [("global_load_b32", "v1"), ("global_load_b64", "v[2:3]"), ("globa
                ("global_load_u16", "v1"), ("global_load_i16", "v1"), ("global_load_u8", "v1"), ("global_load_i8", "v1")]
 GLOBAL_STORE = [("global_store_b32", "v1"), ("global_store_b64", "v[2:3]"), ("global_store_b96", "v[4:6]"), ("global_store_b128", "v[4:7]"),
                 ("global_store_b16", "v1"), ("global_store_b8", "v1")]
-DS_LOAD = [("ds_load_b32", "v1"), ("ds_load_b64", "v[2:3]"), ("ds_load_b128", "v[4:7]"), ("ds_load_u16", "v1"), ("ds_load_u8", "v1")]
+DS_LOAD = [("ds_load_b32", "v1"), ("ds_load_b64", "v[2:3]"), ("ds_load_b128", "v[4:7]"), ("ds_load_u16", "v1"), ("ds_load_u8", "v1"), ("ds_load_tr8_b64", "v[2:3]")]
 DS_STORE = [("ds_store_b32", "v1"), ("ds_store_b64", "v[2:3]"), ("ds_store_b128", "v[4:7]"), ("ds_store_b16", "v1"), ("ds_store_b8", "v1")]
 TDM = ["tensor_load_to_lds", "tensor_store_from_lds"]
 BUF_LOAD = ["buffer_load_b32", "buffer_load_b64", "buffer_load_b96", "buffer_load_b128", "buffer_load_u8", "buffer_load_i8", "buffer_load_u16", "buffer_load_i16"]
@@ -49,7 +49,16 @@ WMMA = [("v_wmma_f32_16x16x32_bf16", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], 
         ("v_wmma_f32_16x16x64_fp8_fp8", "v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[16:23], v[24:31]"),
         ("v_wmma_f32_16x16x128_fp8_fp8", "v_wmma_f32_16x16x128_fp8_fp8 v[8:15], v[16:31], v[32:47], v[48:55]"),
         ("v_wmma_scale_f32_32x16x128_f4", "v_wmma_scale_f32_32x16x128_f4 v[64:79], v[16:31], v[32:39], v[48:63], v3, v4")]
-EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE")]
+EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE"),
+         # the exact replays' forms (gfx1250 MLA / GEMM replicas)
+         ("global_load_async_to_lds_b128", "global_load_async_to_lds_b128 v2, v[4:5], off"), ("s_addk_co_i32", "s_addk_co_i32 s1, 0x1"),
+         ("s_buffer_load_b32", "s_buffer_load_b32 s1, s[4:7], s2 offset:0x0"), ("s_get_pc_i64", "s_get_pc_i64 s[2:3]"),
+         ("s_getreg_b32", "s_getreg_b32 s1, hwreg(HW_REG_WAVE_MODE)"), ("s_prefetch_inst", "s_prefetch_inst s[2:3], 0x0, s4, 0"),
+         ("s_version", "s_version 0x4009"), ("s_wait_idle", "s_wait_idle"), ("v_add_nc_i32", "v_add_nc_i32 v1, v2, v3"),
+         ("v_add_nc_u64", "v_add_nc_u64_e32 v[2:3], v[4:5], v[6:7]"), ("v_cvt_pk_fp8_f32", "v_cvt_pk_fp8_f32 v1, v2, v3"),
+         ("v_permlane16_swap_b32", "v_permlane16_swap_b32_e32 v1, v2"), ("v_pk_add_f32", "v_pk_add_f32 v[2:3], v[4:5], v[6:7]"),
+         ("v_pk_fma_f32", "v_pk_fma_f32 v[2:3], v[4:5], v[6:7], v[8:9]"), ("v_pk_mul_f32", "v_pk_mul_f32 v[2:3], v[4:5], v[6:7]"),
+         ("v_rcp_iflag_f32", "v_rcp_iflag_f32_e32 v1, v2")]
 
 
 def samples():

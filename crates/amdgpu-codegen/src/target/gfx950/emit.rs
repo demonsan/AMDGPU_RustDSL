@@ -414,7 +414,14 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VPkFmaF32 => {
             // a source pair may be an SGPR pair (exact mode: the vendor's `v_pk_fma_f32 v[..], v[..], s[..], v[..]`)
             let p = |r: VReg| if a.scalar.get(r as usize).copied().unwrap_or(false) { spair(a, r) } else { pair(a, r) };
-            vec![format!("v_pk_fma_f32 {}, {}, {}, {}", pair(a, inst.dst.unwrap()), p(reg_of(&inst.srcs[0])), p(reg_of(&inst.srcs[1])), p(reg_of(&inst.srcs[2])))]
+            // (neg_lo / neg_hi: the exact mode's negated sources, both lanes)
+            let n = if inst.neg != 0 {
+                let m = format!("[{},{},{}]", inst.neg & 1, (inst.neg >> 1) & 1, (inst.neg >> 2) & 1);
+                format!(" neg_lo:{m} neg_hi:{m}")
+            } else {
+                String::new()
+            };
+            vec![format!("v_pk_fma_f32 {}, {}, {}, {}{n}", pair(a, inst.dst.unwrap()), p(reg_of(&inst.srcs[0])), p(reg_of(&inst.srcs[1])), p(reg_of(&inst.srcs[2])))]
         }
         MOp::SMulHiU32 => vec![format!("s_mul_hi_u32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::VMadU64U32 => vec![format!("v_mad_u64_u32 {}, vcc, {}, {}, {}", pair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), pair(a, reg_of(&inst.srcs[2])))],
@@ -1134,7 +1141,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SWaitCnt => vec![format!("s_waitcnt vmcnt({}) lgkmcnt({})", inst.imm & 0xff, inst.imm >> 8)],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
         // gfx1250 only: lowering rejects them for gfx950 (`tdm_target`); never reached
-        MOp::SWaitTensor | MOp::TensorLoadToLds | MOp::TensorStoreFromLds | MOp::RawInst | MOp::VSwapB32 | MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::SSys | MOp::SSysVal | MOp::SExecFromMask | MOp::SExecSelect | MOp::VWmmaF32_16x16x64Fp8 | MOp::VWmmaF32_16x16x64Fp8Z | MOp::VWmmaF32_16x16x128Fp8 | MOp::VWmmaF32_16x16x128Fp8Z | MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z | MOp::SWaitCtr | MOp::SBarrierSignal | MOp::SBarrierWait | MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierLeave | MOp::SClusterBarrier | MOp::SSetSchedMode | MOp::SWaitAlu | MOp::SSetVgprMsb | MOp::SReadTtmp => {
+        MOp::SWaitTensor | MOp::TensorLoadToLds | MOp::TensorStoreFromLds | MOp::RawInst | MOp::VSwapB32 | MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::SSys | MOp::SSysVal | MOp::SExecFromMask | MOp::SExecSelect | MOp::VAddNcI32 | MOp::VSubrevU32 | MOp::VRcpIflagF32 | MOp::VAddNcU64 | MOp::GlobalLoadAsyncLds | MOp::SBufferLoadB32 | MOp::SMovB64Pair | MOp::VCvtPkFp8F32Half | MOp::VNop | MOp::VWmmaF32_16x16x64Fp8 | MOp::VWmmaF32_16x16x64Fp8Z | MOp::VWmmaF32_16x16x128Fp8 | MOp::VWmmaF32_16x16x128Fp8Z | MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z | MOp::SWaitCtr | MOp::SBarrierSignal | MOp::SBarrierWait | MOp::SBarrierInit | MOp::SBarrierJoin | MOp::SBarrierLeave | MOp::SClusterBarrier | MOp::SSetSchedMode | MOp::SWaitAlu | MOp::SSetVgprMsb | MOp::SReadTtmp => {
             vec![format!("; {:?}: gfx1250 only", inst.op)]
         }
         MOp::LdsWriteB32 => vec![format!(

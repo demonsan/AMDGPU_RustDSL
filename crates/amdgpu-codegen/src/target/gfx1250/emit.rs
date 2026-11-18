@@ -101,7 +101,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     let keyed = order.len() == m.blocks.len() && m.exact && !m.reg_hints.layout_keys.is_empty();
     // keyed layout: blocks without instructions that only jump on are not laid out; every edge goes to its final block
     let thru: std::collections::HashMap<u32, u32> = if keyed {
-        let has_key: std::collections::HashSet<u32> = m.reg_hints.layout_keys.iter().map(|(l, _)| *l).collect();
+        let has_key: std::collections::HashSet<u32> = m.reg_hints.author_branches.iter().copied().collect();
         m.blocks
             .iter()
             .filter_map(|b| match (&b.term, b.insts.is_empty() && !has_key.contains(&b.label)) {
@@ -122,6 +122,62 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         l
     };
     let order: Vec<usize> = order.into_iter().filter(|&i| !thru.contains_key(&m.blocks[i].label)).collect();
+    let pos: std::collections::HashMap<u32, usize> = order.iter().enumerate().map(|(k, &i)| (m.blocks[i].label, k)).collect();
+    // keyed layout: `A: if c goto T (backward); B: goto E (forward)` with B the author's branch-only block right after A and reached only
+    // from A is the same control flow as the author's latch `A: if !c goto E; B: goto T` - written the author's way
+    let mut latch_a: std::collections::HashMap<u32, (Pred, u32, u32)> = Default::default();
+    let mut latch_b: std::collections::HashMap<u32, u32> = Default::default();
+    // (the second shape: `A: if c goto B; else goto H (backward)` with B next, empty, `goto E` (forward; B may be a shared exit): the
+    // author's `A: if c goto E; B: goto H`, every other edge into B going straight to E)
+    let mut redirect: std::collections::HashMap<u32, u32> = Default::default();
+    if keyed {
+        let mut preds: std::collections::HashMap<u32, usize> = Default::default();
+        for b in &m.blocks {
+            match &b.term {
+                Term::Goto(t) => *preds.entry(fin(*t)).or_default() += 1,
+                Term::CondGoto { target, fall, .. } => {
+                    *preds.entry(fin(*target)).or_default() += 1;
+                    *preds.entry(fin(*fall)).or_default() += 1;
+                }
+                Term::Endpgm => {}
+            }
+        }
+        for (k, &bi) in order.iter().enumerate() {
+            let b = &m.blocks[bi];
+            let Term::CondGoto { on, target, fall } = &b.term else { continue };
+            let (tg, fl) = (fin(*target), fin(*fall));
+            let Some(&nb) = order.get(k + 1) else { continue };
+            let nbk = &m.blocks[nb];
+            let keyed_b = m.reg_hints.layout_keys.iter().any(|(l, _)| *l == fl);
+            let Term::Goto(e) = &nbk.term else { continue };
+            let e = fin(*e);
+            if tg == nbk.label && nbk.insts.is_empty() && keyed_b {
+                let (pf, pe) = (pos.get(&fl).copied().unwrap_or(usize::MAX), pos.get(&e).copied().unwrap_or(0));
+                if pf <= k && pe > k + 1 {
+                    latch_a.insert(b.label, (*on, e, tg));
+                    latch_b.insert(tg, fl);
+                    redirect.insert(tg, e);
+                }
+                continue;
+            }
+            if fl != nbk.label || !nbk.insts.is_empty() || !keyed_b || preds.get(&fl) != Some(&1) {
+                continue;
+            }
+            let Term::Goto(e) = &nbk.term else { continue };
+            let e = fin(*e);
+            let (pt, pe) = (pos.get(&tg).copied().unwrap_or(usize::MAX), pos.get(&e).copied().unwrap_or(0));
+            if pt <= k && pe > k + 1 {
+                let inv = match on {
+                    Pred::Scc0 => Pred::Scc1,
+                    Pred::Scc1 => Pred::Scc0,
+                    Pred::Vccnz => Pred::Vccz,
+                    Pred::Vccz => Pred::Vccnz,
+                };
+                latch_a.insert(b.label, (inv, e, fl));
+                latch_b.insert(fl, tg);
+            }
+        }
+    }
     for (oi, &bi) in order.iter().enumerate() {
         let b = &m.blocks[bi];
         let next_label = order.get(oi + 1).map(|&n| m.blocks[n].label);
@@ -163,10 +219,17 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
             out.push_str(&format!("    {line}\n"));
         }
 
+        let redir = |l: u32| redirect.get(&l).copied().unwrap_or(l);
         let term = match &b.term {
-            Term::Goto(t) => Term::Goto(fin(*t)),
+            // an author's latch block (only its branch) whose terms were swapped by the structure: see `latch` above
+            Term::Goto(_) if latch_b.contains_key(&b.label) => Term::Goto(latch_b[&b.label]),
+            Term::CondGoto { .. } if latch_a.contains_key(&b.label) => {
+                let (p, e, f) = latch_a[&b.label];
+                Term::CondGoto { on: p, target: e, fall: f }
+            }
+            Term::Goto(t) => Term::Goto(redir(fin(*t))),
             Term::CondGoto { on, target, fall } => {
-                let (tg, fl) = (fin(*target), fin(*fall));
+                let (tg, fl) = (redir(fin(*target)), redir(fin(*fall)));
                 if tg == fl {
                     Term::Goto(tg)
                 } else {
@@ -178,7 +241,8 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         match &term {
             Term::Goto(t) => {
                 // (an author's block that is only its branch keeps it, even to the next block: the author wrote it)
-                let only_branch = keyed && b.insts.is_empty();
+                // (the author's own branch - `Stmt::Goto` - is written even to the next block)
+                let only_branch = keyed && m.reg_hints.author_branches.contains(&b.label);
                 if only_branch || !((m.elide_fallthrough || keyed) && next_label == Some(*t)) {
                     out.push_str(&format!("    s_branch BB{t}\n"))
                 }
@@ -190,7 +254,20 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                     Pred::Vccnz => "s_cbranch_vccnz",
                     Pred::Vccz => "s_cbranch_vccz",
                 };
-                if keyed && next_label == Some(*target) && next_label != Some(*fall) {
+                // (keyed layout, neither side next: the conditional branch goes forward and the unconditional one back, as an author
+                // writes a loop latch - `s_cbranch_<inv> exit; s_branch header`)
+                let backward = |l: u32| pos.get(&l).map_or(false, |&p| p <= oi);
+                let flip = keyed && next_label != Some(*target) && next_label != Some(*fall) && backward(*target) && !backward(*fall);
+                if flip {
+                    let inv = match on {
+                        Pred::Scc0 => "s_cbranch_scc1",
+                        Pred::Scc1 => "s_cbranch_scc0",
+                        Pred::Vccnz => "s_cbranch_vccz",
+                        Pred::Vccz => "s_cbranch_vccnz",
+                    };
+                    out.push_str(&format!("    {inv} BB{fall}\n"));
+                    out.push_str(&format!("    s_branch BB{target}\n"));
+                } else if keyed && next_label == Some(*target) && next_label != Some(*fall) {
                     // the author's layout puts the taken side next: the inverse branch to the other side, nothing else
                     let inv = match on {
                         Pred::Scc0 => "s_cbranch_scc1",
@@ -436,25 +513,79 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
             }
             vec![l]
         }
-        MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 => {
+        MOp::SAddCoI32 | MOp::SSubCoI32 | MOp::SBfeU32 | MOp::SBitset0 | MOp::SBitset1 | MOp::SAddNcU64 | MOp::SMovB64Pair => {
             let s = |x: &Src| -> Result<String, String> {
                 match x {
                     Src::Reg(r) => {
                         let p = a.phys[*r as usize];
-                        Ok(if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
+                        Ok(if matches!(inst.op, MOp::SAddNcU64 | MOp::SMovB64Pair) { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) })
                     }
                     Src::Imm(k) => Ok(format!("{:#x}", *k as u32)),
                     _ => Err("scalar form: register or constant operands".into()),
                 }
             };
             let d = a.phys[inst.dst.ok_or("scalar form without a destination")? as usize];
-            let dn = if inst.op == MOp::SAddNcU64 { format!("s[{}:{}]", d, d + 1) } else { format!("s{d}") };
+            let dn = if matches!(inst.op, MOp::SAddNcU64 | MOp::SMovB64Pair) { format!("s[{}:{}]", d, d + 1) } else { format!("s{d}") };
             let mn = crate::op_attrs::attrs(inst.op).mnemonic;
             match inst.op {
                 // in place on the destination (= a's register): only the bit operand is written
                 MOp::SBitset0 | MOp::SBitset1 => vec![format!("{mn} {dn}, {}", s(&inst.srcs[1])?)],
+                MOp::SMovB64Pair => vec![format!("{mn} {dn}, {}", s(&inst.srcs[0])?)],
                 _ => vec![format!("{mn} {dn}, {}, {}", s(&inst.srcs[0])?, s(&inst.srcs[1])?)],
             }
+        }
+        MOp::VNop => vec!["v_nop".to_string()],
+        MOp::VCvtPkFp8F32Half => {
+            let p = |s: &Src| -> String {
+                match s {
+                    Src::Reg(r) if a.scalar.get(*r as usize).copied().unwrap_or(false) => sgpr_name(a.phys[*r as usize]),
+                    Src::Reg(r) => format!("v{}", a.phys[*r as usize]),
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".into(),
+                }
+            };
+            let d = a.phys[inst.dst.ok_or("v_cvt_pk_fp8_f32 without a destination")? as usize];
+            let hi = inst.imm & 1 != 0;
+            let n = inst.srcs.len();
+            vec![format!("v_cvt_pk_fp8_f32 v{d}.{}, {}, {}{}", if hi { "h" } else { "l" }, p(&inst.srcs[n - 2]), p(&inst.srcs[n - 1]), if hi { " op_sel:[0,0,1]" } else { "" })]
+        }
+        MOp::VAddNcI32 | MOp::VSubrevU32 | MOp::VRcpIflagF32 | MOp::VAddNcU64 | MOp::GlobalLoadAsyncLds | MOp::SBufferLoadB32 => {
+            let wide = inst.op == MOp::VAddNcU64;
+            let v = |x: &Src, pair: bool| -> String {
+                match x {
+                    Src::Reg(r) => {
+                        let p = a.phys[*r as usize];
+                        if a.scalar.get(*r as usize).copied().unwrap_or(false) {
+                            if pair { format!("s[{}:{}]", p, p + 1) } else { sgpr_name(p) }
+                        } else if pair {
+                            format!("v[{}:{}]", p, p + 1)
+                        } else {
+                            format!("v{p}")
+                        }
+                    }
+                    Src::Imm(k) => format!("{:#x}", *k as u32),
+                    _ => "?".into(),
+                }
+            };
+            let mn = crate::op_attrs::attrs(inst.op).mnemonic;
+            let line = match inst.op {
+                MOp::GlobalLoadAsyncLds => {
+                    let off = if inst.imm != 0 { format!(" offset:{}", inst.imm) } else { String::new() };
+                    format!("{mn} {}, {}, off{off}", v(&inst.srcs[0], false), v(&inst.srcs[1], true))
+                }
+                MOp::SBufferLoadB32 => {
+                    let d = a.phys[inst.dst.ok_or("s_buffer_load without a destination")? as usize];
+                    let rs = match inst.srcs[0] { Src::Reg(r) => a.phys[r as usize], _ => 0 };
+                    format!("{mn} s{d}, s[{}:{}], {} offset:{:#x}", rs, rs + 3, v(&inst.srcs[1], false), inst.imm)
+                }
+                _ => {
+                    let d = a.phys[inst.dst.ok_or("VALU form without a destination")? as usize];
+                    let dn = if wide { format!("v[{}:{}]", d, d + 1) } else { format!("v{d}") };
+                    let ops: Vec<String> = inst.srcs.iter().map(|s| v(s, wide)).collect();
+                    format!("{mn} {dn}, {}", ops.join(", "))
+                }
+            };
+            vec![line]
         }
         MOp::SExecFromMask | MOp::SExecSelect => {
             let s = |x: &Src| -> String {
@@ -489,6 +620,8 @@ pub fn inst_lines(a: &Alloc, inst: &MInst) -> Result<Vec<String>, String> {
                     1 => format!("s_setreg_imm32_b32 {}, {k2:#x}", hw(k)),
                     2 => "s_wait_idle".to_string(),
                     3 => format!("s_prefetch_inst s[{}:{}], {k:#x}, s{}, {k2}", regs[0], regs[0] + 1, regs[1]),
+                    5 => "v_nop".to_string(),
+                    6 => format!("s_sleep {k}"),
                     _ => format!("global_prefetch_b8 v{}, s[{}:{}]{}", regs[0], regs[1], regs[1] + 1, if k != 0 { format!(" offset:{k}") } else { String::new() }),
                 }
             };
@@ -618,13 +751,16 @@ const RENAMES: &[(&str, &str)] = &[
     ("s_sub_u32", "s_sub_co_u32"),
     ("s_subb_u32", "s_sub_co_ci_u32"),
     ("s_addk_i32", "s_addk_co_i32"),
+    ("ds_read_b64_tr_b8", "ds_load_tr8_b64"),
+    ("v_max3_f32", "v_max3_num_f32"),
+    ("v_min3_f32", "v_min3_num_f32"),
 ];
 
 /// gfx950 mnemonics (exact or by prefix) whose gfx1250 spelling is the same text: the VALU / SALU families the G1 kernels use, checked with
 /// the node's assembler (crates/amdgpu-kernels/tests/gfx1250_emit.rs assembles the probes).
 const SAME_PREFIX: &[&str] = &[
     "v_mov_b32", "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fma_f32", "v_fmac_f32", "v_mul_lo_u32", "v_mul_hi_u32", "v_mad_u32_u24",
-    "v_mul_u32_u24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_bfe_u32", "v_bfe_i32",
+    "v_mul_u32_u24", "v_mul_i32_i24", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_bfe_u32", "v_bfe_i32",
     "v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_xad_u32", "v_add3_u32", "v_exp_f32", "v_log_f32",
     "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_sin_f32", "v_cos_f32", "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
     "v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pk_bf16_f32", "v_readfirstlane_b32", "v_med3_f32", "v_med3_i32", "v_min_i32", "v_max_i32",
@@ -632,7 +768,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
-    "v_mad_u64_u32",
+    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).

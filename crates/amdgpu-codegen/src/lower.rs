@@ -2963,6 +2963,8 @@ impl Lowerer {
                 }
                 let target = self.key_label(*key);
                 self.set_term(Term::Goto(target));
+                let lbl = self.mir.blocks[self.cur].label;
+                self.mir.reg_hints.author_branches.push(lbl);
                 // the code up to the next layout key is reached by a goto only (or not at all)
                 let dead = self.fresh_label();
                 self.start_block(dead);
@@ -3049,6 +3051,14 @@ impl Lowerer {
                     tdm_target()?;
                     self.push(MInst::new(MOp::SSetVgprMsb).imm(*imm as i64));
                 }
+                Stmt::LoadAsyncLds { lds, vaddr, imm } => {
+                    tdm_target()?;
+                    let (rl, ra) = (self.as_v1(*lds)?, self.as_v2(*vaddr)?);
+                    self.touch(&[Src::Reg(rl), Src::Reg(ra)]);
+                    let mut inst = MInst::new(MOp::GlobalLoadAsyncLds).srcreg(rl).srcreg(ra).imm(*imm as i64);
+                    inst.pin = true;
+                    self.push(inst);
+                }
                 Stmt::ExecFromMask { mask } => {
                     tdm_target()?;
                     let Opnd::Val(v) = mask else { return Err("exec_from_mask: the mask is a value".into()) };
@@ -3066,6 +3076,12 @@ impl Lowerer {
                     let regs: Vec<Src> = [Src::Reg(rc), sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
                     self.touch(&regs);
                     let mut inst = MInst::new(MOp::SExecSelect).srcreg(rc).src(sa).src(sb);
+                    inst.pin = true;
+                    self.push(inst);
+                }
+                Stmt::Sys { op: amdgpu_dsl::SysOp::VNop, .. } => {
+                    tdm_target()?;
+                    let mut inst = MInst::new(MOp::VNop);
                     inst.pin = true;
                     self.push(inst);
                 }
@@ -3754,10 +3770,26 @@ impl Lowerer {
                     }
                     me.as_v2(o)
                 };
-                let (ra, rb, rc) = (pk(self, *a)?, pk(self, *b)?, pk(self, *c)?);
+                // exact mode: a negated source is the `neg_lo` / `neg_hi` modifier of that source
+                let mut neg = 0u8;
+                let mut un = |me: &Self, k: u8, o: Opnd| -> Opnd {
+                    if me.exact {
+                        if let Opnd::Val(v) = o {
+                            if let Some(Op::PkNegF32(x)) = me.defs.get(&v) {
+                                neg |= 1 << k;
+                                return *x;
+                            }
+                        }
+                    }
+                    o
+                };
+                let (a, b, c) = (un(self, 0, *a), un(self, 1, *b), un(self, 2, *c));
+                let (ra, rb, rc) = (pk(self, a)?, pk(self, b)?, pk(self, c)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
                 let d = self.new_vreg(RClass::V2);
-                self.push(MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
+                let mut inst = MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc);
+                inst.neg = neg;
+                self.push(inst);
                 self.val.insert(dst, d);
             }
             // a lane mask (VCC / an SGPR pair) or an SCC value: `any lane` is the branch on it (no instruction)
@@ -4390,6 +4422,8 @@ impl Lowerer {
             }
             // exact mode: -x exists only as a source modifier of the instruction that reads it (no instruction of its own)
             Op::NegF32(_) if self.exact => {}
+            Op::PkNegF32(_) if self.exact => {}
+            Op::PkNegF32(_) => return Err("PkNegF32: only a source modifier of PkFmaF32 in exact mode".into()),
             Op::NegF32(a) => {
                 // standalone: flip the sign bit (unused when every reader folds it into a modifier: removed by dce)
                 let r = self.as_v1(*a)?;
@@ -4631,7 +4665,7 @@ impl Lowerer {
             }
             Op::Salu { op, a, b } => {
                 tdm_target()?;
-                let wide = *op == amdgpu_dsl::SaluOp::AddNcU64;
+                let wide = matches!(op, amdgpu_dsl::SaluOp::AddNcU64 | amdgpu_dsl::SaluOp::MovB64);
                 let opnd = |me: &mut Self, o: Opnd| -> Result<Src, String> {
                     if wide {
                         let r = me.s_tuple(o, RClass::S2)?;
@@ -4640,7 +4674,9 @@ impl Lowerer {
                         me.s_operand(o)
                     }
                 };
-                let (sa, sb) = (opnd(self, *a)?, opnd(self, *b)?);
+                // (MovB64 has no second operand)
+                let sa = opnd(self, *a)?;
+                let sb = if *op == amdgpu_dsl::SaluOp::MovB64 { Src::Imm(0) } else { opnd(self, *b)? };
                 let regs: Vec<Src> = [sa, sb].into_iter().filter(|x| matches!(x, Src::Reg(_))).collect();
                 self.touch(&regs);
                 let d = self.new_vreg(if wide { RClass::S2 } else { RClass::S1 });
@@ -4651,14 +4687,89 @@ impl Lowerer {
                     amdgpu_dsl::SaluOp::Bitset0 => MOp::SBitset0,
                     amdgpu_dsl::SaluOp::Bitset1 => MOp::SBitset1,
                     amdgpu_dsl::SaluOp::AddNcU64 => MOp::SAddNcU64,
+                    amdgpu_dsl::SaluOp::MovB64 => MOp::SMovB64Pair,
+                    amdgpu_dsl::SaluOp::AddCoU32 => MOp::SAddU32,
+                    amdgpu_dsl::SaluOp::AddCoCiU32 => MOp::SAddcU32,
                 };
                 if matches!(op, amdgpu_dsl::SaluOp::Bitset0 | amdgpu_dsl::SaluOp::Bitset1) {
                     // in place: the result register starts as a (a copy that vanishes when the author pinned both at one register)
+                    let w = self.author_words.pop_front();
                     self.push(MInst::new(MOp::SMovB32).def(d).src(sa));
+                    if let Some(w) = w {
+                        self.author_words.push_front(w);
+                    }
                     self.push(MInst::new(mop).def(d).srcreg(d).src(sb));
                 } else {
                     self.push(MInst::new(mop).def(d).src(sa).src(sb));
                 }
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
+            Op::Permlane16SwapA { a, b } => {
+                let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                let w = self.author_words.pop_front();
+                self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                if let Some(w) = w {
+                    self.author_words.push_front(w);
+                }
+                self.push(MInst::new(MOp::VPermlane16Swap).def(la).srcreg(la).srcreg(lb));
+                self.val.insert(dst, la);
+                self.swap_second.insert(dst, lb);
+            }
+            Op::CvtPkFp8Half { old, a, b, hi } => {
+                // a 16-bit write: the result register starts as `old` (a copy that vanishes when pinned at old's register)
+                tdm_target()?;
+                let (sa, sb) = self.exact_srcs(*a, *b)?;
+                let d = self.new_vreg(RClass::V1);
+                match old {
+                    Some(o) => {
+                        let ro = self.as_v1(*o)?;
+                        self.touch(&[Src::Reg(ro)]);
+                        // (the in-place copy is no instruction when pinned: the author's words belong to the conversion)
+                        let w = self.author_words.pop_front();
+                        self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
+                        if let Some(w) = w {
+                            self.author_words.push_front(w);
+                        }
+                        self.push(MInst::new(MOp::VCvtPkFp8F32Half).def(d).srcreg(d).src(sa).src(sb).imm(*hi as i64));
+                    }
+                    None => self.push(MInst::new(MOp::VCvtPkFp8F32Half).def(d).src(sa).src(sb).imm(*hi as i64)),
+                }
+                self.val.insert(dst, d);
+            }
+            Op::VAddU64 { a, b } => {
+                tdm_target()?;
+                // (a uniform pair stays an SGPR source of the VALU add)
+                let pair = |me: &mut Self, o: Opnd| -> Result<VReg, String> {
+                    let r = match o {
+                        Opnd::Val(v) => me.val.get(&v).copied(),
+                        Opnd::Var(v) => me.vars.get(v.0 as usize).copied(),
+                        _ => None,
+                    };
+                    match r {
+                        Some(r) if me.mir.vreg_class(r) == RClass::S2 => Ok(r),
+                        _ => me.as_v2(o),
+                    }
+                };
+                let (ra, rb) = (pair(self, *a)?, pair(self, *b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::VAddNcU64).def(d).srcreg(ra).srcreg(rb));
+                self.val.insert(dst, d);
+            }
+            Op::SBufferLoad { rsrc, soff, imm } => {
+                tdm_target()?;
+                let rr = self.s_tuple(*rsrc, RClass::S4)?;
+                let so = self.s_operand(*soff)?;
+                if let Src::Reg(x) = so {
+                    self.touch(&[Src::Reg(x)]);
+                }
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SBufferLoadB32).def(d).srcreg(rr).src(so).imm(*imm as i64));
+                self.pending_smem.push(self.mir.canon(d));
                 self.uniform.insert(dst);
                 self.val.insert(dst, d);
             }
@@ -4668,8 +4779,12 @@ impl Lowerer {
                 let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
                 self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                 let (la, lb) = (self.new_vreg(RClass::V1), self.new_vreg(RClass::V1));
+                let w = self.author_words.pop_front();
                 self.push(MInst::new(MOp::VMovB32).def(la).srcreg(ra));
                 self.push(MInst::new(MOp::VMovB32).def(lb).srcreg(rb));
+                if let Some(w) = w {
+                    self.author_words.push_front(w);
+                }
                 self.push(MInst::new(MOp::VSwapB32).def(la).srcreg(la).srcreg(lb));
                 self.val.insert(dst, la);
                 self.swap_second.insert(dst, lb);
@@ -5776,7 +5891,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         // gfx1250: a preloaded kernarg word, a trap-temporary read; exact: a verbatim SALU instruction
                         Op::KernargPreload { .. } | Op::ReadTtmp { .. } => true,
                         Op::Salu { a, b, .. } => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
-                        Op::SysVal { .. } => true,
+                        Op::SysVal { .. } | Op::SBufferLoad { .. } => true,
                         Op::Raw { scalar, ty, .. } => {
                             if *scalar && *ty == DType::I1 {
                                 // an SCC result: a uniform condition
@@ -6269,6 +6384,7 @@ fn un_mop(o: amdgpu_dsl::UnOp) -> MOp {
         U::CvtF32Ubyte3 => MOp::VCvtF32Ubyte3,
         U::Ffbl => MOp::VFfblB32,
         U::Ffbh => MOp::VFfbhU32,
+        U::RcpIflagF32 => MOp::VRcpIflagF32,
     }
 }
 
@@ -6293,6 +6409,8 @@ fn bin_mop(o: amdgpu_dsl::BinOp) -> MOp {
         B::MbcntLo => MOp::VMbcntLo,
         B::MbcntHi => MOp::VMbcntHi,
         B::BcntAdd => MOp::VBcntU32,
+        B::AddNcI32 => MOp::VAddNcI32,
+        B::SubrevU32 => MOp::VSubrevU32,
     }
 }
 

@@ -143,6 +143,10 @@ impl FromIr for Op {
             "Salu" => { v.expect_struct("Salu")?; Ok(Op::Salu { op: FromIr::from_ir(v.field("op")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "SysVal" => { v.expect_struct("SysVal")?; Ok(Op::SysVal { op: FromIr::from_ir(v.field("op")?)?, imm: FromIr::from_ir(v.field("imm")?)? }) }
             "SwapA" => { v.expect_struct("SwapA")?; Ok(Op::SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "Permlane16SwapA" => { v.expect_struct("Permlane16SwapA")?; Ok(Op::Permlane16SwapA { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "CvtPkFp8Half" => { v.expect_struct("CvtPkFp8Half")?; Ok(Op::CvtPkFp8Half { old: FromIr::from_ir(v.field("old")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "VAddU64" => { v.expect_struct("VAddU64")?; Ok(Op::VAddU64 { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "SBufferLoad" => { v.expect_struct("SBufferLoad")?; Ok(Op::SBufferLoad { rsrc: FromIr::from_ir(v.field("rsrc")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)? }) }
             "Permlane32SwapB" => { v.expect_struct("Permlane32SwapB")?; Ok(Op::Permlane32SwapB { swap: FromIr::from_ir(v.field("swap")?)? }) }
             "Frag4" => { v.expect_tuple("Frag4", 4)?; Ok(Op::Frag4(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
             "Frag4Lane" => { v.expect_struct("Frag4Lane")?; Ok(Op::Frag4Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
@@ -186,6 +190,7 @@ impl FromIr for Op {
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
             "PtrMadU32" => { v.expect_struct("PtrMadU32")?; Ok(Op::PtrMadU32 { base: FromIr::from_ir(v.field("base")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "PkFmaF32" => { v.expect_tuple("PkFmaF32", 3)?; Ok(Op::PkFmaF32(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
+            "PkNegF32" => { v.expect_tuple("PkNegF32", 1)?; Ok(Op::PkNegF32(FromIr::from_ir(v.item(0)?)?)) }
             "AnyLane" => { v.expect_tuple("AnyLane", 1)?; Ok(Op::AnyLane(FromIr::from_ir(v.item(0)?)?)) }
             "FragSlice" => { v.expect_struct("FragSlice")?; Ok(Op::FragSlice { frag: FromIr::from_ir(v.field("frag")?)?, start: FromIr::from_ir(v.field("start")?)?, n: FromIr::from_ir(v.field("n")?)? }) }
             "FragCat" => { v.expect_struct("FragCat")?; Ok(Op::FragCat { parts: FromIr::from_ir(v.field("parts")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
@@ -286,6 +291,10 @@ impl IrIds for Op {
             Op::Salu { op, a, b } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::SysVal { op, imm } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*imm), fv, fr); }
             Op::SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::Permlane16SwapA { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::CvtPkFp8Half { old, a, b, hi } => { IrIds::ids(&mut (*old), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Op::VAddU64 { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::SBufferLoad { rsrc, soff, imm } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); }
             Op::Permlane32SwapB { swap } => { IrIds::ids(&mut (*swap), fv, fr); }
             Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
             Op::Frag4Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
@@ -329,6 +338,7 @@ impl IrIds for Op {
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
             Op::PtrMadU32 { base, a, b } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::PkFmaF32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::PkNegF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::AnyLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::FragSlice { frag, start, n } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*start), fv, fr); IrIds::ids(&mut (*n), fv, fr); }
             Op::FragCat { parts, dwords } => { IrIds::ids(&mut (*parts), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
@@ -403,6 +413,9 @@ impl IrIds for WmmaScale {
 impl FromIr for SaluOp {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
+            "MovB64" => { v.expect_unit("MovB64")?; Ok(SaluOp::MovB64) }
+            "AddCoU32" => { v.expect_unit("AddCoU32")?; Ok(SaluOp::AddCoU32) }
+            "AddCoCiU32" => { v.expect_unit("AddCoCiU32")?; Ok(SaluOp::AddCoCiU32) }
             "AddCoI32" => { v.expect_unit("AddCoI32")?; Ok(SaluOp::AddCoI32) }
             "SubCoI32" => { v.expect_unit("SubCoI32")?; Ok(SaluOp::SubCoI32) }
             "BfeU32" => { v.expect_unit("BfeU32")?; Ok(SaluOp::BfeU32) }
@@ -416,6 +429,9 @@ impl FromIr for SaluOp {
 impl IrIds for SaluOp {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
+            SaluOp::MovB64 => {}
+            SaluOp::AddCoU32 => {}
+            SaluOp::AddCoCiU32 => {}
             SaluOp::AddCoI32 => {}
             SaluOp::SubCoI32 => {}
             SaluOp::BfeU32 => {}
@@ -434,6 +450,8 @@ impl FromIr for SysOp {
             "WaitIdle" => { v.expect_unit("WaitIdle")?; Ok(SysOp::WaitIdle) }
             "PrefetchInst" => { v.expect_unit("PrefetchInst")?; Ok(SysOp::PrefetchInst) }
             "PrefetchGlobal" => { v.expect_unit("PrefetchGlobal")?; Ok(SysOp::PrefetchGlobal) }
+            "VNop" => { v.expect_unit("VNop")?; Ok(SysOp::VNop) }
+            "Sleep" => { v.expect_unit("Sleep")?; Ok(SysOp::Sleep) }
             other => Err(v.err(format!("unknown SysOp variant `{other}`"))),
         }
     }
@@ -446,6 +464,8 @@ impl IrIds for SysOp {
             SysOp::WaitIdle => {}
             SysOp::PrefetchInst => {}
             SysOp::PrefetchGlobal => {}
+            SysOp::VNop => {}
+            SysOp::Sleep => {}
         }
     }
 }
@@ -882,6 +902,7 @@ impl FromIr for Stmt {
             "Raw" => { v.expect_struct("Raw")?; Ok(Stmt::Raw { text: FromIr::from_ir(v.field("text")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
             "LayoutKey" => { v.expect_struct("LayoutKey")?; Ok(Stmt::LayoutKey { key: FromIr::from_ir(v.field("key")?)? }) }
             "Sys" => { v.expect_struct("Sys")?; Ok(Stmt::Sys { op: FromIr::from_ir(v.field("op")?)?, imm: FromIr::from_ir(v.field("imm")?)?, imm2: FromIr::from_ir(v.field("imm2")?)?, reads: FromIr::from_ir(v.field("reads")?)? }) }
+            "LoadAsyncLds" => { v.expect_struct("LoadAsyncLds")?; Ok(Stmt::LoadAsyncLds { lds: FromIr::from_ir(v.field("lds")?)?, vaddr: FromIr::from_ir(v.field("vaddr")?)?, imm: FromIr::from_ir(v.field("imm")?)? }) }
             "ExecFromMask" => { v.expect_struct("ExecFromMask")?; Ok(Stmt::ExecFromMask { mask: FromIr::from_ir(v.field("mask")?)? }) }
             "ExecSelect" => { v.expect_struct("ExecSelect")?; Ok(Stmt::ExecSelect { cond: FromIr::from_ir(v.field("cond")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "AuthorWords" => { v.expect_struct("AuthorWords")?; Ok(Stmt::AuthorWords { words: FromIr::from_ir(v.field("words")?)? }) }
@@ -982,6 +1003,7 @@ impl IrIds for Stmt {
             Stmt::Raw { text, reads } => { IrIds::ids(&mut (*text), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
             Stmt::LayoutKey { key } => { IrIds::ids(&mut (*key), fv, fr); }
             Stmt::Sys { op, imm, imm2, reads } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*imm2), fv, fr); IrIds::ids(&mut (*reads), fv, fr); }
+            Stmt::LoadAsyncLds { lds, vaddr, imm } => { IrIds::ids(&mut (*lds), fv, fr); IrIds::ids(&mut (*vaddr), fv, fr); IrIds::ids(&mut (*imm), fv, fr); }
             Stmt::ExecFromMask { mask } => { IrIds::ids(&mut (*mask), fv, fr); }
             Stmt::ExecSelect { cond, a, b } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Stmt::AuthorWords { words } => { IrIds::ids(&mut (*words), fv, fr); }
@@ -1210,6 +1232,7 @@ impl FromIr for UnOp {
             "CvtF32Ubyte3" => { v.expect_unit("CvtF32Ubyte3")?; Ok(UnOp::CvtF32Ubyte3) }
             "Ffbl" => { v.expect_unit("Ffbl")?; Ok(UnOp::Ffbl) }
             "Ffbh" => { v.expect_unit("Ffbh")?; Ok(UnOp::Ffbh) }
+            "RcpIflagF32" => { v.expect_unit("RcpIflagF32")?; Ok(UnOp::RcpIflagF32) }
             other => Err(v.err(format!("unknown UnOp variant `{other}`"))),
         }
     }
@@ -1236,6 +1259,7 @@ impl IrIds for UnOp {
             UnOp::CvtF32Ubyte3 => {}
             UnOp::Ffbl => {}
             UnOp::Ffbh => {}
+            UnOp::RcpIflagF32 => {}
         }
     }
 }
@@ -1261,6 +1285,8 @@ impl FromIr for BinOp {
             "MbcntLo" => { v.expect_unit("MbcntLo")?; Ok(BinOp::MbcntLo) }
             "MbcntHi" => { v.expect_unit("MbcntHi")?; Ok(BinOp::MbcntHi) }
             "BcntAdd" => { v.expect_unit("BcntAdd")?; Ok(BinOp::BcntAdd) }
+            "AddNcI32" => { v.expect_unit("AddNcI32")?; Ok(BinOp::AddNcI32) }
+            "SubrevU32" => { v.expect_unit("SubrevU32")?; Ok(BinOp::SubrevU32) }
             other => Err(v.err(format!("unknown BinOp variant `{other}`"))),
         }
     }
@@ -1286,6 +1312,8 @@ impl IrIds for BinOp {
             BinOp::MbcntLo => {}
             BinOp::MbcntHi => {}
             BinOp::BcntAdd => {}
+            BinOp::AddNcI32 => {}
+            BinOp::SubrevU32 => {}
         }
     }
 }

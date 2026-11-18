@@ -164,7 +164,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Salu { .. } | Op::SysVal { .. } => ResClass::Salu,
         Op::Raw { .. } => ResClass::Valu,
         Op::KernargPreload { .. } => ResClass::Marker,
-        Op::LoadScalar { .. } => ResClass::Salu,
+        Op::LoadScalar { .. } | Op::SBufferLoad { .. } => ResClass::Salu,
         Op::MemTimeLo { .. } => {
             e.directive = true;
             ResClass::Sync
@@ -200,6 +200,10 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::Permlane32Swap { .. }
         | Op::Permlane32SwapA { .. }
         | Op::SwapA { .. }
+        | Op::Permlane16SwapA { .. }
+        | Op::VAddU64 { .. }
+        | Op::CvtPkFp8Half { .. }
+        | Op::PkNegF32(_)
         | Op::Frag4(..)
         | Op::Frag4Lane { .. }
         | Op::Frag8(..)
@@ -342,6 +346,13 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
         // a verbatim instruction: ordered like a fence (its effects are not modelled)
         Stmt::Raw { .. } => (ResClass::Sync, vec![], false),
         Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } => (ResClass::Sync, vec![], false),
+        // an asynchronous global -> LDS copy (ASYNCcnt), ordered like the other LDS DMAs
+        Stmt::LoadAsyncLds { .. } => {
+            e.dma = true;
+            e.global_read = true;
+            e.lds_write = true;
+            (ResClass::Dma, vec![], false)
+        }
         Stmt::LayoutKey { .. } | Stmt::GotoIf { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => (ResClass::Sync, vec![], false),
         Stmt::TensorLoadToLds { .. } => {
             e.dma = true;

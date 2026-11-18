@@ -33,7 +33,7 @@ pub fn place_layout(m: &mut MFunction) -> usize {
 /// Retargets edges into blocks without instructions whose terminator is an unconditional jump.
 fn forward_empty_jumps(m: &mut MFunction) {
     // (an author's block (exact layout key) stays, even when it is only its branch: the author wrote that branch)
-    let keyed: std::collections::HashSet<u32> = m.reg_hints.layout_keys.iter().map(|(l, _)| *l).collect();
+    let keyed: std::collections::HashSet<u32> = m.reg_hints.author_branches.iter().copied().collect();
     let fwd: HashMap<u32, u32> = m.blocks.iter().filter(|b| b.insts.is_empty() && !keyed.contains(&b.label)).filter_map(|b| if let Term::Goto(t) = b.term { Some((b.label, t)) } else { None }).collect();
     let resolve = |mut l: u32| {
         let mut n = 0;
@@ -52,6 +52,10 @@ fn forward_empty_jumps(m: &mut MFunction) {
             Term::CondGoto { on, target, fall } => Term::CondGoto { on, target: resolve(target), fall: resolve(fall) },
             Term::Endpgm => Term::Endpgm,
         };
+    }
+    // exact keyed layout: every author block stays, also one no edge reaches (the author's dead code is part of the replay)
+    if !m.reg_hints.layout_keys.is_empty() {
+        return;
     }
     // the forwarding blocks (and any block no edge reaches any more) are gone from the layout
     let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
