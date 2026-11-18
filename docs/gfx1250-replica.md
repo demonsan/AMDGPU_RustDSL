@@ -184,5 +184,5 @@ Concrete compiler gaps, in the order they cost:
 8. **Kernarg preload**: the vendor preloads 20 kernarg dwords into SGPRs (no `s_load` in the prologue); ours loads them (7 `s_load`).
 
 An MLA decode compiled by us does not exist for gfx1250 yet; the vendor MLA's loop profile (per WMMA: 3.2 LDS reads incl.
-`ds_load_tr8_b64`, 2.6 VALU incl. 0.5 transcendental, 2.2 `v_nop`, 0.35 async global → LDS loads, TDM 0.06) lists the forms such a kernel
+`ds_load_tr8_b64`, 2.6 VALU incl. 0.5 transcendental, 2.2 `v_nop`, 0.12 async global → LDS loads, TDM 0.06) lists the forms such a kernel
 needs, all of which the DSL now has (§3).
