@@ -223,14 +223,18 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
                 let at = (bi, ii);
                 if e.smem {
                     issue(&mut st, Ctr::Km, at, 0, writes.clone(), reads.clone(), 1);
-                    issue(&mut st, Ctr::X, at, 1, vec![], reads.clone(), 1);
+                    if super::xnack() {
+                        issue(&mut st, Ctr::X, at, 1, vec![], reads.clone(), 1);
+                    }
                 } else if let Some(ma) = &e.mem {
                     let vsrc: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     match ma.space {
                         Space::Global => {
                             let c = if !e.writes.is_empty() { Ctr::Load } else { Ctr::Store };
                             issue(&mut st, c, at, 0, writes.clone(), reads.clone(), 1);
-                            issue(&mut st, Ctr::X, at, 0, vec![], reads.clone(), 1);
+                            if super::xnack() {
+                                issue(&mut st, Ctr::X, at, 0, vec![], reads.clone(), 1);
+                            }
                             let class = if crate::op_attrs::attrs(inst.op).mnemonic.starts_with("buffer") { 2 } else { 0 };
                             issue(&mut st, Ctr::VmVsrc, at, class, vec![], vsrc, 1);
                         }
