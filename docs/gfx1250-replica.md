@@ -186,3 +186,41 @@ Concrete compiler gaps, in the order they cost:
 An MLA decode compiled by us does not exist for gfx1250 yet; the vendor MLA's loop profile (per WMMA: 3.2 LDS reads incl.
 `ds_load_tr8_b64`, 2.6 VALU incl. 0.5 transcendental, 2.2 `v_nop`, 0.12 async global → LDS loads, TDM 0.06) lists the forms such a kernel
 needs, all of which the DSL now has (§3).
+
+## 9. Our own MLA decode on gfx1250 (`mla_g1250_qh16`)
+
+Same ABI and device layouts as the vendor qh16 kernel (120-byte kernarg, grid (1, B, 1), block 128), so `g1250_mla_host` runs both and
+pairs them. Stage body `amdgpu_stage::attention::mla::MlaBody` on the `OneWindow` pipeline:
+
+- KV ring: 3 slots of one page (64 tokens x 576 B), each wave TDM-loads a quarter; the TDM pads 16 B after every 512 B (LDS row stride 528);
+  the sequence's page ids are staged once in LDS.
+- S^T = K Q^T: wave w computes tokens 16 w .. +15 against the 16 heads (9 fp8 WMMA 16x16x64; inside a WMMA the K order is free as long as
+  A and B agree, so each lane half reads 32 contiguous bytes: two `ds_load_b128`).
+- base-2 online softmax; page maximum through LDS (8 partials per head); P to fp8 through LDS, laid out so that the bytes a lane reads back
+  are the A fragment of P for the PV WMMA.
+- PV: wave w owns 128 of the 512 V dims; the B fragments come from `ds_load_tr8_b64`. Its lane mapping, measured by `probe_g1250_tr8`:
+  fetch lane f supplies 8 contiguous bytes; byte b lands in lane `b + 8 ((f >> 2) & 1) + 16 (f >> 4)`, byte `(f & 3) + 4 ((f >> 3) & 1)`.
+  So to load a 16-dims x 16-tokens fragment, fetch lane f reads token `8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1)`, dims `+ 8 ((f >> 2) & 1)`.
+- epilogue: the row sums through LDS, O / L * ks to bf16, the natural-log LSE.
+
+Correct on MI450 against the fp32 reference on every shape tried (B x ctx up to 128 x 8192), with the same error as the vendor. Paired
+against the vendor:
+
+| B x ctx | ours (µs) | ours / vendor |
+|---|---|---|
+| 4 x 1000 | 21.9 | 1.32 |
+| 32 x 2048 | 35.0 | 1.67 |
+| 128 x 4096 | 62.7 | 1.79 |
+| 128 x 8192 | 115 | 2.2 |
+
+Compiler / template gaps found on the way (in the order they mattered):
+
+1. **LDS layout vs the read pattern** (2.5x): token rows at a 512-byte stride put the 16 rows one K read covers, and the 8 rows of a
+   transposing V read, in the same banks. Nothing plans the LDS layout from the readers; the fix is the TDM pad field, which the stage
+   template could choose from the declared read patterns.
+2. **Register reuse serialises the fragment reads**: the allocator gave every K fragment the same 8 VGPRs (read, wait 0, WMMA, nine times).
+   Issuing the reads first in the DSL gives counted waits; the scheduler should do it (the GEMM's gap 4).
+3. **Template loads are per wave**: "every wave issues the same loads" is 4x the KV traffic; the slice per wave is now in the body.
+4. **Per-page instruction overhead** (510 instructions per 17 WMMA, open): ~155 `v_mov` (the loop-carried O accumulators, and the
+   fragments rebuilt after the per-row rescale: the GEMM's gap 1), 64 `v_mul` for the rescale, 3 barriers per page, one page per iteration
+   (the vendor's loop body covers about 12), and 64 scalar bf16 stores per lane in the epilogue.
