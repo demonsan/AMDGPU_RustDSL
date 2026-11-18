@@ -91,10 +91,11 @@ int main(int argc, char** argv) {
                 if (k < lo || k >= hi) A[(size_t)i * KB + k / 2] &= (k & 1) ? 0x0f : 0xf0;
     }
     uint8_t *dA, *dB, *dSA, *dSB; float* dC;
-    HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); HC(hipMalloc(&dC, (size_t)M * N * 4));
+    HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); const bool bf16 = getenv("OUT_BF16") != nullptr;   // the kernel writes bf16 (RNE), M x N x 2 bytes
+    HC(hipMalloc(&dC, (size_t)M * N * (bf16 ? 2 : 4)));
     HC(hipMemcpy(dA, A.data(), A.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, B.data(), B.size(), hipMemcpyHostToDevice));
     HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SB.data(), SB.size(), hipMemcpyHostToDevice));
-    HC(hipMemset(dC, 0xff, (size_t)M * N * 4));
+    HC(hipMemset(dC, 0xff, (size_t)M * N * (bf16 ? 2 : 4)));
 
     struct { void *a, *b, *sa, *sb, *c; int k, n; } ka{dA, dB, dSA, dSB, dC, K, N};
     size_t ksz = sizeof(ka);
@@ -109,7 +110,13 @@ int main(int argc, char** argv) {
         wait_polled(e, kn);
     }
     std::vector<float> C((size_t)M * N);
-    HC(hipMemcpy(C.data(), dC, C.size() * 4, hipMemcpyDeviceToHost));
+    if (bf16) {
+        std::vector<uint16_t> Cb((size_t)M * N);
+        HC(hipMemcpy(Cb.data(), dC, Cb.size() * 2, hipMemcpyDeviceToHost));
+        for (size_t x = 0; x < Cb.size(); ++x) { uint32_t u = (uint32_t)Cb[x] << 16; float f; memcpy(&f, &u, 4); C[x] = f; }
+    } else {
+        HC(hipMemcpy(C.data(), dC, C.size() * 4, hipMemcpyDeviceToHost));
+    }
 
     // fp32 reference on sampled rows (all columns)
     const int nrows = getenv("CHECK_ROWS") ? atoi(getenv("CHECK_ROWS")) : 16;
@@ -131,7 +138,7 @@ int main(int argc, char** argv) {
             }
             const double got = C[(size_t)i * N + j];
             const double err = std::fabs(got - ref);
-            const bool ok = !std::isnan(got) && err <= 5e-4 * scale + 1e-3;
+            const bool ok = !std::isnan(got) && err <= (bf16 ? 8e-3 * std::fabs(ref) : 0.0) + 5e-4 * scale + 1e-3;
             if (!ok) { if (bad < 8) printf("  mismatch C[%d][%d]: got %g ref %g\n", i, j, got, ref); ++bad; if (mismap) rowbad.back()[j / BN]++; }
             if (!std::isnan(err)) maxrel = std::max(maxrel, err / (scale + 1e-9));
         }
