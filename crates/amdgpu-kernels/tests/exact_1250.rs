@@ -173,7 +173,7 @@ fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
     b.break_if(Opnd::Val(one));
     b.end_loop();
     let f = b.finish();
-    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}")).asm;
     // the store's data register is not the register the in-place multiply writes
     let mul_dst: Vec<String> = asm.lines().filter(|l| l.trim_start().starts_with("v_mul_f32")).filter_map(|l| l.split_whitespace().nth(1).map(|s| s.trim_end_matches(',').to_string())).collect();
     let store_data: Vec<String> = asm.lines().filter(|l| l.trim_start().starts_with("global_store_b32")).filter_map(|l| l.split_whitespace().nth(2).map(|s| s.trim_end_matches(',').to_string())).collect();
