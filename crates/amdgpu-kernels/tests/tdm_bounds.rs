@@ -107,3 +107,55 @@ fn a_tile_past_the_extent_is_rejected() {
 fn an_unbounded_offset_is_rejected() {
     rejected(Case::UnboundedOffset, "GV-GLB-OOB");
 }
+
+// ---- a paged buffer (data-dependent base): the index is loaded from a page table in memory ----
+
+/// A tensor load of one 8 x 64-byte tile at `page x 4096` of a paged pool `kv` (`P` pages), the page index loaded from the table `tab` (u32 entries).
+fn paged_kernel(declare_pool: bool, contract: bool, big_tile: bool) -> Function {
+    let mut b = FnBuilder::new("tb_paged", 64);
+    b.arg("kv", DType::Ptr, 0, 8);
+    b.arg("tab", DType::Ptr, 8, 8);
+    b.lds(8192);
+    if declare_pool {
+        b.arg_tensor_paged("kv", "P", 4096, 1 << 20);
+    }
+    b.arg_tensor("tab", Ext::c(64));
+    let pk = b.let_(Op::KernargPtr { offset: 0 });
+    let pt = b.let_(Op::KernargPtr { offset: 8 });
+    let idx_v = b.load_global(pt, 0, amdgpu_dsl::MemTy::B32);
+    // every lane loaded the same entry: the page index is wave-uniform (descriptor words are scalar)
+    let idx = b.let_(Op::ReadFirstLane(Opnd::Val(idx_v)));
+    if contract {
+        b.page_index_below(idx, "P");
+    }
+    let off = b.let_(Op::MulI32(Opnd::Val(idx), Opnd::I32(4096)));
+    let rows = if big_tile { 80 } else { 8 };   // 80 rows x 64 bytes = 5120 bytes: past the page
+    let tile = TensorTile { data_size: 1, tensor_dim: [Opnd::I32(64), Opnd::I32(rows)], stride0: Opnd::I32(64), tile: [64, rows as u16], pad: None, wg_mask: 0 };
+    let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pk), Opnd::Val(off), Opnd::I32(0));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.wait_tensor(0);
+    b.finish()
+}
+
+#[test]
+fn a_paged_tile_with_the_host_contract_compiles() {
+    amdgpu_codegen::compile_target(&paged_kernel(true, true, false), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_paged_tile_without_the_index_contract_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&paged_kernel(true, false, false), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-OOB"), "{e}");
+}
+
+#[test]
+fn a_paged_tile_larger_than_a_page_is_rejected_even_with_the_contract() {
+    let e = amdgpu_codegen::compile_target(&paged_kernel(true, true, true), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-OOB"), "{e}");
+}
+
+#[test]
+fn a_paged_pool_without_a_declared_extent_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&paged_kernel(false, true, false), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-NOEXT") || e.contains("GV-GLB-OOB"), "{e}");
+}

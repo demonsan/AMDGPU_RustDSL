@@ -32,6 +32,11 @@ pub struct F4Shape {
     /// column. A multicast is a rendezvous of identical requests, so every workgroup of the row issues the very same slices (per wave) with the same mask; 1 x 1 = no cluster
     pub cx: i32,
     pub cy: i32,
+    /// the output is bf16 (round to nearest even, row-major M x N x 2 bytes) instead of f32: half the C bytes (the vendor writes bf16)
+    pub bf16: bool,
+    /// cluster only: keep the workgroups of the cluster in lockstep, one cluster barrier per K tile (the vendor loop's `s_barrier_signal -3` / wait): the multicast rendezvous then finds its peers
+    /// asking at about the same time instead of waiting for the timeout
+    pub lock: bool,
 }
 
 impl F4Shape {
@@ -118,6 +123,17 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
+        if self.sh.cx * self.sh.cy > 1 && self.sh.lock {
+            // our own tensor wait, every wave of the workgroup done (reads of the previous tile included: the barrier), then one wave signals the cluster barrier and all wait
+            b.wait_tensor(0);
+            b.wait_lds(0);
+            b.barrier();
+            b.begin_if(Opnd::Val(self.leader));
+            b.barrier_signal(-3);
+            b.end_if();
+            b.barrier_wait(-3);
+            return;
+        }
         // the four loads of a stage (A, B and the two scale tiles) are the only operations a stage leaves outstanding: with `relax` the loads of the stage just issued may stay in flight
         b.wait_tensor(if self.sh.relax && self.steady { 4 } else { 0 });
     }

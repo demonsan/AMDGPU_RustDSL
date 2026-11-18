@@ -258,7 +258,7 @@ pub const F4_NAME: &str = "gemm_g1250_tdm_stage_f4";
 /// per 32 K (`sa` [M][K / 32] bytes, `sb` [N][K / 32] bytes), `v_wmma_scale_f32_32x16x128_f4`. A 128 x 64 C tile per workgroup (4 waves 2 x 2, each wave 2 x 2 WMMAs of 32 x 16), K tiles of
 /// 128, the 3-slot ring of the OneWindow cadence. Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40 (K elements, a multiple of 128), n @44. Grid (N / 64, M / 128).
 pub fn gemm_tdm_stage_f4() -> Function {
-    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// 128 x 128 tile (4 waves, each 2 x 4 WMMAs).
@@ -270,15 +270,15 @@ pub const F4_256X64: &str = "gemm_g1250_tdm_stage_f4_256x64";
 pub const F4_256X128: &str = "gemm_g1250_tdm_stage_f4_256x128";
 
 pub fn gemm_tdm_stage_f4_128x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// K sub-steps per ring slot (a slot holds `ks x 128` K elements: more WMMAs per barrier / tensor wait; the fragment loads of the next sub-step are issued before the WMMAs of the current one).
@@ -287,7 +287,7 @@ pub const F4_128X128_KS4: &str = "gemm_g1250_tdm_stage_f4_128x128_ks4";
 pub const F4_256X128_KS2: &str = "gemm_g1250_tdm_stage_f4_256x128_ks2";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// The vendor-shaped tile: 256 x 256 per workgroup, 4 waves (2 x 2) of 128 x 128 (4 x 8 WMMAs of 32 x 16 each per K step), ks = 2.
@@ -295,48 +295,64 @@ pub const F4_256X256_KS2: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2";
 pub const F4_256X256_KS2_HB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_hb";
 /// `gemm_tdm_stage_f4_256x256_ks2` with the tile origins hoisted out of the pipeline (`gemm_tdm_stage_f4_opts`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_hb() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, true, false)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, true, false)
 }
 
 pub const F4_256X256_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad";
 /// `gemm_tdm_stage_f4_256x256_ks2` with the planner's TDM row padding (conflict-free A / B fragment reads; `f4_row_pad`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
 }
 
 pub const F4_256X256_KS2_PAD_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax";
 /// `_256x256_ks2_pad` with the relaxed tensor waits (each window completes the previous stage's tile; `F4Shape::relax`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad_relax() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1 }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
 }
 
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
-    gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+}
+
+/// The cluster variants with the planner's TDM row padding.
+pub fn gemm_tdm_stage_f4_256x256_ks2_cluster_pad(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_opts(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false, false, true)
 }
 
 pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// The 256 x 256 tile in a cluster of `cx` x `cy` workgroups (the vendor launches 4 x 4): A (and its scales) multicast along the cluster row, B along the column.
 pub fn gemm_tdm_stage_f4_256x256_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy }, true, false)
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false)
+}
+
+/// The same with the cluster kept in lockstep (one cluster barrier per K tile).
+pub fn gemm_tdm_stage_f4_256x256_ks2_cluster_lock(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false)
+}
+
+/// The 256 x 256 tile with a bf16 output (like the vendor kernel): half the C bytes.
+pub const F4_256X256_KS2_BF16: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_bf16";
+pub fn gemm_tdm_stage_f4_256x256_ks2_bf16() -> Function {
+    gemm_tdm_stage_f4_with(F4_256X256_KS2_BF16, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_128x128_ks4() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// Relaxed tensor waits (`F4Shape::relax`): the 128 x 128 tile with 2 sub-steps per slot.
 pub const F4_128X128_KS2_RELAX: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_relax";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2_relax() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// Cluster multicast (docs/mxfp4-gemm-gfx1250-plan.md step 8): the 128 x 128 tile, 2 K sub-steps per slot, in a cluster of 2 x 2 / 2 x 1 / 1 x 2 workgroups (launch with the cluster attribute and
@@ -346,7 +362,7 @@ pub const F4_128X128_KS2_C2X1: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1"
 pub const F4_128X128_KS2_C1X2: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx, cy }, true, false)
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false)
 }
 
 /// The 8-wave 256 x 64 tile (4 x 2 waves, each 2 x 2 WMMAs, cooperative loads, the original interleaved ring layout): the configuration that hung a device on 2026-11-17 (declared LDS 86,784 B).
@@ -354,7 +370,7 @@ pub fn gemm_tdm_stage_f4_128x128_ks2_cluster(name: &str, cx: i32, cy: i32) -> Fu
 pub const F4_8W: &str = "gemm_g1250_tdm_stage_f4_8w_256x64";
 
 pub fn gemm_tdm_stage_f4_8w_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1 }, true, true)
+    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, true)
 }
 
 /// The ks = 2 kernels (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original wrong-result build (the four parts interleaved per slot by `ring_group`, declared 103,936
@@ -363,11 +379,11 @@ pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
 pub const F4_KS2: &str = "gemm_g1250_tdm_stage_f4_ks2";
 
 pub fn gemm_tdm_stage_f4_ks2_grouped() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1 }, true, true)
+    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, true)
 }
 
 pub fn gemm_tdm_stage_f4_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
+    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
 }
 
 /// The MXFP4 stage-template GEMM for a workgroup shape (`sh`) and the loading scheme (`coop`: every wave loads a slice of the tile; otherwise every wave loads all of it). The four rings (A, B and the
@@ -426,7 +442,7 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
     b.arg_tensor("sa", m_rows.clone() * Ext::sym("K128") * Ext::c(4));
     b.arg_tensor("sb", n_cols.clone() * Ext::sym("K128") * Ext::c(4));
-    b.arg_tensor("c", m_rows * n_cols * Ext::c(4));
+    b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
     let mut lds = LdsPlan::new();
     let (ra, rb, rsa, rsb) = if grouped {
         let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * row_l) as i64, Layout::Linear), ("B", (bn * row_l) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
@@ -568,7 +584,8 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     pipe.run(&mut b, Role::All, &mut body);
 
     // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
-    let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
+    let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
+    let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
     let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
     for i in 0..sh.tm {
         for j in 0..sh.tn {
@@ -584,13 +601,20 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let c0 = b.add_i32(c0, m);
             let lin = b.mul_i32(r0, nn);
             let lin = b.add_i32(lin, c0);
-            let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+            let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(esh)));
             for v in 0..16i32 {
                 let rowv = (v % 8) + 16 * (v / 8);
                 let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
                 let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
                 let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                b.store_global(q, 0, x, MemTy::B32, false);
+                if sh.bf16 {
+                    // the accumulator rounded to bf16 (RNE) in the low half of a dword, stored as 16 bits
+                    let xf = b.bitcast_f32(x);
+                    let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(xf), Opnd::Val(xf)));
+                    b.store_u16(q, 0, p);
+                } else {
+                    b.store_global(q, 0, x, MemTy::B32, false);
+                }
             }
         }
     }
