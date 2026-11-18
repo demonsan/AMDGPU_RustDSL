@@ -181,28 +181,28 @@ pub fn mla_g1250_qh16_ws() -> Function {
         let mut okv: Vec<ValueId> = Vec::with_capacity(32);
         // valid tokens of this page (>= 64 except on the sequence's last page)
         let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
+        // the 4 S tiles interleaved chunk by chunk: the 4 K fragments of chunk c are read before the 4 WMMAs of chunk c - 1 complete their
+        // chains (4 independent accumulators: WMMA latency and LDS latency overlap)
         let svals: Vec<ValueId> = mine.read_back(b, gen, |b| {
-            (0..4usize)
-                .map(|j| {
-                    let mut acc: Option<Opnd> = None;
-                    for c3 in 0..3usize {
-                        let fa: Vec<ValueId> = (0..3usize)
-                            .map(|cc| {
-                                let c = 3 * c3 + cc;
-                                let lo = if c < 8 { b.bind_i32(ev(nrow) + kd[j][c]) } else { b.bind_i32(ev(rrow) + kd[j][c]) };
-                                let hi = b.bind_i32(ev(lo) + 16);
-                                b.load_lds_b128x2(lo, hi)
-                            })
-                            .collect();
-                        for cc in 0..3usize {
-                            let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[cc], q[3 * c3 + cc], acc);
-                            acc = Some(Opnd::Val(d));
-                        }
-                    }
-                    match acc {
-                        Some(Opnd::Val(v)) => v,
-                        _ => unreachable!(),
-                    }
+            let frag = |b: &mut FnBuilder, j: usize, c: usize| {
+                let lo = if c < 8 { b.bind_i32(ev(nrow) + kd[j][c]) } else { b.bind_i32(ev(rrow) + kd[j][c]) };
+                let hi = b.bind_i32(ev(lo) + 16);
+                b.load_lds_b128x2(lo, hi)
+            };
+            let mut acc: Vec<Option<Opnd>> = vec![None; 4];
+            let mut cur: Vec<ValueId> = (0..4).map(|j| frag(b, j, 0)).collect();
+            for c in 0..9usize {
+                let next: Vec<ValueId> = if c + 1 < 9 { (0..4).map(|j| frag(b, j, c + 1)).collect() } else { Vec::new() };
+                for j in 0..4 {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, cur[j], q[c], acc[j]);
+                    acc[j] = Some(Opnd::Val(d));
+                }
+                cur = next;
+            }
+            acc.into_iter()
+                .map(|a| match a {
+                    Some(Opnd::Val(v)) => v,
+                    _ => unreachable!(),
                 })
                 .collect()
         });
