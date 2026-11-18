@@ -3780,6 +3780,13 @@ impl<'a> An<'a> {
             Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
             Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
         Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
+            // the async copy global -> LDS: 16 bytes per lane from the lane's global address (+ the instruction offset), proven like a global load
+            Stmt::LoadAsyncLds { lds, vaddr, imm } => {
+                let b = self.av_of(vaddr);
+                self.check_global("global_load_async_to_lds_b128", &b, *imm as i128, 16, false);
+                // the LDS side: 16 bytes at the lane's LDS address (the declared segment)
+                self.check_lds_at("global_load_async_to_lds_b128", lds, 16)
+            }
             Stmt::StoreGlobalN { base, byte_off, ty, .. } => {
                 self.record_global_store(base, *byte_off as i128, ty.bytes() as i128);
                 let b = self.av_of(base);
