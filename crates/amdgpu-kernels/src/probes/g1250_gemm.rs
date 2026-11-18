@@ -408,6 +408,14 @@ pub fn gemm_tdm_stage_f4_256x128() -> Function {
     gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1 }, true, false)
 }
 
+/// The 8-wave 256 x 64 tile (4 x 2 waves, each 2 x 2 WMMAs, cooperative loads, the original interleaved ring layout): the configuration that hung a device on 2026-11-17 (declared LDS 86,784 B).
+/// Regression kernel of that incident: its cause was NOT established when it was registered; run it on one work-group first, watchdogged (docs/mxfp4-gemm-gfx1250-plan.md).
+pub const F4_8W: &str = "gemm_g1250_tdm_stage_f4_8w_256x64";
+
+pub fn gemm_tdm_stage_f4_8w_256x64() -> Function {
+    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1 }, true, true)
+}
+
 /// The ks = 2 kernels (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original wrong-result build (the four parts interleaved per slot by `ring_group`, declared 103,936
 /// bytes), `_ks2` the same kernel with four separate rings (78,336 bytes). They returned wrong data until the wait pass used the gfx1250 DScnt range; now regression kernels of that bug.
 pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
