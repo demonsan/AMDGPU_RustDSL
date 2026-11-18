@@ -64,6 +64,10 @@ impl PipeBody for TdmGemmBody {
         rb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0b), Opnd::Val(g1), None, TdmCpol::default()));
     }
 
+    fn finish(&mut self, b: &mut FnBuilder, _role: Role) {
+        b.wait_tensor(0);   // the last steady iteration's clamped stage is still in flight
+    }
+
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
         // the loads of the slot just staged are the only ones outstanding (the driver completes every stage before it issues the next)
         b.wait_tensor(0);
