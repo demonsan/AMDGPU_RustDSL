@@ -455,6 +455,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epi_opts(name: &str, epi: u8, relax: bool, 
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
 }
 
+/// The padded 256 x 256 kernel with the TDM-store epilogue in a cluster of `cx` x `cy` workgroups, lockstep (one cluster barrier per K tile).
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_cluster(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { epilogue_lds: 2, ..RingOpts::default() })
+}
+
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
 /// The unpadded LDS layout (8-way bank conflicts on the fragment reads), for A/B against the default.
 pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
@@ -572,7 +577,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
-    assert!(epi == 0 || (!sh.bf16 && sh.cx * sh.cy == 1), "the LDS epilogue: f32, no cluster");
+    assert!(epi == 0 || !sh.bf16, "the LDS epilogue: f32 output");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
     // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
     // so its staging rows are unpadded)
