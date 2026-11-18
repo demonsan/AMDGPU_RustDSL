@@ -3528,6 +3528,22 @@ impl Lowerer {
                 self.uniform.insert(dst);
                 self.val.insert(dst, d);
             }
+            // gfx1250: a preloaded kernarg dword is a copy of its user SGPR (s[2 + offset / 4])
+            Op::KernargI32 { offset } | Op::KernargF32 { offset } if crate::target::cur().name == "gfx1250" && offset % 4 == 0 && offset / 4 < crate::target::gfx1250::preload_n() => {
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SReadPhys).def(d).imm(2 + (*offset / 4) as i64));
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
+            Op::KernargPtr { offset } if crate::target::cur().name == "gfx1250" && offset % 4 == 0 && offset / 4 + 1 < crate::target::gfx1250::preload_n() => {
+                let d = self.new_vreg(RClass::S2);
+                for k in 0..2u8 {
+                    let w = self.sub_alias(d, k, RClass::S1);
+                    self.push(MInst::new(MOp::SReadPhys).def(w).imm(2 + (*offset / 4) as i64 + k as i64));
+                }
+                self.uniform.insert(dst);
+                self.val.insert(dst, d);
+            }
             Op::KernargI32 { offset } | Op::KernargF32 { offset } => {
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SLoadDword).def(d).imm(*offset as i64));
