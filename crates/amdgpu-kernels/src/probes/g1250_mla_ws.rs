@@ -184,6 +184,11 @@ pub fn mla_g1250_qh16_wsst() -> Function {
     mla_ws_with("mla_g1250_qh16_wsst", false, 64 | 128 | 256, false)
 }
 
+/// `_wsst` with debug timestamps over the LSE (host PRINT_LSE=1).
+pub fn mla_g1250_qh16_wsstd() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsstd", false, 64 | 128 | 256 | 512, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -216,6 +221,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let ipf = branchless & 128 != 0;
     // bit 8: full page pairs in the loop, an odd last page after it (no masked re-read of a pad page)
     let tail = branchless & 256 != 0;
+    // bit 9: debug timestamps (SHADER_CYCLES, 20 bits) of wave 0 at checkpoints, written over LSE[b][0..6] (the LSE is then garbage)
+    let tstamp = branchless & 512 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -262,12 +269,18 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
     let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
+    let mut stamps: Vec<ValueId> = Vec::new();
+    let cyc = |b: &mut FnBuilder| b.let_(Op::SysVal { op: amdgpu_dsl::SysValOp::GetReg, imm: 29 | (19 << 11) });
     if ipf {
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
         for k in 0..12u32 {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
+    }
+    if tstamp {
+        let c = cyc(&mut b);
+        stamps.push(c);
     }
     let tid = b.let_(Op::WorkitemId);
     let bidx = b.let_(Op::WorkgroupIdY);
@@ -369,6 +382,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.barrier();
     }
 
+    if tstamp {
+        let c = cyc(&mut b);
+        stamps.push(c);
+    }
     // ---- the wave's pages: w, w + 4, ..: nw of them (0 for a short sequence) ----
     let neg = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
@@ -787,6 +804,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.end_if();
     b.wait_tensor(0);
 
+    if tstamp {
+        let c = cyc(&mut b);
+        stamps.push(c);
+    }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
     b.wait_lds(0);
     b.barrier();
@@ -811,6 +832,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     });
     b.wait_lds(0);
     b.barrier();
+    if tstamp {
+        let c = cyc(&mut b);
+        stamps.push(c);
+    }
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);
@@ -930,6 +955,20 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let lse = b.mul_f32(s2, ln2);
     let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
     let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+    if tstamp {
+        let c = cyc(&mut b);
+        stamps.push(c);
+        // wave 0's stamps over LSE[b][0..]: every lane of wave 0 writes the same words
+        let w0 = b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(0));
+        b.begin_if(w0);
+        let lb = b.bind_i32(ev(bidx) * 64);
+        let plb = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lb) });
+        for (i, &s) in stamps.iter().enumerate() {
+            b.store_global(plb, 4 * i as u32, s, MemTy::B32, false);
+        }
+        b.end_if();
+        return b.finish();
+    }
     b.store_global(pl, 0, lse, MemTy::B32, false);
     b.finish()
 }

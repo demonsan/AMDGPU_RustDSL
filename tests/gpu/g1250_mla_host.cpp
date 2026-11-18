@@ -175,6 +175,14 @@ int main(int argc, char** argv) {
     wait_deadline(e1, deadline, "first launch");
     std::vector<uint16_t> R((size_t)B * H * DV);
     HC(hipMemcpy(R.data(), dR, R.size() * 2, hipMemcpyDeviceToHost));
+    // PRINT_LSE=1: the LSE words of sequence 0 as u32 (debug timestamps of a `_wsstd` kernel)
+    if (getenv("PRINT_LSE")) {
+        std::vector<uint32_t> L(H);
+        HC(hipMemcpy(L.data(), dLSE, H * 4, hipMemcpyDeviceToHost));
+        std::printf("lse_u32:");
+        for (int i = 0; i < 8; ++i) std::printf(" %u", L[i]);
+        std::printf("\n");
+    }
     // DUMP=<file>: the raw bf16 output (debugging: diff two kernels' outputs element by element)
     if (const char* dp = getenv("DUMP")) { FILE* fp = fopen(dp, "wb"); if (fp) { fwrite(R.data(), 2, R.size(), fp); fclose(fp); } }
     // a hash of the whole output (FNV-1a 64): two code objects on the same inputs give the same hash exactly when every output bit agrees
