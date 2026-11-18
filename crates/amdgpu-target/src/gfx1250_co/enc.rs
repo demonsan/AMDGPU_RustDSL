@@ -104,9 +104,13 @@ fn parse_inst(line: &str) -> Result<Inst, String> {
     parts.push(cur.trim().to_string());
     parts.retain(|s| !s.is_empty());
     if let Some(last) = parts.pop() {
-        let mut toks = last.split_whitespace();
-        if let Some(first) = toks.next() {
-            parts.push(first.to_string());
+        let mut toks = last.split_whitespace().peekable();
+        // (an instruction without operands may start with a modifier: `global_wb scope:SCOPE_DEV`)
+        if let Some(first) = toks.peek().copied() {
+            if !(first.contains(':') && parse_reg(first).is_none()) {
+                parts.push(first.to_string());
+                toks.next();
+            }
         }
         for m in toks {
             let (k, v) = m.split_once(':').unwrap_or((m, ""));
@@ -434,6 +438,35 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         }
         "VGLOBAL" => {
             // loads: vD, vaddr, saddr|off; stores: vaddr, vdata, saddr|off; prefetch: vaddr, saddr|off
+            // the cache maintenance (no operands; scope only) and the atomics (with return: vdst, vaddr, vdata, saddr; without: vaddr,
+            // vdata, saddr; th:TH_ATOMIC_RETURN = TH 1) - llvm-mc: `global_atomic_add_u32 v5, v[2:3], v4, off th:TH_ATOMIC_RETURN` =
+            // ee0d407c 02100005 00000002, `global_wb scope:SCOPE_DEV` = ee0b007c 00080000 00000000
+            const SC0: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
+            let scope0 = modv(&i, "scope").map(|v| SC0.iter().position(|x| *x == v).unwrap_or(0) as u32).unwrap_or(0);
+            if base == "global_wb" || base == "global_inv" {
+                out.extend_from_slice(&d32(0xEE00_0000 | op << 14 | 0x7C));
+                out.extend_from_slice(&d32(scope0 << 18));
+                out.extend_from_slice(&d32(0));
+                return Ok(out);
+            }
+            if base.starts_with("global_atomic") {
+                let ret = modv(&i, "th") == Some("TH_ATOMIC_RETURN");
+                let (dst, addr, data, saddr) = if ret {
+                    (vreg(op_at(&i, 0)?)?, op_at(&i, 1)?, vreg(op_at(&i, 2)?)?, op_at(&i, 3)?)
+                } else {
+                    (0, op_at(&i, 0)?, vreg(op_at(&i, 1)?)?, op_at(&i, 2)?)
+                };
+                let sa = match saddr {
+                    Op::Special(124) => 0x7C,
+                    Op::S(r, 2) => *r,
+                    x => return Err(format!("`{t}`: saddr {x:?}")),
+                };
+                let off = modv(&i, "offset").map(|v| parse_num(v).ok_or(format!("`{t}`: offset"))).transpose()?.unwrap_or(0);
+                out.extend_from_slice(&d32(0xEE00_0000 | op << 14 | sa));
+                out.extend_from_slice(&d32(data << 23 | (ret as u32) << 20 | scope0 << 18 | dst));
+                out.extend_from_slice(&d32(((off as u32) & 0x00ff_ffff) << 8 | vreg(addr)?));
+                return Ok(out);
+            }
             let store = base.starts_with("global_store");
             let (data, addr, saddr) = if base.starts_with("global_prefetch") {
                 (0, op_at(&i, 0)?, op_at(&i, 1)?)

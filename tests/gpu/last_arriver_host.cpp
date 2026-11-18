@@ -17,7 +17,9 @@ int main(int argc, char** argv) {
     void *dpart, *dcnt, *dres;
     CK(hipMalloc(&dpart, (size_t)maxn * 64 * 4)); CK(hipMalloc(&dcnt, 64)); CK(hipMalloc(&dres, 64));
     long total_bad = 0, total_runs = 0;
+    const int limit = getenv("MAXN") ? std::atoi(getenv("MAXN")) : maxn;   // MAXN: the gated first step (small block counts only)
     for (int n : counts) {
+        if (n > limit) break;
         uint32_t want = 0;
         for (int b = 0; b < n; ++b) for (int t = 0; t < 64; ++t) want += (uint32_t)((b + 1) * 1000 + t);
         int bad = 0; uint32_t first_bad = 0;
