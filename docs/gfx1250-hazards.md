@@ -22,3 +22,22 @@ Distances count intervening VALU instructions (`v_nop` included unless noted; SA
 
 VOPD pairing constraints are applied when LLVM forms pairs (no post-fix); the own tail emits no VOPD. VGPR MSB (`s_set_vgpr_msb`): reset to 0
 at every block end / before branches, folded where possible; see G2 VGPR windowing.
+
+## TRANS co-execution: hardware evidence (MI450)
+
+LLVM pads every VALU that reads a TRANS result (or overwrites a TRANS source) right after the TRANS op with one `v_nop`
+(`GCNHazardRecognizer::fixVALUTransCoexecutionHazards`). On MI450 the probe `probe_g1250_trans_all` (`tools/mi450/trans_all.sh`,
+`tools/mi450/trans_shape.py`) moves each TRANS result's first reader to distance 0 and removes the `v_nop` per reader class; every class
+below is bit-identical to the padded build over 5 runs x 1024 workgroups x 512 work-items (every TRANS op exp / log / rcp / rsq / sqrt /
+sin / cos):
+
+| reader class | positions | sites | result |
+|---|---|---|---|
+| `v_add_f32` | RAW src0 / src1, WAR | 27 + 26 | identical |
+| `v_fma_f32` | RAW src0 / src1 / src2 | 63 | identical |
+| `v_max_f32` (`v_max_num_f32`) | RAW | 43 | identical |
+| `v_mul_f32` | RAW (cos), WAR (all) | 4 + 23 | identical |
+| `v_pk_add_f32` (VOP3P packed f32) | RAW (one half of the pair) | 21 | identical |
+
+The gfx1250 hazard pass therefore omits the `v_nop` for these readers only (`hazards::trans_coexec_proven`); DOT, conversions, moves and
+every other reader keep it.

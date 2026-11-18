@@ -110,7 +110,7 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                     for p in &pend {
                         let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
                         match p.wmma {
-                            None if !me_trans && p.dist == 0 && (hit(&reads, &p.dst) || hit(&writes, &p.srcs)) => need = need.max(1),
+                            None if !me_trans && p.dist == 0 && !trans_coexec_proven(inst.op) && (hit(&reads, &p.dst) || hit(&writes, &p.srcs)) => need = need.max(1),
                             Some((ww, _)) if me_wmma => {
                                 if hit(&ab, &p.dst) && p.dist < ww {
                                     need = need.max(ww - p.dist);
@@ -179,4 +179,12 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
     }
     let _ = has_tdm;
     plan
+}
+
+/// The VALU readers for which the TRANS co-execution `v_nop` is not needed on gfx1250, by hardware evidence (MI450,
+/// tools/mi450/trans_all.sh: every TRANS op - exp / log / rcp / rsq / sqrt / sin / cos - read at distance 0, RAW in every source position and
+/// WAR, by these classes, bit-identical to the padded build over 5 runs x 1024 workgroups x 512 work-items; docs/gfx1250-hazards.md). LLVM
+/// (fixVALUTransCoexecutionHazards) pads every VALU; every class not listed here (DOT, conversions, moves, ...) keeps the `v_nop`.
+pub fn trans_coexec_proven(op: MOp) -> bool {
+    matches!(op, MOp::VAddF32 | MOp::VMulF32 | MOp::VFmaF32 | MOp::VMaxF32 | MOp::VPkAddF32)
 }
