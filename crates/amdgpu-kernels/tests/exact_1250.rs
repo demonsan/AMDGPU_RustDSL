@@ -161,7 +161,7 @@ fn a_copy_of_a_lane_written_in_place_keeps_its_value() {
     b.arg("out", DType::Ptr, 0, 8);
     b.arg_tensor("out", Ext::c(1 << 12));
     let p = b.let_(Op::KernargPtr { offset: 0 });
-    let z = b.let_(Op::FragZero { ty: DType::Frag8 });
+    let z = b.frag_cat(&[Opnd::I32(0); 8]);
     let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(z))]);
     let o = vars[0];
     let lane = b.frag_slice(Opnd::Var(o), 0, 1);
