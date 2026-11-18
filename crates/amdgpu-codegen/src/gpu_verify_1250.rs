@@ -1679,6 +1679,9 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
 /// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
 pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
+    if kd_val(f, "g5:loop_ifs_explored") != 0 {
+        v.push("tile protocol: the runtime ifs inside loops are explored for the simulated iterations only, not for every outcome sequence of a longer run (declared launch fact g5:loop_ifs_explored)".to_string());
+    }
     if kd_val(f, "g5:tdm_host_descriptor") != 0 {
         v.push("tensor descriptors built by the host (launch fact g5:tdm_host_descriptor): their global base / extent are not proved".to_string());
     }

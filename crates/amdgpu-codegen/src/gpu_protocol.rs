@@ -266,7 +266,16 @@ struct Sim<'a> {
     brk_ord: usize,
     /// inside the body of an E5 exit taken on this path (runs once: its runtime ifs are decisions)
     exit_body: bool,
+    /// launch fact `g5:loop_ifs_explored`: runtime ifs INSIDE loops are explored per iteration (each occurrence a decision, at most `LOOP_IF_BUDGET` per trace) instead of rejected
+    loop_ifs: bool,
+    /// the number of loop-internal runtime-if decisions taken on this path so far
+    loop_decisions: usize,
+    /// occurrences of each runtime-if statement met so far on this path (keys the decisions: the same statement in two iterations is two decisions)
+    occ: HashMap<usize, usize>,
 }
+
+/// The most runtime ifs inside loops that one simulated path may decide (2^6 paths of this kind at most per role): beyond it the kernel is rejected as unsupported.
+const LOOP_IF_BUDGET: usize = 6;
 
 impl<'a> Sim<'a> {
     fn cv(&self, o: &Opnd) -> CV {
@@ -688,7 +697,17 @@ impl<'a> Sim<'a> {
                             CV::K(c) => run_arm(self, c != 0),
                             CV::U => {
                                 if has_any {
-                                    if self.loop_depth > 0 && !self.exit_body {
+                                    if self.loop_depth > 0 && !self.exit_body && self.loop_ifs && self.loop_decisions < LOOP_IF_BUDGET {
+                                        // declared (`loop_ifs_explored`): each occurrence of the if in each simulated iteration is a decision (keyed by statement and occurrence, so the two roles pair
+                                        // occurrence for occurrence)
+                                        self.loop_decisions += 1;
+                                        let o = self.occ.entry(i).or_insert(0);
+                                        let key = i + (*o << 24);
+                                        *o += 1;
+                                        let uniform = !self.div.contains(&i);
+                                        let d = self.choose(key, uniform);
+                                        run_arm(self, d);
+                                    } else if self.loop_depth > 0 && !self.exit_body {
                                         self.unsupported.push((i, format!("stmt {i}: a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses: its two outcomes are not explored per iteration (a 2^iterations path set); hoist it out of the loop, make both arms identical, or restructure")));
                                     } else {
                                         let uniform = !self.div.contains(&i);
@@ -1291,7 +1310,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: f.kd.iter().any(|(k, v)| k == "g5:loop_ifs_explored" && *v != 0), loop_decisions: 0, occ: HashMap::default() };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
