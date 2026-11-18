@@ -353,6 +353,40 @@ static int run_tr8(Kernel& k, const char* kn) {
     return 0;
 }
 
+// probe_g1250_varscale{4,32}[_br]: NV loop-carried WMMA accumulators scaled in place per row each iteration by alpha = in[(i*8+r)*32+lane],
+// then += 128 (a WMMA of fp8 ones x twos). Reference O = O * alpha + 128 per iteration (exact in f32 for the alphas used). env NV (4 / 32), N (iterations).
+static int run_varscale(Kernel& k, const char* kn) {
+    const int nv = getenv("NV") ? atoi(getenv("NV")) : 4, n = getenv("N") ? atoi(getenv("N")) : 4;
+    const float choice[4] = {1.0f, 0.5f, 0.25f, 1.0f};
+    std::vector<float> in(64 * 8 * 32, 1.0f);  // the kernel's declared extent: 64 iterations
+    uint32_t s = 12345;
+    for (int j = 0; j < n * 8 * 32; ++j) { s = s * 1103515245u + 12345u; in[j] = choice[(s >> 16) & 3]; }
+    float *din, *dout;
+    HC(hipMalloc(&din, in.size() * 4));
+    HC(hipMalloc(&dout, nv * 8 * 32 * 4));
+    HC(hipMemcpy(din, in.data(), in.size() * 4, hipMemcpyHostToDevice));
+    HC(hipMemset(dout, 0, nv * 8 * 32 * 4));
+    std::vector<uint8_t> args(24, 0);
+    put64(args, 0, dout);
+    put64(args, 8, din);
+    memcpy(args.data() + 16, &n, 4);
+    k.launch(1, 32, args, kn);
+    std::vector<float> o(nv * 8 * 32);
+    HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int v = 0; v < nv; ++v)
+        for (int r = 0; r < 8; ++r)
+            for (int l = 0; l < 32; ++l) {
+                float ref = 0;
+                // the scale of element r of lane l is alpha[r] of lane l
+                for (int i = 0; i < n; ++i) ref = ref * in[(i * 8 + r) * 32 + l] + 128.0f;
+                float got = o[(v * 8 + r) * 32 + l];
+                if (got != ref) { if (bad < 8) printf("  v%d r%d lane %d: got %g ref %g\n", v, r, l, got, ref); ++bad; }
+            }
+    printf("varscale: nv=%d n=%d bad=%ld %s\n", nv, n, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
+
 // probe_g1250_barriers: named barrier 1 (init / join / signal / wait / leave) then the cluster barrier, out[tid] = tid. Launched ONLY as a
 // cluster (CLUSTER, default 2 workgroups along x; a cluster barrier needs a cluster id), GRID workgroups (default 64), 20 repetitions.
 static int run_barriers(Kernel& k, const char* kn) {
@@ -482,6 +516,7 @@ int main(int argc, char** argv) {
     HC(hipModuleLoad(&mod, argv[2]));
     HC(hipModuleGetFunction(&k.fn, mod, kn));
     const int arg = argc > 4 ? atoi(argv[4]) : -1;
+    if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);

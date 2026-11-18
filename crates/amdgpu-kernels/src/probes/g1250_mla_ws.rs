@@ -569,3 +569,78 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     b.store_global(pl, 0, lse, MemTy::B32, false);
     b.finish()
 }
+
+/// Minimal repro for the branch-free rescale: `nv` loop-carried Frag8 accumulators; per iteration each is scaled in place per row
+/// (`var_scale_lane`, alpha[r] = in[(i * 8 + r) * 32 + lane]), unconditionally or under `any_lane(alpha < 1)` (`branch`), then accumulated
+/// in place by a WMMA of fp8 ones x twos (+128 per element). Output out[(v * 8 + r) * 32 + lane]. Host: `g1250_probe_host varscale`.
+pub fn probe_g1250_varscale(name: &str, nv: usize, branch: bool) -> Function {
+    let mut b = FnBuilder::new(name, 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg("inp", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    b.arg_tensor("out", Ext::c((nv * 8 * 32 * 4) as i64));
+    // the host allocates the input for the 64 iterations the loop counter is bounded by
+    b.arg_tensor("inp", Ext::c(64 * 8 * 32 * 4));
+    b.ka_range(16, 1, 64);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let pi = b.let_(Op::KernargPtr { offset: 8 });
+    let n = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let ones = b.c_i32(0x3838_3838);
+    let fa = b.frag_cat(&[Opnd::Val(ones); 8]);
+    // B = fp8 2.0 (distinct registers from A): +128 per element per WMMA
+    let twos = b.c_i32(0x4040_4040);
+    let fb = b.frag_cat(&[Opnd::Val(twos); 8]);
+    let mut inits = Vec::new();
+    for _ in 0..nv {
+        let z = b.frag_cat(&[Opnd::I32(0); 8]);
+        inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
+    }
+    let ov = b.declare_vars(&inits);
+    let z = b.c_i32(0);
+    let lv = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+    let i = lv[0];
+    b.assume(i, Ext::c(0), Ext::c(63));
+    let al: Vec<ValueId> = (0..8)
+        .map(|r| {
+            let off = b.bind_i32(((amdgpu_dsl::varx(i) * 8 + r) * 32 + ev(tid)) * 4);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pi), byte_off: Opnd::Val(off) });
+            let v = b.load_global(pa, 0, MemTy::B32);
+            f32_of(&mut b, v)
+        })
+        .collect();
+    if branch {
+        let lt = b.cmp(CmpPred::Lt, CmpTy::F32, al[0], Opnd::F32(1.0));
+        let any = b.let_(Op::AnyLane(Opnd::Val(lt)));
+        let one = b.c_i32(1);
+        let anyb = b.cmp(CmpPred::Eq, CmpTy::I32, one, Opnd::I32(1));
+        let _ = (any, anyb);
+        b.begin_if(any);
+    }
+    for v in 0..nv {
+        for r in 0..8u8 {
+            b.var_scale_lane(ov[v], r, al[r as usize]);
+        }
+    }
+    if branch {
+        b.end_if();
+    }
+    for v in 0..nv {
+        let d = b.wmma(WmmaKind::Fp8_16x16x64, fa, fb, Some(Opnd::Var(ov[v])));
+        b.set_var(ov[v], Opnd::Val(d));
+    }
+    let i1 = b.bind_i32(amdgpu_dsl::varx(i) + 1);
+    b.set_var(i, Opnd::Val(i1));
+    let fin = b.cmp(CmpPred::Ge, CmpTy::I32, i1, n);
+    b.break_if(fin);
+    b.end_loop();
+    for v in 0..nv {
+        for r in 0..8u8 {
+            let e = b.frag_slice(Opnd::Var(ov[v]), r, 1);
+            let off = b.bind_i32(((v as i32 * 8 + r as i32) * 32 + ev(tid)) * 4);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(off) });
+            b.store_global(pa, 0, e, MemTy::B32, false);
+        }
+    }
+    b.finish()
+}
