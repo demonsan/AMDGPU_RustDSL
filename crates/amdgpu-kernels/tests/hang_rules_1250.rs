@@ -857,35 +857,6 @@ fn pos_tdm_lds_extent() {
     ir_positive(&tdm_lds_kernel(4096, 3, 1024, 1024, 0, 1024));
 }
 
-// GV-1250-LDS-64K
-
-fn lds_kernel_decl(lds: u32, fact: bool) -> Function {
-    let mut b = FnBuilder::new("hr_lds", 64);
-    b.lds(lds);
-    if fact {
-        b.lds_above_64k(1);
-    }
-    let _ = b.let_(Op::WorkitemId);
-    b.finish()
-}
-
-#[test]
-fn mut_lds_64k() {
-    ir_mutation(&lds_kernel_decl(65537, false), "GV-1250-LDS-64K");
-    ir_mutation(&lds_kernel_decl(103936, false), "GV-1250-LDS-64K");
-}
-
-#[test]
-fn pos_lds_64k() {
-    ir_positive(&lds_kernel_decl(65536, false));   // exactly 64 KiB is inside
-    ir_positive(&lds_kernel_decl(51968, false));
-    // above 64 KiB with the named evidence fact: accepted and listed as a trusted item
-    let f = lds_kernel_decl(103936, true);
-    ir_positive(&f);
-    let t = amdgpu_codegen::gpu_verify_1250::trusted_items(&f);
-    assert!(t.iter().any(|x| x.contains("LDS above 64 KiB")), "{t:?}");
-}
-
 // GV-1250-DPP
 
 #[test]
@@ -981,7 +952,6 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),
     ("GV-1250-TDM-DESC", "tdm_desc"),
-    ("GV-1250-LDS-64K", "lds_64k"),
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),

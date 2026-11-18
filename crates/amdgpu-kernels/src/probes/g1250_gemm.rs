@@ -14,6 +14,7 @@
 
 use amdgpu_codegen::DEFAULT_SCALAR;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol, TensorTile, ValueId, WmmaKind};
+use amdgpu_stage::gemm::tdm_f4::F4Shape;
 
 /// C tile rows / columns per workgroup, K bytes per tile, ring slots.
 pub const BM: i32 = 32;
@@ -384,16 +385,53 @@ pub const F4_NAME: &str = "gemm_g1250_tdm_stage_f4";
 /// per 32 K (`sa` [M][K / 32] bytes, `sb` [N][K / 32] bytes), `v_wmma_scale_f32_32x16x128_f4`. A 128 x 64 C tile per workgroup (4 waves 2 x 2, each wave 2 x 2 WMMAs of 32 x 16), K tiles of
 /// 128, the 3-slot ring of the OneWindow cadence. Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40 (K elements, a multiple of 128), n @44. Grid (N / 64, M / 128).
 pub fn gemm_tdm_stage_f4() -> Function {
+    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1 }, true, false)
+}
+
+/// 128 x 128 tile (4 waves, each 2 x 4 WMMAs).
+pub const F4_128X128: &str = "gemm_g1250_tdm_stage_f4_128x128";
+/// 256 x 64 tile (4 waves, each 4 x 2 WMMAs).
+pub const F4_256X64: &str = "gemm_g1250_tdm_stage_f4_256x64";
+/// 256 x 128 tile (4 waves, each 4 x 4 WMMAs): the back end currently rejects it (a scaled WMMA's scale operand must live in v0..v255 while the accumulators go above); registered for lookup only
+/// (`amdc emit`), not part of the compiled kernel sets, and it declares the LDS-above-64 KiB evidence fact so the guard does not hide the back-end failure.
+pub const F4_256X128_REPRO: &str = "gemm_g1250_tdm_stage_f4_256x128_repro";
+
+pub fn gemm_tdm_stage_f4_128x128() -> Function {
+    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1 }, true, false)
+}
+
+pub fn gemm_tdm_stage_f4_256x64() -> Function {
+    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1 }, true, false)
+}
+
+pub fn gemm_tdm_stage_f4_256x128_repro() -> Function {
+    gemm_tdm_stage_f4_with(F4_256X128_REPRO, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1 }, true, false)
+}
+
+/// Bisect repros of the ks = 2 wrong-result case (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original failing build (the four parts interleaved per slot by
+/// `ring_group`, declared 103,936 bytes), `_ks2` the same kernel with four separate rings (78,336 bytes). Looked up by `amdc emit`, not in the compiled sets.
+pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
+pub const F4_KS2: &str = "gemm_g1250_tdm_stage_f4_ks2";
+
+pub fn gemm_tdm_stage_f4_ks2_grouped() -> Function {
+    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2 }, true, true)
+}
+
+pub fn gemm_tdm_stage_f4_ks2() -> Function {
+    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2 }, true, false)
+}
+
+/// The MXFP4 stage-template GEMM for a workgroup shape (`sh`) and the loading scheme (`coop`: every wave loads a slice of the tile; otherwise every wave loads all of it). The four rings (A, B and the
+/// two scale tiles) are separate rings (`grouped`: interleaved per slot by `ring_group`, the original layout, which declares `base of the last part + slots x stride` bytes), so the declared LDS is
+/// exactly `slots x (A + B + scales)` bytes.
+pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool) -> Function {
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
-    let envv = |n: &str, d: i32| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);   // TEMP exploration
-    let sh = F4Shape { wm: envv("F4_WM", 2), wn: envv("F4_WN", 2), tm: envv("F4_TM", 2), tn: envv("F4_TN", 2), ks: envv("F4_KS", 1) };
-    let coop = envv("F4_COOP", 1) != 0;
     let (bm, bn) = (sh.bm(), sh.bn());
-    let mut b = FnBuilder::new(F4_NAME, (sh.waves() * 32) as u32);
+    let mut b = FnBuilder::new(name, (sh.waves() * 32) as u32);
     for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
     }
@@ -402,7 +440,17 @@ pub fn gemm_tdm_stage_f4() -> Function {
     b.arg_tensor("c", Ext::c(1 << 28));
     b.ka_range(40, 128 * sh.ks as i64, 1 << 20);
     let mut lds = LdsPlan::new();
-    let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64 * sh.ks) as i64, Layout::Linear), ("B", (bn * 64 * sh.ks) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
+    let (ra, rb, rsa, rsb) = if grouped {
+        let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64 * sh.ks) as i64, Layout::Linear), ("B", (bn * 64 * sh.ks) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
+        (ra, rb, rsa, rsb)
+    } else {
+        (
+            lds.ring("A", (bm * 64 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("B", (bn * 64 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("SA", (bm * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("SB", (bn * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+        )
+    };
     lds.commit(&mut b);
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
