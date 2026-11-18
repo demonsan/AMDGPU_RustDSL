@@ -170,7 +170,7 @@ pub fn gemm_tdm_stage_fp8() -> Function {
     use amdgpu_dsl::{ev, I32};
     use amdgpu_stage::gemm::tdm::TdmGemmBody;
     use amdgpu_stage::{Cadence, Pipeline};
-    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::lane::{Role, Roles};
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let mut b = FnBuilder::new(STAGE_NAME, 128);
     b.arg("a", DType::Ptr, 0, 8);
@@ -316,6 +316,14 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ring(name: &str, ring: RingOpts) -> Fun
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, ring)
 }
 
+/// The padded 256 x 256 kernel with wave roles: waves 0, 1 issue the A and SA loads, waves 2, 3 the B and SB loads (2 tensor loads per wave per stage), each role its own copy of the loop;
+/// `relax` = the relaxed tensor wait.
+pub const F4_256X256_KS2_PAD_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles";
+pub const F4_256X256_KS2_PAD_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles_relax";
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_roles(name: &str, relax: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: SLOTS as u8, roles: true })
+}
+
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
     gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
@@ -435,11 +443,13 @@ pub fn f4_row_pad(ks: i32) -> i32 {
 pub struct RingOpts {
     /// ring slots (>= 3): the producer runs `slots - 1` tiles ahead
     pub slots: u8,
+    /// wave roles: waves 0, 1 issue the A and SA loads (and run their own copy of the loop), waves 2, 3 the B and SB loads (`TdmF4Body::roles`)
+    pub roles: bool,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8 }
+        RingOpts { slots: SLOTS as u8, roles: false }
     }
 }
 
@@ -452,7 +462,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
-    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::lane::{Role, Roles};
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let (bm, bn) = (sh.bm(), sh.bn());
     // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
@@ -540,12 +550,13 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(coop || !clustered, "a cluster needs cooperative loads");
     // a cluster multicast is a rendezvous of IDENTICAL requests (the ISA: one wave per workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have
     // asked): so the workgroups of a cluster row issue the very same slices of the A tile, those of a cluster column the same slices of the B tile, and the slices are per wave only, as without a cluster
-    let div = if coop { nw } else { 1 };
+    assert!(!ring.roles || (coop && nw == 4 && !clustered), "wave roles: 4 cooperative waves, no cluster");
+    let div = if ring.roles { 2 } else if coop { nw } else { 1 };   // roles: the two waves of a role split each of its tiles
     assert!(bm % div == 0 && bn % div == 0, "the tile splits evenly over the waves");
     let (rpa, rpb) = (bm / div, bn / div);
     // the wave id is wave-uniform: read it into an SGPR so the slice offsets and descriptors stay scalar
     let wid = b.let_(Op::ReadFirstLane(Opnd::Val(w)));
-    let wsl = if coop { wid } else { b.c_i32(0) };
+    let wsl = if ring.roles { b.let_(Op::AndI32(Opnd::Val(wid), Opnd::I32(1))) } else if coop { wid } else { b.c_i32(0) };   // the wave's index inside its role
     let leader = b.bind_cond(ev(wid).eq(0));
     let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
     let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
@@ -611,46 +622,56 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     } else {
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
-    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, row_pad };
     if clustered {
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
-    pipe.run(&mut b, Role::All, &mut body);
 
-    // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
-    let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
-    let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
-    let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
-    for i in 0..sh.tm {
-        for j in 0..sh.tn {
-            let acc = body.acc[(i * sh.tn + j) as usize];
-            // first row of the block (the lane's row group) and the lane's column
-            let r0 = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
-            let r0 = b.add_i32(r0, row0);
-            let r0 = b.add_i32(r0, Opnd::I32(i * 32));
-            let r0 = b.add_i32(r0, g8);
-            let c0 = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
-            let c0 = b.add_i32(c0, col0);
-            let c0 = b.add_i32(c0, Opnd::I32(j * 16));
-            let c0 = b.add_i32(c0, m);
-            let lin = b.mul_i32(r0, nn);
-            let lin = b.add_i32(lin, c0);
-            let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(esh)));
-            for v in 0..16i32 {
-                let rowv = (v % 8) + 16 * (v / 8);
-                let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
-                let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
-                let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                if sh.bf16 {
-                    // the accumulator rounded to bf16 (RNE) in the low half of a dword, stored as 16 bits
-                    let xf = b.bitcast_f32(x);
-                    let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(xf), Opnd::Val(xf)));
-                    b.store_u16(q, 0, p);
-                } else {
-                    b.store_global(q, 0, x, MemTy::B32, false);
+    let mut emit = |b: &mut FnBuilder, role: Role| {
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, row_pad };
+        pipe.run(b, role, &mut body);
+        // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
+        let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
+        let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
+        let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+        for i in 0..sh.tm {
+            for j in 0..sh.tn {
+                let acc = body.acc[(i * sh.tn + j) as usize];
+                // first row of the block (the lane's row group) and the lane's column
+                let r0 = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
+                let r0 = b.add_i32(r0, row0);
+                let r0 = b.add_i32(r0, Opnd::I32(i * 32));
+                let r0 = b.add_i32(r0, g8);
+                let c0 = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
+                let c0 = b.add_i32(c0, col0);
+                let c0 = b.add_i32(c0, Opnd::I32(j * 16));
+                let c0 = b.add_i32(c0, m);
+                let lin = b.mul_i32(r0, nn);
+                let lin = b.add_i32(lin, c0);
+                let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(esh)));
+                for v in 0..16i32 {
+                    let rowv = (v % 8) + 16 * (v / 8);
+                    let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
+                    let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                    let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                    if sh.bf16 {
+                        // the accumulator rounded to bf16 (RNE) in the low half of a dword, stored as 16 bits
+                        let xf = b.bitcast_f32(x);
+                        let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(xf), Opnd::Val(xf)));
+                        b.store_u16(q, 0, p);
+                    } else {
+                        b.store_global(q, 0, x, MemTy::B32, false);
+                    }
                 }
             }
         }
+    };
+    if ring.roles {
+        // two code copies by wave: waves 0, 1 (role A) and waves 2, 3 (role B), the same barrier structure in both
+        let is_a = b.bind_cond(ev(wid).lt(2));
+        let roles = Roles { is_a, wave_in_group: wsl, group: 2 };
+        roles.each(&mut b, |b, role| emit(b, role));
+    } else {
+        emit(&mut b, Role::All);
     }
     let mut f = b.finish();
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));

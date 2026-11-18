@@ -92,10 +92,18 @@ pub struct TdmF4Body {
     /// LDS padding bytes after every A / B row of a slot (the TDM's pad: `row_pad / 4` dwords after each `64 ks`-byte row), 0 = none; the
     /// A / B row stride in LDS is `64 ks + row_pad`
     pub row_pad: i32,
+    /// wave roles: role A (waves 0, 1) issues only the A and SA loads, role B (waves 2, 3) only B and SB (2 tensor loads per wave per stage instead of 4: the per-operation cost of the tensor
+    /// unit, not the bytes, is what the many tiny scale loads cost); `Role::All` issues all four
+    pub roles: bool,
 }
 
 impl PipeBody for TdmF4Body {
-    fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+    fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+        let (do_a, do_b) = match (self.roles, role) {
+            (true, Role::A) => (true, false),
+            (true, Role::B) => (false, true),
+            _ => (true, true),
+        };
         // `key0`: the K element offset of the tile (tile_rows = 128: tile << 7); bytes of an fp4 row: / 2; of a scale row: / 32
         let kb = b.bind_i32(key0.clone().lshr(1));
         let ks = b.bind_i32(key0.clone().lshr(5));
@@ -114,10 +122,18 @@ impl PipeBody for TdmF4Body {
         let g0sb = tdm_group0(b, self.psb, osb, lsb);
         let cp = amdgpu_dsl::TdmCpol::default();
         let (g1a, g1b, g1sa, g1sb) = (self.g1a, self.g1b, self.g1sa, self.g1sb);
-        ra.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0a), Opnd::Val(g1a), None, cp));
-        rb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0b), Opnd::Val(g1b), None, cp));
-        rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cp));
-        rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
+        if do_a {
+            ra.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0a), Opnd::Val(g1a), None, cp));
+        }
+        if do_b {
+            rb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0b), Opnd::Val(g1b), None, cp));
+        }
+        if do_a {
+            rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cp));
+        }
+        if do_b {
+            rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
+        }
     }
 
     fn set_ring_depth(&mut self, slots: u8) {
@@ -142,7 +158,8 @@ impl PipeBody for TdmF4Body {
         }
         // the four loads of a stage (A, B and the two scale tiles) are the only operations a stage leaves outstanding: with `relax` the loads of the stage just issued may stay in flight
         // `depth - 2` stages (the next tiles' 4 loads each) stay in flight; the wait completes the one the next window reads
-        b.wait_tensor(if self.sh.relax && self.steady { 4 * (self.depth - 2) } else { 0 });
+        let per_stage = if self.roles { 2 } else { 4 };   // tensor loads this wave issues per stage
+        b.wait_tensor(if self.sh.relax && self.steady { per_stage * (self.depth - 2) } else { 0 });
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
