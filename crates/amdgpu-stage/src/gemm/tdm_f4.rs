@@ -82,6 +82,9 @@ pub struct TdmF4Body {
     pub steady: bool,
     /// the condition "this is wave 0 of the workgroup" (wave-uniform): the one wave per workgroup that signals the cluster barrier
     pub leader: ValueId,
+    /// LDS padding bytes after every A / B row of a slot (the TDM's pad: `row_pad / 4` dwords after each `64 ks`-byte row), 0 = none; the
+    /// A / B row stride in LDS is `64 ks + row_pad`
+    pub row_pad: i32,
 }
 
 impl PipeBody for TdmF4Body {
@@ -140,7 +143,7 @@ impl PipeBody for TdmF4Body {
         let sh = self.sh;
         let (ra, rb, rsa, rsb) = (self.a.at(&t.cur), self.b.at(&t.cur), self.sa.at(&t.cur), self.sb.at(&t.cur));
         let (abase, bbase, sabase, sbbase) = (self.abase, self.bbase, self.sabase, self.sbbase);
-        let (arow, brow) = (64 * sh.ks, 64 * sh.ks);   // bytes per A / B row of the slot
+        let (arow, brow) = (64 * sh.ks + self.row_pad, 64 * sh.ks + self.row_pad);   // bytes per A / B row of the slot (padding included)
         let (srow_bytes, _) = (4 * sh.ks, 0);          // bytes per scale row of the slot
         // the fragments of sub-step `s`: A (32 rows x 128): two ds_load_b128 per 16-row half, B (16 x 128): two; the scale words
         struct Frags {
