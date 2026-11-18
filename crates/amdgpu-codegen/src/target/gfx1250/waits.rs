@@ -225,6 +225,14 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                     }
                 }
             }
+            // the device-scope cache maintenance of the fences: `global_wb` completes on STOREcnt, `global_inv` on LOADcnt (LLVM
+            // SIGfx12CacheControl waits for them on those counters); they are fences, not memory accesses, in the effects model, so without
+            // this the explicit wait that follows them would see nothing outstanding and be dropped
+            if inst.op == MOp::BufferWbl2 {
+                st.vm.push(Pending { kind: Kind::Store, srcs: Vec::new(), xlate: false });
+            } else if inst.op == MOp::BufferInv {
+                st.vm.push(Pending { kind: Kind::Load, srcs: Vec::new(), xlate: false });
+            }
             // the new memory operation
             if e.smem {
                 st.lg.push(Pending { kind: Kind::Km, srcs: phys_keys(m, a, &e.reads), xlate: super::xnack() });

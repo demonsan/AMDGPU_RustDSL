@@ -862,6 +862,27 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
     }
     // memory operands: gfx950 cache-policy bits have no gfx1250 spelling yet (only an atomic's return); a buffer's immediate soffset 0 is
     // NULL; the LDS-DMA forms do not exist (async loads instead)
+    // the device-scope cache maintenance of the release / acquire fences (LLVM SIGfx12CacheControl, agent scope: GFX12.5 may have more than
+    // one L2 per device, so the write-back and the invalidate are device scope; their completion counts on STOREcnt / LOADcnt)
+    if mn == "buffer_wbl2" {
+        return Ok(vec!["global_wb scope:SCOPE_DEV".to_string()]);
+    }
+    if mn == "buffer_inv" {
+        return Ok(vec!["global_inv scope:SCOPE_DEV".to_string()]);
+    }
+    // a global atomic with return: gfx950 `sc0` -> TH_ATOMIC_RETURN
+    if mn == "global_atomic_add" {
+        let r = wave32(rest).replace(" sc0", " th:TH_ATOMIC_RETURN");
+        return Ok(vec![format!("global_atomic_add_u32 {r}")]);
+    }
+    // a device-coherent global access (gfx950 `sc1`: agent scope) is `scope:SCOPE_DEV` on gfx1250 (LLVM SIGfx12CacheControl)
+    let line_dev;
+    let (line, rest) = if (mn.starts_with("global_load") || mn.starts_with("global_store")) && rest.split_whitespace().any(|x| x == "sc1") && !rest.split_whitespace().any(|x| x == "sc0" || x == "nt") {
+        line_dev = format!("{mn} {}", rest.split_whitespace().map(|x| if x == "sc1" { "scope:SCOPE_DEV" } else { x }).collect::<Vec<_>>().join(" "));
+        (line_dev.as_str(), &line_dev[mn.len() + 1..])
+    } else {
+        (line, rest)
+    };
     let mem = mn.starts_with("buffer_") || mn.starts_with("global_");
     if mem {
         let toks: Vec<&str> = rest.split_whitespace().collect();
