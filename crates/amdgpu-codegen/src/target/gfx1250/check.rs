@@ -223,14 +223,18 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
                 let at = (bi, ii);
                 if e.smem {
                     issue(&mut st, Ctr::Km, at, 0, writes.clone(), reads.clone(), 1);
-                    issue(&mut st, Ctr::X, at, 1, vec![], reads.clone(), 1);
+                    if super::xnack() {
+                        issue(&mut st, Ctr::X, at, 1, vec![], reads.clone(), 1);
+                    }
                 } else if let Some(ma) = &e.mem {
                     let vsrc: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     match ma.space {
                         Space::Global => {
                             let c = if !e.writes.is_empty() { Ctr::Load } else { Ctr::Store };
                             issue(&mut st, c, at, 0, writes.clone(), reads.clone(), 1);
-                            issue(&mut st, Ctr::X, at, 0, vec![], reads.clone(), 1);
+                            if super::xnack() {
+                                issue(&mut st, Ctr::X, at, 0, vec![], reads.clone(), 1);
+                            }
                             let class = if crate::op_attrs::attrs(inst.op).mnemonic.starts_with("buffer") { 2 } else { 0 };
                             issue(&mut st, Ctr::VmVsrc, at, class, vec![], vsrc, 1);
                         }
@@ -275,4 +279,53 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
         out.push((inst.stmt, true, format!("block {} instruction {ii} (`{}`): missing `{}` (gfx1250 software hazard, docs/gfx1250-hazards.md)", m.blocks[*bi].label, crate::op_attrs::attrs(inst.op).mnemonic, lines.join("; "))));
     }
     out
+}
+
+/// The compiler's own waits checked independently (non-exact gfx1250): the MIR with the gfx1250 wait plan's lines (waits.rs: the gfx950
+/// pass's waits converted to split counters, the XCNT waits) put in place of / before the instructions, then the same dataflow as for an
+/// exact kernel. The shared wait pass and its verifier share one counter model; this check uses the gfx1250 counters directly, so a wait the
+/// shared model drops (e.g. an operation it believes complete by a counter range the target does not have) is an error, not wrong data.
+pub fn verify_planned(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Vec<String> {
+    let wait_of = |line: &str| -> Option<MInst> {
+        let (mn, n) = line.trim().split_once(' ')?;
+        let n = u32::from_str_radix(n.trim().trim_start_matches("0x"), 16).ok()? as i64;
+        let c = match mn {
+            "s_wait_loadcnt" => 0,
+            "s_wait_storecnt" => 1,
+            "s_wait_dscnt" => 2,
+            "s_wait_kmcnt" => 3,
+            "s_wait_xcnt" => 4,
+            _ => return None,
+        };
+        Some(MInst::new(MOp::SWaitCtr).imm((c << 8) | n))
+    };
+    let mut m2 = m.clone();
+    for (bi, b) in m2.blocks.iter_mut().enumerate() {
+        let mut out = Vec::with_capacity(b.insts.len());
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for l in plan.before.get(&(bi, ii)).into_iter().flatten() {
+                out.extend(wait_of(l).map(|mut w| {
+                    w.stmt = inst.stmt;
+                    w
+                }));
+            }
+            match plan.replace.get(&(bi, ii)) {
+                Some(ls) => {
+                    for l in ls {
+                        out.extend(wait_of(l).map(|mut w| {
+                            w.stmt = inst.stmt;
+                            w
+                        }));
+                    }
+                }
+                None => out.push(inst.clone()),
+            }
+        }
+        for l in plan.end.get(&bi).into_iter().flatten() {
+            out.extend(wait_of(l));
+        }
+        b.insts = out;
+    }
+    // the instructions moved; the allocation is per value, so it still applies
+    verify(&m2, a).into_iter().filter(|(_, hazard, _)| !hazard).map(|(_, _, msg)| msg).collect()
 }

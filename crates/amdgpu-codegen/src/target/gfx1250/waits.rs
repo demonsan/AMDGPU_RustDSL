@@ -227,13 +227,13 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
             }
             // the new memory operation
             if e.smem {
-                st.lg.push(Pending { kind: Kind::Km, srcs: phys_keys(m, a, &e.reads), xlate: true });
+                st.lg.push(Pending { kind: Kind::Km, srcs: phys_keys(m, a, &e.reads), xlate: super::xnack() });
             } else if let Some(ma) = &e.mem {
                 let srcs = phys_keys(m, a, &e.reads);
                 match ma.space {
                     Space::Global => {
                         let kind = if !e.writes.is_empty() { Kind::Load } else { Kind::Store };
-                        st.vm.push(Pending { kind, srcs, xlate: true });
+                        st.vm.push(Pending { kind, srcs, xlate: super::xnack() });
                     }
                     Space::Lds => st.lg.push(Pending { kind: Kind::Ds, srcs, xlate: false }),
                 }
