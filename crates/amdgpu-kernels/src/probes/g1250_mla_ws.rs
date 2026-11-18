@@ -42,6 +42,14 @@ pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
 
+pub fn mla_g1250_qh16_wsbr1() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbr1", false, 2 | 4, false)
+}
+
+pub fn mla_g1250_qh16_wsbrg() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbrg", false, 2 | 8, false)
+}
+
 pub fn mla_g1250_qh16_wsbr() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbr", false, 2, false)
 }
@@ -55,6 +63,8 @@ pub fn mla_g1250_qh16_wsd() -> Function {
 fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function {
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
+    // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
+    let (dbg_one, dbg_gate) = (branchless & 4 != 0, branchless & 8 != 0);
     let ntw: usize = if dsplit { NT / 2 } else { NT };
     let ngrp: i32 = if dsplit { 2 } else { 4 };
     let layout = PageLayout::plan();
@@ -311,6 +321,16 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
             b.begin_if(any);
         }
         // the alpha of row 8 g + r: lane 8 g + r holds head 8 g + r (v_readlane, then the lane half's choice)
+        let alpha = if dbg_one {
+            b.c_f32(1.0)
+        } else if dbg_gate {
+            let anyf = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(any), a: Opnd::I32(1), b: Opnd::I32(0) });
+            let ab = b.cmp(CmpPred::Ne, CmpTy::I32, anyf, Opnd::I32(0));
+            let one = b.c_f32(1.0);
+            b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ab), a: Opnd::Val(alpha), b: Opnd::Val(one) })
+        } else {
+            alpha
+        };
         let sa: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(alpha, h)).collect();
         let g0c = b.cmp(CmpPred::Eq, CmpTy::I32, g, Opnd::I32(0));
         let al: Vec<ValueId> = (0..8usize)
