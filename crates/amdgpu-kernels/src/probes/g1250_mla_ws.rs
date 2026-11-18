@@ -38,6 +38,12 @@ pub fn mla_g1250_qh16_wsp() -> Function {
     mla_ws_with("mla_g1250_qh16_wsp", false, 1, true)
 }
 
+/// The intra-page form: per page, the rescale of each group of 4 accumulators interleaved with the previous group's PV WMMAs (branch-free
+/// rescale with a select-free row factor; one Free plan phase per page with interleave hints).
+pub fn mla_g1250_qh16_wsi() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsi", false, 1 | 16, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -61,6 +67,8 @@ pub fn mla_g1250_qh16_wsd() -> Function {
 }
 
 fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function {
+    // bit 4 of `branchless`: the intra-page form (`_wsi`)
+    let intra = branchless & 16 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -377,14 +385,81 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
             }
         });
     };
+    // intra-page form: the alpha of row 8 g + r without an I1 select (al = a0 (1 - g) + a1 g: exact for g in {0, 1}); the rescale of a
+    // group of 4 accumulators and that group's PV WMMAs as units of one Free plan phase (PV the skeleton, the next group's rescale its filler)
+    let rows_of = |b: &mut FnBuilder, alpha: ValueId| -> Vec<ValueId> {
+        let sa: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(alpha, h)).collect();
+        // g in {0, 1} as f32: the bits of 1.0 times g
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gi = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gi);
+        (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa[8 + r])));
+                let t0 = b.mul_f32(a0, hf);
+                let t1 = b.mul_f32(a1, gi);
+                b.add_f32(t0, t1)
+            })
+            .collect()
+    };
+    let pv_intra = |b: &mut FnBuilder, s: usize, gen: ValueId, pa: ValueId, al: &[ValueId], h: usize| {
+        let mine = kw[s].mine(w);
+        let sb = b.bind_i32(mine.base());
+        let vrow = b.bind_i32(ev(sb) + ev(vofs));
+        let mut u = Units::new();
+        let mut pvs = Vec::new();
+        let mut rss = Vec::new();
+        for grp in 0..ntw / 4 {
+            let (rid, _) = u.capture(b, format!("rs{h}.{grp}"), |b| {
+                for k in 0..4 {
+                    for r in 0..8u8 {
+                        b.var_scale_lane(ov[4 * grp + k], r, al[r as usize]);
+                    }
+                }
+            });
+            let (pid, _) = u.capture(b, format!("pv{h}.{grp}"), |b| {
+                mine.read_back(b, gen, |b| {
+                    let fv: Vec<ValueId> = (0..4)
+                        .map(|k| {
+                            let nt = 4 * grp + k;
+                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[jj][nt])).collect();
+                            b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                        })
+                        .collect();
+                    for k in 0..4 {
+                        let o = ov[4 * grp + k];
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv[k], Some(Opnd::Var(o)));
+                        b.set_var(o, Opnd::Val(d));
+                    }
+                });
+            });
+            rss.push(rid);
+            pvs.push(pid);
+        }
+        let mut wv = Weaver::new(u).phase(format!("mla.pv{h}")).free();
+        for gi in 0..pvs.len() {
+            if gi + 1 < rss.len() {
+                wv = wv.interleave(pvs[gi], vec![rss[gi + 1]]);
+            }
+        }
+        wv.emit(b);
+    };
     // one page, in order: S, softmax, rescale, PV, the running max / sum; the slot's reads complete before the next stage overwrites it
     let compute = |b: &mut FnBuilder, s: usize, local: amdgpu_dsl::I32| {
         let gen = b.bind_i32(local.clone());
+        let half = (s & 1) as usize;
         let page = page_of(b, local);
         let sv = s_part(b, s, gen);
         let (pa, alpha, m_new, lsum) = soft(b, &sv, page);
-        rescale(b, alpha);
-        pv(b, s, gen, pa);
+        if intra {
+            let al = rows_of(b, alpha);
+            pv_intra(b, s, gen, pa, &al, half);
+        } else {
+            rescale(b, alpha);
+            pv(b, s, gen, pa);
+        }
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(lsum));
         b.wait_lds(0);
