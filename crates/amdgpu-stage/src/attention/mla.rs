@@ -231,17 +231,13 @@ impl PipeBody for MlaBody {
                 .collect();
             for nt in 0..8 {
                 let o = vars[2 + nt];
-                let scaled: Vec<Opnd> = (0..8u8)
-                    .map(|r| {
-                        let e = b.frag_slice(Opnd::Var(o), r, 1);
-                        let ef = f32_of(b, e);
-                        let y = b.mul_f32(ef, al[r as usize]);
-                        bits_of(b, y)
-                    })
-                    .collect();
-                let oc = b.frag_cat(&scaled);
+                // the rescale in place (element r of the accumulator times alpha of its row) and the WMMA accumulating into the
+                // variable itself (D = C = O): no rebuilt fragment, no loop-carried copy
+                for r in 0..8u8 {
+                    b.var_scale_lane(o, r, al[r as usize]);
+                }
                 let fv = fvs[nt];
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv, Some(Opnd::Val(oc)));
+                let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv, Some(Opnd::Var(o)));
                 b.set_var(o, Opnd::Val(d));
             }
         });
