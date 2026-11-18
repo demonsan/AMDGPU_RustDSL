@@ -8,7 +8,7 @@ for v in a b; do k=$([ $v = a ] && echo $KA || echo $KB); $A emit $k --target gf
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_mla_host.cpp -o $O/host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 VCO=$BASE/vendor/gfx1250/mla/mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co; VK=_ZN5aiter34mla_a8w8_qh16_1tg_16mx1_32nx4_np_3pE
 echo "GPU: $IDLE_GPU"; export PROBE_WATCHDOG_S=20
-run() { out=$(gpurun $O/host $1 $2 $3 $4 16 20 2>&1); echo "$out" | grep -q MLA_OK || { echo "$out" | tail -3; echo "STOP: $2 $3x$4"; exit 3; }; echo "$5 $3x$4: $(echo "$out" | grep -oE 'min [0-9.]+ us' | head -1)"; }
+run() { out=$(gpurun $O/host $1 $2 $3 $4 16 20 2>&1); echo "$out" | grep -q MLA_OK || { echo "$out" | tail -3; echo "STOP: $2 $3x$4"; exit 3; }; echo "$5 $3x$4: $(echo "$out" | grep -oE "[0-9.]+ us" | head -1)"; }
 run $O/b.co $KB 1 1000 KB
 run $O/a.co $KA 1 1000 KA
 for s in "4 1000" "32 2048" "128 4096" "128 8192" "512 8192"; do
