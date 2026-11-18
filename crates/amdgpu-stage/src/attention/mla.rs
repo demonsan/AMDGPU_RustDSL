@@ -23,8 +23,14 @@ pub const PAGE_TOKENS: i32 = 64;
 pub const D: i32 = 576;
 pub const DV: i32 = 512;
 pub const PAGE_BYTES: i32 = PAGE_TOKENS * D;
-/// byte offset of the rope plane inside a page
+/// byte offset of the rope plane inside a page (global layout)
 pub const ROPE_OFF: i32 = PAGE_TOKENS * DV;
+/// LDS layout of a page: the TDM pads 16 bytes after every 512 (a nope row: row stride 528, so the 16 K rows a wave reads and the 8 token
+/// rows of a transposing V read hit distinct banks)
+pub const LDS_ROW: i32 = 528;
+pub const SLOT_BYTES: i32 = PAGE_BYTES / 512 * LDS_ROW;
+/// LDS offset of the rope plane (rope row r at LDS_ROPE + 64 r + 16 (r / 8))
+pub const LDS_ROPE: i32 = ROPE_OFF / 512 * LDS_ROW;
 
 pub struct MlaBody {
     /// the KV ring (one slot = one page)
@@ -33,21 +39,26 @@ pub struct MlaBody {
     pub red: Shared,
     pub pbuf: Shared,
     pub abuf: Shared,
-    /// kernarg pointers of KV and of the page table (`LTD`), the sequence's first page-table entry, its page count
+    /// the kernarg pointer of KV; the sequence's page ids, staged once in LDS (`ptab[t]` = the page of tile t; a global read per page would put
+    /// the memory latency on every window's critical path)
     pub pkv: ValueId,
-    pub pltd: ValueId,
-    pub kv0: ValueId,
+    pub ptab: Shared,
     /// valid tokens of the sequence
     pub ctx: ValueId,
-    /// group 1 of the page descriptor (one 64 x 576 byte tile)
+    /// group 1 of the descriptor of a quarter page (a 64 x 144 byte tile; wave w loads rows 144 w ..)
     pub g1: ValueId,
     /// lane roles
     pub w: ValueId,
     pub m: ValueId,
     pub g: ValueId,
     pub lane: ValueId,
-    /// Q fragments (B operand of S^T): 9 x Frag8, head m, dims 64 c + 8 g + 16 j
+    /// Q fragments (B operand of S^T): 9 x Frag8, head m, dims 64 c + 32 g .. + 32 (the K order inside a WMMA is free as long as A and B
+    /// agree: lane half g holds 32 contiguous bytes of each 64-byte chunk, two b128 reads)
     pub q: Vec<ValueId>,
+    /// lane offsets inside a slot (loop-invariant): K nope row (token 16 w + m, + 32 g), K rope row, the V tr8 fetch address of the wave's dims
+    pub kofs: ValueId,
+    pub rofs: ValueId,
+    pub vofs: ValueId,
     /// qs * ks * softmax scale * log2(e)
     pub cscale: ValueId,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
@@ -65,22 +76,21 @@ fn bits_of(b: &mut FnBuilder, v: ValueId) -> Opnd {
 impl PipeBody for MlaBody {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
         // page t = key0 / 64: its id from the page table, the descriptor of the whole page into the slot
-        let t = b.bind_i32(key0.clone() >> 6);
-        let e = b.add_i32(self.kv0, t);
-        let eo = b.let_(Op::ShlI32(Opnd::Val(e), Opnd::I32(2)));
-        let pe = b.let_(Op::PtrAdd { base: Opnd::Val(self.pltd), byte_off: Opnd::Val(eo) });
-        let pidv = b.load_global(pe, 0, MemTy::B32);
+        let ta = b.bind_i32(((key0.clone() >> 6) << 2) + self.ptab.base as i32);
+        let pidv = self.ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
         let pid = b.read_first_lane(pidv);
-        let off = b.mul_i32(pid, Opnd::I32(PAGE_BYTES));
+        // each wave loads its quarter of the page (144 of the 576 rows of 64 bytes): one copy of the page per work-group
+        let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * (PAGE_BYTES / 4));
         let r = self.kv.at(slot);
-        let lds = b.bind_i32(r.base());
+        let lds = b.bind_i32(r.base() + ev(self.w) * (SLOT_BYTES / 4));
         let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
         let g1 = self.g1;
         r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        b.wait_tensor(0);
+        // TENSORcnt is in order: at most the page just staged (t + 2) stays in flight; t + 1, read by the next window, is complete
+        b.wait_tensor(1);
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
@@ -108,21 +118,21 @@ impl PipeBody for MlaBody {
         let tix = SlotIdx::new(Opnd::I32(0), t.it);
         let sb = b.bind_i32(kv.base());
         // ---- S^T: A = K rows (token 16 w + m), K bytes 8 g + 16 j of each 64-byte chunk; B = Q ----
-        let row = b.bind_i32(ev(w) * 16 + ev(m));
-        let nope_row = b.bind_i32(ev(sb) + ev(row) * DV + ev(g) * 8);
-        let rope_row = b.bind_i32(ev(sb) + ROPE_OFF + ev(row) * 64 + ev(g) * 8);
+        let nope_row = b.bind_i32(ev(sb) + ev(self.kofs));
+        let rope_row = b.bind_i32(ev(sb) + ev(self.rofs));
         let q = self.q.clone();
         let s = kv.read(b, |b| {
+            // all nine K fragments first (distinct registers: the reads overlap), then the WMMA chain
+            let fa: Vec<ValueId> = (0..9)
+                .map(|c| {
+                    let lo = if c < 8 { b.bind_i32(ev(nope_row) + 64 * c) } else { b.bind_i32(ev(rope_row)) };
+                    let hi = b.bind_i32(ev(lo) + 16);
+                    b.load_lds_b128x2(lo, hi)
+                })
+                .collect();
             let mut acc: Option<Opnd> = None;
             for c in 0..9 {
-                let parts: Vec<Opnd> = (0..4)
-                    .map(|j| {
-                        let a = if c < 8 { b.bind_i32(ev(nope_row) + (64 * c + 16 * j)) } else { b.bind_i32(ev(rope_row) + 16 * j) };
-                        Opnd::Val(b.load_lds_b64(a))
-                    })
-                    .collect();
-                let fa = b.frag_cat(&parts);
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, fa, q[c as usize], acc);
+                let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[c], q[c], acc);
                 acc = Some(Opnd::Val(d));
             }
             match acc {
@@ -178,7 +188,8 @@ impl PipeBody for MlaBody {
         // ---- P (fp8) and alpha through LDS ----
         let p0 = b.cvt_pk_fp8x4_f32(p[0], p[1], p[2], p[3]);
         let p1 = b.cvt_pk_fp8x4_f32(p[4], p[5], p[6], p[7]);
-        let pw = b.bind_i32((ev(w) * 32 + ev(lane)) * 8 + self.pbuf.base as i32);
+        // P rows: lane l's 32 bytes = the 4 waves' 8 bytes (wave w at byte 8 w): one b128 pair per lane when read back
+        let pw = b.bind_i32(ev(lane) * 32 + ev(w) * 8 + self.pbuf.base as i32);
         let aw = b.bind_i32(ev(w) * 64 + ev(m) * 4 + self.abuf.base as i32);
         self.pbuf.at(&tix).write(b, |b| {
             b.store_lds(pw, p0, MemTy::B32, false);
@@ -190,31 +201,34 @@ impl PipeBody for MlaBody {
         b.barrier();
         // the A fragment of P: wave j's 8 bytes of lane (m, g) = tokens 16 j + 8 g .. + 8
         let pa = self.pbuf.at(&tix).read(b, |b| {
-            let parts: Vec<Opnd> = (0..4)
-                .map(|j| {
-                    let a = b.bind_i32(ev(lane) * 8 + (j * 256 + self.pbuf.base as i32));
-                    Opnd::Val(b.load_lds_b64(a))
-                })
-                .collect();
-            b.frag_cat(&parts)
+            let lo = b.bind_i32(ev(lane) * 32 + self.pbuf.base as i32);
+            let hi = b.bind_i32(ev(lo) + 16);
+            b.load_lds_b128x2(lo, hi)
         });
         // alpha of the O rows: heads 8 g + r
         let al: Vec<ValueId> = self.abuf.at(&tix).read(b, |b| {
-            (0..8)
+            let lo = b.bind_i32(ev(w) * 64 + ev(g) * 32 + self.abuf.base as i32);
+            let hi = b.bind_i32(ev(lo) + 16);
+            let a8 = b.load_lds_b128x2(lo, hi);
+            (0..8u8)
                 .map(|r| {
-                    let a = b.bind_i32(ev(w) * 64 + ev(g) * 32 + (4 * r + self.abuf.base as i32));
-                    let v = b.load_lds(a, MemTy::B32);
+                    let v = b.frag_slice(Opnd::Val(a8), r, 1);
                     f32_of(b, v)
                 })
                 .collect()
         });
         // ---- O = alpha O + P V; wave w owns dims 128 w .. ; the V fragment by ds_load_tr8_b64 ----
         // fetch lane f reads 8 dims at token 8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1) of a 16-token chunk, dims + 8 ((f >> 2) & 1)
-        let ktok = b.bind_i32(((ev(lane) >> 4) << 3) + (ev(lane) & 3) + (((ev(lane) >> 3) & 1) << 2));
-        let kdim = b.bind_i32(((ev(lane) >> 2) & 1) << 3);
-        let vrow = b.bind_i32(ev(sb) + ev(ktok) * DV + ev(kdim) + ev(w) * 128);
+        let vrow = b.bind_i32(ev(sb) + ev(self.vofs));
         let vars = self.vars.clone();
         kv.read(b, |b| {
+            // all eight V fragments first, then the rescale + WMMA per tile
+            let fvs: Vec<ValueId> = (0..8)
+                .map(|nt| {
+                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + (16 * jj * LDS_ROW + 16 * nt as i32))).collect();
+                    b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                })
+                .collect();
             for nt in 0..8 {
                 let o = vars[2 + nt];
                 let scaled: Vec<Opnd> = (0..8u8)
@@ -226,13 +240,7 @@ impl PipeBody for MlaBody {
                     })
                     .collect();
                 let oc = b.frag_cat(&scaled);
-                let parts: Vec<Opnd> = (0..4)
-                    .map(|jj| {
-                        let a = b.bind_i32(ev(vrow) + (16 * jj * DV + 16 * nt as i32));
-                        Opnd::Val(b.load_lds_tr_b8(a))
-                    })
-                    .collect();
-                let fv = b.frag_cat(&parts);
+                let fv = fvs[nt];
                 let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv, Some(Opnd::Val(oc)));
                 b.set_var(o, Opnd::Val(d));
             }
