@@ -295,7 +295,29 @@ pub const F4_256X256_KS2: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2";
 pub const F4_256X256_KS2_HB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_hb";
 /// `gemm_tdm_stage_f4_256x256_ks2` with the tile origins hoisted out of the pipeline (`gemm_tdm_stage_f4_opts`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_hb() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, true)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, true, false)
+}
+
+pub const F4_256X256_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad";
+/// `gemm_tdm_stage_f4_256x256_ks2` with the planner's TDM row padding (conflict-free A / B fragment reads; `f4_row_pad`).
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad() -> Function {
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+}
+
+pub const F4_256X256_KS2_PAD_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax";
+/// `_256x256_ks2_pad` with the relaxed tensor waits (each window completes the previous stage's tile; `F4Shape::relax`).
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_relax() -> Function {
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+}
+
+pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
+pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
+    gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+}
+
+/// The cluster variants with the planner's TDM row padding.
+pub fn gemm_tdm_stage_f4_256x256_ks2_cluster_pad(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_opts(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false, false, true)
 }
 
 pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
@@ -368,18 +390,41 @@ pub fn gemm_tdm_stage_f4_ks2() -> Function {
 /// two scale tiles) are separate rings (`grouped`: interleaved per slot by `ring_group`, the original layout, which declares `base of the last part + slots x stride` bytes), so the declared LDS is
 /// exactly `slots x (A + B + scales)` bytes.
 pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool) -> Function {
-    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false)
+    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, false)
+}
+
+/// The A / B row padding (bytes) that makes the fragment reads conflict-free: the TDM pads every `64 ks`-byte row (interval = the row's
+/// dwords) by the fewest dwords whose bank-conflict cost (`amdgpu_dsl::tdm_pad`) is the least, for the window's read pattern (16 lanes of a
+/// b128 phase on rows m = lane & 15, 16 bytes at h = lane >> 4 of the 32-byte piece).
+pub fn f4_row_pad(ks: i32) -> i32 {
+    use amdgpu_dsl::tdm_pad::{cost, LaneRead};
+    let row = (64 * ks) as u32;
+    let reads: Vec<LaneRead> = (0..2u32)
+        .map(|piece| LaneRead { bytes: 16, lanes: (0..32u32).map(|l| Some((l & 15) * row + 16 * (l >> 4) + 32 * piece)).collect() })
+        .collect();
+    let iv = (row / 4) as u16;
+    let mut best = (cost(&reads, None), 0u16);
+    for am in 1..=16u16 {
+        let c = cost(&reads, Some((iv, am)));
+        if c < best.0 {
+            best = (c, am);
+        }
+    }
+    4 * best.1 as i32
 }
 
 /// `gemm_tdm_stage_f4_with`; `hoist_base`: the per-wave global tile origins (`pointer + row origin`, 64-bit) are formed once before the
 /// pipeline, so a stage adds only its K byte offset (the descriptor address advances by the K offset alone; no per-stage origin add).
-pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool) -> Function {
+pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool, pad: bool) -> Function {
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let (bm, bn) = (sh.bm(), sh.bn());
+    // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
+    let row_pad = if pad { f4_row_pad(sh.ks) } else { 0 };
+    let row_l = 64 * sh.ks + row_pad;
     let mut b = FnBuilder::new(name, (sh.waves() * 32) as u32);
     for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
@@ -400,12 +445,12 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
     let mut lds = LdsPlan::new();
     let (ra, rb, rsa, rsb) = if grouped {
-        let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * 64 * sh.ks) as i64, Layout::Linear), ("B", (bn * 64 * sh.ks) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
+        let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * row_l) as i64, Layout::Linear), ("B", (bn * row_l) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
         (ra, rb, rsa, rsb)
     } else {
         (
-            lds.ring("A", (bm * 64 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
-            lds.ring("B", (bn * 64 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("A", (bm * row_l) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("B", (bn * row_l) as i64, SLOTS as u32, Layout::Linear),
             lds.ring("SA", (bm * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
             lds.ring("SB", (bn * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
         )
@@ -478,8 +523,8 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let sa_org = b.mul_i32(row0w, ks);
     let sb_org = b.mul_i32(col0w, ks);
     let wl = [
-        b.mul_i32(rowa_w, Opnd::I32(64 * sh.ks)),
-        b.mul_i32(rowb_w, Opnd::I32(64 * sh.ks)),
+        b.mul_i32(rowa_w, Opnd::I32(row_l)),
+        b.mul_i32(rowb_w, Opnd::I32(row_l)),
         b.mul_i32(rowa_w, Opnd::I32(4 * sh.ks)),
         b.mul_i32(rowb_w, Opnd::I32(4 * sh.ks)),
     ];
@@ -487,18 +532,18 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let h16 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(4)));
     let a_row = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
     let a_row_m = b.add_i32(a_row, m);
-    let abase = b.mul_i32(a_row_m, Opnd::I32(64 * sh.ks));
+    let abase = b.mul_i32(a_row_m, Opnd::I32(row_l));
     let abase = b.add_i32(abase, h16);
     let b_row = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
     let b_row_m = b.add_i32(b_row, m);
-    let bbase = b.mul_i32(b_row_m, Opnd::I32(64 * sh.ks));
+    let bbase = b.mul_i32(b_row_m, Opnd::I32(row_l));
     let bbase = b.add_i32(bbase, h16);
     let a_row_l = b.add_i32(a_row, lane);
     let sabase = b.mul_i32(a_row_l, Opnd::I32(4 * sh.ks));
     let sbbase = b.mul_i32(b_row_m, Opnd::I32(4 * sh.ks));
     // descriptor group 1 of the four tensors: [rows][K / 2] bytes (tile 64 bytes x rows), scales [rows][K / 128] dwords (tile 1 dword x rows)
-    let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16, mask: Option<Opnd>| -> ValueId {
-        let tile = TensorTile { data_size: esz, tensor_dim: [dim0, Opnd::I32(rows)], stride0: stride, tile: [t0, rows as u16], pad: None, wg_mask: 0 };
+    let g1 = |b: &mut FnBuilder, base: ValueId, org: ValueId, esz: u8, dim0: Opnd, rows: i32, stride: Opnd, t0: u16, mask: Option<Opnd>, pad: Option<(u16, u16)>| -> ValueId {
+        let tile = TensorTile { data_size: esz, tensor_dim: [dim0, Opnd::I32(rows)], stride0: stride, tile: [t0, rows as u16], pad, wg_mask: 0 };
         let z = b.add_i32(org, Opnd::I32(0));
         b.tensor_desc_2d_m(&tile, Opnd::Val(base), Opnd::Val(z), Opnd::I32(0), mask).1
     };
@@ -515,10 +560,11 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
         (None, None)
     };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16, mask_row);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16, mask_col);
-    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(sh.ks), rpa, Opnd::Val(k128), sh.ks as u16, mask_row);
-    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(sh.ks), rpb, Opnd::Val(k128), sh.ks as u16, mask_col);
+    let rpad = (row_pad > 0).then(|| ((16 * sh.ks) as u16, (row_pad / 4) as u16));
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16, mask_row, rpad);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16, mask_col, rpad);
+    let g1sa = g1(&mut b, psa, sa_org, 4, Opnd::I32(sh.ks), rpa, Opnd::Val(k128), sh.ks as u16, mask_row, None);
+    let g1sb = g1(&mut b, psb, sb_org, 4, Opnd::I32(sh.ks), rpb, Opnd::Val(k128), sh.ks as u16, mask_col, None);
     let lgk = 7 + sh.ks.trailing_zeros() as i32;   // K elements per slot: 128 ks
     assert!(sh.ks.count_ones() == 1, "ks a power of two");
     let nkv = b.bind_i32(ev(kk).lshr(lgk));
@@ -531,7 +577,7 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     } else {
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
-    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3 };
+    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, row_pad };
     if clustered {
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
