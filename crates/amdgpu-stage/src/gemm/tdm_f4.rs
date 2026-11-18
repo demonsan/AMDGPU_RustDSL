@@ -87,6 +87,8 @@ pub struct TdmF4Body {
     pub steady: bool,
     /// the condition "this is wave 0 of the workgroup" (wave-uniform): the one wave per workgroup that signals the cluster barrier
     pub leader: ValueId,
+    /// the pipeline's ring depth (set by the driver): `slots - 2` stages stay in flight at the end of a relaxed window
+    pub depth: u8,
     /// LDS padding bytes after every A / B row of a slot (the TDM's pad: `row_pad / 4` dwords after each `64 ks`-byte row), 0 = none; the
     /// A / B row stride in LDS is `64 ks + row_pad`
     pub row_pad: i32,
@@ -118,6 +120,10 @@ impl PipeBody for TdmF4Body {
         rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
     }
 
+    fn set_ring_depth(&mut self, slots: u8) {
+        self.depth = slots;
+    }
+
     fn finish(&mut self, b: &mut FnBuilder, _role: Role) {
         b.wait_tensor(0);   // the last steady iteration's clamped stage is still in flight
     }
@@ -135,7 +141,8 @@ impl PipeBody for TdmF4Body {
             return;
         }
         // the four loads of a stage (A, B and the two scale tiles) are the only operations a stage leaves outstanding: with `relax` the loads of the stage just issued may stay in flight
-        b.wait_tensor(if self.sh.relax && self.steady { 4 } else { 0 });
+        // `depth - 2` stages (the next tiles' 4 loads each) stay in flight; the wait completes the one the next window reads
+        b.wait_tensor(if self.sh.relax && self.steady { 4 * (self.depth - 2) } else { 0 });
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
