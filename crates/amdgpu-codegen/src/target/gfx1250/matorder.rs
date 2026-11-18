@@ -22,27 +22,39 @@ pub fn order_for_matrix(m: &mut MFunction) -> bool {
             continue;
         }
         let g = crate::sched::depgraph::build(m, &m.blocks[bi].insts, &m.blocks[bi].term, true);
-        let mut key: Vec<usize> = (0..n).collect();
-        for &mi in &mats {
-            key[mi] = mi;
-        }
-        // a producer takes the smallest key of what it feeds, if that is a matrix op's (transitively)
-        let mut feeds = vec![usize::MAX; n];
-        for &mi in &mats {
-            feeds[mi] = mi;
+        // rank of each instruction: the first matrix op (by order) that needs it, transitively
+        let mut rank = vec![usize::MAX; n];
+        for (k, &mi) in mats.iter().enumerate() {
+            rank[mi] = k;
         }
         for i in (0..n).rev() {
             for &(j, _) in &g.succs[i] {
-                feeds[i] = feeds[i].min(feeds[j]);
+                if crate::op_attrs::attrs(m.blocks[bi].insts[j].op).cost.pipe == Pipe::Mfma || rank[j] != usize::MAX {
+                    let rj = rank[j];
+                    if rank[i] == usize::MAX || (rj < rank[i] && crate::op_attrs::attrs(m.blocks[bi].insts[i].op).cost.pipe != Pipe::Mfma) {
+                        if crate::op_attrs::attrs(m.blocks[bi].insts[i].op).cost.pipe != Pipe::Mfma {
+                            rank[i] = rank[i].min(rj);
+                        }
+                    }
+                }
             }
         }
-        for i in 0..n {
-            if feeds[i] != usize::MAX && feeds[i] > i {
-                key[i] = feeds[i];
-            }
-        }
+        // order inside the matrix region: the operands of op k + 1 are issued before op k (one op of look-ahead), so op k runs while the
+        // next op's loads land: loads(0) loads(1) mat(0) loads(2) mat(1) .. mat(last)
+        let base = mats[0];
+        let last = mats.len() - 1;
+        let key: Vec<(usize, usize, usize)> = (0..n)
+            .map(|i| {
+                let is_mat = crate::op_attrs::attrs(m.blocks[bi].insts[i].op).cost.pipe == Pipe::Mfma;
+                match rank[i] {
+                    usize::MAX => (i, 0, i),
+                    k if is_mat => (base, 2 * (k + 1).min(last + 1) + 1, i),
+                    k => (base, 2 * k, i),
+                }
+            })
+            .collect();
         let mut indeg: Vec<usize> = g.preds.iter().map(|p| p.len()).collect();
-        let mut ready: BTreeSet<(usize, usize)> = (0..n).filter(|&i| indeg[i] == 0).map(|i| (key[i], i)).collect();
+        let mut ready: BTreeSet<((usize, usize, usize), usize)> = (0..n).filter(|&i| indeg[i] == 0).map(|i| (key[i], i)).collect();
         let mut order = Vec::with_capacity(n);
         while let Some(&(k, i)) = ready.iter().next() {
             ready.remove(&(k, i));
