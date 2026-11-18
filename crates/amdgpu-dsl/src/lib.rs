@@ -3872,6 +3872,23 @@ impl FnBuilder {
         self.f.kd.push((format!("g5:wait_trips_match:{id}"), 1));
     }
 
+    /// gfx1250: `global_load_async_to_lds_b128 lds, vaddr, off offset:imm`: each lane copies 16 bytes from its 64-bit address `vaddr` + imm to
+    /// LDS byte `lds` + imm, asynchronously (completed by `wait_counter(WaitCtr::Async, n)`).
+    pub fn load_async_lds_b128(&mut self, lds: impl Into<Opnd>, vaddr: impl Into<Opnd>, imm: u32) {
+        self.push_stmt(Stmt::LoadAsyncLds { lds: lds.into(), vaddr: vaddr.into(), imm });
+    }
+
+    /// gfx1250: the program counter (`s_get_pc_i64`), a wave-uniform 64-bit value.
+    pub fn get_pc(&mut self) -> ValueId {
+        self.let_(Op::SysVal { op: SysValOp::GetPc, imm: 0 })
+    }
+
+    /// gfx1250: `s_prefetch_inst pc, offset, count, 0`: a hint to fetch `count + 1` instruction-cache lines from `pc + offset` (no effect on
+    /// values or memory; `count` a wave-uniform value).
+    pub fn prefetch_inst(&mut self, pc: impl Into<Opnd>, offset: u32, count: impl Into<Opnd>) {
+        self.push_stmt(Stmt::Sys { op: SysOp::PrefetchInst, imm: offset, imm2: 0, reads: vec![pc.into(), count.into()] });
+    }
+
     /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
     pub fn barrier_wait(&mut self, id: i32) {
         self.push_stmt(Stmt::BarrierWait { id });
