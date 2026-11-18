@@ -3896,6 +3896,12 @@ impl FnBuilder {
         self.let_(Op::SysVal { op: SysValOp::GetPc, imm: 0 })
     }
 
+    /// gfx1250: `global_prefetch_b8 voff, base (+ offset)`: a one-byte-per-lane prefetch of `base + voff` (`base` a wave-uniform pointer). No data returns, but a bad address is a translation
+    /// fault reported to the host: the bounds rule proves it like a global load.
+    pub fn prefetch_global(&mut self, voff: impl Into<Opnd>, base: impl Into<Opnd>, offset: u32) {
+        self.push_stmt(Stmt::Sys { op: SysOp::PrefetchGlobal, imm: offset, imm2: 0, reads: vec![voff.into(), base.into()] });
+    }
+
     /// gfx1250: `s_prefetch_inst pc, offset, count, 0`: a hint to fetch `count + 1` instruction-cache lines from `pc + offset` (no effect on
     /// values or memory; `count` a wave-uniform value).
     pub fn prefetch_inst(&mut self, pc: impl Into<Opnd>, offset: u32, count: impl Into<Opnd>) {

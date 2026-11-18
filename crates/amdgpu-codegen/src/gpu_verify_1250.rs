@@ -2063,6 +2063,9 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
             let first = ins.ops.split(',').next_back().unwrap_or("").trim();   // the barrier operand is the last one (`s_get_barrier_state sdst, id` is excluded above)
             // a disassembler prints the 16-bit immediate of a negative id as unsigned (0xffff = -1, 0xfffd = -3)
             let id16 = parse_int(first).map(|x| if (0x8000..=0xffff).contains(&x) { x - 0x1_0000 } else { x });
+            if ins.mn == "s_barrier_signal_isfirst" && id16.map_or(false, |x| (1..=16).contains(&x)) {
+                viol(&mut v, "GV-1250-BAR-ID", format!("line {}: `{} {}`: the first-arriver form on a named barrier (its SCC result is removed in future products; only the work-group barrier idiom uses it)", ins.line, ins.mn, ins.ops));
+            }
             if ins.mn == "s_barrier_signal_isfirst" && id16 == Some(-3) {
                 viol(&mut v, "GV-1250-BAR-ID", format!("line {}: `{} {}`: the first-arriver form on the cluster barrier (only the work-group barrier idiom uses it)", ins.line, ins.mn, ins.ops));
             }

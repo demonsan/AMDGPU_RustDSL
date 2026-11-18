@@ -302,6 +302,9 @@ struct An<'a> {
     group_win: std::cell::RefCell<BTreeMap<u32, Vec<Vec<u8>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
+    /// async global -> LDS copies issued since the last completing wait in the current straight-line region: (statement, LDS address interval). Two of them in flight must write disjoint LDS
+    /// bytes (the async LDS writes may land in any order, even between two loads of one wave)
+    async_pending: Vec<(usize, Opnd, Itv)>,
     acc: HashMap<VarId, Itv>,
     defs: HashMap<ValueId, Op>,
     /// values constrained by `assume`: their interval is a contract fact, so `recompute` (select-arm refinement) must not re-derive them from their operands
@@ -602,6 +605,30 @@ impl<'a> An<'a> {
         } else {
             Err(format!("upper bound not provably <= limit - {size}: address {} vs limit {}", addr.show(), limit.show()))
         }
+    }
+
+    /// Two 16-byte-per-lane LDS address operands write disjoint bytes: either their intervals are provably apart, or both are the same linear form
+    /// `uniform part + k tid + c` (the same uniform atoms and coefficients, the same work-item stride k) with constants differing by `d` such that no two
+    /// work-items of the workgroup collide: `|m k - d| >= 16` for every work-item distance `m`.
+    fn async_lds_apart(&self, a: &Opnd, ia: &Itv, b: &Opnd, ib: &Itv) -> bool {
+        let apart = |x: &Itv, y: &Itv| x.hi.iter().any(|h| y.lo.iter().any(|l| self.cx.nonneg(&l.sub(&h.add(&Poly::int(16))))));
+        if apart(ia, ib) || apart(ib, ia) {
+            return true;
+        }
+        let (Some((xa, ca)), Some((xb, cb))) = (self.lin(a), self.lin(b)) else { return false };
+        if xa != xb {
+            return false;
+        }
+        let is_tid = |k: &(bool, u32)| !k.0 && matches!(self.defs.get(&k.1), Some(Op::WorkitemId));
+        // the work-item atoms: every other atom is shared by the two copies (wave-uniform or at least equal)
+        let stride: i128 = xa.iter().filter(|(k, _)| is_tid(k)).map(|(_, v)| *v).sum();
+        let d = cb - ca;
+        let t = self.f.workgroup_size as i128;
+        let k = stride.abs();
+        if k == 0 {
+            return d.abs() >= 16;
+        }
+        (-(t - 1)..=(t - 1)).all(|m| (m * k - d).abs() >= 16)
     }
 
     fn check_lds_at(&mut self, what: &str, o: &Opnd, size: i128) {
@@ -3677,6 +3704,19 @@ impl<'a> An<'a> {
         let f = self.f;
         let i = self.idx;
         let _ = i;
+        // a completing async wait or any change of control flow ends the straight-line region the pending async copies are compared in
+        // (copies of different tile events are the tile protocol's concern: a ring slot is not rewritten before its producer completed; here only the copies inside one event / marker-free region)
+        if matches!(st, Stmt::BeginLoop { .. } | Stmt::EndLoop | Stmt::BeginIf { .. } | Stmt::Else | Stmt::EndIf | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd) {
+            self.async_pending.clear();
+        }
+        // `s_wait_asynccnt n`: the async copies of a wave complete in order, so all but the n most recent are done
+        if let Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Async, count } = st {
+            let keep = *count as usize;
+            if self.async_pending.len() > keep {
+                let drop = self.async_pending.len() - keep;
+                self.async_pending.drain(..drop);
+            }
+        }
         match st {
             Stmt::Let { dst, op } => {
                 self.check_op(op);
@@ -3790,7 +3830,20 @@ impl<'a> An<'a> {
                 let b = self.av_of(vaddr);
                 self.check_global("global_load_async_to_lds_b128", &b, *imm as i128, 16, false);
                 // the LDS side: 16 bytes at the lane's LDS address (the declared segment)
-                self.check_lds_at("global_load_async_to_lds_b128", lds, 16)
+                self.check_lds_at("global_load_async_to_lds_b128", lds, 16);
+                // two copies in flight write disjoint LDS bytes: their address intervals (16-byte accesses) are provably apart
+                let a = self.int_of(lds);
+                let clash = self.async_pending.iter().find(|(s, po, pi)| *s != i && !self.async_lds_apart(lds, &a, po, pi)).map(|(s, _, pi)| (*s, pi.show()));
+                if let Some((s, pshow)) = clash {
+                    self.rep.add("GV-LDS-ASYNC-OVERLAP", Severity::Error, format!("stmt {i}: an async copy global -> LDS whose LDS bytes (address {}) are not provably disjoint from those of the copy at stmt {s} (address {pshow}), still in flight: the async LDS writes may land in any order", a.show()));
+                }
+                self.async_pending.retain(|(s, _, _)| *s != i);
+                self.async_pending.push((i, *lds, a));
+            }
+            // global_prefetch_b8 voff, base: one byte per lane at base + voff (+ imm). A bad address is a translation fault reported to the host, not a dropped hint: proven like a global load
+            Stmt::Sys { op: amdgpu_dsl::SysOp::PrefetchGlobal, imm, reads, .. } if reads.len() == 2 => {
+                let pa = self.eval(&Op::PtrAdd { base: reads[1], byte_off: reads[0] });
+                self.check_global("global_prefetch_b8", &pa, *imm as i128, 1, false)
             }
             Stmt::StoreGlobalN { base, byte_off, ty, .. } => {
                 self.record_global_store(base, *byte_off as i128, ty.bytes() as i128);
@@ -4170,7 +4223,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::default(), vars: HashMap::default(), var_prov: HashMap::default(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::default(), var_init: HashMap::default(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::default(), assumed_trusted: HashMap::default(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), gloads: Default::default(), gl_caps: Default::default(), gl_win: Default::default(), loading: false, atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::default(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), async_pending: Vec::new(), env: HashMap::default(), vars: HashMap::default(), var_prov: HashMap::default(), rings: ring_facts(f), users: value_users(f), dep_undo: Vec::new(), exec_lanes: 64, exec_saved: HashMap::default(), var_init: HashMap::default(), scope: Default::default(), var_sym: Default::default(), assumed: HashMap::default(), assumed_trusted: HashMap::default(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), gloads: Default::default(), gl_caps: Default::default(), gl_win: Default::default(), loading: false, atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::default(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     if std::env::var("AMDC_GV_DEBUG").is_ok() || std::env::var("AMDC_GV_LDS_TRACE").is_ok() {
         for (v, r) in &an.rings.rings {
             eprintln!("RING var{} range [{}, {}] starts {:?} rule {:?}", v.0, r.0, r.1, an.rings.starts.get(v), an.rings.rules.get(v));

@@ -281,3 +281,83 @@ fn a_ds_store_past_the_declared_lds_is_rejected() {
     let e = amdgpu_codegen::compile_target(&lds_kernel(Lds::StorePast), "gfx1250").err().expect("must be rejected");
     assert!(e.contains("GV-LDS-OOB"), "{e}");
 }
+
+// ---- two async copies in flight must write disjoint LDS bytes; a prefetch address is proven like a global load ----
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ov {
+    /// the second copy 1024 bytes above the first: disjoint
+    Apart,
+    /// the second copy 512 bytes above the first: the LDS bytes overlap
+    Overlap,
+    /// the same LDS bytes again, but the first copy is completed (ASYNCcnt 0) before the second is issued
+    SameAfterWait,
+}
+
+fn async_pair_kernel(c: Ov) -> Function {
+    let mut b = FnBuilder::new("tb_async2", 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg_tensor("src", Ext::c(1024));
+    b.lds(2048);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(4)));
+    let base = b.let_(Op::KernargPtr { offset: 0 });
+    let va = b.let_(Op::PtrAdd { base: Opnd::Val(base), byte_off: Opnd::Val(off) });
+    b.load_async_lds_b128(Opnd::Val(off), Opnd::Val(va), 0);
+    if c == Ov::SameAfterWait {
+        b.wait_counter(amdgpu_dsl::WaitCtr::Async, 0);
+    }
+    let shift = if c == Ov::Apart { 1024 } else if c == Ov::Overlap { 512 } else { 0 };
+    let off2 = b.let_(Op::AddI32(Opnd::Val(off), Opnd::I32(shift)));
+    b.load_async_lds_b128(Opnd::Val(off2), Opnd::Val(va), 0);
+    b.wait_counter(amdgpu_dsl::WaitCtr::Async, 0);
+    b.barrier();
+    b.finish()
+}
+
+#[test]
+fn async_copies_with_disjoint_lds_bytes_compile() {
+    amdgpu_codegen::compile_target(&async_pair_kernel(Ov::Apart), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    amdgpu_codegen::compile_target(&async_pair_kernel(Ov::SameAfterWait), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn two_async_copies_in_flight_over_the_same_lds_bytes_are_rejected() {
+    let e = amdgpu_codegen::compile_target(&async_pair_kernel(Ov::Overlap), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-LDS-ASYNC-OVERLAP"), "{e}");
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pf {
+    Legal,
+    PastExtent,
+    NoProvenance,
+}
+
+fn prefetch_kernel(c: Pf) -> Function {
+    let mut b = FnBuilder::new("tb_prefetch", 64);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg_tensor("src", Ext::c(if c == Pf::PastExtent { 128 } else { 256 }));
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let base = if c == Pf::NoProvenance { b.let_(Op::KernargSegment) } else { b.let_(Op::KernargPtr { offset: 0 }) };
+    b.prefetch_global(Opnd::Val(off), Opnd::Val(base), 0);
+    b.finish()
+}
+
+#[test]
+fn a_prefetch_inside_its_extent_compiles() {
+    amdgpu_codegen::compile_target(&prefetch_kernel(Pf::Legal), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_prefetch_past_its_extent_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&prefetch_kernel(Pf::PastExtent), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-OOB"), "{e}");
+}
+
+#[test]
+fn a_prefetch_without_pointer_provenance_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&prefetch_kernel(Pf::NoProvenance), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-GLB-PROV"), "{e}");
+}

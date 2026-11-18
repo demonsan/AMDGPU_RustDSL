@@ -862,6 +862,11 @@ fn pos_wait_range() {
 }
 
 #[test]
+fn mut_bar_id_isfirst_named() {
+    asm_mutation("k:\n    s_barrier_signal_isfirst 5\n    s_barrier_wait -1\n    s_endpgm\n", "GV-1250-BAR-ID");   // the first-arriver form on named barrier 5
+}
+
+#[test]
 fn pos_tdm_drain() {
     // 11 back to back: every issue sees at most 10 outstanding
     asm_positive(&burst(11).replace("    s_endpgm", "    s_wait_tensorcnt 0x0\n    s_endpgm"));
