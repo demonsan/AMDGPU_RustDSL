@@ -823,12 +823,14 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let al = b.bind_i32(256 + (ev(w) * 2 + ev(g)) * 64 + ev(m) * 4 + ml.base as i32);
         mlw(b, al, Opnd::Var(vl));
     });
+    let mob = b.bind_i32(ev(w) * 32768 + (ev(g) * 4096 + ev(db) + ev(m)) * 4 + mo.base as i32);
     mo.at(&t0).write(&mut b, |b| {
         for nt in 0..ntw {
             for r in 0..8u8 {
                 let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
                 // O_w [head 8 g + r][dim db + 16 nt + m]
-                let a = b.bind_i32(ev(w) * 32768 + ((ev(g) * 8 + r as i32) * 512 + ev(db) + (16 * nt as i32) + ev(m)) * 4 + mo.base as i32);
+                // the lane base once, the (row, tile) part as the DS offset
+                let a = b.bind_i32(ev(mob) + ((r as i32) * 2048 + (64 * nt as i32)));
                 b.store_lds(a, e, MemTy::B32, false);
             }
         }
@@ -884,12 +886,13 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let (mx, sc) = mx;
     if split {
         // the partial of this work-group: O un-normalised (scaled to the merged max), the max and the sum of head h
-        let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+        let fb: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
+    let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
             let mut acc: Vec<Option<ValueId>> = vec![None; 64];
             for wi in 0..nwl {
+                let v4s: Vec<ValueId> = (0..16).map(|k| { let a = b.bind_i32(ev(fb[wi]) + 16 * k); b.load_lds_b128(a) }).collect();
                 for k in 0..16 {
-                    let a = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + (16 * k + mo.base as i32));
-                    let v4 = b.load_lds_b128(a);
+                    let v4 = v4s[k as usize];
                     for e in 0..4u8 {
                         let x = b.frag_slice(Opnd::Val(v4), e, 1);
                         let xf = f32_of(b, x);
@@ -923,12 +926,13 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let rl = b.rcp_f32(lt);
     let inv = b.mul_f32(rl, ksf);
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();
+    let fb: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
     let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
         let mut acc: Vec<Option<ValueId>> = vec![None; 64];
         for wi in 0..nwl {
+            let v4s: Vec<ValueId> = (0..16).map(|k| { let a = b.bind_i32(ev(fb[wi]) + 16 * k); b.load_lds_b128(a) }).collect();
             for k in 0..16 {
-                let a = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + (16 * k + mo.base as i32));
-                let v4 = b.load_lds_b128(a);
+                let v4 = v4s[k as usize];
                 for e in 0..4u8 {
                     let x = b.frag_slice(Opnd::Val(v4), e, 1);
                     let xf = f32_of(b, x);
