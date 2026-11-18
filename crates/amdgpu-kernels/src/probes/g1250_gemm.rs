@@ -396,9 +396,10 @@ pub fn gemm_tdm_stage_f4_ks2() -> Function {
 /// two scale tiles) are separate rings (`grouped`: interleaved per slot by `ring_group`, the original layout, which declares `base of the last part + slots x stride` bytes), so the declared LDS is
 /// exactly `slots x (A + B + scales)` bytes.
 pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool) -> Function {
-    // the planner's TDM row padding by default (conflict-free fragment reads: 256x256 ks2 +85 % at 4096^3, +87 % at 8192^3, a08-1);
+    // the planner's TDM row padding by default for ks >= 2 (conflict-free fragment reads; a08-1 at 4096^3: 256x256 ks2 2.79 -> 5.17 PF/s,
+    // 128x128 ks2 1.57 -> 3.75, 128x64 ks2 1.52 -> 2.26; the ks = 1 kernels measured flat (0.97 / 1.62 vs 0.99 / 1.64) and stay unpadded);
     // `gemm_tdm_stage_f4_opts(.., pad = false)` keeps the unpadded layout (`_nopad` kernel) for A/B
-    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, true)
+    gemm_tdm_stage_f4_opts(name, sh, coop, grouped, false, sh.ks >= 2)
 }
 
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
