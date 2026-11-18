@@ -80,6 +80,7 @@ pub fn mla_g1250_qh16() -> Function {
     let pbuf = lds.tile("PBUF", 1024 * PAGES as i64, Layout::Linear);
     let abuf = lds.tile("ABUF", 256, Layout::Linear);
     let ptab = lds.tile("PTAB", 4 * MAX_PAGES as i64, Layout::Linear);
+    let out = lds.tile_over("OUT", 16 * 512 * 2, &[&kv]);
     lds.commit(&mut b);
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
@@ -209,19 +210,36 @@ pub fn mla_g1250_qh16() -> Function {
             b.mul_f32(rl, ksf)
         })
         .collect();
-    for nt in 0..8u32 {
-        let o = vars[2 + nt as usize];
-        for r in 0..8u8 {
-            let e = b.frag_slice(Opnd::Var(o), r, 1);
-            let ef = b.let_(Op::BitcastF32(Opnd::Val(e)));
-            let y = b.mul_f32(ef, inv[r as usize]);
-            let h = b.cvt_pk_bf16_f32(y, y);
-            // R[b][8 g + r][128 w + 16 nt + m]
-            let off = b.bind_i32(((ev(bidx) * 16 + ev(g) * 8 + r as i32) * 512 + ev(w) * 128 + (16 * nt as i32) + ev(m)) * 2);
-            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(off) });
-            b.store_u16(pa, 0, h);
+    // the bf16 output through LDS (the KV ring is dead after the drain): every lane writes its 64 values at [head][dim], then each thread
+    // stores 128 contiguous bytes of the sequence's 16 x 512 block with 16-byte stores
+    let ob = out.base as i32;
+    out.at(&amdgpu_tile::shared::SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).write(&mut b, |b| {
+        for nt in 0..8u32 {
+            let o = vars[2 + nt as usize];
+            for r in 0..8u8 {
+                let e = b.frag_slice(Opnd::Var(o), r, 1);
+                let ef = b.let_(Op::BitcastF32(Opnd::Val(e)));
+                let y = b.mul_f32(ef, inv[r as usize]);
+                let h = b.cvt_pk_bf16_f32(y, y);
+                // [8 g + r][128 w + 16 nt + m]
+                let a = b.bind_i32(((ev(g) * 8 + r as i32) * 512 + ev(w) * 128 + (16 * nt as i32) + ev(m)) * 2 + ob);
+                b.store_lds(a, h, MemTy::U16, false);
+            }
         }
-    }
+    });
+    b.wait_lds(0);
+    b.barrier();
+    let rb = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 128);
+    let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb) });
+    out.at(&amdgpu_tile::shared::SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(&mut b, |b| {
+        let rows: Vec<ValueId> = (0..8).map(|k| {
+            let a = b.bind_i32(ev(tid) * 128 + (16 * k + ob));
+            b.load_lds_b128(a)
+        }).collect();
+        for k in 0..8u32 {
+            b.store_global(prb, 16 * k, rows[k as usize], MemTy::B128, false);
+        }
+    });
     // LSE (natural log) of head m
     // (wave 0: both lane halves write the same value of head m)
     let lt = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, w, Opnd::I32(0));
