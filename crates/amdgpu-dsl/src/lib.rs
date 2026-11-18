@@ -5198,9 +5198,18 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::VarScaleLane { var, .. } => {
-                if !matches!(f.var_ty(*var), Some(DType::Frag16) | Some(DType::Frag4)) {
-                    errs.push(here(format!("var{var} must be a frag16 or frag4")));
+            Stmt::VarScaleLane { var, index, .. } => {
+                let lanes = match f.var_ty(*var) {
+                    Some(DType::Frag16) => 16,
+                    Some(DType::Frag8) => 8,
+                    Some(DType::Frag4) => 4,
+                    Some(DType::Frag2) => 2,
+                    _ => 0,
+                };
+                if lanes == 0 {
+                    errs.push(here(format!("var{var} must be a frag16, frag8, frag4 or frag2")));
+                } else if *index as usize >= lanes {
+                    errs.push(here(format!("var{var}: lane {index} of a {lanes}-dword fragment")));
                 }
             }
             Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. } => {
