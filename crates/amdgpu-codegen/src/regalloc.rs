@@ -113,6 +113,30 @@ fn low_window_values(m: &MFunction) -> std::collections::HashSet<VReg> {
     s
 }
 
+/// The accumulator tuples of the matrix ops (their destination and the C source), as tuple roots.
+fn matrix_accumulators(m: &MFunction) -> std::collections::HashSet<VReg> {
+    let root = |mut r: VReg| {
+        while let Some(&(u, _)) = m.alias.get(&r) {
+            r = u;
+        }
+        r
+    };
+    let mut s = std::collections::HashSet::new();
+    for b in &m.blocks {
+        for i in &b.insts {
+            if crate::op_attrs::attrs(i.op).cost.pipe == crate::sched::model::Pipe::Mfma {
+                if let Some(d) = i.dst {
+                    s.insert(root(d));
+                }
+                if let Some(Src::Reg(c)) = i.srcs.iter().filter(|x| matches!(x, Src::Reg(_))).nth(2) {
+                    s.insert(root(*c));
+                }
+            }
+        }
+    }
+    s
+}
+
 fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     let r = allocate_policy_once(m, policy);
     // gfx1250: a value that must stay in v0..v255 found no low register: retry with the wide tuples placed above v255 first
@@ -311,6 +335,17 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     vregs.sort_by_key(|x| (x.0, x.1));
     let low_only = low_window_values(m);
     let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
+    // the window plan of the retry: wide tuples above v255; with `AMDC_ACCWIN` only the matrix accumulators (D / C of the matrix ops), so a
+    // matrix op reads its A / B fragments in the low window and its accumulator in a high one with one MSB setting for all of them
+    // opt-in (`AMDC_ACCWIN`): measured neutral on the 256x128 MXFP4 kernel (a08-1: 4096^3 1614 vs 1619, 8192^3 2097 vs 2136 TFLOPS) despite
+    // 14 -> 3 MSB switches per loop; the default stays every tuple of 8+ dwords high
+    let acc = if !wide_high {
+        std::collections::HashSet::new()
+    } else if std::env::var("AMDC_ACCWIN").is_err() {
+        m.vregs.iter().enumerate().filter(|(_, c)| c.is_vector() && c.dwords() >= 8).map(|(r, _)| r as VReg).collect()
+    } else {
+        matrix_accumulators(m)
+    };
     let mut active: Vec<(usize, VReg, RClass)> = Vec::new();
     // Highest slot ever handed out, not just the ones still live at the end:
     // the descriptor must cover every register the code touches.
@@ -341,8 +376,9 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             let mut found = None;
             // gfx1250: v0..v255-only values search below 256; under the retry, wide tuples search above v255 first
             let top = if low_only.contains(&r) { 256.min(vgpr_count()) } else { vgpr_count() };
-            let mut i = if wide_high && width >= 8 && !low_only.contains(&r) { 256 } else { lo };
-            let mut wrapped = !(wide_high && width >= 8 && !low_only.contains(&r));
+            let high = wide_high && acc.contains(&r) && !low_only.contains(&r);
+            let mut i = if high { 256 } else { lo };
+            let mut wrapped = !high;
             loop {
                 if i + width > top {
                     if wrapped {
@@ -428,7 +464,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         });
         let slot = if low_only.contains(&r) {
             find_slot(&used_v[..256.min(used_v.len())], c, false)
-        } else if wide_high && c.dwords() >= 8 {
+        } else if wide_high && acc.contains(&r) {
             find_slot(&used_v[256..], c, false).map(|x| x + 256).or_else(|| find_slot(&used_v, c, singles_from_top))
         } else if plan.active {
             plan.slot(r, c, s, e, &used_v, &start, &end, &phys, m, singles_from_top)?

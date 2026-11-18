@@ -84,7 +84,25 @@ fn parse_inst(line: &str) -> Result<Inst, String> {
     let mut ops = Vec::new();
     let mut mods = Vec::new();
     // operands are comma separated; trailing modifiers (`off`, `offset:N`, `th:X`, `scope:Y`, `nv`) are blank separated after the last one
-    let mut parts: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    // (commas inside a bracketed modifier value - `op_sel:[0,0,1]` - do not separate operands)
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in rest.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    parts.push(cur.trim().to_string());
+    parts.retain(|s| !s.is_empty());
     if let Some(last) = parts.pop() {
         let mut toks = last.split_whitespace();
         if let Some(first) = toks.next() {
@@ -205,6 +223,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         let id = match f.first() {
             Some(&"HW_REG_WAVE_MODE") => 1u32,
             Some(&"HW_REG_WAVE_SCHED_MODE") => 26u32,
+            Some(n) if n.parse::<u32>().is_ok() => n.parse::<u32>().unwrap(),   // a numeric register id (`hwreg(1, 24, 1)`)
             x => return Err(format!("`{t}`: hardware register {x:?}")),
         };
         let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
@@ -356,7 +375,18 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                 }
             }
             let clamp = i.mods.iter().any(|(m, _)| m == "clamp") as u32;
-            out.extend_from_slice(&d32(0xD400_0000 | op3 << 16 | clamp << 15 | sd << 8 | dst));
+            // op_sel:[s0, s1(, s2), dst]: the sources' bits at [11 + k], the destination's (the last element) at [14]
+            let mut opsel = 0u32;
+            if let Some(v) = modv(&i, "op_sel") {
+                let f: Vec<u32> = v.trim_start_matches('[').trim_end_matches(']').split(',').map(|x| x.trim().parse::<u32>().unwrap_or(0)).collect();
+                if let Some((last, src)) = f.split_last() {
+                    for (k, b) in src.iter().enumerate().take(3) {
+                        opsel |= (b & 1) << (11 + k);
+                    }
+                    opsel |= (last & 1) << 14;
+                }
+            }
+            out.extend_from_slice(&d32(0xD400_0000 | op3 << 16 | clamp << 15 | opsel | sd << 8 | dst));
             out.extend_from_slice(&d32(neg << 29 | enc[2] << 18 | enc[1] << 9 | enc[0]));
             if let Some(l) = lit {
                 out.extend_from_slice(&d32(l));
@@ -434,7 +464,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
                     Some(x) => Err(format!("`{t}`: group {x:?}")),
                 }
             };
-            const TH: [&str; 8] = ["", "NT", "HT", "BYPASS", "LU", "NT_RT", "RT_NT", "NT_HT"];
+            const TH: [&str; 8] = ["", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_HT"];
             const SC: [&str; 4] = ["", "SCOPE_SE", "SCOPE_DEV", "SCOPE_SYS"];
             let th = modv(&i, "th").map(|v| {
                 let v = v.trim_start_matches("TH_LOAD_").trim_start_matches("TH_STORE_");
