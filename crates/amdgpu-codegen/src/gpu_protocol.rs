@@ -335,6 +335,32 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// The loop opened at `begin` is the declared tile loop of a persistent kernel: the launch fact is set and its body holds another loop (the K pipeline).
+    fn persistent_tile_loop(&self, begin: usize) -> bool {
+        if self.f.kd.iter().all(|(k, v)| k != "g5:persistent_tile_loop" || *v == 0) {
+            return false;
+        }
+        let close = matching(self.f, begin);
+        self.f.stmts()[begin + 1..close].iter().any(|s| matches!(s, Stmt::BeginLoop { .. }))
+    }
+
+    /// The state at the end of a tile body must equal the state at its start, so that simulating one iteration covers them all: every tensor operation of the body completed (a
+    /// `wait_tensorcnt 0` after the last one) and a barrier after the body's last LDS access (the next tile's first stage overwrites a slot another wave may still read).
+    fn quiescent_at_end(&mut self, first: usize, stmt: usize) {
+        let (undrained, unfenced) = {
+            let body = &self.items[first.min(self.items.len())..];
+            let undrained = body.iter().rposition(|it| matches!(it, Item::Tensor)).map_or(false, |lt| !body[lt + 1..].iter().any(|it| matches!(it, Item::WaitTensor { count: 0, .. })));
+            let unfenced = body.iter().rposition(|it| matches!(it, Item::Access { .. } | Item::Tensor)).map_or(false, |la| !body[la + 1..].iter().any(|it| matches!(it, Item::Barrier { .. })));
+            (undrained, unfenced)
+        };
+        if undrained {
+            self.diag("GV-TILE-UNSUPPORTED", Severity::Error, stmt, format!("stmt {stmt}: the persistent tile loop's body can end with a tensor operation outstanding: the next tile's stage would race with it (drain with `wait_tensor(0)` before the end of the body)"));
+        }
+        if unfenced {
+            self.diag("GV-TILE-UNSUPPORTED", Severity::Error, stmt, format!("stmt {stmt}: the persistent tile loop's body has no workgroup barrier after its last LDS access: the next tile's first stage could overwrite a slot another wave still reads"));
+        }
+    }
+
     fn diag(&mut self, code: &'static str, sev: Severity, stmt: usize, msg: String) {
         if !self.diags.iter().any(|d| d.0 == code && d.2 == stmt) {
             self.diags.push((code, sev, stmt, msg));
@@ -536,6 +562,23 @@ impl<'a> Sim<'a> {
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
                 Stmt::TileConsume { tile, slot, version } => self.open_marker(i, false, tile, slot, version),
                 Stmt::TileEnd => self.close(),
+                Stmt::BeginLoop { vars, init } if self.loop_depth == 0 && self.persistent_tile_loop(i) => {
+                    // the TILE LOOP of a persistent kernel (launch fact `g5:persistent_tile_loop`): every iteration runs the same self-contained pipeline (its ring drained and a barrier after its
+                    // last LDS access, CHECKED below), so the tile body is simulated ONCE as straight-line code; the loop's own exit tests are not protocol decisions
+                    self.close();
+                    let close = matching(f, i);
+                    for (v, i0) in vars.iter().zip(init.iter()) {
+                        let k = self.cv(i0);
+                        self.vars.insert(*v, k);
+                    }
+                    let first = self.items.len();
+                    self.exec(i + 1, close);
+                    self.break_taken = false;
+                    self.close();
+                    self.quiescent_at_end(first, i);
+                    i = close + 1;
+                    continue;
+                }
                 Stmt::BeginLoop { vars, init } => {
                     self.close();
                     let close = matching(f, i);
