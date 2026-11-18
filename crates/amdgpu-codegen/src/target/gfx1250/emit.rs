@@ -62,13 +62,15 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
     // the kernel prologue the gfx1250 assembler requires (s_mov_b64 / v_nop / global_prefetch_b8 first) and LLVM emits for every kernel, in
-    // LLVM's form; s[6:7] is a reserved SGPR pair (never allocated), v0 the packed workitem ids (read only). Exact mode: the author's
-    // instructions are the prologue (none added).
+    // LLVM's form, v0 the packed workitem ids (read only). Its scratch SGPR pair is the first even pair after the kernarg pointer and the
+    // preloaded kernarg dwords (s[2 .. 2 + n) hold the preload until their copies: writing one of them here would replace a kernel argument;
+    // nothing else is live at entry). Exact mode: the author's instructions are the prologue (none added).
     if !m.exact {
+        let p = (2 + super::preload_n()).next_multiple_of(2).max(6);
         out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
-        out.push_str("    s_mov_b64 s[6:7], 0\n");
+        out.push_str(&format!("    s_mov_b64 s[{p}:{}], 0\n", p + 1));
         out.push_str("    v_nop\n");
-        out.push_str("    global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE\n");
+        out.push_str(&format!("    global_prefetch_b8 v0, s[{p}:{}] scope:SCOPE_SE\n", p + 1));
     }
     // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
     // exact mode: the author's waits and padding are verified (check.rs), never added to
