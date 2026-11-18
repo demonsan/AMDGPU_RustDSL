@@ -432,6 +432,14 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_ss() -> Function {
     gemm_tdm_stage_f4_ring(F4_256X256_KS2_SS, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, ..RingOpts::default() })
 }
 
+/// The padded 256 x 256 kernel with the preshuffled scales composed with the relaxed tensor wait and / or the wave roles (host SCALE_SHUF=1).
+pub const F4_256X256_KS2_PAD_SS_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_relax";
+pub const F4_256X256_KS2_PAD_SS_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles";
+pub const F4_256X256_KS2_PAD_SS_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles_relax";
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ss_opts(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, roles, ..RingOpts::default() })
+}
+
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
 /// The unpadded LDS layout (8-way bank conflicts on the fragment reads), for A/B against the default.
 pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
