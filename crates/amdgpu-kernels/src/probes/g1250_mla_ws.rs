@@ -174,6 +174,11 @@ pub fn mla_g1250_qh16_wss() -> Function {
     mla_ws_with("mla_g1250_qh16_wss", false, 64, false)
 }
 
+/// `_wss` with the instruction prefetch at entry.
+pub fn mla_g1250_qh16_wssp() -> Function {
+    mla_ws_with("mla_g1250_qh16_wssp", false, 64 | 128, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -202,6 +207,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let split = branchless & 32 != 0;
     // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
     let sload = branchless & 64 != 0;
+    // bit 7: prefetch the kernel's code into the instruction cache at entry (s_prefetch_inst, 12 x 4 KB)
+    let ipf = branchless & 128 != 0;
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
@@ -248,6 +255,13 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
     let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
+    if ipf {
+        let pc = b.get_pc();
+        let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
+        for k in 0..12u32 {
+            b.prefetch_inst(pc, 0x1000 * k, nl);
+        }
+    }
     let tid = b.let_(Op::WorkitemId);
     let bidx = b.let_(Op::WorkgroupIdY);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
