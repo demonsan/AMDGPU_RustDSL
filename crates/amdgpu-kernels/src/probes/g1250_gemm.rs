@@ -170,7 +170,7 @@ pub fn gemm_tdm_stage_fp8() -> Function {
     use amdgpu_dsl::{ev, I32};
     use amdgpu_stage::gemm::tdm::TdmGemmBody;
     use amdgpu_stage::{Cadence, Pipeline};
-    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::lane::{Role, Roles};
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let mut b = FnBuilder::new(STAGE_NAME, 128);
     b.arg("a", DType::Ptr, 0, 8);
@@ -316,6 +316,14 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ring(name: &str, ring: RingOpts) -> Fun
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, ring)
 }
 
+/// The padded 256 x 256 kernel with wave roles: waves 0, 1 issue the A and SA loads, waves 2, 3 the B and SB loads (2 tensor loads per wave per stage), each role its own copy of the loop;
+/// `relax` = the relaxed tensor wait.
+pub const F4_256X256_KS2_PAD_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles";
+pub const F4_256X256_KS2_PAD_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles_relax";
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_roles(name: &str, relax: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: SLOTS as u8, roles: true, ..Default::default() })
+}
+
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
     gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
@@ -427,11 +435,27 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_ss() -> Function {
     gemm_tdm_stage_f4_ring(F4_256X256_KS2_SS, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, ..RingOpts::default() })
 }
 
+/// The padded 256 x 256 kernel with the preshuffled scales composed with the relaxed tensor wait and / or the wave roles (host SCALE_SHUF=1).
+pub const F4_256X256_KS2_PAD_SS_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_relax";
+pub const F4_256X256_KS2_PAD_SS_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles";
+pub const F4_256X256_KS2_PAD_SS_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles_relax";
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ss_opts(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, roles, ..RingOpts::default() })
+}
+
 pub const F4_256X256_KS2_EPIB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epib";
 pub const F4_256X256_KS2_EPIT: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit";
 /// The padded 256 x 256 ks2 kernel with the C epilogue staged through LDS: b128 global stores (`_epib`) or one tensor store per wave (`_epit`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epi(name: &str, epi: u8) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, ..RingOpts::default() })
+}
+
+/// The padded 256 x 256 kernel with the LDS-staged epilogue (`epi`: 1 = b128 global stores, 2 = a tensor store per wave) composed with the relaxed tensor wait and / or the wave roles.
+pub const F4_256X256_KS2_EPIT_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit_relax";
+pub const F4_256X256_KS2_EPIT_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles";
+pub const F4_256X256_KS2_EPIT_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles_relax";
+pub fn gemm_tdm_stage_f4_256x256_ks2_epi_opts(name: &str, epi: u8, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
 }
 
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
@@ -467,6 +491,8 @@ pub fn f4_row_pad(ks: i32) -> i32 {
 pub struct RingOpts {
     /// ring slots (>= 3): the producer runs `slots - 1` tiles ahead
     pub slots: u8,
+    /// wave roles: waves 0, 1 issue the A and SA loads (and run their own copy of the loop), waves 2, 3 the B and SB loads (`TdmF4Body::roles`)
+    pub roles: bool,
     /// persistent grid (no cluster): a tile loop inside the kernel; workgroup w takes the tile column w % TX and the rows w / TX, + ystep,
     /// .. (TX = N / BN a power of two; kernargs: tile rows @48, log2 TX @52, the row step @56); each tile is one complete pipeline run
     pub persistent: bool,
@@ -480,7 +506,7 @@ pub struct RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, persistent: false, scale_shuf: false, epilogue_lds: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0 }
     }
 }
 
@@ -493,7 +519,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
-    use amdgpu_tile::lane::Role;
+    use amdgpu_tile::lane::{Role, Roles};
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let (bm, bn) = (sh.bm(), sh.bn());
     // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
@@ -629,12 +655,13 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(coop || !clustered, "a cluster needs cooperative loads");
     // a cluster multicast is a rendezvous of IDENTICAL requests (the ISA: one wave per workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have
     // asked): so the workgroups of a cluster row issue the very same slices of the A tile, those of a cluster column the same slices of the B tile, and the slices are per wave only, as without a cluster
-    let div = if coop { nw } else { 1 };
+    assert!(!ring.roles || (coop && nw == 4 && !clustered), "wave roles: 4 cooperative waves, no cluster");
+    let div = if ring.roles { 2 } else if coop { nw } else { 1 };   // roles: the two waves of a role split each of its tiles
     assert!(bm % div == 0 && bn % div == 0, "the tile splits evenly over the waves");
     let (rpa, rpb) = (bm / div, bn / div);
     // the wave id is wave-uniform: read it into an SGPR so the slice offsets and descriptors stay scalar
     let wid = b.let_(Op::ReadFirstLane(Opnd::Val(w)));
-    let wsl = if coop { wid } else { b.c_i32(0) };
+    let wsl = if ring.roles { b.let_(Op::AndI32(Opnd::Val(wid), Opnd::I32(1))) } else if coop { wid } else { b.c_i32(0) };   // the wave's index inside its role
     let leader = b.bind_cond(ev(wid).eq(0));
     let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
     let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
@@ -723,90 +750,91 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     } else {
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
-    let mut body = TdmF4Body { sh, a: ra, b: rb, sa: rsa, sb: rsb, pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, row_pad, scale_shuf: ring.scale_shuf };
     if clustered {
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
-    pipe.run(&mut b, Role::All, &mut body);
-    if persistent {
-        // the next tile's first stage overwrites slot 0: every wave has finished reading the last window first
-        b.wait_lds(0);
-        b.barrier();
-    }
 
-    if epi > 0 {
-        // every wave has finished reading the ring (its last window) before any wave writes C into it
-        if !persistent {
+    let mut emit = |b: &mut FnBuilder, role: Role| {
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, row_pad, scale_shuf: ring.scale_shuf };
+        pipe.run(b, role, &mut body);
+        if persistent {
+            // the next tile's first stage overwrites slot 0: every wave has finished reading the last window first
             b.wait_lds(0);
             b.barrier();
         }
-        // wave block (wrows x wcols f32) row-major at wave * wrows * epi_rs, row stride epi_rs (+16 bytes: the two lane groups' rows 8
-        // apart fall in different banks)
-        let wl0 = b.mul_i32(wid, Opnd::I32(wrows * epi_rs));
-        let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
-        let lrow = b.mul_i32(g8, Opnd::I32(epi_rs));
-        let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(2)));
-        let lb = b.add_i32(wl0, lrow);
-        let lb = b.add_i32(lb, m4);
-        for i in 0..sh.tm {
-            let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
-            for j in 0..sh.tn {
-                let acc = body.acc[(i * sh.tn + j) as usize];
-                for v in 0..16i32 {
-                    let rowv = (v % 8) + 16 * (v / 8);
-                    let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
-                    let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                    b.store_lds_b32(addr, x);
+        if epi > 0 {
+            // every wave has finished reading the ring (its last window) before any wave writes C into it
+            if !persistent {
+                b.wait_lds(0);
+                b.barrier();
+            }
+            // wave block (wrows x wcols f32) row-major at wave * wrows * epi_rs, row stride epi_rs (+16 bytes: the two lane groups' rows 8
+            // apart fall in different banks)
+            let wl0 = b.mul_i32(wid, Opnd::I32(wrows * epi_rs));
+            let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+            let lrow = b.mul_i32(g8, Opnd::I32(epi_rs));
+            let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(2)));
+            let lb = b.add_i32(wl0, lrow);
+            let lb = b.add_i32(lb, m4);
+            for i in 0..sh.tm {
+                let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
+                for j in 0..sh.tn {
+                    let acc = body.acc[(i * sh.tn + j) as usize];
+                    for v in 0..16i32 {
+                        let rowv = (v % 8) + 16 * (v / 8);
+                        let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
+                        let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                        b.store_lds_b32(addr, x);
+                    }
                 }
             }
-        }
-        b.wait_lds(0);
-        // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
-        let r0 = b.mul_i32(wi, Opnd::I32(wrows));
-        let r0 = b.add_i32(r0, row0);
-        let c0 = b.mul_i32(wj, Opnd::I32(wcols));
-        let c0 = b.add_i32(c0, col0);
-        let lin = b.mul_i32(r0, nn);
-        let lin = b.add_i32(lin, c0);
-        let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
-        if epi == 1 {
-            // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
-            assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
-            let lanes_per_row = wcols / 4;
-            assert!(lanes_per_row % 32 == 0 || 32 % lanes_per_row == 0);
-            let (rows_per_inst, chunks) = if lanes_per_row >= 32 { (1, lanes_per_row / 32) } else { (32 / lanes_per_row, 1) };
-            assert!(rows_per_inst == 1, "a wave block of at least 128 columns");
-            let l16 = b.let_(Op::ShlI32(Opnd::Val(lane), Opnd::I32(4)));
-            let lr = b.add_i32(wl0, l16);
-            let cols_b = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
-            let gofs = b.add_i32(org, l16);
-            for q in 0..wrows {
-                for ch in 0..chunks {
-                    let la = b.bind_i32(ev(lr) + (q * epi_rs + ch * 512));
-                    let v4 = b.load_lds_b128(la);
-                    let rq = b.mul_i32(cols_b, Opnd::I32(q));
-                    let off = b.add_i32(gofs, rq);
-                    let off = if ch == 0 { off } else { b.add_i32(off, Opnd::I32(ch * 512)) };
-                    let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
-                    b.store_f32x4(p, 0, v4);
+            b.wait_lds(0);
+            // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
+            let r0 = b.mul_i32(wi, Opnd::I32(wrows));
+            let r0 = b.add_i32(r0, row0);
+            let c0 = b.mul_i32(wj, Opnd::I32(wcols));
+            let c0 = b.add_i32(c0, col0);
+            let lin = b.mul_i32(r0, nn);
+            let lin = b.add_i32(lin, c0);
+            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+            if epi == 1 {
+                // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
+                assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
+                let lanes_per_row = wcols / 4;
+                assert!(lanes_per_row % 32 == 0 || 32 % lanes_per_row == 0);
+                let (rows_per_inst, chunks) = if lanes_per_row >= 32 { (1, lanes_per_row / 32) } else { (32 / lanes_per_row, 1) };
+                assert!(rows_per_inst == 1, "a wave block of at least 128 columns");
+                let l16 = b.let_(Op::ShlI32(Opnd::Val(lane), Opnd::I32(4)));
+                let lr = b.add_i32(wl0, l16);
+                let cols_b = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
+                let gofs = b.add_i32(org, l16);
+                for q in 0..wrows {
+                    for ch in 0..chunks {
+                        let la = b.bind_i32(ev(lr) + (q * epi_rs + ch * 512));
+                        let v4 = b.load_lds_b128(la);
+                        let rq = b.mul_i32(cols_b, Opnd::I32(q));
+                        let off = b.add_i32(gofs, rq);
+                        let off = if ch == 0 { off } else { b.add_i32(off, Opnd::I32(ch * 512)) };
+                        let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                        b.store_f32x4(p, 0, v4);
+                    }
                 }
+            } else {
+                // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
+                let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
+                // (the origin and the LDS base are wave-uniform: scalar descriptor words)
+                let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
+                let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
+                let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
+                b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                b.wait_tensor(0);
+            }
+            if persistent {
+                // the next tile's first stage writes the ring: every wave's staging reads are done
+                b.wait_lds(0);
+                b.barrier();
             }
         } else {
-            // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
-            let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
-            // (the origin and the LDS base are wave-uniform: scalar descriptor words)
-            let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
-            let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
-            let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
-            b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
-            b.wait_tensor(0);
-        }
-        if persistent {
-            // the next tile's first stage writes the ring: every wave's staging reads are done
-            b.wait_lds(0);
-            b.barrier();
-        }
-    } else {
         // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
         let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
         let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
@@ -842,6 +870,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             }
         }
+        }
+    };
+    if ring.roles {
+        // two code copies by wave: waves 0, 1 (role A) and waves 2, 3 (role B), the same barrier structure in both
+        let is_a = b.bind_cond(ev(wid).lt(2));
+        let roles = Roles { is_a, wave_in_group: wsl, group: 2 };
+        roles.each(&mut b, |b, role| emit(b, role));
+    } else {
+        emit(&mut b, Role::All);
     }
     if let Some(vy) = persist_var {
         let ystep = b.let_(Op::KernargI32 { offset: 56 });

@@ -2710,10 +2710,15 @@ impl<'a> An<'a> {
                 let (x, y) = (self.int_of(a), self.int_of(b));
                 let mut hi: Vec<Poly> = Vec::new();
                 let mut ok = false;
-                for (p, q) in [(&x, &y), (&y, &x)] {
+                for (k, (p, q)) in [(&x, &y), (&y, &x)].into_iter().enumerate() {
                     if let Some(m) = p.point_const() {
                         if m.d == 1 && m.n >= 0 {
                             hi.push(Poly::int(m.n));
+                            // the other operand is a multiple of 2^s (known trailing zeros): the result is too, so it cannot reach the mask's odd top values (`(4 t + 128) & 511` <= 508)
+                            let s = self.tz(if k == 0 { b } else { a }, 0).min(30);
+                            if s > 0 {
+                                hi.push(Poly::int(m.n & !((1i128 << s) - 1)));
+                            }
                             ok = true;
                             if q.nonneg(cx) {
                                 hi.extend(q.hi.iter().cloned());
@@ -4283,7 +4288,10 @@ fn gcd(a: i128, b: i128) -> i128 {
 
 const VGPR_LIMIT: u32 = crate::target::T.verify.vgpr_limit;
 const SGPR_LIMIT: u32 = crate::target::T.verify.sgpr_limit;
-const LDS_LIMIT: u32 = crate::target::T.verify.lds_limit;
+/// the per-workgroup LDS limit of the target being compiled (gfx950: 160 KiB, gfx1250: 320 KiB)
+fn lds_limit() -> u32 {
+    crate::target::cur().verify.lds_limit
+}
 
 fn is_matrix_op(op: MOp) -> bool {
     // every MFMA except the sparse smfmac (op_attrs)
@@ -4383,8 +4391,8 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
     if a.max_s > SGPR_LIMIT {
         rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} SGPRs (limit {SGPR_LIMIT})", a.max_s));
     }
-    if m.lds_bytes > LDS_LIMIT {
-        rep.add("GV-LDS-OOB", Severity::Error, format!("declared + spill LDS {} bytes exceeds the {LDS_LIMIT}-byte per-workgroup limit", m.lds_bytes));
+    if m.lds_bytes > lds_limit() {
+        rep.add("GV-LDS-OOB", Severity::Error, format!("declared + spill LDS {} bytes exceeds the {}-byte per-workgroup limit", m.lds_bytes, lds_limit()));
     }
     if m.lds_bytes < f.lds_bytes {
         rep.add("GV-LDS-OOB", Severity::Error, format!("emitted LDS segment {} bytes is smaller than the DSL-declared {}", m.lds_bytes, f.lds_bytes));
