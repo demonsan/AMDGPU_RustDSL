@@ -424,6 +424,13 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_ss() -> Function {
     gemm_tdm_stage_f4_ring(F4_256X256_KS2_SS, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, ..RingOpts::default() })
 }
 
+pub const F4_256X256_KS2_EPIB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epib";
+pub const F4_256X256_KS2_EPIT: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit";
+/// The padded 256 x 256 ks2 kernel with the C epilogue staged through LDS: b128 global stores (`_epib`) or one tensor store per wave (`_epit`).
+pub fn gemm_tdm_stage_f4_256x256_ks2_epi(name: &str, epi: u8) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, ..RingOpts::default() })
+}
+
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
 /// The unpadded LDS layout (8-way bank conflicts on the fragment reads), for A/B against the default.
 pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
@@ -462,11 +469,15 @@ pub struct RingOpts {
     pub persistent: bool,
     /// the scales in the vendor's preshuffled layout (host SCALE_SHUF=1; `TdmF4Body::scale_shuf`)
     pub scale_shuf: bool,
+    /// the C epilogue through LDS (f32, non-cluster): 0 = the direct per-element stores; 1 = each wave writes its 128-column block row-major
+    /// into the dead ring (`ds_store_b32`, rows padded by 16 bytes), then reads rows back as b128 and stores them with `global_store_b128`
+    /// (512 coalesced bytes per instruction); 2 = the same staging, then one `tensor_store_from_lds` per wave
+    pub epilogue_lds: u8,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, persistent: false, scale_shuf: false }
+        RingOpts { slots: SLOTS as u8, persistent: false, scale_shuf: false, epilogue_lds: 0 }
     }
 }
 
@@ -533,6 +544,18 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             lds.ring("SB", (bn * 4 * sh.ks) as i64, ring.slots as u32, Layout::Linear),
         )
     };
+    // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
+    let epi = ring.epilogue_lds;
+    assert!(epi == 0 || (!sh.bf16 && sh.cx * sh.cy == 1), "the LDS epilogue: f32, no cluster");
+    let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
+    let epi_rs = wcols * 4 + 16;
+    if epi > 0 {
+        let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
+        let need = (sh.waves() * wrows * epi_rs) as i64;
+        if need > ring_bytes {
+            let _ = lds.ring("EPI", need - ring_bytes, 1, Layout::Linear);
+        }
+    }
     lds.commit(&mut b);
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
@@ -706,37 +729,111 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.barrier();
     }
 
-    // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
-    let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
-    let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
-    let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
-    for i in 0..sh.tm {
-        for j in 0..sh.tn {
-            let acc = body.acc[(i * sh.tn + j) as usize];
-            // first row of the block (the lane's row group) and the lane's column
-            let r0 = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
-            let r0 = b.add_i32(r0, row0);
-            let r0 = b.add_i32(r0, Opnd::I32(i * 32));
-            let r0 = b.add_i32(r0, g8);
-            let c0 = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
-            let c0 = b.add_i32(c0, col0);
-            let c0 = b.add_i32(c0, Opnd::I32(j * 16));
-            let c0 = b.add_i32(c0, m);
-            let lin = b.mul_i32(r0, nn);
-            let lin = b.add_i32(lin, c0);
-            let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(esh)));
-            for v in 0..16i32 {
-                let rowv = (v % 8) + 16 * (v / 8);
-                let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
-                let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
-                let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                if sh.bf16 {
-                    // the accumulator rounded to bf16 (RNE) in the low half of a dword, stored as 16 bits
-                    let xf = b.bitcast_f32(x);
-                    let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(xf), Opnd::Val(xf)));
-                    b.store_u16(q, 0, p);
-                } else {
-                    b.store_global(q, 0, x, MemTy::B32, false);
+    if epi > 0 {
+        // every wave has finished reading the ring (its last window) before any wave writes C into it
+        if !persistent {
+            b.wait_lds(0);
+            b.barrier();
+        }
+        // wave block (wrows x wcols f32) row-major at wave * wrows * epi_rs, row stride epi_rs (+16 bytes: the two lane groups' rows 8
+        // apart fall in different banks)
+        let wl0 = b.mul_i32(wid, Opnd::I32(wrows * epi_rs));
+        let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+        let lrow = b.mul_i32(g8, Opnd::I32(epi_rs));
+        let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(2)));
+        let lb = b.add_i32(wl0, lrow);
+        let lb = b.add_i32(lb, m4);
+        for i in 0..sh.tm {
+            let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
+            for j in 0..sh.tn {
+                let acc = body.acc[(i * sh.tn + j) as usize];
+                for v in 0..16i32 {
+                    let rowv = (v % 8) + 16 * (v / 8);
+                    let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
+                    let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                    b.store_lds_b32(addr, x);
+                }
+            }
+        }
+        b.wait_lds(0);
+        // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
+        let r0 = b.mul_i32(wi, Opnd::I32(wrows));
+        let r0 = b.add_i32(r0, row0);
+        let c0 = b.mul_i32(wj, Opnd::I32(wcols));
+        let c0 = b.add_i32(c0, col0);
+        let lin = b.mul_i32(r0, nn);
+        let lin = b.add_i32(lin, c0);
+        let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+        if epi == 1 {
+            // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
+            assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
+            let lanes_per_row = wcols / 4;
+            assert!(lanes_per_row % 32 == 0 || 32 % lanes_per_row == 0);
+            let (rows_per_inst, chunks) = if lanes_per_row >= 32 { (1, lanes_per_row / 32) } else { (32 / lanes_per_row, 1) };
+            assert!(rows_per_inst == 1, "a wave block of at least 128 columns");
+            let l16 = b.let_(Op::ShlI32(Opnd::Val(lane), Opnd::I32(4)));
+            let lr = b.add_i32(wl0, l16);
+            let cols_b = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
+            let gofs = b.add_i32(org, l16);
+            for q in 0..wrows {
+                for ch in 0..chunks {
+                    let la = b.bind_i32(ev(lr) + (q * epi_rs + ch * 512));
+                    let v4 = b.load_lds_b128(la);
+                    let rq = b.mul_i32(cols_b, Opnd::I32(q));
+                    let off = b.add_i32(gofs, rq);
+                    let off = if ch == 0 { off } else { b.add_i32(off, Opnd::I32(ch * 512)) };
+                    let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                    b.store_f32x4(p, 0, v4);
+                }
+            }
+        } else {
+            // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
+            let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: Some((wcols as u16, 4)), wg_mask: 0 };
+            // (the origin and the LDS base are wave-uniform: scalar descriptor words)
+            let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
+            let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
+            let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
+            b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+            b.wait_tensor(0);
+        }
+        if persistent {
+            // the next tile's first stage writes the ring: every wave's staging reads are done
+            b.wait_lds(0);
+            b.barrier();
+        }
+    } else {
+        // C: wave (wi, wj), block (i, j): rows R + v % 8 + 8 h + 16 (v / 8), column m
+        let esh = if sh.bf16 { 1 } else { 2 };   // log2 of the output element size
+        let cols_l = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(esh)));
+        let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+        for i in 0..sh.tm {
+            for j in 0..sh.tn {
+                let acc = body.acc[(i * sh.tn + j) as usize];
+                // first row of the block (the lane's row group) and the lane's column
+                let r0 = b.let_(Op::MulI32(Opnd::Val(wi), Opnd::I32(sh.tm * 32)));
+                let r0 = b.add_i32(r0, row0);
+                let r0 = b.add_i32(r0, Opnd::I32(i * 32));
+                let r0 = b.add_i32(r0, g8);
+                let c0 = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
+                let c0 = b.add_i32(c0, col0);
+                let c0 = b.add_i32(c0, Opnd::I32(j * 16));
+                let c0 = b.add_i32(c0, m);
+                let lin = b.mul_i32(r0, nn);
+                let lin = b.add_i32(lin, c0);
+                let off0 = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(esh)));
+                for v in 0..16i32 {
+                    let rowv = (v % 8) + 16 * (v / 8);
+                    let off = if rowv == 0 { off0 } else { let rb_ = b.mul_i32(cols_l, Opnd::I32(rowv)); b.add_i32(off0, rb_) };
+                    let q = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                    let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                    if sh.bf16 {
+                        // the accumulator rounded to bf16 (RNE) in the low half of a dword, stored as 16 bits
+                        let xf = b.bitcast_f32(x);
+                        let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(xf), Opnd::Val(xf)));
+                        b.store_u16(q, 0, p);
+                    } else {
+                        b.store_global(q, 0, x, MemTy::B32, false);
+                    }
                 }
             }
         }
