@@ -7,7 +7,7 @@ A="$CARGO_TARGET_DIR/release/amdc"
 CL=/opt/rocm/llvm/bin/clang
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_f4own_host.cpp -o $O/own_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"
-export PROBE_WATCHDOG_S=10 CHECK_ROWS=64
+export PROBE_WATCHDOG_S=10 CHECK_ROWS=${CHECK_ROWS:-64}
 for k in ${NAMES:-gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1 gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2 gemm_g1250_tdm_stage_f4_128x128_ks2_c2x2}; do
   case $k in *_c2x2) cl=2,2;; *_c2x1) cl=2,1;; *_c1x2) cl=1,2;; *) cl=1,1;; esac
   cx=${cl%,*}; cy=${cl#*,}
