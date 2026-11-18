@@ -159,6 +159,11 @@ fn merge(a: &State, b: &State) -> State {
 /// The violations of the author's waits (one message per missing wait: block, instruction, counter, the operation it depends on).
 /// (statement, is a software-hazard finding, message).
 pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
+    verify_mode(m, a, 0)
+}
+
+/// `verify` with the wave's scheduling mode at entry `mode0` (a kernel that sets it itself overrides it).
+pub fn verify_mode(m: &MFunction, a: &Alloc, mode0: u8) -> Vec<(u32, bool, String)> {
     let n = m.blocks.len();
     let idx: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let succ: Vec<Vec<usize>> = m
@@ -171,7 +176,7 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
         })
         .collect();
     let mut entry: Vec<Option<State>> = vec![None; n];
-    entry[0] = Some(State { items: BTreeMap::new(), mode: Some(0) });
+    entry[0] = Some(State { items: BTreeMap::new(), mode: Some(mode0) });
     let mut errs: BTreeMap<(usize, usize, Ctr), (u32, bool, String)> = BTreeMap::new();
     for _round in 0..200 {
         let mut changed = false;
@@ -346,5 +351,23 @@ pub fn verify_planned(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Ve
         b.insts = out;
     }
     // the instructions moved; the allocation is per value, so it still applies
+    // (debug, `AMDC_MODE2_SITES`: the dependencies the relaxed scheduling mode would leave to software in this code, for the mode-2 probe)
+    if std::env::var("AMDC_MODE2_SITES").map_or(false, |v| !v.is_empty()) {
+        let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, hz, msg) in verify_mode(&m2, a, 2) {
+            if hz || !msg.contains("relaxed") {
+                continue;
+            }
+            // "... (`consumer`): needs <ctr> for the operation at ... (`producer`) ..."
+            let q: Vec<&str> = msg.split('`').collect();
+            let ctr = if msg.contains("va_vdst") { "va_vdst" } else { "vm_vsrc" };
+            if q.len() >= 4 {
+                *hist.entry(format!("{ctr}: {} -> {}", q[3], q[1])).or_insert(0) += 1;
+            }
+        }
+        for (k, n) in hist {
+            eprintln!("MODE2-SITE {n:5} {k}");
+        }
+    }
     verify(&m2, a).into_iter().filter(|(_, hazard, _)| !hazard).map(|(_, _, msg)| msg).collect()
 }
