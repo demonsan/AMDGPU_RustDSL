@@ -411,14 +411,18 @@ fn desc_check(f: &Function, defs: &HashMap<ValueId, Op>, pos: usize, g0: &Opnd, 
             viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: descriptor group 0 type field {} (must be 2)", x >> 30));
         }
     }
-    // the tile (no padding, 1..3 dimensions) in LDS
+    // the tile (1..3 dimensions, padding included) in LDS
     if let (Some(Some(lds)), true, Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w0.get(1), w1.len() == 8, w1.first(), w1.get(3), w1.get(4)) {
         let pad_enable = a0 >> 20 & 1 != 0;
         let esize = 1u64 << (a0 >> 16 & 3);
         let (t0, t1, t2) = ((a3 >> 16) as u64, (a4 & 0xffff) as u64, (a4 >> 16) as u64);
         let elems = t0 * t1.max(1) * t2.max(1);
-        if !pad_enable && t0 > 0 && f.lds_bytes > 0 && (*lds as u64) + elems * esize > f.lds_bytes as u64 {
-            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the tile ({elems} elements of {esize} bytes at LDS address {lds}) does not fit in the declared {} bytes of LDS", f.lds_bytes));
+        // the padded footprint (amdgpu_dsl::tdm_pad::footprint: `amount` dwords after every full `interval`; interval field v = 2^(v+1)
+        // dwords, amount field v = v + 1 dwords)
+        let pad = pad_enable.then(|| (1u16 << ((a0 >> 22 & 7) + 1), ((a0 >> 25 & 0x7f) + 1) as u16));
+        let bytes = amdgpu_dsl::tdm_pad::footprint((elems * esize).min(u32::MAX as u64) as u32, pad) as u64;
+        if t0 > 0 && f.lds_bytes > 0 && (*lds as u64) + bytes > f.lds_bytes as u64 {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the tile ({elems} elements of {esize} bytes{} at LDS address {lds}) does not fit in the declared {} bytes of LDS", if pad.is_some() { format!(", {bytes} bytes padded") } else { String::new() }, f.lds_bytes));
         }
     }
 }
