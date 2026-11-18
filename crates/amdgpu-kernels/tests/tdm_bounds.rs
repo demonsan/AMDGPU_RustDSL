@@ -210,3 +210,74 @@ fn an_async_load_into_lds_past_the_segment_is_rejected() {
     let e = amdgpu_codegen::compile_target(&async_kernel(Async::LdsPast), "gfx1250").err().expect("must be rejected");
     assert!(e.contains("GV-LDS-OOB"), "{e}");
 }
+
+// ---- plain ds_read / ds_write inside the declared LDS segment (enforced on every gfx1250 compile) ----
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lds {
+    /// address = tid x 4 for 128 work-items in a 512-byte segment: inside
+    Legal,
+    /// the same for 256 work-items: up to 1020, past the segment
+    Past,
+    /// a masked address `(4 t + 128) & 511` (a multiple of 4: at most 508): inside
+    MaskedAligned,
+    /// a masked address `(3 t + 400) & 511` (not provably aligned: the interval reaches 511, where a 4-byte read crosses the end)
+    MaskedCanExceed,
+    /// a store past the segment
+    StorePast,
+}
+
+fn lds_kernel(c: Lds) -> Function {
+    let mut b = FnBuilder::new("tb_lds", if matches!(c, Lds::Past) { 256 } else { 128 });
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(256 * 4));
+    b.lds(512);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let t4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let addr = match c {
+        Lds::Legal | Lds::Past | Lds::StorePast => t4,
+        Lds::MaskedAligned => {
+            let x = b.let_(Op::AddI32(Opnd::Val(t4), Opnd::I32(128)));
+            b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(511)))
+        }
+        Lds::MaskedCanExceed => {
+            let t3 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+            let x = b.let_(Op::AddI32(Opnd::Val(t3), Opnd::I32(400)));
+            b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(511)))
+        }
+    };
+    if c == Lds::StorePast {
+        let big = b.let_(Op::AddI32(Opnd::Val(t4), Opnd::I32(512)));
+        b.store_lds_b32(big, tid);
+        b.wait_lds(0);
+    }
+    let x = b.load_lds(Opnd::Val(addr), amdgpu_dsl::MemTy::B32);
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(t4) });
+    b.store_global(q, 0, x, amdgpu_dsl::MemTy::B32, false);
+    b.finish()
+}
+
+#[test]
+fn lds_accesses_inside_the_segment_compile() {
+    amdgpu_codegen::compile_target(&lds_kernel(Lds::Legal), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    amdgpu_codegen::compile_target(&lds_kernel(Lds::MaskedAligned), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_ds_load_past_the_declared_lds_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&lds_kernel(Lds::Past), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-LDS-OOB"), "{e}");
+}
+
+#[test]
+fn a_masked_lds_address_that_can_exceed_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&lds_kernel(Lds::MaskedCanExceed), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-LDS-OOB"), "{e}");
+}
+
+#[test]
+fn a_ds_store_past_the_declared_lds_is_rejected() {
+    let e = amdgpu_codegen::compile_target(&lds_kernel(Lds::StorePast), "gfx1250").err().expect("must be rejected");
+    assert!(e.contains("GV-LDS-OOB"), "{e}");
+}
