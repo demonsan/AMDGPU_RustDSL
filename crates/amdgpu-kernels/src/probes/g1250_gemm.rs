@@ -310,6 +310,12 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_pad_relax() -> Function {
     gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
 }
 
+/// The padded 256 x 256 kernel with the relaxed tensor wait over a deeper ring: `slots - 2` stages stay in flight at the end of a window (4 slots: two tiles of lookahead past the next one).
+pub const F4_256X256_KS2_PAD_RELAX_S4: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax_s4";
+pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ring(name: &str, ring: RingOpts) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, ring)
+}
+
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
     gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
@@ -415,7 +421,25 @@ pub fn f4_row_pad(ks: i32) -> i32 {
 
 /// `gemm_tdm_stage_f4_with`; `hoist_base`: the per-wave global tile origins (`pointer + row origin`, 64-bit) are formed once before the
 /// pipeline, so a stage adds only its K byte offset (the descriptor address advances by the K offset alone; no per-stage origin add).
+/// The ring options of the MXFP4 stage kernels (`Pipeline::slots`).
+#[derive(Clone, Copy, Debug)]
+pub struct RingOpts {
+    /// ring slots (>= 3): the producer runs `slots - 1` tiles ahead
+    pub slots: u8,
+}
+
+impl Default for RingOpts {
+    fn default() -> Self {
+        RingOpts { slots: SLOTS as u8 }
+    }
+}
+
 pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool, pad: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, sh, coop, grouped, hoist_base, pad, RingOpts::default())
+}
+
+/// The MXFP4 stage kernel with an explicit ring depth (see `RingOpts`).
+pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool, pad: bool, ring: RingOpts) -> Function {
     use amdgpu_dsl::ev;
     use amdgpu_stage::gemm::tdm_f4::{F4Shape, TdmF4Body};
     use amdgpu_stage::{Cadence, Pipeline};
@@ -434,7 +458,7 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // the host contract (docs/gfx1250-hang-rules.md, tensor bounds): the grid covers the output exactly (N = grid x * BN, M = grid y * BM), K a multiple of the slot's K; the buffers hold A / B
     // (fp4: K / 2 bytes per row), their scales (K / 32 bytes per row) and C (f32, M x N). Every tensor tile and every store is proven inside these extents.
     // K = 128 * K128 (K128 a multiple of ks, at least two K slots so the prologue's second stage is a real tile): the extents below are polynomials, no divisions
-    b.sym_range("K128", 2 * sh.ks as i64, 1 << 13);
+    b.sym_range("K128", (ring.slots as i64 - 1) * sh.ks as i64, 1 << 13);   // at least `slots - 1` K slots: the prologue stages tiles 0 .. slots - 2 as real tiles
     b.ka_is(40, Ext::sym("K128") * Ext::c(128));
     b.ka_is(44, Ext::grid_x() * Ext::c(bn as i64));
     let (m_rows, n_cols) = (Ext::grid_y() * Ext::c(bm as i64), Ext::grid_x() * Ext::c(bn as i64));
@@ -445,14 +469,14 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
     let mut lds = LdsPlan::new();
     let (ra, rb, rsa, rsb) = if grouped {
-        let [ra, rb, rsa, rsb] = lds.ring_group(SLOTS as u32, [("A", (bm * row_l) as i64, Layout::Linear), ("B", (bn * row_l) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
+        let [ra, rb, rsa, rsb] = lds.ring_group(ring.slots as u32, [("A", (bm * row_l) as i64, Layout::Linear), ("B", (bn * row_l) as i64, Layout::Linear), ("SA", (bm * 4 * sh.ks) as i64, Layout::Linear), ("SB", (bn * 4 * sh.ks) as i64, Layout::Linear)]);
         (ra, rb, rsa, rsb)
     } else {
         (
-            lds.ring("A", (bm * row_l) as i64, SLOTS as u32, Layout::Linear),
-            lds.ring("B", (bn * row_l) as i64, SLOTS as u32, Layout::Linear),
-            lds.ring("SA", (bm * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
-            lds.ring("SB", (bn * 4 * sh.ks) as i64, SLOTS as u32, Layout::Linear),
+            lds.ring("A", (bm * row_l) as i64, ring.slots as u32, Layout::Linear),
+            lds.ring("B", (bn * row_l) as i64, ring.slots as u32, Layout::Linear),
+            lds.ring("SA", (bm * 4 * sh.ks) as i64, ring.slots as u32, Layout::Linear),
+            lds.ring("SB", (bn * 4 * sh.ks) as i64, ring.slots as u32, Layout::Linear),
         )
     };
     lds.commit(&mut b);
@@ -569,7 +593,8 @@ pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(sh.ks.count_ones() == 1, "ks a power of two");
     let nkv = b.bind_i32(ev(kk).lshr(lgk));
     b.assume_trusted(nkv, Ext::c(1), Ext::ka(40).ceil_div(128 * sh.ks as i64), "nkv = K / (128 ks) >= 1 (a K that is a multiple of the slot's K)");
-    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128 * sh.ks, Ext::ka(40).ceil_div(128 * sh.ks as i64));
+    let mut pipe = Pipeline::new(Cadence::OneWindow, nkv, kk, 128 * sh.ks, Ext::ka(40).ceil_div(128 * sh.ks as i64));
+    pipe.slots = ring.slots;
     let (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org) = if hoist_base {
         let base = |b: &mut FnBuilder, p: ValueId, o: ValueId| b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
         let z = b.let_(Op::ConstI32(0));

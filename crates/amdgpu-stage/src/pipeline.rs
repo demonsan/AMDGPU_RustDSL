@@ -137,15 +137,12 @@ pub struct Pipeline {
     /// `OneWindow`: the ring depth (>= 3, default 3). The producer runs `slots - 1` tiles ahead: iteration t stages tile t + slots - 1 into the slot of tile t - 1, and the prologue stages tiles
     /// 0 .. slots - 2. The body's ring must have `slots` slots (a deeper ring hides more tensor-load latency: `slots - 2` windows). The slot index cycles modulo `slots`.
     pub slots: u8,
-    /// `OneWindow`: do not issue the stage of a tile past the last one (`t + slots - 1 >= nkv`) at all (a uniform scalar branch around the stage) instead of re-staging the clamped last tile. Saves the
-    /// redundant transfer of the last iterations (and any read past the end of a table); the body's `stage_complete` still runs (it waits for what is in flight).
-    pub skip_past_end: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, skip_past_end: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3 }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -155,7 +152,6 @@ impl Pipeline {
     pub fn run(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
         assert!(self.slots >= 3 || self.cadence != Cadence::OneWindow, "Pipeline: OneWindow needs at least 3 ring slots");
         assert!(self.slots == 3 || self.cadence == Cadence::OneWindow, "Pipeline: `slots` is a OneWindow parameter");
-        assert!(!self.skip_past_end || self.cadence == Cadence::OneWindow, "Pipeline: `skip_past_end` is a OneWindow parameter");
         if self.cadence == Cadence::OneWindow {
             body.set_ring_depth(self.slots);
         }
@@ -535,19 +531,11 @@ impl Pipeline {
                 let n2 = t.n2.clone().expect("n2");
                 // rotated weave: the staging of tile t+2 and its completion run two iterations ahead (`iter` +2)
                 let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
-                let (lg, vm, skip) = (self.lg(), self.vm_inflight, self.skip_past_end);
+                let (lg, vm) = (self.lg(), self.vm_inflight);
                 rotate(b, &ONE_WINDOW_PARTS, stage_sel, None, &mut |b, i| match i {
                     0 => {
                         let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << lg);
-                        if skip {
-                            // past the last tile: nothing to load (uniform branch; the tile is never consumed)
-                            let live = b.bind_cond(it_p2.lt(&nkv));
-                            b.begin_if(live);
-                            body.stage(b, role, &key_n2, &n2);
-                            b.end_if();
-                        } else {
-                            body.stage(b, role, &key_n2, &n2);
-                        }
+                        body.stage(b, role, &key_n2, &n2);
                     }
                     1 => body.window(b, role, &t),
                     2 => {
