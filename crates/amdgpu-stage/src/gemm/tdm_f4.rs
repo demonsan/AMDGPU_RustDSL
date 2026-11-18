@@ -9,7 +9,7 @@
 //! `[K 32 h .. +32)` and `[K 64 + 32 h .. +32)` of the row, i.e. bytes `16 h .. +16` and `32 + 16 h .. +16` of the 64-byte row; the A scale of lane `l` is row `l` of the 32-row block (4 bytes: one per
 //! 32 K), the B scale (lanes 0..15) row `l`; C / D dword v: row `v % 8 + 8 h + 16 (v / 8)`, column `m`.
 
-use amdgpu_dsl::{ev, DType, FnBuilder, Opnd, ValueId, VarId, WmmaKind, WmmaScale};
+use amdgpu_dsl::{ev, DType, FnBuilder, Op, Opnd, ValueId, VarId, WmmaKind, WmmaScale};
 use amdgpu_tile::lane::{Role, TileIt};
 use amdgpu_tile::shared::{Shared, SlotIdx};
 
@@ -151,7 +151,8 @@ impl PipeBody for TdmF4Body {
         let n = (self.sh.tm * self.sh.tn) as usize;
         (0..n)
             .map(|_| {
-                let z = b.frag_cat(&[Opnd::I32(0); 16]);
+                // a zero fragment value (the lowering's `zeroinit` writes the variable's own registers: no zero tuple kept live)
+                let z = b.let_(Op::FragZero { ty: DType::Frag16 });
                 (WmmaKind::ScaleF4_32x16x128.acc_ty(), Opnd::Val(z))
             })
             .collect()

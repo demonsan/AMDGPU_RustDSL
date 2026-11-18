@@ -709,6 +709,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
     let mut f = b.finish();
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
+    if persistent {
+        f.lower_opts.push("zeroinit".to_string());
+    }
     if clustered {
         f.kd.push(("cluster_dims".into(), (cx * cy) as i64));   // the launch must declare the cluster (and divide the grid by it)
     }
