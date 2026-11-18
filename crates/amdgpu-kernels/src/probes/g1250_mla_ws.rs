@@ -11,6 +11,7 @@
 use amdgpu_dsl::{ev, CmpPred, CmpTy, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol, TensorTile, ValueId, VarId, WmmaKind};
 use amdgpu_stage::attention::mla::{PageLayout, DV, PAGE_BYTES, PAGE_TOKENS, ROPE_OFF};
 use amdgpu_stage::gemm::tdm::tdm_group0;
+use amdgpu_stage::weave::{Units, Weaver};
 use amdgpu_tile::shared::{Layout, LdsPlan, SlotIdx};
 
 pub const MLA_WS_NAME: &str = "mla_g1250_qh16_ws";
@@ -23,16 +24,55 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
-    mla_ws_with(MLA_WS_NAME, false)
+    mla_ws_with(MLA_WS_NAME, false, 0, false)
+}
+
+/// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
+pub fn mla_g1250_qh16_wsb() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsb", false, 3, false)
+}
+
+/// bisect aids: only the mask (`_wsbm`) / only the rescale (`_wsbr`) branch-free
+/// The cross-page form: page i's softmax and page i - 1's PV in one Free plan phase (interleave hint for the back-end Weaver).
+pub fn mla_g1250_qh16_wsp() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsp", false, 1, true)
+}
+
+/// The intra-page form: per page, the rescale of each group of 4 accumulators interleaved with the previous group's PV WMMAs (branch-free
+/// rescale with a select-free row factor; one Free plan phase per page with interleave hints).
+pub fn mla_g1250_qh16_wsi() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsi", false, 1 | 16, false)
+}
+
+pub fn mla_g1250_qh16_wsbm() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
+}
+
+pub fn mla_g1250_qh16_wsbr1() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbr1", false, 2 | 4, false)
+}
+
+pub fn mla_g1250_qh16_wsbrg() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbrg", false, 2 | 8, false)
+}
+
+pub fn mla_g1250_qh16_wsbr() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsbr", false, 2, false)
 }
 
 /// The wave-split MLA with the V dims split as well: wave pair q = w / 2 takes pages q, q + 2, ..; the pair's two waves compute the same
 /// S / softmax and own 256 V dims each (16 accumulators: O fits in 128 VGPRs).
 pub fn mla_g1250_qh16_wsd() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsd", true)
+    mla_ws_with("mla_g1250_qh16_wsd", true, 0, false)
 }
 
-fn mla_ws_with(name: &str, dsplit: bool) -> Function {
+fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function {
+    // bit 4 of `branchless`: the intra-page form (`_wsi`)
+    let intra = branchless & 16 != 0;
+    // bit 0: the mask branch-free; bit 1: the rescale branch-free
+    let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
+    // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
+    let (dbg_one, dbg_gate) = (branchless & 4 != 0, branchless & 8 != 0);
     let ntw: usize = if dsplit { NT / 2 } else { NT };
     let ngrp: i32 = if dsplit { 2 } else { 4 };
     let layout = PageLayout::plan();
@@ -183,18 +223,13 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
         let gen = b.bind_i32(local);
         mine.write(b, gen, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
     };
-    // one page from private slot s (generation `local`): S, online softmax, PV into the O variables
-    let compute = |b: &mut FnBuilder, s: usize, local: amdgpu_dsl::I32| {
-        let gen = b.bind_i32(local.clone());
-        let page = b.bind_i32(local * ngrp + ev(grp));
+    // the pieces of one page (private slot s, generation `local`): S; the softmax (logits, mask, max, P); the O rescale; PV
+    let page_of = |b: &mut FnBuilder, local: amdgpu_dsl::I32| b.bind_i32(local * ngrp + ev(grp));
+    let s_part = |b: &mut FnBuilder, s: usize, gen: ValueId| -> Vec<ValueId> {
         let mine = kw[s].mine(w);
         let sb = b.bind_i32(mine.base());
         let nrow = b.bind_i32(ev(sb) + ev(kofs));
         let rrow = b.bind_i32(ev(sb) + ev(rofs));
-        let vrow = b.bind_i32(ev(sb) + ev(vofs));
-        // S^T tiles j = 0..4 (tokens 16 j + 8 g + r of the page)
-        // valid tokens of this page (>= 64 except on the sequence's last page)
-        let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
         // the 4 S tiles interleaved chunk by chunk: the 4 K fragments of chunk c are read before the 4 WMMAs of chunk c - 1 complete their
         // chains (4 independent accumulators: WMMA latency and LDS latency overlap)
         let svals: Vec<ValueId> = mine.read_back(b, gen, |b| {
@@ -220,6 +255,11 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 })
                 .collect()
         });
+        svals
+    };
+    let soft = |b: &mut FnBuilder, svals: &[ValueId], page: ValueId| -> (ValueId, ValueId, ValueId, ValueId) {
+        // valid tokens of this page (>= 64 except on the sequence's last page)
+        let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
         // logits; the mask (tokens at or beyond ctx) only on a page that reaches past ctx: a uniform branch around VALU only
         let mut x: Vec<ValueId> = Vec::with_capacity(32);
         for j in 0..4 {
@@ -233,8 +273,11 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
         let one = b.c_i32(1);
         let okv0: Vec<ValueId> = (0..32).map(|_| b.cmp(CmpPred::Eq, CmpTy::I32, one, Opnd::I32(1))).collect();
         let okvars = b.declare_vars(&okv0.iter().map(|&v| (DType::I1, Opnd::Val(v))).collect::<Vec<_>>());
+        // the mask: a uniform branch around it (only a page reaching past ctx), or branch-free (select on every page)
         let partial = b.cmp(CmpPred::Lt, CmpTy::I32, tok_lim, Opnd::I32(64));
-        b.begin_if(partial);
+        if !bl_mask {
+            b.begin_if(partial);
+        }
         for j in 0..4 {
             for r in 0..8u8 {
                 let k = 8 * j + r as usize;
@@ -245,7 +288,9 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 b.set_var(okvars[k], Opnd::Val(ok));
             }
         }
-        b.end_if();
+        if !bl_mask {
+            b.end_if();
+        }
         let x: Vec<Opnd> = xv.iter().map(|&v| Opnd::Var(v)).collect();
         let mut mx = b.max_f32(x[0], x[1]);
         for r in 2..32 {
@@ -274,11 +319,26 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
         // the A fragment of P: tile j's 8 values at bytes 8 j .. (tokens 16 j + 8 g + r)
         let parts: Vec<Opnd> = (0..8).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
         let pa = b.frag_cat(&parts);
-        // lazy rescale of O: the alpha of row 8 g + r through the wave's private hop
+        (pa, alpha, m_new, lsum)
+    };
+    let rescale = |b: &mut FnBuilder, alpha: ValueId| {
         let grew = b.cmp(CmpPred::Lt, CmpTy::F32, alpha, Opnd::F32(1.0));
         let any = b.let_(Op::AnyLane(Opnd::Val(grew)));
-        b.begin_if(any);
+        // lazy (only when some head's max grew: a uniform branch) or branch-free (every page)
+        if !bl_rescale {
+            b.begin_if(any);
+        }
         // the alpha of row 8 g + r: lane 8 g + r holds head 8 g + r (v_readlane, then the lane half's choice)
+        let alpha = if dbg_one {
+            b.c_f32(1.0)
+        } else if dbg_gate {
+            let anyf = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(any), a: Opnd::I32(1), b: Opnd::I32(0) });
+            let ab = b.cmp(CmpPred::Ne, CmpTy::I32, anyf, Opnd::I32(0));
+            let one = b.c_f32(1.0);
+            b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ab), a: Opnd::Val(alpha), b: Opnd::Val(one) })
+        } else {
+            alpha
+        };
         let sa: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(alpha, h)).collect();
         let g0c = b.cmp(CmpPred::Eq, CmpTy::I32, g, Opnd::I32(0));
         let al: Vec<ValueId> = (0..8usize)
@@ -293,7 +353,14 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
         }
-        b.end_if();
+        if !bl_rescale {
+            b.end_if();
+        }
+    };
+    let pv = |b: &mut FnBuilder, s: usize, gen: ValueId, pa: ValueId| {
+        let mine = kw[s].mine(w);
+        let sb = b.bind_i32(mine.base());
+        let vrow = b.bind_i32(ev(sb) + ev(vofs));
         // PV: 32 dim tiles, V fragments in groups of 4
         mine.read_back(b, gen, |b| {
             // V fragments one group of 4 tiles ahead of the WMMAs that use them
@@ -317,36 +384,175 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
                 cur = next;
             }
         });
+    };
+    // intra-page form: the alpha of row 8 g + r without an I1 select (al = a0 (1 - g) + a1 g: exact for g in {0, 1}); the rescale of a
+    // group of 4 accumulators and that group's PV WMMAs as units of one Free plan phase (PV the skeleton, the next group's rescale its filler)
+    let rows_of = |b: &mut FnBuilder, alpha: ValueId| -> Vec<ValueId> {
+        let sa: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(alpha, h)).collect();
+        // g in {0, 1} as f32: the bits of 1.0 times g
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gi = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gi);
+        (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa[8 + r])));
+                let t0 = b.mul_f32(a0, hf);
+                let t1 = b.mul_f32(a1, gi);
+                b.add_f32(t0, t1)
+            })
+            .collect()
+    };
+    let pv_intra = |b: &mut FnBuilder, s: usize, gen: ValueId, pa: ValueId, al: &[ValueId], h: usize| {
+        let mine = kw[s].mine(w);
+        let sb = b.bind_i32(mine.base());
+        let vrow = b.bind_i32(ev(sb) + ev(vofs));
+        let mut u = Units::new();
+        let mut pvs = Vec::new();
+        let mut rss = Vec::new();
+        for grp in 0..ntw / 4 {
+            let (rid, _) = u.capture(b, format!("rs{h}.{grp}"), |b| {
+                for k in 0..4 {
+                    for r in 0..8u8 {
+                        b.var_scale_lane(ov[4 * grp + k], r, al[r as usize]);
+                    }
+                }
+            });
+            let (pid, _) = u.capture(b, format!("pv{h}.{grp}"), |b| {
+                mine.read_back(b, gen, |b| {
+                    let fv: Vec<ValueId> = (0..4)
+                        .map(|k| {
+                            let nt = 4 * grp + k;
+                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[jj][nt])).collect();
+                            b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                        })
+                        .collect();
+                    for k in 0..4 {
+                        let o = ov[4 * grp + k];
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv[k], Some(Opnd::Var(o)));
+                        b.set_var(o, Opnd::Val(d));
+                    }
+                });
+            });
+            rss.push(rid);
+            pvs.push(pid);
+        }
+        let mut wv = Weaver::new(u).phase(format!("mla.pv{h}")).free();
+        for gi in 0..pvs.len() {
+            if gi + 1 < rss.len() {
+                wv = wv.interleave(pvs[gi], vec![rss[gi + 1]]);
+            }
+        }
+        wv.emit(b);
+    };
+    // one page, in order: S, softmax, rescale, PV, the running max / sum; the slot's reads complete before the next stage overwrites it
+    let compute = |b: &mut FnBuilder, s: usize, local: amdgpu_dsl::I32| {
+        let gen = b.bind_i32(local.clone());
+        let half = (s & 1) as usize;
+        let page = page_of(b, local);
+        let sv = s_part(b, s, gen);
+        let (pa, alpha, m_new, lsum) = soft(b, &sv, page);
+        if intra {
+            let al = rows_of(b, alpha);
+            pv_intra(b, s, gen, pa, &al, half);
+        } else {
+            rescale(b, alpha);
+            pv(b, s, gen, pa);
+        }
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(lsum));
-        // the slot's reads are done before the next stage overwrites it
         b.wait_lds(0);
     };
-    // the wave's own pages: nw = ceil((npages - w) / 4), in pairs (an odd last pair re-reads the last page, fully masked); a wave without a
-    // page (npages <= w) skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
+    // the wave's own pages: nw = ceil((npages - w) / 4) (the page group's), in pairs (an odd last pair re-reads the last page, fully masked);
+    // a wave without a page skips the loop. The trip count is the wave's own (wave-uniform): no barrier inside the loop needs the waves in step
     let nw = if dsplit { b.bind_i32((ev(npages) - ev(grp) + 1) >> 1) } else { b.bind_i32((ev(npages) - ev(w) + 3) >> 2) };
-    let npairs = b.bind_i32((ev(nw) + 1) >> 1);
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
-    let z = b.c_i32(0);
-    let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
-    let kp2 = pv2[0];
-    b.assume(kp2, Ext::c(0), Ext::c((MAX_PAGES / 8) as i64));
-    let l0 = b.bind_i32(amdgpu_dsl::varx(kp2) * 2);
-    let l1 = b.bind_i32(ev(l0) + 1);
-    let l2 = b.bind_i32(ev(l0) + 2);
-    stage(&mut b, 1, ev(l1));
-    b.wait_tensor(1);
-    compute(&mut b, 0, ev(l0));
-    stage(&mut b, 0, ev(l2));
-    b.wait_tensor(1);
-    compute(&mut b, 1, ev(l1));
-    let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
-    b.set_var(kp2, Opnd::Val(kn));
-    let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
-    b.break_if(fin);
-    b.end_loop();
+    if !pipe {
+        let npairs = b.bind_i32((ev(nw) + 1) >> 1);
+        let z = b.c_i32(0);
+        let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+        let kp2 = pv2[0];
+        b.assume(kp2, Ext::c(0), Ext::c((MAX_PAGES / 8) as i64));
+        let l0 = b.bind_i32(amdgpu_dsl::varx(kp2) * 2);
+        let l1 = b.bind_i32(ev(l0) + 1);
+        let l2 = b.bind_i32(ev(l0) + 2);
+        stage(&mut b, 1, ev(l1));
+        b.wait_tensor(1);
+        compute(&mut b, 0, ev(l0));
+        stage(&mut b, 0, ev(l2));
+        b.wait_tensor(1);
+        compute(&mut b, 1, ev(l1));
+        let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
+        b.set_var(kp2, Opnd::Val(kn));
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
+        b.break_if(fin);
+        b.end_loop();
+    } else {
+        // cross-page form: step i = S(i); [softmax(i) || PV(i - 1)] (one Free plan phase, PV WMMAs the skeleton, the softmax the fillers);
+        // then the stage of page i + 1 into page i - 1's slot, the rescale by alpha(i). P(i) is carried to the next step.
+        b.wait_tensor(0);
+        let g0v = b.c_i32(0);
+        let sv0 = s_part(&mut b, 0, g0v);
+        let pg0 = page_of(&mut b, amdgpu_dsl::I32::c(0));
+        let (pa0, al0, m0, ls0) = soft(&mut b, &sv0, pg0);
+        rescale(&mut b, al0);
+        b.set_var(vm, Opnd::Val(m0));
+        b.set_var(vl, Opnd::Val(ls0));
+        stage(&mut b, 1, amdgpu_dsl::I32::c(1));
+        let z0 = b.c_i32(0);
+        let pv_ = b.declare_vars(&[(WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(pa0)), (DType::I32, Opnd::Val(z0))]);
+        // the carried P, and the generation (local page index) of the last page: a counter stepped by + 2 per loop pass
+        let (pvar, glast) = (pv_[0], pv_[1]);
+        // steps i = 1 .. 2 npairs (page i in slot i % 2); npairs = floor(nw / 2): pages past nw - 1 are masked re-reads
+        let npairs = b.bind_i32(ev(nw) >> 1);
+        let more = b.cmp(CmpPred::Gt, CmpTy::I32, npairs, Opnd::I32(0));
+        b.begin_if(more);
+        let z = b.c_i32(0);
+        let lv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+        let kp2 = lv2[0];
+        b.assume(kp2, Ext::c(0), Ext::c((MAX_PAGES / 8) as i64));
+        for h in 0..2usize {
+            // page i = 2 k + 1 + h in slot s = 1 - h; page i - 1 in slot 1 - s
+            let s = 1 - h;
+            let li = b.bind_i32(amdgpu_dsl::varx(kp2) * 2 + (1 + h as i32));
+            let gi = li;
+            let gp = b.bind_i32(ev(li) - 1);
+            b.wait_tensor(0);
+            let sv = s_part(&mut b, s, gi);
+            let page = page_of(&mut b, ev(li));
+            let pprev = b.let_(Op::FragCat { parts: vec![Opnd::Var(pvar)], dwords: 8 });
+            let mut u = Units::new();
+            let mut skel = Vec::new();
+            let (fid, (pa, alpha, m_new, lsum)) = u.capture(&mut b, format!("softmax{h}"), |b| soft(b, &sv, page));
+            let (pid, _) = u.capture(&mut b, format!("pv{h}"), |b| pv(b, 1 - s, gp, pprev));
+            skel.push(pid);
+            Weaver::new(u).phase(format!("mla.step{h}")).free().interleave(pid, vec![fid]).emit(&mut b);
+            let _ = skel;
+            b.wait_lds(0);
+            let ln = b.bind_i32(ev(li) + 1);
+            stage(&mut b, 1 - s, ev(ln));
+            rescale(&mut b, alpha);
+            b.set_var(vm, Opnd::Val(m_new));
+            b.set_var(vl, Opnd::Val(lsum));
+            b.set_var(pvar, Opnd::Val(pa));
+        }
+        let g2 = b.bind_i32(amdgpu_dsl::varx(glast) + 2);
+        b.set_var(glast, Opnd::Val(g2));
+        let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
+        b.set_var(kp2, Opnd::Val(kn));
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
+        b.break_if(fin);
+        b.end_loop();
+        b.end_if();
+        // the last page's PV: page 2 npairs, in slot (2 npairs) % 2 = 0
+        let gl = b.bind_i32(amdgpu_dsl::varx(glast) + 0);
+        let plast = b.let_(Op::FragCat { parts: vec![Opnd::Var(pvar)], dwords: 8 });
+        pv(&mut b, 0, gl, plast);
+        b.wait_lds(0);
+    }
     b.end_if();
     b.wait_tensor(0);
 
@@ -456,5 +662,80 @@ fn mla_ws_with(name: &str, dsplit: bool) -> Function {
     let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
     let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
     b.store_global(pl, 0, lse, MemTy::B32, false);
+    b.finish()
+}
+
+/// Minimal repro for the branch-free rescale: `nv` loop-carried Frag8 accumulators; per iteration each is scaled in place per row
+/// (`var_scale_lane`, alpha[r] = in[(i * 8 + r) * 32 + lane]), unconditionally or under `any_lane(alpha < 1)` (`branch`), then accumulated
+/// in place by a WMMA of fp8 ones x twos (+128 per element). Output out[(v * 8 + r) * 32 + lane]. Host: `g1250_probe_host varscale`.
+pub fn probe_g1250_varscale(name: &str, nv: usize, branch: bool) -> Function {
+    let mut b = FnBuilder::new(name, 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg("inp", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    b.arg_tensor("out", Ext::c((nv * 8 * 32 * 4) as i64));
+    // the host allocates the input for the 64 iterations the loop counter is bounded by
+    b.arg_tensor("inp", Ext::c(64 * 8 * 32 * 4));
+    b.ka_range(16, 1, 64);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let pi = b.let_(Op::KernargPtr { offset: 8 });
+    let n = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let ones = b.c_i32(0x3838_3838);
+    let fa = b.frag_cat(&[Opnd::Val(ones); 8]);
+    // B = fp8 2.0 (distinct registers from A): +128 per element per WMMA
+    let twos = b.c_i32(0x4040_4040);
+    let fb = b.frag_cat(&[Opnd::Val(twos); 8]);
+    let mut inits = Vec::new();
+    for _ in 0..nv {
+        let z = b.frag_cat(&[Opnd::I32(0); 8]);
+        inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
+    }
+    let ov = b.declare_vars(&inits);
+    let z = b.c_i32(0);
+    let lv = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+    let i = lv[0];
+    b.assume(i, Ext::c(0), Ext::c(63));
+    let al: Vec<ValueId> = (0..8)
+        .map(|r| {
+            let off = b.bind_i32(((amdgpu_dsl::varx(i) * 8 + r) * 32 + ev(tid)) * 4);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pi), byte_off: Opnd::Val(off) });
+            let v = b.load_global(pa, 0, MemTy::B32);
+            f32_of(&mut b, v)
+        })
+        .collect();
+    if branch {
+        let lt = b.cmp(CmpPred::Lt, CmpTy::F32, al[0], Opnd::F32(1.0));
+        let any = b.let_(Op::AnyLane(Opnd::Val(lt)));
+        let one = b.c_i32(1);
+        let anyb = b.cmp(CmpPred::Eq, CmpTy::I32, one, Opnd::I32(1));
+        let _ = (any, anyb);
+        b.begin_if(any);
+    }
+    for v in 0..nv {
+        for r in 0..8u8 {
+            b.var_scale_lane(ov[v], r, al[r as usize]);
+        }
+    }
+    if branch {
+        b.end_if();
+    }
+    for v in 0..nv {
+        let d = b.wmma(WmmaKind::Fp8_16x16x64, fa, fb, Some(Opnd::Var(ov[v])));
+        b.set_var(ov[v], Opnd::Val(d));
+    }
+    let i1 = b.bind_i32(amdgpu_dsl::varx(i) + 1);
+    b.set_var(i, Opnd::Val(i1));
+    let fin = b.cmp(CmpPred::Ge, CmpTy::I32, i1, n);
+    b.break_if(fin);
+    b.end_loop();
+    for v in 0..nv {
+        for r in 0..8u8 {
+            let e = b.frag_slice(Opnd::Var(ov[v]), r, 1);
+            let off = b.bind_i32(((v as i32 * 8 + r as i32) * 32 + ev(tid)) * 4);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(off) });
+            b.store_global(pa, 0, e, MemTy::B32, false);
+        }
+    }
     b.finish()
 }
