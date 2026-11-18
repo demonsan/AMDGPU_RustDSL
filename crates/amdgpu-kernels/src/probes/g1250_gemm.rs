@@ -463,6 +463,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_swz(name: &str, relax: bool, roles: bo
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, swizzle, ..RingOpts::default() })
 }
 
+/// The best 256 x 256 kernel on a persistent grid (host PERSIST=G): no cross-tile overlap (the LDS-staged epilogue uses the whole LDS), only the tile loop.
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_persist(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
+}
+
 /// The padded 256 x 256 kernel with the TDM-store epilogue in a cluster of `cx` x `cy` workgroups, lockstep (one cluster barrier per K tile).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_cluster(name: &str, cx: i32, cy: i32) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { epilogue_lds: 2, ..RingOpts::default() })
