@@ -26,7 +26,8 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
-    mla_ws_with(MLA_WS_NAME, false, 0, false)
+    // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
+    mla_ws_with(MLA_WS_NAME, false, 64 | 256, false)
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
