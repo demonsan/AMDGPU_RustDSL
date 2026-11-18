@@ -3,7 +3,7 @@
 # va_vdst / vm_vsrc); every kernel's own host checks the results; 5 rounds under contention. Never on GPU 3.
 set -u
 cd "$SRC"
-O="$W/mode2"; rm -rf "$O"; mkdir -p "$O"
+O="$W/mode2"; export MODE=${MODE:-2}; rm -rf "$O"; mkdir -p "$O"
 echo RUNNING > "$O/STATUS"
 [ -z "${IDLE_GPU:-}" ] && { echo NOGPU > "$O/STATUS"; echo "NO-IDLE-GPU"; exit 251; }
 [ "${IDLE_GPU:-none}" = "3" ] && { echo "REFUSE: GPU 3"; exit 9; }
@@ -12,7 +12,7 @@ A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
 for k in probe_g1250_add probe_g1250_buffer probe_g1250_named probe_g1250_tdm_ring gemm_g1250_tdm_stage_f4; do
   AMDC_MODE2_SITES=1 $A emit $k --target gfx1250 --backend=own --out $O/$k.s 2> $O/$k.sites || { echo "EMIT-FAIL $k"; exit 4; }
   grep MODE2 $O/$k.sites | sed "s/^/$k: /"
-  awk '{print} /global_prefetch_b8 v0, s\[6:7\] scope:SCOPE_SE/ && !done {print "    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2"; done=1}' $O/$k.s > $O/$k.m2.s
+  awk '{print} /global_prefetch_b8 v0, s\[6:7\] scope:SCOPE_SE/ && !done {print "    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), " ENVIRON["MODE"]; done=1}' $O/$k.s > $O/$k.m2.s
   grep -c HW_REG_WAVE_SCHED_MODE $O/$k.m2.s | grep -q 1 || { echo "INJECT-FAIL $k"; exit 7; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.m2.s || { echo "ASM-FAIL $k"; exit 5; }
 done
