@@ -1024,6 +1024,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TRAP-BAR", "trap_bar"),
     ("GV-1250-BAR-REACH", "bar_reach"),
     ("GV-1250-TDM-DESC", "tdm_desc"),
+    ("GV-1250-TDM-STORE-PAD", "tdm_store_pad"),
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
