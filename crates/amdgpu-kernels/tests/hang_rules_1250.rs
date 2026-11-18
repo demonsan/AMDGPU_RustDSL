@@ -848,6 +848,17 @@ fn mut_tdm_drain() {
 }
 
 #[test]
+fn mut_getreg_idle() {
+    asm_mutation("k:\n    s_getreg_b32 s4, hwreg(HW_REG_STATE_PRIV, 0, 32)\n    s_endpgm\n", "GV-1250-GETREG-IDLE");
+    asm_mutation("k:\n    s_mov_b32 s5, 0\n    s_getreg_b32 s4, hwreg(17, 0, 32)\n    s_endpgm\n", "GV-1250-GETREG-IDLE");   // EXCP_FLAG_PRIV by id, an instruction in between
+}
+
+#[test]
+fn pos_getreg_idle() {
+    asm_positive("k:\n    s_wait_idle\n    s_getreg_b32 s4, hwreg(HW_REG_STATE_PRIV, 0, 32)\n    s_wait_alu 0x0\n    s_getreg_b32 s5, hwreg(2, 0, 32)\n    s_getreg_b32 s6, hwreg(HW_REG_MODE, 0, 32)\n    s_endpgm\n");   // MODE needs no wait
+}
+
+#[test]
 fn mut_wait_range() {
     asm_mutation("k:\n    s_wait_asynccnt 0x48\n    s_endpgm\n", "GV-1250-WAIT-RANGE");   // 72 > 63: the 6-bit field truncates it to 8
     asm_mutation("k:\n    s_wait_tensorcnt 0x40\n    s_endpgm\n", "GV-1250-WAIT-RANGE");
@@ -1020,6 +1031,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-MCAST", "mcast"),
     ("GV-1250-MCAST-REQ", "mcast_req"),
     ("GV-1250-WAIT-RANGE", "wait_range"),
+    ("GV-1250-GETREG-IDLE", "getreg_idle"),
     ("GV-1250-BAR-ID", "bar_id"),
     ("GV-1250-NBAR-COUNT", "nbar_count"),
     ("GV-1250-BAR-JOIN", "bar_join"),
