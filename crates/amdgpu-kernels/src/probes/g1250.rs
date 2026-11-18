@@ -432,7 +432,12 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     let o = b.let_(Op::AddI32(Opnd::Val(g), Opnd::Val(a)));
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
     b.store_global(q, 0, acc, MemTy::B32, false);
-    b.finish()
+    let mut f = b.finish();
+    if bytes > 65536 {
+        // this probe IS the evidence run for LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
+        f.kd.push(("g5:lds_above_64k".into(), 1));
+    }
+    f
 }
 
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
@@ -458,6 +463,43 @@ pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
         let ga = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * j)));
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(ga) });
         b.store_global(q, 0, x, MemTy::B32, false);
+    }
+    let mut f = b.finish();
+    // an evidence run for TDM / LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
+    f.kd.push(("g5:lds_above_64k".into(), 1));
+    f
+}
+
+/// TRANS co-execution (hardware evidence for the gfx1250 TRANS -> VALU rule): per lane, 8 independent chains x 16 steps; each step is a
+/// TRANS op (rsq / sqrt / sin / cos rotating) whose result the next VALU (add / mul / fma / pk_add pattern) reads right away, so the
+/// compiled code has a TRANS directly followed by its reader at many sites (the emitter puts one v_nop there; the test removes them in a
+/// copy and compares bit for bit). out[tid * 8 + c] = chain c. 512 work-items. Kernargs: out @0.
+pub fn probe_g1250_trans() -> Function {
+    use amdgpu_dsl::UnOp;
+    let mut b = FnBuilder::new("probe_g1250_trans", 512);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(512 * 8 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let tf = b.un(UnOp::CvtF32I32, tid);
+    let ops = [UnOp::RsqF32, UnOp::SqrtF32, UnOp::SinF32, UnOp::CosF32, UnOp::SqrtF32];
+    let mut ch: Vec<ValueId> = (0..8).map(|c| b.add_f32(tf, Opnd::F32(1.5 + c as f32 * 0.37))).collect();
+    for s in 0..16 {
+        for c in 0..8 {
+            let x = ch[c];
+            // keep the arguments in a safe range: |x| small and positive before the transcendental
+            let xa = b.mul_f32(x, Opnd::F32(0.001));
+            let xa = b.add_f32(xa, Opnd::F32(1.25));
+            let tr = b.un(ops[(s + c) % ops.len()], xa);
+            let y = if (s + c) % 2 == 0 { b.add_f32(tr, x) } else { b.mul_f32(tr, Opnd::F32(1.0001)) };
+            ch[c] = y;
+        }
+    }
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(5)));
+    for c in 0..8 {
+        let o = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * c as i32)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+        b.store_global(q, 0, ch[c], MemTy::B32, false);
     }
     b.finish()
 }

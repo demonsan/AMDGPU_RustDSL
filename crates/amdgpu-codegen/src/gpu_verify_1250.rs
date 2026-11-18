@@ -19,7 +19,7 @@ use crate::fxhash::FxMap as HashMap;
 use crate::fxhash::FxSet as HashSet;
 use crate::mir::MFunction;
 use crate::regalloc::Alloc;
-use amdgpu_dsl::{Function, Op, Opnd, Stmt, ValueId, VarId};
+use amdgpu_dsl::{Function, Op, Opnd, Stmt, ValueId, VarId, CmpPred, CmpTy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
@@ -44,6 +44,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
     Rule { id: "GV-1250-BAR-INIT", layer: Layer::Ir, what: "a named barrier is initialized before it is used, and a work-group barrier orders the initialization before the first use (a re-initialization after another wave signalled loses the count)" },
     Rule { id: "GV-1250-BAR-COUNT", layer: Layer::Ir, what: "the cluster barrier is signalled by exactly one wave per work-group per phase: proved statically when the signalling condition is a function of the wave id, otherwise an explicit, named launch fact that is listed as a trusted item (never an implicit pass)" },
+    Rule { id: "GV-1250-LDS-64K", layer: Layer::Ir, what: "a kernel that declares more than 64 KiB of LDS names, as a trusted launch fact, the hardware evidence for LDS above 64 KiB (an interim guard: configurations above it have produced a hung device and wrong data, cause open)" },
     Rule { id: "GV-1250-BAR-WAIT-IMM", layer: Layer::Asm, what: "the operand of a barrier wait is an inline constant" },
     Rule { id: "GV-1250-TRAP-BAR", layer: Layer::Ir, what: "the barriers reserved for the trap handler are not used by kernels" },
     Rule { id: "GV-1250-BAR-REACH", layer: Layer::Ir, what: "every barrier is reached by every wave of its group: no barrier under wave-divergent control flow with unequal arrivals, none in a loop with a wave-divergent exit, no wait without a signal" },
@@ -277,6 +278,116 @@ fn group_words(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Option<u32>> {
     match defs.get(v) {
         Some(Op::RsrcCat { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
         Some(Op::SgprCat8 { words }) => words.iter().map(|w| const_of(w, defs).map(|c| c as u32)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The range [lo, hi] a value can take over every work-item and every execution, when it is built from constants, the work-item id (`wg` work-items), wave-uniform reads of it and the ring slot
+/// the surrounding marker names (`slot`: the operand and the number of slots); `None` when not bounded. Interval arithmetic; variables are bounded only by their single non-recursive assignment.
+fn range_i(o: &Opnd, cx: &EvCtx, wg: i64, slot: Option<(&Opnd, i64)>, depth: u32) -> Option<(i64, i64)> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some((so, n)) = slot {
+        if so == o && !matches!(o, Opnd::I32(_)) {
+            return Some((0, n - 1));
+        }
+    }
+    let go = |x: &Opnd| range_i(x, cx, wg, slot, depth + 1);
+    let corners = |a: (i64, i64), b: (i64, i64), f: &dyn Fn(i64, i64) -> i64| -> (i64, i64) {
+        let c = [f(a.0, b.0), f(a.0, b.1), f(a.1, b.0), f(a.1, b.1)];
+        (*c.iter().min().unwrap(), *c.iter().max().unwrap())
+    };
+    match o {
+        Opnd::I32(c) => Some((*c as i64, *c as i64)),
+        Opnd::Var(v) => {
+            let asg = cx.vars.get(v)?;
+            let mut r: Option<(i64, i64)> = None;
+            for a in asg {
+                if matches!(a, Opnd::Val(u) if matches!(cx.defs.get(u), Some(Op::Undef { .. }))) {
+                    continue;
+                }
+                let x = go(a)?;
+                r = Some(match r {
+                    None => x,
+                    Some(y) => (x.0.min(y.0), x.1.max(y.1)),
+                });
+            }
+            r
+        }
+        Opnd::Val(v) => match cx.defs.get(v)? {
+            Op::ConstI32(c) => Some((*c as i64, *c as i64)),
+            Op::WorkitemId => Some((0, wg - 1)),
+            Op::ReadFirstLane(x) | Op::MovS { a: x, .. } | Op::MovV { a: x, .. } => go(x),
+            Op::AddI32(a, b) => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0 + y.0, x.1 + y.1))
+            }
+            Op::MulI32(a, b) => Some(corners(go(a)?, go(b)?, &|p, q| p * q)),
+            Op::ShlI32(a, Opnd::I32(k)) if (0..31).contains(k) => {
+                let x = go(a)?;
+                Some((x.0 << k, x.1 << k))
+            }
+            Op::LshrI32(a, Opnd::I32(k)) if (0..32).contains(k) => {
+                let x = go(a)?;
+                if x.0 < 0 {
+                    return None;
+                }
+                Some((x.0 >> k, x.1 >> k))
+            }
+            Op::AndI32(a, Opnd::I32(m)) | Op::AndI32(Opnd::I32(m), a) if *m >= 0 => {
+                let x = go(a)?;
+                if x.0 >= 0 && x.1 <= *m as i64 {
+                    Some(x)
+                } else {
+                    Some((0, *m as i64))
+                }
+            }
+            Op::Select { a, b, .. } => {
+                let (x, y) = (go(a)?, go(b)?);
+                Some((x.0.min(y.0), x.1.max(y.1)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// GV-1250-TDM-DESC, the LDS extent: a tensor operation's LDS tile (`lds_addr` .. + the tile's bytes) lies inside the LDS the kernel declares and, inside a ring marker, inside the ring the marker
+/// names (every slot the marker's slot operand can take). A destination the hardware silently drops or wraps is a protocol that waits for data that never arrives, or a read of garbage.
+fn lds_extent_check(f: &Function, cx: &EvCtx, marker: Option<(&str, &Opnd)>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
+    let w0 = group_words_ops(cx.defs, g0);
+    let w1 = group_words(cx.defs, g1);
+    let (Some(lds), true) = (w0.get(1), w1.len() == 8) else { return };
+    let (Some(Some(a0)), Some(Some(a3)), Some(Some(a4))) = (w1.first(), w1.get(3), w1.get(4)) else { return };
+    if a0 >> 20 & 1 != 0 {
+        return;   // padded: the footprint is larger than the tile (not modelled)
+    }
+    let esize = 1i64 << (a0 >> 16 & 3);
+    let (t0, t1, t2) = ((a3 >> 16) as i64, (a4 & 0xffff) as i64, (a4 >> 16) as i64);
+    let bytes = t0 * t1.max(1) * t2.max(1) * esize;
+    if t0 == 0 {
+        return;
+    }
+    let decl = marker.and_then(|(name, _)| f.contract.tiles.iter().find(|t| t.name == name));
+    let slot = marker.zip(decl).map(|((_, so), d)| (so, d.slots as i64));
+    let Some((lo, hi)) = range_i(lds, cx, f.workgroup_size as i64, slot, 0) else { return };
+    if f.lds_bytes > 0 && hi + bytes > f.lds_bytes as i64 {
+        viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can end beyond the {} bytes of LDS the kernel declares: an address at or beyond the allocation is silently dropped", f.lds_bytes));
+    }
+    if let Some(d) = decl {
+        let (rlo, rhi) = (d.base, d.base + d.slot_size * d.slots as i64);
+        if lo < rlo || hi + bytes > rhi {
+            viol(v, "GV-1250-TDM-DESC", format!("statement {pos}: the LDS tile [{lo}.. {hi}] + {bytes} bytes can lie outside the ring `{}` ({rlo}..{rhi}) the marker names", d.name));
+        }
+    }
+}
+
+/// The compile-time-known words of a descriptor group as operands (group 0: the LDS address word may be a computed value).
+fn group_words_ops(defs: &HashMap<ValueId, Op>, o: &Opnd) -> Vec<Opnd> {
+    let Opnd::Val(v) = o else { return Vec::new() };
+    match defs.get(v) {
+        Some(Op::RsrcCat { words }) => words.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -902,81 +1013,399 @@ fn eval_wave(o: &Opnd, cx: &EvCtx, w: i32) -> Option<i64> {
     }
 }
 
-/// One region's cluster-barrier accounting over every resolution of the wave-uniform conditions the verifier cannot evaluate.
-#[derive(Debug)]
-struct CountItem {
-    region: usize,
-    id: i32,
-    /// None: not provable (a path depends on something wave-divergent the verifier cannot evaluate, or too many resolutions). Some: for every resolution, (signals per work-group, waits per wave).
-    worlds: Option<Vec<(i64, i64)>>,
-    /// when `worlds` is None: the statement whose condition stopped the proof
-    why: String,
+/// The result of the cluster-barrier proof.
+#[derive(Debug, Default)]
+struct AltResult {
+    /// not provable: a path depends on a wave-divergent condition the verifier cannot evaluate (the named launch fact is then required)
+    unknown: Option<String>,
+    violations: Vec<String>,
+    /// the waves that do not signal wait in loops the signalling wave's path does not contain: the proof needs the trip counts to agree, which is a named launch fact
+    needs_trip_fact: Option<String>,
 }
 
-/// The most resolutions of unknown uniform conditions the verifier enumerates.
-const MAX_WORLDS: usize = 4096;
+/// The control-flow successors of statement `i` for wave `w`: a condition the verifier can evaluate for the wave is decided; a wave-UNIFORM one it cannot evaluate takes both sides (every wave
+/// takes the same side at run time, the proof must hold for either); a wave-divergent one it cannot evaluate: `Err(i)`.
+fn wave_succs(stmts: &[Stmt], sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) -> bool, w: i32, i: usize) -> Result<Vec<usize>, usize> {
+    let decide = |cond: &Opnd| -> Result<Option<bool>, usize> {
+        match eval_wave(cond, cx, w) {
+            Some(v) => Ok(Some(v != 0)),
+            None if uniform(cond) => Ok(None),
+            None => Err(i),
+        }
+    };
+    let mut next: Vec<usize> = Vec::new();
+    match &stmts[i] {
+        Stmt::BeginIf { cond } => {
+            let &(e, end) = sh.if_else.get(&i).ok_or(i)?;
+            let els = match e {
+                Some(e) => e + 1,
+                None => end,
+            };
+            match decide(cond)? {
+                Some(true) => next.push(i + 1),
+                Some(false) => next.push(els),
+                None => next.extend([i + 1, els]),
+            }
+        }
+        Stmt::GotoIf { cond, key } => {
+            let tgt = *sh.key_pos.get(key).ok_or(i)?;
+            match decide(cond)? {
+                Some(true) => next.push(tgt),
+                Some(false) => next.push(i + 1),
+                None => next.extend([i + 1, tgt]),
+            }
+        }
+        _ => next = succs(stmts, sh, i),
+    }
+    Ok(next)
+}
 
-/// The statements wave `w` reaches, deciding every branch / goto condition for that wave: a condition the verifier can evaluate is decided; a wave-UNIFORM condition it cannot evaluate takes the
-/// value of `assign` (every wave takes the same side; `Err(stmt)` asks the caller to assign it); a wave-divergent one it cannot evaluate: `Err(usize::MAX)`. Loops are entered and left (a loop
-/// exit is not decided: statements after the loop are reached when the loop is).
-fn wave_reach(f: &Function, sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) -> bool, rel: &[u32], assign: &HashMap<usize, bool>, w: i32) -> Result<Vec<bool>, (usize, bool)> {
-    let stmts = f.stmts();
-    let n = stmts.len();
-    let mut reach = vec![false; n + 1];
-    let mut work = vec![0usize];
-    reach[0] = true;
-    while let Some(i) = work.pop() {
-        if i >= n {
-            continue;
+// ---- trip counts: a small scalar-evolution proof that two loops wait on a barrier equally often --------------------------------------------------------------------------------
+
+/// Where a variable's value comes from at a statement along one wave's paths.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rd {
+    Unset,
+    At(usize),
+    Multi,
+}
+
+/// A loop's wait count as a function of its entry value, step, bound and exit phases (see `loop_sig`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TripSig {
+    ty: CmpTy,
+    /// canonical symbolic entry value of the counter + the exits' effective offsets: the first pass reaches the wait when `c0 + mb + 0 * step < bound`, a later pass `j` when
+    /// `c0 + eff + j * step < bound`
+    c0: String,
+    mb: i64,
+    eff: i64,
+    step: i64,
+    bound: String,
+}
+
+struct Scev<'a> {
+    stmts: &'a [Stmt],
+    sh: &'a Shape,
+    cx: &'a EvCtx<'a>,
+    uniform: &'a dyn Fn(&Opnd) -> bool,
+    defpos: HashMap<ValueId, usize>,
+    cache: std::cell::RefCell<HashMap<(i32, VarId), Vec<Rd>>>,
+}
+
+fn assigned_value(st: &Stmt, v: VarId) -> Option<Opnd> {
+    match st {
+        Stmt::SetVar { var, value } if *var == v => Some(*value),
+        Stmt::DeclareVars { vars, init } | Stmt::BeginLoop { vars, init } => vars.iter().position(|x| *x == v).and_then(|k| init.get(k).copied()),
+        _ => None,
+    }
+}
+
+/// The operand-erased text of an op (its operands' text replaced by `#k`, k = the operand's index among the distinct operands) and those operands.
+fn op_key(op: &Op) -> (String, Vec<Opnd>) {
+    let mut text = format!("{op:?}");
+    let mut ops: Vec<Opnd> = Vec::new();
+    for o in op.operands() {
+        if !ops.contains(&o) {
+            ops.push(o);
         }
-        // the statements the two sides of the branch at `i` differ by: (from, to); a uniform condition the verifier cannot evaluate is only enumerated when a relevant statement
-        // (a signal / wait of the barrier being counted) lies there, otherwise both sides count alike and the fall-through side is taken
-        let differ = |from: usize, to: usize| rel[to.min(rel.len() - 1)] > rel[from.min(rel.len() - 1)];
-        let decide = |cond: &Opnd, lo: usize, hi: usize, dflt: bool| -> Result<bool, (usize, bool)> {
-            match eval_wave(cond, cx, w) {
-                Some(v) => Ok(v != 0),
-                None if !uniform(cond) => Err((i, true)),
-                None if !differ(lo, hi) => Ok(dflt),
-                None => assign.get(&i).copied().ok_or((i, false)),
+    }
+    for (k, o) in ops.iter().enumerate() {
+        text = text.replace(&format!("{o:?}"), &format!("#{k}"));
+    }
+    (text, ops)
+}
+
+impl Scev<'_> {
+    fn reaching(&self, w: i32, v: VarId, at: usize) -> Rd {
+        let n = self.stmts.len();
+        if let Some(c) = self.cache.borrow().get(&(w, v)) {
+            return c[at];
+        }
+        // forward dataflow of the definition of `v` over the wave's paths (None = not reached)
+        let mut st: Vec<Option<Rd>> = vec![None; n + 1];
+        st[0] = Some(Rd::Unset);
+        let mut work = vec![0usize];
+        while let Some(i) = work.pop() {
+            if i >= n {
+                continue;
             }
-        };
-        let mut next: Vec<usize> = Vec::new();
-        match &stmts[i] {
-            Stmt::BeginIf { cond } => {
-                let &(e, end) = sh.if_else.get(&i).ok_or((i, true))?;
-                let v = decide(cond, i, end, true)?;
-                if v {
-                    next.push(i + 1);
-                } else {
-                    next.push(match e {
-                        Some(e) => e + 1,
-                        None => end,
-                    });
+            let cur = st[i].unwrap();
+            let out = if assigned_value(&self.stmts[i], v).is_some() { Rd::At(i) } else { cur };
+            let next = match wave_succs(self.stmts, self.sh, self.cx, self.uniform, w, i) {
+                Ok(x) => x,
+                Err(_) => {
+                    self.cache.borrow_mut().insert((w, v), vec![Rd::Multi; n + 1]);
+                    return Rd::Multi;
+                }
+            };
+            for t in next {
+                if t > n {
+                    continue;
+                }
+                let j = match st[t] {
+                    None => out,
+                    Some(o) if o == out => o,
+                    Some(_) => Rd::Multi,
+                };
+                if st[t] != Some(j) {
+                    st[t] = Some(j);
+                    work.push(t);
                 }
             }
-            Stmt::GotoIf { cond, key } => {
-                let tgt = *sh.key_pos.get(key).ok_or((i, true))?;
-                let v = decide(cond, i, tgt, false)?;
-                if v {
-                    next.push(*sh.key_pos.get(key).ok_or((i, true))?);
-                } else {
-                    next.push(i + 1);
-                }
-            }
-            _ => next = succs(stmts, sh, i),
         }
-        for t in next {
-            if t <= n && !reach[t] {
-                reach[t] = true;
-                work.push(t);
+        let v_: Vec<Rd> = st.into_iter().map(|x| x.unwrap_or(Rd::Unset)).collect();
+        let r = v_[at];
+        self.cache.borrow_mut().insert((w, v), v_);
+        r
+    }
+
+    /// Canonical symbolic text of an operand read at statement `at` by wave `w`; None when a variable's definition is not unique.
+    fn expand(&self, w: i32, o: &Opnd, at: usize, depth: u32) -> Option<String> {
+        if depth > 40 {
+            return None;
+        }
+        match o {
+            Opnd::I32(c) => Some(c.to_string()),
+            Opnd::F32(x) => Some(format!("f{}", x.to_bits())),
+            Opnd::Var(v) => match self.reaching(w, *v, at) {
+                Rd::At(s) => {
+                    let val = assigned_value(&self.stmts[s], *v)?;
+                    self.expand(w, &val, s, depth + 1)
+                }
+                Rd::Unset => Some(format!("undef{}", v.0)),
+                Rd::Multi => None,
+            },
+            Opnd::Val(x) => {
+                let op = self.cx.defs.get(x)?;
+                let d = *self.defpos.get(x)?;
+                let (text, ops) = op_key(op);
+                let mut kids = Vec::new();
+                for k in &ops {
+                    kids.push(self.expand(w, k, d, depth + 1)?);
+                }
+                Some(format!("{text}[{}]", kids.join(",")))
             }
         }
     }
-    Ok(reach)
+
+    /// `base + k` form of an operand read at `at`: constants and `x + const` chains are folded.
+    fn affine(&self, w: i32, o: &Opnd, at: usize, depth: u32) -> Option<(String, i64)> {
+        if depth > 16 {
+            return None;
+        }
+        match o {
+            Opnd::I32(c) => Some((String::new(), *c as i64)),
+            Opnd::Val(x) => match self.cx.defs.get(x)? {
+                Op::AddK { a, k } => {
+                    let d = *self.defpos.get(x)?;
+                    let (b, c) = self.affine(w, a, d, depth + 1)?;
+                    Some((b, c + *k as i64))
+                }
+                Op::AddI32(a, Opnd::I32(k)) | Op::AddI32(Opnd::I32(k), a) => {
+                    let d = *self.defpos.get(x)?;
+                    let (b, c) = self.affine(w, a, d, depth + 1)?;
+                    Some((b, c + *k as i64))
+                }
+                _ => Some((self.expand(w, o, at, 0)?, 0)),
+            },
+            _ => Some((self.expand(w, o, at, 0)?, 0)),
+        }
+    }
 }
 
-fn count_items(f: &Function) -> Vec<CountItem> {
+/// The signature of loop `(begin, end)` for wave `w`: when does the pass reach the (single, top-level) `-3` wait.
+/// Every exit of the loop is `BreakIf` of `a >= bound` (the continue test `a < bound`), `a` = the counter `c` (or `c + k` read at a statement before / after the counter's single, top-level,
+/// constant-step update, which fixes its phase), the bound loop-invariant. With offsets `off_i = k_i + phase_i` the pass `j` reaches the wait iff `c0 + j * step + max(off_i of the exits before the wait)
+/// < bound` and (j >= 1) the previous pass's exits all continued: `c0 + (j - 1) * step + max(off_i of all exits) < bound`: two loops with the same (type, c0, step, bound, max-before, effective
+/// offset) wait equally often.
+fn loop_sig(sc: &Scev, w: i32, begin: usize, end: usize) -> Result<TripSig, String> {
+    macro_rules! t {
+        ($e:expr, $m:expr) => {
+            match $e {
+                Some(x) => x,
+                None => return Err($m.to_string()),
+            }
+        };
+    }
+    let stmts = sc.stmts;
+    // statements of this loop proper (not of nested loops), with their nesting depth of ifs
+    let mut own: Vec<(usize, u32)> = Vec::new();
+    let (mut nest_loop, mut depth_if) = (0u32, 0u32);
+    for i in begin + 1..end {
+        match &stmts[i] {
+            Stmt::BeginLoop { .. } => nest_loop += 1,
+            Stmt::EndLoop => nest_loop = nest_loop.saturating_sub(1),
+            Stmt::BeginIf { .. } if nest_loop == 0 => depth_if += 1,
+            Stmt::EndIf if nest_loop == 0 => depth_if = depth_if.saturating_sub(1),
+            _ => {}
+        }
+        if nest_loop == 0 {
+            own.push((i, depth_if));
+        }
+    }
+    // the single top-level wait
+    let waits: Vec<usize> = own.iter().filter(|(i, d)| matches!(stmts[*i], Stmt::BarrierWait { id: -3 }) && *d == 0).map(|(i, _)| *i).collect();
+    let all_waits = (begin + 1..end).filter(|&i| matches!(stmts[i], Stmt::BarrierWait { id: -3 })).count();
+    if waits.len() != 1 || all_waits != 1 {
+        return Err(format!("the loop at statement {begin} has {all_waits} wait(s) on -3, {} at its top level (one is required)", waits.len()));
+    }
+    let pw = waits[0];
+    // the exits: `if cond { BreakIf cond }` (the cond a value the loop computed), cond = not(a < bound) | a >= bound
+    let mut exits: Vec<(usize, Opnd, Opnd, CmpTy, usize)> = Vec::new();   // (BreakIf position, a, bound, ty, the compare's def position)
+    for &(i, _) in &own {
+        if let Stmt::BreakIf { cond: Opnd::Val(cv) } = &stmts[i] {
+            let (cmp, neg) = match t!(sc.cx.defs.get(cv), "exit condition without a definition") {
+                Op::NotI1(Opnd::Val(y)) => (t!(sc.cx.defs.get(y), "exit compare without a definition"), *y),
+                other => (other, *cv),
+            };
+            let cpos = t!(sc.defpos.get(&neg), "exit compare without a position").to_owned();
+            match cmp {
+                Op::Cmp { pred: CmpPred::Lt, ty, a, b } if matches!(sc.cx.defs.get(cv), Some(Op::NotI1(_))) => exits.push((i, *a, *b, *ty, cpos)),
+                Op::Cmp { pred: CmpPred::Ge, ty, a, b } if !matches!(sc.cx.defs.get(cv), Some(Op::NotI1(_))) => exits.push((i, *a, *b, *ty, cpos)),
+                other => return Err(format!("the loop at statement {begin}: an exit at statement {i} is not `a < bound` / `a >= bound` ({:.80?})", other)),
+            }
+        }
+    }
+    if exits.is_empty() {
+        return Err(format!("the loop at statement {begin} has no exit test"));
+    }
+    // the counter: the variable under every exit's `a`
+    let counter_of = |a: &Opnd, at: usize| -> Option<(VarId, i64, usize)> {
+        // (var, k, the position the variable was read at)
+        match a {
+            Opnd::Var(c) => Some((*c, 0, at)),
+            Opnd::Val(x) => match sc.cx.defs.get(x)? {
+                Op::AddK { a: Opnd::Var(c), k } => Some((*c, *k as i64, *sc.defpos.get(x)?)),
+                Op::AddI32(Opnd::Var(c), Opnd::I32(k)) => Some((*c, *k as i64, *sc.defpos.get(x)?)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let (c, _, _) = t!(counter_of(&exits[0].1, exits[0].4), format!("the loop at statement {begin}: the exit compares {:?}, which is not a counter (or counter + constant)", exits[0].1));
+    // the counter's updates, all at the top level of the body, each `c := c + constant` (the value computed from `c` after the previous update, no other update in between): the pass's total step is
+    // their sum, and a read at a position sees the increments of the updates before it (its phase)
+    let upd: Vec<usize> = (begin + 1..end).filter(|&i| matches!(&stmts[i], Stmt::SetVar { var, .. } if *var == c)).collect();
+    if upd.is_empty() {
+        return Err(format!("the loop at statement {begin}: its counter is never updated in the body"));
+    }
+    let mut incs: Vec<(usize, i64)> = Vec::new();   // (position, increment)
+    for &up in &upd {
+        if !own.iter().any(|(i, d)| *i == up && *d == 0) {
+            return Err(format!("the loop at statement {begin}: a counter update at statement {up} is not at the top level of the body"));
+        }
+        let (y, inc) = match &stmts[up] {
+            Stmt::SetVar { value: Opnd::Val(y), .. } => match t!(sc.cx.defs.get(y), "update without a definition") {
+                Op::AddK { a: Opnd::Var(cc), k } if *cc == c => (*y, *k as i64),
+                Op::AddI32(Opnd::Var(cc), Opnd::I32(k)) if *cc == c => (*y, *k as i64),
+                other => return Err(format!("the loop at statement {begin}: the counter update at statement {up} is not `c + constant` ({:.80?})", other)),
+            },
+            _ => return Err(format!("the loop at statement {begin}: the counter update at statement {up} is not `c + constant`")),
+        };
+        let dy = t!(sc.defpos.get(&y), "update value without a position").to_owned();
+        if dy > up || upd.iter().any(|&u2| u2 > dy && u2 < up) {
+            return Err(format!("the loop at statement {begin}: another counter update lies between the computation of the update at statement {up} and the update"));
+        }
+        if inc <= 0 {
+            return Err(format!("the loop at statement {begin}: a counter step {inc} is not positive"));
+        }
+        incs.push((up, inc));
+    }
+    let step: i64 = incs.iter().map(|x| x.1).sum();
+    let phase_of = |read: usize| -> i64 { incs.iter().filter(|(u, _)| *u < read).map(|x| x.1).sum() };
+    // the bound: one expression, loop-invariant (a variable the loop never assigns, or a value defined before the loop)
+    let bound0 = exits[0].2;
+    let invariant = |b: &Opnd| -> bool {
+        match b {
+            Opnd::I32(_) => true,
+            Opnd::Var(v) => !(begin + 1..end).any(|i| assigned_value(&stmts[i], *v).is_some()),
+            Opnd::Val(x) => sc.defpos.get(x).map(|d| *d < begin).unwrap_or(false),
+            _ => false,
+        }
+    };
+    let ty = exits[0].3;
+    let mut mb = i64::MIN / 4;
+    let mut ma = i64::MIN / 4;
+    for (pos, a, b, t, cpos) in &exits {
+        if *t != ty || *b != bound0 || !invariant(b) {
+            return Err(format!("the loop at statement {begin}: the exits do not share one loop-invariant bound / type (bound {:?} vs {:?})", b, bound0));
+        }
+        let (cc, k, read) = t!(counter_of(a, *cpos), "an exit compares something that is not the counter");
+        if cc != c {
+            return Err(format!("the loop at statement {begin}: the exits test different counters"));
+        }
+        let off = k + phase_of(read);
+        ma = ma.max(off);
+        if *pos < pw {
+            mb = mb.max(off);
+        }
+    }
+    let bound = t!(sc.expand(w, &bound0, begin, 0), format!("the loop at statement {begin}: the bound has no unique symbolic definition for wave {w}"));
+    // the entry value (the loop statement's own init for a loop variable, the reaching definition otherwise) as a closed symbolic base + constant
+    let entry = assigned_value(&stmts[begin], c).unwrap_or(Opnd::Var(c));
+    let (base, k0) = t!(sc.affine(w, &entry, begin, 0), format!("the loop at statement {begin}: the counter's entry value has no unique symbolic definition for wave {w}"));
+    let eff = mb.max(ma - step);
+    Ok(TripSig { ty, c0: base, mb: k0 + mb, eff: k0 + eff, step, bound })
+}
+
+/// The loops `(begin, end)` of the function.
+fn loop_spans(stmts: &[Stmt]) -> Vec<(usize, usize)> {
+    let mut st: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for (i, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::BeginLoop { .. } => st.push(i),
+            Stmt::EndLoop => {
+                if let Some(b) = st.pop() {
+                    out.push((b, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Do the loops the waves wait in (`pairs`: (wave, loop begin)) wait equally often? True only when every loop has a signature and all signatures are equal.
+fn trips_equal(f: &Function, sh: &Shape, cx: &EvCtx, uniform: &dyn Fn(&Opnd) -> bool, pairs: &[(i32, usize)]) -> Result<(), String> {
     let stmts = f.stmts();
+    let mut defpos: HashMap<ValueId, usize> = HashMap::default();
+    for (i, st) in stmts.iter().enumerate() {
+        if let Stmt::Let { dst, .. } = st {
+            defpos.insert(*dst, i);
+        }
+    }
+    let sc = Scev { stmts, sh, cx, uniform, defpos, cache: Default::default() };
+    let spans = loop_spans(stmts);
+    let mut first: Option<TripSig> = None;
+    for &(w, b) in pairs {
+        let Some(&(_, e)) = spans.iter().find(|(bb, _)| *bb == b) else { return Err("a loop without an end".to_string()) };
+        let sig = loop_sig(&sc, w, b, e)?;
+        match &first {
+            None => first = Some(sig),
+            Some(s0) => {
+                if *s0 != sig {
+                    return Err(format!("the loops' trip signatures differ: {s0:?} vs {sig:?} (loop at statement {b}, wave {w})"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// GV-1250-BAR-COUNT: the cluster barrier (-3) is signalled by exactly one wave per work-group per wait, proved by ALTERNATION along every path.
+/// * the waves that can reach a signal of -3 (each wave's path decided by its own evaluable conditions): exactly one, the leader;
+/// * for the leader, a forward dataflow over the CFG (loop back edges included) with the state "signals since the last wait" in {0, 1, 2+} (a set of states per statement): at every wait the state
+///   must be exactly 1 (from the kernel entry to the first wait, and between any two consecutive waits, on every path): 0 = a wait that never completes, 2+ = a count that overshoots. This is
+///   sound for a split barrier (signal early, wait late) in any region, and needs no pairing of statements.
+fn alternation(f: &Function) -> AltResult {
+    let stmts = f.stmts();
+    let mut res = AltResult::default();
+    let sigs: Vec<usize> = (0..stmts.len()).filter(|&i| matches!(stmts[i], Stmt::BarrierSignal { id: -3 })).collect();
+    let wts: Vec<usize> = (0..stmts.len()).filter(|&i| matches!(stmts[i], Stmt::BarrierWait { id: -3 })).collect();
+    if wts.is_empty() {
+        return res;
+    }
     let defs = defs_of(f);
     let vars = var_assignments(f);
     let cx = EvCtx { defs: &defs, vars: &vars };
@@ -988,110 +1417,153 @@ fn count_items(f: &Function) -> Vec<CountItem> {
         Opnd::Var(x) => uvars.contains(x),
         _ => true,
     };
-    // the region of every statement: its innermost loop (the top level otherwise): the signals and waits of one pass
-    let mut region: Vec<usize> = Vec::with_capacity(stmts.len());
-    let mut regions: Vec<usize> = vec![usize::MAX];
-    for (i, st) in stmts.iter().enumerate() {
-        match st {
-            Stmt::BeginLoop { .. } => regions.push(i),
-            Stmt::EndLoop => {
-                regions.pop();
+    // the statements each wave may reach
+    let mut reach: Vec<Vec<bool>> = Vec::new();
+    for w in 0..nw {
+        let mut r = vec![false; stmts.len() + 1];
+        let mut work = vec![0usize];
+        r[0] = true;
+        while let Some(i) = work.pop() {
+            if i >= stmts.len() {
+                continue;
             }
-            _ => {}
-        }
-        region.push(*regions.last().unwrap());
-    }
-    let mut all_regions: Vec<usize> = region.clone();
-    all_regions.sort();
-    all_regions.dedup();
-    let id = -3;
-    let mut items: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();   // (region, signal statements, wait statements)
-    let mut unpaired: Vec<usize> = Vec::new();
-    for &r in &all_regions {
-        let sig: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierSignal { id: j } if j == id)).collect();
-        let wts: Vec<usize> = (0..stmts.len()).filter(|&i| region[i] == r && matches!(stmts[i], Stmt::BarrierWait { id: j } if j == id)).collect();
-        // a region that waits on the barrier but never signals it: the signal is issued outside the region (a split barrier: signal early, wait late), which a per-region count cannot see
-        if sig.is_empty() && !wts.is_empty() {
-            unpaired.push(r);
-        }
-        if !(sig.is_empty() && wts.is_empty()) {
-            items.push((r, sig, wts));
-        }
-    }
-    if items.is_empty() {
-        return Vec::new();
-    }
-    // prefix counts of the relevant statements (the signals and waits being counted)
-    let mut rel: Vec<u32> = vec![0; stmts.len() + 1];
-    for (i, st) in stmts.iter().enumerate() {
-        rel[i + 1] = rel[i] + matches!(st, Stmt::BarrierSignal { id: -3 } | Stmt::BarrierWait { id: -3 }) as u32;
-    }
-    // enumerate the resolutions of the unknown wave-uniform conditions (each world: one assignment; every wave takes the assigned side)
-    let mut results: Vec<Vec<(i64, i64)>> = vec![Vec::new(); items.len()];
-    let mut stack: Vec<HashMap<usize, bool>> = vec![HashMap::default()];
-    let mut seen_worlds = 0usize;
-    while let Some(assign) = stack.pop() {
-        seen_worlds += 1;
-        if seen_worlds > MAX_WORLDS {
-            return items.into_iter().map(|(r, _, _)| CountItem { region: r, id, worlds: None, why: format!("more than {MAX_WORLDS} resolutions of the uniform conditions") }).collect();
-        }
-        let reach: Result<Vec<Vec<bool>>, (usize, bool)> = (0..nw).map(|w| wave_reach(f, &sh, &cx, &uniform, &rel, &assign, w)).collect();
-        match reach {
-            Err((at, true)) => {
-                let why = format!("statement {at} ({:.90?}) branches on a condition that is neither evaluable nor wave-uniform", stmts[at]);
-                return items.into_iter().map(|(r, _, _)| CountItem { region: r, id, worlds: None, why: why.clone() }).collect();
-            }
-            Err((at, false)) => {
-                for v in [true, false] {
-                    let mut a = assign.clone();
-                    a.insert(at, v);
-                    stack.push(a);
+            match wave_succs(stmts, &sh, &cx, &uniform, w, i) {
+                Ok(next) => {
+                    for t in next {
+                        if t <= stmts.len() && !r[t] {
+                            r[t] = true;
+                            work.push(t);
+                        }
+                    }
                 }
-            }
-            Ok(rc) => {
-                for (k, (_, sig, wts)) in items.iter().enumerate() {
-                    // signals per work-group: every (wave, signal statement) the wave reaches; waits per wave: the most any wave reaches
-                    let signals: i64 = rc.iter().map(|rw| sig.iter().filter(|&&i| rw[i]).count() as i64).sum();
-                    let waits = rc.iter().map(|rw| wts.iter().filter(|&&i| rw[i]).count() as i64).max().unwrap_or(0);
-                    results[k].push((signals, waits));
+                Err(at) => {
+                    res.unknown = Some(format!("statement {at} ({:.90?}) branches on a condition that is neither evaluable nor wave-uniform", stmts[at]));
+                    return res;
                 }
             }
         }
+        reach.push(r);
     }
-    items
-        .into_iter()
-        .zip(results)
-        .map(|((r, _, _), w)| {
-            let mut w = w;
-            w.sort();
-            w.dedup();
-            if unpaired.contains(&r) {
-                CountItem { region: r, id, worlds: None, why: "the region waits on the barrier but contains no signal of it: the matching signal is issued outside the region".to_string() }
-            } else {
-                CountItem { region: r, id, worlds: Some(w), why: String::new() }
+    let leaders: Vec<i32> = (0..nw).filter(|&w| sigs.iter().any(|&i| reach[w as usize][i])).collect();
+    match leaders.len() {
+        0 => {
+            res.violations.push("the kernel waits on the cluster barrier (-3) but no wave of a work-group can signal it: the barrier never completes".to_string());
+            return res;
+        }
+        1 => {}
+        n => {
+            res.violations.push(format!("{n} waves of a work-group can signal the cluster barrier (-3) (waves {leaders:?}): it needs exactly one signalling wave per work-group (the count is by signals, not by waves)"));
+            return res;
+        }
+    }
+    // every wave waits the same number of times as the signalling wave per phase: outside loops by counting, inside loops only when the waves share the loop (a wave-uniform exit: the same trips);
+    // waits in different loops need the trip counts to agree, which the verifier cannot compare
+    {
+        let mut region: Vec<usize> = Vec::with_capacity(stmts.len());
+        let mut regions: Vec<usize> = vec![usize::MAX];
+        for (i, st) in stmts.iter().enumerate() {
+            match st {
+                Stmt::BeginLoop { .. } => regions.push(i),
+                Stmt::EndLoop => {
+                    regions.pop();
+                }
+                _ => {}
             }
-        })
-        .collect()
-}
-
-fn bar_count(f: &Function, v: &mut Vec<Violation>) {
-    for it in count_items(f) {
-        let where_ = if it.region == usize::MAX { "the top level".to_string() } else { format!("the loop at statement {}", it.region) };
-        match &it.worlds {
-            Some(ws) => {
-                for &(sig, waits) in ws {
-                    if waits > 0 && sig != waits {
-                        viol(v, "GV-1250-BAR-COUNT", format!("{where_}: barrier {} is signalled by {sig} wave(s) per work-group and waited on {waits} time(s) per wave (on some resolution of the kernel's uniform conditions): the cluster barrier needs exactly one signalling wave per work-group per wait (the count is by signals, not by waves)", it.id));
+            region.push(*regions.last().unwrap());
+        }
+        let lw = leaders[0] as usize;
+        let per = |w: usize| -> (usize, std::collections::BTreeSet<usize>) {
+            let mut top = 0usize;
+            let mut loops = std::collections::BTreeSet::new();
+            for &i in &wts {
+                if reach[w][i] {
+                    if region[i] == usize::MAX {
+                        top += 1;
+                    } else {
+                        loops.insert(region[i]);
                     }
                 }
             }
-            None => {
-                match signal_count_fact(f, it.id) {
-                    None => viol(v, "GV-1250-BAR-COUNT", format!("{where_}: cannot prove how many waves per work-group signal barrier {} ({}): declare the launch fact with `barrier_signal_count({}, per_wg)` (a trusted item), or restructure so the verifier can count", it.id, it.why, it.id)),
-                    Some(k) if it.id == -3 && k != 1 => viol(v, "GV-1250-BAR-COUNT", format!("the launch fact says {k} signal(s) per work-group for the cluster barrier: exactly 1 is required")),
-                    Some(_) => {}
+            (top, loops)
+        };
+        let (ltop, lloops) = per(lw);
+        for w in 0..nw as usize {
+            let (top, loops) = per(w);
+            if top != ltop {
+                res.violations.push(format!("wave {w} reaches {top} wait(s) on the cluster barrier (-3) outside loops, the signalling wave {lw} reaches {ltop}: a wave that waits more often than the barrier completes never gets out"));
+            }
+            if loops != lloops && res.needs_trip_fact.is_none() {
+                // try to prove the loops iterate alike (a scalar-evolution comparison of their entry value, step, bound and exit phases)
+                let mut pairs: Vec<(i32, usize)> = Vec::new();
+                for ww in 0..nw as usize {
+                    let (_, ls) = per(ww);
+                    for l in ls {
+                        pairs.push((ww as i32, l));
+                    }
+                }
+                let why = match trips_equal(f, &sh, &cx, &uniform, &pairs) {
+                    Ok(()) => continue,
+                    Err(why) => why,
+                };
+                res.needs_trip_fact = Some(format!("wave {w} waits on the cluster barrier in the loops at statements {:?}, the signalling wave {lw} in {:?}: the loops must iterate the same number of times (not proved: {why})", loops, lloops));
+            }
+        }
+    }
+    // the leader's alternation
+    let w = leaders[0];
+    let mut state: Vec<u8> = vec![0; stmts.len() + 1];   // bit k: "k signals since the last wait" reachable at the entry of the statement (k = 2: two or more)
+    state[0] = 0b001;
+    let mut work = vec![0usize];
+    let mut seen_wait_viol: HashSet<usize> = HashSet::default();
+    while let Some(i) = work.pop() {
+        if i >= stmts.len() {
+            continue;
+        }
+        let m = state[i];
+        let out = match &stmts[i] {
+            Stmt::BarrierSignal { id: -3 } => ((m & 0b001) << 1) | ((m & 0b010) << 1) | (m & 0b100),   // 0 -> 1, 1 -> 2+, 2+ -> 2+
+            Stmt::BarrierWait { id: -3 } => {
+                if m != 0b010 && seen_wait_viol.insert(i) {
+                    let what = if m & 0b001 != 0 { "no signal since the previous wait (the wait never completes)" } else { "more than one signal since the previous wait (the count overshoots)" };
+                    res.violations.push(format!("statement {i}: a wait on the cluster barrier (-3) reached by the signalling wave {w} with {what} on some path (the states reaching it: {m:#05b}); exactly one signal between consecutive waits is required"));
+                }
+                0b001
+            }
+            _ => m,
+        };
+        match wave_succs(stmts, &sh, &cx, &uniform, w, i) {
+            Ok(next) => {
+                for t in next {
+                    if t <= stmts.len() && (state[t] | out) != state[t] {
+                        state[t] |= out;
+                        work.push(t);
+                    }
                 }
             }
+            Err(at) => {
+                res.unknown = Some(format!("statement {at} ({:.90?}) branches on a condition that is neither evaluable nor wave-uniform", stmts[at]));
+                return res;
+            }
+        }
+    }
+    res
+}
+
+fn bar_count(f: &Function, v: &mut Vec<Violation>) {
+    let r = alternation(f);
+    for m in r.violations {
+        viol(v, "GV-1250-BAR-COUNT", m);
+    }
+    if let Some(why) = r.needs_trip_fact {
+        if kd_val(f, "g5:wait_trips_match:-3") == 0 {
+            viol(v, "GV-1250-BAR-COUNT", format!("{why}: the verifier cannot compare the trip counts; declare the launch fact with `barrier_wait_trips_match(-3)` (a trusted item) or put the waits in one loop"));
+        }
+    }
+    if let Some(why) = r.unknown {
+        match signal_count_fact(f, -3) {
+            None => viol(v, "GV-1250-BAR-COUNT", format!("cannot prove the cluster barrier's signal count ({why}): declare the launch fact with `barrier_signal_count(-3, per_wg)` (a trusted item), or restructure so the verifier can count")),
+            Some(k) if k != 1 => viol(v, "GV-1250-BAR-COUNT", format!("the launch fact says {k} signal(s) per work-group for the cluster barrier: exactly 1 is required")),
+            Some(_) => {}
         }
     }
 }
@@ -1099,27 +1571,49 @@ fn bar_count(f: &Function, v: &mut Vec<Violation>) {
 /// The launch facts the verifier relied on instead of proving them: listed in the compile's certificate / diagnostics so a trusted assumption is never silent.
 pub fn trusted_items(f: &Function) -> Vec<String> {
     let mut v = Vec::new();
-    for it in count_items(f) {
-        if it.worlds.is_none() {
-            if let Some(k) = signal_count_fact(f, it.id) {
-                v.push(format!("barrier {}: {k} signalling wave(s) per work-group per phase (declared launch fact, not proved)", it.id));
-            }
+    if declared_lds(f) > 65536 && kd_val(f, "g5:lds_above_64k") != 0 {
+        v.push(format!("LDS above 64 KiB ({} bytes declared): launch fact g5:lds_above_64k (hardware evidence cited by the kernel, not proved)", declared_lds(f)));
+    }
+    if alternation(f).needs_trip_fact.is_some() && kd_val(f, "g5:wait_trips_match:-3") != 0 {
+        v.push("barrier -3: the loops the waves wait in iterate the same number of times (declared launch fact g5:wait_trips_match:-3, not proved)".to_string());
+    }
+    if alternation(f).unknown.is_some() {
+        if let Some(k) = signal_count_fact(f, -3) {
+            v.push(format!("barrier -3: {k} signalling wave(s) per work-group per phase (declared launch fact, not proved)"));
         }
     }
     v
 }
 
+/// The LDS bytes a kernel declares (the DSL's `lds`, or the author's kernel-descriptor value in exact mode).
+fn declared_lds(f: &Function) -> i64 {
+    (f.lds_bytes as i64).max(kd_val(f, "group_segment_fixed_size"))
+}
+
 /// The IR-level rules.
 pub fn verify_ir(f: &Function) -> Vec<Violation> {
     let mut v = Vec::new();
+    // interim guard (GV-1250-LDS-64K): LDS above 64 KiB needs the named evidence fact; see docs/gfx1250-hang-rules.md
+    if declared_lds(f) > 65536 && kd_val(f, "g5:lds_above_64k") == 0 {
+        viol(&mut v, "GV-1250-LDS-64K", format!("the kernel declares {} bytes of LDS (above 64 KiB) without the launch fact `g5:lds_above_64k` naming the hardware evidence for it: configurations of this shape have hung a device / returned wrong data and the cause is not established", declared_lds(f)));
+    }
     let defs = defs_of(f);
     let kz = known_zero(f, &defs);
     let cluster = cluster_wgs(f);
     let named = kd_val(f, "named_barrier_count");
+    let vars_m = var_assignments(f);
+    let cxm = EvCtx { defs: &defs, vars: &vars_m };
+    let mut marker: Option<(String, Opnd)> = None;
     for (pos, st) in f.stmts().iter().enumerate() {
+        match st {
+            Stmt::TileProduce { tile, slot, .. } => marker = Some((tile.clone(), *slot)),
+            Stmt::TileConsume { .. } | Stmt::TileEnd => marker = None,
+            _ => {}
+        }
         match st {
             Stmt::TensorLoadToLds { g0, g1, .. } | Stmt::TensorStoreFromLds { g0, g1, .. } => {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
+                lds_extent_check(f, &cxm, marker.as_ref().map(|(n, o)| (n.as_str(), o)), pos, g0, g1, &mut v);
                 let m = mcast_mask(f, &defs, &kz, g1);
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {

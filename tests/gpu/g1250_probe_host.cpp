@@ -379,6 +379,31 @@ static int run_tdm_hi(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_trans: run the kernel `runs` times x `wgs` workgroups (contention) and write the bits of workgroup 0's outputs of every run to
+// `dump` (the script compares the v_nop and the no-v_nop builds); also checks that every run and every workgroup agree with run 0 / wg 0.
+static int run_trans(Kernel& k, const char* kn, int runs, int wgs, const char* dump) {
+    size_t n = 512 * 8;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, (size_t)wgs * n * 4));
+    std::vector<uint8_t> args(8, 0);
+    long bad = 0;
+    std::vector<uint32_t> ref;
+    FILE* fd = fopen(dump, "wb");
+    for (int r = 0; r < runs; ++r) {
+        HC(hipMemset(dout, 0xee, (size_t)wgs * n * 4));
+        put64(args, 0, dout);
+        k.launch(wgs, 512, args, kn);
+        std::vector<uint32_t> o((size_t)wgs * n);
+        HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+        if (r == 0) ref.assign(o.begin(), o.begin() + n);
+        for (size_t i = 0; i < o.size(); ++i) bad += o[i] != ref[i % n];
+        fwrite(o.data(), 4, n, fd);
+    }
+    fclose(fd);
+    printf("trans %s: %d runs x %d workgroups: disagreements=%ld %s\n", kn, runs, wgs, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
@@ -401,6 +426,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
     if (mode == "wide") return run_wide(k, kn);
+    if (mode == "trans") return run_trans(k, kn, atoi(argv[4]), atoi(argv[5]), argv[6]);
     if (mode == "tdm_hi") return run_tdm_hi(k, kn);
     if (mode == "lds_big") return run_lds_big(k, kn, argc > 4 ? atoi(argv[4]) : 1);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
