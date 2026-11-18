@@ -3,7 +3,7 @@
 //
 //   g1250_f4own_host <co> <kernel> M N K [iters=0] [BM=128] [BN=64]
 //
-// Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40, n @44. Grid (N / BN, M / BM), 128 work-items. Hang policy (docs/mi450-nodes.md): polled waits with a wall-clock limit
+// (argv[9] = work-items per work-group, default 128)  Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40, n @44. Grid (N / BN, M / BM), 128 work-items. Hang policy (docs/mi450-nodes.md): polled waits with a wall-clock limit
 // (PROBE_WATCHDOG_S, default 15), exit 124 on expiry without touching the device again. Env: SEED (1), CHECK_ROWS (16).
 // One JSON line: {"host":"g1250_f4own","kernel":..,"M":..,"N":..,"K":..,"bad":N,"maxrel":..,"us":..,"tflops":..,"ok":bool}
 #include <hip/hip_runtime.h>
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
     const char* kn = argv[2];
     const int M = atoi(argv[3]), N = atoi(argv[4]), K = atoi(argv[5]);
     const int iters = argc > 6 ? atoi(argv[6]) : 0;
-    const int BM = argc > 7 ? atoi(argv[7]) : 128, BN = argc > 8 ? atoi(argv[8]) : 64;
+    const int BM = argc > 7 ? atoi(argv[7]) : 128, BN = argc > 8 ? atoi(argv[8]) : 64, THR = argc > 9 ? atoi(argv[9]) : 128;
     if (M % BM || N % BN || K % 128) { fprintf(stderr, "M %% %d, N %% %d, K %% 128 required\n", BM, BN); return 1; }
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     hipDeviceProp_t prop;
@@ -61,6 +61,14 @@ int main(int argc, char** argv) {
     for (auto& x : B) x = (uint8_t)(rng() & 0xff);
     for (auto& x : SA) x = (uint8_t)(125 + rng() % 5);   // 2^-2 .. 2^2
     for (auto& x : SB) x = (uint8_t)(125 + rng() % 5);
+    // ONLY_K=lo,hi: zero every A element outside the K range [lo, hi) (a bisect aid: the output is nonzero only when the K tiles of that range reach the WMMA correctly)
+    if (const char* ok = getenv("ONLY_K")) {
+        int lo = 0, hi = K;
+        std::sscanf(ok, "%d,%d", &lo, &hi);
+        for (int i = 0; i < M; ++i)
+            for (int k = 0; k < K; ++k)
+                if (k < lo || k >= hi) A[(size_t)i * KB + k / 2] &= (k & 1) ? 0x0f : 0xf0;
+    }
     uint8_t *dA, *dB, *dSA, *dSB; float* dC;
     HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); HC(hipMalloc(&dC, (size_t)M * N * 4));
     HC(hipMemcpy(dA, A.data(), A.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, B.data(), B.size(), hipMemcpyHostToDevice));
@@ -75,7 +83,7 @@ int main(int argc, char** argv) {
         if (stage == 1 && gx == 1 && gy == 1) break;
         hipEvent_t e;
         HC(hipEventCreate(&e));
-        HC(hipModuleLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, nullptr, nullptr, cfg));
+        HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
         HC(hipEventRecord(e, nullptr));
         wait_polled(e, kn);
     }
@@ -107,9 +115,9 @@ int main(int argc, char** argv) {
         hipEvent_t e0, e1;
         HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
         const unsigned gx = N / BN, gy = M / BM;
-        for (int w = 0; w < 3; ++w) HC(hipModuleLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, nullptr, nullptr, cfg));
+        for (int w = 0; w < 3; ++w) HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
         HC(hipEventRecord(e0, nullptr));
-        for (int i = 0; i < iters; ++i) HC(hipModuleLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, nullptr, nullptr, cfg));
+        for (int i = 0; i < iters; ++i) HC(hipModuleLaunchKernel(fn, gx, gy, 1, THR, 1, 1, 0, nullptr, nullptr, cfg));
         HC(hipEventRecord(e1, nullptr));
         wait_polled(e1, "timing");
         float ms = 0;

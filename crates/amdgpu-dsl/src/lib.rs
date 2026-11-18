@@ -3843,12 +3843,6 @@ impl FnBuilder {
         self.f.kd.push((format!("g5:wait_trips_match:{id}"), 1));
     }
 
-    /// gfx1250 launch fact for the hang-safety verifier (`GV-1250-LDS-64K`): the kernel uses more than 64 KiB of LDS and this is the hardware evidence it relies on (a trusted item, listed by
-    /// `trusted_items`; the `evidence` number is the author's reference).
-    pub fn lds_above_64k(&mut self, evidence: u32) {
-        self.f.kd.push(("g5:lds_above_64k".to_string(), evidence.max(1) as i64));
-    }
-
     /// gfx1250: `s_barrier_wait id` (the operand is an inline constant by construction).
     pub fn barrier_wait(&mut self, id: i32) {
         self.push_stmt(Stmt::BarrierWait { id });

@@ -433,10 +433,6 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
     b.store_global(q, 0, acc, MemTy::B32, false);
     let mut f = b.finish();
-    if bytes > 65536 {
-        // this probe IS the evidence run for LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
-        f.kd.push(("g5:lds_above_64k".into(), 1));
-    }
     f
 }
 
@@ -465,8 +461,6 @@ pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
         b.store_global(q, 0, x, MemTy::B32, false);
     }
     let mut f = b.finish();
-    // an evidence run for TDM / LDS above 64 KiB (GV-1250-LDS-64K): a trusted, listed launch fact
-    f.kd.push(("g5:lds_above_64k".into(), 1));
     f
 }
 
