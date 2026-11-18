@@ -61,6 +61,14 @@ int main(int argc, char** argv) {
     for (auto& x : B) x = (uint8_t)(rng() & 0xff);
     for (auto& x : SA) x = (uint8_t)(125 + rng() % 5);   // 2^-2 .. 2^2
     for (auto& x : SB) x = (uint8_t)(125 + rng() % 5);
+    // ONLY_K=lo,hi: zero every A element outside the K range [lo, hi) (a bisect aid: the output is nonzero only when the K tiles of that range reach the WMMA correctly)
+    if (const char* ok = getenv("ONLY_K")) {
+        int lo = 0, hi = K;
+        std::sscanf(ok, "%d,%d", &lo, &hi);
+        for (int i = 0; i < M; ++i)
+            for (int k = 0; k < K; ++k)
+                if (k < lo || k >= hi) A[(size_t)i * KB + k / 2] &= (k & 1) ? 0x0f : 0xf0;
+    }
     uint8_t *dA, *dB, *dSA, *dSB; float* dC;
     HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); HC(hipMalloc(&dC, (size_t)M * N * 4));
     HC(hipMemcpy(dA, A.data(), A.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, B.data(), B.size(), hipMemcpyHostToDevice));
