@@ -48,6 +48,29 @@ struct Kernel {
         HC(hipEventRecord(e, nullptr));
         wait_polled(e, what);
     }
+    // a cluster launch: `grid` workgroups in clusters of `cx` (x only); the cluster dims must divide the grid
+    void launch_cluster(unsigned grid, unsigned block, unsigned cx, std::vector<uint8_t>& args, const char* what) {
+        if (cx < 1 || grid % cx != 0) {
+            printf("PROBE_FAIL cluster %u does not divide grid %u (refused)\n", cx, grid);
+            fflush(stdout);
+            _exit(2);
+        }
+        size_t sz = args.size();
+        void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
+        HIP_LAUNCH_CONFIG lc{};
+        lc.gridDimX = grid; lc.gridDimY = 1; lc.gridDimZ = 1;
+        lc.blockDimX = block; lc.blockDimY = 1; lc.blockDimZ = 1;
+        lc.sharedMemBytes = 0; lc.hStream = nullptr;
+        hipLaunchAttribute at{};
+        at.id = hipLaunchAttributeClusterDimension;
+        at.val.clusterDim.x = cx; at.val.clusterDim.y = 1; at.val.clusterDim.z = 1;
+        lc.attrs = &at; lc.numAttrs = 1;
+        hipEvent_t e;
+        HC(hipEventCreate(&e));
+        HC(hipDrvLaunchKernelEx(&lc, fn, nullptr, cfg));
+        HC(hipEventRecord(e, nullptr));
+        wait_polled(e, what);
+    }
 };
 
 static void put64(std::vector<uint8_t>& a, size_t off, const void* p) { memcpy(&a[off], &p, 8); }
@@ -310,6 +333,28 @@ static int run_named(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_barriers: named barrier 1 (init / join / signal / wait / leave) then the cluster barrier, out[tid] = tid. Launched ONLY as a
+// cluster (CLUSTER, default 2 workgroups along x; a cluster barrier needs a cluster id), GRID workgroups (default 64), 20 repetitions.
+static int run_barriers(Kernel& k, const char* kn) {
+    const unsigned cx = getenv("CLUSTER") ? atoi(getenv("CLUSTER")) : 2;
+    const unsigned grid = getenv("GRID") ? atoi(getenv("GRID")) : 64;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, 128 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    long bad = 0;
+    for (int rep = 0; rep < 20; ++rep) {
+        HC(hipMemset(dout, 0xee, 128 * 4));
+        k.launch_cluster(grid, 128, cx, args, kn);
+        std::vector<uint32_t> o(128);
+        HC(hipMemcpy(o.data(), dout, 128 * 4, hipMemcpyDeviceToHost));
+        for (int t = 0; t < 128; ++t) bad += o[t] != (uint32_t)t;
+    }
+    printf("barriers: 20 x %u workgroups in clusters of %u x 4 waves: bad=%ld %s\n", grid, cx, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    printf("{\"host\":\"g1250_probe\",\"kernel\":\"%s\",\"shape\":{\"grid\":%u,\"cluster\":%u},\"bad\":%ld,\"ok\":%s}\n", kn, grid, cx, bad, bad == 0 ? "true" : "false");
+    return bad == 0 ? 0 : 3;
+}
+
 // probe_g1250_wide: 320 values per lane (one wave), all live at once (more than 256 VGPRs: the MSB window), summed in reverse order.
 static int run_wide(Kernel& k, const char* kn) {
     const int N = 320;
@@ -425,6 +470,7 @@ int main(int argc, char** argv) {
     if (mode == "tdm2d") return run_tdm2d(k, kn);
     if (mode == "tdm_ring") return run_tdm_ring(k, kn);
     if (mode == "named") return run_named(k, kn);
+    if (mode == "barriers") return run_barriers(k, kn);
     if (mode == "wide") return run_wide(k, kn);
     if (mode == "trans") return run_trans(k, kn, atoi(argv[4]), atoi(argv[5]), argv[6]);
     if (mode == "tdm_hi") return run_tdm_hi(k, kn);
