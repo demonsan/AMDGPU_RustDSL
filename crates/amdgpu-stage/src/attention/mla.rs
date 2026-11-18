@@ -25,6 +25,8 @@ pub const DV: i32 = 512;
 pub const PAGE_BYTES: i32 = PAGE_TOKENS * D;
 /// byte offset of the rope plane inside a page (global layout)
 pub const ROPE_OFF: i32 = PAGE_TOKENS * DV;
+/// pages per pipeline tile (one window): the barriers and the softmax exchange are per window
+pub const PAGES: i32 = 2;
 /// bytes of a page one wave loads (a quarter)
 pub const QUARTER: i32 = PAGE_BYTES / 4;
 
@@ -121,6 +123,8 @@ pub struct MlaBody {
     pub layout: PageLayout,
     /// qs * ks * softmax scale * log2(e)
     pub cscale: ValueId,
+    /// the sequence's page count (the last tile's second page is clamped to the last page; its tokens are masked)
+    pub npages: ValueId,
     /// loop state: running max (head m), partial row sum (this lane's tokens), the 8 O tiles (Frag8 each)
     pub vars: Vec<VarId>,
 }
@@ -135,23 +139,28 @@ fn bits_of(b: &mut FnBuilder, v: ValueId) -> Opnd {
 
 impl PipeBody for MlaBody {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
-        // page t = key0 / 64: its id from the page table, the descriptor of the whole page into the slot
-        let ta = b.bind_i32(((key0.clone() >> 6) << 2) + self.ptab.base as i32);
-        let pidv = self.ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
-        let pid = b.read_first_lane(pidv);
-        b.assume_trusted(pid, amdgpu_dsl::Ext::c(0), amdgpu_dsl::Ext::sym("P") - amdgpu_dsl::Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
-        // each wave loads its quarter of the page (144 of the 576 rows of 64 bytes): one copy of the page per work-group
-        let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * QUARTER);
+        // the tile's pages t0 .. t0 + PAGES (clamped to the last page): their ids from the LDS page table, each wave a quarter of each
+        let t0 = b.bind_i32(key0.clone() >> 6);
+        let last = b.bind_i32(ev(self.npages) - 1);
         let r = self.kv.at(slot);
-        let lds = b.bind_i32(r.base() + ev(self.w) * self.layout.quarter_lds);
-        let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
-        let g1 = self.g1;
-        r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        for pg in 0..PAGES {
+            let tp = b.bind_i32(ev(t0) + pg);
+            let tc = b.let_(Op::MinI32(Opnd::Val(tp), Opnd::Val(last)));
+            let ta = b.bind_i32((ev(tc) << 2) + self.ptab.base as i32);
+            let pidv = self.ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
+            let pid = b.read_first_lane(pidv);
+            b.assume_trusted(pid, amdgpu_dsl::Ext::c(0), amdgpu_dsl::Ext::sym("P") - amdgpu_dsl::Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
+            let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(self.w) * QUARTER);
+            let lds = b.bind_i32(r.base() + pg * self.layout.slot_bytes + ev(self.w) * self.layout.quarter_lds);
+            let g0 = tdm_group0(b, self.pkv, off, Opnd::Val(lds));
+            let g1 = self.g1;
+            r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        }
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
-        // TENSORcnt is in order: at most the page just staged (t + 2) stays in flight; t + 1, read by the next window, is complete
-        b.wait_tensor(1);
+        // TENSORcnt is in order: at most the tile just staged (t + 2, PAGES loads) stays in flight; t + 1 is complete
+        b.wait_tensor(PAGES as u8);
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
@@ -178,46 +187,48 @@ impl PipeBody for MlaBody {
         // the single-slot exchange tiles: generation = the tile counter
         let tix = SlotIdx::new(Opnd::I32(0), t.it);
         let sb = b.bind_i32(kv.base());
-        // ---- S^T: A = K rows (token 16 w + m), K bytes 8 g + 16 j of each 64-byte chunk; B = Q ----
-        let nope_row = b.bind_i32(ev(sb) + ev(self.kofs));
-        let rope_row = b.bind_i32(ev(sb) + ev(self.rofs));
         let q = self.q.clone();
-        let s = kv.read(b, |b| {
-            // all nine K fragments first (distinct registers: the reads overlap), then the WMMA chain
-            let fa: Vec<ValueId> = (0..9)
-                .map(|c| {
-                    let lo = if c < 8 { b.bind_i32(ev(nope_row) + self.kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
-                    let hi = b.bind_i32(ev(lo) + 16);
-                    b.load_lds_b128x2(lo, hi)
-                })
-                .collect();
-            let mut acc: Option<Opnd> = None;
-            for c in 0..9 {
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[c], q[c], acc);
-                acc = Some(Opnd::Val(d));
-            }
-            match acc {
-                Some(Opnd::Val(v)) => v,
-                _ => unreachable!(),
-            }
-        });
-        // ---- logits (base 2), masked beyond the sequence ----
-        let tok0 = b.bind_i32(t.key0() + ev(w) * 16 + ev(g) * 8);
         let neg = b.c_f32(-1.0e30);
-        let mut x = Vec::with_capacity(8);
-        for r in 0..8u8 {
-            let si = b.frag_slice(Opnd::Val(s), r, 1);
-            let sf = f32_of(b, si);
-            let v = b.mul_f32(sf, self.cscale);
-            let tok = b.add_i32(tok0, Opnd::I32(r as i32));
-            let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, self.ctx);
-            x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+        // ---- S^T per page: A = K rows (token 16 w + m), B = Q; then the base-2 logits, masked beyond the sequence ----
+        let mut x: Vec<ValueId> = Vec::with_capacity(8 * PAGES as usize);
+        for pg in 0..PAGES {
+            let pb = b.bind_i32(ev(sb) + pg * self.layout.slot_bytes);
+            let nope_row = b.bind_i32(ev(pb) + ev(self.kofs));
+            let rope_row = b.bind_i32(ev(pb) + ev(self.rofs));
+            let s = kv.read(b, |b| {
+                // all nine K fragments first (distinct registers: the reads overlap), then the WMMA chain
+                let fa: Vec<ValueId> = (0..9)
+                    .map(|c| {
+                        let lo = if c < 8 { b.bind_i32(ev(nope_row) + self.kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
+                        let hi = b.bind_i32(ev(lo) + 16);
+                        b.load_lds_b128x2(lo, hi)
+                    })
+                    .collect();
+                let mut acc: Option<Opnd> = None;
+                for c in 0..9 {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, fa[c], q[c], acc);
+                    acc = Some(Opnd::Val(d));
+                }
+                match acc {
+                    Some(Opnd::Val(v)) => v,
+                    _ => unreachable!(),
+                }
+            });
+            let tok0 = b.bind_i32(t.key0() + (64 * pg) + ev(w) * 16 + ev(g) * 8);
+            for r in 0..8u8 {
+                let si = b.frag_slice(Opnd::Val(s), r, 1);
+                let sf = f32_of(b, si);
+                let v = b.mul_f32(sf, self.cscale);
+                let tok = b.add_i32(tok0, Opnd::I32(r as i32));
+                let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, self.ctx);
+                x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+            }
         }
         let mut mx = x[0];
-        for r in 1..8 {
+        for r in 1..x.len() {
             mx = b.max_f32(mx, x[r]);
         }
-        // ---- page maximum per head: 8 partials through LDS ----
+        // ---- tile maximum per head: 8 partials through LDS ----
         let red_w = b.bind_i32(ev(w) * 128 + ev(g) * 64 + ev(m) * 4 + self.red.base as i32);
         self.red.at(&tix).write(b, |b| b.store_lds(red_w, mx, MemTy::B32, false));
         b.wait_lds(0);
@@ -238,35 +249,46 @@ impl PipeBody for MlaBody {
         let m_new = b.max_f32(Opnd::Var(vm), pm);
         let dm = b.sub_f32(Opnd::Var(vm), m_new);
         let alpha = b.exp2_f32(dm);
-        let mut p = Vec::with_capacity(8);
         let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
-        for r in 0..8 {
+        let mut p = Vec::with_capacity(x.len());
+        for r in 0..x.len() {
             let d = b.sub_f32(x[r], m_new);
             let e = b.exp2_f32(d);
             lsum = b.add_f32(lsum, e);
             p.push(e);
         }
-        // ---- P (fp8) and alpha through LDS ----
-        let p0 = b.cvt_pk_fp8x4_f32(p[0], p[1], p[2], p[3]);
-        let p1 = b.cvt_pk_fp8x4_f32(p[4], p[5], p[6], p[7]);
-        // P rows: lane l's 32 bytes = the 4 waves' 8 bytes (wave w at byte 8 w): one b128 pair per lane when read back
+        // ---- P (fp8, one 1 KB block per page) and alpha through LDS ----
         let pw = b.bind_i32(ev(lane) * 32 + ev(w) * 8 + self.pbuf.base as i32);
         let aw = b.bind_i32(ev(w) * 64 + ev(m) * 4 + self.abuf.base as i32);
         self.pbuf.at(&tix).write(b, |b| {
-            b.store_lds(pw, p0, MemTy::B32, false);
-            let pw4 = b.add_i32(pw, Opnd::I32(4));
-            b.store_lds(pw4, p1, MemTy::B32, false);
+            for pg in 0..PAGES as usize {
+                let p0 = b.cvt_pk_fp8x4_f32(p[8 * pg], p[8 * pg + 1], p[8 * pg + 2], p[8 * pg + 3]);
+                let p1 = b.cvt_pk_fp8x4_f32(p[8 * pg + 4], p[8 * pg + 5], p[8 * pg + 6], p[8 * pg + 7]);
+                let a0 = b.add_i32(pw, Opnd::I32(1024 * pg as i32));
+                b.store_lds(a0, p0, MemTy::B32, false);
+                let a1 = b.add_i32(pw, Opnd::I32(1024 * pg as i32 + 4));
+                b.store_lds(a1, p1, MemTy::B32, false);
+            }
         });
         self.abuf.at(&tix).write(b, |b| b.store_lds(aw, alpha, MemTy::B32, false));
         b.wait_lds(0);
         b.barrier();
-        // the A fragment of P: wave j's 8 bytes of lane (m, g) = tokens 16 j + 8 g .. + 8
-        let pa = self.pbuf.at(&tix).read(b, |b| {
-            let lo = b.bind_i32(ev(lane) * 32 + self.pbuf.base as i32);
-            let hi = b.bind_i32(ev(lo) + 16);
-            b.load_lds_b128x2(lo, hi)
+        // the A fragments of P: wave j's 8 bytes of lane (m, g) = tokens 16 j + 8 g .. + 8 of the page
+        let pa: Vec<ValueId> = self.pbuf.at(&tix).read(b, |b| {
+            (0..PAGES)
+                .map(|pg| {
+                    let lo = b.bind_i32(ev(lane) * 32 + (1024 * pg + self.pbuf.base as i32));
+                    let hi = b.bind_i32(ev(lo) + 16);
+                    b.load_lds_b128x2(lo, hi)
+                })
+                .collect()
         });
-        // alpha of the O rows: heads 8 g + r
+        // ---- O = alpha O + P V; wave w owns dims 128 w .. ; the V fragments by ds_load_tr8_b64 ----
+        // lazy rescale: only when some head's running maximum grew (alpha < 1 somewhere in the wave; any-lane: a wave-uniform branch)
+        let grew = b.cmp(CmpPred::Lt, CmpTy::F32, alpha, Opnd::F32(1.0));
+        let any = b.let_(Op::AnyLane(Opnd::Val(grew)));
+        let vars = self.vars.clone();
+        b.begin_if(any);
         let al: Vec<ValueId> = self.abuf.at(&tix).read(b, |b| {
             let lo = b.bind_i32(ev(w) * 64 + ev(g) * 32 + self.abuf.base as i32);
             let hi = b.bind_i32(ev(lo) + 16);
@@ -278,29 +300,28 @@ impl PipeBody for MlaBody {
                 })
                 .collect()
         });
-        // ---- O = alpha O + P V; wave w owns dims 128 w .. ; the V fragment by ds_load_tr8_b64 ----
-        // fetch lane f reads 8 dims at token 8 (f >> 4) + (f & 3) + 4 ((f >> 3) & 1) of a 16-token chunk, dims + 8 ((f >> 2) & 1)
-        let vrow = b.bind_i32(ev(sb) + ev(self.vofs));
+        for nt in 0..8 {
+            for r in 0..8u8 {
+                b.var_scale_lane(vars[2 + nt], r, al[r as usize]);
+            }
+        }
+        b.end_if();
         let vd = self.vdelta.clone();
-        let vars = self.vars.clone();
         kv.read(b, |b| {
-            // all eight V fragments first, then the rescale + WMMA per tile
-            let fvs: Vec<ValueId> = (0..8)
-                .map(|nt| {
-                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[8 * jj as usize + nt as usize])).collect();
-                    b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
-                })
-                .collect();
-            for nt in 0..8 {
-                let o = vars[2 + nt];
-                // the rescale in place (element r of the accumulator times alpha of its row) and the WMMA accumulating into the
-                // variable itself (D = C = O): no rebuilt fragment, no loop-carried copy
-                for r in 0..8u8 {
-                    b.var_scale_lane(o, r, al[r as usize]);
+            for pg in 0..PAGES {
+                let vrow = b.bind_i32(ev(sb) + pg * self.layout.slot_bytes + ev(self.vofs));
+                // all eight V fragments of the page first, then the WMMAs accumulating in place (D = C = O)
+                let fvs: Vec<ValueId> = (0..8)
+                    .map(|nt| {
+                        let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[8 * jj as usize + nt as usize])).collect();
+                        b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                    })
+                    .collect();
+                for nt in 0..8 {
+                    let o = vars[2 + nt];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg as usize], fvs[nt], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
                 }
-                let fv = fvs[nt];
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv, Some(Opnd::Var(o)));
-                b.set_var(o, Opnd::Val(d));
             }
         });
         b.set_var(vm, Opnd::Val(m_new));
