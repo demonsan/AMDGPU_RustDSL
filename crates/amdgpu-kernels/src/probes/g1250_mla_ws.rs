@@ -411,6 +411,17 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
         let mut u = Units::new();
         let mut pvs = Vec::new();
         let mut rss = Vec::new();
+        let vgrp = |b: &mut FnBuilder, grp: usize| -> Vec<ValueId> {
+            (0..4)
+                .map(|k| {
+                    let nt = 4 * grp + k;
+                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[jj][nt])).collect();
+                    b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                })
+                .collect()
+        };
+        // the V fragments of group 0 first; each PV unit loads the next group's before its WMMAs (one group ahead, as in `_ws`)
+        let (_, mut cur) = u.capture(b, format!("v{h}.0"), |b| mine.read_back(b, gen, |b| vgrp(b, 0)));
         for grp in 0..ntw / 4 {
             let (rid, _) = u.capture(b, format!("rs{h}.{grp}"), |b| {
                 for k in 0..4 {
@@ -419,22 +430,19 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u8, pipe: bool) -> Function
                     }
                 }
             });
-            let (pid, _) = u.capture(b, format!("pv{h}.{grp}"), |b| {
+            let fv = cur.clone();
+            let (pid, next) = u.capture(b, format!("pv{h}.{grp}"), |b| {
                 mine.read_back(b, gen, |b| {
-                    let fv: Vec<ValueId> = (0..4)
-                        .map(|k| {
-                            let nt = 4 * grp + k;
-                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vd[jj][nt])).collect();
-                            b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
-                        })
-                        .collect();
+                    let next = if grp + 1 < ntw / 4 { vgrp(b, grp + 1) } else { Vec::new() };
                     for k in 0..4 {
                         let o = ov[4 * grp + k];
                         let d = b.wmma(WmmaKind::Fp8_16x16x64, pa, fv[k], Some(Opnd::Var(o)));
                         b.set_var(o, Opnd::Val(d));
                     }
-                });
+                    next
+                })
             });
+            cur = next;
             rss.push(rid);
             pvs.push(pid);
         }
