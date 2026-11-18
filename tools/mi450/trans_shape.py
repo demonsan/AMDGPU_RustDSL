@@ -48,11 +48,11 @@ def main():
     while i < len(L):
         if TRANS.match(L[i]) and i + 1 < len(L) and L[i + 1].strip() == 'v_nop':
             tmn, td, ts = split(L[i])
-            # the first reader of the TRANS result within the next 6 instructions (same block)
+            # the first reader of the TRANS result within the next 14 instructions (same block)
             j = i + 2
             mid = []
             moved = False
-            while j < len(L) and j < i + 8:
+            while j < len(L) and j < i + 16:
                 s = L[j].strip()
                 if not s.startswith('v_') or s.startswith('v_nop'):
                     break
