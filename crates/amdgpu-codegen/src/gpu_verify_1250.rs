@@ -39,6 +39,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TDM-CLAUSE", layer: Layer::Asm, what: "a tensor operation is never inside an instruction clause" },
     Rule { id: "GV-1250-SLEEP", layer: Layer::Asm, what: "no indefinite sleep: a wave that sleeps forever may never wake" },
     Rule { id: "GV-1250-MCAST", layer: Layer::Ir, what: "a tensor operation's multicast mask is provably zero unless the launch declares a cluster of at least two workgroups" },
+    Rule { id: "GV-1250-MCAST-REQ", layer: Layer::Ir, what: "the requests of a cluster multicast are provably identical across the workgroups its mask names: a multicast is a rendezvous of identical requests (the data goes to every requesting workgroup once all have asked), so a descriptor word that depends on the workgroup's position along an axis the mask spans never matches" },
     Rule { id: "GV-1250-BAR-ID", layer: Layer::Ir, what: "barrier ids are in range and allocated (work-group, cluster only in a cluster launch, named ones within the declared count)" },
     Rule { id: "GV-1250-NBAR-COUNT", layer: Layer::Ir, what: "a named barrier's member count is a constant in the field's range (1..=63); completion is count-based, so the count is the number of signals per phase, joined or not" },
     Rule { id: "GV-1250-BAR-JOIN", layer: Layer::Ir, what: "named barriers are joined and left in a consistent discipline: one joined barrier at a time, a leave only while joined, the same join state on every path, a wait on a named barrier only while joined to it (any wave may signal any barrier)" },
@@ -271,6 +272,105 @@ fn mcast_mask(f: &Function, defs: &HashMap<ValueId, Op>, kz: &KnownZero, g1: &Op
         }
     }
     Mask::Unknown
+}
+
+/// The cluster-position axes a value depends on: bit 0 = x (TTMP6[3:0]), bit 1 = y (TTMP6[7:4]). The cluster ids (TTMP7 / TTMP9) and the cluster shape fields of TTMP6 are the same for every workgroup of a
+/// cluster: no dependence. Field extractions (`ttmp6 & m`, `(ttmp6 >> s) & m`) are recognised; any other use of TTMP6 depends on both axes (conservative).
+fn pos_dep(o: &Opnd, defs: &HashMap<ValueId, Op>, vars: &HashMap<VarId, Vec<Opnd>>, memo: &mut HashMap<ValueId, u8>, seen_vars: &mut HashSet<VarId>, depth: u32) -> u8 {
+    if depth > 40 {
+        return 3;
+    }
+    fn bits_dep(mask: u32) -> u8 {
+        ((mask & 0xf != 0) as u8) | (((mask & 0xf0 != 0) as u8) << 1)
+    }
+    match o {
+        Opnd::I32(_) | Opnd::F32(_) => 0,
+        Opnd::Var(x) => {
+            if !seen_vars.insert(*x) {
+                return 0; // a cycle through the variable adds nothing beyond its other assignments
+            }
+            let mut d = 0;
+            if let Some(vs) = vars.get(x) {
+                for a in vs {
+                    d |= pos_dep(a, defs, vars, memo, seen_vars, depth + 1);
+                }
+            }
+            seen_vars.remove(x);
+            d
+        }
+        Opnd::Val(v) => {
+            if let Some(d) = memo.get(v) {
+                return *d;
+            }
+            let d = match defs.get(v) {
+                None => 0,
+                Some(Op::ReadTtmp { idx }) => {
+                    if *idx == 6 {
+                        3
+                    } else {
+                        0
+                    }
+                }
+                Some(Op::AndI32(a, Opnd::I32(c))) | Some(Op::AndI32(Opnd::I32(c), a)) => {
+                    // a field of TTMP6: `ttmp6 & c` or `(ttmp6 >> s) & c`
+                    let field = |x: &Opnd| -> Option<u32> {
+                        let Opnd::Val(xv) = x else { return None };
+                        match defs.get(xv) {
+                            Some(Op::ReadTtmp { idx: 6 }) => Some(*c as u32),
+                            Some(Op::LshrI32(Opnd::Val(t), Opnd::I32(s))) if matches!(defs.get(t), Some(Op::ReadTtmp { idx: 6 })) && (0..32).contains(s) => Some((*c as u32) << (*s as u32)),
+                            _ => None,
+                        }
+                    };
+                    match field(a) {
+                        Some(m) => bits_dep(m),
+                        None => pos_dep(a, defs, vars, memo, seen_vars, depth + 1),
+                    }
+                }
+                Some(op) => {
+                    let mut d = 0;
+                    for x in op.operands() {
+                        d |= pos_dep(&x, defs, vars, memo, seen_vars, depth + 1);
+                    }
+                    d
+                }
+            };
+            memo.insert(*v, d);
+            d
+        }
+        _ => 0,
+    }
+}
+
+/// GV-1250-MCAST-REQ: for a tensor operation whose multicast mask is not provably zero, every descriptor word other than the mask must depend only on the cluster-position axes the MASK depends on.
+/// The workgroups that share a mask value differ exactly along the axes it does not depend on, so a word depending on those differs between the workgroups of the group: their requests never
+/// match, the multicast never completes by rendezvous and each request waits for the timeout.
+fn mcast_req_check(f: &Function, defs: &HashMap<ValueId, Op>, vars: &HashMap<VarId, Vec<Opnd>>, pos: usize, g0: &Opnd, g1: &Opnd, v: &mut Vec<Violation>) {
+    let _ = f;
+    let (Opnd::Val(a0), Opnd::Val(a1)) = (g0, g1) else { return };
+    let (Some(Op::RsrcCat { words: w0 }), Some(Op::SgprCat8 { words: w1 })) = (defs.get(a0), defs.get(a1)) else { return };
+    let mut memo: HashMap<ValueId, u8> = HashMap::default();
+    let mut dep = |o: &Opnd| pos_dep(o, defs, vars, &mut memo, &mut HashSet::default(), 0);
+    let mask_dep = dep(&w1[0]);
+    let mut bad = 0u8;
+    let mut which: Vec<String> = Vec::new();
+    for (k, w) in w0.iter().enumerate() {
+        let d = dep(w) & !mask_dep;
+        if d != 0 {
+            bad |= d;
+            which.push(format!("group 0 word {k}"));
+        }
+    }
+    for (k, w) in w1.iter().enumerate().skip(1) {
+        let d = dep(w) & !mask_dep;
+        if d != 0 {
+            bad |= d;
+            which.push(format!("group 1 word {k}"));
+        }
+    }
+    if bad != 0 {
+        let axes = [(1u8, "x"), (2u8, "y")].iter().filter(|(b, _)| bad & b != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(" and ");
+        viol(v, "GV-1250-MCAST-REQ", format!("statement {pos}: a multicast whose request ({}) depends on the cluster position along {axes}, an axis its mask does not depend on: the workgroups named by the mask issue different requests, which never match (each waits for the timeout). A multicast tile must be the same request in every workgroup of its group", which.join(", ")));
+    }
 }
 
 /// The compile-time-known words of a descriptor group (`None` per word the host / the program supplies).
@@ -1609,6 +1709,9 @@ pub fn verify_ir(f: &Function) -> Vec<Violation> {
                 desc_check(f, &defs, pos, g0, g1, &mut v);
                 lds_extent_check(f, &cxm, marker.as_ref().map(|(n, o)| (n.as_str(), o)), pos, g0, g1, &mut v);
                 let m = mcast_mask(f, &defs, &kz, g1);
+                if m != Mask::Zero {
+                    mcast_req_check(f, &defs, &vars_m, pos, g0, g1, &mut v);
+                }
                 if m != Mask::Zero && cluster < 2 {
                     let what = match m {
                         Mask::Const(c) => format!("the multicast mask is {c:#x}"),

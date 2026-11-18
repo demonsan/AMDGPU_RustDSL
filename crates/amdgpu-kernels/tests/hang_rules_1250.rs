@@ -10,6 +10,7 @@
 use amdgpu_codegen::gpu_verify_1250::{verify_asm, verify_ir, with_rules_disabled, RULES};
 use amdgpu_codegen::compile_target;
 use amdgpu_dsl::{CmpPred, CmpTy, DType, FnBuilder, Function, MemTy, Op, Opnd, TdmCpol};
+use amdgpu_dsl::{Ext, TensorTile};
 
 fn gfx1250(f: &Function) -> Result<String, String> {
     compile_target(f, "gfx1250").map(|c| c.asm)
@@ -247,6 +248,48 @@ fn pos_mcast() {
     compile_positive(&tdm_kernel(0x20000, 0));
     compile_positive(&tdm_kernel(0x2000f, 4));   // a declared cluster launch of four workgroups
     ir_positive(&tdm_host_kernel(&[0x10000, 0x20000]));   // the host contract: the low 16 bits are zero
+}
+
+/// A multicast tile in a cluster whose row mask depends on the workgroup's y position (`3 << (2 y)`: the workgroups of one cluster row): the request's offset is `slice_by_x` ? a per-x slice (the
+/// first MXFP4 design: the workgroups of the row issue DIFFERENT requests) : the row's own tile (the same request in the whole row).
+fn mcast_req_kernel(slice_by_x: bool, mask_by_x_request_by_y: bool) -> Function {
+    let mut b = FnBuilder::new("hr_mreq", 64);
+    b.lds(8192);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg_tensor("src", Ext::c(1 << 20));
+    let ps = b.let_(Op::KernargPtr { offset: 0 });
+    let t6 = b.let_(Op::ReadTtmp { idx: 6 });
+    let wx = b.let_(Op::AndI32(Opnd::Val(t6), Opnd::I32(15)));
+    let t4 = b.let_(Op::LshrI32(Opnd::Val(t6), Opnd::I32(4)));
+    let wy = b.let_(Op::AndI32(Opnd::Val(t4), Opnd::I32(15)));
+    // the mask: the row (the workgroups with the same y) or, in the second variant, the column (the same x)
+    let (axis, other) = if mask_by_x_request_by_y { (wx, wy) } else { (wy, wx) };
+    let sh = b.let_(Op::MulI32(Opnd::Val(axis), Opnd::I32(2)));
+    let bits = b.let_(Op::ShlI32(Opnd::I32(3), Opnd::Val(sh)));
+    let mask = b.let_(Op::AndI32(Opnd::Val(bits), Opnd::I32(0xffff)));
+    // the request offset: depends on the same axis as the mask (a legal tile of the group) or on the other axis (a different request in every workgroup of the group)
+    let sel = if slice_by_x { other } else { axis };
+    let off = b.let_(Op::ShlI32(Opnd::Val(sel), Opnd::I32(11)));
+    let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(512), Opnd::I32(1)], stride0: Opnd::I32(512), tile: [512, 1], pad: None, wg_mask: 0 };
+    let (g0, g1) = b.tensor_desc_2d_m(&tile, Opnd::Val(ps), Opnd::Val(off), Opnd::I32(0), Some(Opnd::Val(mask)));
+    b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default());
+    b.wait_tensor(0);
+    b.barrier();
+    let mut f = b.finish();
+    f.kd.push(("cluster_dims".into(), 4));
+    f
+}
+
+#[test]
+fn mut_mcast_req() {
+    ir_mutation(&mcast_req_kernel(true, false), "GV-1250-MCAST-REQ");   // a row mask, a per-x request: the first design (per-workgroup slices)
+    ir_mutation(&mcast_req_kernel(true, true), "GV-1250-MCAST-REQ");    // a column mask, a per-y request
+}
+
+#[test]
+fn pos_mcast_req() {
+    ir_positive(&mcast_req_kernel(false, false));   // a row mask, the row's own tile: the same request in the whole row
+    ir_positive(&mcast_req_kernel(false, true));    // a column mask, the column's own tile
 }
 
 /// The scope word the vendor builds (a variable cleared / set bit by bit): group 1 word 0 = a loop-carried variable starting at 0 and updated `x = (x & 0x1ffffff) | or_const`.
@@ -956,6 +999,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TDM-CLAUSE", "tdm_clause"),
     ("GV-1250-SLEEP", "sleep"),
     ("GV-1250-MCAST", "mcast"),
+    ("GV-1250-MCAST-REQ", "mcast_req"),
     ("GV-1250-BAR-ID", "bar_id"),
     ("GV-1250-NBAR-COUNT", "nbar_count"),
     ("GV-1250-BAR-JOIN", "bar_join"),
