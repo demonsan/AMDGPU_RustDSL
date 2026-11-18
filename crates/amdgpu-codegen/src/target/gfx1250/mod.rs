@@ -113,3 +113,15 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     }
     Ok(crate::Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
+
+/// Test hook: the ABI-input check of `f` compiled with the own tail's preload, with the start sequence's scratch pair `pair` (None: the
+/// emitter's choice). The mutation tests pass the pair of the 2026-11-18 hang.
+pub fn start_sequence_check(f: &Function, pair: Option<u32>) -> Result<(), String> {
+    crate::target::with_target(crate::target::by_name("gfx1250").ok_or("gfx1250")?, || {
+        let pre = f.kernarg_size.div_ceil(4).min(16);
+        let oldp = PRELOAD.with(|c| c.replace(pre));
+        let r = crate::lower_and_allocate(f).and_then(|(m, a)| emit::abi_inputs_intact(&m, &a, pair.unwrap_or((2 + pre).next_multiple_of(2).max(6)), pre));
+        PRELOAD.with(|c| c.set(oldp));
+        r
+    })
+}

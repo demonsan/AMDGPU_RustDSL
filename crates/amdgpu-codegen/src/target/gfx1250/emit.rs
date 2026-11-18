@@ -67,6 +67,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     // nothing else is live at entry). Exact mode: the author's instructions are the prologue (none added).
     if !m.exact {
         let p = (2 + super::preload_n()).next_multiple_of(2).max(6);
+        abi_inputs_intact(m, a, p, super::preload_n())?;
         out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1\n");
         out.push_str(&format!("    s_mov_b64 s[{p}:{}], 0\n", p + 1));
         out.push_str("    v_nop\n");
@@ -908,4 +909,40 @@ mod tests {
         assert!(respell("v_mfma_f32_32x32x16_bf16 a[0:15], v[0:3], v[4:7], a[0:15]").is_err());
         assert!(respell("s_and_saveexec_b64 s[10:11], vcc").is_err());
     }
+}
+
+/// The kernel's ABI input registers - the kernarg pointer s[0:1], the preloaded kernarg dwords s[2 .. 2 + preload) - hold their launch
+/// values until the copies that read them (`SReadPhys`): neither the start sequence's scratch pair s[pair : pair + 1] nor any instruction
+/// before such a copy (layout order, which is the execution order up to the copies at the entry) writes one of them. A write there replaces
+/// a kernel argument (the hang of 2026-11-18: the start sequence's `s_mov_b64 s[6:7], 0` zeroed preloaded dwords 4-5).
+pub fn abi_inputs_intact(m: &MFunction, a: &Alloc, pair: u32, preload: u32) -> Result<(), String> {
+    let abi = 0..2 + preload;
+    let reads: Vec<u32> = m.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| i.op == MOp::SReadPhys).map(|i| i.imm as u32).collect();
+    for r in [pair, pair + 1] {
+        if abi.contains(&r) && reads.contains(&r) {
+            return Err(format!("{}: the kernel start sequence writes s{r}, an ABI input (kernarg pointer / preloaded kernarg dword) read later", m.name));
+        }
+    }
+    let mut written: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for b in &m.blocks {
+        for i in &b.insts {
+            if i.op == MOp::SReadPhys && written.contains(&(i.imm as u32)) {
+                return Err(format!("{}: s{} (an ABI input) is overwritten before its copy", m.name, i.imm));
+            }
+            if let Some(d) = i.dst {
+                let (t, off) = { let mut t = d; let mut off = 0u32; while let Some(&(u, k)) = m.alias.get(&t) { off += k as u32; t = u; } (t, off) };
+                if a.scalar.get(t as usize).copied().unwrap_or(false) {
+                    if let Some(&ph) = a.phys.get(t as usize) {
+                        let w = m.vreg_class(d).dwords() as u32;
+                        for k in 0..w {
+                            if abi.contains(&(ph + off + k)) {
+                                written.insert(ph + off + k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

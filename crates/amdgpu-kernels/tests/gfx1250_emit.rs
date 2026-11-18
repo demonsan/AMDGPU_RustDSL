@@ -122,3 +122,17 @@ fn kernel_descriptor_directives_and_kernarg_preload() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The kernarg preload's ABI inputs survive the kernel start sequence: the emitter's choice passes, the bug that hung a GPU (the start
+/// sequence's scratch pair s[6:7] over preloaded dwords 4-5) is rejected.
+#[test]
+fn the_preloaded_kernarg_dwords_are_never_clobbered_before_their_copies() {
+    let f = amdgpu_kernels::registry::kernel_by_name("probe_g1250_tdm").expect("probe");
+    // compiles with the preload on (the emitter's own scratch pair passes the check)
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    assert!(asm.asm.contains(".amdhsa_user_sgpr_kernarg_preload_length"), "preload on");
+    amdgpu_codegen::target::gfx1250::start_sequence_check(&f, None).expect("the emitter's pair");
+    // mutation: the old fixed pair s[6:7], over preloaded dwords 4-5
+    let e = amdgpu_codegen::target::gfx1250::start_sequence_check(&f, Some(6)).err().expect("s[6:7] holds preloaded dwords");
+    assert!(e.contains("ABI input"), "{e}");
+}
