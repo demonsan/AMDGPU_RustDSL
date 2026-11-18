@@ -296,6 +296,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
     gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1 }, true, false)
 }
 
+/// The 256 x 256 tile in a cluster of `cx` x `cy` workgroups (the vendor launches 4 x 4): A (and its scales) multicast along the cluster row, B along the column.
+pub fn gemm_tdm_stage_f4_256x256_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy }, true, false)
+}
+
 pub fn gemm_tdm_stage_f4_128x128_ks4() -> Function {
     gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1 }, true, false)
 }
