@@ -333,6 +333,31 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         }
     }
     vregs.sort_by_key(|x| (x.0, x.1));
+    // (debug, `AMDC_RA_PEAK`: the VGPR values live at the point of the highest interval pressure, with their defining op and range)
+    if std::env::var("AMDC_RA_PEAK").is_ok() {
+        let span = vregs.iter().map(|x| x.1).max().unwrap_or(0) + 1;
+        let mut pr = vec![0usize; span + 1];
+        for (s, e, _, c) in &vregs {
+            for k in *s..=(*e).min(span) {
+                pr[k] += c.dwords() as usize;
+            }
+        }
+        let (at, peak) = pr.iter().enumerate().max_by_key(|x| *x.1).map(|(i, v)| (i, *v)).unwrap_or((0, 0));
+        let mut defop: HashMap<VReg, String> = HashMap::new();
+        for b in &m.blocks {
+            for i in &b.insts {
+                if let Some(d) = i.dst {
+                    defop.entry(m.canon(d)).or_insert_with(|| format!("{:?}", i.op));
+                }
+            }
+        }
+        eprintln!("RA-PEAK {}: {peak} VGPR dwords at {at}", m.name);
+        let mut live: Vec<_> = vregs.iter().filter(|(s, e, _, _)| *s <= at && at <= *e).collect();
+        live.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), x.0));
+        for (s, e, r, c) in live {
+            eprintln!("RA-PEAK   r{r} {c:?} {s}..{e} def {}", defop.get(r).map(|x| x.as_str()).unwrap_or("-"));
+        }
+    }
     let low_only = low_window_values(m);
     let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
     // the window plan of the retry: wide tuples above v255; with `AMDC_ACCWIN` only the matrix accumulators (D / C of the matrix ops), so a
