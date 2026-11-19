@@ -110,7 +110,7 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                     for p in &pend {
                         let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
                         match p.wmma {
-                            None if !me_trans && p.dist == 0 && !trans_coexec_proven(inst.op) && (hit(&reads, &p.dst) || hit(&writes, &p.srcs)) => need = need.max(1),
+                            None if !me_trans && p.dist == 0 && ((hit(&reads, &p.dst) && !trans_coexec_proven(inst.op, false)) || (hit(&writes, &p.srcs) && !trans_coexec_proven(inst.op, true))) => need = need.max(1),
                             Some((ww, _)) if me_wmma => {
                                 if hit(&ab, &p.dst) && p.dist < ww {
                                     need = need.max(ww - p.dist);
@@ -185,8 +185,10 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
 /// tools/mi450/trans_all.sh: every TRANS op - exp / log / rcp / rsq / sqrt / sin / cos - read at distance 0, RAW in every source position and
 /// WAR, by these classes, bit-identical to the padded build over 5 runs x 1024 workgroups x 512 work-items; docs/gfx1250-hazards.md). LLVM
 /// (fixVALUTransCoexecutionHazards) pads every VALU; every class not listed here (DOT, conversions, moves, ...) keeps the `v_nop`.
-pub fn trans_coexec_proven(op: MOp) -> bool {
+/// `war`: the reader overwrites the TRANS op's source (else it reads the TRANS result). The second evidence set (`probe_g1250_trans_rd2`:
+/// `v_sub_f32` in both source positions, `v_cvt_pk_fp8_f32` as the low / the high source; 84 / 83 sites) covers RAW only.
+pub fn trans_coexec_proven(op: MOp, war: bool) -> bool {
     // (`AMDC_TRANS_PROVEN_OLD`: the first evidence set only, for A/B timing)
-    let second = std::env::var("AMDC_TRANS_PROVEN_OLD").is_err() && matches!(op, MOp::VSubF32 | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi | MOp::VCvtPkFp8F32Half);
+    let second = !war && std::env::var("AMDC_TRANS_PROVEN_OLD").is_err() && matches!(op, MOp::VSubF32 | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi | MOp::VCvtPkFp8F32Half);
     second || matches!(op, MOp::VAddF32 | MOp::VMulF32 | MOp::VFmaF32 | MOp::VMaxF32 | MOp::VPkAddF32)
 }
