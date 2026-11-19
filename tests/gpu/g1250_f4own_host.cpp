@@ -204,15 +204,15 @@ int main(int argc, char** argv) {
         HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));
         const char* ph[4] = {"issue", "window", "wait", "barrier"};
         for (int w = 0; w < 4; ++w) {
-            double sum[4] = {0, 0, 0, 0}; long cnt = 0; double it = 0, pro = 0, lp = 0, epi = 0, e1 = 0, e2 = 0, e3 = 0;
+            double sum[4] = {0, 0, 0, 0}; long cnt = 0; double it = 0, pro = 0, pro_setup = 0, lp = 0, epi = 0, e1 = 0, e2 = 0, e3 = 0;
             for (int r = 0; r < ty; ++r) for (int c = 0; c < tx; ++c) {
                 const unsigned* q = &rec[(((size_t)r * 64 + c) * 4 + w) * 16];
                 if (q[4] == 0) continue;
                 for (int k = 0; k < 4; ++k) sum[k] += (double)q[k] / q[4];
-                it += q[4]; ++cnt; pro += (double)(unsigned)(q[5] - q[8]); lp += (double)(unsigned)(q[6] - q[5]); epi += (double)(unsigned)(q[7] - q[6]); e1 += (double)(unsigned)(q[9] - q[6]); e2 += (double)(unsigned)(q[10] - q[9]); e3 += (double)(unsigned)(q[7] - q[10]);
+                it += q[4]; ++cnt; pro += (double)(unsigned)(q[5] - q[8]); pro_setup += (double)(unsigned)(q[11] - q[8]); lp += (double)(unsigned)(q[6] - q[5]); epi += (double)(unsigned)(q[7] - q[6]); e1 += (double)(unsigned)(q[9] - q[6]); e2 += (double)(unsigned)(q[10] - q[9]); e3 += (double)(unsigned)(q[7] - q[10]);
             }
             if (cnt) printf("{\"stamps\":{\"wave\":%d,\"records\":%ld,\"iters\":%.1f,\"cycles_per_iter\":{\"issue\":%.1f,\"window\":%.1f,\"wait\":%.1f,\"barrier\":%.1f,\"total\":%.1f}}}\n", w, cnt, it / cnt, sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, (sum[0] + sum[1] + sum[2] + sum[3]) / cnt);
-            if (cnt) printf("{\"stamps_kernel\":{\"wave\":%d,\"prologue\":%.0f,\"loop\":%.0f,\"epilogue\":%.0f,\"epi_stage\":%.0f,\"epi_issue\":%.0f,\"epi_store_wait\":%.0f}}\n", w, pro / cnt, lp / cnt, epi / cnt, e1 / cnt, e2 / cnt, e3 / cnt);
+            if (cnt) printf("{\"stamps_kernel\":{\"wave\":%d,\"prologue\":%.0f,\"pro_setup\":%.0f,\"loop\":%.0f,\"epilogue\":%.0f,\"epi_stage\":%.0f,\"epi_issue\":%.0f,\"epi_store_wait\":%.0f}}\n", w, pro / cnt, pro_setup / cnt, lp / cnt, epi / cnt, e1 / cnt, e2 / cnt, e3 / cnt);
             (void)ph;
         }
     }
