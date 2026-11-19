@@ -27,7 +27,7 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    mla_ws_with(MLA_WS_NAME, false, 64 | 256, false)
+    mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384, false)
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -202,12 +202,12 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// `_ws` with every wave taking every page and owning 128 of the V dims (S computed by all four): a 4x shorter PV chain per page, for
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
-    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096, false)
+    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 16384, false)
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256, false)
+    mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384, false)
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
