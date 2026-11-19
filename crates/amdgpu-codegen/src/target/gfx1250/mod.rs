@@ -89,7 +89,10 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     if backend == "own" && !m.exact {
         let plan = waits::plan(&m, &alloc);
         let errs = check::verify_planned(&m, &alloc, &plan);
-        if !errs.is_empty() {
+        // (`AMDC_WAIT_CHECK_WARN`: report and continue, to inspect the code of a failing kernel; never for code that runs)
+        if !errs.is_empty() && std::env::var("AMDC_WAIT_CHECK_WARN").is_ok() {
+            eprintln!("{}: gfx1250 wait self-check (warning only): {} missing wait(s)\n  {}", f.name, errs.len(), errs.join("\n  "));
+        } else if !errs.is_empty() {
             return Err(format!("{}: gfx1250 wait self-check: {} missing wait(s) in the compiler's own output\n  {}", f.name, errs.len(), errs.join("\n  ")));
         }
     }
