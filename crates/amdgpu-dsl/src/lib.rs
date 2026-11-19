@@ -3908,6 +3908,12 @@ impl FnBuilder {
         self.push_stmt(Stmt::Sys { op: SysOp::PrefetchGlobal, imm: offset, imm2: 0, reads: vec![voff.into(), base.into()] });
     }
 
+    /// gfx1250: MODE.SCALAR_PREFETCH_EN = 1 (`s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1`): without it every `s_prefetch_*` is a NOP
+    /// (CDNA5 ISA 8.5 / the MODE register table).
+    pub fn enable_scalar_prefetch(&mut self) {
+        self.push_stmt(Stmt::Sys { op: SysOp::SetRegImm, imm: 1 | (24 << 6), imm2: 1, reads: vec![] });
+    }
+
     /// gfx1250: `s_prefetch_inst pc, offset, count, 0`: a hint to fetch `count + 1` instruction-cache lines from `pc + offset` (no effect on
     /// values or memory; `count` a wave-uniform value).
     pub fn prefetch_inst(&mut self, pc: impl Into<Opnd>, offset: u32, count: impl Into<Opnd>) {

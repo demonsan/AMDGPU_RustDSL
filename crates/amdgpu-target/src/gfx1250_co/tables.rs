@@ -87,6 +87,7 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("s_cselect_b32", "SOP2", 48),
     ("s_endpgm", "SOPP", 48),
     ("s_get_pc_i64", "SOP1", 71),
+    ("s_get_shader_cycles_u64", "SOP1", 6),
     ("s_getreg_b32", "SOPK", 17),
     ("s_load_b128", "SMEM", 2),
     ("s_load_b256", "SMEM", 3),
