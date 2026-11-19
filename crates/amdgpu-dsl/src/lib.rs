@@ -3873,6 +3873,12 @@ impl FnBuilder {
         self.f.kd.push(("g5:persistent_tile_loop".to_string(), 1));
     }
 
+    /// PROTOTYPE launch fact (trusted, listed): the tile body may end with tensor STORES outstanding (the next tile's epilogue waits for them before it rewrites the staging region, and the
+    /// kernel drains after the loop); the protocol's quiescence check does not require a drain at the end of the body.
+    pub fn persistent_tile_overlap_stores(&mut self) {
+        self.f.kd.push(("g5:persistent_tile_overlap_stores".to_string(), 1));
+    }
+
     /// gfx1250 launch fact for the hang-safety verifier: the tensor descriptors of this kernel are built by the HOST (kernarg words), so their global base and extent cannot be proved
     /// (GV-TDM-PROV / GV-GLB-*). A TRUSTED item, listed by `trusted_items`; for evidence / probe kernels only.
     pub fn tdm_host_descriptor(&mut self) {

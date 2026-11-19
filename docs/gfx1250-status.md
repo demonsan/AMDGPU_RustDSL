@@ -150,6 +150,12 @@ I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which 
 - **Workgroup ids in a cluster launch**: the lowering of the workgroup-id ops reads TTMP9 / TTMP7, which hold the cluster ids in a
   cluster launch; cluster kernels compute their tile ids by hand (TTMP6 position + cluster id x dims). Planned: lower them that way when
   the kernel declares cluster dims, or reject the plain op there.
-- **MXFP4 GEMM**: the C epilogue is solved (LDS staging + one tensor store per wave) and the remaining gap to the vendor (about 22 - 44 %
-  depending on the shape) is in the tensor transfers and the barrier coupling; the K dependence of the relaxed wait (above) is unexplained
-  (not a power-of-two stride, not tile order). Tried and dropped: multicast, scale layout, deeper ring, persistence.
+- **MXFP4 GEMM** (e08 round, 2026-11-19): the best kernel is `..._256x256_ks4_s2_epit_roles` (512-K slots in a 2-slot ring: 10.0 PF/s at 8192^3, 7.1 - 7.9 at 4096^3,
+  80 % / 65 - 72 % of the reference library kernel). Per-K-step stamps (`RingOpts::stamps`, host `STAMPS=1`) put the K loop at the reference's cycles per WMMA; the remaining
+  gap is the per-tile prologue (7 %) and the staged epilogue (14 - 15 %, a fixed ~7,000-cycle tensor-store latency whatever the output width). Tried and dropped, all measured:
+  a 192 x 256 tile (5 - 12 % slower at the same K step; with a separate 96 KiB bf16 staging region and the tensor stores draining behind the next tile the epilogue falls to
+  2,250 cycles but the forced 256-K slot makes the loop 19 % costlier per WMMA: 8.2 vs 8.56 PF/s), epilogue stores from registers overlapped into the next tile's K loop (the
+  stores contend with the TDM loads: loop +17 %, 7.8 - 8.4 PF/s), operand swap with bf16 output (direct or conflict-free staged: same epilogue time, 12 % slower window with the
+  row permutation), tile staggering, wave-order permutations (the wave skew follows the wave id), lazy prologue, instruction prefetch, 256 x 128 tile, multicast (neutral at
+  8192^3, +8 % at 4096^3 with 512-K slots). The code of the dropped variants stays as options (archive tags `archive/g1250-gemm-variants-2026-11-19{,b,c}`). Not done: partial M tiles
+  (8192 is not a multiple of 192) need dynamic TDM dimensions and a relational footprint proof in the tensor-bounds prover.
