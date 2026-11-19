@@ -642,7 +642,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg("n", DType::I32, 44, 4);
     if ring.stamps {
         b.arg("dbg", DType::Ptr, 64, 8);
-        b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 64));
+        b.arg_tensor("dbg", (if ring.persistent { Ext::sym("TY") } else { Ext::grid_y() }) * Ext::c(64 * 4 * 64));
     }
     let persistent = ring.persistent;
     if ring.roles && sh.cx * sh.cy > 1 {
@@ -726,7 +726,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let (cx, cy) = (sh.cx, sh.cy);
     let clustered = cx * cy > 1;
     let mut persist_var: Option<amdgpu_dsl::VarId> = None;
-    let mut ovl_vars: Option<(amdgpu_dsl::VarId, amdgpu_dsl::VarId, amdgpu_dsl::VarId, Vec<amdgpu_dsl::VarId>)> = None;
+    let mut ovl_vars: Option<(amdgpu_dsl::VarId, Vec<amdgpu_dsl::VarId>, Vec<amdgpu_dsl::VarId>)> = None;
     // the workgroup's tile coordinates and, in a cluster, its position inside the cluster (TTMP6[3:0] / [7:4]); in a cluster launch TTMP9 / TTMP7[15:0] are the CLUSTER ids
     let (wgx, wgy, wg_x, wg_y) = if clustered {
         let bfe = |b: &mut FnBuilder, v: ValueId, off: i32, wd: i32| {
@@ -762,7 +762,10 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(gy0))];
         if ring.ovl > 0 {
             let z = b.c_i32(0);
-            inits.extend([(DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z))]);
+            inits.push((DType::I32, Opnd::Val(z)));
+            for _ in 0..sh.tn {
+                inits.push((DType::I32, Opnd::Val(z)));
+            }
             assert!(ring.ovl % 2 == 0 && (ring.ovl as i32) <= sh.tm * sh.tn, "ovl: an even number of kept blocks");
             for _ in 0..(ring.ovl as i32 * 2) {
                 let fz = b.let_(Op::FragZero { ty: DType::Frag4 });
@@ -772,7 +775,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         let lv = b.begin_loop(&inits);
         let vy = lv[0];
         if ring.ovl > 0 {
-            ovl_vars = Some((lv[1], lv[2], lv[3], lv[4..].to_vec()));
+            ovl_vars = Some((lv[1], lv[2..2 + sh.tn as usize].to_vec(), lv[2 + sh.tn as usize..].to_vec()));
         }
         persist_var = Some(vy);
         let gy = b.let_(Op::AddI32(Opnd::Var(vy), Opnd::I32(0)));
@@ -971,9 +974,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
 
-    let ovl_ctx = ovl_vars.as_ref().map(|(mr, n0, hp, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { mr: *mr, n0: *n0, hp: *hp, prev: prev.clone(), pc, nn, groups: ring.ovl as i32 / 2 });
+    let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2 });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, ovl: ovl_ctx.clone(), perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
         let t_post = if ring.stamps {
             let c = b.shader_cycles();
@@ -1005,7 +1008,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             for g in 0..ovl.groups {
                 let c = b.bind_cond(ev(lim).le(g));
                 b.begin_if(c);
-                ovl.store_group(b, sh.tm, sh.tn, g);
+                ovl.store_group(b, pc, sh.tn, g);
                 b.end_if();
             }
             let g8s = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
@@ -1044,8 +1047,13 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     }
                 }
             }
-            b.set_var(ovl.mr, Opnd::Val(mr));
-            b.set_var(ovl.n0, Opnd::Val(n0));
+            for j in 0..sh.tn {
+                let mrj = b.add_i32(mr, Opnd::I32(j * 16));
+                let rb = b.mul_i32(mrj, rowbytes);
+                let nb = b.let_(Op::ShlI32(Opnd::Val(n0), Opnd::I32(1)));
+                let off = b.add_i32(rb, nb);
+                b.set_var(ovl.ptrs[j as usize], Opnd::Val(off));
+            }
             let one = b.c_i32(1);
             b.set_var(ovl.hp, Opnd::Val(one));
         } else if epi == 3 {
@@ -1283,7 +1291,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         if let Some(ovl) = ovl_ctx.clone() {
             // the last tile's packed accumulators (a persistent launch runs at least one tile)
             for g in 0..ovl.groups {
-                ovl.store_group(&mut b, sh.tm, sh.tn, g);
+                ovl.store_group(&mut b, pc, sh.tn, g);
             }
         }
     }
