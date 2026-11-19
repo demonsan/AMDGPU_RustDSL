@@ -65,22 +65,23 @@ reference, error equal to the vendor's):
 **MXFP4 GEMM** (all bit-exact against the CPU reference; ours f32 output with natural row-major A / B / scales, the vendor's bf16
 output with preshuffled B, 4 x 4 cluster, persistent grid):
 
-| kernel | 4096^3 PF/s | 8192^3 PF/s | 8192 x 8192 x 16384 PF/s |
+| kernel (e08, paired alternating with the vendor) | 4096^3 PF/s | 8192^3 PF/s | 8192 x 8192 x 16384 PF/s |
 |---|---|---|---|
-| `gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles` (256 x 256, 4 waves, ks 2, TDM row padding, LDS-staged epilogue with a tensor store, wave roles) | **6.25** | 8.47 | 8.33 |
-| `..._256x256_ks2_epit_roles_relax` (the same, tensor wait relaxed to the next tile only) | 5.34 | **9.27** | **10.0** |
-| vendor MXFP4 GEMM | 11.1 | 12.9 | |
+| `gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles` (256 x 256, 4 waves, **K slots of 512 in a 2-slot ring**, TDM row padding, LDS-staged epilogue with a tensor store, wave roles) | 7.1 - 7.35 | **9.99 - 10.04** | 10.0 |
+| the same in a 4 x 4 lockstep multicast cluster (`..._epit_roles_c4x4_lock`) | **7.90** | 9.99 | |
+| previous best `..._ks2_epit_roles_relax` (K slots of 256, 3-slot ring) | 5.4 | 9.41 | 10.0 |
+| vendor MXFP4 GEMM | 11.0 | 12.4 - 12.5 | |
 
-That is about 56 % of the vendor at 4096^3, 72 % at 8192^3 and 78 % of the vendor's 8192^3 rate at K = 16384. **Dispatch rule** (the
-relaxed wait's benefit depends irregularly on K; measured table in [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md)): the
-relaxed kernel for K <= 3584 or K >= 5120, the plain `epit_roles` for 3840 <= K <= 4608. Progression at 8192^3: 0.98 (first stage-template
-kernel, 128 x 64) -> 1.37 (cooperative loads) -> 2.44 (two K sub-steps per slot) -> 3.3 (256 x 256 tile) -> 6.7 (TDM row padding: 8-way
-LDS bank conflicts removed) -> 8.1 (LDS-staged epilogue with a tensor store) -> 9.3 (wave roles + relaxed wait). Did not help (all
-measured, opt-in or dropped): cluster multicast, free-running or in lockstep, 2 x 2 and 4 x 4, on the unpadded tile (-7 .. -15 %) and on
-the padded LDS-epilogue tile (-11 .. -22 %); the preshuffled scale layout (alone and composed); a 4-slot ring; a tile-order swizzle; the
-persistent grid (+0.5 % at best on the best kernel; a cross-tile overlap cannot fit beside the LDS-staged epilogue, which needs 264 of the
-320 KiB). A deletion profile of the padded kernel before the epilogue work put the time in the tensor transfers and the work-group barriers,
-not in the WMMAs. Details: [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md).
+That is about 80 % of the vendor at 8192^3 and 65 - 72 % at 4096^3. The 512-K kernel needs K a multiple of 512 (the host rejects other K; the 256-K kernels stay for K = 256 mod 512) and shows
+no K-dependent dip (sweep at 4096 x 4096: K = 2048 5.5, 6144 7.7, 8192 9.1 PF/s; 8192 x 8192 x 4096 8.4). Progression at 8192^3: 0.98 (first stage-template kernel, 128 x 64) -> 1.37
+(cooperative loads) -> 2.44 (two K sub-steps per slot) -> 3.3 (256 x 256 tile) -> 6.7 (TDM row padding: 8-way LDS bank conflicts removed) -> 8.1 (LDS-staged epilogue with a tensor store) ->
+9.3 (wave roles + relaxed wait) -> **10.0 (K slots of 512 in a 2-slot ring: one barrier and one stage per 512 K)**. Per-K-step stamps (shader-cycle counter, `RingOpts::stamps`, host
+`STAMPS=1`) of the 512-K kernel at 8192^3: window (fragment reads + WMMA issue) 81 %, barrier 12 %, stage issue 3 %, wait 3 %; per tile the prologue is 7 %, the K loop 78 % and the
+epilogue 14 - 15 % (about 7,000 cycles: a fixed staged-tensor-store latency, the same for bf16 output). The K loop alone runs at the vendor's all-in cycles per WMMA; the remaining gap is
+the prologue / epilogue per tile, which the vendor hides with a persistent loop (an overlap needs a staging buffer apart from the ring, which does not fit beside a 294 KiB ring).
+Did not help (all measured, opt-in or dropped): cluster multicast on the 256-K kernels (-7 .. -22 %; now neutral at 8192^3 and +8 % at 4096^3 with 512-K slots), the preshuffled scale layout,
+a 4-slot ring, a tile-order swizzle, a lazy prologue, instruction prefetch, a 256 x 128 tile, tile staggering (+5 % at 4096^3, -2 % at 8192^3), the persistent grid (+0.5 %), and the operand
+swap with a bf16 epilogue (direct stores or a conflict-free staged tile): same or longer epilogue, 12 % slower window. Details: [`mxfp4-gemm-gfx1250-plan.md`](mxfp4-gemm-gfx1250-plan.md).
 
 ## 5. Optimisation log (MLA; what helped, what did not, and why)
 
