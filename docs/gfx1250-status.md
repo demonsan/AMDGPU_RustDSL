@@ -129,6 +129,29 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
 | direct epilogue for `_ws4` (no cross-wave merge) | slower (5.1 vs 4.3 us) | - |
 | the rope reads added to the page plan's read model | 0 (same plan) | no single TDM pad serves both the 512-byte K rows and the 64-byte rope rows; the rope chunk stays at 2x its ideal (~0.3 us of 52); a separate rope TDM with its own pad would be needed |
 
+### Short sequences against the vendor (B = 4, e08, us; plain timed runs)
+
+| ctx | vendor | `_ws` | `_ws2` | `_ws4` | first kernel (`mla_g1250_qh16`) |
+|---|---|---|---|---|---|
+| 64 | 2.95 | 8.05 | 5.77 | 4.51 | 8.07 |
+| 128 | 3.01 | 8.12 | 5.89 | 5.36 | 7.95 |
+| 256 | 3.69 | 8.23 | 6.70 | 6.98 | 9.00 |
+| 512 | 7.78 | 9.37 | 8.47 | 10.17 | 11.10 |
+| 1024 | 9.15 | 11.21 | 11.78 | 16.37 | 15.33 |
+| 2048 | 12.16 | 14.73 | 18.21 | 28.04 | 23.50 |
+| 4096 | 18.25 | 21.71 | 30.93 | 52.08 | 40.36 |
+
+The vendor runs ~3 us flat up to 4 pages per sequence and steps to 7.8 us at 8 pages (presumably a second code path or its pipeline
+fill); above that it fits ~6.3 us fixed + 0.187 us per page and work-group, `_ws` ~7.6 us + 0.22 us. At 4 x 1000 the 2 us gap is
+~1.3 us fixed and ~0.5 us per-page rate. Structure (replica §8, the kernel name `16mx1_32nx4_np_3p`): 4 waves split each 2-page window's
+tokens (32 each), P goes through LDS, each wave owns 128 V dims: no final cross-wave merge, a per-window exchange instead. That is our
+first kernel's split, whose per-window cost is ~2.5 x the vendor's; `_ws` replaces the exchange by one final merge (~25 % of a short
+kernel). Copying the vendor's quarter-page tensor loads into `_ws` (`_wsq`, 4 ops per page): 1.00 - 1.04 x (worse), dropped. Matching
+the vendor on short sequences means bringing the first kernel's per-window exchange down to the vendor's cost (a redesign). The vendor's
+KV path is per-lane async loads (`global_load_async_to_lds_b128`, no tensor ops); the first page of each `_ws` wave by async loads
+(`_wsy`, 72 per lane): 1.06 - 1.12 x (worse), dropped. The prologue itself (bounds / scales / page-table scalar loads) is ~5 % of a
+one-page kernel by the stamps, and issuing the first tensor load right after the bounds (`_wse`) measured 0.
+
 ### Profiling inside a kernel: shader-clock stamps
 
 `FnBuilder::shader_cycles()` reads the 64-bit shader-clock counter (`s_get_shader_cycles_u64`; `s_getreg` of the older SHADER_CYCLES
@@ -165,6 +188,7 @@ I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which 
 - **Short sequences** (MLA ~1.2 x the vendor at 4 x 1000 and 32 x 2048): the fixed per-work-group cost (prologue chain, first pages,
   cross-wave merge, final). Measured and rejected so far: KV split (two launches or fused), early staging, instruction prefetch, load
   hoisting, an atomic merge (table above). The K reads are volume-bound (each wave reads the whole page; conflict-free per the planner).
+  The vendor's advantage there is structural (no final merge, a cheap per-window exchange; §5 "Short sequences against the vendor").
 - **Workgroup ids in a cluster launch**: the lowering of the workgroup-id ops reads TTMP9 / TTMP7, which hold the cluster ids in a
   cluster launch; cluster kernels compute their tile ids by hand (TTMP6 position + cluster id x dims). Planned: lower them that way when
   the kernel declares cluster dims, or reject the plain op there.

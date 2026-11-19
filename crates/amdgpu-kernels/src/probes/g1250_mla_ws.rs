@@ -284,6 +284,11 @@ pub fn mla_g1250_qh16_wsq() -> Function {
     mla_ws_with("mla_g1250_qh16_wsq", false, 64 | 256 | 16384 | 65536 | 131072 | 8388608, false)
 }
 
+/// `_ws` with each wave's first page by per-lane async loads.
+pub fn mla_g1250_qh16_wsy() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsy", false, 64 | 256 | 16384 | 65536 | 131072 | 16777216, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -321,6 +326,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let fadd = branchless & 2097152 != 0;
     // bit 23: a page as 4 quarter tensor ops (like the vendor's per-wave quarter loads) instead of one 36 KB op
     let quarters = branchless & 8388608 != 0;
+    // bit 24: the wave's first page by per-lane async loads (`global_load_async_to_lds_b128`, 72 per lane; the vendor's KV path) instead
+    // of the tensor data mover; later pages by the TDM
+    let async0 = branchless & 16777216 != 0;
     let qn: u8 = if quarters { 4 } else { 1 };
     const QUARTER: i32 = PAGE_BYTES / 4;
     assert!(!quarters || branchless & 1048576 == 0, "quarters: not with the early first stage");
@@ -944,7 +952,25 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let nw = b.bind_i32((ev(npages) - ev(gbase) + ev(gstride) - 1) >> ev(gshift));
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
-    if !early {
+    if async0 {
+        let pid = ptab_rd(&mut b, amdgpu_dsl::I32::c(0));
+        let goff = b.bind_i32(ev(pid) * PAGE_BYTES + ev(lane) * 16);
+        let gp = b.let_(Op::PtrAdd { base: Opnd::Val(pkv), byte_off: Opnd::Val(goff) });
+        let mine = kw[0].mine(w);
+        let lb = layout.at_expr(&mut b, ev(lane) * 16);
+        let mb = b.bind_i32(mine.base());
+        let lds0 = b.bind_i32(ev(mb) + ev(lb));
+        let bases: Vec<i32> = (0..32).map(|l| 16 * l).collect();
+        let gen0 = b.c_i32(0);
+        mine.write(&mut b, gen0, |b| {
+            for k in 0..(PAGE_BYTES / 512) {
+                let ga = b.let_(Op::PtrAdd { base: Opnd::Val(gp), byte_off: Opnd::I32(512 * k) });
+                let la = b.bind_i32(ev(lds0) + layout.delta(&bases, 512 * k));
+                b.load_async_lds_b128(la, ga, 0);
+            }
+        });
+        b.wait_counter(amdgpu_dsl::WaitCtr::Async, 0);
+    } else if !early {
         stage(&mut b, 0, amdgpu_dsl::I32::c(0));
     }
     if exit_tdm {
