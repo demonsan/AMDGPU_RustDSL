@@ -35,6 +35,9 @@ fn mla_page_reads_are_conflict_free_under_the_plan() {
         let kw = k_reads(16 * w);
         println!("  wave {w} K reads cost {}", cost(&kw, layout.pad));
     }
+    // the rope chunk: lane (m, g) reads 2 x 16 B at ROPE_OFF + m 64 + 32 g + 16 h (row stride 64 B; not in the plan's read model)
+    let rope: Vec<LaneRead> = (0..2u32).map(|h| LaneRead { bytes: 16, lanes: (0..32u32).map(|l| Some(amdgpu_stage::attention::mla::ROPE_OFF as u32 + (l & 15) * 64 + 32 * (l >> 4) + 16 * h)).collect() }).collect();
+    println!("  rope reads cost {} (unpadded {}, ideal {})", cost(&rope, layout.pad), cost(&rope, None), ideal(&rope));
     assert_eq!(kp, ki, "K reads conflict under the planned padding");
     assert_eq!(vp, vi, "V reads conflict under the planned padding");
 }
