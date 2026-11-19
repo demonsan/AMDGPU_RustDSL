@@ -202,7 +202,7 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// `_ws` with every wave taking every page and owning 128 of the V dims (S computed by all four): a 4x shorter PV chain per page, for
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
-    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 16384, false)
+    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 32768, false)
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
@@ -917,6 +917,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     stamp(&mut b);
     pf_here(&mut b, 1);
     let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
+    // (measured slower than the merge path below on e08 - 5.1 vs 4.3 us at 1 x 64 - and kept off: bit 15 set in `_ws4`)
     if dg == 4 && !split && !tstamp && branchless & 32768 == 0 {
         // every wave saw every page: its O (128 dims) is complete and its max / sums are the work-group's. No cross-wave merge: the
         // row sum of head m = the two lane halves' partials (v_permlane16_swap), 1 / L of row 8 g + r by v_readlane, then the scaled O through
