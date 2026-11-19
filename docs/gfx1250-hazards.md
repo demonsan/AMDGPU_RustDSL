@@ -39,7 +39,7 @@ sin / cos):
 | `v_mul_f32` | RAW (cos), WAR (all) | 4 + 23 | identical |
 | `v_pk_add_f32` (VOP3P packed f32) | RAW (one half of the pair) | 21 | identical |
 | `v_sub_f32` (probe `probe_g1250_trans_rd2`) | RAW src0 / src1 | 84 | identical |
-| `v_cvt_pk_fp8_f32` (probe `probe_g1250_trans_rd2`) | RAW as the low / the high source | 83 | identical |
+| `v_cvt_pk_fp8_f32` (probe `probe_g1250_trans_rd2`) | RAW (the low / op_sel high form, 32-bit) | 42 | identical |
 
 The gfx1250 hazard pass therefore omits the `v_nop` for these readers only (`hazards::trans_coexec_proven`); DOT, the other conversions,
 moves and every other reader keep it. The last two rows: `KERNEL=probe_g1250_trans_rd2 tools/mi450/trans_all.sh` on e08-01, 2026-11-19

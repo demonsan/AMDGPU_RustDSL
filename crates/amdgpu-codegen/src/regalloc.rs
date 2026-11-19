@@ -389,7 +389,14 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     let acc = if !wide_high {
         std::collections::HashSet::new()
     } else if acc_high {
-        matrix_accumulators(m)
+        // the accumulators that live across blocks (the loop-carried ones: an attention kernel's O tiles); a block-local one (the S tile
+        // of a score WMMA) stays with its operands, so the score matrix ops and the softmax VALU keep one window setting
+        let mut x = matrix_accumulators(m);
+        if std::env::var("AMDC_ACC_HIGH_ALL").is_err() {
+            let carried: HashSet<VReg> = live_in.iter().flat_map(|s| s.iter().copied()).collect();
+            x.retain(|r| carried.contains(r));
+        }
+        x
     } else if std::env::var("AMDC_ACCWIN").is_err() {
         m.vregs.iter().enumerate().filter(|(_, c)| c.is_vector() && c.dwords() >= 8).map(|(r, _)| r as VReg).collect()
     } else {
