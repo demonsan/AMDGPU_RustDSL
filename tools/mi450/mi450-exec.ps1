@@ -38,6 +38,22 @@ $kh = Join-Path $env:USERPROFILE '.ssh\mi450_known_hosts'
 $wsdir = "$($cfg.work)/ws/$Tag"
 $sshBase = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=20', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh", "$user@$($cfg.host)")
 
+# e08 is a shared account whose authorized_keys gets rewritten: if the key is refused and a local askpass helper exists
+# (%USERPROFILE%\.ssh\<node>-askpass.cmd, outside the repo: the password never enters the repository), re-append our public key once.
+$askpass = Join-Path $env:USERPROFILE ".ssh\$Node-askpass.cmd"
+if ($cfg.user -and (Test-Path $askpass)) {
+    $eap0 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & ssh @sshBase 'true' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $pub = (Get-Content "$key.pub" -Raw).Trim()
+        $env:SSH_ASKPASS = $askpass; $env:SSH_ASKPASS_REQUIRE = 'force'; if (-not $env:DISPLAY) { $env:DISPLAY = 'x' }
+        & ssh -o ConnectTimeout=20 -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$kh" "$user@$($cfg.host)" "mkdir -p ~/.ssh; grep -qF '$pub' ~/.ssh/authorized_keys 2>/dev/null || echo '$pub' >> ~/.ssh/authorized_keys" 2>&1 | Out-Null
+        Remove-Item Env:SSH_ASKPASS, Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+        Write-Host "[mi450] $Node refused the key: re-appended it via the local askpass helper"
+    }
+    $ErrorActionPreference = $eap0
+}
+
 function Invoke-Remote([string]$bash, [switch]$Wrap) {
     if ($Wrap) { $bash = "echo @@MI450-BEGIN@@`n" + $bash + "`n" + 'echo "@@MI450-END rc=$?@@"' }
     # base64 transport: no quoting problems, no ';' on the ssh command line
