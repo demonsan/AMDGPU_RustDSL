@@ -245,6 +245,15 @@ pub fn mla_g1250_qh16_wsm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsm", false, 64 | 256 | 16384 | 65536 | 131072, false)
 }
 
+/// candidates: `_ws2` / `_ws4` with the last page apart
+pub fn mla_g1250_qh16_ws2m() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws2m", true, 64 | 256 | 16384 | 65536 | 131072, false)
+}
+
+pub fn mla_g1250_qh16_ws4m() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4m", false, 64 | 256 | 4096 | 32768 | 65536 | 131072, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
