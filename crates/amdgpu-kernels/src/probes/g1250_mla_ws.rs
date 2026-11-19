@@ -205,6 +205,11 @@ pub fn mla_g1250_qh16_ws4() -> Function {
     mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096, false)
 }
 
+/// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
+pub fn mla_g1250_qh16_ws2() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
