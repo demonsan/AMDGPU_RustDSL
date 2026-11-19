@@ -9,7 +9,7 @@ echo RUNNING > "$O/STATUS"
 [ "${IDLE_GPU:-none}" = "3" ] && { echo "REFUSE: GPU 3"; exit 9; }
 cargo build --release --bin amdc -j 64 2>&1 | tail -1
 A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
-k=probe_g1250_trans_all
+k=${KERNEL:-probe_g1250_trans_all}
 $A emit $k --target gfx1250 --backend=own --out $O/ref.s > $O/emit.log 2>&1 || { echo EMIT-FAIL; tail -5 $O/emit.log; exit 4; }
 python3 tools/mi450/trans_shape.py $O/ref.s $O || { echo SHAPE-FAIL; exit 7; }
 for f in $O/shaped.s $O/no_*.s; do $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o ${f%.s}.co $f || { echo "ASM-FAIL $f"; exit 5; }; done
