@@ -488,6 +488,12 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), ..RingOpts::default() })
 }
 
+/// The vendor's 192 x 256 tile with the operand swap (A operand = the B matrix: 4 x 6 blocks of 32 x 16 per wave), K slots of 256 in a 3-slot ring, wave roles, a persistent grid and a
+/// SEPARATE bf16 staging region whose four tensor stores per wave drain behind the next tile's prologue (host PERSIST=G, OUT_BF16=1; M a multiple of 192).
+pub fn gemm_tdm_stage_f4_192x256_swap_ovl(name: &str, relax: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 6, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles: true, swap: true, persistent: true, epilogue_lds: 4, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
 /// The vendor's 192 x 256 tile (2 x 2 waves of 96 x 128: 3 x 8 blocks, 24 accumulator blocks) with K slots of 256, the f32 LDS-staged epilogue and wave roles; M a multiple of 192.
 pub fn gemm_tdm_stage_f4_192x256_ks2(name: &str, relax: bool, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
@@ -638,6 +644,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     use amdgpu_tile::lane::{Role, Roles};
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let (bm, bn) = (sh.bm(), sh.bn());
+    // the output tile: the swap mode reads the B matrix as the A operand, so its tile is bn rows (M) by bm columns (N)
+    let (tile_m, tile_n) = if ring.swap { (bn, bm) } else { (bm, bn) };
     // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
     let row_pad = if pad { if ring.perm() { f4_row_pad_perm(sh.ks) } else { f4_row_pad(sh.ks) } } else { 0 };
     let row_l = 64 * sh.ks + row_pad;
@@ -660,6 +668,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     if persistent {
         // the outermost loop is the persistent tile loop (G5 verifies one tile body ending quiescent)
         b.persistent_tile_loop();
+        if ring.epilogue_lds == 4 {
+            b.persistent_tile_overlap_stores();
+        }
         b.arg("tiles_y", DType::I32, 48, 4);
         b.arg("lg_tiles_x", DType::I32, 52, 4);
         b.arg("ystep", DType::I32, 56, 4);
@@ -673,12 +684,12 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let (m_rows, n_cols) = if persistent {
         b.sym_range("TX", 1, 1 << 12);
         b.sym_range("TY", 1, 1 << 12);
-        b.ka_is(44, Ext::sym("TX") * Ext::c(bn as i64));
+        b.ka_is(44, Ext::sym("TX") * Ext::c(tile_n as i64));
         b.ka_is(48, Ext::sym("TY"));
-        (Ext::sym("TY") * Ext::c(bm as i64), Ext::sym("TX") * Ext::c(bn as i64))
+        (Ext::sym("TY") * Ext::c(tile_m as i64), Ext::sym("TX") * Ext::c(tile_n as i64))
     } else {
-        b.ka_is(44, Ext::grid_x() * Ext::c(bn as i64));
-        (Ext::grid_y() * Ext::c(bm as i64), Ext::grid_x() * Ext::c(bn as i64))
+        b.ka_is(44, Ext::grid_x() * Ext::c(tile_n as i64));
+        (Ext::grid_y() * Ext::c(tile_m as i64), Ext::grid_x() * Ext::c(tile_n as i64))
     };
     b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
     b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
@@ -699,16 +710,20 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
-    assert!(epi == 0 || epi == 3 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 with the swap)");
+    assert!(epi == 0 || epi == 3 || epi == 4 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap)");
+    assert!(epi != 4 || (ring.swap && sh.bf16), "epilogue_lds 4: bf16 output with the operand swap");
     assert!(epi != 3 || (ring.swap && sh.bf16), "epilogue_lds 3: bf16 output with the operand swap");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
     // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
     // so its staging rows are unpadded)
-    let epi_rs = if epi == 3 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
+    let epi_rs = if epi == 3 || epi == 4 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
-        if need > ring_bytes {
+        if epi == 4 {
+            // a separate staging region behind the ring: the next tile's stages load into the ring while the tensor stores still read the staging
+            let _ = lds.ring("EPI", need, 1, Layout::Linear);
+        } else if need > ring_bytes {
             let _ = lds.ring("EPI", need - ring_bytes, 1, Layout::Linear);
         }
     }
@@ -716,7 +731,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
     // swap: the A operand reads the B matrix and its scales (and vice versa)
-    assert!(!ring.swap || (bm == bn && sh.cx * sh.cy == 1), "operand swap: a square tile, no cluster");
+    assert!(!ring.swap || sh.cx * sh.cy == 1, "operand swap: no cluster");
     let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
     let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
     let t_start = if ring.stamps {
@@ -833,8 +848,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
-    let row0 = b.mul_i32(wgy, Opnd::I32(bm));
-    let col0 = b.mul_i32(wgx, Opnd::I32(bn));
+    let row0 = b.mul_i32(wgy, Opnd::I32(tile_m));
+    let col0 = b.mul_i32(wgx, Opnd::I32(tile_n));
     // bytes per row: fp4 K / 2, scales K / 32
     let kb = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(1)));
     let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
@@ -1063,6 +1078,59 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             }
             let one = b.c_i32(1);
             b.set_var(ovl.hp, Opnd::Val(one));
+        } else if epi == 4 {
+            // bf16 staging in a region of its own (behind the ring): wait for the previous tile's tensor stores (they read it), pack and write 16-byte pieces into 64-byte-wide column chunks
+            // of 96 rows (one chunk per 32 columns), issue the four tensor stores and go on: the next tile's prologue overlaps their drain
+            b.wait_tensor(0);
+            let ring_bytes_c = ring.slots as i32 * (bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks);
+            let (nrows, chunk) = (sh.tn * 16, sh.tn * 16 * 64);
+            let wsz = chunk * sh.tm;
+            let wbase = b.mul_i32(wid, Opnd::I32(wsz));
+            let wbase = b.add_i32(wbase, Opnd::I32(ring_bytes_c));
+            let g16 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(4)));
+            let m64 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(6)));
+            let l0 = b.add_i32(wbase, m64);
+            let l0 = b.add_i32(l0, g16);
+            for i in 0..sh.tm {
+                for j in 0..sh.tn {
+                    let acc = body.acc[(i * sh.tn + j) as usize];
+                    for h in 0..2i32 {
+                        let mut parts: Vec<Opnd> = Vec::new();
+                        for q in 0..4i32 {
+                            let x0 = b.frag_slice(Opnd::Var(acc), (h * 8 + 2 * q) as u8, 1);
+                            let x1 = b.frag_slice(Opnd::Var(acc), (h * 8 + 2 * q + 1) as u8, 1);
+                            let f0 = b.bitcast_f32(x0);
+                            let f1 = b.bitcast_f32(x1);
+                            parts.push(Opnd::Val(b.let_(Op::CvtPkBf16F32(Opnd::Val(f0), Opnd::Val(f1)))));
+                        }
+                        let v4 = b.frag_cat(&parts);
+                        let addr = b.bind_i32(ev(l0) + (i * chunk + j * 1024 + h * 32));
+                        b.store_lds_b128(addr, v4);
+                    }
+                }
+            }
+            b.wait_lds(0);
+            let r0 = b.mul_i32(wj, Opnd::I32(nrows));
+            let r0 = b.add_i32(r0, row0);
+            let tile = TensorTile { data_size: 2, tensor_dim: [Opnd::I32(32), Opnd::I32(nrows)], stride0: Opnd::Val(nn), tile: [32, nrows as u16], pad: None, wg_mask: 0 };
+            for i in 0..sh.tm {
+                let c0 = b.mul_i32(wi, Opnd::I32(sh.tm * 32));
+                let c0 = b.add_i32(c0, col0);
+                let c0 = b.add_i32(c0, Opnd::I32(i * 32));
+                let lin = b.mul_i32(r0, nn);
+                let lin = b.add_i32(lin, c0);
+                let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(1)));
+                let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
+                let lw = b.bind_i32(ev(wbase) + i * chunk);
+                let lw_s = b.let_(Op::ReadFirstLane(Opnd::Val(lw)));
+                let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(lw_s));
+                b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+            }
+            // (no wait here: the stores drain behind the next tile's prologue; the next epilogue waits before it rewrites the staging, the kernel drains after the tile loop)
+            if persistent {
+                b.wait_lds(0);
+                b.barrier();
+            }
         } else if epi == 3 {
             // the staged bf16 epilogue: the lane's 16 contiguous columns of a row go to LDS as two 16-byte stores into 64-byte-wide column chunks (one per 32 columns), which the tensor store
             // then writes as 128-row tiles of 64 bytes; every wave owns 32 KiB of the (dead) ring
@@ -1295,6 +1363,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         let done = b.bind_cond(ev(ny).ge(ev(tyk)));
         b.break_if(done);
         b.end_loop();
+        if ring.epilogue_lds == 4 {
+            b.wait_tensor(0);
+        }
         if let Some(ovl) = ovl_ctx.clone() {
             // the last tile's packed accumulators (a persistent launch runs at least one tile)
             for g in 0..ovl.groups {

@@ -358,7 +358,8 @@ impl<'a> Sim<'a> {
     fn quiescent_at_end(&mut self, first: usize, stmt: usize) {
         let (undrained, unfenced) = {
             let body = &self.items[first.min(self.items.len())..];
-            let undrained = body.iter().rposition(|it| matches!(it, Item::Tensor)).map_or(false, |lt| !body[lt + 1..].iter().any(|it| matches!(it, Item::WaitTensor { count: 0, .. })));
+            let overlap = self.f.kd.iter().any(|(k, v)| k == "g5:persistent_tile_overlap_stores" && *v != 0);
+            let undrained = !overlap && body.iter().rposition(|it| matches!(it, Item::Tensor)).map_or(false, |lt| !body[lt + 1..].iter().any(|it| matches!(it, Item::WaitTensor { count: 0, .. })));
             let unfenced = body.iter().rposition(|it| matches!(it, Item::Access { .. } | Item::Tensor)).map_or(false, |la| !body[la + 1..].iter().any(|it| matches!(it, Item::Barrier { .. })));
             (undrained, unfenced)
         };
