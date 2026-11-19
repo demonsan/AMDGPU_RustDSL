@@ -220,6 +220,15 @@ pub fn mla_g1250_qh16_wsg() -> Function {
     mla_ws_with("mla_g1250_qh16_wsg", false, 64 | 256 | 16384, false)
 }
 
+/// ablation aids (not registered): `_ws4` without the GEMM policy; and also with the cross-wave merge instead of the direct epilogue
+pub fn mla_g1250_qh16_ws4b() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4b", false, 64 | 256 | 4096, false)
+}
+
+pub fn mla_g1250_qh16_ws4c() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4c", false, 64 | 256 | 4096 | 32768, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -908,7 +917,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     stamp(&mut b);
     pf_here(&mut b, 1);
     let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
-    if dg == 4 && !split && !tstamp {
+    if dg == 4 && !split && !tstamp && branchless & 32768 == 0 {
         // every wave saw every page: its O (128 dims) is complete and its max / sums are the work-group's. No cross-wave merge: the
         // row sum of head m = the two lane halves' partials (v_permlane16_swap), 1 / L of row 8 g + r by v_readlane, then the scaled O through
         // the wave's quarter of the (dead) merge buffer for 16-byte stores
