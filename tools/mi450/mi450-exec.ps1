@@ -1,7 +1,7 @@
 # Run a bash payload on an MI450 (gfx1250) node: optional repo sync, idle-GPU selection, gpu-lock on a08-1, hard timeouts, hang watchdog.
 # ASCII only (Windows PowerShell 5.1 and pwsh).
 #
-#   mi450-exec.ps1 -Node f01|a08 -Payload '<bash>' [-PayloadFile file.sh] [-Sync] [-TimeoutSec 600] [-GpuIdx N] [-NoGpu]
+#   mi450-exec.ps1 -Node f01|a08|e08 -Payload '<bash>' [-PayloadFile file.sh] [-Sync] [-TimeoutSec 600] [-GpuIdx N] [-NoGpu]
 #
 # What the payload sees (exported by the bootstrap):
 #   $W          work dir on the node   (f01-2: /data/blyu/amdrustdsl, a08-1: ~/amdrustdsl);  $SRC = $W/src (the synced repo), $CARGO_TARGET_DIR = $W/target
@@ -11,7 +11,7 @@
 # Hard limits: the whole payload runs under `timeout -s KILL <TimeoutSec>` (its own process group, so children die too); gpurun has its own limit (-GpuTimeoutSec, default 120).
 # Output: only what the payload prints (the node's login banner is filtered); the exit code of the payload is the exit code of this script (250 = ssh / sync failure, 251 = no idle GPU).
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('f01', 'a08')][string]$Node,
+    [Parameter(Mandatory = $true)][ValidateSet('f01', 'a08', 'e08')][string]$Node,
     [string]$Payload = '',
     [string]$PayloadFile = '',
     [switch]$Sync,
@@ -30,11 +30,13 @@ if (-not $Repo) { $Repo = (Get-Location).Path }
 $cfg = @{
     f01 = @{ host = '10.5.236.36'; work = '/data/blyu/amdrustdsl'; lock = $false }
     a08 = @{ host = 'ctheliosr-1b112-a08-1.mnb.dcgpu'; work = '$HOME/amdrustdsl'; lock = $true }
+    e08 = @{ host = '10.223.206.118'; user = 'amd'; work = '/data/blyu/amdrustdsl'; lock = $true; pergpu = $true; extra = 'export HIPCC_COMPILE_FLAGS_APPEND=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 CCC_OVERRIDE_OPTIONS=+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15' }   # Ubuntu 26.04: gcc 16 has no libstdc++ headers; clang must use gcc 15
 }[$Node]
+$user = if ($cfg.user) { $cfg.user } else { 'blyu' }
 $key = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
 $kh = Join-Path $env:USERPROFILE '.ssh\mi450_known_hosts'
 $wsdir = "$($cfg.work)/ws/$Tag"
-$sshBase = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=20', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh", "blyu@$($cfg.host)")
+$sshBase = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=20', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh", "$user@$($cfg.host)")
 
 function Invoke-Remote([string]$bash, [switch]$Wrap) {
     if ($Wrap) { $bash = "echo @@MI450-BEGIN@@`n" + $bash + "`n" + 'echo "@@MI450-END rc=$?@@"' }
@@ -73,11 +75,11 @@ if ($Sync) {
     $rcMk = Invoke-Remote ("mkdir -p " + $wsdir.Replace('$HOME', '~')) -Wrap
     $scpArgs = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh")
     $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $scprc = 1; for ($try = 0; $try -lt 3 -and $scprc -ne 0; $try++) { if ($try -gt 0) { Start-Sleep 5 }; & scp @scpArgs $tgz ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null; $scprc = $LASTEXITCODE }
+    $scprc = 1; for ($try = 0; $try -lt 3 -and $scprc -ne 0; $try++) { if ($try -gt 0) { Start-Sleep 5 }; & scp @scpArgs $tgz ($user + "@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null; $scprc = $LASTEXITCODE }
     $ErrorActionPreference = $eap2
     if ($Bundle) {
         Push-Location $Repo; $bun = Join-Path $env:TEMP ("mi450-" + [guid]::NewGuid().ToString('N') + '.bundle'); $headSha = (git rev-parse HEAD).Trim(); & git bundle create $bun HEAD origin/Main 2>&1 | Out-Null; Pop-Location
-        $ErrorActionPreference = 'Continue'; & scp @scpArgs $bun ("blyu@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.bundle") 2>&1 | Out-Null; $ErrorActionPreference = $eap2; Remove-Item $bun -ErrorAction SilentlyContinue
+        $ErrorActionPreference = 'Continue'; & scp @scpArgs $bun ($user + "@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.bundle") 2>&1 | Out-Null; $ErrorActionPreference = $eap2; Remove-Item $bun -ErrorAction SilentlyContinue
     }
     if ($scprc -ne 0) { Write-Error "scp failed ($scprc)"; exit 250 }
     $ok = Invoke-Remote ("W=$wsdir; cd `$W && rm -rf src.new src.old && mkdir src.new && tar -xzf src.tgz -C src.new && { find src.new -type f \( -name '*.sh' -o -name '*.py' -o -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.txt' -o -name '*.lock' -o -name '*.hip' -o -name '*.cpp' -o -name '*.h' -o -name '*.asm' -o -name '*.tbl' -o -name '*.json' -o -name '*.yml' -o -name '*.tsv' -o -name '.gitignore' -o -name '.gitattributes' -o -name '*.ps1' -o -name '*.irv1' -o -name '*.s' \) -print0 | xargs -0 -r sed -i 's/\r$//'; [ -d src ] && mv src src.old; mv src.new src; rm -rf src.old src.tgz; echo SYNCED; }") -Wrap
@@ -92,7 +94,7 @@ if ($Sync) {
 if ($PayloadFile) { $Payload = Get-Content -Raw -LiteralPath $PayloadFile }
 if (-not $Payload.Trim()) { if ($Sync) { exit 0 } else { Write-Error 'no payload'; exit 2 } }
 
-$lockCmd = if ($cfg.lock) { '/usr/local/bin/gpu-lock ' } else { '' }
+$lockCmd = if ($cfg.pergpu) { '/usr/local/bin/gpu-lock -g $IDLE_GPU ' } elseif ($cfg.lock) { '/usr/local/bin/gpu-lock ' } else { '' }
 $noGpuFlag = if ($NoGpu) { 1 } else { 0 }
 $envLines = ($Env | ForEach-Object { $kv = $_ -split '=', 2; "export $($kv[0])='$($kv[1])'" }) -join "`n"
 $boot = @"
@@ -103,6 +105,7 @@ export SRC=`$W/src CARGO_TARGET_DIR=`$W/target
 export CARGO_HOME=`$BASE/cargo RUSTUP_HOME=`$BASE/rustup
 export PATH=`$CARGO_HOME/bin:/opt/rocm/bin:`$PATH
 export GPU_TIMEOUT=$GpuTimeoutSec
+$($cfg.extra)
 IDLE_GPU=''
 if [ $noGpuFlag = 0 ]; then
   if [ $GpuIdx -ge 0 ]; then IDLE_GPU=$GpuIdx; else
