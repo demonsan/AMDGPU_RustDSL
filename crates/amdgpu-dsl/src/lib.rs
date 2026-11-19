@@ -3915,6 +3915,12 @@ impl FnBuilder {
     }
 
     /// gfx1250: `s_prefetch_inst pc, offset, null-offset, len`: fetch `len + 1` instruction-cache lines from `pc + offset` (`len` 0..=31; a hint: no effect on values or memory).
+    /// gfx1250: `s_sleep imm`: sleep for 64 x `imm` clocks (a FINITE sleep: the indefinite forms are rejected by `GV-1250-SLEEP`).
+    pub fn sleep(&mut self, imm: u32) {
+        assert!(imm < 0x8000, "a finite sleep: the high bit makes it indefinite");
+        self.push_stmt(Stmt::Sys { op: SysOp::Sleep, imm, imm2: 0, reads: vec![] });
+    }
+
     pub fn prefetch_inst_len(&mut self, pc: impl Into<Opnd>, offset: u32, zero: impl Into<Opnd>, len: u32) {
         self.push_stmt(Stmt::Sys { op: SysOp::PrefetchInst, imm: offset, imm2: len, reads: vec![pc.into(), zero.into()] });
     }

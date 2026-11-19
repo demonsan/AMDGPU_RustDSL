@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -593,6 +593,8 @@ pub struct RingOpts {
     /// operand swap: the WMMA's A operand is the B matrix (tile rows = N) and its B operand the A matrix, so a lane's accumulator holds 8 CONSECUTIVE columns of C for a fixed row (instead of 8
     /// consecutive rows of one column): with `bf16` output the epilogue packs them and stores 16 bytes per lane straight from the registers (no LDS staging, no tensor store). Needs bm == bn.
     pub swap: bool,
+    /// stagger: the workgroups of odd tile parity (tile column + tile row) sleep `stagger` x 64 clocks at the start, so the epilogue write bursts of the tiles in flight do not all align (0 = off)
+    pub stagger: u16,
 }
 
 impl RingOpts {
@@ -604,7 +606,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0 }
     }
 }
 
@@ -915,6 +917,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     } else {
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
+    if ring.stagger > 0 {
+        let par = b.let_(Op::XorI32(Opnd::Val(wgx), Opnd::Val(wgy)));
+        let odd = b.let_(Op::AndI32(Opnd::Val(par), Opnd::I32(1)));
+        let c = b.bind_cond(ev(odd).eq(1));
+        b.begin_if(c);
+        b.sleep(ring.stagger as u32);
+        b.end_if();
+    }
     if ring.iprefetch > 0 {
         let pc = b.get_pc();
         let zero = b.c_i32(0);
