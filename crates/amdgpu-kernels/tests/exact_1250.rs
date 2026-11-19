@@ -218,3 +218,24 @@ fn two_materialised_booleans_stay_distinct() {
     let distinct: std::collections::HashSet<&String> = mats.iter().collect();
     assert!(distinct.len() >= 2, "two booleans, one materialisation: {mats:?}\n{asm}");
 }
+
+/// Loads whose results are never read: the allocator may give a later load the same destination while the first is in flight. Two
+/// loads on the in-order LOADcnt need no wait between them (the younger lands last); the wait self-check accepts it, and a VALU
+/// write over an in-flight load's destination still gets its wait (`hazards::pad_inflight_waw`).
+#[test]
+fn dead_loads_with_reused_destinations_compile() {
+    let mut b = FnBuilder::new("probe_dead_loads", 32);
+    b.arg("p", DType::Ptr, 0, 8);
+    b.arg_tensor("p", Ext::c(1 << 12));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    for k in 0..4u32 {
+        let _dead = b.let_(Op::LoadGlobalB128 { base: Opnd::Val(p), byte_off: 64 * k });
+    }
+    let x = b.let_(Op::LoadGlobalB128 { base: Opnd::Val(p), byte_off: 512 });
+    b.store_f32x4(p, 1024, x);
+    let f = b.finish();
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}")).asm;
+    if std::env::var("SHOW_ASM").is_ok() {
+        eprintln!("{asm}");
+    }
+}
