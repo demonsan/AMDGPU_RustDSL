@@ -440,6 +440,47 @@ pub fn probe_g1250_lds_big(bytes: u32) -> Function {
     f
 }
 
+/// LDS float atomics (the MLA final reduce): 4 waves (128 work-items) zero a 1 KiB accumulation buffer, barrier, then every work-item adds
+/// `x_r = (tid + 1) * 2^-r` into acc[(tid + 7 r) mod 256] for r = 0..7 with `ds_add_f32` (all waves into the same dwords), wait, barrier,
+/// and out[wg * 256 + i] = acc[i]. Exact in f32 (dyadic values, every sum representable), so the result is checked bit for bit.
+/// Kernargs: out @0 (1 KiB per workgroup). 128 work-items.
+pub fn probe_g1250_lds_fadd() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_lds_fadd", 128);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(1024));
+    b.lds(1024);
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let a = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let zero = b.let_(Op::ConstI32(0));
+    b.store_lds_b32(a, zero);
+    let a2 = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(512)));
+    b.store_lds_b32(a2, zero);
+    b.wait_lds(0);
+    b.barrier();
+    let t1 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(1)));
+    let xf = b.un(amdgpu_dsl::UnOp::CvtF32I32, t1);
+    for r in 0..8i32 {
+        let x = b.mul_f32(xf, Opnd::F32(1.0 / (1u32 << r) as f32));
+        let i = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(7 * r)));
+        let i = b.let_(Op::AndI32(Opnd::Val(i), Opnd::I32(255)));
+        let la = b.let_(Op::ShlI32(Opnd::Val(i), Opnd::I32(2)));
+        b.atomic_lds(amdgpu_dsl::AtomicOp::AddF32, la, x, false);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    let g = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(10)));
+    for h in 0..2i32 {
+        let la = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(512 * h)));
+        let v = b.load_lds(la, MemTy::B32);
+        let o = b.let_(Op::AddI32(Opnd::Val(g), Opnd::Val(la)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+        b.store_global(q, 0, v, MemTy::B32, false);
+    }
+    b.finish()
+}
+
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
 /// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {

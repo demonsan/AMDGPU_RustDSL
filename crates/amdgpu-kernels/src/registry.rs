@@ -80,6 +80,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_g1250_wide" => Some(crate::probes::g1250::probe_g1250_wide()),
         "probe_g1250_trans" => Some(crate::probes::g1250::probe_g1250_trans()),
         "probe_g1250_trans_rd2" => Some(crate::probes::g1250::probe_g1250_trans_rd2()),
+        "probe_g1250_lds_fadd" => Some(crate::probes::g1250::probe_g1250_lds_fadd()),
         "probe_g1250_trans_all" => Some(crate::probes::g1250::probe_g1250_trans_all()),
         "probe_g1250_mcast_m0" => Some(crate::probes::g1250::probe_g1250_mcast_with(name, 0, 0, 0)),
         "probe_g1250_mcast_same" => Some(crate::probes::g1250::probe_g1250_mcast_same(name, 0, 0, 0b11, 4096, false, 0, true)),
