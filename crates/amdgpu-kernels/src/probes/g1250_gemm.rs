@@ -517,6 +517,27 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
 /// The A / B row padding (bytes) that makes the fragment reads conflict-free: the TDM pads every `64 ks`-byte row (interval = the row's
 /// dwords) by the fewest dwords whose bank-conflict cost (`amdgpu_dsl::tdm_pad`) is the least, for the window's read pattern (16 lanes of a
 /// b128 phase on rows m = lane & 15, 16 bytes at h = lane >> 4 of the 32-byte piece).
+/// The same for the swap mode's permuted A operand: it reads rows (m & 7) + 16 (m >> 3) (the other operand keeps rows m): the pad minimising the cost of both patterns together.
+pub fn f4_row_pad_perm(ks: i32) -> i32 {
+    use amdgpu_dsl::tdm_pad::{cost, LaneRead};
+    let row = (64 * ks) as u32;
+    let mk = |rowmap: &dyn Fn(u32) -> u32| -> Vec<LaneRead> {
+        (0..2u32).map(|piece| LaneRead { bytes: 16, lanes: (0..32u32).map(|l| Some(rowmap(l & 15) * row + 16 * (l >> 4) + 32 * piece)).collect() }).collect()
+    };
+    let pa = mk(&|m| (m & 7) + 16 * (m >> 3));
+    let pb = mk(&|m| m);
+    let iv = (row / 4) as u16;
+    let total = |pad: Option<(u16, u16)>| cost(&pa, pad) + cost(&pb, pad);
+    let mut best = (total(None), 0u16);
+    for am in 1..=16u16 {
+        let c = total(Some((iv, am)));
+        if c < best.0 {
+            best = (c, am);
+        }
+    }
+    4 * best.1 as i32
+}
+
 pub fn f4_row_pad(ks: i32) -> i32 {
     use amdgpu_dsl::tdm_pad::{cost, LaneRead};
     let row = (64 * ks) as u32;
@@ -595,7 +616,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let (bm, bn) = (sh.bm(), sh.bn());
     // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
-    let row_pad = if pad { f4_row_pad(sh.ks) } else { 0 };
+    let row_pad = if pad { if ring.perm() { f4_row_pad_perm(sh.ks) } else { f4_row_pad(sh.ks) } } else { 0 };
     let row_l = 64 * sh.ks + row_pad;
     let mut b = FnBuilder::new(name, (sh.waves() * 32) as u32);
     for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
