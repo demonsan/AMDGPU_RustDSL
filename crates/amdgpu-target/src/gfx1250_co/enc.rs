@@ -492,9 +492,10 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             }
         }
         "VOPC" if !e64 => {
-            // vcc_lo, src0, vsrc1
-            let (s0, lit) = src9(op_at(&i, 1)?)?;
-            let s1 = vreg(op_at(&i, 2)?)?;
+            // vcc_lo, src0, vsrc1 (v_cmpx: no destination operand, it writes EXEC)
+            let k0 = if base.starts_with("v_cmpx") { 0 } else { 1 };
+            let (s0, lit) = src9(op_at(&i, k0)?)?;
+            let s1 = vreg(op_at(&i, k0 + 1)?)?;
             out.extend_from_slice(&d32(0x7C00_0000 | op << 17 | s1 << 9 | s0));
             if let Some(l) = lit {
                 out.extend_from_slice(&d32(l));
@@ -543,7 +544,12 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             let mut opsel = 0u32;
             if let Some(v) = modv(&i, "op_sel") {
                 let f: Vec<u32> = v.trim_start_matches('[').trim_end_matches(']').split(',').map(|x| x.trim().parse::<u32>().unwrap_or(0)).collect();
-                if let Some((last, src)) = f.split_last() {
+                if base.starts_with("v_permlane") {
+                    // the lane permutes: op_sel:[fetch_invalid, bound_ctrl] at [11], [12] (no destination element)
+                    for (k, b) in f.iter().enumerate().take(2) {
+                        opsel |= (b & 1) << (11 + k);
+                    }
+                } else if let Some((last, src)) = f.split_last() {
                     for (k, b) in src.iter().enumerate().take(3) {
                         opsel |= (b & 1) << (11 + k);
                     }
@@ -644,7 +650,8 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             // stores and the atomics without return: addr, data0; the atomics with return: vdst, addr, data0 (llvm-mc: `ds_add_f32 v1, v2` =
             // d8540000 00000201, `ds_add_rtn_f32 v3, v1, v2` = d9e40000 03000201)
             let atomic = base.starts_with("ds_add") || base.starts_with("ds_max") || base.starts_with("ds_min");
-            let rtn = atomic && base.contains("_rtn");
+            // ds_permute / ds_bpermute: vdst, addr, data0 like an atomic with return (llvm-mc: `ds_bpermute_b32 v1, v2, v3` = dacc0000 01000302)
+            let rtn = (atomic && base.contains("_rtn")) || base.starts_with("ds_permute") || base.starts_with("ds_bpermute");
             let store = base.starts_with("ds_store") || (atomic && !rtn);
             let (vdst, addr, data0) = if store {
                 (0, vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?)
