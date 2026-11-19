@@ -414,9 +414,19 @@ pub enum DppCtrl {
     RowHalfMirror,
     RowBcast15,
     RowBcast31,
+    /// gfx10+ (gfx1250): every lane of a row reads lane n (0..=15) of its row
+    RowShare(u8),
+    /// gfx10+ (gfx1250): lane i of a row reads lane i ^ n (0..=15) of its row
+    RowXmask(u8),
+    /// gfx10+ (gfx1250) DPP8: lane i reads lane 8 (i / 8) + sel[i % 8] (each group of 8 lanes, the same selectors)
+    Dpp8([u8; 8]),
 }
 
 impl DppCtrl {
+    /// A control that exists on gfx10+ only (gfx950 has none of them).
+    pub fn gfx10_only(self) -> bool {
+        matches!(self, DppCtrl::RowShare(_) | DppCtrl::RowXmask(_) | DppCtrl::Dpp8(_))
+    }
     /// The 9-bit dpp_ctrl encoding.
     pub fn bits(self) -> u32 {
         match self {
@@ -432,6 +442,10 @@ impl DppCtrl {
             DppCtrl::RowHalfMirror => 0x141,
             DppCtrl::RowBcast15 => 0x142,
             DppCtrl::RowBcast31 => 0x143,
+            DppCtrl::RowShare(n) => 0x150 + (n as u32 & 15),
+            DppCtrl::RowXmask(n) => 0x160 + (n as u32 & 15),
+            // (DPP8 has no dpp_ctrl: `Dpp::imm` carries its selectors)
+            DppCtrl::Dpp8(_) => 0,
         }
     }
 }
@@ -451,7 +465,12 @@ impl Dpp {
     pub const fn new(ctrl: DppCtrl) -> Dpp {
         Dpp { ctrl, row_mask: 0xf, bank_mask: 0xf, bound_zero: false }
     }
+    /// dpp_ctrl | (row_mask ^ 0xf) << 12 | (bank_mask ^ 0xf) << 16 | bound_zero << 20; DPP8: 1 << 21 | the 8 three-bit selectors << 24.
     pub fn imm(self) -> i64 {
+        if let DppCtrl::Dpp8(s) = self.ctrl {
+            let sel = s.iter().enumerate().fold(0i64, |w, (k, x)| w | ((*x as i64) & 7) << (3 * k));
+            return 1 << 21 | sel << 24;
+        }
         self.ctrl.bits() as i64 | (((self.row_mask & 0xf) ^ 0xf) as i64) << 12 | (((self.bank_mask & 0xf) ^ 0xf) as i64) << 16 | (self.bound_zero as i64) << 20
     }
 }
@@ -4342,6 +4361,8 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             let ok = match dpp.ctrl {
                 DppCtrl::RowShl(n) | DppCtrl::RowShr(n) | DppCtrl::RowRor(n) => (1..=15).contains(&n),
                 DppCtrl::QuadPerm(p) => p.iter().all(|x| *x < 4),
+                DppCtrl::RowShare(n) | DppCtrl::RowXmask(n) => n < 16,
+                DppCtrl::Dpp8(s) => s.iter().all(|x| *x < 8),
                 _ => true,
             };
             if !ok {

@@ -387,6 +387,67 @@ static int run_varscale(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_dpp: every DPP control against this CPU model (wave32: rows of 16 lanes, banks of 4 lanes in a row; a lane whose source is
+// invalid keeps old unless bound_ctrl (then 0); a lane in a disabled row / bank is not written: old). WGS workgroups (default 64).
+static int run_dpp(Kernel& k, const char* kn) {
+    const int wgs = getenv("WGS") ? atoi(getenv("WGS")) : 64;
+    const uint32_t OLD = 0xdeadbeefu;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, (size_t)wgs * 20 * 32 * 4));
+    HC(hipMemset(dout, 0, (size_t)wgs * 20 * 32 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(wgs, 32, args, kn);
+    std::vector<uint32_t> o((size_t)wgs * 20 * 32);
+    HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+    // control k: source lane within the row (-1 invalid) for row lane i (0..15) or wave lane l
+    auto src = [](int c, int l) -> int {
+        int r = l & ~15, i = l & 15;
+        auto inrow = [&](int j) { return (j >= 0 && j < 16) ? r + j : -1; };
+        switch (c) {
+            case 0: { const int p[4] = {1, 0, 3, 2}; return (l & ~3) | p[l & 3]; }
+            case 1: { const int p[4] = {3, 2, 1, 0}; return (l & ~3) | p[l & 3]; }
+            case 2: return inrow(i + 1);
+            case 3: return inrow(i + 3);
+            case 4: return inrow(i - 1);
+            case 5: return inrow(i - 15);
+            case 6: return r + ((i - 1) & 15);
+            case 7: return r + ((i - 4) & 15);
+            case 8: return r + 15 - i;
+            case 9: return r + (i & 8) + 7 - (i & 7);
+            case 10: return r + 0;
+            case 11: return r + 5;
+            case 12: return r + (i ^ 1);
+            case 13: return r + (i ^ 15);
+            case 14: { const int s[8] = {1, 0, 3, 2, 5, 4, 7, 6}; return (l & ~7) + s[l & 7]; }
+            case 15: { const int s[8] = {7, 6, 5, 4, 3, 2, 1, 0}; return (l & ~7) + s[l & 7]; }
+            case 16: return inrow(i + 1);
+            case 17: { const int p[4] = {1, 0, 3, 2}; return (l & ~3) | p[l & 3]; }
+            case 18: return inrow(i - 1);
+            default: return r + (i ^ 1);
+        }
+    };
+    long bad = 0;
+    for (int w = 0; w < wgs; ++w)
+        for (int c = 0; c < 20; ++c)
+            for (int l = 0; l < 32; ++l) {
+                auto x = [&](int lane) { return (uint32_t)((w << 8) + 3 * lane + 1); };
+                const int row = l >> 4, bank = (l & 15) >> 2;
+                bool written = true;
+                if (c == 16 && !((0x2 >> row) & 1)) written = false;
+                if (c == 17 && !((0x5 >> bank) & 1)) written = false;
+                const int s = src(c, l);
+                uint32_t ref;
+                if (!written) ref = OLD;
+                else if (s < 0) ref = (c == 18) ? 0u : OLD;
+                else ref = (c == 19) ? x(s) + x(l) : x(s);
+                const uint32_t got = o[((size_t)w * 20 + c) * 32 + l];
+                if (got != ref) { if (bad < 12) printf("  wg %d ctrl %d lane %d: got %#x ref %#x\n", w, c, l, got, ref); ++bad; }
+            }
+    printf("dpp: wgs=%d bad=%ld %s\n", wgs, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
+
 // probe_g1250_lds_fadd: 128 work-items add x = (tid + 1) * 2^-r into acc[(tid + 7 r) mod 256] (r = 0..7) with ds_add_f32 after a zeroing
 // barrier; out[wg * 256 + i] = acc[i]. Every partial sum is a dyadic rational far inside f32's range: the result is exact, compared bit for bit.
 // WGS workgroups (default 1024), REPS repetitions (default 5).
@@ -543,6 +604,7 @@ int main(int argc, char** argv) {
     const int arg = argc > 4 ? atoi(argv[4]) : -1;
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
+    if (mode == "dpp") return run_dpp(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);

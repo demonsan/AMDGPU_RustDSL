@@ -829,6 +829,22 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
     };
+    // DPP (gfx950 text -> gfx1250): the base mnemonic re-spelled (`v_max_f32` -> `v_max_num_f32`, `v_add_u32` -> `v_add_nc_u32`, ...), the
+    // controls kept (quad_perm, row_shl / shr / ror, row_mirror, row_half_mirror, row_share, row_xmask, dpp8, the masks, bound_ctrl:1, fi:1);
+    // the wave-wide and broadcast controls of gfx9 do not exist on gfx1250 (a compile error, never a guess)
+    if let Some(b) = mn.strip_suffix("_dpp") {
+        if ["wave_shl", "wave_shr", "wave_rol", "wave_ror", "row_bcast"].iter().any(|k| rest.contains(k)) {
+            return Err(format!("`{line}`: a gfx9 DPP control without a gfx1250 form (row_share / row_xmask / dpp8 / permlane instead)"));
+        }
+        let nb = match b {
+            "v_max_f32" => "v_max_num_f32",
+            "v_min_f32" => "v_min_num_f32",
+            "v_add_u32" => "v_add_nc_u32",
+            "v_sub_u32" => "v_sub_nc_u32",
+            x => x,
+        };
+        return Ok(vec![format!("{nb}_dpp {rest}")]);
+    }
     // v_cvt_pk_fp8_f32 (a 16-bit half write: op_sel:[0,0,1] = the high half) keeps the 32-bit operand spelling the assembler accepts
     if mn == "v_cvt_pk_fp8_f32" {
         return Ok(vec![line.to_string()]);

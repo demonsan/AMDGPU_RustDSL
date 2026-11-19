@@ -1667,6 +1667,9 @@ impl FromIr for DppCtrl {
             "RowHalfMirror" => { v.expect_unit("RowHalfMirror")?; Ok(DppCtrl::RowHalfMirror) }
             "RowBcast15" => { v.expect_unit("RowBcast15")?; Ok(DppCtrl::RowBcast15) }
             "RowBcast31" => { v.expect_unit("RowBcast31")?; Ok(DppCtrl::RowBcast31) }
+            "RowShare" => { v.expect_tuple("RowShare", 1)?; Ok(DppCtrl::RowShare(FromIr::from_ir(v.item(0)?)?)) }
+            "RowXmask" => { v.expect_tuple("RowXmask", 1)?; Ok(DppCtrl::RowXmask(FromIr::from_ir(v.item(0)?)?)) }
+            "Dpp8" => { v.expect_tuple("Dpp8", 1)?; Ok(DppCtrl::Dpp8(FromIr::from_ir(v.item(0)?)?)) }
             other => Err(v.err(format!("unknown DppCtrl variant `{other}`"))),
         }
     }
@@ -1686,6 +1689,9 @@ impl IrIds for DppCtrl {
             DppCtrl::RowHalfMirror => {}
             DppCtrl::RowBcast15 => {}
             DppCtrl::RowBcast31 => {}
+            DppCtrl::RowShare(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::RowXmask(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::Dpp8(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
         }
     }
 }

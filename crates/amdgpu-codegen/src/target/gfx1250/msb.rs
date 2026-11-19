@@ -34,6 +34,8 @@ fn low(tok: &str, lo: u32, hi: u32) -> String {
 /// Slot index (0 dst, 1 src0, 2 src1, 3 src2) of each operand position of an instruction, None = no VGPR slot (SGPR, constant, or an
 /// operand the hardware reads without MSBs: Some(4)).
 fn slots(mn: &str, n_ops: usize) -> Option<Vec<Option<usize>>> {
+    // a DPP form has the slots of its base encoding (the DPP word's source 0 is the src0 slot)
+    let mn = mn.strip_suffix("_dpp").unwrap_or(mn);
     let base = mn.strip_suffix("_e32").or_else(|| mn.strip_suffix("_e64")).unwrap_or(mn);
     let fmt = OPS.iter().find(|(m, _, _)| *m == base).map(|x| x.1)?;
     let mut v = vec![None; n_ops];

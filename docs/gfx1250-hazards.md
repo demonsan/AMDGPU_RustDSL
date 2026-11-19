@@ -44,3 +44,7 @@ sin / cos):
 The gfx1250 hazard pass therefore omits the `v_nop` for these readers only (`hazards::trans_coexec_proven`); DOT, the other conversions,
 moves and every other reader keep it. The last two rows: `KERNEL=probe_g1250_trans_rd2 tools/mi450/trans_all.sh` on e08-01, 2026-11-19
 (the MLA softmax's readers: the next exp argument and the P-to-fp8 conversion).
+
+## DPP
+
+LLVM's DPP hazards (`GCNHazardRecognizer::checkDPPHazards`: 2 wait states between a VALU VGPR write and a DPP read of it, 5 after an EXEC write) sit behind `if (ST.hasNoDataDepHazard()) return` in both the hazard query and the padding pass; gfx10+ (gfx1250 included) has that feature: the hardware interlocks those dependencies, and the gfx1250 hazard pass inserts nothing for them. A DPP instruction is a VALU for the rules above (TRANS co-execution: it is not a proven reader class, so it keeps the `v_nop`; the WMMA windows apply). Evidence: `probe_g1250_dpp` (every DPP16 control, DPP8, the row / bank masks, bound_ctrl, a DPP ALU op; each result written right after its source VALU) matches the CPU model on MI450 (e08-01, 1 and 64 workgroups, `tools/mi450/dpp_probe.sh`).
