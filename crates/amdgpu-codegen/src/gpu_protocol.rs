@@ -75,6 +75,9 @@ struct Ev {
     coherent: bool,
     /// the iteration of the OUTERMOST enclosing loop when the event opened (-1 outside loops): the period claim is checked per outer iteration
     outer: i64,
+    /// the event's LDS writes include atomics (`ds_add_*`: several waves may accumulate into the same words in one phase) / plain stores
+    atomic: bool,
+    plain: bool,
 }
 
 struct Trace {
@@ -420,7 +423,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, n_acc: 0, global, coherent: true, outer: self.outer };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -524,6 +527,16 @@ impl<'a> Sim<'a> {
                                 ev.dma = true;
                             } else {
                                 ev.ds = true;
+                            }
+                            // LDS atomics accumulate: every wave of the phase may add into the same words (the hardware orders them);
+                            // a plain store in the same phase would race with them (its word is overwritten or lost unordered)
+                            if write && !dma {
+                                let atomic = matches!(st, Stmt::AtomicLdsNoRet { .. } | Stmt::Let { op: Op::AtomicLds { .. }, .. });
+                                if atomic { ev.atomic = true } else { ev.plain = true }
+                                let (mixed, at) = (ev.atomic && ev.plain, ev.stmt);
+                                if mixed {
+                                    self.diag("GV-TILE-RACE", Severity::Error, i, format!("stmt {i}: plain LDS stores and LDS atomics in the same tile_produce phase (stmt {at}): the stores race with other waves' atomic adds; zero / write the buffer in its own phase, then a barrier"));
+                                }
                             }
                         }
                     }
@@ -2078,7 +2091,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
