@@ -51,6 +51,43 @@ impl F4Shape {
     }
 }
 
+/// The overlapped epilogue of a persistent swap kernel (bf16 output): the finished tile's accumulators are packed into `prev` (loop variables of the tile loop, 4 dwords per 16-byte store) and
+/// stored from registers by the NEXT tile's K loop, 4 stores per iteration (`window`), the remainder after that loop; `mr` / `n0` are the previous tile's lane row and column base, `hp` is
+/// 1 once a previous tile exists.
+#[derive(Clone)]
+pub struct Ovl {
+    pub mr: VarId,
+    pub n0: VarId,
+    pub hp: VarId,
+    pub prev: Vec<VarId>,
+    /// the C pointer and the row length N (elements)
+    pub pc: ValueId,
+    pub nn: ValueId,
+    /// the blocks (of `tm * tn`, i-major) whose packed accumulators are carried into the next tile's loop: group g stores blocks 2 g and 2 g + 1, so `groups = kept / 2`; the other
+    /// blocks are stored straight at the end of the tile (the VGPR budget holds only a part of a second accumulator set)
+    pub groups: i32,
+}
+
+impl Ovl {
+    /// The four 16-byte stores of group `g` of the previous tile's packed accumulators (`tm` x `tn` blocks, block index i * tn + j).
+    pub fn store_group(&self, b: &mut FnBuilder, tm: i32, tn: i32, g: i32) {
+        let _ = tm;
+        for q in 0..2 {
+            let blk = 2 * g + q;
+            let (i, j) = (blk / tn, blk % tn);
+            let mrj = b.bind_i32(amdgpu_dsl::varx(self.mr) + j * 16);
+            let rowoff = b.mul_i32(mrj, self.nn);
+            for h in 0..2i32 {
+                let col = b.bind_i32(amdgpu_dsl::varx(self.n0) + (i * 32 + h * 16));
+                let el = b.add_i32(rowoff, col);
+                let off = b.let_(Op::ShlI32(Opnd::Val(el), Opnd::I32(1)));
+                let p = b.let_(Op::PtrAdd { base: Opnd::Val(self.pc), byte_off: Opnd::Val(off) });
+                b.store_f32x4(p, 0, Opnd::Var(self.prev[(blk * 2 + h) as usize]));
+            }
+        }
+    }
+}
+
 pub struct TdmF4Body {
     pub sh: F4Shape,
     /// the rings: A / B tiles (bytes) and the scale tiles
@@ -101,6 +138,8 @@ pub struct TdmF4Body {
     /// timing stamps of the K loop (the shader-cycle counter at four points of every steady iteration, summed per phase into loop variables; the kernel stores the sums): stage issue,
     /// window (fragment reads + WMMA issue), the tensor / LDS wait, the barrier and loop overhead
     pub stamps: bool,
+    /// the overlapped epilogue (see `Ovl`)
+    pub ovl: Option<Ovl>,
     /// row permutation of the A operand (the swap mode's epilogue): the 32 operand rows of a block are the B-matrix rows with bits 3 and 4 of the row index exchanged, so that a lane's
     /// accumulator holds 16 CONTIGUOUS columns of C (v = 0 .. 7: n .. n + 7, v = 8 .. 15: n + 8 .. n + 15, the lane group g adding 16 g)
     pub perm: bool,
@@ -310,6 +349,16 @@ impl PipeBody for TdmF4Body {
             }
             if let Some(n) = next {
                 cur = n;
+            }
+        }
+        if let (Some(ovl), true) = (self.ovl.clone(), t.staged) {
+            // the previous tile's packed accumulators go out 4 stores per iteration: group g in iteration g of this K loop (only when a previous tile exists)
+            let sel = b.bind_i32(amdgpu_dsl::varx(ovl.hp).eq(1).select_i32(amdgpu_dsl::ox(t.it), 1000));
+            for g in 0..ovl.groups {
+                let c = b.bind_cond(ev(sel).eq(g));
+                b.begin_if(c);
+                ovl.store_group(b, sh.tm, sh.tn, g);
+                b.end_if();
             }
         }
         if self.stamps && t.staged {
