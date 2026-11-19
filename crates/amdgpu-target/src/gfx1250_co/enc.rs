@@ -252,7 +252,7 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
     match fmt {
         "SOP1" => {
             // one operand: a source (s_setpc_b64 ..), except the destination-only forms (s_get_pc_i64: SDST, SSRC0 = 0; llvm-mc)
-            let dst_only = matches!(base, "s_get_pc_i64" | "s_getpc_b64");
+            let dst_only = matches!(base, "s_get_pc_i64" | "s_getpc_b64" | "s_get_shader_cycles_u64");
             let (d, s0, lit) = if i.ops.len() == 1 && dst_only {
                 (sdst(op_at(&i, 0)?)?, 0, None)
             } else if i.ops.len() == 1 {

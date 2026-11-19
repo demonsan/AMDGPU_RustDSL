@@ -118,11 +118,17 @@ int main(int argc, char** argv) {
     int lgx = 0;
     while ((1 << lgx) < tx) ++lgx;
     if (persist && ((1 << lgx) != tx || persist % tx || persist > tx * ty)) { fprintf(stderr, "PERSIST=%d: N / BN = %d must be a power of two dividing it, at most %d tiles\n", persist, tx, tx * ty); return 1; }
-    struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1};
+    // STAMPS=1: the kernel stores per-wave K-loop phase sums (shader cycles: stage issue, window, wait, barrier; iterations) into a debug buffer (kernarg @64):
+    // [tile row][tile column & 63][wave] x 8 dwords; N / BN must be <= 64
+    const bool stamps = getenv("STAMPS") != nullptr;
+    void* dDbg = nullptr;
+    const size_t dbg_bytes = (size_t)ty * 64 * 4 * 32;
+    if (stamps) { if (tx > 64) { fprintf(stderr, "STAMPS: N / BN = %d must be at most 64\n", tx); return 1; } HC(hipMalloc(&dDbg, dbg_bytes)); HC(hipMemset(dDbg, 0, dbg_bytes)); }
+    struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; int pad_; void* dbg; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1, 0, dDbg};
     // SWIZZLE=G: the kernel remaps the tile order (rows grouped by G); it needs the log2 of the tile columns (kernarg @52)
     const int swizzle = getenv("SWIZZLE") ? atoi(getenv("SWIZZLE")) : 0;
     if (swizzle && (((1 << lgx) != tx) || ty % swizzle)) { fprintf(stderr, "SWIZZLE=%d: N / BN = %d must be a power of two and the tile rows %d a multiple of it\n", swizzle, tx, ty); return 1; }
-    size_t ksz = (persist || swizzle) ? sizeof(ka) : 48;
+    size_t ksz = (persist || swizzle || stamps) ? sizeof(ka) : 48;
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
         unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
@@ -191,6 +197,23 @@ int main(int argc, char** argv) {
         HC(hipEventElapsedTime(&ms, e0, e1));
         us = 1000.0 * ms / iters;
         tflops = 2.0 * M * N * K / (us * 1e-6) / 1e12;
+    }
+    if (stamps && iters > 0) {
+        HC(hipDeviceSynchronize());
+        std::vector<unsigned> rec(dbg_bytes / 4);
+        HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));
+        const char* ph[4] = {"issue", "window", "wait", "barrier"};
+        for (int w = 0; w < 4; ++w) {
+            double sum[4] = {0, 0, 0, 0}; long cnt = 0; double it = 0;
+            for (int r = 0; r < ty; ++r) for (int c = 0; c < tx; ++c) {
+                const unsigned* q = &rec[(((size_t)r * 64 + c) * 4 + w) * 8];
+                if (q[4] == 0) continue;
+                for (int k = 0; k < 4; ++k) sum[k] += (double)q[k] / q[4];
+                it += q[4]; ++cnt;
+            }
+            if (cnt) printf("{\"stamps\":{\"wave\":%d,\"records\":%ld,\"iters\":%.1f,\"cycles_per_iter\":{\"issue\":%.1f,\"window\":%.1f,\"wait\":%.1f,\"barrier\":%.1f,\"total\":%.1f}}}\n", w, cnt, it / cnt, sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, (sum[0] + sum[1] + sum[2] + sum[3]) / cnt);
+            (void)ph;
+        }
     }
     printf("{\"host\":\"g1250_f4own\",\"kernel\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"bad\":%ld,\"maxrel\":%.3g,\"us\":%.2f,\"tflops\":%.3f,\"ok\":%s}\n", kn, M, N, K, bad, maxrel, us, tflops, bad == 0 ? "true" : "false");
     return bad == 0 ? 0 : 3;

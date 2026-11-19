@@ -478,6 +478,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, iprefetch: n, ..RingOpts::default() })
 }
 
+/// The best 256 x 256 kernel with the K-loop phase stamps (host STAMPS=1).
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_stamps(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, stamps: true, ..RingOpts::default() })
+}
+
 /// The best 256 x 256 kernel on a persistent grid (host PERSIST=G): no cross-tile overlap (the LDS-staged epilogue uses the whole LDS), only the tile loop.
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_persist(name: &str, relax: bool, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
@@ -541,11 +546,14 @@ pub struct RingOpts {
     /// instruction prefetch at the kernel start: this many `s_prefetch_inst` of 32 lines each from the kernel's first instruction (0 = none): the first iteration of the loop then finds its
     /// code in the instruction cache instead of fetching it line by line from L2
     pub iprefetch: u8,
+    /// the K-loop phase stamps (`TdmF4Body::stamps`): a debug buffer argument `dbg` @64, per wave 8 dwords: the summed cycles of the stage issue, the window, the wait, the barrier,
+    /// the steady iteration count
+    pub stamps: bool,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false }
     }
 }
 
@@ -570,6 +578,10 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
     b.arg("k", DType::I32, 40, 4);
     b.arg("n", DType::I32, 44, 4);
+    if ring.stamps {
+        b.arg("dbg", DType::Ptr, 64, 8);
+        b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 32));
+    }
     let persistent = ring.persistent;
     assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
     if persistent {
@@ -629,6 +641,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     lds.commit(&mut b);
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
+    let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
     let kk = b.let_(Op::KernargI32 { offset: 40 });
     let nn = b.let_(Op::KernargI32 { offset: 44 });
     let tid = b.let_(Op::WorkitemId);
@@ -826,8 +839,20 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
 
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
+        if ring.stamps {
+            // the per-wave record: [tile row][tile column & 63][wave] x 32 bytes of the debug buffer (the host keeps N / BN <= 64)
+            let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+            let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 32);
+            for (k, var) in body.stamp_vars.clone().iter().take(4).enumerate() {
+                let v = b.let_(Op::AddI32(Opnd::Var(*var), Opnd::I32(0)));
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), k as u32, v);
+            }
+            let it = b.let_(Op::AddI32(Opnd::Val(nkv), Opnd::I32(-1)));
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 4, it);
+        }
         if persistent {
             // the next tile's first stage overwrites slot 0: every wave has finished reading the last window first
             b.wait_lds(0);

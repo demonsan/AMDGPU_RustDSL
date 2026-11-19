@@ -52,7 +52,7 @@ WMMA = [("v_wmma_f32_16x16x32_bf16", "v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], 
 EXTRA = [("s_wait_alu", "s_wait_alu 0xfff"), ("global_atomic_add_u32", "global_atomic_add_u32 v5, v[2:3], v4, off th:TH_ATOMIC_RETURN"), ("global_wb", "global_wb scope:SCOPE_DEV"), ("global_inv", "global_inv scope:SCOPE_DEV"), ("s_barrier_signal_isfirst", "s_barrier_signal_isfirst -1"), ("s_barrier_init", "s_barrier_init m0"), ("s_barrier_join", "s_barrier_join 1"), ("s_barrier_leave", "s_barrier_leave"), ("s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1"), ("global_prefetch_b8", "global_prefetch_b8 v0, s[6:7] scope:SCOPE_SE"),
          # the exact replays' forms (gfx1250 MLA / GEMM replicas)
          ("global_load_async_to_lds_b128", "global_load_async_to_lds_b128 v2, v[4:5], off"), ("s_addk_co_i32", "s_addk_co_i32 s1, 0x1"),
-         ("s_buffer_load_b32", "s_buffer_load_b32 s1, s[4:7], s2 offset:0x0"), ("s_get_pc_i64", "s_get_pc_i64 s[2:3]"),
+         ("s_buffer_load_b32", "s_buffer_load_b32 s1, s[4:7], s2 offset:0x0"), ("s_get_pc_i64", "s_get_pc_i64 s[2:3]"), ("s_get_shader_cycles_u64", "s_get_shader_cycles_u64 s[2:3]"),
          ("s_getreg_b32", "s_getreg_b32 s1, hwreg(HW_REG_WAVE_MODE)"), ("s_prefetch_inst", "s_prefetch_inst s[2:3], 0x0, s4, 0"),
          ("s_version", "s_version 0x4009"), ("s_wait_idle", "s_wait_idle"), ("v_add_nc_i32", "v_add_nc_i32 v1, v2, v3"),
          ("v_add_nc_u64", "v_add_nc_u64_e32 v[2:3], v[4:5], v[6:7]"), ("v_cvt_pk_fp8_f32", "v_cvt_pk_fp8_f32 v1, v2, v3"),
