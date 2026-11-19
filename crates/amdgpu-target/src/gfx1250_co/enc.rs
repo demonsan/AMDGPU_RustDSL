@@ -313,6 +313,14 @@ fn encode_dpp(t: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>) -> Resu
     parts[1] = format!("{neg0}{marker}");
     let body = format!("{base} {}", parts.join(", "));
     let mut out = encode_line(&body, pc, label)?;
+    // a VOP3 DPP form leaves its unused source fields 0 (the plain VOP3 holds the inline constant 0 = 128 there)
+    if vop3 && out.len() == 8 {
+        let mut w1 = u32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+        for k in (parts.len() - 1)..3 {
+            w1 &= !(0x1ff << (9 * k));
+        }
+        out[4..8].copy_from_slice(&d32(w1));
+    }
     out.extend_from_slice(&d32(word));
     Ok(out)
 }
