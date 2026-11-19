@@ -215,6 +215,11 @@ pub fn mla_g1250_qh16_wsstd_nowait() -> Function {
     mla_ws_with("mla_g1250_qh16_wsstd_nowait", false, 64 | 128 | 256 | 512 | 8192, false)
 }
 
+/// `_ws` compiled with the GEMM compile policy.
+pub fn mla_g1250_qh16_wsg() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsg", false, 64 | 256 | 16384, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -263,6 +268,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let layout = PageLayout::plan();
     let slot = layout.slot_bytes as i64;
     let mut b = FnBuilder::new(name, 128);
+    if branchless & 16384 != 0 {
+        // bit 14: the GEMM compile policy (its lowering passes and the scheduler preset)
+        b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    }
     let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
     for (i, n) in names.iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
