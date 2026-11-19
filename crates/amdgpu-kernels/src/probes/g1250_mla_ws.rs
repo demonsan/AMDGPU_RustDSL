@@ -21,6 +21,12 @@ const NT: usize = 32;
 /// workspace bytes per (sequence, split) of the KV-split form: O 16 x 512 f32, then the 16 maxima and the 16 sums
 pub const WS_BYTES: i64 = (16 * 512 + 32) * 4;
 
+fn branch_bits_lean(bits: u32) -> bool {
+    let lean = bits & 65536 != 0;
+    assert!(!lean || bits & 256 != 0, "the lean softmax needs the tail form (no fully masked pages)");
+    lean
+}
+
 fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
 }
@@ -229,6 +235,11 @@ pub fn mla_g1250_qh16_ws4c() -> Function {
     mla_ws_with("mla_g1250_qh16_ws4c", false, 64 | 256 | 4096 | 32768, false)
 }
 
+/// `_ws` with the lean softmax.
+pub fn mla_g1250_qh16_wsl() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsl", false, 64 | 256 | 16384 | 65536, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -261,6 +272,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let ipf = branchless & 128 != 0;
     // bit 8: full page pairs in the loop, an odd last page after it (no masked re-read of a pad page)
     let tail = branchless & 256 != 0;
+    // bit 16: lean softmax (only with `tail`: no fully masked page exists, so a masked logit's exp2 underflows to 0 and needs no select):
+    // the mask as a branch-free select on the logits, no I1 loop variables
+    let lean = branch_bits_lean(branchless);
     // bit 9: debug timestamps (SHADER_CYCLES, 20 bits) of wave 0 at checkpoints, written over LSE[b][0..6] (the LSE is then garbage)
     let tstamp = branchless & 512 != 0;
     // bits 10 / 11 (timing experiments): exit right after the prologue / right after the first page's tensor load completes
@@ -561,6 +575,43 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let soft = |b: &mut FnBuilder, svals: &[ValueId], page: ValueId| -> (ValueId, ValueId, ValueId, ValueId) {
         // valid tokens of this page (>= 64 except on the sequence's last page)
         let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
+        if lean {
+            let mut x: Vec<ValueId> = Vec::with_capacity(32);
+            for j in 0..4 {
+                for r in 0..8u8 {
+                    let si = b.frag_slice(Opnd::Val(svals[j]), r, 1);
+                    let sf = f32_of(b, si);
+                    let v = b.mul_f32(sf, cscale);
+                    let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
+                    let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
+                    x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                }
+            }
+            let mut mx = b.max_f32(x[0], x[1]);
+            for r in 2..32 {
+                mx = b.max_f32(mx, x[r]);
+            }
+            let sw = b.let_(Op::Permlane16Swap { a: Opnd::Val(mx), b: Opnd::Val(mx) });
+            let s0 = b.frag_slice(Opnd::Val(sw), 0, 1);
+            let s1 = b.frag_slice(Opnd::Val(sw), 1, 1);
+            let s0f = f32_of(b, s0);
+            let s1f = f32_of(b, s1);
+            let pm = b.max_f32(s0f, s1f);
+            let m_new = b.max_f32(Opnd::Var(vm), pm);
+            let dm = b.sub_f32(Opnd::Var(vm), m_new);
+            let alpha = b.exp2_f32(dm);
+            let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
+            let mut p = Vec::with_capacity(32);
+            for r in 0..32 {
+                let d = b.sub_f32(x[r], m_new);
+                let e = b.exp2_f32(d);
+                lsum = b.add_f32(lsum, e);
+                p.push(e);
+            }
+            let parts: Vec<Opnd> = (0..8).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
+            let pa = b.frag_cat(&parts);
+            return (pa, alpha, m_new, lsum);
+        }
         // logits; the mask (tokens at or beyond ctx) only on a page that reaches past ctx: a uniform branch around VALU only
         let mut x: Vec<ValueId> = Vec::with_capacity(32);
         for j in 0..4 {
