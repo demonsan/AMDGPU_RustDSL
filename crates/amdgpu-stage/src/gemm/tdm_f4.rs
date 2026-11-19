@@ -101,6 +101,9 @@ pub struct TdmF4Body {
     /// timing stamps of the K loop (the shader-cycle counter at four points of every steady iteration, summed per phase into loop variables; the kernel stores the sums): stage issue,
     /// window (fragment reads + WMMA issue), the tensor / LDS wait, the barrier and loop overhead
     pub stamps: bool,
+    /// row permutation of the A operand (the swap mode's epilogue): the 32 operand rows of a block are the B-matrix rows with bits 3 and 4 of the row index exchanged, so that a lane's
+    /// accumulator holds 16 CONTIGUOUS columns of C (v = 0 .. 7: n .. n + 7, v = 8 .. 15: n + 8 .. n + 15, the lane group g adding 16 g)
+    pub perm: bool,
     /// the phase sums (stage issue, window, wait, barrier) and the last wait-done stamp: loop variables, bound with the accumulators
     pub stamp_vars: Vec<VarId>,
     /// the stamps of the iteration being emitted: stage end, window end
@@ -260,7 +263,7 @@ impl PipeBody for TdmF4Body {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for half in 0..2 {
                         for piece in 0..2 {
-                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * 16) * arow + s * 64 + piece * 32);
+                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * if self.perm { 8 } else { 16 }) * arow + s * 64 + piece * 32);
                             parts.push(Opnd::Val(b.load_lds_b128(addr)));
                         }
                     }

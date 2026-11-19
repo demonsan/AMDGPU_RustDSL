@@ -166,7 +166,7 @@ impl Pipeline {
 
     /// Emits the whole pipeline for one role (call it inside `Roles::each`, or once with `Role::All`), then the body's drain (`PipeBody::finish`).
     pub fn run(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
-        assert!(self.slots >= 3 || self.cadence != Cadence::OneWindow, "Pipeline: OneWindow needs at least 3 ring slots");
+        assert!(self.slots >= 2 || self.cadence != Cadence::OneWindow, "Pipeline: OneWindow needs at least 2 ring slots (2: the body reads only the current slot: tile t + 1 is staged into the slot of t - 1 and completed by the end of the window)");
         assert!(self.slots == 3 || self.cadence == Cadence::OneWindow, "Pipeline: `slots` is a OneWindow parameter");
         if self.cadence == Cadence::OneWindow {
             body.set_ring_depth(self.slots);
