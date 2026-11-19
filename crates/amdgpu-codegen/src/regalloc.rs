@@ -166,7 +166,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 eprintln!("ACC_HIGH {}: first {} VGPRs, window plan {:?}", m.name, a.max_v, r3.as_ref().map(|x| x.max_v).map_err(|e| e.chars().take(160).collect::<String>()));
             }
             if let Ok(a3) = &r3 {
-                if a3.max_v.div_ceil(16) <= a.max_v.div_ceil(16) {
+                if a3.max_v.div_ceil(16) <= a.max_v.div_ceil(16) || std::env::var("AMDC_ACC_HIGH_ANY").is_ok() {
                     return r3;
                 }
             }
