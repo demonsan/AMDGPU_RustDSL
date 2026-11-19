@@ -270,22 +270,38 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
     let (pqs, pks) = (kp(&mut b, 8), kp(&mut b, 9));
-    let mut stamps: Vec<ValueId> = Vec::new();
+    let stamps: std::cell::RefCell<Vec<ValueId>> = std::cell::RefCell::new(Vec::new());
     let cyc = |b: &mut FnBuilder| {
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
     };
+    // a checkpoint of the debug variant: the stamp is stored at once over R[b] (word 64 w + checkpoint index; all lanes write the same word;
+    // the output is garbage in this variant, and the R stores of the epilogue are skipped)
+    let stamp_n = std::cell::Cell::new(0u32);
+    let stamp = |b: &mut FnBuilder| {
+        if tstamp {
+            let c = cyc(b);
+            let i = stamp_n.get();
+            stamp_n.set(i + 1);
+            let wb = b.let_(Op::WorkgroupIdY);
+            let tidx = b.let_(Op::WorkitemId);
+            let o = b.bind_i32(ev(wb) * (16 * 512 * 2) + ((ev(tidx) >> 5) * 64 + i as i32) * 4);
+            let pr0 = b.let_(Op::KernargPtr { offset: 0 });
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr0), byte_off: Opnd::Val(o) });
+            b.store_global(pa, 0, c, MemTy::B32, false);
+            stamps.borrow_mut().push(c);
+        }
+    };
     if ipf {
+        // MODE.SCALAR_PREFETCH_EN first: the prefetches are NOPs without it (the vendor kernels set it the same way)
+        b.enable_scalar_prefetch();
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
         for k in 0..12u32 {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
     }
-    if tstamp {
-        let c = cyc(&mut b);
-        stamps.push(c);
-    }
+    stamp(&mut b);
     let tid = b.let_(Op::WorkitemId);
     let bidx = b.let_(Op::WorkgroupIdY);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
@@ -348,6 +364,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             b.frag_cat(&parts)
         })
         .collect();
+    if tstamp {
+        // the debug stamps store to global memory inside the loop: settle the Q loads first
+        b.wait_vm(0);
+    }
     // one page = one tensor op (4608 x 8 bytes), padded by the plan
     let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
     let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
@@ -386,10 +406,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.barrier();
     }
 
-    if tstamp {
-        let c = cyc(&mut b);
-        stamps.push(c);
-    }
+    stamp(&mut b);
     // ---- the wave's pages: w, w + 4, ..: nw of them (0 for a short sequence) ----
     let neg = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
@@ -668,15 +685,20 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let gen = b.bind_i32(local.clone());
         let half = (s & 1) as usize;
         let page = page_of(b, local);
+        stamp(b);
         let sv = s_part(b, s, gen);
+        stamp(b);
         let (pa, alpha, m_new, lsum) = soft(b, &sv, page);
+        stamp(b);
         if intra {
             let al = rows_of(b, alpha);
             pv_intra(b, s, gen, pa, &al, half);
         } else {
             rescale(b, alpha);
+            stamp(b);
             pv(b, s, gen, pa);
         }
+        stamp(b);
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(lsum));
         b.wait_lds(0);
@@ -721,6 +743,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.begin_if(is_odd);
         b.wait_tensor(0);
         compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
+        if tstamp {
+            // timing experiment: the same page again (warm instruction cache; the output is garbage in this variant anyway)
+            compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
+        }
         b.end_if();
     } else if !pipe {
         let npairs = b.bind_i32((ev(nw) + 1) >> 1);
@@ -808,10 +834,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.end_if();
     b.wait_tensor(0);
 
-    if tstamp {
-        let c = cyc(&mut b);
-        stamps.push(c);
-    }
+    stamp(&mut b);
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
     b.wait_lds(0);
     b.barrier();
@@ -838,10 +861,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     });
     b.wait_lds(0);
     b.barrier();
-    if tstamp {
-        let c = cyc(&mut b);
-        stamps.push(c);
-    }
+    stamp(&mut b);
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);
@@ -885,6 +905,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         ((mx, sc), lt.unwrap())
     });
     let (mx, sc) = mx;
+    stamp(&mut b);
     if split {
         // the partial of this work-group: O un-normalised (scaled to the merged max), the max and the sum of head h
         let fb: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
@@ -948,13 +969,16 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         }
         acc.into_iter().map(|x| x.unwrap()).collect()
     });
+    stamp(&mut b);
     // bf16 pairs -> 8 x 16-byte stores of R[b][h][d0 ..]
     let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(d0) * 2);
     let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
     for k in 0..8u32 {
         let parts: Vec<Opnd> = (0..4).map(|i| Opnd::Val(b.cvt_pk_bf16_f32(outs[8 * k as usize + 2 * i], outs[8 * k as usize + 2 * i + 1]))).collect();
         let v = b.frag_cat(&parts);
-        b.store_global(prb, 16 * k, v, MemTy::B128, false);
+        if !tstamp {
+            b.store_global(prb, 16 * k, v, MemTy::B128, false);
+        }
     }
     // LSE of head h (the 8 threads of the head write the same value)
     let lg = b.log2_f32(lt);
@@ -964,17 +988,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
     let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
     if tstamp {
-        let c = cyc(&mut b);
-        stamps.push(c);
-        // wave 0's stamps over LSE[b][0..]: every lane of wave 0 writes the same words
-        let w0 = b.cmp(CmpPred::Eq, CmpTy::I32, w, Opnd::I32(0));
-        b.begin_if(w0);
-        let lb = b.bind_i32(ev(bidx) * 64);
-        let plb = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lb) });
-        for (i, &s) in stamps.iter().enumerate() {
-            b.store_global(plb, 4 * i as u32, s, MemTy::B32, false);
-        }
-        b.end_if();
+        stamp(&mut b);
         return b.finish();
     }
     b.store_global(pl, 0, lse, MemTy::B32, false);
