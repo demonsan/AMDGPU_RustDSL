@@ -15,7 +15,7 @@ for kb in $KL; do
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s || continue
   echo "== $k (${bm}x${bn})"
   IFS='|'; for sh in $SHAPES; do unset IFS
-    raw=$(gpurun $O/own_host $O/$k.co $k $sh $bm $bn 128 2>&1); echo "$raw" | grep '\"stamps\"' | cut -c1-260; out=$(echo "$raw" | grep -E '^\{"host"|HANG|FAIL|mismatch' | head -1); [ -n "$out" ] || echo "RAW: $(echo "$raw" | head -c 300)"
+    raw=$(gpurun $O/own_host $O/$k.co $k $sh $bm $bn 128 2>&1); echo "$raw" | grep '"stamps"' | cut -c1-260; out=$(echo "$raw" | grep -E '^\{"host"|HANG|FAIL|mismatch' | head -1); [ -n "$out" ] || echo "RAW: $(echo "$raw" | head -c 300)"
     echo "   $sh: $(echo "$out" | sed -E 's/.*"bad":([0-9]+),"maxrel":([0-9.e+-]+),"us":([0-9.]+),"tflops":([0-9.]+).*/bad=\1 us=\3 tflops=\4/')"
     case "$out" in *'"ok":true'*) ;; *) echo "   STOP: $out"; break;; esac
   IFS='|'; done; unset IFS
