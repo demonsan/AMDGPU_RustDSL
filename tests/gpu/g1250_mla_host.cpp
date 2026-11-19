@@ -129,6 +129,21 @@ int main(int argc, char** argv) {
     KA kas = ka;
     void* cfgs[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &kas, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     hipFunction_t fc = nullptr;
+    // FUSED=1 (with SPLITS): a KV-split kernel that combines in the same launch (last arriver); ticket counters (B x 4 u32, zero) in the QTP slot
+    const bool fused = getenv("FUSED") != nullptr;
+    if (fused) {
+        void *dW, *dC;
+        HC(hipMalloc(&dW, (size_t)B * S * 8224 * 4));
+        HC(hipMalloc(&dC, (size_t)B * 16));
+        HC(hipMemset(dC, 0, (size_t)B * 16));
+        kas.VSC = dW;
+        kas.QTP = dC;
+        kas.passes = S;
+        unsigned l2 = 0;
+        while ((1u << l2) < S) l2++;
+        if ((1u << l2) != S || S > 8) FAIL("SPLITS must be 1, 2, 4 or 8");
+        kas.flags = l2;
+    }
     if (getenv("COMBINE_CO")) {
         void* dW;
         HC(hipMalloc(&dW, (size_t)B * S * 8224 * 4));
@@ -160,7 +175,9 @@ int main(int argc, char** argv) {
     HC(hipEventCreate(&e0));
     HC(hipEventCreate(&e1));
     auto launch1 = [&](hipStream_t st) {
-        if (fc) {
+        if (fused) {
+            HC(hipModuleLaunchKernel(f, S, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
+        } else if (fc) {
             HC(hipModuleLaunchKernel(f, S, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
             HC(hipModuleLaunchKernel(fc, 1, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
         } else {
