@@ -239,3 +239,15 @@ fn dead_loads_with_reused_destinations_compile() {
         eprintln!("{asm}");
     }
 }
+
+/// The wait self-check accepts the compiler's own waits for kernel-opt's MLA debug variants (not registered): a prologue whose Q-fragment
+/// loads are stored after more than 63 younger STORES (the shared vmcnt saturation must not retire a load on gfx1250's split counters),
+/// an early exit after the first tensor load, and Q loads before the page loop with global stores inside it (operations beyond the known
+/// queue at a loop head are not counted as loads).
+#[test]
+fn mla_debug_variants_get_their_waits() {
+    use amdgpu_kernels::probes::g1250_mla_ws as w;
+    for f in [w::mla_g1250_qh16_wsx0(), w::mla_g1250_qh16_wsx1(), w::mla_g1250_qh16_wsstd_nowait()] {
+        amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{}: {e}", f.name));
+    }
+}
