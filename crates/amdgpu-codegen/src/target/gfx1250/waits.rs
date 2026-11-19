@@ -177,6 +177,9 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                         }
                     }
                 }
+                if std::env::var("AMDC_WAIT_DEBUG").is_ok() {
+                    eprintln!("wait b{bi} i{ii}: gfx950 vm {vm:?} lgkm {lg:?} -> {lines:?}");
+                }
                 plan.replace.insert((bi, ii), lines);
                 continue;
             }
