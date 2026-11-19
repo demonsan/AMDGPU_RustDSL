@@ -193,7 +193,7 @@ pub fn mla_g1250_qh16_wsst() -> Function {
 
 /// `_wsst` with debug timestamps over the LSE (host PRINT_LSE=1).
 pub fn mla_g1250_qh16_wsstd() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsstd", false, 64 | 128 | 256 | 512, false)
+    mla_ws_with("mla_g1250_qh16_wsstd", false, 64 | 256 | 512 | 16384 | 65536 | 131072, false)
 }
 
 /// timing experiments (not for use): `_ws` exiting after the prologue / after the first page's tensor load
@@ -245,6 +245,25 @@ pub fn mla_g1250_qh16_wsm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsm", false, 64 | 256 | 16384 | 65536 | 131072, false)
 }
 
+/// candidates: `_ws2` / `_ws4` with the last page apart
+pub fn mla_g1250_qh16_ws2m() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws2m", true, 64 | 256 | 16384 | 65536 | 131072, false)
+}
+
+pub fn mla_g1250_qh16_ws4m() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4m", false, 64 | 256 | 4096 | 32768 | 65536 | 131072, false)
+}
+
+/// `_ws` with the instruction prefetch (32 KB at entry, then the tail / merge / final windows)
+pub fn mla_g1250_qh16_wsp8() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsp8", false, 64 | 128 | 256 | 16384 | 65536 | 131072 | 262144, false)
+}
+
+/// KV split with the combine fused into the same launch (last-arriver per (sequence, wave); counters in the QTP slot).
+pub fn mla_g1250_qh16_wskf() -> Function {
+    mla_ws_with("mla_g1250_qh16_wskf", false, 64 | 32 | 524288 | 16384 | 65536 | 256, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -271,6 +290,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     // bit 4 of `branchless`: the intra-page form (`_wsi`); bit 5: the KV split across work-groups (`_wsk`: partials to a workspace, `_cmb` combines)
     let intra = branchless & 16 != 0;
     let split = branchless & 32 != 0;
+    // bit 19 (with `split`): the combine fused into the same launch (a per (sequence, wave) ticket counter in the QTP slot; the last wave combines)
+    let fused = branchless & 524288 != 0;
     // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
     let sload = branchless & 64 != 0;
     // bit 7: prefetch the kernel's code into the instruction cache at entry (s_prefetch_inst, 12 x 4 KB)
@@ -326,6 +347,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.ka_pow2(116, Ext::ka(100));
         b.grid_is(0, Ext::ka(100));
         b.arg_tensor("VSC", Ext::grid_y() * Ext::ka(100) * Ext::c(WS_BYTES));
+        if branchless & 524288 != 0 {
+            b.arg_tensor("QTP", Ext::grid_y() * Ext::c(16));
+            // the last-arriver pattern over the workspace: generation = split id (the workgroup's x), read back in full by the last arriver
+            b.buf_region("ws", "VSC", Ext::c(0), Ext::grid_y() * Ext::ka(100) * Ext::c(WS_BYTES));
+            b.buf_last_arriver("ws", "QTP", Ext::ka(100));
+        }
     }
     b.sym_range("P", 1, 1 << 24);
     b.sym_range("NPG", 1, 1 << 26);
@@ -381,7 +408,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         // can fault (an unmapped page): only windows that are known to lie inside the code are requested
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
-        for k in 0..4u32 {
+        // 4 windows, or (bit 18) 8: 32 KB, for kernels whose code is known to be longer than that
+        let nwin = if branchless & 262144 != 0 { 8 } else { 4 };
+        for k in 0..nwin {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
     }
@@ -1214,6 +1243,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let wsb = b.bind_i32((ev(bidx) * ev(s_count) + ev(sid)) * WS_BYTES as i32);
         let wo = b.bind_i32(ev(wsb) + (ev(h) * 512 + ev(d0)) * 4);
         let pwo = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wo) });
+        if fused {
+            b.buf_produce("ws", sid);
+        }
         for k in 0..16u32 {
             let parts: Vec<Opnd> = (0..4).map(|i| Opnd::Val(b.let_(Op::BitcastI32(Opnd::Val(outs[4 * k as usize + i]))))).collect();
             let v = b.frag_cat(&parts);
@@ -1223,6 +1255,116 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let pwm = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm) });
         b.store_global(pwm, 0, mx, MemTy::B32, false);
         b.store_global(pwm, 64, lt, MemTy::B32, false);
+        if fused {
+            b.tile_end();
+            // single-launch combine: wave w's partial (heads 4 w .. 4 w + 3) is published, then a ticket on counter[b][w] (one per lane);
+            // the wave holding the last ticket of the S splits combines those 4 heads (lane = head 4 w + lane / 8, dims 64 (lane % 8) ..)
+            b.fence_release();
+            let pcnt = b.let_(Op::KernargPtr { offset: 56 });
+            let co = b.bind_i32((ev(bidx) * 4 + ev(w)) * 4);
+            let pc = b.let_(Op::PtrAdd { base: Opnd::Val(pcnt), byte_off: Opnd::Val(co) });
+            let one = b.c_i32(1);
+            let old = b.atomic_add_u32(pc, 0, Opnd::Val(one));
+            let lastt = b.bind_i32(ev(s_count) * 32 - 1);
+            let is_last = b.cmp(CmpPred::Ge, CmpTy::I32, old, lastt);
+            let any = b.any_lane(is_last);
+            b.begin_if(Opnd::Val(any));
+            b.fence_acquire();
+            // reset for the next launch (every split has arrived)
+            let zr = b.c_i32(0);
+            b.store_global(pc, 0, zr, MemTy::B32, false);
+            let neg = b.c_f32(-1.0e30);
+            let zf = b.c_f32(0.0);
+            let mut inits = vec![(DType::F32, Opnd::Val(neg)), (DType::F32, Opnd::Val(zf))];
+            for _ in 0..64 {
+                inits.push((DType::F32, Opnd::Val(zf)));
+            }
+            let st = b.declare_vars(&inits);
+            let (vmx, vls) = (st[0], st[1]);
+            let ovs: Vec<VarId> = st[2..].to_vec();
+            let smax = b.bind_i32(ev(s_count) - 1);
+            // pass 1: the max over the splits
+            let z0 = b.c_i32(0);
+            let lv = b.begin_loop(&[(DType::I32, Opnd::Val(z0))]);
+            let si = lv[0];
+            b.assume(si, Ext::c(0), Ext::c(7));
+            let sic = b.let_(Op::MinI32(Opnd::Var(si), Opnd::Val(smax)));
+            let wsb1 = b.bind_i32((ev(bidx) * ev(s_count) + ev(sic)) * WS_BYTES as i32);
+            let wm1 = b.bind_i32(ev(wsb1) + (8192 + ev(h)) * 4);
+            let pm1 = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm1) });
+            b.buf_consume("ws", sic);
+            let msv = b.load_global(pm1, 0, MemTy::B32);
+            b.tile_end();
+            let msf = f32_of(&mut b, msv);
+            let m2 = b.max_f32(Opnd::Var(vmx), msf);
+            b.set_var(vmx, Opnd::Val(m2));
+            let s1 = b.bind_i32(amdgpu_dsl::varx(si) + 1);
+            b.set_var(si, Opnd::Val(s1));
+            let f1 = b.cmp(CmpPred::Ge, CmpTy::I32, s1, s_count);
+            b.break_if(f1);
+            b.end_loop();
+            // pass 2: the rescaled sums and O
+            let z1 = b.c_i32(0);
+            let lv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z1))]);
+            let sj = lv2[0];
+            b.assume(sj, Ext::c(0), Ext::c(7));
+            let sjc = b.let_(Op::MinI32(Opnd::Var(sj), Opnd::Val(smax)));
+            let wsb2 = b.bind_i32((ev(bidx) * ev(s_count) + ev(sjc)) * WS_BYTES as i32);
+            let wm2 = b.bind_i32(ev(wsb2) + (8192 + ev(h)) * 4);
+            let pm2 = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wm2) });
+            b.buf_consume("ws", sjc);
+            let msv2 = b.load_global(pm2, 0, MemTy::B32);
+            let lsv2 = b.load_global(pm2, 64, MemTy::B32);
+            let msf2 = f32_of(&mut b, msv2);
+            let lsf2 = f32_of(&mut b, lsv2);
+            let dd = b.sub_f32(msf2, Opnd::Var(vmx));
+            let scl = b.exp2_f32(dd);
+            let ltt = b.mul_f32(lsf2, scl);
+            let l2 = b.add_f32(Opnd::Var(vls), ltt);
+            b.set_var(vls, Opnd::Val(l2));
+            let wo2 = b.bind_i32(ev(wsb2) + (ev(h) * 512 + ev(d0)) * 4);
+            let po2 = b.let_(Op::PtrAdd { base: Opnd::Val(pws), byte_off: Opnd::Val(wo2) });
+            let v4s: Vec<ValueId> = (0..16u32).map(|k| b.load_global(po2, 16 * k, MemTy::B128)).collect();
+            b.tile_end();
+            for k in 0..16usize {
+                for e in 0..4u8 {
+                    let x = b.frag_slice(Opnd::Val(v4s[k]), e, 1);
+                    let xf = f32_of(&mut b, x);
+                    let tt = b.mul_f32(xf, scl);
+                    let i = 4 * k + e as usize;
+                    let y = b.add_f32(Opnd::Var(ovs[i]), tt);
+                    b.set_var(ovs[i], Opnd::Val(y));
+                }
+            }
+            let s2 = b.bind_i32(amdgpu_dsl::varx(sj) + 1);
+            b.set_var(sj, Opnd::Val(s2));
+            let f2 = b.cmp(CmpPred::Ge, CmpTy::I32, s2, s_count);
+            b.break_if(f2);
+            b.end_loop();
+            let rl = b.rcp_f32(Opnd::Var(vls));
+            let inv = b.mul_f32(rl, ksf);
+            let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(d0) * 2);
+            let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
+            for k in 0..8u32 {
+                let parts: Vec<Opnd> = (0..4)
+                    .map(|i| {
+                        let a = b.mul_f32(Opnd::Var(ovs[8 * k as usize + 2 * i]), inv);
+                        let c = b.mul_f32(Opnd::Var(ovs[8 * k as usize + 2 * i + 1]), inv);
+                        Opnd::Val(b.cvt_pk_bf16_f32(a, c))
+                    })
+                    .collect();
+                let v = b.frag_cat(&parts);
+                b.store_global(prb, 16 * k, v, MemTy::B128, false);
+            }
+            let lg = b.log2_f32(Opnd::Var(vls));
+            let s3 = b.add_f32(Opnd::Var(vmx), lg);
+            let ln2 = b.c_f32(std::f32::consts::LN_2);
+            let lse = b.mul_f32(s3, ln2);
+            let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
+            let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+            b.store_global(pl, 0, lse, MemTy::B32, false);
+            b.end_if();
+        }
         return b.finish();
     }
     let rl = b.rcp_f32(lt);
