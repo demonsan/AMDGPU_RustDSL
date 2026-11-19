@@ -83,9 +83,12 @@ fn bound(q: &[Pending], unknown: bool, n: usize, k: Kind) -> u32 {
     // would allow MORE outstanding operations of that class than there are younger ones, i.e. too weak a wait (an older load waited
     // with a count that included younger stores: the MLA `_wsstd_nowait` loop). The safe bound counts only the known ones: every
     // operation of class `k` beyond them is older than the target or the target itself.
-    let _ = unknown;
     let known = q.len().min(n);
-    let c = q[q.len() - known..].iter().filter(|p| p.kind == k).count();
+    let mut c = q[q.len() - known..].iter().filter(|p| p.kind == k).count();
+    // (`AMDC_WAIT_BOUND_OLD`: the old, too weak bound - only for A/B timing, never for code that runs in production)
+    if unknown && n > q.len() && std::env::var("AMDC_WAIT_BOUND_OLD").is_ok() {
+        c += n - q.len();
+    }
     c as u32
 }
 
