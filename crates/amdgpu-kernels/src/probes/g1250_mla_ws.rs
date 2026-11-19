@@ -264,6 +264,11 @@ pub fn mla_g1250_qh16_wskf() -> Function {
     mla_ws_with("mla_g1250_qh16_wskf", false, 64 | 32 | 524288 | 16384 | 65536 | 256, false)
 }
 
+/// `_ws` with the first page's tensor load issued right after the sequence bounds.
+pub fn mla_g1250_qh16_wse() -> Function {
+    mla_ws_with("mla_g1250_qh16_wse", false, 64 | 256 | 16384 | 65536 | 131072 | 1048576, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -292,6 +297,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let split = branchless & 32 != 0;
     // bit 19 (with `split`): the combine fused into the same launch (a per (sequence, wave) ticket counter in the QTP slot; the last wave combines)
     let fused = branchless & 524288 != 0;
+    // bit 20: the first page's tensor load issued right after the sequence bounds (before the Q loads and the scale loads); the scale
+    // scalars loaded together with the bounds
+    let early = branchless & 1048576 != 0;
+    assert!(!early || (branchless & 64 != 0 && !split && !pipe), "early staging needs the scalar page-id loads");
     // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
     let sload = branchless & 64 != 0;
     // bit 7: prefetch the kernel's code into the instruction cache at entry (s_prefetch_inst, 12 x 4 KB)
@@ -445,6 +454,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             b.read_first_lane(v)
         }
     };
+    let zero = b.c_i32(0);
+    let early_qk = if early { Some((ld(&mut b, pqs, zero), ld(&mut b, pks, zero))) } else { None };
     let bo = b.let_(Op::ShlI32(Opnd::Val(bidx), Opnd::I32(2)));
     let kv0 = ld(&mut b, pltp, bo);
     let bo4 = b.add_i32(bo, Opnd::I32(4));
@@ -457,9 +468,28 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.assume_trusted(kv_end, Ext::c(1), Ext::sym("NPG"), "host contract: LTP[b + 1] <= NPG (a sequence's entries lie inside the page table)");
     b.assume_trusted(last, Ext::c(1), Ext::c(PAGE_TOKENS as i64), "host contract: the last page holds 1 .. 64 tokens");
     let ctx = b.bind_i32(((ev(npages) - 1) << 6) + ev(last));
-    let zero = b.c_i32(0);
-    let qs = ld(&mut b, pqs, zero);
-    let ks = ld(&mut b, pks, zero);
+    if early {
+        // page 0 of the wave (clamped into the sequence: a wave without pages loads the last page and never reads it)
+        let er = b.bind_i32(ev(kv0) + ev(gbase));
+        let el = b.bind_i32(ev(kv_end) - 1);
+        let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+        let eo = b.bind_i32(ev(ec) * 4);
+        let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+        let pid = b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 });
+        b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
+        let tile0 = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
+        let (_, g1e) = b.tensor_desc_2d(&tile0, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
+        let off = b.bind_i32(ev(pid) * PAGE_BYTES);
+        let mine = kw[0].mine(w);
+        let lds_a = b.bind_i32(mine.base());
+        let g0 = tdm_group0(&mut b, pkv, off, Opnd::Val(lds_a));
+        let gen0 = b.c_i32(0);
+        mine.write(&mut b, gen0, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1e), None, TdmCpol::default()));
+    }
+    let (qs, ks) = match early_qk {
+        Some(v) => v,
+        None => (ld(&mut b, pqs, zero), ld(&mut b, pks, zero)),
+    };
     let qsf = b.let_(Op::BitcastF32(Opnd::Val(qs)));
     let ksf = b.let_(Op::BitcastF32(Opnd::Val(ks)));
     let sc = b.let_(Op::KernargI32 { offset: 92 });
@@ -876,7 +906,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let nw = b.bind_i32((ev(npages) - ev(gbase) + ev(gstride) - 1) >> ev(gshift));
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
-    stage(&mut b, 0, amdgpu_dsl::I32::c(0));
+    if !early {
+        stage(&mut b, 0, amdgpu_dsl::I32::c(0));
+    }
     if exit_tdm {
         b.wait_tensor(0);
         keep_q(&mut b);
