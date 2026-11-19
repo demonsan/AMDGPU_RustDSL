@@ -109,6 +109,15 @@ fn low_window_values(m: &MFunction) -> std::collections::HashSet<VReg> {
                     s.insert(root(*r));
                 }
             }
+            // DPP instructions (`v_mov_b32_dpp`, the cross-lane exchanges of a packing epilogue): the MSB table has no DPP forms, so their
+            // registers stay in v0..v255 (no window switch needed)
+            if crate::op_attrs::attrs(i.op).mnemonic.ends_with("_dpp") {
+                for r in i.dst.iter().copied().chain(i.srcs.iter().filter_map(|x| if let Src::Reg(r) = x { Some(*r) } else { None })) {
+                    if m.vreg_class(r).is_vector() {
+                        s.insert(root(r));
+                    }
+                }
+            }
         }
     }
     s
