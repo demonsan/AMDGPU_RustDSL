@@ -644,7 +644,8 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             // stores and the atomics without return: addr, data0; the atomics with return: vdst, addr, data0 (llvm-mc: `ds_add_f32 v1, v2` =
             // d8540000 00000201, `ds_add_rtn_f32 v3, v1, v2` = d9e40000 03000201)
             let atomic = base.starts_with("ds_add") || base.starts_with("ds_max") || base.starts_with("ds_min");
-            let rtn = atomic && base.contains("_rtn");
+            // ds_permute / ds_bpermute: vdst, addr, data0 like an atomic with return (llvm-mc: `ds_bpermute_b32 v1, v2, v3` = dacc0000 01000302)
+            let rtn = (atomic && base.contains("_rtn")) || base.starts_with("ds_permute") || base.starts_with("ds_bpermute");
             let store = base.starts_with("ds_store") || (atomic && !rtn);
             let (vdst, addr, data0) = if store {
                 (0, vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?)

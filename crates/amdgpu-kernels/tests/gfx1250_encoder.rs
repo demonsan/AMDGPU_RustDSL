@@ -64,6 +64,10 @@ fn the_emitted_lines_encode_like_llvm_mc() {
         lines.push(l.to_string());
     }
     // DPP16 / DPP8 (VOP1, VOP2, VOP3 forms; every control, masks, bound_ctrl, fi, source modifiers): tools/mi450/dpp_samples.txt
+    // the lane permutes (permlane16 / x16 / _var, bcast, up, down, xor, idx_gen, ds_[b]permute), DPP8 + fi, DPP on VOPC
+    for l in include_str!("../../../tools/mi450/permlane_enc_samples.txt").lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        lines.push(l.to_string());
+    }
     for l in include_str!("../../../tools/mi450/dpp_samples.txt").lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
         lines.push(l.to_string());
     }

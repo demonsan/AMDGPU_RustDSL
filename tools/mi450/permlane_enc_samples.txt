@@ -1,0 +1,24 @@
+v_permlane16_b32 v1, v2, s3, s4
+v_permlane16_b32 v1, v2, s3, s4 op_sel:[1,0]
+v_permlane16_b32 v1, v2, s3, s4 op_sel:[0,1]
+v_permlane16_b32 v1, v2, s3, s4 op_sel:[1,1]
+v_permlanex16_b32 v1, v2, s3, s4
+v_permlanex16_b32 v1, v2, s3, s4 op_sel:[1,1]
+v_permlane16_var_b32 v1, v2, v3
+v_permlane16_var_b32 v1, v2, v3 op_sel:[1,1]
+v_permlanex16_var_b32 v1, v2, v3
+v_permlane16_swap_b32_e32 v1, v2
+v_permlane_bcast_b32 v1, v2, s3, s4
+v_permlane_bcast_b32 v1, v2, 4, 0
+v_permlane_up_b32 v1, v2, s3, s4
+v_permlane_down_b32 v1, v2, s3, s4
+v_permlane_xor_b32 v1, v2, s3, s4
+v_permlane_xor_b32 v1, v2, 1, 32
+v_permlane_idx_gen_b32 v1, v2, s3
+v_permlane_idx_gen_b32 v1, v2, 7
+v_cmpx_gt_f32_e32 v1, v2
+v_add_f32_dpp v1, v2, v3 dpp8:[1,0,3,2,5,4,7,6] fi:1
+v_cmp_gt_f32_dpp vcc_lo, v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_cmp_gt_f32_e64_dpp s4, v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+ds_bpermute_b32 v1, v2, v3
+ds_bpermute_b32 v1, v2, v3 offset:4
