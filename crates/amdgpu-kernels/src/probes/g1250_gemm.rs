@@ -897,6 +897,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             }
             b.wait_lds(0);
+            let t_e1 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
             // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
             let r0 = b.mul_i32(wi, Opnd::I32(wrows));
             let r0 = b.add_i32(r0, row0);
@@ -935,6 +936,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
                 let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
                 b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                let t_e2 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
+                if let (Some(e1), Some(e2)) = (t_e1, t_e2) {
+                    let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+                    let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+                    let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+                    b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 9, e1);
+                    b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 10, e2);
+                }
                 b.wait_tensor(0);
             }
             if persistent {
