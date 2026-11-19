@@ -387,6 +387,31 @@ static int run_varscale(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_lds_fadd: 128 work-items add x = (tid + 1) * 2^-r into acc[(tid + 7 r) mod 256] (r = 0..7) with ds_add_f32 after a zeroing
+// barrier; out[wg * 256 + i] = acc[i]. Every partial sum is a dyadic rational far inside f32's range: the result is exact, compared bit for bit.
+// WGS workgroups (default 1024), REPS repetitions (default 5).
+static int run_lds_fadd(Kernel& k, const char* kn) {
+    const int wgs = getenv("WGS") ? atoi(getenv("WGS")) : 1024, reps = getenv("REPS") ? atoi(getenv("REPS")) : 5;
+    std::vector<float> ref(256, 0.0f);
+    for (int tid = 0; tid < 128; ++tid)
+        for (int r = 0; r < 8; ++r) ref[(tid + 7 * r) & 255] += (float)(tid + 1) * (1.0f / (float)(1 << r));
+    float* dout;
+    HC(hipMalloc(&dout, (size_t)wgs * 1024));
+    long bad = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        HC(hipMemset(dout, 0xff, (size_t)wgs * 1024));
+        std::vector<uint8_t> args(8, 0);
+        put64(args, 0, dout);
+        k.launch(wgs, 128, args, kn);
+        std::vector<float> o((size_t)wgs * 256);
+        HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+        for (size_t x = 0; x < o.size(); ++x)
+            if (o[x] != ref[x & 255]) { if (bad < 8) printf("  wg %zu i %zu: got %g ref %g\n", x / 256, x & 255, o[x], ref[x & 255]); ++bad; }
+    }
+    printf("lds_fadd: wgs=%d reps=%d bad=%ld %s\n", wgs, reps, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
+
 // probe_g1250_barriers: named barrier 1 (init / join / signal / wait / leave) then the cluster barrier, out[tid] = tid. Launched ONLY as a
 // cluster (CLUSTER, default 2 workgroups along x; a cluster barrier needs a cluster id), GRID workgroups (default 64), 20 repetitions.
 static int run_barriers(Kernel& k, const char* kn) {
@@ -517,6 +542,7 @@ int main(int argc, char** argv) {
     HC(hipModuleGetFunction(&k.fn, mod, kn));
     const int arg = argc > 4 ? atoi(argv[4]) : -1;
     if (mode == "varscale") return run_varscale(k, kn);
+    if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);
