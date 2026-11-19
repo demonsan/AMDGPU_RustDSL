@@ -210,6 +210,11 @@ pub fn mla_g1250_qh16_ws2() -> Function {
     mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256, false)
 }
 
+/// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
+pub fn mla_g1250_qh16_wsstd_nowait() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsstd_nowait", false, 64 | 128 | 256 | 512 | 8192, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -416,8 +421,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         keep_q(&mut b);
         return b.finish();
     }
-    if tstamp {
-        // the debug stamps store to global memory inside the loop: settle the Q loads first
+    if tstamp && branchless & 8192 == 0 {
+        // the debug stamps store to global memory inside the loop: settle the Q loads first (bit 13 drops this: the wait-pass repro)
         b.wait_vm(0);
     }
     // one page = one tensor op (4608 x 8 bytes), padded by the plan
