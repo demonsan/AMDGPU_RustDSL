@@ -21,13 +21,19 @@ const NT: usize = 32;
 /// workspace bytes per (sequence, split) of the KV-split form: O 16 x 512 f32, then the 16 maxima and the 16 sums
 pub const WS_BYTES: i64 = (16 * 512 + 32) * 4;
 
+fn branch_bits_lean(bits: u32) -> bool {
+    let lean = bits & 65536 != 0;
+    assert!(!lean || bits & 256 != 0, "the lean softmax needs the tail form (no fully masked pages)");
+    lean
+}
+
 fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
 }
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384, false)
+    mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536, false)
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -202,12 +208,12 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// `_ws` with every wave taking every page and owning 128 of the V dims (S computed by all four): a 4x shorter PV chain per page, for
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
-    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 16384, false)
+    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 32768 | 65536, false)
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384, false)
+    mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536, false)
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
@@ -218,6 +224,20 @@ pub fn mla_g1250_qh16_wsstd_nowait() -> Function {
 /// `_ws` compiled with the GEMM compile policy.
 pub fn mla_g1250_qh16_wsg() -> Function {
     mla_ws_with("mla_g1250_qh16_wsg", false, 64 | 256 | 16384, false)
+}
+
+/// ablation aids (not registered): `_ws4` without the GEMM policy; and also with the cross-wave merge instead of the direct epilogue
+pub fn mla_g1250_qh16_ws4b() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4b", false, 64 | 256 | 4096, false)
+}
+
+pub fn mla_g1250_qh16_ws4c() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4c", false, 64 | 256 | 4096 | 32768, false)
+}
+
+/// `_ws` with the lean softmax.
+pub fn mla_g1250_qh16_wsl() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsl", false, 64 | 256 | 16384 | 65536, false)
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -252,6 +272,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let ipf = branchless & 128 != 0;
     // bit 8: full page pairs in the loop, an odd last page after it (no masked re-read of a pad page)
     let tail = branchless & 256 != 0;
+    // bit 16: lean softmax (only with `tail`: no fully masked page exists, so a masked logit's exp2 underflows to 0 and needs no select):
+    // the mask as a branch-free select on the logits, no I1 loop variables
+    let lean = branch_bits_lean(branchless);
     // bit 9: debug timestamps (SHADER_CYCLES, 20 bits) of wave 0 at checkpoints, written over LSE[b][0..6] (the LSE is then garbage)
     let tstamp = branchless & 512 != 0;
     // bits 10 / 11 (timing experiments): exit right after the prologue / right after the first page's tensor load completes
@@ -552,6 +575,43 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let soft = |b: &mut FnBuilder, svals: &[ValueId], page: ValueId| -> (ValueId, ValueId, ValueId, ValueId) {
         // valid tokens of this page (>= 64 except on the sequence's last page)
         let tok_lim = b.bind_i32(ev(ctx) - (ev(page) << 6));
+        if lean {
+            let mut x: Vec<ValueId> = Vec::with_capacity(32);
+            for j in 0..4 {
+                for r in 0..8u8 {
+                    let si = b.frag_slice(Opnd::Val(svals[j]), r, 1);
+                    let sf = f32_of(b, si);
+                    let v = b.mul_f32(sf, cscale);
+                    let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
+                    let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
+                    x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                }
+            }
+            let mut mx = b.max_f32(x[0], x[1]);
+            for r in 2..32 {
+                mx = b.max_f32(mx, x[r]);
+            }
+            let sw = b.let_(Op::Permlane16Swap { a: Opnd::Val(mx), b: Opnd::Val(mx) });
+            let s0 = b.frag_slice(Opnd::Val(sw), 0, 1);
+            let s1 = b.frag_slice(Opnd::Val(sw), 1, 1);
+            let s0f = f32_of(b, s0);
+            let s1f = f32_of(b, s1);
+            let pm = b.max_f32(s0f, s1f);
+            let m_new = b.max_f32(Opnd::Var(vm), pm);
+            let dm = b.sub_f32(Opnd::Var(vm), m_new);
+            let alpha = b.exp2_f32(dm);
+            let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
+            let mut p = Vec::with_capacity(32);
+            for r in 0..32 {
+                let d = b.sub_f32(x[r], m_new);
+                let e = b.exp2_f32(d);
+                lsum = b.add_f32(lsum, e);
+                p.push(e);
+            }
+            let parts: Vec<Opnd> = (0..8).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
+            let pa = b.frag_cat(&parts);
+            return (pa, alpha, m_new, lsum);
+        }
         // logits; the mask (tokens at or beyond ctx) only on a page that reaches past ctx: a uniform branch around VALU only
         let mut x: Vec<ValueId> = Vec::with_capacity(32);
         for j in 0..4 {
@@ -907,11 +967,88 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
 
     stamp(&mut b);
     pf_here(&mut b, 1);
+    let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
+    // (measured slower than the merge path below on e08 - 5.1 vs 4.3 us at 1 x 64 - and kept off: bit 15 set in `_ws4`)
+    if dg == 4 && !split && !tstamp && branchless & 32768 == 0 {
+        // every wave saw every page: its O (128 dims) is complete and its max / sums are the work-group's. No cross-wave merge: the
+        // row sum of head m = the two lane halves' partials (v_permlane16_swap), 1 / L of row 8 g + r by v_readlane, then the scaled O through
+        // the wave's quarter of the (dead) merge buffer for 16-byte stores
+        let sw = b.let_(Op::Permlane16Swap { a: Opnd::Var(vl), b: Opnd::Var(vl) });
+        let s0 = b.frag_slice(Opnd::Val(sw), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(sw), 1, 1);
+        let s0f = f32_of(&mut b, s0);
+        let s1f = f32_of(&mut b, s1);
+        let lh = b.add_f32(s0f, s1f);
+        let rl = b.rcp_f32(lh);
+        let invh = b.mul_f32(rl, ksf);
+        let si: Vec<ValueId> = (0..16u8).map(|hh| b.read_lane(invh, hh)).collect();
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let inv_r: Vec<ValueId> = (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(si[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(si[8 + r])));
+                let t0_ = b.mul_f32(a0, hf);
+                let t1_ = b.mul_f32(a1, gf);
+                b.add_f32(t0_, t1_)
+            })
+            .collect();
+        // the wave's staging area: [16 heads][128 dims] f32 at w * 8 KB of the merge buffer
+        let sbase = b.bind_i32(ev(w) * 8192 + (ev(g) * 8 * 128 + ev(m)) * 4 + mo.base as i32);
+        b.wait_lds(0);
+        b.barrier();
+        mo.at(&t0).write(&mut b, |b| {
+            for nt in 0..ntw {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(b, e);
+                    let y = b.mul_f32(ef, inv_r[r as usize]);
+                    let a = b.bind_i32(ev(sbase) + ((r as i32) * 512 + (64 * nt as i32)));
+                    b.store_lds(a, y, MemTy::B32, false);
+                }
+            }
+        });
+        b.wait_lds(0);
+        b.barrier();
+        // lane l: head l / 2, dims 64 (l % 2) .. + 64 of the wave's 128
+        let hh = b.bind_i32(ev(lane) >> 1);
+        let dd = b.bind_i32((ev(lane) & 1) * 64);
+        let rbase = b.bind_i32(ev(w) * 8192 + (ev(hh) * 128 + ev(dd)) * 4 + mo.base as i32);
+        let vals: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+            (0..16).map(|k| { let a = b.bind_i32(ev(rbase) + 16 * k); b.load_lds_b128(a) }).collect()
+        });
+        let ro = b.bind_i32((ev(bidx) * 16 + ev(hh)) * 1024 + (ev(db) + ev(dd)) * 2);
+        let prr = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
+        for k in 0..8u32 {
+            let parts: Vec<Opnd> = (0..4u32)
+                .map(|i| {
+                    let j = 8 * k + 2 * i;
+                    let x0 = b.frag_slice(Opnd::Val(vals[(j / 4) as usize]), (j % 4) as u8, 1);
+                    let x1 = b.frag_slice(Opnd::Val(vals[((j + 1) / 4) as usize]), ((j + 1) % 4) as u8, 1);
+                    let f0 = f32_of(&mut b, x0);
+                    let f1 = f32_of(&mut b, x1);
+                    Opnd::Val(b.cvt_pk_bf16_f32(f0, f1))
+                })
+                .collect();
+            let v = b.frag_cat(&parts);
+            b.store_global(prr, 16 * k, v, MemTy::B128, false);
+        }
+        // the LSE of head m (both lane halves and every wave write the same value)
+        let lg = b.log2_f32(lh);
+        let s2 = b.add_f32(Opnd::Var(vm), lg);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lse = b.mul_f32(s2, ln2);
+        let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+        b.store_global(pl, 0, lse, MemTy::B32, false);
+        return b.finish();
+    }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
     b.wait_lds(0);
     b.barrier();
     let mlw = |b: &mut FnBuilder, a: ValueId, v: Opnd| b.store_lds(a, v, MemTy::B32, false);
-    let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     ml.at(&t0).write(&mut b, |b| {
         // max of head m (both lane halves write the same value), the half-sum of lane (m, g)
         let am = b.bind_i32(ev(w) * 64 + ev(m) * 4 + ml.base as i32);
