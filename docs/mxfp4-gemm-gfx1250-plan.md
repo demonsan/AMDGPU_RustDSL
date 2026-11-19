@@ -77,3 +77,22 @@ The dependence on K is not monotonic and is not explained by a power-of-two row 
 ## 512-K slots in a 2-slot ring (e08 round, supersedes the relaxed-wait dispatch above)
 
 `gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles`: ks 4 (one stage = 512 K), ring of 2 slots, one barrier and one stage per 512 K; 9.99 - 10.04 PF/s at 8192^3 and 7.1 - 7.35 at 4096^3 against the vendor's 12.4 - 12.5 / 11.0 (paired, e08). No K-dependent resonance (the relaxed-wait dispatch table above applies only to the 256-K kernels). Host contract: K a multiple of 512. Multicast composes with it (`_roles_c4x4_lock`: 7.9 at 4096^3, equal at 8192^3). Stamps and the profile that led here: `docs/gfx1250-status.md` section 4.
+
+## What did not close the last 20 % (e08 round, 2026-11-19)
+
+Measured on e08-01 against the 512-K kernel above, all bit-exact; the details of the stamps are in `docs/gfx1250-status.md`.
+
+| attempt | result (8192^3 unless noted) | why |
+|---|---|---|
+| cluster multicast with 512-K slots (`_roles_c4x4_lock`) | 4096^3 7.9 (+8 %), 8192^3 9.99 (equal) | the cluster barrier is amortised over 512 K; traffic is no longer the limiter at 8192^3 |
+| 256 x 128 tile (512 workgroups at 4096^3) | slower at every shape except 2048^3 | smaller tiles raise the per-K-step overhead and the epilogue share |
+| lazy prologue, instruction prefetch | 0 to +2 % / 0 | the prologue is one DRAM round trip; the loop's code is already in the instruction cache |
+| tile staggering (odd tiles sleep at the start) | 4096^3 +5 %, 8192^3 -2 % | desynchronises the write bursts, costs the sleep |
+| wave order (Gray / transposed) | 0 | the 4 % window skew follows the wave id, not the block position |
+| operand swap + bf16 epilogue (direct 16-byte stores / conflict-free staged chunks) | 8.3 / 8.6 - 8.8 | the epilogue is a fixed latency (about 7,000 cycles) whatever the width; the row permutation makes the window 12 % slower |
+| epilogue stores overlapped into the next tile's K loop (packed bf16 `prev`, 8 - 16 blocks) | 7.8 - 8.4 | the global stores contend with the TDM loads (loop +17 %); the full 32-block carry does not fit in 1,024 VGPRs |
+| 192 x 256 tile, K slot 256, separate bf16 staging, persistent, stores draining behind the next prologue | 6144 x 8192 x 8192: 8.23 (f32 aliased epilogue 8.56, 512-K slots 8.86) | epilogue 2,250 cycles but the 256-K slot costs 21.3 cycles per WMMA in the loop (17.9 for the 256 x 256 512-K kernel); the stores sit ahead of the next prologue's loads in the in-order tensor queue |
+
+Where the time goes (per 256 x 256 tile, 8192^3): prologue 3,200 cycles (7 %), K loop 36,100 (78 %: window 81 %, barrier 12 %, stage issue 3 %, wait 3 %), epilogue 6,300 -
+8,400 (14 - 15 %). Left: issue the next tile's stage loads before the epilogue (a tail prologue across the loop back edge: needs the protocol verifier to compare the back-edge
+state with the pre-loop prologue state) with a staging buffer outside the ring, which no K slot of 512 leaves room for.
