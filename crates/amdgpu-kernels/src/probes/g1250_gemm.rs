@@ -495,6 +495,11 @@ pub fn gemm_tdm_stage_f4_192x256_swap_ovl(name: &str, relax: bool) -> Function {
 }
 
 /// The vendor's 192 x 256 tile (2 x 2 waves of 96 x 128: 3 x 8 blocks, 24 accumulator blocks) with K slots of 256, the f32 LDS-staged epilogue and wave roles; M a multiple of 192.
+/// The 192 x 256 tile with K slots of 512 in a 2-slot ring (f32 staged epilogue aliasing the ring).
+pub fn gemm_tdm_stage_f4_192x256_ks4_s2(name: &str, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
 pub fn gemm_tdm_stage_f4_192x256_ks2(name: &str, relax: bool, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
 }
