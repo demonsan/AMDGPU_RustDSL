@@ -580,7 +580,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg("n", DType::I32, 44, 4);
     if ring.stamps {
         b.arg("dbg", DType::Ptr, 64, 8);
-        b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 32));
+        b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 64));
     }
     let persistent = ring.persistent;
     assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
@@ -642,6 +642,12 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
     let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
+    let t_start = if ring.stamps {
+        let c = b.shader_cycles();
+        b.let_(Op::PtrLo(Opnd::Val(c)))
+    } else {
+        pc
+    };
     let kk = b.let_(Op::KernargI32 { offset: 40 });
     let nn = b.let_(Op::KernargI32 { offset: 44 });
     let tid = b.let_(Op::WorkitemId);
@@ -841,11 +847,17 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let mut emit = |b: &mut FnBuilder, role: Role| {
         let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
+        let t_post = if ring.stamps {
+            let c = b.shader_cycles();
+            Some(b.let_(Op::PtrLo(Opnd::Val(c))))
+        } else {
+            None
+        };
         if ring.stamps {
             // the per-wave record: [tile row][tile column & 63][wave] x 32 bytes of the debug buffer (the host keeps N / BN <= 64)
             let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
             let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
-            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 32);
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
             for (k, var) in body.stamp_vars.clone().iter().take(4).enumerate() {
                 let v = b.let_(Op::AddI32(Opnd::Var(*var), Opnd::I32(0)));
                 b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), k as u32, v);
@@ -966,6 +978,18 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             }
         }
+        }
+        if let Some(tp) = t_post {
+            let c = b.shader_cycles();
+            let t_end = b.let_(Op::PtrLo(Opnd::Val(c)));
+            let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+            let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+            let l0 = b.let_(Op::AddI32(Opnd::Var(body.stamp_vars[5]), Opnd::I32(0)));
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 5, l0);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 6, tp);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 7, t_end);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 8, t_start);
         }
     };
     if ring.roles {

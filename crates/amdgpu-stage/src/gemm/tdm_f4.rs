@@ -226,7 +226,7 @@ impl PipeBody for TdmF4Body {
             .chain(if self.stamps {
                 let z = b.c_i32(0);
                 let c0 = cyc(b);
-                vec![(DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(c0))]
+                vec![(DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]
             } else {
                 Vec::new()
             })
