@@ -73,3 +73,7 @@ Not to be run: the 8-wave variant that hung (not registered). `..._256x128` (78,
 | 16384 (M = N = 8192) | 8.27 | 10.06 |
 
 The dependence on K is not monotonic and is not explained by a power-of-two row stride (K = 3840 and 4352 lose as well) nor by tile order: a tile-order swizzle (`RingOpts::swizzle`, host `SWIZZLE=G`, G = 4, 8) changes nothing measurable. Cluster multicast on the same kernel (`_epit_c2x2_lock`, `_epit_c4x4_lock`) is slower (6.5 / 7.4 PF/s at 8192^3 against 8.3). Dispatch rule until the K dependence is understood: relaxed for K <= 3584 or K >= 5120, not relaxed for 3840 <= K <= 4608.
+
+## 512-K slots in a 2-slot ring (e08 round, supersedes the relaxed-wait dispatch above)
+
+`gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles`: ks 4 (one stage = 512 K), ring of 2 slots, one barrier and one stage per 512 K; 9.99 - 10.04 PF/s at 8192^3 and 7.1 - 7.35 at 4096^3 against the vendor's 12.4 - 12.5 / 11.0 (paired, e08). No K-dependent resonance (the relaxed-wait dispatch table above applies only to the 256-K kernels). Host contract: K a multiple of 512. Multicast composes with it (`_roles_c4x4_lock`: 7.9 at 4096^3, equal at 8192^3). Stamps and the profile that led here: `docs/gfx1250-status.md` section 4.

@@ -8,7 +8,7 @@ CL=/opt/rocm/llvm/bin/clang
 echo "GPU: ${IDLE_GPU:-none}"
 export PROBE_WATCHDOG_S=20 CHECK_ROWS=16
 SHAPES=${SHAPES:-"2048 2048 2048 20|4096 4096 2048 10|4096 4096 4096 10|4096 4096 8192 5|8192 8192 8192 5"}
-KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles:256:256 gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles:256:256}
+KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit:256:256 gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles:256:256}
 for kb in $KL; do
   IFS=: read k bm bn <<< "$kb"; unset IFS; echo "[parse] k=$k bm=$bm bn=$bn"
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -3 $O/$k.log; continue; }

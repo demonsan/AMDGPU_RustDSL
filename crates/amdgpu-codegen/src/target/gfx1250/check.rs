@@ -216,11 +216,23 @@ pub fn verify_mode(m: &MFunction, a: &Alloc, mode0: u8) -> Vec<(u32, bool, Strin
                 let writes = keys(m, a, &e.writes);
                 let valu = is_valu(inst.op);
                 let relaxed = st.mode != Some(0);
+                // a load overwriting the destination of an older load of the SAME in-order counter needs no wait: LOADcnt / DScnt
+                // operations return in issue order, so the younger load's data lands last (LLVM SIInsertWaitcnts waits on a WAW only
+                // across different VMEM types; `hazards::pad_inflight_waw` makes the same exception)
+                let my_load = if e.smem || e.writes.is_empty() {
+                    None
+                } else {
+                    e.mem.as_ref().map(|ma| match ma.space {
+                        crate::sched::effects::Space::Global => Ctr::Load,
+                        crate::sched::effects::Space::Lds => Ctr::Ds,
+                    })
+                };
                 // dependencies on outstanding operations
                 for (k, v) in &st.items {
                     let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
                     let dep = match k.0 {
-                        Ctr::Load | Ctr::Ds | Ctr::Km => hit(&reads, &v.dst) || hit(&writes, &v.dst),
+                        Ctr::Load | Ctr::Ds => hit(&reads, &v.dst) || (hit(&writes, &v.dst) && my_load != Some(k.0)),
+                        Ctr::Km => hit(&reads, &v.dst) || hit(&writes, &v.dst),
                         Ctr::Store => false,
                         Ctr::X => hit(&writes, &v.src),
                         Ctr::VaVdst => relaxed && !valu && (hit(&reads, &v.dst) || hit(&writes, &v.dst) || hit(&writes, &v.src)),
