@@ -6,6 +6,7 @@ use amdgpu_dsl::Function;
 
 pub mod check;
 pub mod cse;
+pub mod dse;
 pub mod emit;
 pub mod hazards;
 pub mod matorder;
@@ -67,7 +68,12 @@ pub fn compile_with(f: &Function, backend: &str) -> Result<crate::Compiled, Stri
 }
 
 fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String> {
-    let (m, alloc) = crate::lower_and_allocate(f)?;
+    let (mut m, alloc) = crate::lower_and_allocate(f)?;
+    // dead writes the allocation exposed (descriptor words rewritten before use; `dse.rs`)
+    if backend == "own" && !f.exact {
+        dse::dse(&mut m, &alloc);
+        dse::tdm_first(&mut m, &alloc);
+    }
     // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
     crate::gpu_verify_1250::enforce(f, &m, &alloc)?;
     // the LDS tile protocol (gpu_protocol: completion incl. the tensor operations' TENSORcnt, publication by barriers, slot reuse) of the

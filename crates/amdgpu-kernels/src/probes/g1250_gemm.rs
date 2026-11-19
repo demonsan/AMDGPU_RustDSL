@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -622,6 +622,9 @@ pub struct RingOpts {
     pub ovl: u8,
     /// the kept groups all stored at iteration 0 (one `if`)
     pub ovl_burst: bool,
+    /// the staged tensor-store epilogue in bands: each 32-row band of the wave's block is stored by its own tensor store as soon as it is staged (the LDS staging of band i + 1 overlaps the
+    /// store of band i), instead of one store after the whole block
+    pub epi_bands: u8,
 }
 
 impl RingOpts {
@@ -633,7 +636,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0 }
     }
 }
 
@@ -1235,6 +1238,43 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(2)));
             let lb = b.add_i32(wl0, lrow);
             let lb = b.add_i32(lb, m4);
+            if ring.epi_bands > 0 && epi == 2 {
+                // band i (rows 32 i .. 32 i + 31 of the wave block, 32 x wcols f32 contiguous in LDS): stage it, store it, stage the next while it drains
+                let r0 = b.mul_i32(wi, Opnd::I32(wrows));
+                let r0 = b.add_i32(r0, row0);
+                let c0 = b.mul_i32(wj, Opnd::I32(wcols));
+                let c0 = b.add_i32(c0, col0);
+                let lin = b.mul_i32(r0, nn);
+                let lin = b.add_i32(lin, c0);
+                let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+                let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
+                let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
+                let per = sh.tm / ring.epi_bands as i32;   // 32-row blocks per band
+                let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(32 * per)], stride0: Opnd::Val(nn), tile: [wcols as u16, (32 * per) as u16], pad: None, wg_mask: 0 };
+                for i in 0..sh.tm {
+                    let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
+                    for j in 0..sh.tn {
+                        let acc = body.acc[(i * sh.tn + j) as usize];
+                        for v in 0..16i32 {
+                            let rowv = (v % 8) + 16 * (v / 8);
+                            let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
+                            let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
+                            b.store_lds_b32(addr, x);
+                        }
+                    }
+                    if (i + 1) % per == 0 {
+                        b.wait_lds(0);
+                        let i0 = i + 1 - per;   // the band's first 32-row block
+                        let band_bytes = b.mul_i32(nn, Opnd::I32(32 * 4 * i0));
+                        let org_i = b.add_i32(org_s, band_bytes);
+                        let org_i = b.let_(Op::ReadFirstLane(Opnd::Val(org_i)));
+                        let lds_i = b.add_i32(wl0_s, Opnd::I32(i0 * 32 * epi_rs));
+                        let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_i), Opnd::Val(lds_i));
+                        b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                    }
+                }
+                b.wait_tensor(0);
+            } else {
             for i in 0..sh.tm {
                 let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
                 for j in 0..sh.tn {
@@ -1296,6 +1336,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 10, e2);
                 }
                 b.wait_tensor(0);
+            }
             }
             if persistent {
                 // the next tile's first stage writes the ring: every wave's staging reads are done
