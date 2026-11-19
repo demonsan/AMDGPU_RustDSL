@@ -11,10 +11,22 @@ Two shared 4-GPU nodes carry gfx1250 GPUs (wave 32, 256 CUs each) and the ROCm c
 
 Both nodes are shared with other teams and with the other sessions of this project (one account, `blyu`). Nobody owns a GPU: pick an idle one every time and never touch a process you did not start.
 
+## 0. e08-01 (the third node)
+
+| | e08-01 |
+|---|---|
+| login | `amd@10.223.206.118`, a **shared** account; **password login only**: never install an ssh key or set up passwordless login there (user policy). `mi450-exec.ps1 -Node e08` logs in through a local askpass helper kept outside the repository; use only `mi450-exec` for this node (no direct `ssh` / `scp`) |
+| work dir | `/data/blyu/amdrustdsl` (`$BASE`; sessions under `$BASE/ws/<Tag>`). The account is shared with other people: touch nothing outside `/data/blyu` |
+| GPU lock | per-GPU `gpu-lock` (`pergpu`: `gpurun` locks only `IDLE_GPU`, `gpu-lock -g <n>`); same rules as on a08-1 |
+| host compiler | Ubuntu 26.04: gcc 16 ships no libstdc++ headers, so the HIP hosts are compiled against gcc 15. The runner exports `HIPCC_COMPILE_FLAGS_APPEND` / `CCC_OVERRIDE_OPTIONS=+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15`; the `### CCC_OVERRIDE_OPTIONS` / `unused argument` lines in the build output are expected |
+| vendor code objects | copied to `$BASE/vendor/gfx1250/{f4gemm,mla}` (the same files as on a08-1) |
+| known test result | `co_oracle` (`the_in_process_code_object_is_byte_identical_to_clangs_for_every_reachable_kernel`) **fails there by design**: the node's clang (ROCm 10.3) is not the pinned assembler, so its code objects differ. Do not chase it; the gate there is the md5 / co / added / cert manifests, the other tests and `lite_contract` as everywhere |
+| profiler | the release `rocprofv3` lacks the gfx1250 derived metrics, and most SQ / TX counters read 0 without VMP arming (shared GPU state: needs the user's authorisation; see the mi450-spm-capture skill). Do not arm VMP or install a profiler runtime without that authorisation |
+
 ## 1. `_scripts/mi450-exec.ps1` (`tools/mi450/mi450-exec.ps1`)
 
 ```
-mi450-exec.ps1 -Node f01|a08 [-Sync -Repo <worktree>] [-PayloadFile x.sh | -Payload '<bash>'] [-Tag <session>]
+mi450-exec.ps1 -Node f01|a08|e08 [-Sync -Repo <worktree>] [-PayloadFile x.sh | -Payload '<bash>'] [-Tag <session>]
                [-TimeoutSec 600] [-GpuTimeoutSec 120] [-GpuIdx N] [-NoGpu]
 ```
 
