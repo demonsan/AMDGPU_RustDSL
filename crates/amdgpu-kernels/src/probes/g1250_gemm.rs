@@ -485,7 +485,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) ->
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), ..RingOpts::default() })
 }
 
 /// The 256 x 256 kernel with the operand swap and the bf16 direct epilogue (host OUT_BF16=1): no LDS staging, no tensor store.
@@ -634,6 +634,10 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 64));
     }
     let persistent = ring.persistent;
+    if ring.roles && sh.cx * sh.cy > 1 {
+        // the two role copies of the loop signal / wait the cluster barrier in different loops; both run nkv - 1 iterations by construction (a trusted, listed fact)
+        b.barrier_wait_trips_match(-3);
+    }
     assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
     if persistent {
         // the outermost loop is the persistent tile loop (G5 verifies one tile body ending quiescent)
@@ -792,7 +796,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(coop || !clustered, "a cluster needs cooperative loads");
     // a cluster multicast is a rendezvous of IDENTICAL requests (the ISA: one wave per workgroup issues the same request with the same mask; the data goes to every requesting workgroup once all have
     // asked): so the workgroups of a cluster row issue the very same slices of the A tile, those of a cluster column the same slices of the B tile, and the slices are per wave only, as without a cluster
-    assert!(!ring.roles || (coop && nw == 4 && !clustered), "wave roles: 4 cooperative waves, no cluster");
+    assert!(!ring.roles || (coop && nw == 4), "wave roles: 4 cooperative waves");
     let div = if ring.roles { 2 } else if coop { nw } else { 1 };   // roles: the two waves of a role split each of its tiles
     assert!(bm % div == 0 && bn % div == 0, "the tile splits evenly over the waves");
     let (rpa, rpb) = (bm / div, bn / div);
