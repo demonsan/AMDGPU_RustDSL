@@ -279,6 +279,11 @@ pub fn mla_g1250_qh16_wsr() -> Function {
     mla_ws_with("mla_g1250_qh16_wsr", false, 64 | 256 | 16384 | 65536 | 131072 | 4194304, false)
 }
 
+/// `_ws` with each page loaded as 4 quarter tensor ops.
+pub fn mla_g1250_qh16_wsq() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsq", false, 64 | 256 | 16384 | 65536 | 131072 | 8388608, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -314,6 +319,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     // max) and its row sums into one 16 x 512 accumulator (zeroed in its own phase); the final reads 16 instead of 64 b128 per thread.
     // The sum order across waves is not fixed (float atomics): the output can differ in the last bits from run to run
     let fadd = branchless & 2097152 != 0;
+    // bit 23: a page as 4 quarter tensor ops (like the vendor's per-wave quarter loads) instead of one 36 KB op
+    let quarters = branchless & 8388608 != 0;
+    let qn: u8 = if quarters { 4 } else { 1 };
+    const QUARTER: i32 = PAGE_BYTES / 4;
+    assert!(!quarters || branchless & 1048576 == 0, "quarters: not with the early first stage");
     assert!(!early || (branchless & 64 != 0 && !split && !pipe), "early staging needs the scalar page-id loads");
     // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
     let sload = branchless & 64 != 0;
@@ -544,6 +554,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     // one page = one tensor op (4608 x 8 bytes), padded by the plan
     let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
     let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
+    let tile_q = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(QUARTER / 8), Opnd::I32(1)], stride0: Opnd::I32(QUARTER / 8), tile: [(QUARTER / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
+    let g1q = if quarters { b.tensor_desc_2d(&tile_q, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0)).1 } else { g1 };
     // lane offsets in a page slot (tile j = tokens 16 j ..): K nope / rope rows, the V tr8 fetch address; the constant parts as checked deltas
     let kofs = layout.at_expr(&mut b, ev(m) * DV + ev(g) * 32);
     let rofs = layout.at_expr(&mut b, ev(m) * 64 + ev(g) * 32 + ROPE_OFF);
@@ -620,7 +632,18 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let lds_a = b.bind_i32(mine.base());
         let g0 = tdm_group0(b, pkv, off, Opnd::Val(lds_a));
         let gen = b.bind_i32(local);
-        mine.write(b, gen, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        if quarters {
+            mine.write(b, gen, |b| {
+                for qq in 0..4i32 {
+                    let offq = b.bind_i32(ev(off) + qq * QUARTER);
+                    let lq = b.bind_i32(ev(lds_a) + qq * layout.quarter_lds);
+                    let g0q = tdm_group0(b, pkv, offq, Opnd::Val(lq));
+                    b.tensor_load_to_lds(Opnd::Val(g0q), Opnd::Val(g1q), None, TdmCpol::default());
+                }
+            });
+        } else {
+            mine.write(b, gen, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        }
     };
     // the pieces of one page (private slot s, generation `local`): S; the softmax (logits, mask, max, P); the O rescale; PV
     let page_of = |b: &mut FnBuilder, local: amdgpu_dsl::I32| b.bind_i32(local * ev(gstride) + ev(gbase));
@@ -950,10 +973,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let l1 = b.bind_i32(ev(l0) + 1);
         let l2 = b.bind_i32(ev(l0) + 2);
         stage(&mut b, 1, ev(l1));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 0, ev(l0));
         stage(&mut b, 0, ev(l2));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 1, ev(l1));
         let g2 = b.bind_i32(amdgpu_dsl::varx(gl) + 2);
         b.set_var(gl, Opnd::Val(g2));
@@ -999,10 +1022,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let l1 = b.bind_i32(ev(l0) + 1);
         let l2 = b.bind_i32(ev(l0) + 2);
         stage(&mut b, 1, ev(l1));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 0, ev(l0));
         stage(&mut b, 0, ev(l2));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 1, ev(l1));
         let g2 = b.bind_i32(amdgpu_dsl::varx(gl) + 2);
         b.set_var(gl, Opnd::Val(g2));
@@ -1034,10 +1057,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let l1 = b.bind_i32(ev(l0) + 1);
         let l2 = b.bind_i32(ev(l0) + 2);
         stage(&mut b, 1, ev(l1));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 0, ev(l0));
         stage(&mut b, 0, ev(l2));
-        b.wait_tensor(1);
+        b.wait_tensor(qn);
         compute(&mut b, 1, ev(l1));
         let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
         b.set_var(kp2, Opnd::Val(kn));
