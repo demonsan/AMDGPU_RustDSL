@@ -478,6 +478,16 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, iprefetch: n, ..RingOpts::default() })
 }
 
+/// The 256 x 256 kernel with the operand swap and the bf16 direct epilogue (host OUT_BF16=1): no LDS staging, no tensor store.
+pub fn gemm_tdm_stage_f4_256x256_ks2_swapbf16(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles, swap: true, ..RingOpts::default() })
+}
+
+/// The best 256 x 256 kernel with the K-loop phase stamps (host STAMPS=1).
+pub fn gemm_tdm_stage_f4_256x256_ks2_epit_stamps(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, stamps: true, ..RingOpts::default() })
+}
+
 /// The best 256 x 256 kernel on a persistent grid (host PERSIST=G): no cross-tile overlap (the LDS-staged epilogue uses the whole LDS), only the tile loop.
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_persist(name: &str, relax: bool, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
@@ -541,11 +551,17 @@ pub struct RingOpts {
     /// instruction prefetch at the kernel start: this many `s_prefetch_inst` of 32 lines each from the kernel's first instruction (0 = none): the first iteration of the loop then finds its
     /// code in the instruction cache instead of fetching it line by line from L2
     pub iprefetch: u8,
+    /// the K-loop phase stamps (`TdmF4Body::stamps`): a debug buffer argument `dbg` @64, per wave 8 dwords: the summed cycles of the stage issue, the window, the wait, the barrier,
+    /// the steady iteration count
+    pub stamps: bool,
+    /// operand swap: the WMMA's A operand is the B matrix (tile rows = N) and its B operand the A matrix, so a lane's accumulator holds 8 CONSECUTIVE columns of C for a fixed row (instead of 8
+    /// consecutive rows of one column): with `bf16` output the epilogue packs them and stores 16 bytes per lane straight from the registers (no LDS staging, no tensor store). Needs bm == bn.
+    pub swap: bool,
 }
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false }
     }
 }
 
@@ -570,6 +586,10 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
     b.arg("k", DType::I32, 40, 4);
     b.arg("n", DType::I32, 44, 4);
+    if ring.stamps {
+        b.arg("dbg", DType::Ptr, 64, 8);
+        b.arg_tensor("dbg", Ext::grid_y() * Ext::c(64 * 4 * 64));
+    }
     let persistent = ring.persistent;
     assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
     if persistent {
@@ -629,6 +649,16 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     lds.commit(&mut b);
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
+    // swap: the A operand reads the B matrix and its scales (and vice versa)
+    assert!(!ring.swap || (bm == bn && sh.cx * sh.cy == 1 && !persistent), "operand swap: a square tile, no cluster, not persistent");
+    let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
+    let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
+    let t_start = if ring.stamps {
+        let c = b.shader_cycles();
+        b.let_(Op::PtrLo(Opnd::Val(c)))
+    } else {
+        pc
+    };
     let kk = b.let_(Op::KernargI32 { offset: 40 });
     let nn = b.let_(Op::KernargI32 { offset: 44 });
     let tid = b.let_(Op::WorkitemId);
@@ -728,8 +758,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let leader = b.bind_cond(ev(wid).eq(0));
     let rowa_w = b.mul_i32(wsl, Opnd::I32(rpa));
     let rowb_w = b.mul_i32(wsl, Opnd::I32(rpb));
-    let row0w = b.add_i32(row0, rowa_w);
-    let col0w = b.add_i32(col0, rowb_w);
+    let (org_a, org_b) = if ring.swap { (col0, row0) } else { (row0, col0) };   // the global row origin of the A / B operand tile
+    let row0w = b.add_i32(org_a, rowa_w);
+    let col0w = b.add_i32(org_b, rowb_w);
     let a_org = b.mul_i32(row0w, kb);
     let b_org = b.mul_i32(col0w, kb);
     let sa_org = b.mul_i32(row0w, ks);
@@ -826,14 +857,65 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
 
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
+        let t_post = if ring.stamps {
+            let c = b.shader_cycles();
+            Some(b.let_(Op::PtrLo(Opnd::Val(c))))
+        } else {
+            None
+        };
+        if ring.stamps {
+            // the per-wave record: [tile row][tile column & 63][wave] x 32 bytes of the debug buffer (the host keeps N / BN <= 64)
+            let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+            let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+            for (k, var) in body.stamp_vars.clone().iter().take(4).enumerate() {
+                let v = b.let_(Op::AddI32(Opnd::Var(*var), Opnd::I32(0)));
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), k as u32, v);
+            }
+            let it = b.let_(Op::AddI32(Opnd::Val(nkv), Opnd::I32(-1)));
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 4, it);
+        }
         if persistent {
             // the next tile's first stage overwrites slot 0: every wave has finished reading the last window first
             b.wait_lds(0);
             b.barrier();
         }
-        if epi > 0 {
+        if ring.swap && sh.bf16 {
+            // D[n][m]: the lane holds, for its column m (a row of C), 8 consecutive n at v = 0..7 (+ 16 more at v = 8..15): bf16 pairs packed into 4 dwords, one 16-byte store each
+            let g8s = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+            let row_bytes = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(1)));
+            for i in 0..sh.tm {
+                for j in 0..sh.tn {
+                    let acc = body.acc[(i * sh.tn + j) as usize];
+                    let mr = b.mul_i32(wj, Opnd::I32(sh.tn * 16));
+                    let mr = b.add_i32(mr, row0);
+                    let mr = b.add_i32(mr, Opnd::I32(j * 16));
+                    let mr = b.add_i32(mr, m);
+                    let n0 = b.mul_i32(wi, Opnd::I32(sh.tm * 32));
+                    let n0 = b.add_i32(n0, col0);
+                    let n0 = b.add_i32(n0, Opnd::I32(i * 32));
+                    let n0 = b.add_i32(n0, g8s);
+                    let rb = b.mul_i32(mr, row_bytes);
+                    let nb = b.let_(Op::ShlI32(Opnd::Val(n0), Opnd::I32(1)));
+                    let off = b.add_i32(rb, nb);
+                    for h in 0..2i32 {
+                        let mut parts: Vec<Opnd> = Vec::new();
+                        for q in 0..4i32 {
+                            let x0 = b.frag_slice(Opnd::Var(acc), (h * 8 + 2 * q) as u8, 1);
+                            let x1 = b.frag_slice(Opnd::Var(acc), (h * 8 + 2 * q + 1) as u8, 1);
+                            let f0 = b.bitcast_f32(x0);
+                            let f1 = b.bitcast_f32(x1);
+                            parts.push(Opnd::Val(b.let_(Op::CvtPkBf16F32(Opnd::Val(f0), Opnd::Val(f1)))));
+                        }
+                        let v4 = b.frag_cat(&parts);
+                        let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
+                        b.store_f32x4(p, (h * 32) as u32, v4);
+                    }
+                }
+            }
+        } else if epi > 0 {
             // every wave has finished reading the ring (its last window) before any wave writes C into it
             if !persistent {
                 b.wait_lds(0);
@@ -860,6 +942,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             }
             b.wait_lds(0);
+            let t_e1 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
             // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
             let r0 = b.mul_i32(wi, Opnd::I32(wrows));
             let r0 = b.add_i32(r0, row0);
@@ -898,6 +981,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
                 let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
                 b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                let t_e2 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
+                if let (Some(e1), Some(e2)) = (t_e1, t_e2) {
+                    let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+                    let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+                    let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+                    b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 9, e1);
+                    b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 10, e2);
+                }
                 b.wait_tensor(0);
             }
             if persistent {
@@ -941,6 +1032,18 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             }
         }
+        }
+        if let Some(tp) = t_post {
+            let c = b.shader_cycles();
+            let t_end = b.let_(Op::PtrLo(Opnd::Val(c)));
+            let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+            let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+            let l0 = b.let_(Op::AddI32(Opnd::Var(body.stamp_vars[5]), Opnd::I32(0)));
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 5, l0);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 6, tp);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 7, t_end);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 8, t_start);
         }
     };
     if ring.roles {

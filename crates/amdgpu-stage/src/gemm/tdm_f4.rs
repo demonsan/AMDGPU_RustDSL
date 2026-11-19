@@ -98,10 +98,34 @@ pub struct TdmF4Body {
     /// the scales in the vendor's preshuffled layout (aiter `shuffle_scale_f4`: [rows / 32][K / 128][32 rows][4 bytes]): a stage's scale
     /// slice is rows / 32 TDM rows of 128 ks contiguous bytes (instead of rows of 4 ks bytes); in LDS [row block][k tile][32][4]
     pub scale_shuf: bool,
+    /// timing stamps of the K loop (the shader-cycle counter at four points of every steady iteration, summed per phase into loop variables; the kernel stores the sums): stage issue,
+    /// window (fragment reads + WMMA issue), the tensor / LDS wait, the barrier and loop overhead
+    pub stamps: bool,
+    /// the phase sums (stage issue, window, wait, barrier) and the last wait-done stamp: loop variables, bound with the accumulators
+    pub stamp_vars: Vec<VarId>,
+    /// the stamps of the iteration being emitted: stage end, window end
+    pub st_t1: Option<ValueId>,
+    pub st_t2: Option<ValueId>,
+}
+
+fn cyc(b: &mut FnBuilder) -> ValueId {
+    let c = b.shader_cycles();
+    b.let_(Op::PtrLo(Opnd::Val(c)))
+}
+
+fn add_to(b: &mut FnBuilder, var: VarId, delta: ValueId) {
+    let n = b.bind_i32(amdgpu_dsl::varx(var) + ev(delta));
+    b.set_var(var, Opnd::Val(n));
 }
 
 impl PipeBody for TdmF4Body {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+        let stamp_t0 = if self.stamps && self.steady { Some(cyc(b)) } else { None };
+        if let Some(t0) = stamp_t0 {
+            // the barrier and loop overhead of the previous iteration: from its wait-done stamp to this stage's start
+            let d = b.bind_i32(ev(t0) - amdgpu_dsl::varx(self.stamp_vars[4]));
+            add_to(b, self.stamp_vars[3], d);
+        }
         let (do_a, do_b) = match (self.roles, role) {
             (true, Role::A) => (true, false),
             (true, Role::B) => (false, true),
@@ -138,6 +162,12 @@ impl PipeBody for TdmF4Body {
         if do_b {
             rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
         }
+        if let Some(t0) = stamp_t0 {
+            let t1 = cyc(b);
+            let d = b.bind_i32(ev(t1) - ev(t0));
+            add_to(b, self.stamp_vars[0], d);
+            self.st_t1 = Some(t1);
+        }
     }
 
     fn stage_complete_keep(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx, keep: u8) {
@@ -170,6 +200,15 @@ impl PipeBody for TdmF4Body {
         // `depth - 2` stages (the next tiles' 4 loads each) stay in flight; the wait completes the one the next window reads
         let per_stage = if self.roles { 2 } else { 4 };   // tensor loads this wave issues per stage
         b.wait_tensor(if self.sh.relax && self.steady { per_stage * (self.depth - 2) } else { 0 });
+        if self.stamps && self.steady {
+            if let Some(t2) = self.st_t2.take() {
+                b.wait_lds(0);
+                let t3 = cyc(b);
+                let d = b.bind_i32(ev(t3) - ev(t2));
+                add_to(b, self.stamp_vars[2], d);
+                b.set_var(self.stamp_vars[4], Opnd::Val(t3));
+            }
+        }
     }
 
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
@@ -182,11 +221,22 @@ impl PipeBody for TdmF4Body {
                 let z = b.let_(Op::FragZero { ty: DType::Frag16 });
                 (WmmaKind::ScaleF4_32x16x128.acc_ty(), Opnd::Val(z))
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(if self.stamps {
+                let z = b.c_i32(0);
+                let c0 = cyc(b);
+                vec![(DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(z)), (DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]
+            } else {
+                Vec::new()
+            })
             .collect()
     }
 
     fn bind_state(&mut self, vars: &[VarId]) {
-        self.acc = vars.to_vec();
+        let n = (self.sh.tm * self.sh.tn) as usize;
+        self.acc = vars[..n].to_vec();
+        self.stamp_vars = vars[n..].to_vec();
         self.steady = true;
     }
 
@@ -258,6 +308,14 @@ impl PipeBody for TdmF4Body {
             if let Some(n) = next {
                 cur = n;
             }
+        }
+        if self.stamps && t.staged {
+            let t2 = cyc(b);
+            if let Some(t1) = self.st_t1.take() {
+                let d = b.bind_i32(ev(t2) - ev(t1));
+                add_to(b, self.stamp_vars[1], d);
+            }
+            self.st_t2 = Some(t2);
         }
     }
 }
