@@ -51,6 +51,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-TDM-DESC", layer: Layer::Ir, what: "a tensor descriptor whose compile-time-known fields are invalid for a kernel: the context-restore / store / volatile bits set, a wrong type, a valid count that is not 0 or 1, or a tile that does not fit in the declared LDS (a descriptor word the host supplies is the host contract's business, see GV-1250-MCAST)" },
     Rule { id: "GV-1250-TDM-STORE-PAD", layer: Layer::Ir, what: "a tensor store from LDS has no LDS padding: the hardware reads a store's LDS source contiguously (MI450: a padded source came out shifted from its second row on), so a store descriptor whose pad-enable bit is set, or not known to be clear at compile time, is an error; lay out the staging rows unpadded" },
     Rule { id: "GV-1250-GETREG-IDLE", layer: Layer::Asm, what: "an s_getreg_b32 of STATUS / STATE_PRIV / EXCP_FLAG_* / SCRATCH_BASE / XNACK state without a wait-idle directly before: the instruction does not wait for idle and returns a stale value" },
+    Rule { id: "GV-1250-SMEM-PENDING", layer: Layer::Asm, what: "an SGPR written by a scalar load (s_load / s_buffer_load) is not mentioned (read, or written again) before an `s_wait_kmcnt 0` / `s_wait_idle` completes the load on every path: SMEM returns out of order, so only a full drain proves it; a tensor operation whose descriptor words are such registers would read stale words and can hang the device" },
     Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
@@ -2046,10 +2047,124 @@ fn sched_mode_problem(mn: &str, ops: &str) -> Option<String> {
 const BARRIER_MNEMONICS: &[&str] = &["s_barrier_signal", "s_barrier_signal_isfirst", "s_barrier_wait", "s_barrier_join", "s_barrier_init", "s_wakeup_barrier", "s_get_barrier_state"];
 
 /// The final-instruction-stream rules (the text of a kernel as the assembler will see it).
+/// The SGPRs (bit n = s[n], n < 128) an operand text mentions: `s5`, `s[4:7]` (a name like `s_load_b32` is a mnemonic, never an operand; `vcc_lo`, `ttmp`, `exec`, `src_*` are not SGPR numbers).
+fn sgpr_mask(ops: &str) -> u128 {
+    let b = ops.as_bytes();
+    let mut mask = 0u128;
+    let mut i = 0;
+    let digits = |from: usize| -> (usize, Option<usize>) {
+        let mut j = from;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        (j, if j > from { ops[from..j].parse::<usize>().ok() } else { None })
+    };
+    while i < b.len() {
+        let prev_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if b[i] == b's' && prev_ok && i + 1 < b.len() {
+            if b[i + 1] == b'[' {
+                let (j, lo) = digits(i + 2);
+                if let (Some(lo), true) = (lo, j < b.len() && b[j] == b':') {
+                    let (k, hi) = digits(j + 1);
+                    if let (Some(hi), true) = (hi, k < b.len() && b[k] == b']') {
+                        for r in lo..=hi.min(127) {
+                            if r < 128 {
+                                mask |= 1u128 << r;
+                            }
+                        }
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            } else if b[i + 1].is_ascii_digit() {
+                let (j, n) = digits(i + 1);
+                // `s5` followed by an identifier character is not a register (`s5x`)
+                if let Some(n) = n {
+                    if n < 128 && (j >= b.len() || !(b[j].is_ascii_alphabetic() || b[j] == b'_')) {
+                        mask |= 1u128 << n;
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    mask
+}
+
+/// GV-1250-SMEM-PENDING: a scalar load's destination registers are in flight until a `s_wait_kmcnt 0` (or `s_wait_idle`) completes it (SMEM returns out of order: a counted wait above 0 proves
+/// nothing); any instruction that mentions one of them before that (a read of a stale value, a write the late load would overwrite) is a violation. Path-sensitive over the control-flow graph
+/// (joins take the union, loops iterate to a fixpoint). The tensor operations are the dangerous readers: their descriptor words are SGPR tuples, and a descriptor read before its `s_load` landed
+/// points at no buffer. (The IR layers prove the descriptor's provenance and the lowering inserts the waits; this is the independent re-check on the final text.)
+fn smem_pending(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
+    let is_load = |m: &str| m.starts_with("s_load_") || m.starts_with("s_buffer_load_") || m == "s_load_dword" || m.starts_with("s_load_dword");
+    if !insts.iter().any(|i| is_load(&i.mn)) {
+        return;
+    }
+    let n = insts.len();
+    let by_addr: HashMap<u64, usize> = insts.iter().enumerate().filter_map(|(i, x)| x.addr.map(|(a, _)| (a, i))).collect();
+    let mut pend: Vec<Option<u128>> = vec![None; n + 1];
+    pend[0] = Some(0);
+    let mut work = vec![0usize];
+    let mut reported: std::collections::BTreeSet<usize> = Default::default();
+    while let Some(i) = work.pop() {
+        if i >= n {
+            continue;
+        }
+        let ins = &insts[i];
+        let p = pend[i].unwrap_or(0);
+        let used = sgpr_mask(&ins.ops);
+        let is_wait_all = (ins.mn == "s_wait_kmcnt" && parse_int(&ins.ops) == Some(0)) || ins.mn == "s_wait_idle";
+        if !is_wait_all && used & p != 0 && reported.insert(i) {
+            let r = (used & p).trailing_zeros();
+            let what = if ins.mn.starts_with("tensor_") { " (a tensor descriptor word: the operation would use a stale descriptor)" } else { "" };
+            viol(v, "GV-1250-SMEM-PENDING", format!("line {}: `{} {}` mentions s{r}, the destination of a scalar load that no `s_wait_kmcnt 0` has completed on some path{what}", ins.line, ins.mn, ins.ops));
+        }
+        let out = if is_wait_all {
+            0
+        } else if is_load(&ins.mn) {
+            // the destination is the first operand (`s_load_b64 s[4:5], s[0:1], 0x0`)
+            let dst = sgpr_mask(ins.ops.split(',').next().unwrap_or(""));
+            p | dst
+        } else {
+            p
+        };
+        let mut succ: Vec<usize> = Vec::new();
+        let branch = ins.mn == "s_branch" || ins.mn.starts_with("s_cbranch");
+        let falls = !(ins.mn == "s_branch" || ins.mn == "s_endpgm" || ins.mn == "s_setpc_b64");
+        if falls {
+            succ.push(i + 1);
+        }
+        if branch {
+            let target = ins.ops.split(',').next().unwrap_or("").trim();
+            if let Some(t) = labels.get(target) {
+                succ.push(*t);
+            } else if let (Some(off), Some((a, size))) = (parse_int(target), ins.addr) {
+                let dest = (a + size) as i64 + off * 4;
+                if let Some(t) = by_addr.get(&(dest as u64)) {
+                    succ.push(*t);
+                }
+            }
+        }
+        for t in succ {
+            if t > n {
+                continue;
+            }
+            let joined = pend[t].map_or(out, |b| b | out);
+            if pend[t] != Some(joined) {
+                pend[t] = Some(joined);
+                work.push(t);
+            }
+        }
+    }
+}
+
 pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
     tdm_drain(&insts, &labels, &mut v);
+    smem_pending(&insts, &labels, &mut v);
     wait_range(&insts, &mut v);
     // clauses: the N + 1 instructions after `s_clause N`
     let mut remaining = 0usize;

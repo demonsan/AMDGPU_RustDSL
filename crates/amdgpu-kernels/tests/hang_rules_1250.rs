@@ -859,6 +859,29 @@ fn pos_getreg_idle() {
 }
 
 #[test]
+fn mut_smem_pending() {
+    // a tensor load whose descriptor words come from scalar loads nobody waited for
+    asm_mutation("k:\n    s_load_b128 s[4:7], s[0:1], 0x0\n    s_load_b256 s[8:15], s[0:1], 0x10\n    tensor_load_to_lds s[4:7], s[8:15]\n    s_wait_tensorcnt 0x0\n    s_endpgm\n", "GV-1250-SMEM-PENDING");
+    // a counted wait above 0 proves nothing (SMEM returns out of order)
+    asm_mutation("k:\n    s_load_b128 s[4:7], s[0:1], 0x0\n    s_load_b256 s[8:15], s[0:1], 0x10\n    s_wait_kmcnt 0x1\n    tensor_load_to_lds s[4:7], s[8:15]\n    s_wait_tensorcnt 0x0\n    s_endpgm\n", "GV-1250-SMEM-PENDING");
+    // the wait on one path only
+    asm_mutation("k:\n    s_load_b32 s4, s[0:1], 0x0\n    s_cmp_eq_u32 s5, 0\n    s_cbranch_scc1 L_skip\n    s_wait_kmcnt 0x0\n    L_skip:\n    s_add_co_u32 s6, s4, 1\n    s_endpgm\n", "GV-1250-SMEM-PENDING");
+    // a wait that is inside the loop but after the use of the previous iteration's load
+    asm_mutation("k:\n    s_mov_b32 s9, 0\n    L_loop:\n    s_add_co_u32 s6, s4, 1\n    s_load_b32 s4, s[0:1], 0x0\n    s_add_co_u32 s9, s9, 1\n    s_cmp_lt_u32 s9, 4\n    s_cbranch_scc1 L_loop\n    s_wait_kmcnt 0x0\n    s_endpgm\n", "GV-1250-SMEM-PENDING");
+    // writing a register a late load would overwrite
+    asm_mutation("k:\n    s_load_b32 s4, s[0:1], 0x0\n    s_mov_b32 s4, 0\n    s_wait_kmcnt 0x0\n    s_endpgm\n", "GV-1250-SMEM-PENDING");
+}
+
+#[test]
+fn pos_smem_pending() {
+    asm_positive("k:\n    s_load_b128 s[4:7], s[0:1], 0x0\n    s_load_b256 s[8:15], s[0:1], 0x10\n    s_wait_kmcnt 0x0\n    tensor_load_to_lds s[4:7], s[8:15]\n    s_wait_tensorcnt 0x0\n    s_endpgm\n");
+    // a load into registers nobody reads before the wait, a use of other registers meanwhile, s_wait_idle as the full wait
+    asm_positive("k:\n    s_load_b32 s4, s[0:1], 0x0\n    s_add_co_u32 s6, s7, 1\n    s_wait_idle\n    s_add_co_u32 s8, s4, 1\n    s_endpgm\n");
+    // the loop form: wait before the next iteration's use
+    asm_positive("k:\n    s_mov_b32 s9, 0\n    L_loop:\n    s_load_b32 s4, s[0:1], 0x0\n    s_wait_kmcnt 0x0\n    s_add_co_u32 s6, s4, 1\n    s_add_co_u32 s9, s9, 1\n    s_cmp_lt_u32 s9, 4\n    s_cbranch_scc1 L_loop\n    s_endpgm\n");
+}
+
+#[test]
 fn mut_wait_range() {
     asm_mutation("k:\n    s_wait_asynccnt 0x48\n    s_endpgm\n", "GV-1250-WAIT-RANGE");   // 72 > 63: the 6-bit field truncates it to 8
     asm_mutation("k:\n    s_wait_tensorcnt 0x40\n    s_endpgm\n", "GV-1250-WAIT-RANGE");
@@ -1031,6 +1054,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-MCAST", "mcast"),
     ("GV-1250-MCAST-REQ", "mcast_req"),
     ("GV-1250-WAIT-RANGE", "wait_range"),
+    ("GV-1250-SMEM-PENDING", "smem_pending"),
     ("GV-1250-GETREG-IDLE", "getreg_idle"),
     ("GV-1250-BAR-ID", "bar_id"),
     ("GV-1250-NBAR-COUNT", "nbar_count"),
