@@ -35,8 +35,7 @@ fn low(tok: &str, lo: u32, hi: u32) -> String {
 /// operand the hardware reads without MSBs: Some(4)).
 fn slots(mn: &str, n_ops: usize) -> Option<Vec<Option<usize>>> {
     let base = mn.strip_suffix("_e32").or_else(|| mn.strip_suffix("_e64")).unwrap_or(mn);
-    // (the DPP move is a VOP1 with the DPP controls as a trailing dword: dst and src0 take their MSBs like any VOP1; the controls are modifiers, not operands)
-    let fmt = if base == "v_mov_b32_dpp" { "VOP1" } else { OPS.iter().find(|(m, _, _)| *m == base).map(|x| x.1)? };
+    let fmt = OPS.iter().find(|(m, _, _)| *m == base).map(|x| x.1)?;
     let mut v = vec![None; n_ops];
     match fmt {
         "VOPC" => {
