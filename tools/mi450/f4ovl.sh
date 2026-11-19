@@ -7,7 +7,7 @@ CL=/opt/rocm/llvm/bin/clang
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 tests/gpu/g1250_f4own_host.cpp -o $O/own_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"
 export PROBE_WATCHDOG_S=20 CHECK_ROWS=16 OUT_BF16=1
-KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_ovl16_roles gemm_g1250_tdm_stage_f4_256x256_ks4_s2_ovl8_roles}
+KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_ovl8a_roles gemm_g1250_tdm_stage_f4_256x256_ks4_s2_ovl16a_roles}
 CFGS=${CFGS:-"4096 4096 4096 10:128|8192 8192 8192 5:256|8192 8192 16384 3:256"}
 for k in $KL; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -3 $O/$k.log; continue; }

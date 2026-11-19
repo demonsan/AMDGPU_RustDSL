@@ -1010,7 +1010,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             for g in 0..ovl.groups {
                 let c = b.bind_cond(ev(lim).le(g));
                 b.begin_if(c);
-                ovl.store_group(b, pc, sh.tn, g);
+                ovl.store_group(b, pc, sh.tm, g);
                 b.end_if();
             }
             let g8s = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
@@ -1021,10 +1021,10 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let n0 = b.add_i32(n0, col0);
             let n0 = b.add_i32(n0, g8s);
             let rowbytes = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(1)));
-            for i in 0..sh.tm {
-                for j in 0..sh.tn {
+            for j in 0..sh.tn {
+                for i in 0..sh.tm {
                     let acc = body.acc[(i * sh.tn + j) as usize];
-                    let blk = i * sh.tn + j;
+                    let blk = j * sh.tm + i;
                     for h in 0..2i32 {
                         let mut parts: Vec<Opnd> = Vec::new();
                         for q in 0..4i32 {
@@ -1293,7 +1293,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         if let Some(ovl) = ovl_ctx.clone() {
             // the last tile's packed accumulators (a persistent launch runs at least one tile)
             for g in 0..ovl.groups {
-                ovl.store_group(&mut b, pc, sh.tn, g);
+                ovl.store_group(&mut b, pc, sh.tm, g);
             }
         }
     }

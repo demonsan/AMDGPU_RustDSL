@@ -70,10 +70,11 @@ pub struct Ovl {
 
 impl Ovl {
     /// The four 16-byte stores of group `g` of the previous tile's packed accumulators (`tm` x `tn` blocks, block index i * tn + j).
-    pub fn store_group(&self, b: &mut FnBuilder, pc: ValueId, tn: i32, g: i32) {
+    pub fn store_group(&self, b: &mut FnBuilder, pc: ValueId, tm: i32, g: i32) {
         for q in 0..2 {
             let blk = 2 * g + q;
-            let (i, j) = (blk / tn, blk % tn);
+            // j-major blocks: a group covers 128 contiguous bytes of each of 16 rows (two i, two h) per 4 stores
+            let (i, j) = (blk % tm, blk / tm);
             for h in 0..2i32 {
                 let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Var(self.ptrs[j as usize]) });
                 b.store_f32x4(p, (i * 64 + h * 32) as u32, Opnd::Var(self.prev[(blk * 2 + h) as usize]));
@@ -354,14 +355,14 @@ impl PipeBody for TdmF4Body {
                 let c = b.bind_cond(ev(sel).eq(0));
                 b.begin_if(c);
                 for g in 0..ovl.groups {
-                    ovl.store_group(b, self.pc_c, sh.tn, g);
+                    ovl.store_group(b, self.pc_c, sh.tm, g);
                 }
                 b.end_if();
             } else {
                 for g in 0..ovl.groups {
                     let c = b.bind_cond(ev(sel).eq(g));
                     b.begin_if(c);
-                    ovl.store_group(b, self.pc_c, sh.tn, g);
+                    ovl.store_group(b, self.pc_c, sh.tm, g);
                     b.end_if();
                 }
             }
