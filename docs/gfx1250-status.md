@@ -147,7 +147,10 @@ fill); above that it fits ~6.3 us fixed + 0.187 us per page and work-group, `_ws
 tokens (32 each), P goes through LDS, each wave owns 128 V dims: no final cross-wave merge, a per-window exchange instead. That is our
 first kernel's split, whose per-window cost is ~2.5 x the vendor's; `_ws` replaces the exchange by one final merge (~25 % of a short
 kernel). Copying the vendor's quarter-page tensor loads into `_ws` (`_wsq`, 4 ops per page): 1.00 - 1.04 x (worse), dropped. Matching
-the vendor on short sequences means bringing the first kernel's per-window exchange down to the vendor's cost (a redesign).
+the vendor on short sequences means bringing the first kernel's per-window exchange down to the vendor's cost (a redesign). The vendor's
+KV path is per-lane async loads (`global_load_async_to_lds_b128`, no tensor ops); the first page of each `_ws` wave by async loads
+(`_wsy`, 72 per lane): 1.06 - 1.12 x (worse), dropped. The prologue itself (bounds / scales / page-table scalar loads) is ~5 % of a
+one-page kernel by the stamps, and issuing the first tensor load right after the bounds (`_wse`) measured 0.
 
 ### Profiling inside a kernel: shader-clock stamps
 
