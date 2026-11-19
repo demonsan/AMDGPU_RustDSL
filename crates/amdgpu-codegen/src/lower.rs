@@ -4026,6 +4026,9 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::Dpp { dpp, x, old } => {
+                if dpp.ctrl.gfx10_only() && crate::target::cur().name != "gfx1250" {
+                    return Err(format!("DPP {:?}: a gfx10+ control (row_share / row_xmask / dpp8), not on {}", dpp.ctrl, crate::target::cur().name));
+                }
                 let r = self.as_v1(*x)?;
                 let o = self.as_v1(*old)?;
                 self.touch(&[Src::Reg(r), Src::Reg(o)]);
@@ -4035,6 +4038,9 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::DppAlu { op, dpp, a, b, old } => {
+                if dpp.ctrl.gfx10_only() && crate::target::cur().name != "gfx1250" {
+                    return Err(format!("DPP {:?}: a gfx10+ control (row_share / row_xmask / dpp8), not on {}", dpp.ctrl, crate::target::cur().name));
+                }
                 let ra = self.as_v1(*a)?;
                 let rb = self.as_v1(*b)?;
                 let o = self.as_v1(*old)?;

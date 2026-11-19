@@ -1291,6 +1291,11 @@ fn f8f6f4_fmt(imm: i64) -> String {
 
 /// DPP modifiers of a full control word (`MInst::imm` of the `*Dpp` ops: dpp_ctrl | (row_mask ^ 0xf) << 12 | (bank_mask ^ 0xf) << 16 | bound_zero << 20).
 fn dpp_mods(imm: i64) -> String {
+    // DPP8 (gfx10+): the selectors
+    if imm >> 21 & 1 != 0 {
+        let s: Vec<String> = (0..8).map(|k| ((imm >> (24 + 3 * k)) & 7).to_string()).collect();
+        return format!(" dpp8:[{}]", s.join(","));
+    }
     let c = (imm & 0x1ff) as u32;
     let ctrl = match c {
         0..=0xff => format!("quad_perm:[{},{},{},{}]", c & 3, c >> 2 & 3, c >> 4 & 3, c >> 6 & 3),
@@ -1305,6 +1310,8 @@ fn dpp_mods(imm: i64) -> String {
         0x141 => "row_half_mirror".to_string(),
         0x142 => "row_bcast:15".to_string(),
         0x143 => "row_bcast:31".to_string(),
+        0x150..=0x15f => format!("row_share:{}", c - 0x150),
+        0x160..=0x16f => format!("row_xmask:{}", c - 0x160),
         _ => format!("quad_perm:[0,1,2,3] /* bad dpp_ctrl {c:#x} */"),
     };
     let row = ((imm >> 12) & 0xf) ^ 0xf;
