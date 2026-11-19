@@ -14,6 +14,7 @@ for kb in $KL; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -3 $O/$k.log; continue; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s || continue
   case $k in *bf16*) export OUT_BF16=1;; *) unset OUT_BF16;; esac
+  case $k in *_ovl*) export PERSIST=256;; *) unset PERSIST;; esac
   echo "== $k (${bm}x${bn})"
   IFS='|'; for sh in $SHAPES; do unset IFS
     raw=$(gpurun $O/own_host $O/$k.co $k $sh $bm $bn 128 2>&1); echo "$raw" | grep '"stamps' | cut -c1-260; out=$(echo "$raw" | grep -E '^\{"host"|HANG|FAIL|mismatch' | head -1); [ -n "$out" ] || echo "RAW: $(echo "$raw" | head -c 300)"
