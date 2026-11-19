@@ -96,3 +96,19 @@ Measured on e08-01 against the 512-K kernel above, all bit-exact; the details of
 Where the time goes (per 256 x 256 tile, 8192^3): prologue 3,200 cycles (7 %), K loop 36,100 (78 %: window 81 %, barrier 12 %, stage issue 3 %, wait 3 %), epilogue 6,300 -
 8,400 (14 - 15 %). Left: issue the next tile's stage loads before the epilogue (a tail prologue across the loop back edge: needs the protocol verifier to compare the back-edge
 state with the pre-loop prologue state) with a staging buffer outside the ring, which no K slot of 512 leaves room for.
+
+### The per-tile fixed parts of the 512-K kernel (e08, 2026-11-19 evening)
+
+- **Prologue (3.2 - 3.5 k cycles).** The first `tensor_load_to_lds` is instruction 166 of 6,121 (150 SALU / address instructions, about 300 cycles); everything after it is the wait for
+  the first stage (147 KiB per workgroup, 256 workgroups at once), so issuing the first stage before the rest of the setup, or precomputing descriptor words, can save at most the
+  300 cycles. Not changed.
+- **Epilogue (about 7 k cycles).** LDS staging is 2,300 cycles = the LDS write bandwidth (4 waves x 64 KiB at 128 B per clock = 2,048); the tensor-store phase is 3,000 - 5,000 cycles
+  for 256 KiB per workgroup (about 52 B per cycle per CU, the L2 write rate), the two waves served first finish at 3,000, the other two at 5,000, so it is throughput-bound, not
+  latency-bound.
+- **Banded epilogue** (`RingOpts::epi_bands` = 2 or 4: each 32 / 64-row band of the wave's block is stored by its own tensor store as soon as it is staged, so the staging of the next band
+  overlaps the drain of the previous): e08, alternating with the default kernel, 2 reps. 4096 x 4096 x K: K = 2048 +5 %, 4096 **-12 %**, 8192 +3 %, 16384 +1 - 2 %; 8192 x 8192 x K:
+  K = 2048 +3 - 4 %, 4096 -3 %, 8192 +0 - 2 %, 12288 -3 %, 16384 +2 - 3 %, 32768 about 0. Mixed and shape-dependent (the K = 3840 - 4608 region that the relaxed-wait dispatch also
+  sees), so it stays opt-in (archive tag `archive/g1250-gemm-variants-2026-11-19d`); the default kernel is unchanged.
+- **Where it could still come from:** fewer bytes through the store phase (bf16 output with a conflict-free staging whose tensor-store rows are full width: the padded layout that
+  makes `ds_store_b128` conflict-free cannot be stored, since the tensor store reads its LDS rows contiguously) or overlapping the store phase with the next tile's loads (the ring is the
+  staging buffer: see the 192 x 256 prototype above).
