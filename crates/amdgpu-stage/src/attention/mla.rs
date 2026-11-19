@@ -337,12 +337,11 @@ impl PipeBody for MlaBody {
         let dm = b.sub_f32(Opnd::Var(vm), m_new);
         let alpha = b.exp2_f32(dm);
         let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
-        let mut p = Vec::with_capacity(x.len());
+        // exponents, exps, sums batched (distinct registers: no TRANS write-after-read v_nop)
+        let d: Vec<ValueId> = (0..x.len()).map(|r| b.sub_f32(x[r], m_new)).collect();
+        let p: Vec<ValueId> = (0..x.len()).map(|r| b.exp2_f32(d[r])).collect();
         for r in 0..x.len() {
-            let d = b.sub_f32(x[r], m_new);
-            let e = b.exp2_f32(d);
-            lsum = b.add_f32(lsum, e);
-            p.push(e);
+            lsum = b.add_f32(lsum, p[r]);
         }
         // ---- P (fp8, one 1 KB block per page) and alpha through LDS ----
         let pw = b.bind_i32(ev(lane) * 32 + ev(w) * 8 + self.pbuf.base as i32);
