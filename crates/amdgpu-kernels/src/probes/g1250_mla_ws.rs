@@ -190,6 +190,21 @@ pub fn mla_g1250_qh16_wsstd() -> Function {
     mla_ws_with("mla_g1250_qh16_wsstd", false, 64 | 128 | 256 | 512, false)
 }
 
+/// timing experiments (not for use): `_ws` exiting after the prologue / after the first page's tensor load
+pub fn mla_g1250_qh16_wsx0() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsx0", false, 64 | 256 | 1024, false)
+}
+
+pub fn mla_g1250_qh16_wsx1() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsx1", false, 64 | 256 | 2048, false)
+}
+
+/// `_ws` with every wave taking every page and owning 128 of the V dims (S computed by all four): a 4x shorter PV chain per page, for
+/// sequences with few pages.
+pub fn mla_g1250_qh16_ws4() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -224,12 +239,17 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let tail = branchless & 256 != 0;
     // bit 9: debug timestamps (SHADER_CYCLES, 20 bits) of wave 0 at checkpoints, written over LSE[b][0..6] (the LSE is then garbage)
     let tstamp = branchless & 512 != 0;
+    // bits 10 / 11 (timing experiments): exit right after the prologue / right after the first page's tensor load completes
+    let (exit_pro, exit_tdm) = (branchless & 1024 != 0, branchless & 2048 != 0);
     // bit 0: the mask branch-free; bit 1: the rescale branch-free
     let (bl_mask, bl_rescale) = (branchless & 1 != 0, branchless & 2 != 0);
     // bisect aids for the branch-free rescale: bit 2 = scale by the constant 1.0; bit 3 = scale by alpha only where some lane grew (select)
     let (dbg_one, dbg_gate) = (branchless & 4 != 0, branchless & 8 != 0);
-    let ntw: usize = if dsplit { NT / 2 } else { NT };
-    let ngrp: i32 = if dsplit { 2 } else { 4 };
+    // dim groups: the waves that share a page and split its V dims (1: none; 2: `_wsd`; 4 (bit 12): every wave takes every page, 128 dims each)
+    let dg: i32 = if branchless & 4096 != 0 { 4 } else if dsplit { 2 } else { 1 };
+    let lg_dg: i32 = dg.trailing_zeros() as i32;
+    let ntw: usize = NT / dg as usize;
+    let ngrp: i32 = 4 / dg;
     let layout = PageLayout::plan();
     let slot = layout.slot_bytes as i64;
     let mut b = FnBuilder::new(name, 128);
@@ -275,6 +295,16 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
     };
+    // instruction prefetch of the code that follows (n x 4 KB from here)
+    let pf_here = |b: &mut FnBuilder, n: u32| {
+        if ipf {
+            let pc = b.get_pc();
+            let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
+            for k in 0..n {
+                b.prefetch_inst(pc, 0x1000 * k, nl);
+            }
+        }
+    };
     // a checkpoint of the debug variant: the stamp is stored at once over R[b] (word 64 w + checkpoint index; all lanes write the same word;
     // the output is garbage in this variant, and the R stores of the epilogue are skipped)
     let stamp_n = std::cell::Cell::new(0u32);
@@ -295,9 +325,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if ipf {
         // MODE.SCALAR_PREFETCH_EN first: the prefetches are NOPs without it (the vendor kernels set it the same way)
         b.enable_scalar_prefetch();
+        // the first 16 KB (prologue, the page loop); later windows are fetched where their code starts. A prefetch past the end of the code
+        // can fault (an unmapped page): only windows that are known to lie inside the code are requested
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
-        for k in 0..12u32 {
+        for k in 0..4u32 {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
     }
@@ -310,19 +342,19 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
     // the page group of the wave (its pages: grp, grp + ngrp, ..) and, with the dim split, its half of the V dims
-    let grp = if dsplit { b.bind_i32(ev(w) >> 1) } else { w };
+    let grp = if dg > 1 { b.bind_i32(ev(w) >> lg_dg) } else { w };
     // the page sequence of the wave: pages gbase + gstride k (split: the 4 S waves of the S work-groups interleave)
     let (sid, lgs) = if split { (b.let_(Op::WorkgroupIdX), b.let_(Op::KernargI32 { offset: 116 })) } else { (b.c_i32(0), b.c_i32(0)) };
     let gbase = if split { b.bind_i32(ev(sid) * 4 + ev(w)) } else { grp };
-    let gshift = if split { b.bind_i32(ev(lgs) + 2) } else { b.c_i32(if dsplit { 1 } else { 2 }) };
+    let gshift = if split { b.bind_i32(ev(lgs) + 2) } else { b.c_i32(2 - lg_dg) };
     let gstride = if split {
         let sc_ = b.let_(Op::KernargI32 { offset: 100 });
         b.bind_i32(ev(sc_) * 4)
     } else {
-        b.c_i32(if dsplit { 2 } else { 4 })
+        b.c_i32(ngrp)
     };
-    let hd = b.bind_i32(ev(w) & 1);
-    let db = if dsplit { b.bind_i32(ev(hd) * 256) } else { b.c_i32(0) };
+    let hd = b.bind_i32(ev(w) & (dg - 1));
+    let db = if dg > 1 { b.bind_i32(ev(hd) * (512 / dg)) } else { b.c_i32(0) };
     let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
         if sload {
@@ -364,6 +396,21 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             b.frag_cat(&parts)
         })
         .collect();
+    // the timing experiments keep the Q loads alive (one word to R[b]: the output is garbage in these variants)
+    let keep_q = |b: &mut FnBuilder| {
+        let o = b.bind_i32(ev(bidx) * (16 * 512 * 2));
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) });
+        for c in 0..9usize {
+            for e8 in 0..8u8 {
+                let e = b.frag_slice(Opnd::Val(q[c]), e8, 1);
+                b.store_global(pa, 4 * (8 * c as u32 + e8 as u32), e, MemTy::B32, false);
+            }
+        }
+    };
+    if exit_pro {
+        keep_q(&mut b);
+        return b.finish();
+    }
     if tstamp {
         // the debug stamps store to global memory inside the loop: settle the Q loads first
         b.wait_vm(0);
@@ -709,7 +756,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let has = b.cmp(CmpPred::Gt, CmpTy::I32, nw, Opnd::I32(0));
     b.begin_if(has);
     stage(&mut b, 0, amdgpu_dsl::I32::c(0));
-    if !pipe && tail {
+    if exit_tdm {
+        b.wait_tensor(0);
+        keep_q(&mut b);
+    }
+    if !pipe && tail && !exit_tdm {
         let npairs = b.bind_i32(ev(nw) >> 1);
         let z0 = b.c_i32(0);
         // the generation (local index) of the odd last page: a counter stepped by + 2 per pass
@@ -741,6 +792,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let odd = b.bind_i32(ev(nw) & 1);
         let is_odd = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
         b.begin_if(is_odd);
+        pf_here(&mut b, 2);
         b.wait_tensor(0);
         compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
         if tstamp {
@@ -748,7 +800,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
         }
         b.end_if();
-    } else if !pipe {
+    } else if !pipe && !exit_tdm {
         let npairs = b.bind_i32((ev(nw) + 1) >> 1);
         let z = b.c_i32(0);
         let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
@@ -768,7 +820,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
         b.break_if(fin);
         b.end_loop();
-    } else {
+    } else if !exit_tdm {
         // cross-page form: step i = S(i); [softmax(i) || PV(i - 1)] (one Free plan phase, PV WMMAs the skeleton, the softmax the fillers);
         // then the stage of page i + 1 into page i - 1's slot, the rescale by alpha(i). P(i) is carried to the next step.
         b.wait_tensor(0);
@@ -835,6 +887,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_tensor(0);
 
     stamp(&mut b);
+    pf_here(&mut b, 1);
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
     b.wait_lds(0);
     b.barrier();
@@ -862,13 +915,15 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_lds(0);
     b.barrier();
     stamp(&mut b);
+    pf_here(&mut b, 1);
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);
     // the waves holding this thread's dims: all four, or (dim split) the two of the dim half d0 / 256 (one per page group)
-    let wl: Vec<ValueId> = if dsplit {
-        let hh = b.bind_i32(ev(d0) >> 8);
-        vec![hh, b.bind_i32(ev(hh) + 2)]
+    let wl: Vec<ValueId> = if dg > 1 {
+        // the dim group of d0, one wave per page group
+        let hh = b.bind_i32(ev(d0) >> (9 - lg_dg));
+        (0..ngrp).map(|k| b.bind_i32(ev(hh) + k * dg)).collect()
     } else {
         (0..4).map(|k| b.c_i32(k)).collect()
     };
