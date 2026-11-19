@@ -30,13 +30,25 @@ if (-not $Repo) { $Repo = (Get-Location).Path }
 $cfg = @{
     f01 = @{ host = '10.5.236.36'; work = '/data/blyu/amdrustdsl'; lock = $false }
     a08 = @{ host = 'ctheliosr-1b112-a08-1.mnb.dcgpu'; work = '$HOME/amdrustdsl'; lock = $true }
-    e08 = @{ host = '10.223.206.118'; user = 'amd'; work = '/data/blyu/amdrustdsl'; lock = $true; pergpu = $true; extra = 'export HIPCC_COMPILE_FLAGS_APPEND=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 CCC_OVERRIDE_OPTIONS=+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15' }   # Ubuntu 26.04: gcc 16 has no libstdc++ headers; clang must use gcc 15
+    e08 = @{ host = '10.223.206.118'; user = 'amd'; work = '/data/blyu/amdrustdsl'; lock = $true; pergpu = $true; password = $true; extra = 'export HIPCC_COMPILE_FLAGS_APPEND=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15 CCC_OVERRIDE_OPTIONS=+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15' }   # Ubuntu 26.04: gcc 16 has no libstdc++ headers; clang must use gcc 15
 }[$Node]
 $user = if ($cfg.user) { $cfg.user } else { 'blyu' }
 $key = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
 $kh = Join-Path $env:USERPROFILE '.ssh\mi450_known_hosts'
 $wsdir = "$($cfg.work)/ws/$Tag"
 $sshBase = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=20', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh", "$user@$($cfg.host)")
+$scpAuth = @('-i', $key, '-o', 'BatchMode=yes')
+
+# e08: key login is NOT allowed (policy): password login only, through a local askpass helper (%USERPROFILE%\.ssh\<node>-askpass.cmd,
+# outside the repo: the password never enters the repository). No key is ever installed on the node.
+if ($cfg.password) {
+    $askpass = Join-Path $env:USERPROFILE ".ssh\$Node-askpass.cmd"
+    if (-not (Test-Path $askpass)) { Write-Error "missing $askpass (echoes the node password)"; exit 250 }
+    $env:SSH_ASKPASS = $askpass; $env:SSH_ASKPASS_REQUIRE = 'force'; if (-not $env:DISPLAY) { $env:DISPLAY = 'x' }
+    $pw = @('-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password,keyboard-interactive', '-o', 'NumberOfPasswordPrompts=1')
+    $sshBase = $pw + @('-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=20', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh", "$user@$($cfg.host)")
+    $scpAuth = $pw
+}
 
 function Invoke-Remote([string]$bash, [switch]$Wrap) {
     if ($Wrap) { $bash = "echo @@MI450-BEGIN@@`n" + $bash + "`n" + 'echo "@@MI450-END rc=$?@@"' }
@@ -73,7 +85,7 @@ if ($Sync) {
     $sz = [math]::Round((Get-Item $tgz).Length / 1MB, 1)
     Write-Host "[mi450] syncing $sz MB to $Node"
     $rcMk = Invoke-Remote ("mkdir -p " + $wsdir.Replace('$HOME', '~')) -Wrap
-    $scpArgs = @('-i', $key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh")
+    $scpArgs = $scpAuth + @('-o', 'StrictHostKeyChecking=accept-new', '-o', "UserKnownHostsFile=$kh")
     $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $scprc = 1; for ($try = 0; $try -lt 3 -and $scprc -ne 0; $try++) { if ($try -gt 0) { Start-Sleep 5 }; & scp @scpArgs $tgz ($user + "@" + $cfg.host + ":" + $wsdir.Replace('$HOME', '~') + "/src.tgz") 2>&1 | Out-Null; $scprc = $LASTEXITCODE }
     $ErrorActionPreference = $eap2

@@ -85,6 +85,7 @@ enum Policy {
 thread_local! {
     /// gfx1250 retry: wide tuples (accumulators) first above v255, so the low window stays free for the operands that must be in v0..v255
     static WIDE_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACC_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// gfx1250: the VGPR values an instruction reads WITHOUT the VGPR MSBs, so they must sit in v0..v255 (CDNA5 ISA section 3.3.2.3, section 7.12.6:
@@ -151,6 +152,24 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         WIDE_HIGH.with(|c| c.set(false));
         if r2.is_ok() {
             return r2;
+        }
+    }
+    // gfx1250 window plan (`AMDC_ACC_HIGH`): a kernel that needs more than 256 VGPRs is allocated again with the matrix accumulators
+    // above v255 and every other value from v0 up, so its matrix ops read A / B in window 0 and C / D in window 1 with one MSB setting;
+    // taken when it fits in no more registers than the first allocation
+    if let Ok(a) = &r {
+        if a.max_v > 256 && crate::target::cur().name == "gfx1250" && std::env::var("AMDC_ACC_HIGH").is_ok() && !matrix_accumulators(m).is_empty() {
+            ACC_HIGH.with(|c| c.set(true));
+            let r3 = allocate_policy_once(m, policy);
+            ACC_HIGH.with(|c| c.set(false));
+            if std::env::var("AMDC_RA_PEAK").is_ok() {
+                eprintln!("ACC_HIGH {}: first {} VGPRs, window plan {:?}", m.name, a.max_v, r3.as_ref().map(|x| x.max_v).map_err(|e| e.chars().take(160).collect::<String>()));
+            }
+            if let Ok(a3) = &r3 {
+                if a3.max_v.div_ceil(16) <= a.max_v.div_ceil(16) || std::env::var("AMDC_ACC_HIGH_ANY").is_ok() {
+                    return r3;
+                }
+            }
         }
     }
     r
@@ -364,13 +383,23 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         }
     }
     let low_only = low_window_values(m);
-    let wide_high = WIDE_HIGH.with(|c| c.get()) && vgpr_count() > 256;
+    let acc_high = ACC_HIGH.with(|c| c.get());
+    let wide_high = (WIDE_HIGH.with(|c| c.get()) || acc_high) && vgpr_count() > 256;
     // the window plan of the retry: wide tuples above v255; with `AMDC_ACCWIN` only the matrix accumulators (D / C of the matrix ops), so a
     // matrix op reads its A / B fragments in the low window and its accumulator in a high one with one MSB setting for all of them
     // opt-in (`AMDC_ACCWIN`): measured neutral on the 256x128 MXFP4 kernel (a08-1: 4096^3 1614 vs 1619, 8192^3 2097 vs 2136 TFLOPS) despite
     // 14 -> 3 MSB switches per loop; the default stays every tuple of 8+ dwords high
     let acc = if !wide_high {
         std::collections::HashSet::new()
+    } else if acc_high {
+        // the accumulators that live across blocks (the loop-carried ones: an attention kernel's O tiles); a block-local one (the S tile
+        // of a score WMMA) stays with its operands, so the score matrix ops and the softmax VALU keep one window setting
+        let mut x = matrix_accumulators(m);
+        if std::env::var("AMDC_ACC_HIGH_ALL").is_err() {
+            let carried: HashSet<VReg> = live_in.iter().flat_map(|s| s.iter().copied()).collect();
+            x.retain(|r| carried.contains(r));
+        }
+        x
     } else if std::env::var("AMDC_ACCWIN").is_err() {
         m.vregs.iter().enumerate().filter(|(_, c)| c.is_vector() && c.dwords() >= 8).map(|(r, _)| r as VReg).collect()
     } else {

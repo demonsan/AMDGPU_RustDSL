@@ -33,7 +33,7 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536, false)
+    mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072, false)
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -240,6 +240,11 @@ pub fn mla_g1250_qh16_wsl() -> Function {
     mla_ws_with("mla_g1250_qh16_wsl", false, 64 | 256 | 16384 | 65536, false)
 }
 
+/// `_ws` with the sequence's last page computed apart (the only masked page).
+pub fn mla_g1250_qh16_wsm() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsm", false, 64 | 256 | 16384 | 65536 | 131072, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -275,6 +280,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     // bit 16: lean softmax (only with `tail`: no fully masked page exists, so a masked logit's exp2 underflows to 0 and needs no select):
     // the mask as a branch-free select on the logits, no I1 loop variables
     let lean = branch_bits_lean(branchless);
+    // bit 17 (with `lean`): the sequence's last page (the only one that can be partial) is computed apart, with the mask; every other page
+    // without any mask code
+    let lastsep = branchless & 131072 != 0;
+    assert!(!lastsep || (lean && tail), "lastsep needs the lean tail form");
+    let masked_now = std::cell::Cell::new(true);
     // bit 9: debug timestamps (SHADER_CYCLES, 20 bits) of wave 0 at checkpoints, written over LSE[b][0..6] (the LSE is then garbage)
     let tstamp = branchless & 512 != 0;
     // bits 10 / 11 (timing experiments): exit right after the prologue / right after the first page's tensor load completes
@@ -582,9 +592,13 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
                     let si = b.frag_slice(Opnd::Val(svals[j]), r, 1);
                     let sf = f32_of(b, si);
                     let v = b.mul_f32(sf, cscale);
-                    let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
-                    let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
-                    x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                    if masked_now.get() {
+                        let tk = b.bind_i32(ev(g) * 8 + (16 * j as i32 + r as i32));
+                        let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tk, tok_lim);
+                        x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                    } else {
+                        x.push(v);
+                    }
                 }
             }
             let mut mx = b.max_f32(x[0], x[1]);
@@ -601,12 +615,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             let dm = b.sub_f32(Opnd::Var(vm), m_new);
             let alpha = b.exp2_f32(dm);
             let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
-            let mut p = Vec::with_capacity(32);
+            // all the exponents first (distinct registers: no exp source is overwritten right behind its TRANS op), then the exps, then the sums
+            let d: Vec<ValueId> = (0..32).map(|r| b.sub_f32(x[r], m_new)).collect();
+            let p: Vec<ValueId> = (0..32).map(|r| b.exp2_f32(d[r])).collect();
             for r in 0..32 {
-                let d = b.sub_f32(x[r], m_new);
-                let e = b.exp2_f32(d);
-                lsum = b.add_f32(lsum, e);
-                p.push(e);
+                lsum = b.add_f32(lsum, p[r]);
             }
             let parts: Vec<Opnd> = (0..8).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
             let pa = b.frag_cat(&parts);
@@ -839,7 +852,63 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.wait_tensor(0);
         keep_q(&mut b);
     }
-    if !pipe && tail && !exit_tdm {
+    if !pipe && tail && !exit_tdm && lastsep {
+        // the wave's full pages: all but the sequence's last page when this wave owns it
+        let lastp = b.bind_i32(ev(npages) - 1);
+        let own = b.bind_i32((ev(lastp) - ev(gbase)) & (ev(gstride) - 1));
+        let ownb = b.cmp(CmpPred::Eq, CmpTy::I32, own, Opnd::I32(0));
+        let ownl = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ownb), a: Opnd::I32(1), b: Opnd::I32(0) });
+        let nf = b.bind_i32(ev(nw) - ev(ownl));
+        let npairs = b.bind_i32(ev(nf) >> 1);
+        let z0 = b.c_i32(0);
+        let gl = b.declare_vars(&[(DType::I32, Opnd::Val(z0))])[0];
+        b.assume(gl, Ext::c(0), Ext::c(MAX_PAGES as i64));
+        masked_now.set(false);
+        let any_pair = b.cmp(CmpPred::Gt, CmpTy::I32, npairs, Opnd::I32(0));
+        b.begin_if(any_pair);
+        let z = b.c_i32(0);
+        let pv2 = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+        let kp2 = pv2[0];
+        b.assume(kp2, Ext::c(0), Ext::c((MAX_PAGES / 8) as i64));
+        let l0 = b.bind_i32(amdgpu_dsl::varx(kp2) * 2);
+        let l1 = b.bind_i32(ev(l0) + 1);
+        let l2 = b.bind_i32(ev(l0) + 2);
+        stage(&mut b, 1, ev(l1));
+        b.wait_tensor(1);
+        compute(&mut b, 0, ev(l0));
+        stage(&mut b, 0, ev(l2));
+        b.wait_tensor(1);
+        compute(&mut b, 1, ev(l1));
+        let g2 = b.bind_i32(amdgpu_dsl::varx(gl) + 2);
+        b.set_var(gl, Opnd::Val(g2));
+        let kn = b.bind_i32(amdgpu_dsl::varx(kp2) + 1);
+        b.set_var(kp2, Opnd::Val(kn));
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, kn, npairs);
+        b.break_if(fin);
+        b.end_loop();
+        b.end_if();
+        // page 2 npairs (slot 0, already staged) is an odd full page, or this wave's masked last page
+        let odd = b.bind_i32(ev(nf) & 1);
+        let is_odd = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
+        b.begin_if(is_odd);
+        b.wait_tensor(0);
+        compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
+        // and then the last page (if this wave owns it) from slot 1
+        masked_now.set(true);
+        b.begin_if(ownb);
+        let gl1 = b.bind_i32(amdgpu_dsl::varx(gl) + 1);
+        stage(&mut b, 1, ev(gl1));
+        b.wait_tensor(0);
+        compute(&mut b, 1, ev(gl1));
+        b.end_if();
+        b.else_();
+        b.begin_if(ownb);
+        b.wait_tensor(0);
+        compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
+        b.end_if();
+        b.end_if();
+        masked_now.set(true);
+    } else if !pipe && tail && !exit_tdm {
         let npairs = b.bind_i32(ev(nw) >> 1);
         let z0 = b.c_i32(0);
         // the generation (local index) of the odd last page: a counter stepped by + 2 per pass
