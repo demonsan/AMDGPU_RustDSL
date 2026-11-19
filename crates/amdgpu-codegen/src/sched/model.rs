@@ -74,5 +74,39 @@ pub const PARAMS: ModelParams = ModelParams { trans_separate_pipe: crate::target
 
 /// Cost of one opcode (the `cost` attribute of `crate::op_attrs`). Grades: see docs/scheduling.md (tables 1-2).
 pub fn cost(op: MOp) -> OpCost {
-    crate::op_attrs::attrs(op).cost
+    let c = crate::op_attrs::attrs(op).cost;
+    if crate::target::cur().name == "gfx1250" && std::env::var("AMDC_SCHED_MODEL950").is_err() {
+        gfx1250_cost(op, c)
+    } else {
+        c
+    }
+}
+
+/// The gfx1250 machine model (one wave32 on a SIMD), from LLVM's GFX1250SpeedModel (SISchedule.td, `GFX125xCommonWriteRes`): VALU 5 cycles
+/// (64-bit 6, integer multiply 8), TRANS 8 on its own pipe, LDS 20, SMEM 20, SALU 2, VMEM 320; XDL WMMA 16x16x64 FP8/BF8 one pass (4
+/// cycles, the XDL unit busy 4), 16x16x128 FP8/BF8 and the scaled 32x16x128 F4 two passes (8 / 8). The pipes stay the shared table's;
+/// the WMMA co-execution windows are the hazard pass's business. `AMDC_SCHED_MODEL950`: the gfx950 numbers (A/B).
+fn gfx1250_cost(op: MOp, c: OpCost) -> OpCost {
+    let g = Grade::Experimental;
+    match c.pipe {
+        Pipe::Mfma => match op {
+            MOp::VWmmaF32_16x16x64Fp8 | MOp::VWmmaF32_16x16x64Fp8Z => co(Pipe::Mfma, 4, 4, 4, g),
+            MOp::VWmmaF32_16x16x128Fp8 | MOp::VWmmaF32_16x16x128Fp8Z | MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z => co(Pipe::Mfma, 8, 8, 8, g),
+            _ => c,
+        },
+        Pipe::Valu => match op {
+            MOp::VMulLoU32 | MOp::VMulHiU32 => c_(Pipe::Valu, 1, 8, g),
+            _ => c_(Pipe::Valu, 1, 5, g),
+        },
+        Pipe::Trans => c_(Pipe::Trans, 1, 8, g),
+        Pipe::Lds => c_(Pipe::Lds, c.issue.min(4).max(1), 20, g),
+        Pipe::Smem => c_(Pipe::Smem, 1, 20, g),
+        Pipe::Salu => c_(Pipe::Salu, 1, 2, g),
+        Pipe::Vmem => c_(Pipe::Vmem, c.issue.min(4).max(1), 320, g),
+        Pipe::Ctrl => c,
+    }
+}
+
+const fn c_(pipe: Pipe, issue: u32, latency: u32, grade: Grade) -> OpCost {
+    c(pipe, issue, latency, grade)
 }
