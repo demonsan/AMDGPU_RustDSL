@@ -186,5 +186,7 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
 /// WAR, by these classes, bit-identical to the padded build over 5 runs x 1024 workgroups x 512 work-items; docs/gfx1250-hazards.md). LLVM
 /// (fixVALUTransCoexecutionHazards) pads every VALU; every class not listed here (DOT, conversions, moves, ...) keeps the `v_nop`.
 pub fn trans_coexec_proven(op: MOp) -> bool {
-    matches!(op, MOp::VAddF32 | MOp::VMulF32 | MOp::VFmaF32 | MOp::VMaxF32 | MOp::VPkAddF32 | MOp::VSubF32 | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi | MOp::VCvtPkFp8F32Half)
+    // (`AMDC_TRANS_PROVEN_OLD`: the first evidence set only, for A/B timing)
+    let second = std::env::var("AMDC_TRANS_PROVEN_OLD").is_err() && matches!(op, MOp::VSubF32 | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi | MOp::VCvtPkFp8F32Half);
+    second || matches!(op, MOp::VAddF32 | MOp::VMulF32 | MOp::VFmaF32 | MOp::VMaxF32 | MOp::VPkAddF32)
 }
