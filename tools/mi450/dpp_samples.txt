@@ -1,0 +1,42 @@
+v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0x5 bank_mask:0xa
+v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_shl:15 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_shr:1 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1
+v_mov_b32_dpp v1, v2 row_ror:1 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_ror:15 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_share:0 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_share:15 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_xmask:0 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_xmask:15 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf fi:1
+v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1
+v_mov_b32_dpp v255, v254 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_add_f32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_add_f32_dpp v1, -v2, |v3| row_shr:1 row_mask:0xf bank_mask:0xf
+v_sub_f32_dpp v1, v2, v3 row_ror:4 row_mask:0xf bank_mask:0xf
+v_mul_f32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+v_max_num_f32_dpp v1, v2, v3 row_share:3 row_mask:0xf bank_mask:0xf
+v_min_num_f32_dpp v1, v2, v3 row_xmask:5 row_mask:0xf bank_mask:0xf
+v_add_nc_u32_dpp v1, v2, v3 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+v_and_b32_dpp v1, v2, v3 row_shl:2 row_mask:0xf bank_mask:0xf
+v_or_b32_dpp v1, v2, v3 row_shr:2 row_mask:0xf bank_mask:0xf
+v_xor_b32_dpp v1, v2, v3 row_half_mirror row_mask:0xf bank_mask:0xf
+v_max_i32_dpp v1, v2, v3 row_ror:2 row_mask:0xf bank_mask:0xf
+v_min_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_mov_b32_e64_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_add_f32_e64_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_add_f32_e64_dpp v1, v2, s3 row_shr:1 row_mask:0xf bank_mask:0xf
+v_fma_f32_e64_dpp v1, v2, v3, v4 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_cvt_pk_bf16_f32_e64_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v1, v2 dpp8:[1,0,3,2,5,4,7,6]
+v_mov_b32_dpp v1, v2 dpp8:[7,6,5,4,3,2,1,0]
+v_mov_b32_dpp v1, v2 dpp8:[1,0,3,2,5,4,7,6] fi:1
+v_add_f32_dpp v1, v2, v3 dpp8:[1,0,3,2,5,4,7,6]
+v_mul_f32_dpp v1, v2, v3 dpp8:[0,0,0,0,0,0,0,0]
+v_add_f32_e64_dpp v1, v2, v3 dpp8:[1,0,3,2,5,4,7,6]
+v_fma_f32_e64_dpp v1, v2, v3, v4 dpp8:[1,0,3,2,5,4,7,6]
