@@ -1083,6 +1083,13 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         (0..4).map(|k| b.c_i32(k)).collect()
     };
     let nwl = wl.len();
+    // the O partials first (their LDS latency overlaps the max / sum arithmetic below; the accumulators are dead, so the registers are free)
+    let fb_all: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
+    let pre: Vec<Vec<ValueId>> = if split {
+        Vec::new()
+    } else {
+        mo.at(&t0).read(&mut b, |b| (0..nwl).map(|wi| (0..16).map(|k| { let a = b.bind_i32(ev(fb_all[wi]) + 16 * k); b.load_lds_b128(a) }).collect()).collect())
+    };
     let (mx, lt) = ml.at(&t0).read(&mut b, |b| {
         let mw: Vec<ValueId> = (0..nwl)
             .map(|wi| {
@@ -1158,11 +1165,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let rl = b.rcp_f32(lt);
     let inv = b.mul_f32(rl, ksf);
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();
-    let fb: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
-    let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+    let outs: Vec<ValueId> = {
+        let b = &mut b;
         let mut acc: Vec<Option<ValueId>> = vec![None; 64];
         for wi in 0..nwl {
-            let v4s: Vec<ValueId> = (0..16).map(|k| { let a = b.bind_i32(ev(fb[wi]) + 16 * k); b.load_lds_b128(a) }).collect();
+            let v4s: Vec<ValueId> = pre[wi].clone();
             for k in 0..16 {
                 let v4 = v4s[k as usize];
                 for e in 0..4u8 {
@@ -1178,7 +1185,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             }
         }
         acc.into_iter().map(|x| x.unwrap()).collect()
-    });
+    };
     stamp(&mut b);
     // bf16 pairs -> 8 x 16-byte stores of R[b][h][d0 ..]
     let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(d0) * 2);
