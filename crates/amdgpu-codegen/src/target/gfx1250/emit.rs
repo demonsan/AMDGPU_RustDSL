@@ -843,7 +843,7 @@ pub fn respell(line: &str) -> Result<Vec<String>, String> {
             "v_sub_u32" => "v_sub_nc_u32",
             x => x,
         };
-        return Ok(vec![format!("{nb}_dpp {}", wave32(rest))]);
+        return Ok(vec![format!("{nb}_dpp {rest}")]);
     }
     // v_cvt_pk_fp8_f32 (a 16-bit half write: op_sel:[0,0,1] = the high half) keeps the 32-bit operand spelling the assembler accepts
     if mn == "v_cvt_pk_fp8_f32" {
