@@ -488,6 +488,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), ..RingOpts::default() })
 }
 
+/// The vendor's 192 x 256 tile (2 x 2 waves of 96 x 128: 3 x 8 blocks, 24 accumulator blocks) with K slots of 256, the f32 LDS-staged epilogue and wave roles; M a multiple of 192.
+pub fn gemm_tdm_stage_f4_192x256_ks2(name: &str, relax: bool, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
+}
+
 /// The 512-K 2-slot tile on a persistent grid with the operand swap and the overlapped bf16 epilogue (host PERSIST=G, OUT_BF16=1).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_ovl(name: &str, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, roles, swap: true, persistent: true, ovl_burst: name.contains("a_roles"), ovl: if name.contains("_ovl0") { 0 } else if name.contains("_ovl8") { 8 } else if name.contains("_ovl16") { 16 } else { 32 }, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
