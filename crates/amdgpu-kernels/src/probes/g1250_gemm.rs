@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 kernel with the operand swap and the bf16 direct epilogue (host OUT_BF16=1): no LDS staging, no tensor store.
 pub fn gemm_tdm_stage_f4_256x256_ks2_swapbf16(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles, swap: true, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles, swap: true, stamps: name.ends_with("_stamps"), persistent: name.ends_with("_persist"), ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel with the K-loop phase stamps (host STAMPS=1).
@@ -650,7 +650,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let ptr = |b: &mut FnBuilder, off: u32| b.let_(Op::KernargPtr { offset: off });
     let (pa, pb, psa, psb, pc) = (ptr(&mut b, 0), ptr(&mut b, 8), ptr(&mut b, 16), ptr(&mut b, 24), ptr(&mut b, 32));
     // swap: the A operand reads the B matrix and its scales (and vice versa)
-    assert!(!ring.swap || (bm == bn && sh.cx * sh.cy == 1 && !persistent), "operand swap: a square tile, no cluster, not persistent");
+    assert!(!ring.swap || (bm == bn && sh.cx * sh.cy == 1), "operand swap: a square tile, no cluster");
     let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
     let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
     let t_start = if ring.stamps {
