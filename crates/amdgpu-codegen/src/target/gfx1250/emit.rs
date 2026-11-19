@@ -752,6 +752,11 @@ const RENAMES: &[(&str, &str)] = &[
     ("buffer_store_short", "buffer_store_b16"),
     ("buffer_store_byte", "buffer_store_b8"),
     ("buffer_atomic_add", "buffer_atomic_add_u32"),
+    // LDS atomics: the same spelling on gfx1250 (llvm-mc)
+    ("ds_add_f32", "ds_add_f32"),
+    ("ds_add_rtn_f32", "ds_add_rtn_f32"),
+    ("ds_add_u32", "ds_add_u32"),
+    ("ds_add_rtn_u32", "ds_add_rtn_u32"),
     ("buffer_atomic_add_f32", "buffer_atomic_add_f32"),
     ("v_add_u32_e32", "v_add_nc_u32_e32"),
     ("v_add_u32_e64", "v_add_nc_u32_e64"),

@@ -521,8 +521,18 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             out.extend_from_slice(&d32(((off as u32) & 0x00ff_ffff) << 8 | va));
         }
         "VDS" => {
-            let store = base.starts_with("ds_store");
-            let (vdst, addr, data0) = if store { (0, vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?) } else { (vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?, 0) };
+            // stores and the atomics without return: addr, data0; the atomics with return: vdst, addr, data0 (llvm-mc: `ds_add_f32 v1, v2` =
+            // d8540000 00000201, `ds_add_rtn_f32 v3, v1, v2` = d9e40000 03000201)
+            let atomic = base.starts_with("ds_add") || base.starts_with("ds_max") || base.starts_with("ds_min");
+            let rtn = atomic && base.contains("_rtn");
+            let store = base.starts_with("ds_store") || (atomic && !rtn);
+            let (vdst, addr, data0) = if store {
+                (0, vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?)
+            } else if rtn {
+                (vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?, vreg(op_at(&i, 2)?)?)
+            } else {
+                (vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?, 0)
+            };
             let off = modv(&i, "offset").map(|v| parse_num(v).ok_or(format!("`{t}`: offset"))).transpose()?.unwrap_or(0) as u32;
             out.extend_from_slice(&d32(0xD800_0000 | op << 18 | (off & 0xffff)));
             out.extend_from_slice(&d32(vdst << 24 | data0 << 8 | addr));
