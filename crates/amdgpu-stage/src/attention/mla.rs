@@ -43,8 +43,24 @@ pub struct PageLayout {
 
 impl PageLayout {
     pub fn plan() -> PageLayout {
+        Self::plan_reads(false)
+    }
+    /// The plan with the rope reads in the model too (the whole-page form `mla_g1250_qh16_ws*`: lane (m, g) reads 2 x 16 bytes at rope row
+    /// 16 j + m, + 32 g; the rope plane starts at ROPE_OFF, i.e. at ROPE_OFF mod QUARTER inside the repeating quarter pattern)
+    pub fn plan_rope() -> PageLayout {
+        Self::plan_reads(true)
+    }
+    fn plan_reads(rope: bool) -> PageLayout {
         use amdgpu_dsl::tdm_pad::{footprint, plan, LaneRead};
         let mut reads = Vec::new();
+        if rope {
+            let r0 = (ROPE_OFF % QUARTER) as u32;
+            for j in 0..4u32 {
+                for h in 0..2u32 {
+                    reads.push(LaneRead { bytes: 16, lanes: (0..32u32).map(|l| Some(r0 + 1024 * j + (l & 15) * 64 + 32 * (l >> 4) + 16 * h)).collect() });
+                }
+            }
+        }
         // K (wave 0; the other waves differ by whole 512-byte rows): lane (m, g) reads 2 x 16 bytes at row m, 64 c + 32 g
         for c in 0..8u32 {
             for h in 0..2u32 {

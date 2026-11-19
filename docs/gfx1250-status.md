@@ -51,16 +51,21 @@ our own kernels with them.
 **MLA decode, qh16, fp8 Q / KV, page size 64** (same ABI as the vendor kernel, so the host runs both; all results checked against an fp32
 reference, error equal to the vendor's):
 
-| B x ctx | first kernel (`mla_g1250_qh16`) / vendor | wave-split (`mla_g1250_qh16_ws`) / vendor |
-|---|---|---|
-| 1 x 64 | - | 2.67 |
-| 4 x 1000 | 1.65 | **1.34** |
-| 32 x 2048 | 1.90 | **1.35** |
-| 128 x 4096 | 1.38 | **0.97** |
-| 128 x 8192 | 1.65 | **1.12** |
-| 512 x 8192 | 1.34 | **1.11** |
+| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-19) | kernel |
+|---|---|---|---|
+| 1 x 64 (1) | - | ~1.3 (the vendor itself 2.9 - 3.8 us) | `_ws4` |
+| 4 x 512 (8) | - | 1.09 - 1.13 | `_ws2` |
+| 4 x 1000 (16) | 1.65 | 1.24 | `_ws` |
+| 32 x 2048 (32) | 1.90 | 1.22 | `_ws` |
+| 128 x 4096 (64) | 1.38 | **0.93 - 0.95** | `_ws` |
+| 128 x 8192 (128) | 1.65 | **0.97 - 1.01** | `_ws` |
+| 512 x 8192 (128) | 1.34 | 1.03 | `_ws` |
 
-`_ws` is the default. Structure of both: [`gfx1250-replica.md`](gfx1250-replica.md) §9.
+Dispatch rule: 1 page per sequence -> `mla_g1250_qh16_ws4` (all 4 waves take every page, 128 V dims each), 2 - 8 pages -> `_ws2` (wave
+pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
+the sequence bounds / page ids, full page pairs + the sequence's last page computed apart (the only masked page; every other page
+without mask code), the lean softmax (exponents / exps / sums batched: no TRANS-WAR `v_nop`), the GEMM compile policy. 128 x 4096 and
+128 x 8192 are at or ahead of the vendor (a08: 0.93 / 0.97; e08: 0.95 / 1.01). Structure: [`gfx1250-replica.md`](gfx1250-replica.md) §9.
 
 **MXFP4 GEMM** (all bit-exact against the CPU reference; ours f32 output with natural row-major A / B / scales, the vendor's bf16
 output with preshuffled B, 4 x 4 cluster, persistent grid):
@@ -111,6 +116,18 @@ were the largest single factor (2 - 2.5 x in each kernel); the TDM padding fixes
 | KV split across work-groups + a combine kernel (`_wsk` + `_cmb`) | slower (0.52 - 0.84 x) | every split pays the fixed per-work-group cost again, plus a second launch |
 | **timestamp profile (`shader_cycles`) -> the cross-wave merge's LDS addresses hoisted (DS offset field)** | **-10 .. -48 %** | the merge's 256 stores per lane recomputed their addresses with `v_mul_lo_u32`: 1551 -> 290 instructions; the merge was 41 % of a one-page kernel |
 | scalar loads for the sequence bounds / scales / page ids (no LDS page table, no prologue barrier); full page pairs + an odd tail page | -3 .. -8 % | a shorter dependent prologue; no masked pad page |
+| the GEMM compile policy (`CompileProfile::Gemm`) | -3 .. -5.5 % | its lowering passes and scheduler preset |
+| lean softmax (no I1 loop variables / probability selects: a masked logit's exp2 underflows) | -2 .. -4 % | 64 VALU and the variable copies per page |
+| exponents, exps and sums batched | -0.5 .. -1.2 % | 64 `v_nop` per pass from the TRANS write-after-read (the next sub overwrote the exp's source) |
+| **the sequence's last page computed apart** (the only masked page) | **-2 .. -5 %** | no mask code on the full pages |
+| page sharing for few pages: `_ws4` (1 page), `_ws2` (2 - 8 pages) | 1 x 64: 7.7 -> 4.3 us | one page on one wave is a full dependency chain; split the V dims over the waves |
+| instruction prefetch with MODE.SCALAR_PREFETCH_EN set (before: a NOP), windows inside the code | 0 | not instruction-fetch bound; a window past the end of the code faulted (illegal access) |
+| KV split with the last-arriver combine in the same launch (`_wskf`, g24 atomics) | 1.2 - 1.7 x slower | every split pays the fixed per-work-group cost again; the combine is a global-memory latency chain |
+| the first page's tensor load right after the sequence bounds (`_wse`) | 0 (±1 %) | its latency was already overlapped by the Q loads |
+| the final reduce's LDS loads hoisted before the max / sum arithmetic | +1 .. +6 % (worse) | register pressure / waits |
+| cross-wave merge by LDS float atomics (`_wsa`: max exchange, 256 `ds_add_f32` per lane, 16 instead of 64 b128 final reads) | +2 .. +16 % (worse) | four waves adding into the same words cost more than the reads they replace; **nondeterministic**: 5 runs, 5 output hashes (cos_diff identical) |
+| direct epilogue for `_ws4` (no cross-wave merge) | slower (5.1 vs 4.3 us) | - |
+| the rope reads added to the page plan's read model | 0 (same plan) | no single TDM pad serves both the 512-byte K rows and the 64-byte rope rows; the rope chunk stays at 2x its ideal (~0.3 us of 52); a separate rope TDM with its own pad would be needed |
 
 ### Profiling inside a kernel: shader-clock stamps
 
@@ -145,8 +162,9 @@ I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which 
   window-aware placement of accumulators vs streamed operands (back end).
 - **Single-wave scheduling**: with one wave per SIMD, the remaining MLA gap is latency inside a wave (softmax VALU / TRANS against the
   WMMAs); in progress in the back end: an instruction-level software pipeline of page i's softmax under page i - 1's PV WMMAs.
-- **Short sequences** (MLA 1.34 x the vendor at 4 x 1000, 2.7 x at 1 x 64): per the stamps, one page on one wave (~55 % of a one-page
-  kernel) and the final cross-wave reduce (~25 %); next step: exchange the wave maxima first so each wave stores its O already scaled.
+- **Short sequences** (MLA ~1.2 x the vendor at 4 x 1000 and 32 x 2048): the fixed per-work-group cost (prologue chain, first pages,
+  cross-wave merge, final). Measured and rejected so far: KV split (two launches or fused), early staging, instruction prefetch, load
+  hoisting, an atomic merge (table above). The K reads are volume-bound (each wave reads the whole page; conflict-free per the planner).
 - **Workgroup ids in a cluster launch**: the lowering of the workgroup-id ops reads TTMP9 / TTMP7, which hold the cluster ids in a
   cluster launch; cluster kernels compute their tile ids by hand (TTMP6 position + cluster id x dims). Planned: lower them that way when
   the kernel declares cluster dims, or reject the plain op there.

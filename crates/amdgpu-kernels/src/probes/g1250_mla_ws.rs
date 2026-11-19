@@ -274,6 +274,11 @@ pub fn mla_g1250_qh16_wsa() -> Function {
     mla_ws_with("mla_g1250_qh16_wsa", false, 64 | 256 | 16384 | 65536 | 131072 | 2097152, false)
 }
 
+/// `_ws` with the rope reads in the page plan.
+pub fn mla_g1250_qh16_wsr() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsr", false, 64 | 256 | 16384 | 65536 | 131072 | 4194304, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -337,7 +342,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let lg_dg: i32 = dg.trailing_zeros() as i32;
     let ntw: usize = NT / dg as usize;
     let ngrp: i32 = 4 / dg;
-    let layout = PageLayout::plan();
+    // bit 22: the page plan with the rope reads in its read model
+    let layout = if branchless & 4194304 != 0 { PageLayout::plan_rope() } else { PageLayout::plan() };
     let slot = layout.slot_bytes as i64;
     let mut b = FnBuilder::new(name, 128);
     if branchless & 16384 != 0 {
