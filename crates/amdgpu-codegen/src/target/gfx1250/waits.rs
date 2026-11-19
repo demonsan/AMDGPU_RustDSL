@@ -79,11 +79,13 @@ pub struct Plan {
 
 /// Bound for class `k` among the youngest `n` operations of `q` (positions beyond the known suffix count fully when `unknown`).
 fn bound(q: &[Pending], unknown: bool, n: usize, k: Kind) -> u32 {
+    // Beyond the known suffix (`unknown`: the operations before this block's entry) the kinds are not known: counting them as class `k`
+    // would allow MORE outstanding operations of that class than there are younger ones, i.e. too weak a wait (an older load waited
+    // with a count that included younger stores: the MLA `_wsstd_nowait` loop). The safe bound counts only the known ones: every
+    // operation of class `k` beyond them is older than the target or the target itself.
+    let _ = unknown;
     let known = q.len().min(n);
-    let mut c = q[q.len() - known..].iter().filter(|p| p.kind == k).count();
-    if unknown && n > q.len() {
-        c += n - q.len();
-    }
+    let c = q[q.len() - known..].iter().filter(|p| p.kind == k).count();
     c as u32
 }
 
