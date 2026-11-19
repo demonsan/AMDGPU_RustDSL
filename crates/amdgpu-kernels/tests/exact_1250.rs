@@ -251,3 +251,22 @@ fn mla_debug_variants_get_their_waits() {
         amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{}: {e}", f.name));
     }
 }
+
+/// The f32 -> bf16 pair conversion (the bf16 epilogue): `Op::CvtPkBf16F32` lowers to `v_cvt_pk_bf16_f32` on gfx1250 and the in-process
+/// encoder accepts it (its encoding is checked against llvm-mc in gfx1250_encoder).
+#[test]
+fn bf16_pack_lowers_on_gfx1250() {
+    let mut b = FnBuilder::new("probe_bf16_pack", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(1 << 12));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t);
+    let y = b.mul_f32(x, Opnd::F32(0.5));
+    let pk = b.let_(Op::CvtPkBf16F32(Opnd::Val(x), Opnd::Val(y)));
+    let o = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
+    b.store_global(q, 0, pk, amdgpu_dsl::MemTy::B32, false);
+    let c = amdgpu_codegen::compile_target(&b.finish(), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("v_cvt_pk_bf16_f32"), "{}", c.asm);
+}
