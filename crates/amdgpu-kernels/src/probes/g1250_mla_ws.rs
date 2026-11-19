@@ -601,12 +601,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
             let dm = b.sub_f32(Opnd::Var(vm), m_new);
             let alpha = b.exp2_f32(dm);
             let mut lsum = b.mul_f32(Opnd::Var(vl), alpha);
-            let mut p = Vec::with_capacity(32);
+            // all the exponents first (distinct registers: no exp source is overwritten right behind its TRANS op), then the exps, then the sums
+            let d: Vec<ValueId> = (0..32).map(|r| b.sub_f32(x[r], m_new)).collect();
+            let p: Vec<ValueId> = (0..32).map(|r| b.exp2_f32(d[r])).collect();
             for r in 0..32 {
-                let d = b.sub_f32(x[r], m_new);
-                let e = b.exp2_f32(d);
-                lsum = b.add_f32(lsum, e);
-                p.push(e);
+                lsum = b.add_f32(lsum, p[r]);
             }
             let parts: Vec<Opnd> = (0..8).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
             let pa = b.frag_cat(&parts);
