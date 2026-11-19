@@ -145,6 +145,8 @@ pub struct TdmF4Body {
     /// the stamps of the iteration being emitted: stage end, window end
     pub st_t1: Option<ValueId>,
     pub st_t2: Option<ValueId>,
+    /// the stamp after the prologue's first stage issue (the setup ends there; what follows is the wait for the first tile)
+    pub st_pro: Option<ValueId>,
 }
 
 fn cyc(b: &mut FnBuilder) -> ValueId {
@@ -200,6 +202,9 @@ impl PipeBody for TdmF4Body {
         }
         if do_b {
             rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
+        }
+        if self.stamps && !self.steady && self.st_pro.is_none() {
+            self.st_pro = Some(cyc(b));
         }
         if let Some(t0) = stamp_t0 {
             let t1 = cyc(b);
