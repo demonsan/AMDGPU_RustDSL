@@ -3,6 +3,8 @@
 //! way - is removed. The value-level DCE before allocation cannot see these: a tensor descriptor's group words are first assembled from one
 //! template, then partly rewritten (the kernel prologue of the MXFP4 GEMM wrote 4 x 8 SGPR words twice, and computed an address into them
 //! that the second write discarded). Repeats until nothing changes (removing a write can make its operands' producers dead).
+//! Opt-in (`AMDC_DSE=1`, and `AMDC_TDM_FIRST=1` for `tdm_first`): measured neutral on the MXFP4 GEMM and the MLA (e08-01, 2026-11-19;
+//! the prologue 159 -> 106 instructions before the first tensor load).
 
 use crate::mir::*;
 use crate::regalloc::Alloc;
@@ -35,7 +37,7 @@ fn keys(m: &MFunction, a: &Alloc, slots: &[u32]) -> Vec<u32> {
 }
 
 pub fn dse(m: &mut MFunction, a: &Alloc) -> usize {
-    if m.exact || std::env::var("AMDC_NO_DSE").is_ok() {
+    if m.exact || std::env::var("AMDC_DSE").is_err() {
         return 0;
     }
     let mut removed = 0;
@@ -105,9 +107,9 @@ pub fn dse(m: &mut MFunction, a: &Alloc) -> usize {
 /// The kernel prologue issues its first tensor loads as early as possible: in the entry block, every instruction before the first group of
 /// `tensor_load_to_lds` that has no side effect and no dependence (RAW / WAR / WAW on a physical register, SCC, VCC) with any instruction it
 /// would jump over is moved behind the group (keeping its order). The lane-offset VALU math of the later LDS reads goes there; the
-/// descriptor words stay in front. `AMDC_NO_TDM_FIRST`: off.
+/// descriptor words stay in front. Opt-in: `AMDC_TDM_FIRST=1`.
 pub fn tdm_first(m: &mut MFunction, a: &Alloc) -> usize {
-    if m.exact || std::env::var("AMDC_NO_TDM_FIRST").is_ok() || m.blocks.is_empty() {
+    if m.exact || std::env::var("AMDC_TDM_FIRST").is_err() || m.blocks.is_empty() {
         return 0;
     }
     let insts = &m.blocks[0].insts;
