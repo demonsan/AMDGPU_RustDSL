@@ -907,11 +907,87 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
 
     stamp(&mut b);
     pf_here(&mut b, 1);
+    let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
+    if dg == 4 && !split && !tstamp {
+        // every wave saw every page: its O (128 dims) is complete and its max / sums are the work-group's. No cross-wave merge: the
+        // row sum of head m = the two lane halves' partials (v_permlane16_swap), 1 / L of row 8 g + r by v_readlane, then the scaled O through
+        // the wave's quarter of the (dead) merge buffer for 16-byte stores
+        let sw = b.let_(Op::Permlane16Swap { a: Opnd::Var(vl), b: Opnd::Var(vl) });
+        let s0 = b.frag_slice(Opnd::Val(sw), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(sw), 1, 1);
+        let s0f = f32_of(&mut b, s0);
+        let s1f = f32_of(&mut b, s1);
+        let lh = b.add_f32(s0f, s1f);
+        let rl = b.rcp_f32(lh);
+        let invh = b.mul_f32(rl, ksf);
+        let si: Vec<ValueId> = (0..16u8).map(|hh| b.read_lane(invh, hh)).collect();
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let inv_r: Vec<ValueId> = (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(si[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(si[8 + r])));
+                let t0_ = b.mul_f32(a0, hf);
+                let t1_ = b.mul_f32(a1, gf);
+                b.add_f32(t0_, t1_)
+            })
+            .collect();
+        // the wave's staging area: [16 heads][128 dims] f32 at w * 8 KB of the merge buffer
+        let sbase = b.bind_i32(ev(w) * 8192 + (ev(g) * 8 * 128 + ev(m)) * 4 + mo.base as i32);
+        b.wait_lds(0);
+        b.barrier();
+        mo.at(&t0).write(&mut b, |b| {
+            for nt in 0..ntw {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(b, e);
+                    let y = b.mul_f32(ef, inv_r[r as usize]);
+                    let a = b.bind_i32(ev(sbase) + ((r as i32) * 512 + (64 * nt as i32)));
+                    b.store_lds(a, y, MemTy::B32, false);
+                }
+            }
+        });
+        b.wait_lds(0);
+        b.barrier();
+        // lane l: head l / 2, dims 64 (l % 2) .. + 64 of the wave's 128
+        let hh = b.bind_i32(ev(lane) >> 1);
+        let dd = b.bind_i32((ev(lane) & 1) * 64);
+        let rbase = b.bind_i32(ev(w) * 8192 + (ev(hh) * 128 + ev(dd)) * 4 + mo.base as i32);
+        let vals: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+            (0..16).map(|k| { let a = b.bind_i32(ev(rbase) + 16 * k); b.load_lds_b128(a) }).collect()
+        });
+        let ro = b.bind_i32((ev(bidx) * 16 + ev(hh)) * 1024 + (ev(db) + ev(dd)) * 2);
+        let prr = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
+        for k in 0..8u32 {
+            let parts: Vec<Opnd> = (0..4u32)
+                .map(|i| {
+                    let j = 8 * k + 2 * i;
+                    let x0 = b.frag_slice(Opnd::Val(vals[(j / 4) as usize]), (j % 4) as u8, 1);
+                    let x1 = b.frag_slice(Opnd::Val(vals[((j + 1) / 4) as usize]), ((j + 1) % 4) as u8, 1);
+                    let f0 = f32_of(&mut b, x0);
+                    let f1 = f32_of(&mut b, x1);
+                    Opnd::Val(b.cvt_pk_bf16_f32(f0, f1))
+                })
+                .collect();
+            let v = b.frag_cat(&parts);
+            b.store_global(prr, 16 * k, v, MemTy::B128, false);
+        }
+        // the LSE of head m (both lane halves and every wave write the same value)
+        let lg = b.log2_f32(lh);
+        let s2 = b.add_f32(Opnd::Var(vm), lg);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lse = b.mul_f32(s2, ln2);
+        let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+        b.store_global(pl, 0, lse, MemTy::B32, false);
+        return b.finish();
+    }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
     b.wait_lds(0);
     b.barrier();
     let mlw = |b: &mut FnBuilder, a: ValueId, v: Opnd| b.store_lds(a, v, MemTy::B32, false);
-    let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     ml.at(&t0).write(&mut b, |b| {
         // max of head m (both lane halves write the same value), the half-sum of lane (m, g)
         let am = b.bind_i32(ev(w) * 64 + ev(m) * 4 + ml.base as i32);
