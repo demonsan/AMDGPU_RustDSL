@@ -50,6 +50,19 @@ pub fn mla_g1250_qh16() -> Function {
     mla_g1250_qh16_with(MLA_NAME, false, 3, false)
 }
 
+/// The window kernel with the wave-split kernel's later improvements that apply here: the GEMM compile policy and scalar loads for the
+/// sequence bounds / scales (the exponent batching is in the shared body).
+pub fn mla_g1250_qh16_g() -> Function {
+    G_MODE.with(|c| c.set(true));
+    let f = mla_g1250_qh16_with("mla_g1250_qh16_g", false, 3, false);
+    G_MODE.with(|c| c.set(false));
+    f
+}
+
+thread_local! {
+    static G_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The MLA decode with the KV pages loaded by per-lane async 16-byte copies instead of the tensor data mover (`async_kv`).
 pub fn mla_g1250_qh16_async() -> Function {
     mla_g1250_qh16_with("mla_g1250_qh16_async", true, 3, false)
@@ -73,6 +86,10 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8, prefetch: bool) ->
     use amdgpu_tile::lane::Role;
     use amdgpu_tile::shared::{Layout, LdsPlan};
     let mut b = FnBuilder::new(name, 128);
+    let gmode = G_MODE.with(|c| c.get());
+    if gmode {
+        b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    }
     let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
     for (i, n) in names.iter().enumerate() {
         b.arg(n, DType::Ptr, 8 * i as u32, 8);
@@ -114,8 +131,12 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8, prefetch: bool) ->
     // uniform scalars of the sequence
     let ld = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
-        let v = b.load_global(q, 0, MemTy::B32);
-        b.read_first_lane(v)
+        if gmode {
+            b.let_(Op::LoadScalar { base: Opnd::Val(q), byte_off: 0 })
+        } else {
+            let v = b.load_global(q, 0, MemTy::B32);
+            b.read_first_lane(v)
+        }
     };
     let ld_v = |b: &mut FnBuilder, p: ValueId, off: ValueId| {
         let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off) });
