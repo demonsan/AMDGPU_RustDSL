@@ -619,7 +619,8 @@ pub fn probe_g1250_trans_rd2() -> Function {
                 _ => {
                     // the packed fp8 conversion: the TRANS result as the low (rd 2) or the high (rd 3) source; the byte back to f32
                     let (lo, hi) = if rd == 2 { (tr, x) } else { (x, tr) };
-                    let p = b.let_(Op::CvtPkFp8Half { old: None, a: Opnd::Val(lo), b: Opnd::Val(hi), hi: false });
+                    let old = b.let_(Op::ConstI32(0));
+                    let p = b.let_(Op::CvtPkFp8Half { old: Some(Opnd::Val(old)), a: Opnd::Val(lo), b: Opnd::Val(hi), hi: false });
                     let by = b.let_(Op::AndI32(Opnd::Val(p), Opnd::I32(0xffff)));
                     let bf = b.un(UnOp::CvtF32I32, by);
                     let bf = b.mul_f32(bf, Opnd::F32(1.0 / 65536.0));
