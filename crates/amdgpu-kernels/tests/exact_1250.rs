@@ -218,3 +218,36 @@ fn two_materialised_booleans_stay_distinct() {
     let distinct: std::collections::HashSet<&String> = mats.iter().collect();
     assert!(distinct.len() >= 2, "two booleans, one materialisation: {mats:?}\n{asm}");
 }
+
+/// Loads whose results are never read: the allocator may give a later load the same destination while the first is in flight. Two
+/// loads on the in-order LOADcnt need no wait between them (the younger lands last); the wait self-check accepts it, and a VALU
+/// write over an in-flight load's destination still gets its wait (`hazards::pad_inflight_waw`).
+#[test]
+fn dead_loads_with_reused_destinations_compile() {
+    let mut b = FnBuilder::new("probe_dead_loads", 32);
+    b.arg("p", DType::Ptr, 0, 8);
+    b.arg_tensor("p", Ext::c(1 << 12));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    for k in 0..4u32 {
+        let _dead = b.let_(Op::LoadGlobalB128 { base: Opnd::Val(p), byte_off: 64 * k });
+    }
+    let x = b.let_(Op::LoadGlobalB128 { base: Opnd::Val(p), byte_off: 512 });
+    b.store_f32x4(p, 1024, x);
+    let f = b.finish();
+    let asm = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}")).asm;
+    if std::env::var("SHOW_ASM").is_ok() {
+        eprintln!("{asm}");
+    }
+}
+
+/// The wait self-check accepts the compiler's own waits for kernel-opt's MLA debug variants (not registered): a prologue whose Q-fragment
+/// loads are stored after more than 63 younger STORES (the shared vmcnt saturation must not retire a load on gfx1250's split counters),
+/// an early exit after the first tensor load, and Q loads before the page loop with global stores inside it (operations beyond the known
+/// queue at a loop head are not counted as loads).
+#[test]
+fn mla_debug_variants_get_their_waits() {
+    use amdgpu_kernels::probes::g1250_mla_ws as w;
+    for f in [w::mla_g1250_qh16_wsx0(), w::mla_g1250_qh16_wsx1(), w::mla_g1250_qh16_wsstd_nowait()] {
+        amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{}: {e}", f.name));
+    }
+}

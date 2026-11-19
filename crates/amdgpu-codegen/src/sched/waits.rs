@@ -285,6 +285,18 @@ fn is_back_edge(m: &MFunction, from: usize, to: usize) -> bool {
 fn vm_max() -> u32 {
     crate::target::cur().counters.of(amdgpu_target::MemClass::VmemLoad).max
 }
+/// How many younger operations prove an older vector-memory operation complete. gfx950: the shared vmcnt saturates at its maximum, so
+/// an operation with that many younger ones has returned. gfx1250: never - the queue mixes LOADcnt and STOREcnt operations (the split
+/// counters do not saturate together: a load with 63 younger STORES can still be in flight; the MLA `_wsx0` prologue: a Q-fragment load
+/// stored after 64 younger stores got no wait); the emitted wait is clamped to the counter range and the gfx1250 translation computes the
+/// LOADcnt / STOREcnt bounds from the real queue.
+fn vm_keep() -> u32 {
+    if crate::target::cur().name == "gfx1250" {
+        u32::MAX
+    } else {
+        vm_max()
+    }
+}
 fn lg_max() -> u32 {
     crate::target::cur().counters.of(amdgpu_target::MemClass::Lds).max
 }
@@ -378,9 +390,9 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         }
         if let Some(n) = st.vm.need(&ring_vm) {
             if let Some(o) = out {
-                o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
+                o.push(MInst::new(MOp::SWaitVm).imm(n.min(vm_max()) as i64).auto());
             }
-            st.vm.complete(n);
+            st.vm.complete(n.min(vm_max()));
             inserted += 1;
         }
         if let Some(n) = st.lg.need(&ring_lg) {
@@ -396,9 +408,9 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             let touched: Vec<Slot> = e.reads.clone();
             if let Some(n) = st.vm.need(&touched) {
                 if let Some(o) = out {
-                    o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
+                    o.push(MInst::new(MOp::SWaitVm).imm(n.min(vm_max()) as i64).auto());
                 }
-                st.vm.complete(n);
+                st.vm.complete(n.min(vm_max()));
                 inserted += 1;
             }
             if let Some(n) = st.lg.need(&touched) {
@@ -413,7 +425,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             if is_tensor(inst.op) {
                 st.tn.issue(key, ring_issue, false, TN_MAX);
             } else {
-                st.vm.issue(key, ring_issue, false, vm_max());
+                st.vm.issue(key, ring_issue, false, vm_keep());
             }
             if let Some(o) = out {
                 o.push(inst.clone());
@@ -483,9 +495,9 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
     };
     if let Some(n) = st.vm.need(&vm_touched) {
         if let Some(o) = out {
-            o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
+            o.push(MInst::new(MOp::SWaitVm).imm(n.min(vm_max()) as i64).auto());
         }
-        st.vm.complete(n);
+        st.vm.complete(n.min(vm_max()));
         inserted += 1;
     }
     if let Some(n) = st.lg.need(&touched) {
@@ -512,7 +524,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         let mut slots = e.writes.clone();
         slots.extend(ring_issue);
         match a.space {
-            Space::Global => st.vm.issue(key, slots, false, vm_max()),
+            Space::Global => st.vm.issue(key, slots, false, vm_keep()),
             Space::Lds => st.lg.issue(key, slots, false, lg_max()),
         }
     } else if e.smem {

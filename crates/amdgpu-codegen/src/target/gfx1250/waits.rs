@@ -79,9 +79,14 @@ pub struct Plan {
 
 /// Bound for class `k` among the youngest `n` operations of `q` (positions beyond the known suffix count fully when `unknown`).
 fn bound(q: &[Pending], unknown: bool, n: usize, k: Kind) -> u32 {
+    // Beyond the known suffix (`unknown`: the operations before this block's entry) the kinds are not known: counting them as class `k`
+    // would allow MORE outstanding operations of that class than there are younger ones, i.e. too weak a wait (an older load waited
+    // with a count that included younger stores: the MLA `_wsstd_nowait` loop). The safe bound counts only the known ones: every
+    // operation of class `k` beyond them is older than the target or the target itself.
     let known = q.len().min(n);
     let mut c = q[q.len() - known..].iter().filter(|p| p.kind == k).count();
-    if unknown && n > q.len() {
+    // (`AMDC_WAIT_BOUND_OLD`: the old, too weak bound - only for A/B timing, never for code that runs in production)
+    if unknown && n > q.len() && std::env::var("AMDC_WAIT_BOUND_OLD").is_ok() {
         c += n - q.len();
     }
     c as u32
@@ -176,6 +181,9 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                             st.lg_unknown = false;
                         }
                     }
+                }
+                if std::env::var("AMDC_WAIT_DEBUG").is_ok() {
+                    eprintln!("wait b{bi} i{ii}: gfx950 vm {vm:?} lgkm {lg:?} -> {lines:?}");
                 }
                 plan.replace.insert((bi, ii), lines);
                 continue;
