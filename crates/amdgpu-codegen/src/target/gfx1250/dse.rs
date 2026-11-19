@@ -6,7 +6,7 @@
 
 use crate::mir::*;
 use crate::regalloc::Alloc;
-use crate::sched::effects::{effects, VCC};
+use crate::sched::effects::{effects, SCC, VCC};
 
 /// A physical location: VGPR n -> n, SGPR n -> (1 << 20) + n, VCC -> u32::MAX.
 fn keys(m: &MFunction, a: &Alloc, slots: &[u32]) -> Vec<u32> {
@@ -14,6 +14,10 @@ fn keys(m: &MFunction, a: &Alloc, slots: &[u32]) -> Vec<u32> {
     for &s in slots {
         if s == VCC {
             out.push(u32::MAX);
+            continue;
+        }
+        if s == SCC {
+            // SCC: tracked by the op attributes (scc_read / scc_write) below
             continue;
         }
         if s >= u32::MAX - 1 {
