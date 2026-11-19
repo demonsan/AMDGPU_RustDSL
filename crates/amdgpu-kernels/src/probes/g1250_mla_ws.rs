@@ -269,6 +269,11 @@ pub fn mla_g1250_qh16_wse() -> Function {
     mla_ws_with("mla_g1250_qh16_wse", false, 64 | 256 | 16384 | 65536 | 131072 | 1048576, false)
 }
 
+/// `_ws` with the cross-wave merge by LDS float atomics (nondeterministic summation order across the 4 waves).
+pub fn mla_g1250_qh16_wsa() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsa", false, 64 | 256 | 16384 | 65536 | 131072 | 2097152, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -300,6 +305,10 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     // bit 20: the first page's tensor load issued right after the sequence bounds (before the Q loads and the scale loads); the scale
     // scalars loaded together with the bounds
     let early = branchless & 1048576 != 0;
+    // bit 21: the cross-wave merge by LDS float atomics: the wave maxima exchanged first, then every wave adds its O (scaled to the common
+    // max) and its row sums into one 16 x 512 accumulator (zeroed in its own phase); the final reads 16 instead of 64 b128 per thread.
+    // The sum order across waves is not fixed (float atomics): the output can differ in the last bits from run to run
+    let fadd = branchless & 2097152 != 0;
     assert!(!early || (branchless & 64 != 0 && !split && !pipe), "early staging needs the scalar page-id loads");
     // bit 6: scalar loads (s_load) for the sequence bounds, the scales and the page ids; no LDS page table and no prologue barrier
     let sload = branchless & 64 != 0;
@@ -1171,6 +1180,162 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let ln2 = b.c_f32(std::f32::consts::LN_2);
         let lse = b.mul_f32(s2, ln2);
         let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+        b.store_global(pl, 0, lse, MemTy::B32, false);
+        return b.finish();
+    }
+    if fadd && dg == 1 && !split && !tstamp {
+        // phase 0: the wave maxima (head m, both lane halves write the same value) and the zeroed accumulator (O 16 x 512 f32, then 16 sums)
+        b.wait_lds(0);
+        b.barrier();
+        ml.at(&t0).write(&mut b, |b| {
+            let am = b.bind_i32(ev(w) * 64 + ev(m) * 4 + ml.base as i32);
+            b.store_lds(am, Opnd::Var(vm), MemTy::B32, false);
+        });
+        let z4 = b.frag_cat(&[Opnd::I32(0); 4]);
+        let zb = b.bind_i32(ev(tid) * 256 + mo.base as i32);
+        mo.at(&t0).write(&mut b, |b| {
+            for k in 0..16 {
+                let a = b.bind_i32(ev(zb) + 16 * k);
+                b.store_lds(a, Opnd::Val(z4), MemTy::B128, false);
+            }
+            // the 16 sums (threads 0 .. 15)
+            let lz = b.bind_i32(32768 + (ev(tid) & 15) * 4 + mo.base as i32);
+            let zf0 = b.c_f32(0.0);
+            b.store_lds(lz, Opnd::Val(zf0), MemTy::B32, false);
+        });
+        b.wait_lds(0);
+        b.barrier();
+        // the common max M[h] of the 16 heads, and this wave's scale exp2(m_w[h] - M[h])
+        let t1 = SlotIdx::new(Opnd::I32(0), Opnd::I32(1));
+        let (mall, mown): (Vec<ValueId>, Vec<ValueId>) = ml.at(&t0).read(&mut b, |b| {
+            let mut mall: Vec<Option<ValueId>> = vec![None; 16];
+            for ww in 0..4i32 {
+                for q4 in 0..4i32 {
+                    let a = b.bind_i32(ww * 64 + q4 * 16 + ml.base as i32);
+                    let v4 = b.load_lds_b128(a);
+                    for e in 0..4u8 {
+                        let x = b.frag_slice(Opnd::Val(v4), e, 1);
+                        let xf = f32_of(b, x);
+                        let h = (4 * q4 + e as i32) as usize;
+                        mall[h] = Some(match mall[h] {
+                            None => xf,
+                            Some(y) => b.max_f32(y, xf),
+                        });
+                    }
+                }
+            }
+            let ab = b.bind_i32(ev(w) * 64 + ml.base as i32);
+            let mut mown = Vec::new();
+            for q4 in 0..4u32 {
+                let aq = b.bind_i32(ev(ab) + 16 * q4 as i32);
+                let v4 = b.load_lds_b128(aq);
+                for e in 0..4u8 {
+                    let x = b.frag_slice(Opnd::Val(v4), e, 1);
+                    mown.push(f32_of(b, x));
+                }
+            }
+            (mall.into_iter().map(|x| x.unwrap()).collect(), mown)
+        });
+        let sch: Vec<ValueId> = (0..16).map(|h| { let d = b.sub_f32(mown[h], mall[h]); b.exp2_f32(d) }).collect();
+        // the scale of row 8 g + r (g = the lane half: select-free, exact for g in {0, 1}) and of head m (this lane's sum)
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let srow: Vec<ValueId> = (0..8usize)
+            .map(|r| {
+                let a0 = b.mul_f32(sch[r], hf);
+                let a1 = b.mul_f32(sch[8 + r], gf);
+                b.add_f32(a0, a1)
+            })
+            .collect();
+        // this lane's head m: the max / scale picked by v_readlane-free arithmetic is awkward for 16 values; read it back from LDS instead
+        let mrow = ml.at(&t0).read(&mut b, |b| {
+            let a = b.bind_i32(ev(w) * 64 + ev(m) * 4 + ml.base as i32);
+            let v = b.load_lds(a, MemTy::B32);
+            f32_of(b, v)
+        });
+        let mmax = ml.at(&t0).read(&mut b, |b| {
+            let mut mx: Option<ValueId> = None;
+            for ww in 0..4i32 {
+                let a = b.bind_i32(ev(m) * 4 + (ww * 64 + ml.base as i32));
+                let v = b.load_lds(a, MemTy::B32);
+                let vf = f32_of(b, v);
+                mx = Some(match mx {
+                    None => vf,
+                    Some(y) => b.max_f32(y, vf),
+                });
+            }
+            mx.unwrap()
+        });
+        let dm = b.sub_f32(mrow, mmax);
+        let sm = b.exp2_f32(dm);
+        let lsc = b.mul_f32(Opnd::Var(vl), sm);
+        let ob = b.bind_i32((ev(g) * 8 * 512 + ev(m)) * 4 + mo.base as i32);
+        mo.at(&t1).write(&mut b, |b| {
+            for nt in 0..ntw {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(b, e);
+                    let y = b.mul_f32(ef, srow[r as usize]);
+                    let a = b.bind_i32(ev(ob) + ((r as i32) * 2048 + (64 * nt as i32)));
+                    b.atomic_lds(amdgpu_dsl::AtomicOp::AddF32, a, y, false);
+                }
+            }
+            let la = b.bind_i32(32768 + ev(m) * 4 + mo.base as i32);
+            b.atomic_lds(amdgpu_dsl::AtomicOp::AddF32, la, lsc, false);
+        });
+        b.wait_lds(0);
+        b.barrier();
+        // thread t: head h = t / 8, dims 64 (t % 8) .. + 64: 16 b128 reads of the accumulated O, the sum, the max
+        let h = b.bind_i32(ev(tid) >> 3);
+        let d0 = b.bind_i32((ev(tid) & 7) << 6);
+        let rb = b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + mo.base as i32);
+        let (vals, lt): (Vec<ValueId>, ValueId) = mo.at(&t1).read(&mut b, |b| {
+            let v: Vec<ValueId> = (0..16).map(|k| { let a = b.bind_i32(ev(rb) + 16 * k); b.load_lds_b128(a) }).collect();
+            let la = b.bind_i32(32768 + ev(h) * 4 + mo.base as i32);
+            let l = b.load_lds(la, MemTy::B32);
+            (v, f32_of(b, l))
+        });
+        let mx = ml.at(&t0).read(&mut b, |b| {
+            let mut mx: Option<ValueId> = None;
+            for ww in 0..4i32 {
+                let a = b.bind_i32(ev(h) * 4 + (ww * 64 + ml.base as i32));
+                let v = b.load_lds(a, MemTy::B32);
+                let vf = f32_of(b, v);
+                mx = Some(match mx {
+                    None => vf,
+                    Some(y) => b.max_f32(y, vf),
+                });
+            }
+            mx.unwrap()
+        });
+        let rl = b.rcp_f32(lt);
+        let inv = b.mul_f32(rl, ksf);
+        let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(d0) * 2);
+        let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
+        for k in 0..8u32 {
+            let parts: Vec<Opnd> = (0..4u32)
+                .map(|i| {
+                    let j = 8 * k + 2 * i;
+                    let x0 = b.frag_slice(Opnd::Val(vals[(j / 4) as usize]), (j % 4) as u8, 1);
+                    let x1 = b.frag_slice(Opnd::Val(vals[((j + 1) / 4) as usize]), ((j + 1) % 4) as u8, 1);
+                    let f0 = f32_of(&mut b, x0);
+                    let f1 = f32_of(&mut b, x1);
+                    let y0 = b.mul_f32(f0, inv);
+                    let y1 = b.mul_f32(f1, inv);
+                    Opnd::Val(b.cvt_pk_bf16_f32(y0, y1))
+                })
+                .collect();
+            let v = b.frag_cat(&parts);
+            b.store_global(prb, 16 * k, v, MemTy::B128, false);
+        }
+        let lg = b.log2_f32(lt);
+        let s2 = b.add_f32(mx, lg);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lse = b.mul_f32(s2, ln2);
+        let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
         let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
         b.store_global(pl, 0, lse, MemTy::B32, false);
         return b.finish();
