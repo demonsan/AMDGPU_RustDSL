@@ -583,6 +583,65 @@ pub fn probe_g1250_trans_all() -> Function {
     b.finish()
 }
 
+/// TRANS co-execution, the MLA softmax's other readers: every TRANS op read right away by `v_sub_f32` (TRANS result as src0 / as src1) and
+/// by `v_cvt_pk_fp8_f32` (as the low / the high source of the packed conversion, the P-to-fp8 step). Same layout and evidence method as
+/// `probe_g1250_trans_all` (8 chains x 21 steps; tools/mi450/trans_all.sh KERNEL=probe_g1250_trans_rd2 removes the v_nops per reader class
+/// and compares bit for bit). out[(wg * 512 + tid) * 8 + chain]. 512 work-items. Kernargs: out @0.
+pub fn probe_g1250_trans_rd2() -> Function {
+    use amdgpu_dsl::UnOp;
+    let mut b = FnBuilder::new("probe_g1250_trans_rd2", 512);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(16384));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let tf = b.un(UnOp::CvtF32I32, tid);
+    let tf = b.mul_f32(tf, Opnd::F32(1.0 / 512.0));
+    let mut ch: Vec<ValueId> = (0..8).map(|c| b.add_f32(tf, Opnd::F32(0.5 + c as f32 * 0.0625))).collect();
+    for s in 0..21 {
+        for c in 0..8 {
+            let k = (s * 8 + c) % 28;
+            let (tr_i, rd) = (k % 7, k / 7);
+            let x = ch[c];
+            let xa = b.mul_f32(x, Opnd::F32(0.03125));
+            let xa = b.add_f32(xa, Opnd::F32(1.125));
+            let tr = match tr_i {
+                0 => b.let_(Op::Exp2F32(Opnd::Val(xa))),
+                1 => b.let_(Op::Log2F32(Opnd::Val(xa))),
+                2 => b.let_(Op::RcpF32(Opnd::Val(xa))),
+                3 => b.un(UnOp::RsqF32, xa),
+                4 => b.un(UnOp::SqrtF32, xa),
+                5 => b.un(UnOp::SinF32, xa),
+                _ => b.un(UnOp::CosF32, xa),
+            };
+            let y = match rd {
+                0 => b.sub_f32(tr, x),
+                1 => b.sub_f32(x, tr),
+                _ => {
+                    // the packed fp8 conversion: the TRANS result as the low (rd 2) or the high (rd 3) source; the byte back to f32
+                    // (the 32-bit form the MLA uses: cvt_pk_fp8x4 = a low v_cvt_pk_fp8_f32 and an op_sel high one; rd 2: TRANS as the low op's src0, rd 3: as the high op's src1)
+                    let p = if rd == 2 { b.cvt_pk_fp8x4_f32(tr, x, x, x) } else { b.cvt_pk_fp8x4_f32(x, x, x, tr) };
+                    let p = if rd == 2 { b.let_(Op::AndI32(Opnd::Val(p), Opnd::I32(0xffff))) } else { b.let_(Op::LshrI32(Opnd::Val(p), Opnd::I32(16))) };
+                    let by = b.let_(Op::AndI32(Opnd::Val(p), Opnd::I32(0xffff)));
+                    let bf = b.un(UnOp::CvtF32I32, by);
+                    let bf = b.mul_f32(bf, Opnd::F32(1.0 / 65536.0));
+                    b.add_f32(bf, x)
+                }
+            };
+            ch[c] = b.let_(Op::FmaF32(Opnd::Val(y), Opnd::F32(0.25), Opnd::F32(0.5)));
+        }
+    }
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wg9 = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(9)));
+    let gt = b.let_(Op::AddI32(Opnd::Val(wg9), Opnd::Val(tid)));
+    let a = b.let_(Op::ShlI32(Opnd::Val(gt), Opnd::I32(5)));
+    for c in 0..8 {
+        let o = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32(4 * c as i32)));
+        let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+        b.store_global(q, 0, ch[c], MemTy::B32, false);
+    }
+    b.finish()
+}
+
 /// Multicast probe (cluster of 2 workgroups in x): every workgroup loads ITS slice of `src` (2048 bytes, slice = its position in the cluster) with the group-1 multicast mask `mask` into LDS at
 /// byte 2048 x slice (wave 0 issues, cache policy `th` / `scope`), waits for its own tensor completion, a workgroup barrier, the cluster barrier; then every work-item copies the whole 4096-byte LDS
 /// to `out[position]`. With mask 0b11 each workgroup must see both slices; mask 0 (no multicast) only its own. Kernargs: src @0 (4096 bytes), out @8 (8192 bytes). 64 work-items.
