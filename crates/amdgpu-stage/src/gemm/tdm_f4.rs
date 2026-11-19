@@ -64,6 +64,8 @@ pub struct Ovl {
     /// the blocks (of `tm * tn`, i-major) whose packed accumulators are carried into the next tile's loop: group g stores blocks 2 g and 2 g + 1, so `groups = kept / 2`; the other
     /// blocks are stored straight at the end of the tile (the VGPR budget holds only a part of a second accumulator set)
     pub groups: i32,
+    /// all kept groups in one `if` at iteration 0 (instead of one `if` per iteration)
+    pub burst: bool,
 }
 
 impl Ovl {
@@ -348,11 +350,20 @@ impl PipeBody for TdmF4Body {
         if let (Some(ovl), true) = (self.ovl.clone(), t.staged) {
             // the previous tile's packed accumulators go out 4 stores per iteration: group g in iteration g of this K loop (only when a previous tile exists)
             let sel = b.bind_i32(amdgpu_dsl::varx(ovl.hp).eq(1).select_i32(amdgpu_dsl::ox(t.it), 1000));
-            for g in 0..ovl.groups {
-                let c = b.bind_cond(ev(sel).eq(g));
+            if ovl.burst {
+                let c = b.bind_cond(ev(sel).eq(0));
                 b.begin_if(c);
-                ovl.store_group(b, self.pc_c, sh.tn, g);
+                for g in 0..ovl.groups {
+                    ovl.store_group(b, self.pc_c, sh.tn, g);
+                }
                 b.end_if();
+            } else {
+                for g in 0..ovl.groups {
+                    let c = b.bind_cond(ev(sel).eq(g));
+                    b.begin_if(c);
+                    ovl.store_group(b, self.pc_c, sh.tn, g);
+                    b.end_if();
+                }
             }
         }
         if self.stamps && t.staged {

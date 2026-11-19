@@ -490,7 +490,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
 
 /// The 512-K 2-slot tile on a persistent grid with the operand swap and the overlapped bf16 epilogue (host PERSIST=G, OUT_BF16=1).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_ovl(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, roles, swap: true, persistent: true, ovl: if name.contains("_ovl8") { 8 } else if name.contains("_ovl16") { 16 } else { 32 }, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, roles, swap: true, persistent: true, ovl_burst: name.contains("a_roles"), ovl: if name.contains("_ovl0") { 0 } else if name.contains("_ovl8") { 8 } else if name.contains("_ovl16") { 16 } else { 32 }, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 /// The 256 x 256 kernel with the operand swap and the bf16 direct epilogue (host OUT_BF16=1): no LDS staging, no tensor store.
@@ -604,6 +604,8 @@ pub struct RingOpts {
     pub wave_order: u8,
     /// the overlapped epilogue (persistent, swap, bf16 output): the tile's packed accumulators are stored from registers by the next tile's K loop (`tdm_f4::Ovl`)
     pub ovl: u8,
+    /// the kept groups all stored at iteration 0 (one `if`)
+    pub ovl_burst: bool,
 }
 
 impl RingOpts {
@@ -615,7 +617,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false }
     }
 }
 
@@ -974,7 +976,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
     }
 
-    let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2 });
+    let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
         let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
