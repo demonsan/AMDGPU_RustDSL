@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -595,6 +595,8 @@ pub struct RingOpts {
     pub swap: bool,
     /// stagger: the workgroups of odd tile parity (tile column + tile row) sleep `stagger` x 64 clocks at the start, so the epilogue write bursts of the tiles in flight do not all align (0 = off)
     pub stagger: u16,
+    /// wave grid order: 0 = (wi, wj) = (w >> 1, w & 1); 1 = Gray order (w0 (0,0), w1 (0,1), w2 (1,1), w3 (1,0)); 2 = transposed (wi, wj) = (w & 1, w >> 1)
+    pub wave_order: u8,
 }
 
 impl RingOpts {
@@ -606,7 +608,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0 }
     }
 }
 
@@ -784,8 +786,19 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         (gx, gy, gx, gy)
     };
     assert!((sh.wn as u32).is_power_of_two(), "wn a power of two");
-    let wi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(sh.wn.trailing_zeros() as i32)));
-    let wj = b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(sh.wn - 1)));
+    let (wi, wj) = match ring.wave_order {
+        1 => {
+            assert!(sh.wm == 2 && sh.wn == 2, "wave order: a 2 x 2 wave grid");
+            let hi = b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(1)));
+            let x = b.let_(Op::XorI32(Opnd::Val(w), Opnd::Val(hi)));
+            (hi, b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(1))))
+        }
+        2 => {
+            assert!(sh.wm == 2 && sh.wn == 2, "wave order: a 2 x 2 wave grid");
+            (b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(1))), b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(1))))
+        }
+        _ => (b.let_(Op::LshrI32(Opnd::Val(w), Opnd::I32(sh.wn.trailing_zeros() as i32))), b.let_(Op::AndI32(Opnd::Val(w), Opnd::I32(sh.wn - 1)))),
+    };
     let m = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(15)));
     let g = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::I32(4)));
     let row0 = b.mul_i32(wgy, Opnd::I32(bm));
