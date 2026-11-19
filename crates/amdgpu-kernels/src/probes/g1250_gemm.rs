@@ -488,6 +488,12 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), ..RingOpts::default() })
 }
 
+/// The 512-K 2-slot kernel with bf16 output and no operand swap: the f32 accumulators are rounded in registers (`v_cvt_pk_bf16_f32`), staged as 16-bit pieces into unpadded LDS rows and
+/// stored by one tensor store per wave (half the bytes of the f32 epilogue); host OUT_BF16=1.
+pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16s(name: &str, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 5, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
 /// The vendor's 192 x 256 tile with the operand swap (A operand = the B matrix: 4 x 6 blocks of 32 x 16 per wave), K slots of 256 in a 3-slot ring, wave roles, a persistent grid and a
 /// SEPARATE bf16 staging region whose four tensor stores per wave drain behind the next tile's prologue (host PERSIST=G, OUT_BF16=1; M a multiple of 192).
 pub fn gemm_tdm_stage_f4_192x256_swap_ovl(name: &str, relax: bool) -> Function {
@@ -718,13 +724,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
-    assert!(epi == 0 || epi == 3 || epi == 4 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap)");
+    assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
+    assert!(epi != 5 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
     assert!(epi != 4 || (ring.swap && sh.bf16), "epilogue_lds 4: bf16 output with the operand swap");
     assert!(epi != 3 || (ring.swap && sh.bf16), "epilogue_lds 3: bf16 output with the operand swap");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
     // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
     // so its staging rows are unpadded)
-    let epi_rs = if epi == 3 || epi == 4 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
+    let epi_rs = if epi == 3 || epi == 4 || epi == 5 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
@@ -1235,7 +1242,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let wl0 = b.mul_i32(wid, Opnd::I32(wrows * epi_rs));
             let g8 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
             let lrow = b.mul_i32(g8, Opnd::I32(epi_rs));
-            let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(2)));
+            let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(if epi == 5 { 1 } else { 2 })));
             let lb = b.add_i32(wl0, lrow);
             let lb = b.add_i32(lb, m4);
             if ring.epi_bands > 0 && epi == 2 {
@@ -1257,9 +1264,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                         let acc = body.acc[(i * sh.tn + j) as usize];
                         for v in 0..16i32 {
                             let rowv = (v % 8) + 16 * (v / 8);
-                            let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
+                            let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * if epi == 5 { 32 } else { 64 }));
                             let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                            b.store_lds_b32(addr, x);
+                            if epi == 5 {
+                                let f = b.bitcast_f32(x);
+                                let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(f), Opnd::Val(f)));
+                                b.store_lds(addr, p, MemTy::U16, false);
+                            } else {
+                                b.store_lds_b32(addr, x);
+                            }
                         }
                     }
                     if (i + 1) % per == 0 {
@@ -1281,9 +1294,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     let acc = body.acc[(i * sh.tn + j) as usize];
                     for v in 0..16i32 {
                         let rowv = (v % 8) + 16 * (v / 8);
-                        let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * 64));
+                        let addr = b.bind_i32(ev(bi) + (rowv * epi_rs + j * if epi == 5 { 32 } else { 64 }));
                         let x = b.frag_slice(Opnd::Var(acc), v as u8, 1);
-                        b.store_lds_b32(addr, x);
+                        if epi == 5 {
+                            let f = b.bitcast_f32(x);
+                            let p = b.let_(Op::CvtPkBf16F32(Opnd::Val(f), Opnd::Val(f)));
+                            b.store_lds(addr, p, MemTy::U16, false);
+                        } else {
+                            b.store_lds_b32(addr, x);
+                        }
                     }
                 }
             }
@@ -1296,7 +1315,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let c0 = b.add_i32(c0, col0);
             let lin = b.mul_i32(r0, nn);
             let lin = b.add_i32(lin, c0);
-            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
+            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(if epi == 5 { 1 } else { 2 })));
             if epi == 1 {
                 // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
                 assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
@@ -1321,7 +1340,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 }
             } else {
                 // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
-                let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
+                let tile = TensorTile { data_size: if epi == 5 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
                 // (the origin and the LDS base are wave-uniform: scalar descriptor words)
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
