@@ -72,6 +72,7 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     // dead writes the allocation exposed (descriptor words rewritten before use; `dse.rs`)
     if backend == "own" && !f.exact {
         dse::dse(&mut m, &alloc);
+        dse::tdm_first(&mut m, &alloc);
     }
     // G5: the hang-safety rules are compile errors (docs/gfx1250-hang-rules.md): the kernel IR here, the final instruction text below
     crate::gpu_verify_1250::enforce(f, &m, &alloc)?;

@@ -101,3 +101,65 @@ pub fn dse(m: &mut MFunction, a: &Alloc) -> usize {
     }
     removed
 }
+
+/// The kernel prologue issues its first tensor loads as early as possible: in the entry block, every instruction before the first group of
+/// `tensor_load_to_lds` that has no side effect and no dependence (RAW / WAR / WAW on a physical register, SCC, VCC) with any instruction it
+/// would jump over is moved behind the group (keeping its order). The lane-offset VALU math of the later LDS reads goes there; the
+/// descriptor words stay in front. `AMDC_NO_TDM_FIRST`: off.
+pub fn tdm_first(m: &mut MFunction, a: &Alloc) -> usize {
+    if m.exact || std::env::var("AMDC_NO_TDM_FIRST").is_ok() || m.blocks.is_empty() {
+        return 0;
+    }
+    let insts = &m.blocks[0].insts;
+    let Some(first) = insts.iter().position(|i| i.op == MOp::TensorLoadToLds) else { return 0 };
+    let mut last = first;
+    while last + 1 < insts.len() && insts[last + 1].op == MOp::TensorLoadToLds {
+        last += 1;
+    }
+    let info: Vec<(Vec<u32>, Vec<u32>, bool, bool)> = insts
+        .iter()
+        .map(|i| {
+            let e = effects(m, i);
+            let at = crate::op_attrs::attrs(i.op);
+            (keys(m, a, &e.reads), keys(m, a, &e.writes), at.scc_read, at.scc_write)
+        })
+        .collect();
+    let movable = |i: usize| -> bool {
+        let inst = &insts[i];
+        let at = crate::op_attrs::attrs(inst.op);
+        matches!(at.dce, crate::op_attrs::Dce::Pure) && at.mem.is_none() && !at.smem && !inst.pin && inst.dst.is_some() && !info[i].0.contains(&(u32::MAX - 1)) && !info[i].1.contains(&(u32::MAX - 1))
+    };
+    let conflict = |r: usize, s: usize| -> bool {
+        let (rr, rw, rsr, rsw) = &info[r];
+        let (sr, sw, ssr, ssw) = &info[s];
+        let hit = |x: &[u32], y: &[u32]| x.iter().any(|k| y.contains(k));
+        hit(rw, sr) || hit(rr, sw) || hit(rw, sw) || (*rsw && (*ssr || *ssw)) || (*rsr && *ssw)
+    };
+    let mut moved = vec![false; last + 1];
+    for r in (0..first).rev() {
+        if !movable(r) {
+            continue;
+        }
+        if (r + 1..=last).filter(|&s| !moved[s]).all(|s| !conflict(r, s)) {
+            moved[r] = true;
+        }
+    }
+    let n = moved.iter().filter(|x| **x).count();
+    if n == 0 {
+        return 0;
+    }
+    let old = std::mem::take(&mut m.blocks[0].insts);
+    let (mut keep, mut tail) = (Vec::new(), Vec::new());
+    for (i, inst) in old.into_iter().enumerate() {
+        if i <= last && moved[i] {
+            tail.push(inst);
+        } else {
+            keep.push(inst);
+            if i == last {
+                keep.append(&mut tail);
+            }
+        }
+    }
+    m.blocks[0].insts = keep;
+    n
+}
