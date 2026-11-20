@@ -67,9 +67,11 @@ pub fn mla_g1250_qh16_w1v() -> Function {
 /// operand), 3 = no S / PV WMMAs (the fragments are read and folded into the carried values by a cheap op)
 pub fn mla_g1250_qh16_w1x(mode: u8) -> Function {
     ILP.with(|c| c.set(true));
+    LEAN.with(|c| c.set(mode >= 6));
     ABL.with(|c| c.set(mode));
     let f = mla_w1_with(&format!("mla_g1250_qh16_w1x{mode}"), 2, 4);
     ABL.with(|c| c.set(0));
+    LEAN.with(|c| c.set(false));
     ILP.with(|c| c.set(false));
     f
 }
@@ -488,7 +490,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let r2 = kv.at(&sl2);
         let sb2 = b.bind_i32(r2.base());
         let abl = ABL.with(|c| c.get());
-        let kfr: Vec<Vec<ValueId>> = if abl == 1 { (0..WP).map(|_| (0..9).map(|c| q[(c + 1) % 9]).collect()).collect() } else { (0..WP)
+        let kfr: Vec<Vec<ValueId>> = if abl == 1 || abl == 6 { (0..WP).map(|_| (0..9).map(|c| q[(c + 1) % 9]).collect()).collect() } else { (0..WP)
             .map(|pg| {
                 let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
                 let nope_row = b.bind_i32(ev(pb) + ev(kofs));
@@ -521,7 +523,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
         let kr = kv.at(&ksl);
         let kb = b.bind_i32(kr.base());
-        let vfr: Vec<Vec<ValueId>> = if abl == 2 { (0..WP).map(|_| (0..8).map(|nt| q[nt]).collect()).collect() } else { (0..WP)
+        let vfr: Vec<Vec<ValueId>> = if abl == 2 || abl == 6 { (0..WP).map(|_| (0..8).map(|nt| q[nt]).collect()).collect() } else { (0..WP)
             .map(|pg| {
                 let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
                 kr.read(&mut b, |b| {
