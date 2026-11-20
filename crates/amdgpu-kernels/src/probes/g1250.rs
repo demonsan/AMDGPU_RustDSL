@@ -610,11 +610,12 @@ pub fn probe_g1250_pkmul() -> Function {
     let wg = b.let_(Op::WorkgroupIdX);
     let t1 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(1)));
     let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t1);
-    let init: Vec<ValueId> = (0..8).map(|k| b.mul_f32(x, Opnd::F32((k + 1) as f32))).collect();
+    let init: Vec<ValueId> = (0..8).map(|k| { let m = b.mul_f32(x, Opnd::F32((k + 1) as f32)); b.bitcast_i32(m) }).collect();
     let acc0 = b.frag8(init[0], init[1], init[2], init[3], init[4], init[5], init[6], init[7]);
     let s0 = b.mul_f32(x, Opnd::F32(0.5));
     let s1a = b.mul_f32(x, Opnd::F32(0.25));
     let s1 = b.add_f32(s1a, Opnd::F32(1.0));
+    let (s0, s1) = (b.bitcast_i32(s0), b.bitcast_i32(s1));
     let s = b.frag2(s0, s1);
     let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(acc0)), (DType::I32, Opnd::I32(0))]);
     for r in 0..4u8 {
