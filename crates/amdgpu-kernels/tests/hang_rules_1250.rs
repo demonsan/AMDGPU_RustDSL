@@ -1024,7 +1024,7 @@ fn pos_vopd() {
         asm_positive(&inject("tensor_load_to_lds", &[l]));
     }
     // a window change between: Y's v0 in source window 1 is v256, not X's destination v0
-    asm_positive(&inject("tensor_load_to_lds", &["s_set_vgpr_msb 0x1", "v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v0, v9", "s_set_vgpr_msb 0"]));
+    asm_positive(&inject("tensor_load_to_lds", &["s_set_vgpr_msb 0x1", "v_dual_mul_f32 v0, v5, v8 :: v_dual_mul_f32 v1, v0, v9", "s_set_vgpr_msb 0"]));
 }
 
 // GV-1250-CLAUSE-TYPE
@@ -1038,7 +1038,7 @@ fn mut_clause_type() {
 #[test]
 fn pos_clause_type() {
     asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "global_load_b32 v1, v2, s[4:5]", "global_load_b32 v3, v2, s[4:5] offset:4"]));
-    asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "s_load_b32 s4, s[0:1], 0x0", "s_load_b32 s5, s[0:1], 0x4"]));
+    asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "s_load_b32 s40, s[0:1], 0x0", "s_load_b32 s41, s[0:1], 0x4", "s_wait_kmcnt 0x0"]));
 }
 
 // GV-1250-FORBIDDEN-OP
