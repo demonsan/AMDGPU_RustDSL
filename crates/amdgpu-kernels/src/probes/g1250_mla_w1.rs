@@ -19,8 +19,6 @@ use amdgpu_stage::attention::mla::{PageLayout, DV, PAGE_BYTES, PAGE_TOKENS, QUAR
 use amdgpu_stage::gemm::tdm::tdm_group0;
 use amdgpu_tile::shared::{Layout, LdsPlan, SlotIdx};
 
-/// pages per window
-const WP: i32 = 2;
 /// pages per sequence the LDS page table holds (ctx <= 65536)
 const MAX_PAGES: i32 = 1024;
 
@@ -28,9 +26,23 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
 }
 
-/// The one-barrier window kernel.
+/// The one-barrier window kernel: 2-page windows, a 4-slot ring (one window of load lead).
 pub fn mla_g1250_qh16_w1() -> Function {
-    let name = "mla_g1250_qh16_w1";
+    mla_w1_with("mla_g1250_qh16_w1", 2, 4)
+}
+
+/// 1-page windows and an 8-slot ring: four windows of load lead (the tensor-load latency exceeds one 2-page window).
+pub fn mla_g1250_qh16_w1d() -> Function {
+    mla_w1_with("mla_g1250_qh16_w1d", 1, 8)
+}
+
+/// `wp` pages per window, a `depth`-slot ring (a power of two >= 4): window t + depth - 1 is staged in iteration t, window t + 3 must be
+/// complete at its end (depth - 4 windows stay in flight).
+fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
+    #[allow(non_snake_case)]
+    let WP = wp;
+    assert!(depth >= 4 && (depth & (depth - 1)) == 0);
+    let in_flight = ((depth - 4) * wp) as u8;
     let layout = PageLayout::plan();
     let mut b = FnBuilder::new(name, 128);
     b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
@@ -53,7 +65,7 @@ pub fn mla_g1250_qh16_w1() -> Function {
     b.arg_tensor("KV", Ext::sym("P") * Ext::c(PAGE_BYTES as i64));
     b.arg_tensor("LTD", Ext::sym("NPG") * Ext::c(4));
     let mut lds = LdsPlan::new();
-    let kv = lds.ring("KV", (WP * layout.slot_bytes) as i64, 4, Layout::Linear);
+    let kv = lds.ring("KV", (WP * layout.slot_bytes) as i64, depth as u32, Layout::Linear);
     let red = lds.ring("RED", 512, 2, Layout::Linear);
     let pbuf = lds.ring("PBUF", 1024 * WP as i64, 2, Layout::Linear);
     let ptab = lds.tile("PTAB", 4 * MAX_PAGES as i64, Layout::Linear);
@@ -142,13 +154,13 @@ pub fn mla_g1250_qh16_w1() -> Function {
     b.wait_lds(0);
     b.barrier();
 
-    let nwin = b.bind_i32((ev(npages) + (WP - 1)) >> 1);
+    let nwin = b.bind_i32((ev(npages) + (WP - 1)) >> (WP.trailing_zeros() as i32));
     let neg = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
     let lastp = b.bind_i32(ev(npages) - 1);
     // ---- the per-window pieces (window index `t` an I32 expression; ring slot t & 3, exchange slots t & 1, generation t) ----
     let stage = |b: &mut FnBuilder, t: ValueId| {
-        let si = b.bind_i32(ev(t) & 3);
+        let si = b.bind_i32(ev(t) & (depth - 1));
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = kv.at(&sl);
         for pg in 0..WP {
@@ -166,7 +178,7 @@ pub fn mla_g1250_qh16_w1() -> Function {
     };
     // S^T of window t: one Frag8 per page (lane (m, g) = head m, tokens 16 w + 8 g + r of the page)
     let s_win = |b: &mut FnBuilder, t: ValueId| -> Vec<ValueId> {
-        let si = b.bind_i32(ev(t) & 3);
+        let si = b.bind_i32(ev(t) & (depth - 1));
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = kv.at(&sl);
         let sb = b.bind_i32(r.base());
@@ -199,7 +211,7 @@ pub fn mla_g1250_qh16_w1() -> Function {
     };
     // the masked base-2 logits of window t (16 per lane)
     let logits = |b: &mut FnBuilder, t: ValueId, s: &[Opnd]| -> Vec<ValueId> {
-        let mut x = Vec::with_capacity(16);
+        let mut x = Vec::with_capacity(8 * WP as usize);
         for pg in 0..WP {
             let tok0 = b.bind_i32(ev(t) * (64 * WP) + (64 * pg) + ev(w) * 16 + ev(g) * 8);
             for r in 0..8u8 {
@@ -277,10 +289,12 @@ pub fn mla_g1250_qh16_w1() -> Function {
     let c0 = b.c_i32(0);
     let c1i = b.c_i32(1);
     let c2i = b.c_i32(2);
-    stage(&mut b, c0);
-    stage(&mut b, c1i);
-    stage(&mut b, c2i);
-    b.wait_tensor(0);
+    let _ = c2i;
+    for k in 0..(depth - 1) {
+        let ck = b.c_i32(k);
+        stage(&mut b, ck);
+    }
+    b.wait_tensor(in_flight);
     b.barrier();
     let s0 = s_win(&mut b, c0);
     let x0 = logits(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
@@ -307,7 +321,7 @@ pub fn mla_g1250_qh16_w1() -> Function {
     let st = b.declare_vars(&inits);
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
-    let sv: Vec<_> = st[11..13].to_vec();
+    let sv: Vec<_> = st[11..11 + WP as usize].to_vec();
     let z = b.c_i32(0);
     let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
     let it = lvars[0];
@@ -315,8 +329,8 @@ pub fn mla_g1250_qh16_w1() -> Function {
     let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
     let t1 = b.bind_i32(ev(t) + 1);
     let t2 = b.bind_i32(ev(t) + 2);
-    let t3 = b.bind_i32(ev(t) + 3);
-    // 1. stage window t + 3
+    let t3 = b.bind_i32(ev(t) + (depth - 1));
+    // 1. stage window t + depth - 1 (into the slot of window t - 1)
     stage(&mut b, t3);
     // 2. S(t + 2) and its maxima
     let s2 = s_win(&mut b, t2);
@@ -359,7 +373,7 @@ pub fn mla_g1250_qh16_w1() -> Function {
             })
             .collect()
     });
-    let ksi = b.bind_i32(ev(t) & 3);
+    let ksi = b.bind_i32(ev(t) & (depth - 1));
     let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
     let kr = kv.at(&ksl);
     let kb = b.bind_i32(kr.base());
@@ -385,8 +399,8 @@ pub fn mla_g1250_qh16_w1() -> Function {
     for pg in 0..WP as usize {
         b.set_var(sv[pg], Opnd::Val(s2[pg]));
     }
-    // 5. window t + 3 complete; B(t)
-    b.wait_tensor(0);
+    // 5. window t + 3 complete (depth - 4 windows stay in flight); B(t)
+    b.wait_tensor(in_flight);
     b.wait_lds(0);
     b.barrier();
     let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
