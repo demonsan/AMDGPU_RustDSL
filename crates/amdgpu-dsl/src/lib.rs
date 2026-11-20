@@ -1484,6 +1484,9 @@ pub enum Stmt {
     /// In place: `var[start + 2 i .. + 2] = t[2 i .. + 2] * s + var[...]` for every dword pair of `t` (`v_pk_fma_f32`; `s` a Frag2, e.g. a
     /// `frag2_dup` scale)
     VarPkFma { var: VarId, start: u8, t: Opnd, s: Opnd },
+    /// In place: `var[start .. start + 2] *= s` (one `v_pk_mul_f32` on the variable's own registers; `s` a Frag2: e.g. a row pair's two
+    /// rescale factors)
+    VarPkMul { var: VarId, start: u8, s: Opnd },
     /// LDS atomic without return
     AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
     /// MUBUF atomic without return (`buffer_atomic_<op>`; AddU32, AddF32, PkAddBf16, PkAddF16): range-checked against the descriptor like a store
@@ -2975,6 +2978,10 @@ impl FnBuilder {
     #[track_caller]
     pub fn var_pk_fma(&mut self, var: VarId, start: u8, t: impl Into<Opnd>, s: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarPkFma { var, start, t: t.into(), s: s.into() });
+    }
+    /// In place `var[start .. start + 2] *= s` (`Stmt::VarPkMul`, one `v_pk_mul_f32`; `start` even, `s` a Frag2).
+    pub fn var_pk_mul(&mut self, var: VarId, start: u8, s: impl Into<Opnd>) {
+        self.push_stmt(Stmt::VarPkMul { var, start, s: s.into() });
     }
     /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
     /// be wave-uniform; this is the explicit way to branch on a per-lane one).
@@ -5417,6 +5424,25 @@ pub fn verify(f: &Function) -> Vec<String> {
                     errs.push(here("var_pk_fma: the scale must be a Frag2 (e.g. frag2_dup(s))".to_string()));
                 }
             }
+            Stmt::VarPkMul { var, start, s } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} updated outside its loop")));
+                }
+                let vw = match f.var_ty(*var) {
+                    Some(DType::Frag2) => 2,
+                    Some(DType::Frag4) => 4,
+                    Some(DType::Frag8) => 8,
+                    Some(DType::Frag16) => 16,
+                    _ => 0,
+                };
+                if vw == 0 || *start % 2 != 0 || *start as u32 + 2 > vw {
+                    errs.push(here(format!("var_pk_mul: var{var} ({vw} dwords) start {start}: a dword pair inside the variable at an even offset")));
+                }
+                if !matches!(opnd_ty(f, *s), Ok(DType::Frag2)) {
+                    errs.push(here("var_pk_mul: the factor must be a Frag2".to_string()));
+                }
+            }
             Stmt::VarScalePk { var, pair } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -5729,6 +5755,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
         Stmt::VarPkFma { t, s, .. } => vec![*t, *s],
+        Stmt::VarPkMul { s, .. } => vec![*s],
         Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
         Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
         Stmt::BufferAtomicNoRet { rsrc, voff, soff, value, .. } => {
@@ -5811,6 +5838,7 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarScaleF32 { var, .. }
         | Stmt::VarScalePk { var, .. }
         | Stmt::VarPkFma { var, .. }
+        | Stmt::VarPkMul { var, .. }
         | Stmt::VarAddPk { var, .. }
         | Stmt::VarMfmaF16Z { var, .. }
         | Stmt::VarScaleLane { var, .. }

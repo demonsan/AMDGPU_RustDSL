@@ -385,7 +385,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             (ResClass::Sync, vec![], false)
         }
         Stmt::SetVar { var, .. } => (ResClass::Valu, vec![*var], false),
-        Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarScaleLane { var, .. } | Stmt::VarSetLane { var, .. } => {
+        Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarPkMul { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarScaleLane { var, .. } | Stmt::VarSetLane { var, .. } => {
             (ResClass::Valu, vec![*var], true)
         }
         Stmt::VarMfmaF16Z { var, .. } => (ResClass::Mfma { passes: 8 }, vec![*var], false),

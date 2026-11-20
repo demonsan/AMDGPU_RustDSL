@@ -2673,6 +2673,13 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VPkFmaF32).def(acc).srcreg(tp).srcreg(rs).srcreg(acc));
                     }
                 }
+                Stmt::VarPkMul { var, start, s } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let rs = self.as_v2(*s)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(rs)]);
+                    let acc = if self.mir.vreg_class(v).dwords() == 2 { v } else { self.sub_alias(v, *start, RClass::V2) };
+                    self.push(MInst::new(MOp::VPkMulF32).def(acc).srcreg(acc).srcreg(rs));
+                }
                 Stmt::VarScalePk { var, pair } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let p = self.as_v2(*pair)?;
@@ -6126,7 +6133,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                     }
                 }
                 // any other statement that writes a variable in place makes it non-scalar
-                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
+                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarPkMul { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
                 | Stmt::VarScaleLane { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarMfma { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;

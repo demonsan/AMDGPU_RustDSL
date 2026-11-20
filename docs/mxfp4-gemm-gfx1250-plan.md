@@ -131,3 +131,23 @@ state with the pre-loop prologue state) with a staging buffer outside the ring, 
   (`RingOpts::racompact`: 496 VGPRs for a kernel whose peak live set is 477, the default scan emits 720), two waves per SIMD are possible. Measured on e08 at 4096^3 / 8192^3 (PF/s): default allocation (720 VGPRs, one workgroup per CU) 4.94 / 5.57; **compact allocation, two workgroups per CU 3.99 / 5.08 (-19 % / -9 %)**;
   compact allocation with the LDS declared at 176 KiB (one workgroup per CU, `RingOpts::lds_pad`) 4.90 / 5.74. So the allocation is fine and it is the co-residency that loses: the K loop of one wave per SIMD is already
   WMMA-bound (the window is 81 % of the iteration), a second wave only adds LDS / TDM / L2 contention. (The 256 x 128 tile itself is far below the 256 x 256 kernel, 4.9 vs 6.2 PF/s at 4096^3.)
+
+### Smaller first stage (analysis, not built)
+
+The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
+split exists (half-width tiles written with a pad of 36 dwords per 32-dword interval land in the same 272-byte rows; the scales as 8-byte tiles padded to 16), but the compute overlap needs (a) a peeled window of two sub-steps
+plus a second barrier in the prologue, and (b) the tile protocol to know that a consumer reads only the first half of a slot (half-slot tile regions for A / B / SA / SB, i.e. eight rings instead of four, and every
+window read declared per half): the protocol's granule is the slot. The bound: the prologue's data wait is about 4.7 k cycles of the 4,960 at 4096^3 (3,260 with the 4 x 4 multicast), the first two sub-steps are about 960 cycles of
+compute, so at most 960 cycles = 3.0 % of the 31.8 k-cycle tile (about 1.5 - 2 % after the extra descriptors, the second barrier and the unchanged exposed epilogue) and about 2 % with the multicast variant. Below the
+2 % bar that was set for it, against a restructure of the pipeline driver, the body and the protocol contract, so it was not built.
+
+### Dispatch table (MXFP4 GEMM, e08, 2026-11-20)
+
+| output tiles (256 x 256) | K | kernel | PF/s |
+|---|---|---|---|
+| 256 (e.g. 4096 x 4096), grid divisible by 4 x 4 | <= 4096 and 8192 | `..._ks4_s2_epit_roles_c4x4_lock` | 4096^3 7.9 (default 6.3 - 7.1); K = 2048 / 3072 6.0 / 7.2 (default 5.5 / 6.9); K = 8192 9.5 (default 9.1) |
+| 256 | 5120 - 6144, other K | `..._ks4_s2_epit_roles` | 7.5 (default) |
+| >= 1,024 (8192 x 8192 and larger) | any multiple of 512 | `..._ks4_s2_epit_roles` | 9.9 - 10.1 (8192^3, K = 16384) |
+| any, K = 256 mod 512 | | the 256-K kernels (`..._ks2_epit_roles[_relax]`) | 9.3 (relaxed for K <= 3584 or >= 5120, plain for 3840 - 4608) |
+
+Vendor reference on the same node: 11.0 at 4096^3, 12.4 - 12.5 at 8192^3 (so the best of the table is 72 % / 80 %).
