@@ -590,8 +590,10 @@ pub fn probe_g1250_permlane() -> Function {
         let v = b.permlane(*kind, x, av, Opnd::I32(*bb as i32), old, *fi, *bc);
         b.store_global(q, (k * 128) as u32, v, MemTy::B32, false);
     }
-    for (j, a) in [1i32, 5].iter().enumerate() {
-        let v = b.permlane_idx_gen(tid, Opnd::I32(*a));
+    let t5 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(5)));
+    let t5 = b.let_(Op::AddI32(Opnd::Val(t5), Opnd::I32(3)));
+    for (j, (xs, a)) in [(t5, 1i32), (x, 31)].iter().enumerate() {
+        let v = b.permlane_idx_gen(*xs, Opnd::I32(*a));
         b.store_global(q, ((26 + j) * 128) as u32, v, MemTy::B32, false);
     }
     b.finish()
