@@ -214,6 +214,33 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let zf = b.c_f32(0.0);
     let lastp = b.bind_i32(ev(npages) - 1);
     // ---- the per-window pieces (window index `t` an I32 expression; ring slot t & 3, exchange slots t & 1, generation t) ----
+    // the page ids of window t by scalar loads (lean form: loaded one iteration ahead of their stage)
+    let load_pids = |b: &mut FnBuilder, t: ValueId| -> Vec<ValueId> {
+        (0..WP)
+            .map(|pg| {
+                let tp = b.bind_i32(ev(t) * WP + pg);
+                let er = b.bind_i32(ev(kv0) + ev(tp));
+                let el = b.bind_i32(ev(kv_end) - 1);
+                let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+                let eo = b.bind_i32(ev(ec) * 4);
+                let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+                b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 })
+            })
+            .collect()
+    };
+    let stage_pids = |b: &mut FnBuilder, t: ValueId, pids: &[amdgpu_dsl::I32]| {
+        let si = b.bind_i32(ev(t) & (depth - 1));
+        let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
+        let r = kv.at(&sl);
+        for pg in 0..WP {
+            let pid = b.bind_i32(pids[pg as usize].clone() + 0);
+            b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
+            let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(w) * QUARTER);
+            let lds_a = b.bind_i32(r.base() + pg * layout.slot_bytes + ev(w) * layout.quarter_lds);
+            let g0 = tdm_group0(b, pkv, off, Opnd::Val(lds_a));
+            r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        }
+    };
     let stage = |b: &mut FnBuilder, t: ValueId| {
         let si = b.bind_i32(ev(t) & (depth - 1));
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
@@ -484,7 +511,15 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
             inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(*s)));
         }
     }
+    let npre = inits.len();
+    if lean {
+        let tf = b.c_i32(depth - 1);
+        for pv0 in load_pids(&mut b, tf) {
+            inits.push((DType::I32, Opnd::Val(pv0)));
+        }
+    }
     let st = b.declare_vars(&inits);
+    let pidv: Vec<_> = if lean { st[npre..].to_vec() } else { Vec::new() };
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
     let sv: Vec<_> = if lean { Vec::new() } else { st[11..11 + WP as usize].to_vec() };
@@ -521,8 +556,18 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         } else {
             None
         };
-        // 1. stage window t + depth - 1
-        stage(&mut b, t3);
+        // 1. stage window t + depth - 1 (lean: page ids loaded one iteration ahead; then those of the next window)
+        if lean {
+            let pe: Vec<amdgpu_dsl::I32> = pidv.iter().map(|&v| amdgpu_dsl::varx(v) + 0).collect();
+            stage_pids(&mut b, t3, &pe);
+            let t4 = b.bind_i32(ev(t3) + 1);
+            let np = load_pids(&mut b, t4);
+            for k in 0..np.len() {
+                b.set_var(pidv[k], Opnd::Val(np[k]));
+            }
+        } else {
+            stage(&mut b, t3);
+        }
         stamp(&mut b);
         // 2. the LDS fragments: K of window t + 2 (both pages, 9 chunks each), P(t), V(t) (8 tiles per page)
         let si2 = b.bind_i32(ev(t2) & (depth - 1));
