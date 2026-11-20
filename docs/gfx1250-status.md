@@ -296,6 +296,23 @@ So the roles give the w1 family **-1 % (4 x 512) to -12 % (128 x 8192)** vs the 
 the second barrier and the clamped extra windows), and **no change to the dispatch**: the wave-split `_ws` family stays ahead of every w1 variant from 4 x 1000 up (`_ws2` at 4 x 512). The role structure's remaining cost
 is two barriers per window and the stage on the MMA waves' critical path; the next levers are the ones listed above (pre-barrier loads when the protocol models reads' completion, a third role).
 
+#### An 8-wave `_ws` (waves paired on a SIMD), stub measurements (e08, 2026-11-20)
+
+Idea: keep the `_ws` structure (each SIMD's pages, own online softmax, no cross-wave max exchange) but use two waves per SIMD so that one wave's softmax VALU overlaps the other's WMMA / LDS work. `probes/g1250_ws_pair.rs`
+(`mla_g1250_qh16_wsp_<mask>`, stub data, window 0 staged once, the loop runs page steps; runner `tools/mi450/mla_roles.sh`), cycles per page step of one SIMD's page (4 waves in the baseline, 8 in the others):
+
+| variant | cycles per page step |
+|---|---:|
+| `_ws`-style single wave per SIMD (S 36 WMMA + softmax + PV 32 WMMA in one wave) | 2,000 |
+| **pair**: MMA wave (S + PV) + softmax wave on one SIMD, S / P through pair-private LDS rings, one barrier per step | **1,825** (-9 %) |
+| the same with the MMA work skipped / the softmax skipped / both skipped | 909 / 1,661 / 429 |
+| **half-page waves**: two waves per SIMD share a page, each its own half of the tokens (own softmax, own O, PV with zero blocks for the other half) | 2,394 (+20 %) |
+
+The softmax wave is hidden completely in the pair (+160 cycles over the MMA wave alone), but the MMA wave's own chain (K reads -> 36 WMMA -> V reads -> 32 WMMA) is 1,660 cycles by itself, so the step only drops
+from 2,000 to 1,825; and two waves of the same kind on a SIMD (half pages) serialize (2,394). Kernel-opt's `_wsstd` page split (per page and wave: S 625, softmax 1,045, rescale 455 when taken, PV 600, stage / TDM
+wait 140 = 2,880) shows what a pair could take out (the softmax and the rescale), and the stub says about 150 - 200 cycles of the 2,880. Structural limit: the page ring. LDS holds 8 pages (4 x 2 slots of 36.9 KiB), so
+a pair can have two pages in flight; splitting a page's S, softmax and PV across waves needs three pages live per pair (page k read by PV(k) while S(k + 2) is staged), or an exposed TDM latency per page. Not built.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
