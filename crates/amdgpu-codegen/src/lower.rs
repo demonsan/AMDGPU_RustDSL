@@ -2673,6 +2673,9 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VPkFmaF32).def(acc).srcreg(tp).srcreg(rs).srcreg(acc));
                     }
                 }
+                Stmt::WaitLdsWrites => {
+                    self.push(MInst::new(MOp::SWaitLdsWrites));
+                }
                 Stmt::VarPkMul { var, start, s } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let rs = self.as_v2(*s)?;
