@@ -47,6 +47,17 @@ pub fn mla_g1250_qh16_w1i() -> Function {
 
 thread_local! {
     static ILP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAMPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// timing aid (not registered for tests): `_w1i` storing shader-clock stamps of every wave over R[b] (word 64 w + checkpoint)
+pub fn mla_g1250_qh16_w1s() -> Function {
+    ILP.with(|c| c.set(true));
+    STAMPS.with(|c| c.set(true));
+    let f = mla_w1_with("mla_g1250_qh16_w1s", 2, 4);
+    STAMPS.with(|c| c.set(false));
+    ILP.with(|c| c.set(false));
+    f
 }
 
 /// `wp` pages per window, a `depth`-slot ring (a power of two >= 4): window t + depth - 1 is staged in iteration t, window t + 3 must be
@@ -344,9 +355,24 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let t2 = b.bind_i32(ev(t) + 2);
     let t3 = b.bind_i32(ev(t) + (depth - 1));
     let ilp = ILP.with(|c| c.get());
+    let stamps = STAMPS.with(|c| c.get());
+    let stamp_n = std::cell::Cell::new(0u32);
+    let stamp = |b: &mut FnBuilder| {
+        if stamps {
+            let c = b.shader_cycles();
+            let lo = b.let_(Op::PtrLo(Opnd::Val(c)));
+            let i = stamp_n.get();
+            stamp_n.set(i + 1);
+            let o = b.bind_i32(ev(bidx) * (16 * 512 * 2) + (ev(w) * 64 + i as i32) * 4);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) });
+            b.store_global(pa, 0, lo, MemTy::B32, false);
+        }
+    };
     if ilp {
+        stamp(&mut b);
         // 1. stage window t + depth - 1
         stage(&mut b, t3);
+        stamp(&mut b);
         // 2. the LDS fragments: K of window t + 2 (both pages, 9 chunks each), P(t), V(t) (8 tiles per page)
         let si2 = b.bind_i32(ev(t2) & (depth - 1));
         let sl2 = SlotIdx::new(Opnd::Val(si2), Opnd::Val(t2));
@@ -398,6 +424,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 })
             })
             .collect();
+        stamp(&mut b);
         // 3. O *= alpha(t) (rows 8 g + r: v_readlane of head 8 g + r, select-free choice of the lane half)
         let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
         let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
@@ -442,9 +469,11 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 p1 = Some(put_p(&mut b, t1, &x1c_keep, Opnd::Var(vm), Opnd::Var(vl), pm1));
             }
         }
+        stamp(&mut b);
         let s2: Vec<ValueId> = sacc.into_iter().map(|a| match a { Some(Opnd::Val(v)) => v, _ => unreachable!() }).collect();
         let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
         put_max(&mut b, t2, &x2);
+        stamp(&mut b);
         let (alpha1, m1, l1) = p1.unwrap();
         b.set_var(vm, Opnd::Val(m1));
         b.set_var(vl, Opnd::Val(l1));
@@ -525,8 +554,10 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     }
     // 5. window t + 3 complete (depth - 4 windows stay in flight); B(t)
     b.wait_tensor(in_flight);
+    stamp(&mut b);
     b.wait_lds(0);
     b.barrier();
+    stamp(&mut b);
     let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
     b.set_var(it, Opnd::Val(tn));
     let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
@@ -586,7 +617,9 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
             b.load_lds_b128(a)
         }).collect();
         for k in 0..8u32 {
-            b.store_global(prb, 16 * k, rows[k as usize], MemTy::B128, false);
+            if !STAMPS.with(|c| c.get()) {
+                b.store_global(prb, 16 * k, rows[k as usize], MemTy::B128, false);
+            }
         }
     });
     let l = sum_head(&mut b, ev(m));
