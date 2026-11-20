@@ -403,7 +403,7 @@ static int run_permlane(Kernel& k, const char* kn) {
         {5, 1, 4u, 0, 0}, {5, 3, 8u, 0, 0}, {5, 5, 16u, 0, 0}, {5, 1, 32u, 0, 0},
         {6, 1, 4u, 0, 0}, {6, 3, 8u, 0, 0}, {6, 5, 16u, 0, 0}, {6, 1, 32u, 0, 0},
         {7, 1, 4u, 0, 0}, {7, 5, 8u, 0, 0}, {7, 3, 16u, 0, 0}, {7, 16, 32u, 0, 0},
-        {4, 1, 4u, 1, 0}, {5, 1, 8u, 0, 1}, {7, 1, 2u, 1, 1},
+        {4, 1, 2u, 0, 0}, {5, 7, 8u, 0, 0}, {7, 1, 2u, 0, 0},
     };
     const int n = sizeof(cs) / sizeof(cs[0]), stride = n + 2;
     uint32_t* dout;
@@ -439,7 +439,8 @@ static int run_permlane(Kernel& k, const char* kn) {
                 }
                 uint32_t ref;
                 if (!((mask >> l) & 1)) ref = old;
-                else if (!((mask >> s) & 1) && !cc.fi) ref = cc.bc ? 0u : old;
+                // (the group forms always read the source lane: they ignore EXEC for reads)
+                else if (!((mask >> s) & 1) && !cc.fi && cc.kind < 4) ref = cc.bc ? 0u : old;
                 else ref = x(s);
                 const uint32_t got = o[((size_t)w * stride + c) * 32 + l];
                 if (got != ref) { if (bad < 16) printf("  wg %d case %d lane %d: got %#x ref %#x (src lane %d)\n", w, c, l, got, ref, s); ++bad; }

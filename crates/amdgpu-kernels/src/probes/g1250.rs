@@ -581,9 +581,9 @@ pub fn probe_g1250_permlane() -> Function {
         (PermlaneKind::Xor, Some(5u32), 8u32, false, false),
         (PermlaneKind::Xor, Some(3u32), 16u32, false, false),
         (PermlaneKind::Xor, Some(16u32), 32u32, false, false),
-        (PermlaneKind::Bcast, Some(1u32), 4u32, true, false),
-        (PermlaneKind::Up, Some(1u32), 8u32, false, true),
-        (PermlaneKind::Xor, Some(1u32), 2u32, true, true),
+        (PermlaneKind::Bcast, Some(1u32), 2u32, false, false),
+        (PermlaneKind::Up, Some(7u32), 8u32, false, false),
+        (PermlaneKind::Xor, Some(1u32), 2u32, false, false),
     ];
     for (k, (kind, a, bb, fi, bc)) in cases.iter().enumerate() {
         let av = match a { Some(v) => Opnd::I32(*v as i32), None => Opnd::Val(vsel) };

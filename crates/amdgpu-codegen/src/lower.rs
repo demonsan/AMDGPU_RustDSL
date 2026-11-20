@@ -4054,6 +4054,10 @@ impl Lowerer {
                 if crate::target::cur().name != "gfx1250" {
                     return Err(format!("{}: a gfx1250 lane permute", kind.mnemonic()));
                 }
+                // the group forms read every source lane whatever EXEC says (no fetch-invalid / bound-ctrl bits: the assembler refuses them)
+                if (*fi || *bc) && !matches!(kind, amdgpu_dsl::PermlaneKind::P16 | amdgpu_dsl::PermlaneKind::X16 | amdgpu_dsl::PermlaneKind::P16Var | amdgpu_dsl::PermlaneKind::X16Var) {
+                    return Err(format!("{}: fetch-invalid / bound-ctrl exist only on the 16-lane permutes (the group forms always read the source lane)", kind.mnemonic()));
+                }
                 let rx = self.as_v1(*x)?;
                 let o = self.as_v1(*old)?;
                 // the selects: VGPR for the _var forms, else SGPR / inline constant (`as_s_or_imm`)
