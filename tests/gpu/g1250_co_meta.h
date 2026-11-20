@@ -11,7 +11,7 @@
 #include <vector>
 #include <unistd.h>
 
-struct CoMeta { long kernarg = -1; long max_flat = -1; };
+struct CoMeta { long kernarg = -1; long max_flat = -1; long cluster = 0; };   // cluster: work-groups per cluster the kernel was built for (0 = not a cluster kernel)
 
 static inline bool co_msgpack_int(const std::vector<unsigned char>& d, size_t p, long* v) {
     if (p >= d.size()) return false;
@@ -44,6 +44,7 @@ static inline CoMeta co_meta(const char* path, const char* kname) {
     const std::string key_ka = std::string(1, (char)(0xa0 | 21)) + ".kernarg_segment_size";
     const std::string key_mf = std::string(1, (char)(0xa0 | 24)) + ".max_flat_workgroup_size";
     const std::string key_nm = std::string(1, (char)(0xa0 | 5)) + ".name";
+    const std::string key_cl = std::string(1, (char)(0xa0 | 19)) + ".cluster_workgroups";
     const size_t kl = strlen(kname);
     std::string name_val = kl < 32 ? std::string(1, (char)(0xa0 | kl)) : std::string("\xd9") + (char)kl;
     name_val += kname;
@@ -63,13 +64,18 @@ static inline CoMeta co_meta(const char* path, const char* kname) {
         if (co_msgpack_int(d, p + key_ka.size(), &v)) m.kernarg = v;
         const size_t pm = co_find(d, p, pn, key_mf);
         if (pm != (size_t)-1 && co_msgpack_int(d, pm + key_mf.size(), &v)) m.max_flat = v;
+        // the cluster key sorts before .group_segment_fixed_size, i.e. before the kernarg key of the same map: look back a little
+        const size_t back = p > 700 ? p - 700 : 0;
+        size_t pc = (size_t)-1, at = back;
+        for (;;) { const size_t q = co_find(d, at, p, key_cl); if (q == (size_t)-1) break; pc = q; at = q + 1; }
+        if (pc != (size_t)-1 && co_msgpack_int(d, pc + key_cl.size(), &v)) m.cluster = v;
         break;
     }
     return m;
 }
 
 // refuse the launch (exit 2, nothing launched) when the contract recorded in the code object is violated; threads <= 0: do not check the work-group size
-static inline void g1250_check_launch(const char* path, const char* kname, size_t provided_kargs, long threads, bool strict = true) {
+static inline void g1250_check_launch(const char* path, const char* kname, size_t provided_kargs, long threads, bool strict = true, bool exact = true) {
     const CoMeta m = co_meta(path, kname);
     if (m.kernarg < 0) {
         fprintf(stderr, "LAUNCH-%s: cannot read the metadata of kernel %s in %s\n", strict ? "REFUSED" : "WARNING", kname, path);
@@ -80,8 +86,18 @@ static inline void g1250_check_launch(const char* path, const char* kname, size_
         fprintf(stderr, "LAUNCH-REFUSED: kernel %s reads %ld kernarg bytes, the host passes %zu (a persistent / swizzled / stamped kernel needs its option: PERSIST=G, SWIZZLE=G, STAMPS=1)\n", kname, m.kernarg, provided_kargs);
         _exit(2);
     }
-    if (threads > 0 && m.max_flat >= 0 && threads != m.max_flat) {
+    if (threads > 0 && m.max_flat >= 0 && (exact ? threads != m.max_flat : threads > m.max_flat)) {
         fprintf(stderr, "LAUNCH-REFUSED: kernel %s was built for %ld work-items per work-group, the host launches %ld (a role-split kernel would hang at its first barrier)\n", kname, m.max_flat, threads);
+        _exit(2);
+    }
+}
+// the cluster launch shape: a kernel built for a cluster of N work-groups must be launched with exactly N per cluster, and a plain kernel must not be (its work-group ids come from different registers)
+static inline void g1250_check_cluster(const char* path, const char* kname, long launch_cluster /* work-groups per cluster the host launches (1 = none) */) {
+    const CoMeta m = co_meta(path, kname);
+    const long built = m.cluster > 1 ? m.cluster : 1;
+    if (m.kernarg < 0) return;   // the metadata was not found: g1250_check_launch reports it
+    if (built != launch_cluster) {
+        fprintf(stderr, "LAUNCH-REFUSED: kernel %s was built for clusters of %ld work-groups, the host launches clusters of %ld\n", kname, built, launch_cluster);
         _exit(2);
     }
 }

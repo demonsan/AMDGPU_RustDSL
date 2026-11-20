@@ -143,6 +143,7 @@ int main(int argc, char** argv) {
     size_t ksz = (persist || swizzle || stamps || lda_pad) ? sizeof(ka) : 48;
     // the launch contract of the kernel, checked BEFORE any launch: the kernarg bytes it reads (a persistent / swizzled / stamped kernel reads more than the plain 48) and its work-group size
     g1250_check_launch(argv[1], kn, ksz, THR);
+    g1250_check_cluster(argv[1], kn, (long)g_cx * g_cy);
     if (persist && strstr(kn, "persist") == nullptr) { fprintf(stderr, "LAUNCH-REFUSED: PERSIST=%d but kernel %s is not a persistent kernel\n", persist, kn); return 2; }
     if (!persist && strstr(kn, "persist") != nullptr) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s is persistent: set PERSIST=G (G a multiple of N / BN, at most the tile count)\n", kn); return 2; }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};

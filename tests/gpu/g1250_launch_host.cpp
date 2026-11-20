@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
 
     size_t sz = ka.size();
     g1250_check_launch(co, kn, sz, 0, false);
+    g1250_check_cluster(co, kn, cluster ? (long)c[0] * c[1] * c[2] : 1);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ka.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     hipStream_t s;
     HC(hipStreamCreate(&s));

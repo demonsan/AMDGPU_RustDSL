@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
     struct { void *s, *o; } ka{dsrc, dout};
     size_t ksz = sizeof(ka);
     g1250_check_launch(argv[1], argv[2], ksz, 0, false);
+    g1250_check_cluster(argv[1], argv[2], 2);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     HIP_LAUNCH_CONFIG lc{};
     lc.gridDimX = 2; lc.gridDimY = 1; lc.gridDimZ = 1;

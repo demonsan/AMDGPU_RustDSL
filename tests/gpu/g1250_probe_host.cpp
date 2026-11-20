@@ -12,6 +12,7 @@
 // deadline; on expiry the program prints PROBE_HANG and leaves with `_exit(124)` without touching the device again (no synchronize / free / reset); a failed check exits 3 and nothing retries.
 // One JSON line per successful run: {"host":"g1250_probe","kernel":..,"shape":{..},"us":..,"gbs":..,"maxrel":..,"bad":N,"ok":bool}
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -38,9 +39,12 @@ static void wait_polled(hipEvent_t ev, const char* what) {
 
 struct Kernel {
     hipFunction_t fn;
+    const char* co = nullptr;   // the code object and kernel name (set after the load): the launch contract is checked before every launch
+    const char* kn = nullptr;
     // one launch with a kernarg blob; the completion is awaited by polling
     void launch(unsigned grid, unsigned block, std::vector<uint8_t>& args, const char* what) {
         size_t sz = args.size();
+        if (co) { g1250_check_launch(co, kn, sz, block, true, false); g1250_check_cluster(co, kn, 1); }
         void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
         hipEvent_t e;
         HC(hipEventCreate(&e));
@@ -50,6 +54,7 @@ struct Kernel {
     }
     // a cluster launch: `grid` workgroups in clusters of `cx` (x only); the cluster dims must divide the grid
     void launch_cluster(unsigned grid, unsigned block, unsigned cx, std::vector<uint8_t>& args, const char* what) {
+        if (co) { g1250_check_launch(co, kn, args.size(), block, true, false); g1250_check_cluster(co, kn, cx); }
         if (cx < 1 || grid % cx != 0) {
             printf("PROBE_FAIL cluster %u does not divide grid %u (refused)\n", cx, grid);
             fflush(stdout);
@@ -715,6 +720,7 @@ int main(int argc, char** argv) {
     Kernel k;
     HC(hipModuleLoad(&mod, argv[2]));
     HC(hipModuleGetFunction(&k.fn, mod, kn));
+    k.co = argv[2]; k.kn = kn;
     const int arg = argc > 4 ? atoi(argv[4]) : -1;
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);

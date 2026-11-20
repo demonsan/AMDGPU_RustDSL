@@ -370,6 +370,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     out.push_str(&format!("    .vgpr_count: {vgpr}\n"));
     out.push_str("    .sgpr_spill_count: 0\n");
     out.push_str("    .vgpr_spill_count: 0\n");
+    // the work-groups per cluster the launch must use (a custom metadata key: the runtime ignores it, the hosts read it and refuse another launch shape; 0 / absent = no cluster)
+    if let Some(c) = kdv("cluster_dims") {
+        if c > 1 {
+            out.push_str(&format!("    .cluster_workgroups: {c}\n"));
+        }
+    }
     out.push_str("    .args:\n");
     // every kernarg byte must be covered by an `.args` entry: the runtime copies a launch's arguments entry by entry (a word read only through
     // the kernarg preload, or skipped by the DSL's args, would otherwise arrive as garbage): gaps get by-value padding entries
