@@ -2313,6 +2313,8 @@ pub mod g1250_gemm;
 pub mod g1250_mla;
 pub mod g1250_mla_ws;
 pub mod g1250_mla_w1;
+pub mod g1250_mla_w1p;
+pub mod mla_w1_parts;
 pub mod g1250_mla_phase;
 pub mod g1250_waves;
 pub mod g1250_mla_roles;
