@@ -520,7 +520,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let t2 = b.bind_i32(ev(t) + 2);
         let s2 = b.bind_i32(ev(t2) & 1);
         let xn = sbuf_load(&mut b, t2, Opnd::Val(s2));
-        put_max(&mut b, t2, &xn);
         let pm = get_max(&mut b, t1);
         let xo: Vec<Opnd> = xs.iter().map(|&v| Opnd::Var(v)).collect();
         let (m_new, l_new) = if mask & 2 != 0 {
@@ -540,6 +539,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         } else {
             put_p_lean(&mut b, t1, &xo, Opnd::Var(vm), Opnd::Var(vl), pm)
         };
+        put_max(&mut b, t2, &xn);
         for i in 0..16usize {
             b.set_var(xs[i], Opnd::Val(xn[i]));
         }
