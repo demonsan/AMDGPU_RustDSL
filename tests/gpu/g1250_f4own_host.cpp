@@ -60,6 +60,15 @@ int main(int argc, char** argv) {
     const int M = atoi(argv[3]), N = atoi(argv[4]), K = atoi(argv[5]);
     const int iters = argc > 6 ? atoi(argv[6]) : 0;
     const int BM = argc > 7 ? atoi(argv[7]) : 128, BN = argc > 8 ? atoi(argv[8]) : 64, THR = argc > 9 ? atoi(argv[9]) : 128;
+    // the tile and the K step the kernel was built for (its name: ..._<BM>x<BN>_..., _ks<n>_): a launch with another tile writes out of C, another K step reads out of A / B
+    {
+        int nbm = 0, nbn = 0;
+        for (const char* p = kn; *p; ++p)
+            if (*p == '_' && sscanf(p, "_%dx%d_", &nbm, &nbn) == 2 && nbm >= 64) break; else nbm = nbn = 0;
+        if (nbm && (nbm != BM || nbn != BN)) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s is a %d x %d tile kernel, the host was given BM=%d BN=%d\n", kn, nbm, nbn, BM, BN); return 2; }
+        const int kstep = strstr(kn, "_ks4") ? 512 : strstr(kn, "_ks2") ? 256 : 128;
+        if (K % kstep) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s needs K to be a multiple of %d, K=%d\n", kn, kstep, K); return 2; }
+    }
     if (M % BM || N % BN || K % 128) { fprintf(stderr, "M %% %d, N %% %d, K %% 128 required\n", BM, BN); return 1; }
     if (const char* w = getenv("PROBE_WATCHDOG_S")) g_limit = atof(w);
     if (const char* cl = getenv("CLUSTER")) std::sscanf(cl, "%d,%d", &g_cx, &g_cy);
