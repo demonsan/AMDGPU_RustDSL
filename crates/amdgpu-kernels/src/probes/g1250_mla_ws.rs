@@ -23,7 +23,9 @@ pub const WS_BYTES: i64 = (16 * 512 + 32) * 4;
 
 fn branch_bits_lean(bits: u32) -> bool {
     let lean = bits & 65536 != 0;
-    assert!(!lean || bits & 256 != 0, "the lean softmax needs the tail form (no fully masked pages)");
+    // without the tail form a padded page is fully masked: its logits are all -1e30 and every wave has a real page before it (finite
+    // running max), so exp2 still underflows to 0 and the page adds nothing
+
     lean
 }
 
@@ -287,6 +289,16 @@ pub fn mla_g1250_qh16_wsq() -> Function {
 /// `_ws` with each wave's first page by per-lane async loads.
 pub fn mla_g1250_qh16_wsy() -> Function {
     mla_ws_with("mla_g1250_qh16_wsy", false, 64 | 256 | 16384 | 65536 | 131072 | 16777216, false)
+}
+
+/// `_ws` with every page in the loop (an odd count padded with a masked page; no tail / last-page code copies).
+pub fn mla_g1250_qh16_wsnt() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsnt", false, 64 | 16384, false)
+}
+
+/// every page in the loop (odd count padded with a masked page, the mask in the loop on every page) with the lean softmax
+pub fn mla_g1250_qh16_wsnl() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsnl", false, 64 | 16384 | 65536, false)
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
