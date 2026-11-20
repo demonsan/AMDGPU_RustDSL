@@ -23,10 +23,12 @@ thread_local! {
     static PAIRS: RefCell<HashSet<(usize, usize)>> = RefCell::new(HashSet::new());
 }
 
-/// The kernel's `vopd` lowering token, or `AMDC_VOPD` (A/B).
+/// On by default for gfx1250 (own tail, non-exact kernels; the paired e08 sweep of every registered GEMM / MLA kernel: MLA -0.5 .. -4.5 %,
+/// GEMM within noise, tools/mi450/vopd_sweep.sh, 2026-11-20); `AMDC_NO_VOPD` turns it off (A/B). (The `vopd` lowering token and `AMDC_VOPD`
+/// are kept: they request it explicitly.)
 pub fn enabled(m: &MFunction) -> bool {
-    // (AMDC_NO_VOPD: off even for a kernel with the token, A/B only)
-    std::env::var("AMDC_NO_VOPD").is_err() && (m.vopd || std::env::var("AMDC_VOPD").is_ok())
+    let _ = m.vopd;
+    std::env::var("AMDC_NO_VOPD").is_err()
 }
 
 pub fn clear() {
