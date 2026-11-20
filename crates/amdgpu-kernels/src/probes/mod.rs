@@ -2317,6 +2317,7 @@ pub mod g1250_mla_w1p;
 pub mod mla_w1_parts;
 pub mod g1250_mla_phase;
 pub mod g1250_waves;
+pub mod g1250_ws_pair;
 pub mod g1250_mla_w1r;
 pub mod g1250_mla_roles;
 pub mod handoff;
