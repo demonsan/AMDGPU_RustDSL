@@ -78,6 +78,6 @@ new = '''        if pre && do_s {
         b.end_loop();
     };
 '''
-t = rep(t, old, new)
+assert t.count(old) == 2\ni = t.index(old)\nt = t[:i] + new + t[i + len(old):]
 open(p, 'w', encoding='utf-8', newline='').write(t)
 print('ok')
