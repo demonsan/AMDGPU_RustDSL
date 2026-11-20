@@ -45,6 +45,10 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
 }
 
 fn allocate_any(m: &MFunction) -> Result<Alloc, String> {
+    if std::env::var("AMDC_RA_TRY_ALL").is_ok() {
+        let show = |r: &Result<Alloc, String>| r.as_ref().map(|a| a.max_v.to_string()).unwrap_or_else(|e| e.chars().take(120).collect());
+        eprintln!("RA-TRY {}: scan {} | scan-top {} | two-phase {}", m.name, show(&allocate_with(m, false)), show(&allocate_with(m, true)), show(&allocate_two_phase(m).and_then(|a| checked(m, a, "two-phase"))));
+    }
     // First try the compact policy. If the kernel runs out of registers only because wide
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.
