@@ -388,7 +388,7 @@ static int run_varscale(Kernel& k, const char* kn) {
 }
 // probe_g1250_permlane: the gfx1250 lane permutes against this CPU model (wave32). Selects: P16 / X16: lane i of a 16-lane group reads
 // lane (sel nibble i of the 64-bit {b:a}) of its own / the other group; *_VAR: the per-lane select (3 lane) & 15; BCAST: lane a % size of the
-// group of `size` lanes; UP: lane (i - a) mod size (values move to higher lanes); DOWN: (i + a) mod size; XOR: i ^ (a & (size - 1)).
+// group of `size` lanes; UP: lane i - a (values move to higher lanes), DOWN: lane i + a, a lane whose source would leave the group keeping its\n// own value (measured); XOR: i ^ (a & (size - 1)).
 // EXEC (env MASK, default all lanes; the partial-EXEC variant narrows EXEC around each permute): a disabled destination lane keeps old; a
 // disabled source lane is read anyway with fetch-invalid, else it is invalid: 0 with bound-ctrl, else the destination keeps old. The
 // v_permlane_idx_gen results are printed (DUMP_IDX=1) and not checked. WGS workgroups (default 1).
