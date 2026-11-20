@@ -24,7 +24,7 @@ pub fn mla_g1250_qh16_roles() -> Function {
 /// `mla_g1250_qh16_roles_<hex mask>`: bit 0 = the MMA waves skip their window work, bit 1 = the softmax waves skip theirs (the barrier stays).
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 31 {
+    if mask > 63 {
         return None;
     }
     Some(mla_roles_with(&format!("mla_g1250_qh16_roles_{hex}"), 2, 2, mask))
@@ -480,7 +480,41 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let z = b.c_i32(0);
     let nitr = b.bind_i32((ev(nwin) + (w_n - 1)) >> ((w_n as u32).trailing_zeros() as i32));
     // ---- the MMA waves' loop: S and PV in each wave, or (with `sub`) a uniform branch inside the loop that makes the first four waves S waves and the next four PV waves ----
+    let hoist = mask & 32 != 0;
     let mma_loop = |b: &mut FnBuilder, do_s: bool, do_pv: bool, sub: Option<ValueId>| {
+        // mask 32: the fragments are read once before the loop (a measurement of the load-latency share)
+        let kfr_h = if hoist && do_s { k_frags(b) } else { Vec::new() };
+        let (pa_h, vfr_h): (Vec<ValueId>, Vec<Vec<ValueId>>) = if hoist && do_pv {
+            let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
+            let pr_ = pbuf.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
+            let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+            let pa: Vec<ValueId> = pr_.read(b, |b| {
+                (0..WP)
+                    .map(|pg| {
+                        let lo = b.bind_i32(ev(pbase) + 1024 * pg);
+                        let hi = b.bind_i32(ev(lo) + 16);
+                        b.load_lds_b128x2(lo, hi)
+                    })
+                    .collect()
+            });
+            let kb = b.bind_i32(kr.base());
+            let vfr: Vec<Vec<ValueId>> = (0..WP)
+                .map(|pg| {
+                    let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                    kr.read(b, |b| {
+                        (0..8)
+                            .map(|nt| {
+                                let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                                b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            (pa, vfr)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
         let it = lvars[0];
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
@@ -494,14 +528,21 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 b.begin_if(c);
             }
             if do_s {
-                let kfr = k_frags(b);
+                let kfr = if hoist { kfr_h.clone() } else { k_frags(b) };
                 let sacc = s_chain(b, &kfr);
                 sbuf_store(b, wa, Opnd::Val(sa), &sacc);
             }
             if sub.is_some() {
                 b.else_();
             }
-            if do_pv {
+            if do_pv && hoist {
+                for nt in 0..8usize {
+                    for pg in 0..WP as usize {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa_h[pg], vfr_h[pg][nt], Some(Opnd::Var(ov[nt])));
+                        b.set_var(ov[nt], Opnd::Val(d));
+                    }
+                }
+            } else if do_pv {
                 let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(sp), Opnd::Val(wn)));
                 let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
                 let pa: Vec<ValueId> = pr_.read(b, |b| {
