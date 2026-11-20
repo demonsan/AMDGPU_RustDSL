@@ -53,7 +53,7 @@ fn kind(op: MOp) -> Option<(bool, bool)> {
 }
 
 fn phys(m: &MFunction, a: &Alloc, r: VReg) -> Option<(bool, u32, u32)> {
-    let r = m.canon(r);
+    // (the allocation's own register of the value: a tuple's sub-register alias has its dword's register, as the emitter prints it)
     let p = *a.phys.get(r as usize)?;
     if p == u32::MAX {
         return None;
