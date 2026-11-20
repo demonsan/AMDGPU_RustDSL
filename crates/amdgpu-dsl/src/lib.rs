@@ -5245,7 +5245,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
-            Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
+            Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } | Stmt::WaitLdsWrites => {}
             Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } | Stmt::LoadAsyncLds { .. } => {}
             Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
