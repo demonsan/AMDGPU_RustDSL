@@ -671,6 +671,7 @@ impl Lowerer {
             elide_fallthrough: false,
             edge_pad: opt_on("edgepad"),
             ra_dword: opt_on("radword"),
+            ra_compact: opt_on("racompact"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));
