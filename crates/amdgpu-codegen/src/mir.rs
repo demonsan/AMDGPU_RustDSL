@@ -204,6 +204,16 @@ pub enum MOp {
     VOrB32Dpp,
     VXorB32Dpp,
     VPermlane16Swap,
+    /// gfx1250 lane permutes: dst (tied to its old value, the last source), x, a[, b]; imm = fetch_invalid | bound_ctrl << 1
+    VPermlane16B32,
+    VPermlaneX16B32,
+    VPermlane16VarB32,
+    VPermlaneX16VarB32,
+    VPermlaneBcastB32,
+    VPermlaneUpB32,
+    VPermlaneDownB32,
+    VPermlaneXorB32,
+    VPermlaneIdxGenB32,
     // P1 A2 conversions (imm: word / byte select; partial writes keep the destination's other bits: srcs end with the old value)
     VCvtPkF32Fp8,
     VCvtF32Fp8,
