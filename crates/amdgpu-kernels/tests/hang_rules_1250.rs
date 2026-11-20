@@ -1041,14 +1041,45 @@ fn pos_clause_type() {
     asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "s_load_b32 s40, s[0:1], 0x0", "s_load_b32 s41, s[0:1], 0x4", "s_wait_kmcnt 0x0"]));
 }
 
+// GV-1250-PERMPK16 (the base stream starts with the entry prologue the own tail emits)
+
+#[test]
+fn mut_permpk16() {
+    let m = |ls: &[&str]| asm_mutation(&inject("tensor_load_to_lds", ls), "GV-1250-PERMPK16");
+    // unsafe followers: a scalar wait, an integer multiply (4 cycles), DPP, a pseudo-scalar TRANS, a dual-issue line, a branch, a 64-bit move
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "s_wait_dscnt 0x0"]);
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_mul_lo_u32 v9, v10, v11"]);
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_mov_b32_dpp v9, v10 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]);
+    m(&["v_perm_pk16_b8_u4 v[2:5], v[0:1], v[8:9], v[6:7]", "v_s_exp_f32 s9, s10"]);
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_dual_mul_f32 v10, v4, v8 :: v_dual_mul_f32 v11, v5, v9"]);
+    m(&["v_perm_pk16_b6_u4 v[2:4], v1, v[4:5], v[6:7]", "s_branch 0"]);
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_mov_b64 v[10:11], v[12:13]"]);
+    // EXEC written in the kernel
+    m(&["s_mov_b32 exec_lo, s10", "v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_nop"]);
+    m(&["v_cmpx_gt_f32_e32 v1, v2", "v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_nop"]);
+    // mixed table sources
+    m(&["v_perm_pk16_b4_u4 v[2:3], v1, s4, v[6:7]", "v_nop"]);
+    // no entry prologue
+    asm_mutation("hr:\n    v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]\n    v_nop\n    s_endpgm\n", "GV-1250-PERMPK16");
+}
+
+#[test]
+fn pos_permpk16() {
+    for ls in [
+        &["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_nop"][..],
+        &["v_perm_pk16_b8_u4 v[2:5], v[0:1], v[8:9], v[6:7]", "v_add_f32_e32 v10, v11, v12"],
+        &["v_perm_pk16_b6_u4 v[2:4], v1, v[4:5], v[6:7]", "v_exp_f32_e32 v10, v11"],
+        &["v_perm_pk16_b4_u4 v[2:3], s1, s4, v[6:7]", "v_wmma_f32_16x16x64_fp8_fp8 v[16:23], v[24:31], v[32:39], v[16:23]"],
+    ] {
+        asm_positive(&inject("tensor_load_to_lds", ls));
+    }
+}
+
 // GV-1250-FORBIDDEN-OP
 
 #[test]
 fn mut_forbidden_op() {
     asm_mutation(&inject("tensor_load_to_lds", &["v_nop_power"]), "GV-1250-FORBIDDEN-OP");
-    for op in ["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_perm_pk16_b6_u4 v[2:4], v1, v[4:5], v[6:7]", "v_perm_pk16_b8_u4 v[2:5], v[0:1], v[4:5], v[6:7]"] {
-        asm_mutation(&inject("tensor_load_to_lds", &[op]), "GV-1250-FORBIDDEN-OP");
-    }
 }
 
 #[test]
@@ -1145,6 +1176,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-FORBIDDEN-OP", "forbidden_op"),
+    ("GV-1250-PERMPK16", "permpk16"),
     ("GV-1250-VOPD", "vopd"),
     ("GV-1250-CLAUSE-TYPE", "clause_type"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),

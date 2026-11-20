@@ -57,7 +57,8 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "DPP only where the hardware supports it: not with a literal operand; not on a 64-bit operation (no 64-bit DPP on this part); not on the instructions without a DPP form (lane reads / writes, swaps, permutes, v_nop, the FMAMK / FMAAK forms, the packed / dot / WMMA VOP3P ops other than FMA_MIX); the 32-bit multiplies of the double-precision unit only with row_share" },
     Rule { id: "GV-1250-VOPD", layer: Layer::Asm, what: "every dual-issue (VOPD) instruction is a legal combination: opcodes from the X / Y sets, destinations of opposite parity, each source slot of the two components in different register banks unless the same register, the second source a VGPR, no literal, at most two scalar operands, the Y component not reading the X destination" },
     Rule { id: "GV-1250-CLAUSE-TYPE", layer: Layer::Asm, what: "an instruction clause holds instructions of one memory type only (scalar loads, vector memory, flat, LDS)" },
-    Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device whatever surrounds it (the packed lookup-table converts v_perm_pk16_*): forbidden" },
+    Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device (v_nop_power): forbidden" },
+    Rule { id: "GV-1250-PERMPK16", layer: Layer::Asm, what: "a packed lookup-table convert (v_perm_pk16_*) only with its mitigation (public LLVM fixVPermPk16Hazard / isVPermPk16SafeInstr): the kernel entry prologue (s_mov_b64 s[n:n+1], 0; v_nop; global_prefetch_b8 v0, s[n:n+1] before any other vector memory), the very next instruction a safe VALU (or v_nop), EXEC never written in the kernel (so it is non-zero at the instruction), and both table sources VGPRs or both SGPRs" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
     Rule { id: "GV-1250-PRIV", layer: Layer::Asm, what: "privileged state is not written from a kernel" },
@@ -2282,9 +2283,74 @@ fn vopd_rule(insts: &[Inst], v: &mut Vec<Violation>) {
     }
 }
 
+/// A safe follower of `v_perm_pk16_*` (public LLVM `isVPermPk16SafeInstr`): a VALU instruction (not LDS DMA) that is a matrix (XDL) op, or
+/// whose gfx1250 blocking-cycle count (the `GFX1250BlockingCycles` table) is below 2, or 2 for a 32-bit TRANS op; pseudo-scalar TRANS
+/// (`v_s_*`) is not safe. Conservative: an allow-list of 32-bit VALU forms that have no table entry (0 cycles), the 32-bit TRANS forms
+/// (2 cycles, TRANS) and the matrix ops; DPP (2 cycles), 64-bit forms, integer multiplies (4), swaps / permutes (2) and every other
+/// instruction (dual issue included) are not safe.
+pub fn permpk16_safe_follower(mn: &str, ops: &str) -> bool {
+    if ops.contains("::") || mn.contains("_dpp") || ops.contains("dpp8") || ops.contains("quad_perm") || ops.contains("row_") || mn.starts_with("v_s_") {
+        return false;
+    }
+    if mn.starts_with("v_wmma_") || mn.starts_with("v_swmmac_") {
+        return true;
+    }
+    let base = mn.strip_suffix("_e32").or_else(|| mn.strip_suffix("_e64")).unwrap_or(mn);
+    const SAFE: &[&str] = &[
+        "v_nop", "v_mov_b32", "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_fma_f32", "v_fmac_f32", "v_max_num_f32", "v_min_num_f32",
+        "v_add_nc_u32", "v_sub_nc_u32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_not_b32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
+        "v_cndmask_b32", "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
+        // 32-bit TRANS: 2 cycles and TRANS: safe
+        "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_sin_f32", "v_cos_f32",
+    ];
+    SAFE.contains(&base)
+}
+
+/// GV-1250-PERMPK16 (see the rule): the entry prologue, the follower, EXEC, the table sources.
+fn permpk16_rule(insts: &[Inst], v: &mut Vec<Violation>) {
+    let perms: Vec<usize> = insts.iter().enumerate().filter(|(_, i)| i.mn.starts_with("v_perm_pk16_")).map(|(k, _)| k).collect();
+    if perms.is_empty() {
+        return;
+    }
+    // the entry prologue: s_mov_b64 s[n:n+1], 0 ; v_nop ; global_prefetch_b8 v0, s[n:n+1] ..., before any other vector-memory instruction
+    // (an s_setreg / s_mov of the mode may precede it)
+    let first_vmem = insts.iter().position(|i| i.mn.starts_with("global_") || i.mn.starts_with("buffer_") || i.mn.starts_with("flat_") || i.mn.starts_with("scratch_") || i.mn.starts_with("tensor_"));
+    let pro = insts.windows(3).take(8).position(|w| {
+        w[0].mn == "s_mov_b64"
+            && w[0].ops.split(',').nth(1).map(|x| x.trim() == "0").unwrap_or(false)
+            && w[1].mn == "v_nop"
+            && w[2].mn == "global_prefetch_b8"
+            && w[2].ops.split(',').next().map(|x| x.trim() == "v0").unwrap_or(false)
+            && w[2].ops.split(',').nth(1).map(|x| x.trim().split_whitespace().next() == w[0].ops.split(',').next().map(|y| y.trim())).unwrap_or(false)
+    });
+    if pro.map_or(true, |p| first_vmem.map_or(false, |f| f < p + 2)) {
+        viol(v, "GV-1250-PERMPK16", format!("line {}: `{}` in a kernel without the entry prologue (s_mov_b64 s[n:n+1], 0; v_nop; global_prefetch_b8 v0, s[n:n+1] first)", insts[perms[0]].line, insts[perms[0]].mn));
+    }
+    // EXEC never written (it is the launch's non-zero mask at every instruction)
+    if let Some(w) = insts.iter().find(|i| i.mn.starts_with("v_cmpx") || i.mn.contains("saveexec") || i.mn.contains("_exec") || i.ops.split(',').next().map(|d| d.trim().starts_with("exec")).unwrap_or(false)) {
+        viol(v, "GV-1250-PERMPK16", format!("line {}: `{} {}` writes EXEC in a kernel with `{}`: EXEC must be provably non-zero at the lookup-table convert", w.line, w.mn, w.ops, insts[perms[0]].mn));
+    }
+    for &k in &perms {
+        let ins = &insts[k];
+        // the very next issued instruction (program order; labels and directives are not instructions)
+        match insts.get(k + 1) {
+            Some(n) if permpk16_safe_follower(&n.mn, &n.ops) => {}
+            Some(n) => viol(v, "GV-1250-PERMPK16", format!("line {}: `{}` followed by `{} {}`, not a safe instruction (a `v_nop` must follow)", ins.line, ins.mn, n.mn, n.ops)),
+            None => viol(v, "GV-1250-PERMPK16", format!("line {}: `{}` is the last instruction (a `v_nop` must follow)", ins.line, ins.mn)),
+        }
+        // both table sources VGPRs or both SGPRs
+        let ops: Vec<&str> = ins.ops.split(',').map(|o| o.trim()).collect();
+        let kind = |o: &str| o.chars().next().unwrap_or(' ');
+        if ops.len() >= 3 && kind(ops[1]) != kind(ops[2]) {
+            viol(v, "GV-1250-PERMPK16", format!("line {}: `{} {}`: the two table sources mix a VGPR and an SGPR", ins.line, ins.mn, ins.ops));
+        }
+    }
+}
+
 pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
+    permpk16_rule(&insts, &mut v);
     tdm_drain(&insts, &labels, &mut v);
     smem_pending(&insts, &labels, &mut v);
     wait_range(&insts, &mut v);
@@ -2341,7 +2407,7 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
             }
         }
         // instructions that can hang the device whatever runs next (in any wave): never emitted
-        if ins.mn.starts_with("v_perm_pk16_") || ins.mn.starts_with("v_nop_power") {
+        if ins.mn.starts_with("v_nop_power") {
             viol(&mut v, "GV-1250-FORBIDDEN-OP", format!("line {}: `{}`: known to hang the device; forbidden", ins.line, ins.mn));
         }
         // DPP
