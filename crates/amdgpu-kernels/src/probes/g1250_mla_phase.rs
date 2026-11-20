@@ -38,11 +38,14 @@ const PH_VALU: u32 = 128;
 const PH_SPREAD: u32 = 256;
 /// the VALU block uses mul + add (no TRANS) instead of mul + exp2: does a TRANS op block WMMA co-execution?
 const PH_ALU: u32 = 512;
+/// with PH_ILP + PH_SM: the lean softmax arithmetic (no per-token mask: valid on every window but the last, which a uniform branch would handle; the scale folded into one fma per exponent;
+/// the maximum taken on the raw scores and scaled once): about 90 fewer VALU per window
+const PH_LEAN: u32 = 1024;
 
 /// `mla_g1250_qh16_ph_<hex mask>`.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 0x3ff {
+    if mask > 0x7ff {
         return None;
     }
     Some(mla_ph_with(&format!("mla_g1250_qh16_ph_{hex}"), 2, 4, mask))
@@ -469,7 +472,15 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let mut m_new_v: Option<ValueId> = None;
         let mut alpha_v: Option<ValueId> = None;
         let mut lsum_v: Option<ValueId> = None;
+        let lean = mask & PH_LEAN != 0;
+        let mut m_old_keep: Option<ValueId> = None;
         let mut step = |b: &mut FnBuilder, k: usize| match k {
+            0 | 1 if lean => {
+                for r in 0..8u8 {
+                    let si = b.frag_slice(Opnd::Var(sv[k]), r, 1);
+                    xs.push(f32_of(b, si));
+                }
+            }
             0 | 1 => {
                 let pg = k as i32;
                 let tok0 = b.bind_i32(ev(t1) * (64 * WP) + (64 * pg) + ev(w) * 16 + ev(g) * 8);
@@ -483,6 +494,16 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 }
             }
             2 => pm_v = Some(get_max(b, t1)),
+            3 if lean => {
+                let pms = b.mul_f32(pm_v.unwrap(), cscale);
+                let m_new = b.max_f32(Opnd::Var(vm), pms);
+                let dm = b.sub_f32(Opnd::Var(vm), m_new);
+                let alpha = b.exp2_f32(dm);
+                lsum_v = Some(b.mul_f32(Opnd::Var(vl), alpha));
+                m_new_v = Some(b.sub_f32(zf, m_new));   // -m_new, the fma addend
+                alpha_v = Some(alpha);
+                m_old_keep = Some(m_new);
+            }
             3 => {
                 let m_new = b.max_f32(Opnd::Var(vm), pm_v.unwrap());
                 let dm = b.sub_f32(Opnd::Var(vm), m_new);
@@ -490,6 +511,15 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 lsum_v = Some(b.mul_f32(Opnd::Var(vl), alpha));
                 m_new_v = Some(m_new);
                 alpha_v = Some(alpha);
+            }
+            4 | 5 if lean => {
+                let pg = k - 4;
+                for r in 0..8usize {
+                    let d = b.let_(Op::FmaF32(Opnd::Val(xs[8 * pg + r]), Opnd::Val(cscale), Opnd::Val(m_new_v.unwrap())));
+                    let p = b.exp2_f32(d);
+                    ps.push(p);
+                    lsum_v = Some(b.add_f32(lsum_v.unwrap(), p));
+                }
             }
             4 | 5 => {
                 let pg = k - 4;
@@ -572,7 +602,18 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         if s_on {
             let s2: Vec<Opnd> = sacc.iter().map(|o| o.unwrap()).collect();
             if sm_on {
-                let x2 = logits(&mut b, t2, &s2);
+                let x2 = if lean {
+                    let mut raw = Vec::new();
+                    for pg in 0..WP as usize {
+                        for r in 0..8u8 {
+                            let si = b.frag_slice(s2[pg], r, 1);
+                            raw.push(f32_of(&mut b, si));
+                        }
+                    }
+                    raw
+                } else {
+                    logits(&mut b, t2, &s2)
+                };
                 put_max(&mut b, t2, &x2);
             }
             for pg in 0..WP as usize {
@@ -582,7 +623,7 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             }
         }
         if sm_on {
-            b.set_var(vm, Opnd::Val(m_new_v.unwrap()));
+            b.set_var(vm, Opnd::Val(if lean { m_old_keep.unwrap() } else { m_new_v.unwrap() }));
             b.set_var(vl, Opnd::Val(lsum_v.unwrap()));
             b.set_var(va, Opnd::Val(alpha_v.unwrap()));
         }
