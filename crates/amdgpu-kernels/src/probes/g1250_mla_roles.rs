@@ -24,7 +24,7 @@ pub fn mla_g1250_qh16_roles() -> Function {
 /// `mla_g1250_qh16_roles_<hex mask>`: bit 0 = the MMA waves skip their window work, bit 1 = the softmax waves skip theirs (the barrier stays).
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 63 {
+    if mask > 127 {
         return None;
     }
     Some(mla_roles_with(&format!("mla_g1250_qh16_roles_{hex}"), 2, 2, mask))
@@ -315,7 +315,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             })
             .collect()
     };
-    let s_chain = |b: &mut FnBuilder, kfr: &[Vec<ValueId>]| -> Vec<Opnd> {
+    let s_chain = |b: &mut FnBuilder, kfr: &[Vec<Opnd>]| -> Vec<Opnd> {
         let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
         for c in 0..9usize {
             for pg in 0..WP as usize {
@@ -466,7 +466,15 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     }
     inits.push((DType::F32, Opnd::Val(neg)));
     inits.push((DType::F32, Opnd::Val(zf)));
+    let pre = mask & 4 != 0;
+    if pre {
+        for _ in 0..(2 * 9) {
+            let z = b.frag_cat(&[Opnd::I32(0); 8]);
+            inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
+        }
+    }
     let st = b.declare_vars(&inits);
+    let kvars: Vec<Vec<_>> = if pre { (0..2usize).map(|pg| (0..9usize).map(|c| st[10 + nx + pg * 9 + c]).collect()).collect() } else { Vec::new() };
     let ov: Vec<_> = st[0..8].to_vec();
     let xs: Vec<_> = st[8..8 + nx].to_vec();
     let (vm, vl) = (st[8 + nx], st[9 + nx]);
@@ -481,9 +489,18 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.barrier();
     b.begin_if(is_mma);
     let kf0 = k_frags(&mut b);
-    let s0 = s_chain(&mut b, &kf0);
+    let kf0o: Vec<Vec<Opnd>> = kf0.iter().map(|v| v.iter().map(|&x| Opnd::Val(x)).collect()).collect();
+    let s0 = s_chain(&mut b, &kf0o);
     for k in w_n..3 * w_n {
         sbuf_store(&mut b, gc[k as usize], slot_c(k), &s0);
+    }
+    if pre {
+        let kf = k_frags(&mut b);
+        for pg in 0..2usize {
+            for c in 0..9usize {
+                b.set_var(kvars[pg][c], Opnd::Val(kf[pg][c]));
+            }
+        }
     }
     b.end_if();
     b.wait_lds(0);
@@ -562,7 +579,13 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 b.begin_if(c);
             }
             if do_s {
-                let kfr = if hoist { kfr_h.clone() } else { k_frags(b) };
+                let kfr: Vec<Vec<Opnd>> = if hoist {
+                    kfr_h.iter().map(|v| v.iter().map(|&x| Opnd::Val(x)).collect()).collect()
+                } else if pre {
+                    kvars.iter().map(|v| v.iter().map(|&x| Opnd::Var(x)).collect()).collect()
+                } else {
+                    k_frags(b).iter().map(|v| v.iter().map(|&x| Opnd::Val(x)).collect()).collect()
+                };
                 let sacc = s_chain(b, &kfr);
                 sbuf_store(b, wa, Opnd::Val(sa), &sacc);
             }
@@ -613,7 +636,18 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 b.end_if();
             }
         }
-        b.wait_lds(0);
+        if pre && do_s {
+            // the next window's K fragments are issued before the barrier (their slot is already published); only the stores before them must complete
+            let nk = k_frags(b);
+            for pg in 0..2usize {
+                for c in 0..9usize {
+                    b.set_var(kvars[pg][c], Opnd::Val(nk[pg][c]));
+                }
+            }
+            b.wait_lds_writes();
+        } else {
+            b.wait_lds(0);
+        }
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
