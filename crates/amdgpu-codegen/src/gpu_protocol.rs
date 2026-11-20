@@ -1383,9 +1383,13 @@ fn role_split(f: &Function, div: &HashSet<usize>) -> Option<Vec<i64>> {
         Some(s)
     };
     let mut reps: Vec<(Vec<(usize, bool)>, i64)> = Vec::new();
+    let dbg = std::env::var("AMDC_PROTO_DEBUG").is_ok();
     for w in 0..waves {
         let a = sig_of(w * ws)?;
         let b = sig_of(w * ws + ws - 1)?;
+        if dbg {
+            eprintln!("role_split: wave {w}: {a:?} / {b:?} (divergent ifs {:?})", { let mut d: Vec<_> = div.iter().copied().collect(); d.sort(); d });
+        }
         if a != b || a.is_empty() {
             return None;
         }
