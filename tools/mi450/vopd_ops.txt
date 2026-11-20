@@ -1,0 +1,34 @@
+v_dual_mul_f32 v0, v4, v8 :: v_dual_fmac_f32 v1, v5, v9
+v_dual_fmac_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_add_f32 v1, v5, v9
+v_dual_add_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_sub_f32 v1, v5, v9
+v_dual_sub_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_subrev_f32 v1, v5, v9
+v_dual_subrev_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_dx9_zero_f32 v1, v5, v9
+v_dual_mul_dx9_zero_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_mov_b32 v1, v5
+v_dual_mov_b32 v0, v4 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_cndmask_b32 v1, v5, v9
+v_dual_cndmask_b32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_max_num_f32 v1, v5, v9
+v_dual_max_num_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_min_num_f32 v1, v5, v9
+v_dual_min_num_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_add_nc_u32 v1, v5, v9
+v_dual_add_nc_u32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_lshlrev_b32 v1, v5, v9
+v_dual_lshlrev_b32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_max_i32 v1, v5, v9
+v_dual_max_i32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_min_i32 v1, v5, v9
+v_dual_min_i32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_sub_nc_u32 v1, v5, v9
+v_dual_sub_nc_u32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_lshrrev_b32 v1, v5, v9
+v_dual_lshrrev_b32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9
+v_dual_mul_f32 v0, v4, v8 :: v_dual_ashrrev_i32 v1, v5, v9
+v_dual_ashrrev_i32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9

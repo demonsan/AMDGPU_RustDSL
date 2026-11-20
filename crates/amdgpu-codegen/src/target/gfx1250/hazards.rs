@@ -77,6 +77,9 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
     let mut entry: Vec<Option<(Vec<Producer>, u32)>> = vec![None; n];
     entry[0] = Some((Vec::new(), 0));
     let mut plan = Plan::default();
+    // VOPD: a pair issues as ONE VALU instruction (its second instruction sees the distances of the first and adds none); a pair whose second
+    // instruction would need padding is broken (the plan is then recomputed with the two instructions issued separately)
+    let mut broken = false;
     for _round in 0..64 {
         let mut changed = false;
         plan.before.clear();
@@ -94,6 +97,12 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                 }
                 if inst.op == MOp::SWaitTensor || (inst.op == MOp::SWaitCtr && inst.imm >> 8 == 6) {
                     tdm = tdm.min((inst.imm & 0xff) as u32);
+                }
+                let second = super::vopd::is_second(bi, ii);
+                if second && is_valu(inst.op) {
+                    for p in pend.iter_mut() {
+                        p.dist = p.dist.saturating_sub(1);
+                    }
                 }
                 if is_valu(inst.op) {
                     let e = effects(m, inst);
@@ -123,6 +132,10 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                             }
                             None => {}
                         }
+                    }
+                    if need > 0 && second {
+                        super::vopd::break_pair(bi, ii - 1);
+                        broken = true;
                     }
                     if need > 0 {
                         lines.push(if need == 1 { "v_nop".to_string() } else { format!("v_nop ; x{need}") });
@@ -173,8 +186,14 @@ pub fn plan(m: &MFunction, a: &Alloc) -> Plan {
                 }
             }
         }
-        if !changed {
+        if !changed && !broken {
             break;
+        }
+        if broken {
+            // restart from scratch with the broken pairs issued separately
+            broken = false;
+            entry = vec![None; n];
+            entry[0] = Some((Vec::new(), 0));
         }
     }
     let _ = has_tdm;

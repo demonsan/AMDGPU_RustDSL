@@ -41,7 +41,7 @@ fn block(pin_middle: bool) -> MFunction {
         vregs,
         loops: Vec::new(),
         alias: Default::default(),
-        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false,
+        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false, vopd: false,
         agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }

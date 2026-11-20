@@ -188,7 +188,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         if !m.exact {
             msb = super::msb::Msb::default();
         }
+        let mut skip_next = false;
         for (ii, inst) in b.insts.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
             let lines = match plan.replace.get(&(bi, ii)) {
                 Some(r) => r.clone(),
                 None if inst.op == MOp::SNop && !m.exact => Vec::new(),
@@ -199,6 +204,18 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                     v
                 }
             };
+            // VOPD: the pair's two instructions as one dual line when the final text meets every rule and nothing lands between them
+            let mut lines = lines;
+            if super::vopd::is_first(bi, ii) && ii + 1 < b.insts.len() && !plan.replace.contains_key(&(bi, ii + 1)) && !plan.before.contains_key(&(bi, ii + 1)) && !hz.before.contains_key(&(bi, ii + 1)) && b.insts[ii + 1].op != MOp::SNop {
+                if let Ok(l2) = inst_lines(a, &b.insts[ii + 1]) {
+                    if l2.len() == 1 {
+                        if let Some(d) = lines.last().and_then(|l1| super::vopd::merge(l1, &l2[0])) {
+                            *lines.last_mut().unwrap() = d;
+                            skip_next = true;
+                        }
+                    }
+                }
+            }
             let n_lines = lines.len();
             for (li, line) in lines.into_iter().enumerate() {
                 let mut ls = if windowed { super::msb::window(&line, &mut msb, m.exact).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))? } else { vec![line] };
