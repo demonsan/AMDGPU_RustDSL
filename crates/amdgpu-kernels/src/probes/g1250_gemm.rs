@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -649,6 +649,9 @@ pub struct RingOpts {
     pub epi_bands: u8,
     /// no in-window software pipeline (`TdmF4Body::nopf`)
     pub nopf: bool,
+    /// the A / B row pitch is a kernarg (`lda`, bytes, @72) = K / 2 + PAD instead of K / 2 (host LDA_PAD): row pitches that are powers of two (K = 4096: 2 KiB) land the 256 rows of a
+    /// tile in a few memory channels; the pad moves them apart
+    pub pitch: bool,
 }
 
 impl RingOpts {
@@ -660,7 +663,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false }
     }
 }
 
@@ -723,8 +726,17 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.ka_is(44, Ext::grid_x() * Ext::c(tile_n as i64));
         (Ext::grid_y() * Ext::c(tile_m as i64), Ext::grid_x() * Ext::c(tile_n as i64))
     };
-    b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
-    b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+    if ring.pitch {
+        // row pitch of A / B = K / 2 + PAD bytes (the host contract: PAD a multiple of 16, at most 16 KiB)
+        b.arg("lda", DType::I32, 72, 4);
+        b.sym_range("PAD", 0, 1 << 14);
+        b.ka_is(72, Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD"));
+        b.arg_tensor("a", m_rows.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+        b.arg_tensor("b", n_cols.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+    } else {
+        b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
+        b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+    }
     b.arg_tensor("sa", m_rows.clone() * Ext::sym("K128") * Ext::c(4));
     b.arg_tensor("sb", n_cols.clone() * Ext::sym("K128") * Ext::c(4));
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
@@ -885,6 +897,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let col0 = b.mul_i32(wgx, Opnd::I32(tile_n));
     // bytes per row: fp4 K / 2, scales K / 32
     let kb = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(1)));
+    let pitch = if ring.pitch { b.let_(Op::KernargI32 { offset: 72 }) } else { kb };
     let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
     // cooperative loads: wave w loads rows [w * R / waves, ..) of each tile (R / waves rows)
     let nw = sh.waves();
@@ -904,8 +917,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let (org_a, org_b) = if ring.swap { (col0, row0) } else { (row0, col0) };   // the global row origin of the A / B operand tile
     let row0w = b.add_i32(org_a, rowa_w);
     let col0w = b.add_i32(org_b, rowb_w);
-    let a_org = b.mul_i32(row0w, kb);
-    let b_org = b.mul_i32(col0w, kb);
+    let a_org = b.mul_i32(row0w, pitch);
+    let b_org = b.mul_i32(col0w, pitch);
     let sa_org = b.mul_i32(row0w, ks);
     let sb_org = b.mul_i32(col0w, ks);
     let wl = [
@@ -979,8 +992,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
     let rpad = (row_pad > 0).then(|| ((16 * sh.ks) as u16, (row_pad / 4) as u16));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16, mask_row, rpad);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16, mask_col, rpad);
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_row, rpad);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_col, rpad);
     let (g1sa, g1sb) = if ring.scale_shuf {
         // preshuffled scales: rows of a 32-row block are K / 4 dwords (K / 128 tiles of 32 dwords); the slice is rows / 32 of them, 32 ks
         // dwords each
