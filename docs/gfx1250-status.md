@@ -164,6 +164,32 @@ encoding yet) and is built on demand.
 Two more debugging aids in the same host: `DUMP=<file>` writes the raw output (to diff two kernels element by element; it located the
 I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which (head, 16-dim tile) blocks exceed the tolerance.
 
+### Per-phase microbenchmarks of the window kernel (e08, 2026-11-20)
+
+`mla_g1250_qh16_ph_<mask>` (`probes/g1250_mla_phase.rs`, `tools/mi450/mla_phase.sh`) runs only selected blocks of the one-barrier window kernel's loop (`_w1` / `_w1i` structure, same ABI, extents, padded LDS ring
+layout and fragment address expressions) on window 0 staged once into the ring, `nwin` times, and writes each wave's loop cycles to R. Blocks (mask bits): 1 = S (K fragments, 18 S WMMA), 2 = PV (P and V fragments, 16 PV WMMA),
+4 = alpha (the O rescale, with PV), 8 = softmax (logits, per-wave maxima to RED, the exchange barrier, window maximum, exponents / sums, P to PBUF2), 16 = a work-group barrier. One work-group (B = 1), two sequence lengths
+(16,384 / 32,768 tokens = 128 / 256 windows of 2 pages); the per-window cost is the difference of the two runs divided by 128 windows (fixed parts cancel). One window = 128 tokens:
+
+| blocks | cycles per window (shader clock) | us per window | share of the compute-only loop |
+|---|---:|---:|---:|
+| loop skeleton (nothing) | 36 | 0.018 | |
+| barrier | 52 (16 above the skeleton) | 0.025 | |
+| **S** (K reads + 18 WMMA) | 298 | **0.125** | 18 % |
+| **PV** (P + V reads + 16 WMMA) | 262 | **0.132** | 19 % |
+| PV + alpha | 395 | 0.215 (alpha **0.083**) | 12 % |
+| **softmax** (with its barrier) | 665 | **0.295** | 44 % |
+| S + PV | 637 | 0.239 (sum of the parts 0.257: no overlap) | |
+| S + PV + alpha | 647 | 0.308 | |
+| S + PV + alpha + softmax | 1,524 | **0.677** (sum of the parts 0.635: nothing hides) | 100 % |
+| the same + a barrier | 1,685 | 0.718 | |
+
+In situ (B = 1, 128-token windows, MLA_OK): `_w1i` **0.958 us** per window ((251.2 - 128.5) / 128), the replica **0.379 us** ((102.9 - 54.3) / 128), so `_w1i` is 2.5 x the replica. Reading it: the compute-only
+blocks already take 0.68 us, 1.8 x the replica's whole window (staging, waits and barriers included), the remaining 0.24 us in situ is the TDM staging, the tensor wait and the barriers. The MMA blocks (S + PV, 34 WMMA) cost
+0.24 - 0.26 us = about 16 cycles per 16 x 16 x 64 fp8 WMMA, twice the WMMA's own issue time (LDS-read bound); the softmax block is 44 % of the compute: about 100 VALU / TRANS instructions at the 6 - 7 cycles per VALU that
+the GEMM epilogue analysis found, and none of it overlaps the WMMAs (0.677 combined vs 0.635 as parts). With perfect hiding of the softmax and the alpha rescale under the MMA blocks the window would be about 0.26 - 0.3 us,
+which is the replica's 0.38 us budget: the lever is overlap (and the lazy rescale), not the MMA blocks.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
