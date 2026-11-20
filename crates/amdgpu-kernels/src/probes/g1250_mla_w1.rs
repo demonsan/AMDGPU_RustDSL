@@ -36,6 +36,19 @@ pub fn mla_g1250_qh16_w1d() -> Function {
     mla_w1_with("mla_g1250_qh16_w1d", 1, 8)
 }
 
+/// `_w1` with the iteration body ordered for instruction-level parallelism: all LDS fragments first (K of window t + 2, P and V of
+/// window t), then S(t + 2)'s and PV(t)'s WMMAs interleaved chunk by chunk with P(t + 1)'s VALU / TRANS work between them.
+pub fn mla_g1250_qh16_w1i() -> Function {
+    ILP.with(|c| c.set(true));
+    let f = mla_w1_with("mla_g1250_qh16_w1i", 2, 4);
+    ILP.with(|c| c.set(false));
+    f
+}
+
+thread_local! {
+    static ILP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `wp` pages per window, a `depth`-slot ring (a power of two >= 4): window t + depth - 1 is staged in iteration t, window t + 3 must be
 /// complete at its end (depth - 4 windows stay in flight).
 fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
@@ -330,74 +343,185 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let t1 = b.bind_i32(ev(t) + 1);
     let t2 = b.bind_i32(ev(t) + 2);
     let t3 = b.bind_i32(ev(t) + (depth - 1));
-    // 1. stage window t + depth - 1 (into the slot of window t - 1)
-    stage(&mut b, t3);
-    // 2. S(t + 2) and its maxima
-    let s2 = s_win(&mut b, t2);
-    let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
-    put_max(&mut b, t2, &x2);
-    // 3. P(t + 1) from the carried S(t + 1)
-    let x1c = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
-    let pm1 = get_max(&mut b, t1);
-    let (alpha1, m1, l1) = put_p(&mut b, t1, &x1c, Opnd::Var(vm), Opnd::Var(vl), pm1);
-    // 4. O = alpha(t) O + P(t) V(t): alpha of row 8 g + r by v_readlane of head 8 g + r (every wave holds the same alpha)
-    let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
-    let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
-    let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
-    let one = b.c_f32(1.0);
-    let hf = b.sub_f32(one, gf);
-    let al: Vec<ValueId> = (0..8usize)
-        .map(|r| {
-            let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa16[r])));
-            let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa16[8 + r])));
-            let u0 = b.mul_f32(a0, hf);
-            let u1 = b.mul_f32(a1, gf);
-            b.add_f32(u0, u1)
-        })
-        .collect();
-    for nt in 0..8 {
-        for r in 0..8u8 {
-            b.var_scale_lane(ov[nt], r, al[r as usize]);
-        }
-    }
-    let psi = b.bind_i32(ev(t) & 1);
-    let psl = SlotIdx::new(Opnd::Val(psi), Opnd::Val(t));
-    let pr_ = pbuf.at(&psl);
-    let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
-    let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
-        (0..WP)
+    let ilp = ILP.with(|c| c.get());
+    if ilp {
+        // 1. stage window t + depth - 1
+        stage(&mut b, t3);
+        // 2. the LDS fragments: K of window t + 2 (both pages, 9 chunks each), P(t), V(t) (8 tiles per page)
+        let si2 = b.bind_i32(ev(t2) & (depth - 1));
+        let sl2 = SlotIdx::new(Opnd::Val(si2), Opnd::Val(t2));
+        let r2 = kv.at(&sl2);
+        let sb2 = b.bind_i32(r2.base());
+        let kfr: Vec<Vec<ValueId>> = (0..WP)
             .map(|pg| {
-                let lo = b.bind_i32(ev(pbase) + 1024 * pg);
-                let hi = b.bind_i32(ev(lo) + 16);
-                b.load_lds_b128x2(lo, hi)
-            })
-            .collect()
-    });
-    let ksi = b.bind_i32(ev(t) & (depth - 1));
-    let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
-    let kr = kv.at(&ksl);
-    let kb = b.bind_i32(kr.base());
-    kr.read(&mut b, |b| {
-        for pg in 0..WP {
-            let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
-            let fvs: Vec<ValueId> = (0..8)
-                .map(|nt| {
-                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
-                    b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
+                let nope_row = b.bind_i32(ev(pb) + ev(kofs));
+                let rope_row = b.bind_i32(ev(pb) + ev(rofs));
+                r2.read(&mut b, |b| {
+                    (0..9)
+                        .map(|c| {
+                            let lo = if c < 8 { b.bind_i32(ev(nope_row) + kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
+                            let hi = b.bind_i32(ev(lo) + 16);
+                            b.load_lds_b128x2(lo, hi)
+                        })
+                        .collect()
                 })
-                .collect();
-            for nt in 0..8 {
-                let o = ov[nt];
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg as usize], fvs[nt], Some(Opnd::Var(o)));
-                b.set_var(o, Opnd::Val(d));
+            })
+            .collect();
+        let psi = b.bind_i32(ev(t) & 1);
+        let psl = SlotIdx::new(Opnd::Val(psi), Opnd::Val(t));
+        let pr_ = pbuf.at(&psl);
+        let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+        let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
+            (0..WP)
+                .map(|pg| {
+                    let lo = b.bind_i32(ev(pbase) + 1024 * pg);
+                    let hi = b.bind_i32(ev(lo) + 16);
+                    b.load_lds_b128x2(lo, hi)
+                })
+                .collect()
+        });
+        let ksi = b.bind_i32(ev(t) & (depth - 1));
+        let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
+        let kr = kv.at(&ksl);
+        let kb = b.bind_i32(kr.base());
+        let vfr: Vec<Vec<ValueId>> = (0..WP)
+            .map(|pg| {
+                let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                kr.read(&mut b, |b| {
+                    (0..8)
+                        .map(|nt| {
+                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                            b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        // 3. O *= alpha(t) (rows 8 g + r: v_readlane of head 8 g + r, select-free choice of the lane half)
+        let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let al: Vec<ValueId> = (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa16[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa16[8 + r])));
+                let u0 = b.mul_f32(a0, hf);
+                let u1 = b.mul_f32(a1, gf);
+                b.add_f32(u0, u1)
+            })
+            .collect();
+        for nt in 0..8 {
+            for r in 0..8u8 {
+                b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
         }
-    });
-    b.set_var(vm, Opnd::Val(m1));
-    b.set_var(vl, Opnd::Val(l1));
-    b.set_var(va, Opnd::Val(alpha1));
-    for pg in 0..WP as usize {
-        b.set_var(sv[pg], Opnd::Val(s2[pg]));
+        // 4. S(t + 2) and PV(t) WMMAs interleaved (independent chains); P(t + 1)'s logits / max read / exps between the first groups
+        let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
+        let mut p1 = None;
+        let mut x1c_keep = Vec::new();
+        for c in 0..9usize {
+            for pg in 0..WP as usize {
+                let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
+                sacc[pg] = Some(Opnd::Val(d));
+            }
+            if c < 8 {
+                for pg in 0..WP as usize {
+                    let o = ov[c];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+            }
+            if c == 1 {
+                x1c_keep = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
+            }
+            if c == 3 {
+                let pm1 = get_max(&mut b, t1);
+                p1 = Some(put_p(&mut b, t1, &x1c_keep, Opnd::Var(vm), Opnd::Var(vl), pm1));
+            }
+        }
+        let s2: Vec<ValueId> = sacc.into_iter().map(|a| match a { Some(Opnd::Val(v)) => v, _ => unreachable!() }).collect();
+        let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+        put_max(&mut b, t2, &x2);
+        let (alpha1, m1, l1) = p1.unwrap();
+        b.set_var(vm, Opnd::Val(m1));
+        b.set_var(vl, Opnd::Val(l1));
+        b.set_var(va, Opnd::Val(alpha1));
+        for pg in 0..WP as usize {
+            b.set_var(sv[pg], Opnd::Val(s2[pg]));
+        }
+    } else {
+    // 1. stage window t + depth - 1 (into the slot of window t - 1)
+        stage(&mut b, t3);
+        // 2. S(t + 2) and its maxima
+        let s2 = s_win(&mut b, t2);
+        let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+        put_max(&mut b, t2, &x2);
+        // 3. P(t + 1) from the carried S(t + 1)
+        let x1c = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
+        let pm1 = get_max(&mut b, t1);
+        let (alpha1, m1, l1) = put_p(&mut b, t1, &x1c, Opnd::Var(vm), Opnd::Var(vl), pm1);
+        // 4. O = alpha(t) O + P(t) V(t): alpha of row 8 g + r by v_readlane of head 8 g + r (every wave holds the same alpha)
+        let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let al: Vec<ValueId> = (0..8usize)
+            .map(|r| {
+                let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa16[r])));
+                let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa16[8 + r])));
+                let u0 = b.mul_f32(a0, hf);
+                let u1 = b.mul_f32(a1, gf);
+                b.add_f32(u0, u1)
+            })
+            .collect();
+        for nt in 0..8 {
+            for r in 0..8u8 {
+                b.var_scale_lane(ov[nt], r, al[r as usize]);
+            }
+        }
+        let psi = b.bind_i32(ev(t) & 1);
+        let psl = SlotIdx::new(Opnd::Val(psi), Opnd::Val(t));
+        let pr_ = pbuf.at(&psl);
+        let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+        let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
+            (0..WP)
+                .map(|pg| {
+                    let lo = b.bind_i32(ev(pbase) + 1024 * pg);
+                    let hi = b.bind_i32(ev(lo) + 16);
+                    b.load_lds_b128x2(lo, hi)
+                })
+                .collect()
+        });
+        let ksi = b.bind_i32(ev(t) & (depth - 1));
+        let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
+        let kr = kv.at(&ksl);
+        let kb = b.bind_i32(kr.base());
+        kr.read(&mut b, |b| {
+            for pg in 0..WP {
+                let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                let fvs: Vec<ValueId> = (0..8)
+                    .map(|nt| {
+                        let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                        b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                    })
+                    .collect();
+                for nt in 0..8 {
+                    let o = ov[nt];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg as usize], fvs[nt], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+            }
+        });
+        b.set_var(vm, Opnd::Val(m1));
+        b.set_var(vl, Opnd::Val(l1));
+        b.set_var(va, Opnd::Val(alpha1));
+        for pg in 0..WP as usize {
+            b.set_var(sv[pg], Opnd::Val(s2[pg]));
+        }
     }
     // 5. window t + 3 complete (depth - 4 windows stay in flight); B(t)
     b.wait_tensor(in_flight);
