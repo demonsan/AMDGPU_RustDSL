@@ -203,6 +203,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::Permlane16SwapA { .. }
         | Op::Permlane { .. }
         | Op::PermlaneIdxGen { .. }
+        | Op::PermPk16 { .. }
         | Op::VAddU64 { .. }
         | Op::CvtPkFp8Half { .. }
         | Op::PkNegF32(_)

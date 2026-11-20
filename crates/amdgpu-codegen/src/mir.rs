@@ -216,6 +216,9 @@ pub enum MOp {
     VPermlaneDownB32,
     VPermlaneXorB32,
     VPermlaneIdxGenB32,
+    /// gfx1250 packed lookup-table converts: dst (V2 / V4), a, b, idx (V2)
+    VPermPk16B4U4,
+    VPermPk16B8U4,
     // P1 A2 conversions (imm: word / byte select; partial writes keep the destination's other bits: srcs end with the old value)
     VCvtPkF32Fp8,
     VCvtF32Fp8,

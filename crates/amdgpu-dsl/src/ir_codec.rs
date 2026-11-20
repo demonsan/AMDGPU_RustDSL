@@ -207,6 +207,7 @@ impl FromIr for Op {
             "DppAlu" => { v.expect_struct("DppAlu")?; Ok(Op::DppAlu { op: FromIr::from_ir(v.field("op")?)?, dpp: FromIr::from_ir(v.field("dpp")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
             "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Permlane" => { v.expect_struct("Permlane")?; Ok(Op::Permlane { kind: FromIr::from_ir(v.field("kind")?)?, x: FromIr::from_ir(v.field("x")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, old: FromIr::from_ir(v.field("old")?)?, fi: FromIr::from_ir(v.field("fi")?)?, bc: FromIr::from_ir(v.field("bc")?)? }) }
+            "PermPk16" => { v.expect_struct("PermPk16")?; Ok(Op::PermPk16 { wide: FromIr::from_ir(v.field("wide")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, idx: FromIr::from_ir(v.field("idx")?)? }) }
             "PermlaneIdxGen" => { v.expect_struct("PermlaneIdxGen")?; Ok(Op::PermlaneIdxGen { x: FromIr::from_ir(v.field("x")?)?, a: FromIr::from_ir(v.field("a")?)? }) }
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
@@ -357,6 +358,7 @@ impl IrIds for Op {
             Op::DppAlu { op, dpp, a, b, old } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*dpp), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
             Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Permlane { kind, x, a, b, old, fi, bc } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*old), fv, fr); IrIds::ids(&mut (*fi), fv, fr); IrIds::ids(&mut (*bc), fv, fr); }
+            Op::PermPk16 { wide, a, b, idx } => { IrIds::ids(&mut (*wide), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*idx), fv, fr); }
             Op::PermlaneIdxGen { x, a } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*a), fv, fr); }
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }

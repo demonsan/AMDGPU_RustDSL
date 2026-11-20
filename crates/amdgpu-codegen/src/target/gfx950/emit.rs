@@ -462,6 +462,8 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             let sel = if inst.imm & 3 != 0 { format!(" op_sel:[{},{}]", inst.imm & 1, inst.imm >> 1 & 1) } else { String::new() };
             vec![format!("{mn} {}, {}{sel}", vr(a, inst.dst.expect("dst")), ops.join(", "))]
         }
+        MOp::VPermPk16B4U4 => vec![format!("v_perm_pk16_b4_u4 {}, {}, {}, {}", pair(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), pair(a, reg_of(&inst.srcs[2])))],
+        MOp::VPermPk16B8U4 => vec![format!("v_perm_pk16_b8_u4 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), pair(a, reg_of(&inst.srcs[0])), pair(a, reg_of(&inst.srcs[1])), pair(a, reg_of(&inst.srcs[2])))],
         MOp::VPermlaneIdxGenB32 => vec![format!("v_permlane_idx_gen_b32 {}, {}, {}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), src1(a, inst.srcs[1]))],
         MOp::VPermlane16Swap => vec![format!("v_permlane16_swap_b32_e32 {}, {}", vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])))],
         MOp::VCvtPkF32Fp8 => vec![format!("v_cvt_pk_f32_fp8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],

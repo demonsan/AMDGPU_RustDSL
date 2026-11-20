@@ -4110,6 +4110,18 @@ impl Lowerer {
                 self.push(mi.srcreg(d).imm(*fi as i64 | (*bc as i64) << 1));
                 self.val.insert(dst, d);
             }
+            Op::PermPk16 { wide, a, b, idx } => {
+                if crate::target::cur().name != "gfx1250" {
+                    return Err("v_perm_pk16_*: a gfx1250 instruction".into());
+                }
+                let (ra, rb) = if *wide { (self.as_v2(*a)?, self.as_v2(*b)?) } else { (self.as_v1(*a)?, self.as_v1(*b)?) };
+                let ri = self.as_v2(*idx)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(ri)]);
+                let d = self.new_vreg(if *wide { RClass::V4 } else { RClass::V2 });
+                let op = if *wide { MOp::VPermPk16B8U4 } else { MOp::VPermPk16B4U4 };
+                self.push(MInst::new(op).def(d).srcreg(ra).srcreg(rb).srcreg(ri));
+                self.val.insert(dst, d);
+            }
             Op::PermlaneIdxGen { x, a } => {
                 // refused until its function is specified (the encoder and the emitter know it; no kernel may depend on unspecified
                 // behaviour)

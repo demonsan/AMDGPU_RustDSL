@@ -838,6 +838,10 @@ pub enum Op {
     /// no `fi` / `bc` (a lowering error). `Up` / `Down`: lane i reads lane i - a / i + a of its group; a lane whose source would leave the
     /// group keeps its own value (measured on MI450, tests/gpu/g1250_probe_host.cpp `permlane`).
     Permlane { kind: PermlaneKind, x: Opnd, a: Opnd, b: Opnd, old: Opnd, fi: bool, bc: bool },
+    /// gfx1250 packed lookup-table convert `v_perm_pk16_b4_u4` (`wide` false: d Frag2, a / b one dword each) / `v_perm_pk16_b8_u4` (`wide`
+    /// true: d Frag4, a / b Frag2 each); `idx` a Frag2 of sixteen 4-bit indices. The hardware's lookup semantics are not modelled here; the
+    /// back end emits the public LLVM mitigation around it (a safe follower, the entry prologue) and G5 (`GV-1250-PERMPK16`) checks it.
+    PermPk16 { wide: bool, a: Opnd, b: Opnd, idx: Opnd },
     /// gfx1250 `v_permlane_idx_gen_b32 d, x, a`: the byte index for a backwards permute (`ds_bpermute`) built from `x` and `a`. Encoded and
     /// lowered only in exact mode: its function is not specified (no public specification), so the lowering refuses it elsewhere.
     PermlaneIdxGen { x: Opnd, a: Opnd },
@@ -950,6 +954,7 @@ impl Op {
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } => DType::U32,
             Op::Permlane { .. } | Op::PermlaneIdxGen { .. } => DType::U32,
+            Op::PermPk16 { wide, .. } => if *wide { DType::Frag4 } else { DType::Frag2 },
             Op::VAddU64 { .. } => DType::Frag2,
             Op::CvtPkFp8Half { .. } => DType::U32,
             Op::PkNegF32(_) => DType::Frag2,
@@ -1041,6 +1046,7 @@ impl Op {
             Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Permlane { x, a, b, old, .. } => vec![*x, *a, *b, *old],
             Op::PermlaneIdxGen { x, a } => vec![*x, *a],
+            Op::PermPk16 { a, b, idx, .. } => vec![*a, *b, *idx],
             Op::Mfma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());

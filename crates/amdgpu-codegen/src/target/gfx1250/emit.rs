@@ -315,6 +315,11 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     if !m.exact && (kdv("wmma_reuse").unwrap_or(0) != 0 || std::env::var("AMDC_WMMA_REUSE").is_ok()) {
         out = wmma_reuse(&out);
     }
+    // the packed lookup-table converts: a safe instruction must issue right after each (public LLVM fixVPermPk16Hazard): a `v_nop` unless
+    // the next instruction in program order is one (G5 GV-1250-PERMPK16 checks the result)
+    if !m.exact {
+        out = permpk16_pad(&out);
+    }
     for _ in 0..kdv("code_end_pad").unwrap_or(0) {
         out.push_str("    s_code_end\n");
     }
@@ -825,7 +830,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
-    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_permlane16_b32", "v_permlanex16_b32", "v_permlane16_var_b32", "v_permlanex16_var_b32", "v_permlane_bcast_b32", "v_permlane_up_b32", "v_permlane_down_b32", "v_permlane_xor_b32", "v_permlane_idx_gen_b32", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
+    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_permlane16_b32", "v_permlanex16_b32", "v_permlane16_var_b32", "v_permlanex16_var_b32", "v_permlane_bcast_b32", "v_permlane_up_b32", "v_permlane_down_b32", "v_permlane_xor_b32", "v_permlane_idx_gen_b32", "v_perm_pk16_b4_u4", "v_perm_pk16_b8_u4", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).
@@ -849,6 +854,33 @@ fn ttmp_names(line: &str) -> String {
         })
         .collect();
     format!("{} {}", &line[..i], ops.join(", "))
+}
+
+/// A `v_nop` after every `v_perm_pk16_*` whose next instruction line (labels and directives are not instructions) is not a safe follower
+/// (`gpu_verify_1250::permpk16_safe_follower`); the last instruction of the text gets one too.
+fn permpk16_pad(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_inst = |l: &str| {
+        let t = l.trim();
+        !t.is_empty() && !t.ends_with(':') && !t.starts_with('.') && !t.starts_with("//")
+    };
+    let mut out = String::with_capacity(text.len() + 64);
+    for (k, l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        let t = l.trim();
+        if t.starts_with("v_perm_pk16_") {
+            let next = lines[k + 1..].iter().find(|x| is_inst(x)).map(|x| x.trim());
+            let safe = next.map_or(false, |n| {
+                let (mn, ops) = n.split_once(char::is_whitespace).unwrap_or((n, ""));
+                crate::gpu_verify_1250::permpk16_safe_follower(mn, ops.trim())
+            });
+            if !safe {
+                out.push_str("    v_nop\n");
+            }
+        }
+    }
+    out
 }
 
 pub fn respell(line: &str) -> Result<Vec<String>, String> {
