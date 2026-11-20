@@ -80,7 +80,9 @@ pub fn mla_g1250_qh16_w1x(mode: u8) -> Function {
 pub fn mla_g1250_qh16_w1s() -> Function {
     ILP.with(|c| c.set(true));
     STAMPS.with(|c| c.set(true));
+    LEAN.with(|c| c.set(true));
     let f = mla_w1_with("mla_g1250_qh16_w1s", 2, 4);
+    LEAN.with(|c| c.set(false));
     STAMPS.with(|c| c.set(false));
     ILP.with(|c| c.set(false));
     f
@@ -181,7 +183,9 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let vbases: Vec<i32> = (0..128).map(|t| { let f = t & 31; (8 * (f >> 4) + (f & 3) + 4 * ((f >> 3) & 1)) * DV + 8 * ((f >> 2) & 1) + (t / 32) * 128 }).collect();
     let vdelta: Vec<i32> = (0..32).map(|i| layout.delta(&vbases, 16 * (i / 8) * DV + 16 * (i % 8))).collect();
     let _ = QUARTER;
-    // the sequence's page ids into LDS (indices clamped to the last page)
+    // the sequence's page ids into LDS (indices clamped to the last page); lean: none (scalar page-id loads)
+    let t00 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
+    if !lean_early {
     let nch = b.bind_i32((ev(npages) + 127) >> 7);
     let k0 = b.c_i32(0);
     let lv = b.begin_loop(&[(DType::I32, Opnd::Val(k0))]);
@@ -195,7 +199,6 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
     let pv = b.load_global(pe, 0, MemTy::B32);
     let sa = b.bind_i32(ev(idx) * 4 + ptab.base as i32);
-    let t00 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     ptab.at(&t00).write(&mut b, |b| b.store_lds(sa, pv, MemTy::B32, false));
     let k1 = b.bind_i32(amdgpu_dsl::varx(kk) + 1);
     b.set_var(kk, Opnd::Val(k1));
@@ -204,6 +207,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
+    }
 
     let nwin = b.bind_i32((ev(npages) + (WP - 1)) >> (WP.trailing_zeros() as i32));
     let neg = b.c_f32(-1.0e30);
