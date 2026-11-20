@@ -24,7 +24,7 @@ pub fn mla_g1250_qh16_roles() -> Function {
 /// `mla_g1250_qh16_roles_<hex mask>`: bit 0 = the MMA waves skip their window work, bit 1 = the softmax waves skip theirs (the barrier stays).
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 7 {
+    if mask > 15 {
         return None;
     }
     Some(mla_roles_with(&format!("mla_g1250_qh16_roles_{hex}"), 2, 2, mask))
@@ -36,6 +36,8 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     assert!(depth >= 2 && (depth & (depth - 1)) == 0);
     let in_flight = ((depth - 4).max(0) * wp) as u8;
     let layout = PageLayout::plan();
+    // windows per barrier (mask bit 3 = 2): every producer -> consumer hop crosses one barrier, so the pipeline is 3 W windows deep and the exchange rings have 2 W slots
+    let wpi: i32 = if mask & 8 != 0 { 2 } else { 1 };
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     let names = ["R", "LSE", "Q", "KV", "LTP", "LTD", "LTL", "QTP", "QS", "KS", "VSC"];
@@ -58,10 +60,10 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.arg_tensor("LTD", Ext::sym("NPG") * Ext::c(4));
     let mut lds = LdsPlan::new();
     let kv = lds.ring("KV", (WP * layout.slot_bytes) as i64, depth as u32, Layout::Linear);
-    let red = lds.ring("RED", 512, 2, Layout::Linear);
-    let pbuf = lds.ring("PBUF", 1024 * WP as i64, 2, Layout::Linear);
+    let red = lds.ring("RED", 512, 2 * wpi as u32, Layout::Linear);
+    let pbuf = lds.ring("PBUF", 1024 * WP as i64, 2 * wpi as u32, Layout::Linear);
     let pbuf2 = lds.ring("PBUF2", 1024 * WP as i64, 2, Layout::Linear);
-    let sbuf = lds.ring("SBUF", 8192, 2, Layout::Linear);
+    let sbuf = lds.ring("SBUF", 8192, 2 * wpi as u32, Layout::Linear);
     let ptab = lds.tile("PTAB", 4 * MAX_PAGES as i64, Layout::Linear);
     let lsb = lds.tile("LSUM", 512, Layout::Linear);
     let out = lds.tile_over("OUT", 16 * 512 * 2, &[&kv]);
@@ -282,22 +284,20 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     };
 
     // ---- the two-role prototype: waves 0 - 3 (role 0) = MMA waves, waves 4 - 7 (role 1) = softmax waves; window 0 staged once into slot 0 (stub data, no KV streaming) ----
-    // iteration t: MMA waves: PV(t) from PBUF[t & 1] (gen t), S(t + 3) -> SBUF (gen t + 3); softmax waves: S(t + 2) <- SBUF (gen t + 2), its partial maxima -> RED (gen t + 2),
-    // the window maximum of t + 1 <- RED (gen t + 1), P(t + 1) -> PBUF[(t + 1) & 1] (gen t + 1) from the carried scores of window t + 1; one barrier at the end (all 8 waves)
-    let c0 = b.c_i32(0);
-    let c1 = b.c_i32(1);
-    let c2 = b.c_i32(2);
+    // W = windows per barrier. Window w, produced at one hop and consumed at the next (each hop crosses a barrier): the MMA waves store S(w + 3 W) to SBUF and run PV(w) from PBUF gen w; the softmax waves read S(w + 2 W), put
+    // its maxima to RED gen w + 2 W, read the window maximum of w + W (RED gen w + W) and write P(w + W) (PBUF gen w + W) from the scores carried from the previous iteration; one barrier after W windows (all 8 waves).
+    let w_n = wpi;
+    let nslots = 2 * w_n;
+    let smask = nslots - 1;
     let any_role = |b: &mut FnBuilder, r: i32| {
         let c = b.cmp(CmpPred::Eq, CmpTy::I32, role, Opnd::I32(r));
         b.let_(Op::AnyLane(Opnd::Val(c)))
     };
     let is_mma = any_role(&mut b, 0);
-    let is_sm = any_role(&mut b, 1);
-    // the S tile of the staged window on the MMA waves (K fragments from slot 0, 2 pages x 9 chunks), as two Frag8
     let k_frags = |b: &mut FnBuilder| -> Vec<Vec<ValueId>> {
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
         let sb2 = b.bind_i32(kr.base());
-        let kfr: Vec<Vec<ValueId>> = (0..WP)
+        (0..WP)
             .map(|pg| {
                 let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
                 let nope_row = b.bind_i32(ev(pb) + ev(kofs));
@@ -312,10 +312,9 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                         .collect()
                 })
             })
-            .collect();
-        kfr
+            .collect()
     };
-    let s_chain = |b: &mut FnBuilder, kfr: &[Vec<Opnd>]| -> Vec<Opnd> {
+    let s_chain = |b: &mut FnBuilder, kfr: &[Vec<ValueId>]| -> Vec<Opnd> {
         let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
         for c in 0..9usize {
             for pg in 0..WP as usize {
@@ -325,11 +324,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         }
         sacc.iter().map(|o| o.unwrap()).collect()
     };
-    let s_compute = |b: &mut FnBuilder| -> Vec<Opnd> {
-        let kfr: Vec<Vec<Opnd>> = k_frags(b).iter().map(|v| v.iter().map(|&x| Opnd::Val(x)).collect()).collect();
-        s_chain(b, &kfr)
-    };
-    // the S tile to SBUF[gen & 1] (wave w's 2 KiB: [page][lane][8 f32]) and back on the softmax wave of the same index
     let sbuf_store = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, sacc: &[Opnd]| {
         let r = sbuf.at(&SlotIdx::new(slot, Opnd::Val(gen)));
         let base = b.bind_i32(r.base() + ev(w) * 2048 + ev(lane) * 32);
@@ -361,8 +355,46 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             out
         })
     };
-    // the lean P of window t1: maximum on the raw scores scaled once, one fma per exponent, fp8 pairs to PBUF[t1 & 1]
-    let put_p_lean = |b: &mut FnBuilder, t1: ValueId, x: &[Opnd], vm_old: Opnd, vl_old: Opnd, pm: ValueId| -> (ValueId, ValueId) {
+    let put_max_g = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, x: &[ValueId]| {
+        let mut mx = x[0];
+        for r in 1..x.len() {
+            mx = b.max_f32(mx, x[r]);
+        }
+        let r = red.at(&SlotIdx::new(slot, Opnd::Val(gen)));
+        let a = b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4);
+        r.write(b, |b| b.store_lds(a, mx, MemTy::B32, false));
+    };
+    let get_max_g = |b: &mut FnBuilder, gen: ValueId, slot: Opnd| -> ValueId {
+        let r = red.at(&SlotIdx::new(slot, Opnd::Val(gen)));
+        let rb = b.bind_i32(r.base() + ev(m) * 4);
+        r.read(b, |b| {
+            let mut pm: Option<ValueId> = None;
+            for k in 0..8 {
+                let a = b.bind_i32(ev(rb) + k * 64);
+                let v = b.load_lds(a, MemTy::B32);
+                let vf = f32_of(b, v);
+                pm = Some(match pm {
+                    None => vf,
+                    Some(p) => b.max_f32(p, vf),
+                });
+            }
+            pm.unwrap()
+        })
+    };
+    let pbuf_write = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, vals: &dyn Fn(&mut FnBuilder, usize) -> (ValueId, ValueId)| {
+        let r = pbuf.at(&SlotIdx::new(slot, Opnd::Val(gen)));
+        let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
+        r.write(b, |b| {
+            for pg in 0..WP as usize {
+                let (p0, p1) = vals(b, pg);
+                let a0 = b.bind_i32(ev(pw) + 1024 * pg as i32);
+                b.store_lds(a0, p0, MemTy::B32, false);
+                let a1 = b.bind_i32(ev(pw) + (1024 * pg as i32 + 4));
+                b.store_lds(a1, p1, MemTy::B32, false);
+            }
+        });
+    };
+    let put_p_lean = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, x: &[Opnd], vm_old: Opnd, vl_old: Opnd, pm: ValueId| -> (ValueId, ValueId) {
         let pms = b.mul_f32(pm, cscale);
         let m_new = b.max_f32(vm_old, pms);
         let dm = b.sub_f32(vm_old, m_new);
@@ -379,84 +411,59 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         for pi in &p {
             lsum = b.add_f32(lsum, *pi);
         }
-        let si = b.bind_i32(ev(t1) & 1);
-        let r = pbuf.at(&SlotIdx::new(Opnd::Val(si), Opnd::Val(t1)));
-        let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
-        r.write(b, |b| {
-            for pg in 0..WP as usize {
-                let p0 = b.cvt_pk_fp8x4_f32(p[8 * pg], p[8 * pg + 1], p[8 * pg + 2], p[8 * pg + 3]);
-                let p1 = b.cvt_pk_fp8x4_f32(p[8 * pg + 4], p[8 * pg + 5], p[8 * pg + 6], p[8 * pg + 7]);
-                let a0 = b.bind_i32(ev(pw) + 1024 * pg as i32);
-                b.store_lds(a0, p0, MemTy::B32, false);
-                let a1 = b.bind_i32(ev(pw) + (1024 * pg as i32 + 4));
-                b.store_lds(a1, p1, MemTy::B32, false);
-            }
+        pbuf_write(b, gen, slot, &|b, pg| {
+            (
+                b.cvt_pk_fp8x4_f32(p[8 * pg], p[8 * pg + 1], p[8 * pg + 2], p[8 * pg + 3]),
+                b.cvt_pk_fp8x4_f32(p[8 * pg + 4], p[8 * pg + 5], p[8 * pg + 6], p[8 * pg + 7]),
+            )
         });
         (m_new, lsum)
     };
-    // loop state: O (8 Frag8, MMA waves), the carried scores of window t + 1 (16 f32), running max and sum (softmax waves)
+    // loop state: O (8 Frag8, MMA waves), the carried scores (16 f32 per window of the iteration), running max and sum (softmax waves)
+    let nx = 16 * w_n as usize;
     let mut inits: Vec<(DType, Opnd)> = Vec::new();
     for _ in 0..8 {
         let z = b.frag_cat(&[Opnd::I32(0); 8]);
         inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
     }
-    for _ in 0..16 {
+    for _ in 0..nx {
         inits.push((DType::F32, Opnd::Val(zf)));
     }
     inits.push((DType::F32, Opnd::Val(neg)));
     inits.push((DType::F32, Opnd::Val(zf)));
-    let pre = mask & 4 != 0;
-    if pre {
-        for _ in 0..(2 * 9) {
-            let z = b.frag_cat(&[Opnd::I32(0); 8]);
-            inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
-        }
-    }
     let st = b.declare_vars(&inits);
-    let kvars: Vec<Vec<_>> = if pre { (0..2usize).map(|pg| (0..9usize).map(|c| st[26 + pg * 9 + c]).collect()).collect() } else { Vec::new() };
     let ov: Vec<_> = st[0..8].to_vec();
-    let xs: Vec<_> = st[8..24].to_vec();
-    let (vm, vl) = (st[24], st[25]);
-    // ---- prologue: window 0 into slot 0; S(1) and S(2) on the MMA waves; the softmax waves take S(1) (carried scores, maxima to RED gen 1) and write a stub P into PBUF gen 0 ----
+    let xs: Vec<_> = st[8..8 + nx].to_vec();
+    let (vm, vl) = (st[8 + nx], st[9 + nx]);
+    let gc: Vec<ValueId> = (0..3 * w_n).map(|k| b.c_i32(k)).collect();
+    let slot_c = |k: i32| Opnd::I32(k & smask);
+    // ---- prologue: window 0 into slot 0; S(W .. 3 W - 1) on the MMA waves; the softmax waves take S(W .. 2 W - 1) (carried scores, maxima to RED) and write stub P gens 0 .. W - 1 ----
     b.begin_if(is_mma);
-    stage(&mut b, c0);
+    stage(&mut b, gc[0]);
     b.wait_tensor(0);
     b.end_if();
     b.wait_lds(0);
     b.barrier();
     b.begin_if(is_mma);
-    let s0 = s_compute(&mut b);
-    sbuf_store(&mut b, c1, Opnd::I32(1), &s0);
-    sbuf_store(&mut b, c2, Opnd::I32(0), &s0);
-    if pre {
-        let kf = k_frags(&mut b);
-        for pg in 0..2usize {
-            for c in 0..9usize {
-                b.set_var(kvars[pg][c], Opnd::Val(kf[pg][c]));
-            }
-        }
+    let kf0 = k_frags(&mut b);
+    let s0 = s_chain(&mut b, &kf0);
+    for k in w_n..3 * w_n {
+        sbuf_store(&mut b, gc[k as usize], slot_c(k), &s0);
     }
     b.end_if();
     b.wait_lds(0);
     b.barrier();
-    b.begin_if(is_sm);
-    let x1 = sbuf_load(&mut b, c1, Opnd::I32(1));
-    put_max(&mut b, c1, &x1);
-    for i in 0..16usize {
-        b.set_var(xs[i], Opnd::Val(x1[i]));
+    b.begin_if(is_sm_marker(&mut b, role));
+    for k in w_n..2 * w_n {
+        let xk = sbuf_load(&mut b, gc[k as usize], slot_c(k));
+        put_max_g(&mut b, gc[k as usize], slot_c(k), &xk);
+        for i in 0..16usize {
+            b.set_var(xs[16 * (k - w_n) as usize + i], Opnd::Val(xk[i]));
+        }
     }
-    {
-        let r = pbuf.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
-        let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
+    for k in 0..w_n {
         let stub = b.c_i32(0x3838_3838);
-        r.write(&mut b, |b| {
-            for pg in 0..WP {
-                let a0 = b.bind_i32(ev(pw) + 1024 * pg);
-                b.store_lds(a0, stub, MemTy::B32, false);
-                let a1 = b.bind_i32(ev(pw) + (1024 * pg + 4));
-                b.store_lds(a1, stub, MemTy::B32, false);
-            }
-        });
+        pbuf_write(&mut b, gc[k as usize], slot_c(k), &|_b, _pg| (stub, stub));
     }
     b.end_if();
     b.wait_lds(0);
@@ -469,39 +476,33 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let o0 = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(wfull) * 256);
     let pa0 = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o0) });
     let z = b.c_i32(0);
+    let nitr = b.bind_i32((ev(nwin) + (w_n - 1)) >> ((w_n as u32).trailing_zeros() as i32));
     // ---- the MMA waves' loop ----
     b.begin_if(is_mma);
     {
         let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
         let it = lvars[0];
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
-        let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
-        let t3 = b.bind_i32(ev(t) + 3);
-        let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
-        let kfr_l: Vec<Vec<Opnd>> = if mask & 1 != 0 {
-            Vec::new()
-        } else if pre {
-            kvars.iter().map(|v| v.iter().map(|&x| Opnd::Var(x)).collect()).collect()
-        } else {
-            k_frags(&mut b).iter().map(|v| v.iter().map(|&x| Opnd::Val(x)).collect()).collect()
-        };
-        let psi = b.bind_i32(ev(t) & 1);
-        let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(psi), Opnd::Val(t)));
-        let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
-        let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
-            (0..WP)
-                .map(|pg| {
-                    let lo = b.bind_i32(ev(pbase) + 1024 * pg);
-                    let hi = b.bind_i32(ev(lo) + 16);
-                    b.load_lds_b128x2(lo, hi)
-                })
-                .collect()
-        });
-        let kb = b.bind_i32(kr.base());
-        let vfr: Vec<Vec<ValueId>> = if mask & 1 != 0 {
-            Vec::new()
-        } else {
-            (0..WP)
+        for j in 0..w_n {
+            let wn = b.bind_i32(amdgpu_dsl::varx(it) * w_n + j);
+            let wa = b.bind_i32(ev(wn) + 3 * w_n);
+            let sp = b.bind_i32(ev(wn) & smask);
+            let sa = b.bind_i32(ev(wa) & smask);
+            let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
+            let kfr = k_frags(&mut b);
+            let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(sp), Opnd::Val(wn)));
+            let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+            let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
+                (0..WP)
+                    .map(|pg| {
+                        let lo = b.bind_i32(ev(pbase) + 1024 * pg);
+                        let hi = b.bind_i32(ev(lo) + 16);
+                        b.load_lds_b128x2(lo, hi)
+                    })
+                    .collect()
+            });
+            let kb = b.bind_i32(kr.base());
+            let vfr: Vec<Vec<ValueId>> = (0..WP)
                 .map(|pg| {
                     let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
                     kr.read(&mut b, |b| {
@@ -513,40 +514,21 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                             .collect()
                     })
                 })
-                .collect()
-        };
-        let sacc: Vec<Opnd> = if mask & 1 != 0 {
-            (0..WP).map(|_| Opnd::Val(b.frag_cat(&[Opnd::I32(0); 8]))).collect()
-        } else {
-            s_chain(&mut b, &kfr_l)
-        };
-        let s3 = b.bind_i32(ev(t3) & 1);
-        sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
-        for nt in 0..8usize {
-            if mask & 1 != 0 {
-                break;
-            }
-            for pg in 0..WP as usize {
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][nt], Some(Opnd::Var(ov[nt])));
-                b.set_var(ov[nt], Opnd::Val(d));
-            }
-        }
-        if pre {
-            // the next window's K fragments are issued before the barrier (the slot is already published); only the stores before them must complete
-            let nk = k_frags(&mut b);
-            for pg in 0..2usize {
-                for c in 0..9usize {
-                    b.set_var(kvars[pg][c], Opnd::Val(nk[pg][c]));
+                .collect();
+            let sacc = s_chain(&mut b, &kfr);
+            sbuf_store(&mut b, wa, Opnd::Val(sa), &sacc);
+            for nt in 0..8usize {
+                for pg in 0..WP as usize {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][nt], Some(Opnd::Var(ov[nt])));
+                    b.set_var(ov[nt], Opnd::Val(d));
                 }
             }
-            b.wait_lds(36);
-        } else {
-            b.wait_lds(0);
         }
+        b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
-        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nitr);
         b.break_if(fin);
         b.end_loop();
     }
@@ -556,41 +538,28 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
         let it = lvars[0];
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
-        let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
-        let t1 = b.bind_i32(ev(t) + 1);
-        let t2 = b.bind_i32(ev(t) + 2);
-        let s2 = b.bind_i32(ev(t2) & 1);
-        let xn = sbuf_load(&mut b, t2, Opnd::Val(s2));
-        let pm = get_max(&mut b, t1);
-        let xo: Vec<Opnd> = xs.iter().map(|&v| Opnd::Var(v)).collect();
-        let (m_new, l_new) = if mask & 2 != 0 {
-            let si = b.bind_i32(ev(t1) & 1);
-            let r = pbuf.at(&SlotIdx::new(Opnd::Val(si), Opnd::Val(t1)));
-            let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
-            let stub = b.c_i32(0x3838_3838);
-            r.write(&mut b, |b| {
-                for pg in 0..WP {
-                    let a0 = b.bind_i32(ev(pw) + 1024 * pg);
-                    b.store_lds(a0, stub, MemTy::B32, false);
-                    let a1 = b.bind_i32(ev(pw) + (1024 * pg + 4));
-                    b.store_lds(a1, stub, MemTy::B32, false);
-                }
-            });
-            (pm, pm)
-        } else {
-            put_p_lean(&mut b, t1, &xo, Opnd::Var(vm), Opnd::Var(vl), pm)
-        };
-        put_max(&mut b, t2, &xn);
-        for i in 0..16usize {
-            b.set_var(xs[i], Opnd::Val(xn[i]));
+        for j in 0..w_n {
+            let wn = b.bind_i32(amdgpu_dsl::varx(it) * w_n + j);
+            let w1 = b.bind_i32(ev(wn) + w_n);
+            let w2 = b.bind_i32(ev(wn) + 2 * w_n);
+            let s1 = b.bind_i32(ev(w1) & smask);
+            let s2 = b.bind_i32(ev(w2) & smask);
+            let xn = sbuf_load(&mut b, w2, Opnd::Val(s2));
+            let pm = get_max_g(&mut b, w1, Opnd::Val(s1));
+            let xo: Vec<Opnd> = (0..16usize).map(|i| Opnd::Var(xs[16 * j as usize + i])).collect();
+            let (m_new, l_new) = put_p_lean(&mut b, w1, Opnd::Val(s1), &xo, Opnd::Var(vm), Opnd::Var(vl), pm);
+            put_max_g(&mut b, w2, Opnd::Val(s2), &xn);
+            for i in 0..16usize {
+                b.set_var(xs[16 * j as usize + i], Opnd::Val(xn[i]));
+            }
+            b.set_var(vm, Opnd::Val(m_new));
+            b.set_var(vl, Opnd::Val(l_new));
         }
-        b.set_var(vm, Opnd::Val(m_new));
-        b.set_var(vl, Opnd::Val(l_new));
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
-        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
+        let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nitr);
         b.break_if(fin);
         b.end_loop();
     }
@@ -609,6 +578,11 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     }
     b.store_global(pa0, 104, Opnd::Var(vm), MemTy::B32, false);
     b.store_global(pa0, 108, Opnd::Var(vl), MemTy::B32, false);
-    let _ = (c0, &plse, pbuf2.base, lsb.base, out.base);
+    let _ = (&plse, pbuf2.base, lsb.base, out.base, is_mma);
     b.finish()
+}
+
+fn is_sm_marker(b: &mut FnBuilder, role: ValueId) -> ValueId {
+    let c = b.cmp(CmpPred::Eq, CmpTy::I32, role, Opnd::I32(1));
+    b.let_(Op::AnyLane(Opnd::Val(c)))
 }
