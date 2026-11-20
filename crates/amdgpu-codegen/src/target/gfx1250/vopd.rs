@@ -23,8 +23,9 @@ thread_local! {
     static PAIRS: RefCell<HashSet<(usize, usize)>> = RefCell::new(HashSet::new());
 }
 
-pub fn enabled() -> bool {
-    std::env::var("AMDC_VOPD").is_ok()
+/// The kernel's `vopd` lowering token, or `AMDC_VOPD` (A/B).
+pub fn enabled(m: &MFunction) -> bool {
+    m.vopd || std::env::var("AMDC_VOPD").is_ok()
 }
 
 pub fn clear() {
@@ -65,7 +66,7 @@ fn phys(m: &MFunction, a: &Alloc, r: VReg) -> Option<(bool, u32, u32)> {
 /// tools/mi450/vopd_estimate.py).
 pub fn select(m: &MFunction, a: &Alloc) {
     clear();
-    if !enabled() || m.exact {
+    if !enabled(m) || m.exact {
         return;
     }
     let ok1 = |i: &MInst| -> bool {
