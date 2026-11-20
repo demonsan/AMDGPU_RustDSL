@@ -275,6 +275,27 @@ next steps (not built): issue the next window's K / V fragment loads before the 
 - **Fragments hoisted out of the loop** (`_roles_20`, a measurement only: K, P and V fragments read once): 0.354 us per window, so the fragment-load latency chains are 0.09 us of the 0.446; the rest is the two roles' own paths (MMA about 0.35, softmax about 0.32: they overlap, the window is their max plus the barrier).
 - **Blocked on the tile protocol** (requests to backend): the split barrier across roles, the counted `s_wait_dscnt N` completion of stores (pre-barrier fragment loads, `_roles_4`), and N-way role branches (three waves per SIMD: S waves / softmax waves / PV waves, `_roles_10`, block 384, 336 VGPRs per wave): the role model has two roles and does not follow a wave-uniform sub-branch inside a role.
 
+#### `mla_g1250_qh16_w1r`: the two-role window kernel, in situ (e08, 2026-11-20)
+
+`probes/g1250_mla_w1r.rs` on kernel-opt's `mla_w1_parts::W1Parts` (the parts: setup, `s_load` page ids, TDM stage, masked raw S, RED layout, lean P with packed ops, lazy rescale, epilogue): 8 waves, MMA waves (stage, K / V
+fragments, S and PV WMMAs, the O accumulators) and softmax waves (masked raw scores, maxima, P, running max / sum), handing over through the LDS rings SBUF (S, f32), RED, PBUF, ALPHA, with **two barriers per window**
+(phase A: S(t + 2) and the partial maxima of S(t + 1); phase B: P(t + 1) and PV(t)); a 4-slot KV ring (the PV of window t - 1 may not overlap the stage of t + 3, which rules out the one-barrier pipeline of the prototype
+here). LDS 326,336 B, 336 VGPRs. **Correct on the first build**: MLA_OK at B = 1 for ctx 64, 100, 128, 129, 200, 256, 320, 1000, 1100, 4113, 8192, and the 32 x 2048 output hash is **identical** to `_w1p` / `_w1v`
+(c4343096...). Paired alternating, e08, us (2 runs agree to 1 %):
+
+| B x ctx | `_w1r` | `_w1p` (1 role) | `_ws` | `_ws2` | `_ws4` | vendor |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 x 512 | 8.89 | 8.97 | 9.36 | **8.43** | 10.1 | 7.73 |
+| 4 x 1000 | 11.33 | 12.02 | **11.12** | 11.68 | 16.2 | 9.14 |
+| 32 x 2048 | 16.46 | 18.19 | **15.12** | 18.73 | 29.0 | 12.48 |
+| 128 x 4096 | 40.4 | 44.9 | **32.3** | 39.9 | 64.5 | 31.9 - 34.1 |
+| 128 x 8192 | 72.4 | 82.0 | **53.0** | 74.5 | 123.9 | 54.5 - 54.8 |
+| 512 x 8192 | 187.5 | 199.3 | **174.0** | 213.8 | 347 | 166 - 167.5 |
+
+So the roles give the w1 family **-1 % (4 x 512) to -12 % (128 x 8192)** vs the same code in one role (`_w1p`), not the -28 % the stub prototype promised (the in-situ window also pays the TDM stage, the page ids, the rescale,
+the second barrier and the clamped extra windows), and **no change to the dispatch**: the wave-split `_ws` family stays ahead of every w1 variant from 4 x 1000 up (`_ws2` at 4 x 512). The role structure's remaining cost
+is two barriers per window and the stage on the MMA waves' critical path; the next levers are the ones listed above (pre-barrier loads when the protocol models reads' completion, a third role).
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
