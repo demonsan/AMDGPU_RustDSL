@@ -6,6 +6,7 @@
 //   g1250_wmma_probe_host <co> <kernel> <fp8|fp8k128|f4> <with_c 0|1> [deadline_ms]
 // Kernarg: pointers a, b, c, d, sa, sb (48 bytes). One workgroup of 32 lanes. Prints `WMMA_OK` / `WMMA_FAIL ...` and a JSON line.
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -107,6 +108,7 @@ int main(int argc, char** argv) {
     HC(hipMemset(dd, 0xFF, 32 * nc * 4));
     struct { void *a, *b, *c, *d, *sa, *sb; } ka{da, db, dc, dd, dsa, dsb};
     size_t ksz = sizeof(ka);
+    g1250_check_launch(argv[1], argv[2], ksz, 0, false);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     hipModule_t mod;
     hipFunction_t fn;

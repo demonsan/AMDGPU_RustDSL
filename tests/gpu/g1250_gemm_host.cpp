@@ -6,6 +6,7 @@
 // Hang policy (docs/mi450-nodes.md): every wait is polled with a wall-clock limit (PROBE_WATCHDOG_S, default 15); on expiry the program prints GEMM_HANG and leaves with _exit(124) without touching the device again.
 // One JSON line per run: {"host":"g1250_gemm","kernel":..,"M":..,"N":..,"K":..,"maxerr":..,"maxrel":..,"bad":N,"us":..,"tflops":..,"ok":bool}
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     put64(args, 0, dA); put64(args, 8, dB); put64(args, 16, dC);
     put32(args, 24, K); put32(args, 28, N); put32(args, 32, K / 192);
     size_t sz = args.size();
+    g1250_check_launch(argv[1], kn, sz, 128);
     void* cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, args.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END };
     // the smallest launch first: ONE work-group, then the full grid
     for (int stage = 0; stage < 2; ++stage) {

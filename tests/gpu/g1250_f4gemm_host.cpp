@@ -8,6 +8,7 @@
 // selection), WARMUP (5). Prints `F4GEMM_OK` / `F4GEMM_FAIL ...`, the time and TF/s. Hang safety: every wait is a polled event with a deadline;
 // on expiry the process exits 124 WITHOUT touching the device again (no synchronize / free / reset).
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include "g1250_timing.h"
 #include <chrono>
 #include <cmath>
@@ -137,6 +138,7 @@ int main(int argc, char** argv) {
     hipFunction_t f;
     HC(hipModuleLoad(&mod, co));
     HC(hipModuleGetFunction(&f, mod, kn));
+    g1250_check_launch(argv[1], kn, ksz, 0, false);
     // PAIRED mode: CO2 [KERNEL2] = a second kernel of the same ABI, timed alternately with the first on the same buffers (tests/gpu/g1250_timing.h)
     hipFunction_t f2 = nullptr;
     if (const char* co2 = getenv("CO2")) {

@@ -10,6 +10,7 @@
 //   g1250_launch_host <co> <kernel> <kernarg.bin> <kernarg_size> gx gy gz bx by bz cx cy cz <dyn_lds> <deadline_ms> [iters]
 //   (cx cy cz = 0 0 0: no cluster launch). Prints `LAUNCH_OK us=<avg>` or `LAUNCH_FAIL <reason>`.
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
     if (static_lds + (int)dyn_lds > dev_lds) FAIL("LDS %d + %u exceeds the device limit %d", static_lds, dyn_lds, dev_lds);
 
     size_t sz = ka.size();
+    g1250_check_launch(co, kn, sz, 0, false);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ka.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     hipStream_t s;
     HC(hipStreamCreate(&s));

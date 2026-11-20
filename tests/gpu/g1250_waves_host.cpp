@@ -1,6 +1,7 @@
 // Two-waves-per-SIMD microbenchmark host: g1250_waves_host <co> <kernel> [iters=2000]; env WGS (1) work-groups, PROBE_WATCHDOG_S (20).
 // 256 work-items per work-group (8 waves); prints the loop cycles of each wave of work-group 0 and the kernel time.
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,7 @@ int main(int argc, char** argv) {
     const double lim = getenv("PROBE_WATCHDOG_S") ? atof(getenv("PROBE_WATCHDOG_S")) : 20.0;
     hipModule_t mod; hipFunction_t fn;
     HC(hipModuleLoad(&mod, argv[1])); HC(hipModuleGetFunction(&fn, mod, argv[2]));
+    g1250_check_launch(argv[1], argv[2], 16, 256);
     uint32_t* d; HC(hipMalloc(&d, (size_t)wgs * 2048)); HC(hipMemset(d, 0, (size_t)wgs * 2048));
     struct { void* out; int iters; int pad; } ka{d, iters, 0};
     size_t sz = sizeof(ka);

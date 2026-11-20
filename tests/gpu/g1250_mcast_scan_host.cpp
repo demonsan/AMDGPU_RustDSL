@@ -4,6 +4,7 @@
 //   g1250_mcast_scan_host <co> <kernel> [expect_cluster=2]
 // Hang policy: a polled wait with a wall-clock limit (PROBE_WATCHDOG_S, default 10), exit 124 on expiry.
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
     HC(hipMemcpy(dout, out.data(), 2 * NW * 4, hipMemcpyHostToDevice));
     struct { void *s, *o; } ka{dsrc, dout};
     size_t ksz = sizeof(ka);
+    g1250_check_launch(argv[1], argv[2], ksz, 0, false);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     HIP_LAUNCH_CONFIG lc{};
     lc.gridDimX = 2; lc.gridDimY = 1; lc.gridDimZ = 1;

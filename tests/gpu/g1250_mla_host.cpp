@@ -10,6 +10,7 @@
 // Prints `MLA_OK` / `MLA_FAIL`, time and KV bandwidth. Hang safety: polled deadlines; on expiry exit 124 without touching the device again.
 #include <hip/hip_runtime.h>
 #include "g1250_timing.h"
+#include "g1250_co_meta.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,6 +28,7 @@
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) FAIL("%s: %s", #x, hipGetErrorString(e_)); } while (0)
 
 static int envi(const char* n, int d) { const char* v = getenv(n); return v ? atoi(v) : d; }
+static int g_blk = 128;   // BLOCK=N: the work-items per work-group (kernels built for 256 / 384 work-items: the role-split kernels); checked against the code object before any launch
 static float e4m3(uint8_t b) {  // OCP e4m3fn
     const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
     float v = e == 0 ? std::ldexp((float)m, -9) : std::ldexp(1.f + m / 8.f, e - 7);
@@ -51,6 +53,7 @@ static void wait_deadline(hipEvent_t e, long ms, const char* what) {
 }
 
 int main(int argc, char** argv) {
+    g_blk = envi("BLOCK", 128);
     if (argc < 5) { std::fprintf(stderr, "usage: %s co kernel B ctx [H] [iters] [deadline_ms]\n", argv[0]); return 1; }
     const char* co = argv[1];
     const char* kn = argv[2];
@@ -161,6 +164,8 @@ int main(int argc, char** argv) {
     hipFunction_t f;
     HC(hipModuleLoad(&mod, co));
     HC(hipModuleGetFunction(&f, mod, kn));
+    // the launch contract (kernarg bytes read, work-group size) from the code object, before any launch; vendor code objects: kernarg size only
+    g1250_check_launch(argv[1], kn, ksz, strncmp(kn, "mla_g1250", 9) == 0 ? g_blk : 0, strncmp(kn, "mla_g1250", 9) == 0);
     // PAIRED mode: CO2 [KERNEL2] = a second kernel of the same ABI, timed alternately with the first on the same buffers (tests/gpu/g1250_timing.h)
     hipFunction_t f2 = nullptr;
     if (const char* co2 = getenv("CO2")) {
@@ -176,12 +181,12 @@ int main(int argc, char** argv) {
     HC(hipEventCreate(&e1));
     auto launch1 = [&](hipStream_t st) {
         if (fused) {
-            HC(hipModuleLaunchKernel(f, S, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
+            HC(hipModuleLaunchKernel(f, S, B, 1, g_blk, 1, 1, 0, st, nullptr, cfgs));
         } else if (fc) {
-            HC(hipModuleLaunchKernel(f, S, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
+            HC(hipModuleLaunchKernel(f, S, B, 1, g_blk, 1, 1, 0, st, nullptr, cfgs));
             HC(hipModuleLaunchKernel(fc, 1, B, 1, 128, 1, 1, 0, st, nullptr, cfgs));
         } else {
-            HC(hipModuleLaunchKernel(f, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg));
+            HC(hipModuleLaunchKernel(f, gdx, B, 1, g_blk, 1, 1, 0, st, nullptr, cfg));
         }
     };
     std::printf("launch grid %ux%dx1 block 128%s\n", fc ? S : gdx, B, fc ? " + combine" : "");
@@ -269,7 +274,7 @@ int main(int argc, char** argv) {
     const G1250Timing tmg = g1250_time([&](hipStream_t st) { launch1(st); }, s, wait_deadline, deadline);
     const double us = tmg.median_us;
     if (f2) {
-        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { launch1(st); }, [&](hipStream_t st) { HC(hipModuleLaunchKernel(f2, gdx, B, 1, 128, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
+        const G1250Paired pr = g1250_time_pair([&](hipStream_t st) { launch1(st); }, [&](hipStream_t st) { HC(hipModuleLaunchKernel(f2, gdx, B, 1, g_blk, 1, 1, 0, st, nullptr, cfg)); }, s, wait_deadline, deadline);
         std::printf("{\"host\":\"g1250_mla\",\"paired\":true,\"kernel\":\"%s\",\"us\":%.3f,\"us2\":%.3f,\"ratio\":%.4f,\"pair_spread\":%.4f,\"ok\":true}\n", kn, pr.a_us, pr.b_us, pr.ratio_ba, pr.spread_ratio);
     }
     const double cosd = 1 - 2 * dot / std::max(nn, 1e-12);

@@ -7,6 +7,7 @@
 // (PROBE_WATCHDOG_S, default 15), exit 124 on expiry without touching the device again. Env: SEED (1), CHECK_ROWS (16).
 // One JSON line: {"host":"g1250_f4own","kernel":..,"M":..,"N":..,"K":..,"bad":N,"maxrel":..,"us":..,"tflops":..,"ok":bool}
 #include <hip/hip_runtime.h>
+#include "g1250_co_meta.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -131,6 +132,10 @@ int main(int argc, char** argv) {
     const int swizzle = getenv("SWIZZLE") ? atoi(getenv("SWIZZLE")) : 0;
     if (swizzle && (((1 << lgx) != tx) || ty % swizzle)) { fprintf(stderr, "SWIZZLE=%d: N / BN = %d must be a power of two and the tile rows %d a multiple of it\n", swizzle, tx, ty); return 1; }
     size_t ksz = (persist || swizzle || stamps || lda_pad) ? sizeof(ka) : 48;
+    // the launch contract of the kernel, checked BEFORE any launch: the kernarg bytes it reads (a persistent / swizzled / stamped kernel reads more than the plain 48) and its work-group size
+    g1250_check_launch(argv[1], kn, ksz, THR);
+    if (persist && strstr(kn, "persist") == nullptr) { fprintf(stderr, "LAUNCH-REFUSED: PERSIST=%d but kernel %s is not a persistent kernel\n", persist, kn); return 2; }
+    if (!persist && strstr(kn, "persist") != nullptr) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s is persistent: set PERSIST=G (G a multiple of N / BN, at most the tile count)\n", kn); return 2; }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
         unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
