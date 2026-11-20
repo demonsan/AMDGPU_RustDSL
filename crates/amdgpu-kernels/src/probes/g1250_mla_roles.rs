@@ -21,6 +21,15 @@ pub fn mla_g1250_qh16_roles() -> Function {
     mla_roles_with("mla_g1250_qh16_roles", 2, 2, 0)
 }
 
+/// `mla_g1250_qh16_roles_<hex mask>`: bit 0 = the MMA waves skip their window work, bit 1 = the softmax waves skip theirs (the barrier stays).
+pub fn by_mask(hex: &str) -> Option<Function> {
+    let mask = u32::from_str_radix(hex, 16).ok()?;
+    if mask > 3 {
+        return None;
+    }
+    Some(mla_roles_with(&format!("mla_g1250_qh16_roles_{hex}"), 2, 2, mask))
+}
+
 fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     #[allow(non_snake_case)]
     let WP = wp;
@@ -445,6 +454,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
         let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
         let t3 = b.bind_i32(ev(t) + 3);
+        if mask & 1 == 0 {
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
         let psi = b.bind_i32(ev(t) & 1);
         let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(psi), Opnd::Val(t)));
@@ -481,6 +491,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         }
         let s3 = b.bind_i32(ev(t3) & 1);
         sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
+        }
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
@@ -498,6 +509,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
         let t1 = b.bind_i32(ev(t) + 1);
         let t2 = b.bind_i32(ev(t) + 2);
+        if mask & 2 == 0 {
         let s2 = b.bind_i32(ev(t2) & 1);
         let xn = sbuf_load(&mut b, t2, Opnd::Val(s2));
         put_max(&mut b, t2, &xn);
@@ -509,6 +521,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         }
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(l_new));
+        }
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);

@@ -20,6 +20,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
 
 pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
     // the MLA per-phase microbenchmarks (any mask: `mla_g1250_qh16_ph_<hex>`)
+    if let Some(m) = name.strip_prefix("mla_g1250_qh16_roles_") {
+        return crate::probes::g1250_mla_roles::by_mask(m);
+    }
     if let Some(m) = name.strip_prefix("probe_g1250_waves_") {
         return crate::probes::g1250_waves::by_mask(m);
     }
