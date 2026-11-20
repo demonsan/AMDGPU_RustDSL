@@ -43,9 +43,11 @@ def parse(path):
     return out
 
 def ok(a, b):
+    import os
     if a["mn"] not in X or b["mn"] not in Y:
         return False
-    if len(a["d"]) != 1 or len(b["d"]) != 1 or (a["d"][0] & 1) == (b["d"][0] & 1):
+    import os
+    if len(a["d"]) != 1 or len(b["d"]) != 1 or (not os.environ.get("VOPD3") and (a["d"][0] & 1) == (b["d"][0] & 1)):
         return False
     # windows per slot
     if a["d"][0] // 256 != b["d"][0] // 256:
@@ -56,7 +58,7 @@ def ok(a, b):
         if sa and sb:
             if sa[0] // 256 != sb[0] // 256:
                 return False
-            if sa[0] != sb[0] and (sa[0] & 3) == (sb[0] & 3):
+            if sa[0] != sb[0] and (sa[0] & 3) == (sb[0] & 3) and not os.environ.get("VOPD3"):
                 return False
     # no RAW / WAW between
     reads_b = [x for s_ in b["s"] for x in s_]
