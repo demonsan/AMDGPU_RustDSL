@@ -491,6 +491,11 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
 /// The 512-K 2-slot kernel with bf16 output and no operand swap: the f32 accumulators are rounded in registers (`v_cvt_pk_bf16_f32`), staged as 16-bit pieces into unpadded LDS rows and
 /// stored by one tensor store per wave (half the bytes of the f32 epilogue); host OUT_BF16=1.
 /// As `_bf16s` but the pair exchange (epilogue_lds 6): 32-bit stores of packed bf16 pairs.
+/// As `_bf16p` with the packed-pair exchange (epilogue_lds 7): cvt first, then the neighbour swap and one byte permute per stored dword.
+pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16q(name: &str, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 7, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16p(name: &str, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 6, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
@@ -729,14 +734,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
-    assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || epi == 6 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
-    assert!(epi != 5 && epi != 6 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
+    assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || epi == 6 || epi == 7 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
+    assert!(epi != 5 && epi != 6 && epi != 7 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
     assert!(epi != 4 || (ring.swap && sh.bf16), "epilogue_lds 4: bf16 output with the operand swap");
     assert!(epi != 3 || (ring.swap && sh.bf16), "epilogue_lds 3: bf16 output with the operand swap");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
     // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
     // so its staging rows are unpadded)
-    let epi_rs = if epi == 3 || epi == 4 || epi == 5 || epi == 6 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
+    let epi_rs = if epi == 3 || epi == 4 || epi == 5 || epi == 6 || epi == 7 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
@@ -1250,6 +1255,11 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(if epi == 5 { 1 } else { 2 })));
             // epilogue 6: the lane pair shares a dword column (m & ~1 -> (m >> 1) 4 bytes) and the odd lane takes the odd row of each pair
             let odd = b.let_(Op::AndI32(Opnd::Val(m), Opnd::I32(1)));
+            // epilogue 7: the byte selector of the pair permute (even lane {lo(self), lo(neighbour)}, odd lane {hi(neighbour), hi(self)})
+            let permsel = {
+                let c = b.bind_cond(amdgpu_dsl::ox(Opnd::Val(odd)).ne(0));
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(0x0302_0706), b: Opnd::I32(0x0504_0100) })
+            };
             let lb = b.add_i32(wl0, lrow);
             let lb = b.add_i32(lb, m4);
             let lb2 = {
@@ -1278,7 +1288,28 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     for j in 0..sh.tn {
                         let acc = body.acc[(i * sh.tn + j) as usize];
                         let bi2 = b.add_i32(lb2, Opnd::I32(i * 32 * epi_rs));
-if epi == 6 {
+if epi == 7 {
+// bf16 pairs: round the lane's row pairs first (all in one MSB window: the accumulators are read by `v_cvt_pk_bf16_f32` only), swap the packed pairs with the neighbour lane, and
+// pick the halves with one byte permute per pair (the even lane builds {E[r], O[r]} of the even row, the odd lane {E[r + 1], O[r + 1]}): 3 VALU per stored dword, no selects
+let mut pks: Vec<ValueId> = Vec::new();
+for q in 0..8i32 {
+    let xa = b.frag_slice(Opnd::Var(acc), (2 * q) as u8, 1);
+    let xc = b.frag_slice(Opnd::Var(acc), (2 * q + 1) as u8, 1);
+    let fa = b.bitcast_f32(xa);
+    let fc = b.bitcast_f32(xc);
+    pks.push(b.let_(Op::CvtPkBf16F32(Opnd::Val(fa), Opnd::Val(fc))));
+}
+let mut zs: Vec<ValueId> = Vec::new();
+for q in 0..8usize {
+    zs.push(b.let_(Op::DppQuadPerm { x: Opnd::Val(pks[q]), perm: [1, 0, 3, 2] }));
+}
+for q in 0..8i32 {
+    let w = b.let_(Op::PermB32(Opnd::Val(zs[q as usize]), Opnd::Val(pks[q as usize]), Opnd::Val(permsel)));
+    let rowbase = if q < 4 { 2 * q } else { 2 * q + 8 };
+    let addr = b.bind_i32(ev(bi2) + (rowbase * epi_rs + j * 32));
+    b.store_lds_b32(addr, w);
+}
+} else if epi == 6 {
                         // bf16 pairs through a lane exchange: lanes (2k, 2k + 1) hold columns n, n + 1 of the same rows; the even lane keeps the even accumulator rows of the pair, the odd lane the odd ones: each
                         // sends the row the other keeps (`quad_perm` swap), rounds the pair with one `v_cvt_pk_bf16_f32` and stores the dword (half the stores of the f32 staging, 16-bit data)
                         for q in 0..8i32 {
@@ -1330,7 +1361,28 @@ if epi == 6 {
                 for j in 0..sh.tn {
                     let acc = body.acc[(i * sh.tn + j) as usize];
                     let bi2 = b.add_i32(lb2, Opnd::I32(i * 32 * epi_rs));
-if epi == 6 {
+if epi == 7 {
+// bf16 pairs: round the lane's row pairs first (all in one MSB window: the accumulators are read by `v_cvt_pk_bf16_f32` only), swap the packed pairs with the neighbour lane, and
+// pick the halves with one byte permute per pair (the even lane builds {E[r], O[r]} of the even row, the odd lane {E[r + 1], O[r + 1]}): 3 VALU per stored dword, no selects
+let mut pks: Vec<ValueId> = Vec::new();
+for q in 0..8i32 {
+    let xa = b.frag_slice(Opnd::Var(acc), (2 * q) as u8, 1);
+    let xc = b.frag_slice(Opnd::Var(acc), (2 * q + 1) as u8, 1);
+    let fa = b.bitcast_f32(xa);
+    let fc = b.bitcast_f32(xc);
+    pks.push(b.let_(Op::CvtPkBf16F32(Opnd::Val(fa), Opnd::Val(fc))));
+}
+let mut zs: Vec<ValueId> = Vec::new();
+for q in 0..8usize {
+    zs.push(b.let_(Op::DppQuadPerm { x: Opnd::Val(pks[q]), perm: [1, 0, 3, 2] }));
+}
+for q in 0..8i32 {
+    let w = b.let_(Op::PermB32(Opnd::Val(zs[q as usize]), Opnd::Val(pks[q as usize]), Opnd::Val(permsel)));
+    let rowbase = if q < 4 { 2 * q } else { 2 * q + 8 };
+    let addr = b.bind_i32(ev(bi2) + (rowbase * epi_rs + j * 32));
+    b.store_lds_b32(addr, w);
+}
+} else if epi == 6 {
                     // bf16 pairs through a lane exchange: lanes (2k, 2k + 1) hold columns n, n + 1 of the same rows; the even lane keeps the even accumulator rows of the pair, the odd lane the odd ones: each
                     // sends the row the other keeps (`quad_perm` swap), rounds the pair with one `v_cvt_pk_bf16_f32` and stores the dword (half the stores of the f32 staging, 16-bit data)
                     for q in 0..8i32 {
@@ -1374,7 +1426,7 @@ if epi == 6 {
             let c0 = b.add_i32(c0, col0);
             let lin = b.mul_i32(r0, nn);
             let lin = b.add_i32(lin, c0);
-            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(if epi == 5 || epi == 6 { 1 } else { 2 })));
+            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(if epi == 5 || epi == 6 || epi == 7 { 1 } else { 2 })));
             if epi == 1 {
                 // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
                 assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
@@ -1399,7 +1451,7 @@ if epi == 6 {
                 }
             } else {
                 // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
-                let tile = TensorTile { data_size: if epi == 5 || epi == 6 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
+                let tile = TensorTile { data_size: if epi == 5 || epi == 6 || epi == 7 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
                 // (the origin and the LDS base are wave-uniform: scalar descriptor words)
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
