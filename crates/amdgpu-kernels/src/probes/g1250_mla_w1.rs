@@ -481,6 +481,14 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     };
     if ilp {
         stamp(&mut b);
+        // (lean) M(t + 1) and P(t + 1) first: the max partials' LDS reads must not queue behind the fragment batch (in-order DScnt: a wait
+        // for them would wait for every fragment)
+        let p1_early = if lean {
+            let pm1 = get_max(&mut b, t1);
+            Some(put_p_lean(&mut b, t1, &xv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>(), Opnd::Var(vm), Opnd::Var(vl), pm1))
+        } else {
+            None
+        };
         // 1. stage window t + depth - 1
         stage(&mut b, t3);
         stamp(&mut b);
@@ -574,7 +582,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         }
         // 4. S(t + 2) and PV(t) WMMAs interleaved (independent chains); P(t + 1)'s logits / max read / exps between the first groups
         let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
-        let mut p1 = None;
+        let mut p1 = p1_early;
         let mut x1c_keep = Vec::new();
         for c in 0..9usize {
             for pg in 0..WP as usize {
@@ -618,7 +626,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
             if c == 1 && !lean {
                 x1c_keep = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
             }
-            if c == 3 {
+            if c == 3 && !lean {
                 let pm1 = get_max(&mut b, t1);
                 p1 = Some(if lean {
                     put_p_lean(&mut b, t1, &xv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>(), Opnd::Var(vm), Opnd::Var(vl), pm1)
