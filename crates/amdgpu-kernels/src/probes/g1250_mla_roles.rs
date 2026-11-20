@@ -294,7 +294,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let is_mma = any_role(&mut b, 0);
     let is_sm = any_role(&mut b, 1);
     // the S tile of the staged window on the MMA waves (K fragments from slot 0, 2 pages x 9 chunks), as two Frag8
-    let s_compute = |b: &mut FnBuilder| -> Vec<Opnd> {
+    let k_frags = |b: &mut FnBuilder| -> Vec<Vec<ValueId>> {
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
         let sb2 = b.bind_i32(kr.base());
         let kfr: Vec<Vec<ValueId>> = (0..WP)
@@ -313,6 +313,9 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 })
             })
             .collect();
+        kfr
+    };
+    let s_chain = |b: &mut FnBuilder, kfr: &[Vec<ValueId>]| -> Vec<Opnd> {
         let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
         for c in 0..9usize {
             for pg in 0..WP as usize {
@@ -321,6 +324,10 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             }
         }
         sacc.iter().map(|o| o.unwrap()).collect()
+    };
+    let s_compute = |b: &mut FnBuilder| -> Vec<Opnd> {
+        let kfr = k_frags(b);
+        s_chain(b, &kfr)
     };
     // the S tile to SBUF[gen & 1] (wave w's 2 KiB: [page][lane][8 f32]) and back on the softmax wave of the same index
     let sbuf_store = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, sacc: &[Opnd]| {
@@ -455,6 +462,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
         let t3 = b.bind_i32(ev(t) + 3);
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
+        let kfr_l = if mask & 1 != 0 { Vec::new() } else { k_frags(&mut b) };
         let psi = b.bind_i32(ev(t) & 1);
         let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(psi), Opnd::Val(t)));
         let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
@@ -488,8 +496,10 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let sacc: Vec<Opnd> = if mask & 1 != 0 {
             (0..WP).map(|_| Opnd::Val(b.frag_cat(&[Opnd::I32(0); 8]))).collect()
         } else {
-            s_compute(&mut b)
+            s_chain(&mut b, &kfr_l)
         };
+        let s3 = b.bind_i32(ev(t3) & 1);
+        sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
         for nt in 0..8usize {
             if mask & 1 != 0 {
                 break;
@@ -499,8 +509,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 b.set_var(ov[nt], Opnd::Val(d));
             }
         }
-        let s3 = b.bind_i32(ev(t3) & 1);
-        sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
