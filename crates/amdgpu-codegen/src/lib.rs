@@ -204,6 +204,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str], inner_start
         exact::diff_pub("waits(physical)", &view, &c, &a, &mut out);
         if !out.is_empty() {
             let first: Vec<String> = out.iter().take(4).map(|v| format!("{v:?}")).collect();
+            // (debug, `AMDC_WAIT_CHECK_WARN`: report and continue, to inspect the code)
+            if std::env::var("AMDC_WAIT_CHECK_WARN").is_ok() {
+                eprintln!("{}: {} wait(s) missing on the physical-register view: {}", f.name, out.len(), first.join(" | "));
+                return Ok((m, a, k));
+            }
             return Err(format!("{}: {} wait(s) missing on the physical-register view: {}", f.name, out.len(), first.join(" | ")));
         }
     }
