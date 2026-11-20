@@ -834,9 +834,12 @@ pub enum Op {
     /// starts as `old` (lanes the EXEC mask disables keep it; so do lanes whose source is invalid unless `bc`, which then read 0). `fi`
     /// (fetch invalid): a disabled source lane is read anyway. The 16-lane forms: `a` / `b` the two SGPR halves of the 8 x 4-bit lane
     /// selects (`P16` / `X16`), or `a` one VGPR of per-lane selects (`P16Var` / `X16Var`, `b` unused); the group forms (`Bcast`, `Up`,
-    /// `Down`, `Xor`): `a` the lane / distance / mask, `b` the group size.
+    /// `Down`, `Xor`): `a` the lane / distance / mask, `b` the group size in lanes; they read every source lane whatever EXEC says and have
+    /// no `fi` / `bc` (a lowering error). `Up` / `Down`: lane i reads lane i - a / i + a of its group; a lane whose source would leave the
+    /// group keeps its own value (measured on MI450, tests/gpu/g1250_probe_host.cpp `permlane`).
     Permlane { kind: PermlaneKind, x: Opnd, a: Opnd, b: Opnd, old: Opnd, fi: bool, bc: bool },
-    /// gfx1250 `v_permlane_idx_gen_b32 d, x, a`: the byte index for a backwards permute (`ds_bpermute`) built from `x` and `a`.
+    /// gfx1250 `v_permlane_idx_gen_b32 d, x, a`: the byte index for a backwards permute (`ds_bpermute`) built from `x` and `a`. Encoded and
+    /// lowered; its exact function is not modelled here (no public specification): the probe records results but does not check them.
     PermlaneIdxGen { x: Opnd, a: Opnd },
     /// conversion (`CvtOp`; operands and `sel` per op)
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
