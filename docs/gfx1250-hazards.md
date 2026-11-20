@@ -48,3 +48,10 @@ moves and every other reader keep it. The last two rows: `KERNEL=probe_g1250_tra
 ## DPP
 
 LLVM's DPP hazards (`GCNHazardRecognizer::checkDPPHazards`: 2 wait states between a VALU VGPR write and a DPP read of it, 5 after an EXEC write) sit behind `if (ST.hasNoDataDepHazard()) return` in both the hazard query and the padding pass; gfx10+ (gfx1250 included) has that feature: the hardware interlocks those dependencies, and the gfx1250 hazard pass inserts nothing for them. A DPP instruction is a VALU for the rules above (TRANS co-execution: it is not a proven reader class, so it keeps the `v_nop`; the WMMA windows apply). Evidence: `probe_g1250_dpp` (every DPP16 control, DPP8, the row / bank masks, bound_ctrl, a DPP ALU op; each result written right after its source VALU) matches the CPU model on MI450 (e08-01, 1 and 64 workgroups, `tools/mi450/dpp_probe.sh`).
+
+## Lane permutes
+
+- A lane permute must not directly follow a `v_cmpx` (G5 `GV-1250-PERMLANE-CMPX`; LLVM's `fixVcmpxPermlaneHazards` is the public counterpart). The compiler emits no `v_cmpx`.
+- The hardware documentation's lists that name `v_permlane16` / `v_permlanex16` and "any DPP instruction" among other cross-lane and 64-bit operations are the instructions that cannot take part in the single-use-VDST register hint (as producer or consumer). The compiler never emits that hint, so these lists impose nothing here.
+- The lane permutes are VALU instructions for the rules above (the TRANS co-execution and WMMA windows); they read their destination's old value (lanes not written keep it).
+- Semantics checked on MI450 (`probe_g1250_permlane`, `tools/mi450/permlane_probe.sh`; 1 and 64 workgroups, and with EXEC narrowed around every permute): `v_permlane16_b32` / `v_permlanex16_b32` and their `_var` forms with fetch-invalid / bound-ctrl, and the group forms `v_permlane_bcast_b32`, `_up`, `_down`, `_xor`, which read disabled source lanes and take no `op_sel`.

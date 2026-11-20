@@ -204,6 +204,16 @@ pub enum MOp {
     VOrB32Dpp,
     VXorB32Dpp,
     VPermlane16Swap,
+    /// gfx1250 lane permutes: dst (tied to its old value, the last source), x, a[, b]; imm = fetch_invalid | bound_ctrl << 1
+    VPermlane16B32,
+    VPermlaneX16B32,
+    VPermlane16VarB32,
+    VPermlaneX16VarB32,
+    VPermlaneBcastB32,
+    VPermlaneUpB32,
+    VPermlaneDownB32,
+    VPermlaneXorB32,
+    VPermlaneIdxGenB32,
     // P1 A2 conversions (imm: word / byte select; partial writes keep the destination's other bits: srcs end with the old value)
     VCvtPkF32Fp8,
     VCvtF32Fp8,
@@ -915,6 +925,10 @@ pub struct MFunction {
     /// `radword` lowering option (S1 of docs/ra-subreg.md): the hole-filling allocation tracks liveness per tuple DWORD, so a tuple's dead
     /// dwords hold other values
     pub ra_dword: bool,
+    /// `racompact` lowering option: the register allocation is the smaller of the linear scan and the two-phase packing (wide tuples first,
+    /// singles into the holes in time), not the scan unless it fails; for kernels whose VGPR count gates their occupancy (a 2-workgroup
+    /// GEMM needs <= 512 on gfx1250) when the scan's fragmentation costs a window
+    pub ra_compact: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
     /// Register planning (DSL `RegMark`s resolved to vregs) and the weave / stage regions instructions are tagged with (`MInst::region`).

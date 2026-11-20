@@ -691,6 +691,30 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             // prefix (VOP3P op 0x35: scale A, scale B, the inline 0; matrix_b_scale:MATRIX_SCALE_ROW1 sets its op_sel_hi bit 0), then the
             // matrix instruction with op_sel_hi[2] (d0 bit 14) set
             let d = vreg(op_at(&i, 0)?)?;
+            // FMA_MIX (v_fma_mix_f32 / v_fma_mixlo_f16 / v_fma_mixhi_f16): op_sel [11 + k], op_sel_hi src0 / src1 at d1 [27] / [28], src2
+            // at d0 [14] (default 0: the f32 sources), source negation d1 [29 + k], clamp d0 [15]
+            if i.mn.starts_with("v_fma_mix") {
+                let bits = |k: &str| -> Vec<u32> {
+                    modv(&i, k).map(|v| v.trim_start_matches('[').trim_end_matches(']').split(',').map(|x| x.trim().parse::<u32>().unwrap_or(0) & 1).collect()).unwrap_or_default()
+                };
+                let (os, oh) = (bits("op_sel"), bits("op_sel_hi"));
+                let g = |v: &Vec<u32>, k: usize| v.get(k).copied().unwrap_or(0);
+                let mut enc = [0u32; 3];
+                let mut neg = 0u32;
+                for k in 0..3 {
+                    let (o, n) = i.ops.get(k + 1).ok_or_else(|| format!("`{t}`: operand {}", k + 1))?;
+                    let (c, l) = src9(o)?;
+                    if l.is_some() {
+                        return Err(format!("`{t}`: a literal in FMA_MIX"));
+                    }
+                    enc[k] = c;
+                    neg |= (*n as u32) << k;
+                }
+                let clamp = i.mods.iter().any(|(m, _)| m == "clamp") as u32;
+                out.extend_from_slice(&d32(0xCC00_0000 | op << 16 | clamp << 15 | g(&oh, 2) << 14 | g(&os, 2) << 13 | g(&os, 1) << 12 | g(&os, 0) << 11 | d));
+                out.extend_from_slice(&d32(neg << 29 | g(&oh, 1) << 28 | g(&oh, 0) << 27 | enc[2] << 18 | enc[1] << 9 | enc[0]));
+                return Ok(out);
+            }
             // the packed f32 forms (v_pk_add / mul / fma_f32): op_sel_hi = 1 for all three sources (d0 bit 14 + d1 [28:27]); a missing
             // src2 is the inline 0 (llvm-mc: `v_pk_add_f32 v[20:21], v[16:17], v[16:17]` = cc294014 1a022110)
             let packed = i.mn.starts_with("v_pk_");

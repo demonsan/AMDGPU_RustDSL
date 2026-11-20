@@ -201,6 +201,8 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::Permlane32SwapA { .. }
         | Op::SwapA { .. }
         | Op::Permlane16SwapA { .. }
+        | Op::Permlane { .. }
+        | Op::PermlaneIdxGen { .. }
         | Op::VAddU64 { .. }
         | Op::CvtPkFp8Half { .. }
         | Op::PkNegF32(_)
@@ -230,7 +232,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
         Op::Wmma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::PkFmaF32(..) | Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
+        Op::PkFmaF32(..) | Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::Permlane { .. } | Op::PermlaneIdxGen { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
         // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
         Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
