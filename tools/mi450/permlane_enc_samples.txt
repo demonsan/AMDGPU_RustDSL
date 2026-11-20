@@ -21,4 +21,9 @@ v_add_f32_dpp v1, v2, v3 dpp8:[1,0,3,2,5,4,7,6] fi:1
 v_cmp_gt_f32_dpp vcc_lo, v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 v_cmp_gt_f32_e64_dpp s4, v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 ds_bpermute_b32 v1, v2, v3
-ds_bpermute_b32 v1, v2, v3 offset:4
+ds_bpermute_b32 v1, v2, v3 offset:4v_fma_mix_f32 v1, v2, v3, v4
+v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[1,1,1]
+v_fma_mix_f32 v1, -v2, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,1]
+v_fma_mixlo_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]
+v_fma_mix_f32_e64_dpp v1, v2, v3, v4 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+v_fma_mix_f32_e64_dpp v1, v2, v3, v4 dpp8:[1,0,3,2,5,4,7,6]
