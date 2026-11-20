@@ -51,15 +51,23 @@ our own kernels with them.
 **MLA decode, qh16, fp8 Q / KV, page size 64** (same ABI as the vendor kernel, so the host runs both; all results checked against an fp32
 reference, error equal to the vendor's):
 
-| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-19) | kernel |
+| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-20, VOPD build) | kernel |
 |---|---|---|---|
-| 1 x 64 (1) | - | ~1.3 (the vendor itself 2.9 - 3.8 us) | `_ws4` |
-| 4 x 512 (8) | - | 1.09 - 1.13 | `_ws2` |
-| 4 x 1000 (16) | 1.65 | 1.24 | `_ws` |
-| 32 x 2048 (32) | 1.90 | 1.22 | `_ws` |
-| 128 x 4096 (64) | 1.38 | **0.93 - 0.95** | `_ws` |
-| 128 x 8192 (128) | 1.65 | **0.97 - 1.01** | `_ws` |
-| 512 x 8192 (128) | 1.34 | 1.03 | `_ws` |
+| 1 x 64 (1) | - | 1.22 | `_ws4` |
+| 4 x 64 (1) | - | 1.31 | `_ws4` |
+| 4 x 128 (2) | - | 1.50 | `_ws4` |
+| 4 x 256 (4) | - | 1.52 | `_ws4` |
+| 4 x 512 (8) | - | 1.08 | `_ws2` |
+| 4 x 1000 (16) | 1.65 | 1.19 | `_ws` |
+| 32 x 2048 (32) | 1.90 | 1.15 | `_ws` |
+| 128 x 4096 (64) | 1.38 | **0.94** | `_ws` |
+| 128 x 8192 (128) | 1.65 | **0.98** | `_ws` |
+| 512 x 8192 (128) | 1.34 | 1.01 | `_ws` |
+
+All paired against the vendor on one e08 GPU, every run MLA_OK for our kernels. The vendor kernel itself hung once in a timed run at
+512 x 8192 (`GPU HANG ANALYSIS`, 1 of 4 runs; its other runs and ours were correct): that shape's vendor timings are from the runs that
+completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in the code object (`.amdc_launch_abi`, the workspace /
+counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
 Dispatch rule: 1 page per sequence -> `mla_g1250_qh16_ws4` (all 4 waves take every page, 128 V dims each), 2 - 8 pages -> `_ws2` (wave
 pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
