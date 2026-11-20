@@ -287,7 +287,13 @@ fn independent_multiplies_pair_into_vopd() {
     let p = b.let_(Op::KernargPtr { offset: 0 });
     let t = b.let_(Op::WorkitemId);
     let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t);
-    let ys: Vec<_> = (0..8).map(|k| b.mul_f32(x, Opnd::F32(1.5 + k as f32))).collect();
+    let ys: Vec<_> = (0..8)
+        .map(|k| {
+            let tk = b.let_(Op::AddI32(Opnd::Val(t), Opnd::I32(k + 1)));
+            let z = b.un(amdgpu_dsl::UnOp::CvtF32I32, tk);
+            b.mul_f32(x, z)
+        })
+        .collect();
     let o = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2)));
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
     for (k, y) in ys.iter().enumerate() {
