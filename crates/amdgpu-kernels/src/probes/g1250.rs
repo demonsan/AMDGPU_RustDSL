@@ -622,7 +622,7 @@ pub fn probe_g1250_pkmul() -> Function {
     }
     let i2 = b.add_i32(Opnd::Var(vars[1]), 1);
     b.set_var(vars[1], i2);
-    let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, 2);
+    let done = b.cmp(amdgpu_dsl::CmpPred::Ge, amdgpu_dsl::CmpTy::I32, i2, 2);
     b.break_if(done);
     b.end_loop();
     let wgo = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(8 * 128)));
