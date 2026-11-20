@@ -93,6 +93,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let WP = wp;
     assert!(depth >= 4 && (depth & (depth - 1)) == 0);
     let in_flight = ((depth - 4) * wp) as u8;
+    let lean_early = LEAN.with(|c| c.get());
     let layout = PageLayout::plan();
     let mut b = FnBuilder::new(name, 128);
     b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
@@ -216,9 +217,19 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         for pg in 0..WP {
             let tp = b.bind_i32(ev(t) * WP + pg);
             let tc = b.let_(Op::MinI32(Opnd::Val(tp), Opnd::Val(lastp)));
-            let ta = b.bind_i32((ev(tc) << 2) + ptab.base as i32);
-            let pidv = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
-            let pid = b.read_first_lane(pidv);
+            let pid = if lean_early {
+                // the page id straight from the page table (scalar load; no LDS round trip)
+                let er = b.bind_i32(ev(kv0) + ev(tc));
+                let el = b.bind_i32(ev(kv_end) - 1);
+                let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+                let eo = b.bind_i32(ev(ec) * 4);
+                let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+                b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 })
+            } else {
+                let ta = b.bind_i32((ev(tc) << 2) + ptab.base as i32);
+                let pidv = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
+                b.read_first_lane(pidv)
+            };
             b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
             let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(w) * QUARTER);
             let lds_a = b.bind_i32(r.base() + pg * layout.slot_bytes + ev(w) * layout.quarter_lds);
@@ -288,7 +299,11 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let si = b.bind_i32(ev(t) & 1);
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = red.at(&sl);
-        let a = b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4);
+        let a = if lean_early {
+            b.bind_i32(r.base() + ev(m) * 32 + (ev(w) * 2 + ev(g)) * 4)
+        } else {
+            b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4)
+        };
         r.write(b, |b| b.store_lds(a, mx, MemTy::B32, false));
     };
     // the window maximum of head m (8 partials)
@@ -296,6 +311,19 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let si = b.bind_i32(ev(t) & 1);
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = red.at(&sl);
+        if lean_early {
+            // the 8 partials of head m are contiguous: one b128 pair
+            let lo = b.bind_i32(r.base() + ev(m) * 32);
+            let hi = b.bind_i32(ev(lo) + 16);
+            return r.read(b, |b| {
+                let v8 = b.load_lds_b128x2(lo, hi);
+                let f: Vec<ValueId> = (0..8u8).map(|e| { let x = b.frag_slice(Opnd::Val(v8), e, 1); f32_of(b, x) }).collect();
+                let a1 = b.max3_f32(f[0], f[1], f[2]);
+                let a2 = b.max3_f32(a1, f[3], f[4]);
+                let a3 = b.max3_f32(a2, f[5], f[6]);
+                b.max_f32(a3, f[7])
+            });
+        }
         let rb = b.bind_i32(r.base() + ev(m) * 4);
         r.read(b, |b| {
             let mut pm: Option<ValueId> = None;
