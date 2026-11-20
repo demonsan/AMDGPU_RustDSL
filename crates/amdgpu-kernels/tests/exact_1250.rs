@@ -305,3 +305,20 @@ fn independent_multiplies_pair_into_vopd() {
         amdgpu_codegen::amdgpu_target::gfx1250_co::encode_line(l, 0, &|_| Some(0)).unwrap_or_else(|e| panic!("{e}"));
     }
 }
+
+/// The packed lookup-table converts compile with their mitigation: every `v_perm_pk16_*` is followed by a safe instruction (a `v_nop` when
+/// the next one is not), the kernel starts with the entry prologue, and G5 (GV-1250-PERMPK16, part of every compile) accepts the text.
+#[test]
+fn permpk16_compiles_with_its_mitigation() {
+    let c = amdgpu_codegen::compile_target(&amdgpu_kernels::probes::g1250::probe_g1250_permpk16(), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    let lines: Vec<&str> = c.asm.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.ends_with(':') && !l.starts_with('.') && !l.starts_with("//")).collect();
+    let n = lines.iter().filter(|l| l.starts_with("v_perm_pk16_")).count();
+    assert_eq!(n, 2, "{}", c.asm);
+    for (k, l) in lines.iter().enumerate() {
+        if l.starts_with("v_perm_pk16_") {
+            let next = lines[k + 1];
+            let (mn, ops) = next.split_once(' ').unwrap_or((next, ""));
+            assert!(amdgpu_codegen::gpu_verify_1250::permpk16_safe_follower(mn, ops), "`{l}` followed by `{next}`\n{}", c.asm);
+        }
+    }
+}

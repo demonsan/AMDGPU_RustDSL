@@ -488,6 +488,36 @@ static int run_pkmul(Kernel& k, const char* kn) {
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_permpk16: no CPU model (the lookup semantics are not public): two launches must agree word for word; lane 0..3 words printed.
+// WGS workgroups (default 1).
+static int run_permpk16(Kernel& k, const char* kn) {
+    const int wgs = getenv("WGS") ? atoi(getenv("WGS")) : 1;
+    const size_t n = (size_t)wgs * 6 * 32;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, n * 4));
+    std::vector<uint32_t> o1(n), o2(n);
+    for (int rep = 0; rep < 2; ++rep) {
+        HC(hipMemset(dout, 0, n * 4));
+        std::vector<uint8_t> args(8, 0);
+        put64(args, 0, dout);
+        k.launch(wgs, 32, args, kn);
+        HC(hipMemcpy(rep ? o2.data() : o1.data(), dout, n * 4, hipMemcpyDeviceToHost));
+    }
+    long diff = 0;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t x = 0; x < n; ++x) {
+        diff += o1[x] != o2[x];
+        h = (h ^ o1[x]) * 1099511628211ull;
+    }
+    for (int l = 0; l < 4; ++l) {
+        printf("lane %d:", l);
+        for (int kk = 0; kk < 6; ++kk) printf(" %08x", o1[kk * 32 + l]);
+        printf("\n");
+    }
+    printf("permpk16: wgs=%d hash %016llx diff=%ld %s\n", wgs, (unsigned long long)h, diff, diff == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return diff == 0 ? 0 : 3;
+}
+
 // probe_g1250_dpp: every DPP control against this CPU model (wave32: rows of 16 lanes, banks of 4 lanes in a row; a lane whose source is
 // invalid keeps old unless bound_ctrl (then 0); a lane in a disabled row / bank is not written: old). WGS workgroups (default 64).
 static int run_dpp(Kernel& k, const char* kn) {
@@ -725,6 +755,7 @@ int main(int argc, char** argv) {
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "dpp") return run_dpp(k, kn);
+    if (mode == "permpk16") return run_permpk16(k, kn);
     if (mode == "pkmul") return run_pkmul(k, kn);
     if (mode == "wmmalat") return run_wmmalat(k, kn);
     if (mode == "permlane") return run_permlane(k, kn);
