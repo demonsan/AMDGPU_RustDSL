@@ -397,23 +397,44 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             }
         });
     };
+    // kernel-opt's lean P (w1v): m_new = max(m_old, pm_raw * scale); exponent pairs by v_pk_fma_f32 (x * scale - m_new); the sum by pairwise packed adds
     let put_p_lean = |b: &mut FnBuilder, gen: ValueId, slot: Opnd, x: &[Opnd], vm_old: Opnd, vl_old: Opnd, pm: ValueId| -> (ValueId, ValueId) {
         let pms = b.mul_f32(pm, cscale);
         let m_new = b.max_f32(vm_old, pms);
         let dm = b.sub_f32(vm_old, m_new);
         let alpha = b.exp2_f32(dm);
-        let negm = b.sub_f32(zf, m_new);
-        let mut lsum = b.mul_f32(vl_old, alpha);
-        let p: Vec<ValueId> = x
-            .iter()
-            .map(|&xi| {
-                let d = b.let_(Op::FmaF32(xi, Opnd::Val(cscale), Opnd::Val(negm)));
-                b.exp2_f32(d)
+        let sc2 = b.frag2_dup(cscale);
+        let nm = b.neg_f32(m_new);
+        let nm2 = b.frag2_dup(nm);
+        let mut p = Vec::with_capacity(x.len());
+        let dp: Vec<ValueId> = (0..x.len() / 2)
+            .map(|k| {
+                let pair = b.frag_cat(&[x[2 * k], x[2 * k + 1]]);
+                b.pk_fma_f32(pair, sc2, nm2)
             })
             .collect();
-        for pi in &p {
-            lsum = b.add_f32(lsum, *pi);
+        for k in 0..dp.len() {
+            for h in 0..2u8 {
+                let dv = b.frag_slice(Opnd::Val(dp[k]), h, 1);
+                let df = f32_of(b, dv);
+                p.push(b.exp2_f32(df));
+            }
         }
+        let mut pairs: Vec<ValueId> = (0..p.len() / 2).map(|k| b.frag_cat(&[Opnd::Val(p[2 * k]), Opnd::Val(p[2 * k + 1])])).collect();
+        while pairs.len() > 1 {
+            let mut nx = Vec::new();
+            for k in 0..pairs.len() / 2 {
+                nx.push(b.pk_add_f32(pairs[2 * k], pairs[2 * k + 1]));
+            }
+            pairs = nx;
+        }
+        let s0 = b.frag_slice(Opnd::Val(pairs[0]), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(pairs[0]), 1, 1);
+        let s0f = f32_of(b, s0);
+        let s1f = f32_of(b, s1);
+        let ps = b.add_f32(s0f, s1f);
+        let la = b.mul_f32(vl_old, alpha);
+        let lsum = b.add_f32(la, ps);
         pbuf_write(b, gen, slot, &|b, pg| {
             (
                 b.cvt_pk_fp8x4_f32(p[8 * pg], p[8 * pg + 1], p[8 * pg + 2], p[8 * pg + 3]),
@@ -422,7 +443,18 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         });
         (m_new, lsum)
     };
-    // loop state: O (8 Frag8, MMA waves), the carried scores (16 f32 per window of the iteration), running max and sum (softmax waves)
+    // the masked raw scores of window `gen` read from SBUF: per-lane token limit against constant offsets (w1v's mask)
+    let mask_raw = |b: &mut FnBuilder, gen: ValueId, x: &[ValueId]| -> Vec<ValueId> {
+        let mut out = Vec::with_capacity(x.len());
+        for pg in 0..WP {
+            let lim = b.bind_i32(ev(ctx) - (ev(gen) * (64 * WP) + (64 * pg) + ev(w) * 16 + ev(g) * 8));
+            for r in 0..8usize {
+                let ok = b.cmp(CmpPred::Gt, CmpTy::I32, lim, Opnd::I32(r as i32));
+                out.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(x[8 * pg as usize + r]), b: Opnd::Val(neg) }));
+            }
+        }
+        out
+    };    // loop state: O (8 Frag8, MMA waves), the carried scores (16 f32 per window of the iteration), running max and sum (softmax waves)
     let nx = 16 * w_n as usize;
     let mut inits: Vec<(DType, Opnd)> = Vec::new();
     for _ in 0..8 {
