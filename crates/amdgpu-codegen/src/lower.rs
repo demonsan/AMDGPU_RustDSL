@@ -4057,8 +4057,19 @@ impl Lowerer {
                 let rx = self.as_v1(*x)?;
                 let o = self.as_v1(*old)?;
                 // the selects: VGPR for the _var forms, else SGPR / inline constant (`as_s_or_imm`)
-                let sa = if kind.var() { Src::Reg(self.as_v1(*a)?) } else { self.s_operand(*a)? };
-                let sb = if kind.var() { None } else { Some(self.s_operand(*b)?) };
+                // (a VOP3 carries at most one literal: a select that is not an inline constant goes to an SGPR)
+                let sreg = |me: &mut Self, o: Opnd| -> Result<Src, String> {
+                    match me.s_operand(o)? {
+                        Src::Imm(k) if !(-16..=64).contains(&k) => {
+                            let r = me.new_vreg(RClass::S1);
+                            me.push(MInst::new(MOp::SMovB32).def(r).src(Src::Imm(k)));
+                            Ok(Src::Reg(r))
+                        }
+                        s => Ok(s),
+                    }
+                };
+                let sa = if kind.var() { Src::Reg(self.as_v1(*a)?) } else { sreg(self, *a)? };
+                let sb = if kind.var() { None } else { Some(sreg(self, *b)?) };
                 let mut reads = vec![Src::Reg(rx), Src::Reg(o), sa];
                 if let Some(s) = sb {
                     reads.push(s);
