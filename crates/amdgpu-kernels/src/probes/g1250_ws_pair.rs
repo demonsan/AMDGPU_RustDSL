@@ -20,7 +20,7 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 /// `probe_g1250_wspair_<hex mask>` as `mla_g1250_qh16_wsp_<hex>`: bit 0 = the single-wave baseline.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 7 {
+    if mask > 15 {
         return None;
     }
     Some(mla_wsp_with(&format!("mla_g1250_qh16_wsp_{hex}"), 2, 2, mask))
@@ -34,6 +34,7 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let layout = PageLayout::plan();
     // windows per barrier (mask bit 3 = 2): every producer -> consumer hop crosses one barrier, so the pipeline is 3 W windows deep and the exchange rings have 2 W slots
     let wpi: i32 = if mask & 8 != 0 { 2 } else { 1 };
+    let half = mask & 8 != 0;   // mask bit 3: two waves per SIMD share one page, each with half of its tokens (own softmax, own O)
     let seq = mask & 1 != 0;   // mask bit 0: the single-wave baseline (4 waves, S + softmax + PV in each wave)
     let three = false;
     let mut b = FnBuilder::new(name, if seq { 128 } else { 256 });
@@ -395,6 +396,49 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let pa = b.frag_cat(&packed);
         (vec![pa], alpha, m_new, lsum)
     };
+    let softmax_half = |b: &mut FnBuilder, x: &[ValueId], vm_old: Opnd, vl_old: Opnd, h: usize| -> (ValueId, ValueId, ValueId, ValueId) {
+        let mut mx = b.max_f32(x[0], x[1]);
+        for r in 2..x.len() {
+            mx = b.max_f32(mx, x[r]);
+        }
+        let pms = b.mul_f32(mx, cscale);
+        let m_new = b.max_f32(vm_old, pms);
+        let dm = b.sub_f32(vm_old, m_new);
+        let alpha = b.exp2_f32(dm);
+        let sc2 = b.frag2_dup(cscale);
+        let nm = b.neg_f32(m_new);
+        let nm2 = b.frag2_dup(nm);
+        let mut p = Vec::with_capacity(x.len());
+        for k in 0..x.len() / 2 {
+            let pair2 = b.frag_cat(&[Opnd::Val(x[2 * k]), Opnd::Val(x[2 * k + 1])]);
+            let dp = b.pk_fma_f32(pair2, sc2, nm2);
+            for hh in 0..2u8 {
+                let dv = b.frag_slice(Opnd::Val(dp), hh, 1);
+                let df = f32_of(b, dv);
+                p.push(b.exp2_f32(df));
+            }
+        }
+        let mut pairs: Vec<ValueId> = (0..p.len() / 2).map(|k| b.frag_cat(&[Opnd::Val(p[2 * k]), Opnd::Val(p[2 * k + 1])])).collect();
+        while pairs.len() > 1 {
+            let mut nx = Vec::new();
+            for k in 0..pairs.len() / 2 {
+                nx.push(b.pk_add_f32(pairs[2 * k], pairs[2 * k + 1]));
+            }
+            pairs = nx;
+        }
+        let s0 = b.frag_slice(Opnd::Val(pairs[0]), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(pairs[0]), 1, 1);
+        let s0f = f32_of(b, s0);
+        let s1f = f32_of(b, s1);
+        let ps = b.add_f32(s0f, s1f);
+        let la = b.mul_f32(vl_old, alpha);
+        let lsum = b.add_f32(la, ps);
+        let real: Vec<Opnd> = (0..4).map(|k| Opnd::Val(b.cvt_pk_fp8x4_f32(p[4 * k], p[4 * k + 1], p[4 * k + 2], p[4 * k + 3]))).collect();
+        let zeros = [Opnd::I32(0); 4];
+        let parts: Vec<Opnd> = if h == 0 { real.iter().cloned().chain(zeros.iter().cloned()).collect() } else { zeros.iter().cloned().chain(real.iter().cloned()).collect() };
+        let pa = b.frag_cat(&parts);
+        (pa, alpha, m_new, lsum)
+    };
     // the 32 PV WMMAs of the page (O tile nt += P . V tile nt)
     let pv_page = |b: &mut FnBuilder, pa: ValueId| {
         // 8 V tiles at a time
@@ -459,7 +503,79 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let z = b.c_i32(0);
     let steps = b.bind_i32(ev(nwin) * 2);   // page steps per pair
     let sbase = |b: &mut FnBuilder| b.bind_i32(ev(pair) * 4096 + ev(lane) * 32);
-    if seq {
+    if half {
+        // half-page waves: wave of role h handles tokens 32 h .. 32 h + 31 of the pair's page: 2 S tiles, 16 scores per lane, P with the other half zero, the 32 PV WMMAs with zero B blocks for the other half
+        let half_loop = |b: &mut FnBuilder, h: usize| {
+            let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+            let it = lvars[0];
+            b.assume(it, Ext::c(0), Ext::c(MAX_PAGES as i64));
+            // S of the half page
+            let mut s = Vec::new();
+            for jj in 0..2usize {
+                let j = 2 * h + jj;
+                let kf = k_tile(b, j as i32);
+                let mut acc: Option<Opnd> = None;
+                for c in 0..9usize {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, kf[c], q[c], acc);
+                    acc = Some(Opnd::Val(d));
+                }
+                if let Some(Opnd::Val(v)) = acc {
+                    s.push(v);
+                }
+            }
+            let mut x = Vec::new();
+            for j in 0..2usize {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Val(s[j]), r, 1);
+                    x.push(f32_of(b, e));
+                }
+            }
+            let (pav, _alpha, m_new, lsum) = softmax_half(b, &x, Opnd::Var(vm), Opnd::Var(vl), h);
+            // PV: B = 2 real transposing blocks + 2 zero blocks
+            for grp in 0..4usize {
+                let mut vfs: Vec<ValueId> = Vec::new();
+                for k in 0..8usize {
+                    let nt = 8 * grp + k;
+                    let wq = nt / 8;
+                    let nl = nt % 8;
+                    let blocks: Vec<ValueId> = (0..2usize)
+                        .map(|jb| {
+                            let jj = 2 * h + jb;
+                            let a = b.bind_i32(ev(v_tiles[wq]) + vdelta[8 * jj + nl]);
+                            kvr.read(b, |b| b.load_lds_tr_b8(a))
+                        })
+                        .collect();
+                    let zeros = [Opnd::I32(0); 4];
+                    let parts: Vec<Opnd> = if h == 0 {
+                        vec![Opnd::Val(blocks[0]), Opnd::Val(blocks[1]), zeros[0], zeros[1], zeros[2], zeros[3]]
+                    } else {
+                        vec![zeros[0], zeros[1], zeros[2], zeros[3], Opnd::Val(blocks[0]), Opnd::Val(blocks[1])]
+                    };
+                    vfs.push(b.frag_cat(&parts));
+                }
+                for k in 0..8usize {
+                    let nt = 8 * grp + k;
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pav, vfs[k], Some(Opnd::Var(ov[nt])));
+                    b.set_var(ov[nt], Opnd::Val(d));
+                }
+            }
+            b.set_var(vm, Opnd::Val(m_new));
+            b.set_var(vl, Opnd::Val(lsum));
+            // one barrier per page step: the pair's page slot is free for the next stage once both halves are done
+            b.wait_lds(0);
+            b.barrier();
+            let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
+            b.set_var(it, Opnd::Val(tn));
+            let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, steps);
+            b.break_if(fin);
+            b.end_loop();
+        };
+        b.begin_if(is_mma);
+        half_loop(&mut b, 0);
+        b.else_();
+        half_loop(&mut b, 1);
+        b.end_if();
+    } else if seq {
         let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
         let it = lvars[0];
         b.assume(it, Ext::c(0), Ext::c(MAX_PAGES as i64));
