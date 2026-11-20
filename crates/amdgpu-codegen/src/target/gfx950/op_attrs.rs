@@ -1263,7 +1263,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // ---- misc
         SNop => a("s_nop", ctrl).fence_only(F::Nop),
         // (an ordering fence for the scheduler: no LDS operation moves across it, so the count the wait pass computes stays exact)
-        SWaitLdsWrites => a("s_wait_lds_writes", ctrl).fence_only(F::Barrier),
+        SWaitLdsWrites => a("s_wait_lds_writes", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
         SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
         // gfx1250 only (the gfx950 pipeline rejects them in lowering); kept in program order
         SWaitTensor => a("s_wait_tensorcnt", ctrl).fence_only(F::Barrier).backend(Backend::OwnOnly),
