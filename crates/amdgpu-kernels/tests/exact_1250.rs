@@ -283,7 +283,7 @@ fn independent_multiplies_pair_into_vopd() {
     let mut b = FnBuilder::new("probe_vopd_pairs", 32);
     b.arg("out", DType::Ptr, 0, 8);
     b.arg_tensor("out", Ext::c(32 * 4 * 8));
-    b.lower_opts.push("vopd".into());
+    b.lower_opts(&["vopd"]);
     let p = b.let_(Op::KernargPtr { offset: 0 });
     let t = b.let_(Op::WorkitemId);
     let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t);
