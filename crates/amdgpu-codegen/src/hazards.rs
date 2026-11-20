@@ -897,9 +897,10 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                 // the COMPILATION's target counter ranges (gfx1250: DScnt 63, not gfx950's lgkmcnt 15: an LDS load with 15 younger ones is
                 // still in flight there; the vector-memory queue mixes LOADcnt / STOREcnt operations and never retires by count, as in
                 // sched::waits::vm_keep)
-                let t = crate::target::cur();
+                // (`AMDC_WAW_OLD_LIMITS`: the old gfx950 ranges, A/B only)
+                let t = if std::env::var("AMDC_WAW_OLD_LIMITS").is_ok() { crate::target::T } else { crate::target::cur() };
                 let lim = if vm {
-                    if t.name == "gfx1250" { u32::MAX } else { t.counters.of(amdgpu_target::MemClass::VmemLoad).max }
+                    if crate::target::cur().name == "gfx1250" && std::env::var("AMDC_WAW_OLD_LIMITS").is_err() { u32::MAX } else { t.counters.of(amdgpu_target::MemClass::VmemLoad).max }
                 } else {
                     t.counters.of(amdgpu_target::MemClass::Lds).max
                 };
