@@ -1995,10 +1995,14 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     }
     // the claimed period must be real: verify it on the longest simulated trace of each role
     if let Some(p) = period_claim {
-        let ta = enumerate_traces(f, 0, nmax, &div, &mut diags, &mut untagged);
-        let tb = enumerate_traces(f, 1, nmax, &div, &mut diags, &mut untagged);
-        if let (Some(a), Some(b)) = (ta.first(), tb.first()) {
-            if let Err(e) = verify_period_claim(f, &[a, b], p) {
+        // (N-way roles: every role's longest trace)
+        let firsts: Vec<Trace> = match &roles {
+            Some(reps) => reps.iter().enumerate().filter_map(|(r, &tid)| enumerate_traces_at(f, r, nmax, &div, &mut diags, &mut untagged, Some(tid)).into_iter().next()).collect(),
+            None => [0usize, 1].iter().filter_map(|&r| enumerate_traces(f, r, nmax, &div, &mut diags, &mut untagged).into_iter().next()).collect(),
+        };
+        let refs: Vec<&Trace> = firsts.iter().collect();
+        if refs.len() >= 2 {
+            if let Err(e) = verify_period_claim(f, &refs, p) {
                 diags.push(("GV-TILE-UNROLL-LIMIT", Severity::Error, 0, format!("{e}; a launch with more iterations than {nmax} is NOT covered")));
             }
         }
