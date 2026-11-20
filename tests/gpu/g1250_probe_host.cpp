@@ -432,8 +432,9 @@ static int run_permlane(Kernel& k, const char* kn) {
                     default: {
                         const int size = (int)cc.b, gb = l & ~(size - 1), j = l & (size - 1), a = (int)cc.a;
                         if (cc.kind == 4) s = gb + (a % size);
-                        else if (cc.kind == 5) s = gb + (((j - a) % size + size) % size);
-                        else if (cc.kind == 6) s = gb + ((j + a) % size);
+                        // UP / DOWN (measured on MI450): a lane whose source would leave the group reads its own value
+                        else if (cc.kind == 5) s = j >= a ? l - a : l;
+                        else if (cc.kind == 6) s = j + a < size ? l + a : l;
                         else s = gb + ((j ^ a) & (size - 1));
                     }
                 }
