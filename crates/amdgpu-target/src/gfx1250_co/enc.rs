@@ -336,6 +336,7 @@ fn vopd_op(m: &str, y: bool) -> Option<u32> {
         "v_dual_subrev_f32" => 6,
         "v_dual_mul_dx9_zero_f32" => 7,
         "v_dual_mov_b32" => 8,
+        "v_dual_cndmask_b32" => 9,
         "v_dual_max_num_f32" => 10,
         "v_dual_min_num_f32" => 11,
         "v_dual_add_nc_u32" if y => 16,
