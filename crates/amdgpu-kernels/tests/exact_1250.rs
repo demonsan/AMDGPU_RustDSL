@@ -270,3 +270,9 @@ fn bf16_pack_lowers_on_gfx1250() {
     let c = amdgpu_codegen::compile_target(&b.finish(), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
     assert!(c.asm.contains("v_cvt_pk_bf16_f32"), "{}", c.asm);
 }
+
+/// The in-flight-WAW guard with gfx1250's DScnt range: fragment-rebuild copies over ~100 in-flight LDS loads get their waits (backend fix g37).
+#[test]
+fn copies_over_in_flight_lds_loads_beyond_15_get_their_waits() {
+    amdgpu_codegen::compile_target(&amdgpu_kernels::probes::g1250_mla_w1::mla_g1250_qh16_w1x(3), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+}

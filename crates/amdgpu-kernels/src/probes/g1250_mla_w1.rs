@@ -280,9 +280,9 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         x
     };
     // this wave's head-m maximum over the window -> RED[t & 1]
-    let put_max = |b: &mut FnBuilder, t: ValueId, x: &[ValueId]| {
-        let mut mx = x[0];
-        for r in 1..x.len() {
+    let put_max = |b: &mut FnBuilder, t: ValueId, x: &[Opnd]| {
+        let mut mx = b.max_f32(x[0], x[1]);
+        for r in 2..x.len() {
             mx = b.max_f32(mx, x[r]);
         }
         let si = b.bind_i32(ev(t) & 1);
@@ -422,10 +422,10 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     b.barrier();
     let s0 = s_win(&mut b, c0);
     let x0 = if lean { raw_masked(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
-    put_max(&mut b, c0, &x0);
+    put_max(&mut b, c0, &x0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
     let s1 = s_win(&mut b, c1i);
     let x1 = if lean { raw_masked(&mut b, c1i, &s1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, c1i, &s1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
-    put_max(&mut b, c1i, &x1);
+    put_max(&mut b, c1i, &x1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
     b.wait_lds(0);
     b.barrier();
     let pm0 = get_max(&mut b, c0);
@@ -545,7 +545,13 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
             })
             .collect() };
         stamp(&mut b);
-        // 3. O *= alpha(t) (rows 8 g + r: v_readlane of head 8 g + r, select-free choice of the lane half)
+        // 3. O *= alpha(t) (rows 8 g + r: v_readlane of head 8 g + r, select-free choice of the lane half); lean: only when some head's
+        // running max grew (a uniform branch)
+        if lean {
+            let grew = b.cmp(CmpPred::Lt, CmpTy::F32, Opnd::Var(va), Opnd::F32(1.0));
+            let anyg = b.let_(Op::AnyLane(Opnd::Val(grew)));
+            b.begin_if(anyg);
+        }
         let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
         let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
         let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
@@ -560,19 +566,15 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 b.add_f32(u0, u1)
             })
             .collect();
-        if false {
-            // (packed O rescale by rebuilt fragments: +32 VALU of copies; kept off until an in-place packed form exists)
+        if lean {
+            // O rows (r, r + 1) by one in-place v_pk_mul_f32 with the alpha pair
             let ap: Vec<ValueId> = (0..4).map(|k| b.frag_cat(&[Opnd::Val(al[2 * k]), Opnd::Val(al[2 * k + 1])])).collect();
             for nt in 0..8 {
-                let parts: Vec<Opnd> = (0..4u8)
-                    .map(|k| {
-                        let pr2 = b.frag_slice(Opnd::Var(ov[nt]), 2 * k, 2);
-                        Opnd::Val(b.pk_mul_f32(pr2, ap[k as usize]))
-                    })
-                    .collect();
-                let nv = b.frag_cat(&parts);
-                b.set_var(ov[nt], Opnd::Val(nv));
+                for k in 0..4u8 {
+                    b.var_pk_mul(ov[nt], 2 * k, ap[k as usize]);
+                }
             }
+            b.end_if();
         } else if abl != 4 {
             for nt in 0..8 {
                 for r in 0..8u8 {
@@ -637,7 +639,26 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         }
         stamp(&mut b);
         let s2: Vec<ValueId> = sacc.into_iter().map(|a| match a { Some(Opnd::Val(v)) => v, _ => unreachable!() }).collect();
-        let x2 = if lean { raw_masked(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
+        let x2: Vec<Opnd> = if lean {
+            // raw S; the mask only in a window that reaches past ctx (a uniform branch over VALU)
+            let raw: Vec<(DType, Opnd)> = (0..WP as usize)
+                .flat_map(|pg| (0..8u8).map(move |r| (pg, r)))
+                .map(|(pg, r)| {
+                    let si = b.frag_slice(Opnd::Val(s2[pg]), r, 1);
+                    (DType::F32, Opnd::Val(f32_of(&mut b, si)))
+                })
+                .collect();
+            let xm = b.declare_vars(&raw);
+            let wend = b.bind_i32((ev(t2) + 1) * (64 * WP));
+            let part = b.cmp(CmpPred::Gt, CmpTy::I32, wend, ctx);
+            b.begin_if(part);
+            let mk = raw_masked(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+            for k in 0..xm.len() {
+                b.set_var(xm[k], Opnd::Val(mk[k]));
+            }
+            b.end_if();
+            xm.iter().map(|&v| Opnd::Var(v)).collect::<Vec<Opnd>>()
+        } else { logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()).into_iter().map(Opnd::Val).collect() };
         put_max(&mut b, t2, &x2);
         stamp(&mut b);
         let (alpha1, m1, l1) = p1.unwrap();
@@ -646,7 +667,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         b.set_var(va, Opnd::Val(alpha1));
         if lean {
             for k in 0..xv.len() {
-                b.set_var(xv[k], Opnd::Val(x2[k]));
+                b.set_var(xv[k], x2[k]);
             }
         } else {
             for pg in 0..WP as usize {
@@ -659,7 +680,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         // 2. S(t + 2) and its maxima
         let s2 = s_win(&mut b, t2);
         let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
-        put_max(&mut b, t2, &x2);
+        put_max(&mut b, t2, &x2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
         // 3. P(t + 1) from the carried S(t + 1)
         let x1c = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
         let pm1 = get_max(&mut b, t1);
