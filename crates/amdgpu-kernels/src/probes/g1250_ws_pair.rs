@@ -20,7 +20,7 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 /// `probe_g1250_wspair_<hex mask>` as `mla_g1250_qh16_wsp_<hex>`: bit 0 = the single-wave baseline.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 1 {
+    if mask > 7 {
         return None;
     }
     Some(mla_wsp_with(&format!("mla_g1250_qh16_wsp_{hex}"), 2, 2, mask))
@@ -489,7 +489,7 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             b.assume(it, Ext::c(0), Ext::c(MAX_PAGES as i64));
             let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
             // phase A: S(t + 1) of the page -> SBUF gen t + 1; PV(t) with P of gen t (written last step)
-            let s = s_page(&mut b);
+            let s = if mask & 2 != 0 { (0..4).map(|_| b.frag_cat(&[Opnd::I32(0); 8])).collect::<Vec<_>>() } else { s_page(&mut b) };
             let t1 = b.bind_i32(ev(t) + 1);
             let sl1 = b.bind_i32(ev(t1) & 1);
             let sr = sbuf.at(&SlotIdx::new(Opnd::Val(sl1), Opnd::Val(t1)));
@@ -511,7 +511,9 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 let hi = b.bind_i32(ev(pbs) + 16);
                 b.load_lds_b128x2(pbs, hi)
             });
-            pv_page(&mut b, pa);
+            if mask & 2 == 0 {
+                pv_page(&mut b, pa);
+            }
             b.wait_lds(0);
             b.barrier();
             let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
@@ -545,7 +547,12 @@ fn mla_wsp_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 }
                 o
             });
-            let (pav, alpha, m_new, lsum) = softmax_page(&mut b, &x, Opnd::Var(vm), Opnd::Var(vl));
+            let (pav, alpha, m_new, lsum) = if mask & 4 != 0 {
+                let a8 = b.frag_cat(&[Opnd::Val(x[0]); 8]);
+                (vec![a8], x[1], x[2], x[3])
+            } else {
+                softmax_page(&mut b, &x, Opnd::Var(vm), Opnd::Var(vl))
+            };
             let t1 = b.bind_i32(ev(t) + 1);
             let sl1 = b.bind_i32(ev(t1) & 1);
             let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(sl1), Opnd::Val(t1)));
