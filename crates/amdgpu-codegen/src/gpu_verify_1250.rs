@@ -55,6 +55,8 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
     Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "DPP only where the hardware supports it: not with a literal operand; not on a 64-bit operation (no 64-bit DPP on this part); not on the instructions without a DPP form (lane reads / writes, swaps, permutes, v_nop, the FMAMK / FMAAK forms, the packed / dot / WMMA VOP3P ops other than FMA_MIX); the 32-bit multiplies of the double-precision unit only with row_share" },
+    Rule { id: "GV-1250-VOPD", layer: Layer::Asm, what: "every dual-issue (VOPD) instruction is a legal combination: opcodes from the X / Y sets, destinations of opposite parity, each source slot of the two components in different register banks unless the same register, the second source a VGPR, no literal, at most two scalar operands, the Y component not reading the X destination" },
+    Rule { id: "GV-1250-CLAUSE-TYPE", layer: Layer::Asm, what: "an instruction clause holds instructions of one memory type only (scalar loads, vector memory, flat, LDS)" },
     Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device whatever surrounds it (the packed lookup-table converts v_perm_pk16_*): forbidden" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -2161,23 +2163,154 @@ fn smem_pending(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Vio
     }
 }
 
+/// The memory type of an instruction for the clause rule (None: not a memory instruction).
+fn clause_type(mn: &str) -> Option<&'static str> {
+    if mn.starts_with("s_load") || mn.starts_with("s_buffer_load") || mn.starts_with("s_prefetch") {
+        Some("scalar load")
+    } else if mn.starts_with("global_") || mn.starts_with("buffer_") || mn.starts_with("scratch_") {
+        Some("vector memory")
+    } else if mn.starts_with("flat_") {
+        Some("flat")
+    } else if mn.starts_with("ds_") {
+        Some("LDS")
+    } else if mn.starts_with("tensor_") {
+        Some("tensor")
+    } else {
+        None
+    }
+}
+
+/// GV-1250-VOPD: re-validates every dual-issue line on the final text (public LLVM GCNVOPDUtils / AMDGPUBaseInfo / VOPDInstructions.td for
+/// this target), with the VGPR window (s_set_vgpr_msb) state tracked so registers are compared as absolute numbers.
+fn vopd_rule(insts: &[Inst], v: &mut Vec<Violation>) {
+    const X: &[&str] = &["v_dual_fmac_f32", "v_dual_mul_f32", "v_dual_add_f32", "v_dual_sub_f32", "v_dual_subrev_f32", "v_dual_mul_dx9_zero_f32", "v_dual_mov_b32", "v_dual_cndmask_b32", "v_dual_max_num_f32", "v_dual_min_num_f32"];
+    const Y_ONLY: &[&str] = &["v_dual_add_nc_u32", "v_dual_lshlrev_b32", "v_dual_sub_nc_u32", "v_dual_lshrrev_b32", "v_dual_ashrrev_i32", "v_dual_max_i32", "v_dual_min_i32"];
+    // window (MSBs) per slot: dst, src0, src1, src2
+    let mut msb = [0u32; 4];
+    for ins in insts {
+        if ins.mn == "s_set_vgpr_msb" {
+            if let Some(x) = parse_int(&ins.ops) {
+                let x = x as u32;
+                msb = [(x >> 6) & 3, x & 3, (x >> 2) & 3, (x >> 4) & 3];
+            }
+            continue;
+        }
+        if !ins.mn.starts_with("v_dual_") {
+            continue;
+        }
+        let full = format!("{} {}", ins.mn, ins.ops);
+        let bad = |v: &mut Vec<Violation>, why: &str| viol(v, "GV-1250-VOPD", format!("line {}: `{full}`: {why}", ins.line));
+        let Some((xs, ys)) = full.split_once("::") else {
+            bad(v, "a dual-issue instruction without its second component");
+            continue;
+        };
+        // (mnemonic, absolute dst, src0 (VGPR abs / None), src0 is a literal, src0 scalar name, vsrc1 abs)
+        struct C {
+            mn: String,
+            d: Option<u32>,
+            s0: Option<u32>,
+            s0_lit: bool,
+            s0_scalar: Option<String>,
+            s1: Option<u32>,
+            nops: usize,
+        }
+        let vg = |t: &str, slot: usize| -> Option<u32> { t.trim().strip_prefix('v').and_then(|x| x.parse::<u32>().ok()).map(|r| r + 256 * msb[slot]) };
+        let comp = |s: &str| -> C {
+            let s = s.trim();
+            let (mn, rest) = s.split_once(char::is_whitespace).unwrap_or((s, ""));
+            let ops: Vec<&str> = rest.split(',').map(|o| o.trim()).filter(|o| !o.is_empty()).collect();
+            let s0t = ops.get(1).copied().unwrap_or("");
+            let s0 = vg(s0t, 1);
+            let scalar = s0.is_none() && (s0t.starts_with('s') || s0t.starts_with("vcc") || s0t.starts_with("exec") || s0t.starts_with("m0") || s0t.starts_with("ttmp"));
+            let inline = parse_int(s0t).map_or(false, |x| (-16..=64).contains(&x)) || matches!(s0t, "0.5" | "-0.5" | "1.0" | "-1.0" | "2.0" | "-2.0" | "4.0" | "-4.0" | "0.15915494");
+            C {
+                mn: mn.to_string(),
+                d: ops.first().and_then(|o| vg(o, 0)),
+                s0,
+                s0_lit: s0.is_none() && !scalar && !inline,
+                s0_scalar: scalar.then(|| s0t.to_string()),
+                s1: ops.get(2).and_then(|o| vg(o, 2)),
+                nops: ops.len(),
+            }
+        };
+        let (x, y) = (comp(xs), comp(ys));
+        if !X.contains(&x.mn.as_str()) {
+            bad(v, &format!("`{}` is not a dual-issue X opcode", x.mn));
+        }
+        if !X.contains(&y.mn.as_str()) && !Y_ONLY.contains(&y.mn.as_str()) {
+            bad(v, &format!("`{}` is not a dual-issue Y opcode", y.mn));
+        }
+        for c in [&x, &y] {
+            let want = if c.mn == "v_dual_mov_b32" { 2 } else { 3 };
+            if c.nops != want || c.d.is_none() || (want == 3 && c.s1.is_none()) {
+                bad(v, &format!("`{}`: operands (a VGPR destination{})", c.mn, if want == 3 { " and a VGPR second source" } else { "" }));
+            }
+            if c.s0_lit {
+                bad(v, "a literal operand (dual-issue instructions here carry none)");
+            }
+        }
+        if let (Some(a), Some(b)) = (x.d, y.d) {
+            if (a & 1) == (b & 1) {
+                bad(v, "the two destinations have the same parity");
+            }
+        }
+        for (k, (a, b)) in [(x.s0, y.s0), (x.s1, y.s1)].into_iter().enumerate() {
+            if let (Some(a), Some(b)) = (a, b) {
+                if a != b && (a & 3) == (b & 3) {
+                    bad(v, &format!("source {k} of the two components in the same register bank (v{a} / v{b})"));
+                }
+            }
+        }
+        // Y must not read X's destination (fmac: Y's own destination is its addend)
+        if let Some(dx) = x.d {
+            if y.s0 == Some(dx) || y.s1 == Some(dx) || (y.mn == "v_dual_fmac_f32" && y.d == Some(dx)) {
+                bad(v, "the Y component reads the X destination");
+            }
+        }
+        // scalar operands: at most two distinct (VCC of a cndmask counts)
+        let mut sc: Vec<String> = [&x, &y].iter().filter_map(|c| c.s0_scalar.clone()).collect();
+        for c in [&x, &y] {
+            if c.mn == "v_dual_cndmask_b32" {
+                sc.push("vcc_lo".into());
+            }
+        }
+        sc.sort();
+        sc.dedup();
+        if sc.len() > 2 {
+            bad(v, "more than two scalar operands");
+        }
+    }
+}
+
 pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
     tdm_drain(&insts, &labels, &mut v);
     smem_pending(&insts, &labels, &mut v);
     wait_range(&insts, &mut v);
-    // clauses: the N + 1 instructions after `s_clause N`
+    vopd_rule(&insts, &mut v);
+    // clauses: the N + 1 instructions after `s_clause N`, all of one memory type
     let mut remaining = 0usize;
+    let mut ctype: Option<&'static str> = None;
     for (k, ins) in insts.iter().enumerate() {
         if remaining > 0 {
             if ins.mn.starts_with("tensor_") {
                 viol(&mut v, "GV-1250-TDM-CLAUSE", format!("line {}: `{}` inside an instruction clause", ins.line, ins.mn));
             }
+            match clause_type(&ins.mn) {
+                _ if ins.mn == "s_nop" => {}
+                None => viol(&mut v, "GV-1250-CLAUSE-TYPE", format!("line {}: `{}` inside an instruction clause (not a memory instruction)", ins.line, ins.mn)),
+                Some(t) => match ctype {
+                    None => ctype = Some(t),
+                    Some(c) if c != t => viol(&mut v, "GV-1250-CLAUSE-TYPE", format!("line {}: `{}` ({t}) inside a {c} clause", ins.line, ins.mn)),
+                    _ => {}
+                },
+            }
             remaining -= 1;
         }
         if ins.mn == "s_clause" {
             remaining = parse_int(&ins.ops).map(|n| (n as usize) + 1).unwrap_or(0);
+            ctype = None;
         }
         // indefinite sleeps
         if ins.mn == "s_sleep" || ins.mn == "s_monitor_sleep" {
@@ -2208,7 +2341,7 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
             }
         }
         // instructions that can hang the device whatever runs next (in any wave): never emitted
-        if ins.mn.starts_with("v_perm_pk16_") {
+        if ins.mn.starts_with("v_perm_pk16_") || ins.mn.starts_with("v_nop_power") {
             viol(&mut v, "GV-1250-FORBIDDEN-OP", format!("line {}: `{}`: known to hang the device; forbidden", ins.line, ins.mn));
         }
         // DPP

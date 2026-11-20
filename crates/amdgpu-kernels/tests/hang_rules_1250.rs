@@ -987,10 +987,65 @@ fn pos_dpp() {
     asm_positive(&inject("tensor_load_to_lds", &["v_fma_mix_f32_e64_dpp v1, v2, v3, v4 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]));
 }
 
+// GV-1250-VOPD
+
+#[test]
+fn mut_vopd() {
+    let m = |l: &str| asm_mutation(&inject("tensor_load_to_lds", &[l]), "GV-1250-VOPD");
+    // an opcode outside the X set / the Y set
+    m("v_dual_add_nc_u32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9");
+    m("v_dual_mul_f32 v0, v4, v8 :: v_dual_and_b32 v1, v5, v9");
+    m("v_dual_exp_f32 v0, v4 :: v_dual_mul_f32 v1, v5, v9");
+    // destinations of the same parity
+    m("v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v2, v5, v9");
+    // src0 / vsrc1 in the same bank (different registers)
+    m("v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v8, v9");
+    m("v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v12");
+    // vsrc1 not a VGPR, a literal
+    m("v_dual_mul_f32 v0, v4, s8 :: v_dual_mul_f32 v1, v5, v9");
+    m("v_dual_mul_f32 v0, 0x12345678, v8 :: v_dual_mul_f32 v1, v5, v9");
+    // Y reads X's destination (plain, and through the window state: v0 in window 1 is v256)
+    m("v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v0, v9");
+    // more than two scalar operands (cndmask reads VCC)
+    m("v_dual_cndmask_b32 v0, s4, v8 :: v_dual_mul_f32 v1, s5, v9");
+    // no second component
+    asm_mutation(&inject("tensor_load_to_lds", &["v_dual_mul_f32 v0, v4, v8"]), "GV-1250-VOPD");
+}
+
+#[test]
+fn pos_vopd() {
+    for l in [
+        "v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v9",
+        "v_dual_fmac_f32 v0, v4, v8 :: v_dual_fmac_f32 v1, v4, v9",   // the same register in a source slot
+        "v_dual_mov_b32 v6, s27 :: v_dual_mov_b32 v7, s32",
+        "v_dual_mul_f32 v0, 1.0, v8 :: v_dual_add_nc_u32 v1, 4, v9",
+        "v_dual_max_num_f32 v10, v4, v8 :: v_dual_lshlrev_b32 v13, 2, v9",
+    ] {
+        asm_positive(&inject("tensor_load_to_lds", &[l]));
+    }
+    // a window change between: Y's v0 in source window 1 is v256, not X's destination v0
+    asm_positive(&inject("tensor_load_to_lds", &["s_set_vgpr_msb 0x1", "v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v0, v9", "s_set_vgpr_msb 0"]));
+}
+
+// GV-1250-CLAUSE-TYPE
+
+#[test]
+fn mut_clause_type() {
+    asm_mutation(&inject("tensor_load_to_lds", &["s_clause 0x1", "global_load_b32 v1, v2, s[4:5]", "ds_load_b32 v3, v4"]), "GV-1250-CLAUSE-TYPE");
+    asm_mutation(&inject("tensor_load_to_lds", &["s_clause 0x1", "s_load_b32 s4, s[0:1], 0x0", "v_mov_b32 v1, v2"]), "GV-1250-CLAUSE-TYPE");
+}
+
+#[test]
+fn pos_clause_type() {
+    asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "global_load_b32 v1, v2, s[4:5]", "global_load_b32 v3, v2, s[4:5] offset:4"]));
+    asm_positive(&inject("tensor_load_to_lds", &["s_clause 0x1", "s_load_b32 s4, s[0:1], 0x0", "s_load_b32 s5, s[0:1], 0x4"]));
+}
+
 // GV-1250-FORBIDDEN-OP
 
 #[test]
 fn mut_forbidden_op() {
+    asm_mutation(&inject("tensor_load_to_lds", &["v_nop_power"]), "GV-1250-FORBIDDEN-OP");
     for op in ["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_perm_pk16_b6_u4 v[2:4], v1, v[4:5], v[6:7]", "v_perm_pk16_b8_u4 v[2:5], v[0:1], v[4:5], v[6:7]"] {
         asm_mutation(&inject("tensor_load_to_lds", &[op]), "GV-1250-FORBIDDEN-OP");
     }
@@ -1090,6 +1145,8 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-FORBIDDEN-OP", "forbidden_op"),
+    ("GV-1250-VOPD", "vopd"),
+    ("GV-1250-CLAUSE-TYPE", "clause_type"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
     ("GV-1250-DVGPR", "dvgpr"),
     ("GV-1250-PRIV", "priv"),
