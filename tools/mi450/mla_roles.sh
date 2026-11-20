@@ -19,7 +19,7 @@ for ctx in ${CTXS:-16384 32768}; do
 import struct,sys
 try:
     d=open(sys.argv[1],'rb').read()
-    print(' '.join('%d/%d'%struct.unpack_from('<II',d,256*w) for w in range(int('${NW:-8}'))))
+    print(' '.join('%d/%d'%struct.unpack_from('<II',d,256*w) for w in range(int(__import__('os').environ.get('NW','8')))))
 except Exception as e:
     print('nodump', e)
 EOF
