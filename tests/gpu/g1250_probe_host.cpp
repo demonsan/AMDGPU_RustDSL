@@ -386,7 +386,7 @@ static int run_varscale(Kernel& k, const char* kn) {
     printf("varscale: nv=%d n=%d bad=%ld %s\n", nv, n, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
     return bad == 0 ? 0 : 3;
 }
-
+System.Management.Automation.Internal.Host.InternalHost
 // probe_g1250_dpp: every DPP control against this CPU model (wave32: rows of 16 lanes, banks of 4 lanes in a row; a lane whose source is
 // invalid keeps old unless bound_ctrl (then 0); a lane in a disabled row / bank is not written: old). WGS workgroups (default 64).
 static int run_dpp(Kernel& k, const char* kn) {
@@ -605,6 +605,7 @@ int main(int argc, char** argv) {
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "dpp") return run_dpp(k, kn);
+    if (mode == "permlane") return run_permlane(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);
