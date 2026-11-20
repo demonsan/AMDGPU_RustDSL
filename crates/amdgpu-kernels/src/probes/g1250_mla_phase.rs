@@ -32,11 +32,15 @@ const PH_BAR: u32 = 16;
 const PH_ILP: u32 = 32;
 /// with PH_ILP: the O rescale only when some head's maximum grew (a uniform branch), instead of every window
 const PH_LAZY: u32 = 64;
+/// an independent VALU / TRANS block (8 chains of mul + exp2, 8 rounds = 128 instructions): after the other blocks, or (with PH_ILP) one round after each WMMA pair: does a wave overlap VALU with WMMA at all?
+const PH_VALU: u32 = 128;
+/// with PH_ILP: the WMMA stream orders independent chains round-robin (a dependent WMMA never directly follows its producer)
+const PH_SPREAD: u32 = 256;
 
 /// `mla_g1250_qh16_ph_<hex mask>`.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 0x7f {
+    if mask > 0x1ff {
         return None;
     }
     Some(mla_ph_with(&format!("mla_g1250_qh16_ph_{hex}"), 2, 4, mask))
@@ -319,7 +323,18 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let z = b.frag_cat(&[Opnd::I32(0); 8]);
         inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
     }
+    for _ in 0..8 {
+        inits.push((DType::F32, Opnd::Val(zf)));
+    }
     let st = b.declare_vars(&inits);
+    let uv: Vec<_> = st[11 + WP as usize..11 + WP as usize + 8].to_vec();
+    let valu_round = |b: &mut FnBuilder| {
+        for i in 0..8usize {
+            let x = b.mul_f32(Opnd::Var(uv[i]), cscale);
+            let y = b.exp2_f32(x);
+            b.set_var(uv[i], Opnd::Val(y));
+        }
+    };
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
     let sv: Vec<_> = st[11..11 + WP as usize].to_vec();
@@ -500,23 +515,51 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         };
         let mut next = 0usize;
         let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
-        for c in 0..9usize {
-            if s_on {
-                for pg in 0..WP as usize {
-                    let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
-                    sacc[pg] = Some(Opnd::Val(d));
+        // chains: S page 0 / page 1 (9 deep each) and the 8 PV tiles (2 deep: page 0, then page 1); round r issues S chunk r of both pages, PV tile r page 0 and PV tile r - 4 page 1, so that a
+        // dependent WMMA never follows its producer directly and the VALU steps between rounds run in the producer's latency (`PH_SPREAD`) -- or, without it, adjacent pairs as before
+        let spread = mask & PH_SPREAD != 0;
+        let rounds = if spread { 13 } else { 9 };
+        for r in 0..rounds {
+            if spread {
+                if s_on && r < 9 {
+                    for pg in 0..WP as usize {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][r], q[r], sacc[pg]);
+                        sacc[pg] = Some(Opnd::Val(d));
+                    }
                 }
-            }
-            if pv_on && c < 8 {
-                for pg in 0..WP as usize {
-                    let o = ov[c];
-                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
+                if pv_on && r < 8 {
+                    let o = ov[r];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[0], vfr[0][r], Some(Opnd::Var(o)));
                     b.set_var(o, Opnd::Val(d));
+                }
+                if pv_on && r >= 4 && r - 4 < 8 {
+                    let nt = r - 4;
+                    let o = ov[nt];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[1], vfr[1][nt], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+            } else {
+                let c = r;
+                if s_on {
+                    for pg in 0..WP as usize {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
+                        sacc[pg] = Some(Opnd::Val(d));
+                    }
+                }
+                if pv_on && c < 8 {
+                    for pg in 0..WP as usize {
+                        let o = ov[c];
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
+                        b.set_var(o, Opnd::Val(d));
+                    }
                 }
             }
             if sm_on && next < 8 {
                 step(&mut b, next);
                 next += 1;
+            }
+            if mask & PH_VALU != 0 && r < 8 {
+                valu_round(&mut b);
             }
         }
         while sm_on && next < 8 {
@@ -649,6 +692,11 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.wait_lds(0);
         b.barrier();
     }
+    if mask & PH_VALU != 0 {
+        for _ in 0..8 {
+            valu_round(&mut b);
+        }
+    }
     }
     let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
     b.set_var(it, Opnd::Val(tn));
@@ -673,6 +721,9 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.store_global(pa0, 56, Opnd::Var(vm), MemTy::B32, false);
     b.store_global(pa0, 60, Opnd::Var(vl), MemTy::B32, false);
     b.store_global(pa0, 64, Opnd::Var(va), MemTy::B32, false);
+    for i in 0..8usize {
+        b.store_global(pa0, (68 + 4 * i) as u32, Opnd::Var(uv[i]), MemTy::B32, false);
+    }
     let _ = &plse;
     b.finish()
 }
