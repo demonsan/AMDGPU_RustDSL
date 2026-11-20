@@ -598,6 +598,44 @@ pub fn probe_g1250_permlane() -> Function {
     b.finish()
 }
 
+/// The in-place `var_pk_mul` (one `v_pk_mul_f32` on a loop variable's dword pair) against tests/gpu/g1250_probe_host.cpp `pkmul`: lane l,
+/// x = l + 1 (f32); a Frag8 loop variable acc[k] = x (k + 1), two iterations of acc[2r .. 2r + 2] *= (x / 2, x / 4 + 1) for r = 0..3;
+/// out[(wg * 8 + k) * 32 + l] = acc[k]. Kernargs: out @0. 32 work-items.
+pub fn probe_g1250_pkmul() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_pkmul", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(8 * 128));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let t1 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(1)));
+    let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t1);
+    let init: Vec<ValueId> = (0..8).map(|k| b.mul_f32(x, Opnd::F32((k + 1) as f32))).collect();
+    let acc0 = b.frag8(init[0], init[1], init[2], init[3], init[4], init[5], init[6], init[7]);
+    let s0 = b.mul_f32(x, Opnd::F32(0.5));
+    let s1a = b.mul_f32(x, Opnd::F32(0.25));
+    let s1 = b.add_f32(s1a, Opnd::F32(1.0));
+    let s = b.frag2(s0, s1);
+    let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(acc0)), (DType::I32, Opnd::I32(0))]);
+    for r in 0..4u8 {
+        b.var_pk_mul(vars[0], 2 * r, s);
+    }
+    let i2 = b.add_i32(Opnd::Var(vars[1]), 1);
+    b.set_var(vars[1], i2);
+    let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, 2);
+    b.break_if(done);
+    b.end_loop();
+    let wgo = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(8 * 128)));
+    let t4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let o = b.let_(Op::AddI32(Opnd::Val(wgo), Opnd::Val(t4)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+    for k in 0..8u8 {
+        let v = b.frag_slice(Opnd::Var(vars[0]), k, 1);
+        b.store_global(q, 128 * k as u32, v, MemTy::B32, false);
+    }
+    b.finish()
+}
+
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
 /// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {

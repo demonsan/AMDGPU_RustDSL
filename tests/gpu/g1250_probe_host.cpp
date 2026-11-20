@@ -456,6 +456,33 @@ static int run_permlane(Kernel& k, const char* kn) {
     printf("permlane: wgs=%d mask=%#x bad=%ld %s\n", wgs, mask, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
     return bad == 0 ? 0 : 3;
 }
+// probe_g1250_pkmul: the in-place var_pk_mul against the same float operations on the host (bit-exact).
+static int run_pkmul(Kernel& k, const char* kn) {
+    const int wgs = getenv("WGS") ? atoi(getenv("WGS")) : 1;
+    float* dout;
+    HC(hipMalloc(&dout, (size_t)wgs * 8 * 32 * 4));
+    HC(hipMemset(dout, 0, (size_t)wgs * 8 * 32 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(wgs, 32, args, kn);
+    std::vector<float> o((size_t)wgs * 8 * 32);
+    HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int w = 0; w < wgs; ++w)
+        for (int l = 0; l < 32; ++l) {
+            const float x = (float)(l + 1);
+            const float s[2] = {x * 0.5f, x * 0.25f + 1.0f};
+            for (int kk = 0; kk < 8; ++kk) {
+                float acc = x * (float)(kk + 1);
+                for (int it = 0; it < 2; ++it) acc = acc * s[kk & 1];
+                const float got = o[((size_t)w * 8 + kk) * 32 + l];
+                if (got != acc) { if (bad < 8) printf("  wg %d lane %d k %d: got %g ref %g\n", w, l, kk, got, acc); ++bad; }
+            }
+        }
+    printf("pkmul: wgs=%d bad=%ld %s\n", wgs, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
+
 // probe_g1250_dpp: every DPP control against this CPU model (wave32: rows of 16 lanes, banks of 4 lanes in a row; a lane whose source is
 // invalid keeps old unless bound_ctrl (then 0); a lane in a disabled row / bank is not written: old). WGS workgroups (default 64).
 static int run_dpp(Kernel& k, const char* kn) {
@@ -674,6 +701,7 @@ int main(int argc, char** argv) {
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "dpp") return run_dpp(k, kn);
+    if (mode == "pkmul") return run_pkmul(k, kn);
     if (mode == "permlane") return run_permlane(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
