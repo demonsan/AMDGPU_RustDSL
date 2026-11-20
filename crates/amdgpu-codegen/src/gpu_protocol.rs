@@ -280,6 +280,11 @@ struct Sim<'a> {
     loop_decisions: usize,
     /// occurrences of each runtime-if statement met so far on this path (keys the decisions: the same statement in two iterations is two decisions)
     occ: HashMap<usize, usize>,
+    /// N-way wave roles: the work-item id of the simulated wave's representative lane (`WorkitemId` evaluates to it): the wave-divergent ifs whose
+    /// condition is a wave-uniform function of the wave index are then decided by that wave (`role_split`); None = the two-role convention
+    lane_tid: Option<i64>,
+    /// the outcomes of the wave-divergent ifs decided by `lane_tid` (statement, outcome): the wave's role signature
+    role_sig: Vec<(usize, bool)>,
 }
 
 /// The most runtime ifs inside loops that one simulated path may decide (2^6 paths of this kind at most per role): beyond it the kernel is rejected as unsupported.
@@ -303,6 +308,8 @@ impl<'a> Sim<'a> {
         };
         match op {
             Op::ConstI32(c) => K(*c as i64),
+            Op::WorkitemId => self.lane_tid.map_or(U, K),
+            Op::ReadFirstLane(a) | Op::AnyLane(a) if self.lane_tid.is_some() => self.cv(a),
             Op::MovS { a, .. } | Op::MovV { a, .. } | Op::BitcastI32(a) => self.cv(a),
             Op::AddK { a, k } => match self.cv(a) {
                 K(x) => K((x + *k as i64) as i32 as i64),
@@ -700,6 +707,16 @@ impl<'a> Sim<'a> {
                         && then_range.1 > then_range.0
                         && matches!(&f.stmts()[then_range.1 - 1], Stmt::BreakIf { cond: c2 } if c2 == cond)
                         && matches!(self.cv(cond), CV::U);
+                    // N-way roles: a wave-divergent if decided by the simulated wave (its condition is a wave-uniform function of the wave index)
+                    if self.lane_tid.is_some() && self.div.contains(&i) {
+                        if let CV::K(c) = self.cv(cond) {
+                            self.role_sig.push((i, c != 0));
+                            run_arm(self, c != 0);
+                            self.close();
+                            i = endif + 1;
+                            continue;
+                        }
+                    }
                     if exit_arm && self.loop_depth >= 1 && !(self.div.contains(&i) && !self.in_role) {
                         let take = if self.loop_depth == 1 && self.outer == self.n as i64 - 1 {
                             let key = usize::MAX - self.brk_ord;
@@ -1338,6 +1355,52 @@ fn verify_period_claim(f: &Function, traces: &[&Trace], p: usize) -> Result<(), 
 }
 
 fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>) -> Vec<Trace> {
+    enumerate_traces_at(f, role, n, div, diags, untagged, None)
+}
+
+/// The wave roles of a kernel whose wave-divergent ifs are all decided by wave-uniform functions of the wave index: one representative work-item
+/// id per distinct role signature (the outcomes of those ifs), when there are MORE than two (two roles keep the then / else convention). The
+/// first and the last lane of every wave must agree (a lane-dependent condition is not a role split): otherwise None.
+fn role_split(f: &Function, div: &HashSet<usize>) -> Option<Vec<i64>> {
+    if div.is_empty() {
+        return None;
+    }
+    let ws: i64 = if crate::target::cur().name == "gfx1250" { 32 } else { 64 };
+    let waves = (f.workgroup_size as i64 + ws - 1) / ws;
+    if !(3..=32).contains(&waves) {
+        return None;
+    }
+    let sig_of = |tid: i64| -> Option<Vec<(usize, bool)>> {
+        let mut diags = Vec::new();
+        let mut untagged = BTreeSet::new();
+        let mut unsupported = Vec::new();
+        let mut sim = Sim { f, role: 0, n: 1, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, sig: 0, open: None, outer: -1, diags: &mut diags, untagged: &mut untagged, steps: 0, break_taken: false, decisions: Vec::new(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: false, loop_decisions: 0, occ: HashMap::default(), lane_tid: Some(tid), role_sig: Vec::new() };
+        sim.exec(0, f.stmts().len());
+        let mut s = sim.role_sig.clone();
+        s.sort();
+        s.dedup();
+        // every divergent if met must have been decided by the wave
+        Some(s)
+    };
+    let mut reps: Vec<(Vec<(usize, bool)>, i64)> = Vec::new();
+    let dbg = std::env::var("AMDC_PROTO_DEBUG").is_ok();
+    for w in 0..waves {
+        let a = sig_of(w * ws)?;
+        let b = sig_of(w * ws + ws - 1)?;
+        if dbg {
+            eprintln!("role_split: wave {w}: {a:?} / {b:?} (divergent ifs {:?})", { let mut d: Vec<_> = div.iter().copied().collect(); d.sort(); d });
+        }
+        if a != b || a.is_empty() {
+            return None;
+        }
+        if !reps.iter().any(|(s, _)| *s == a) {
+            reps.push((a, w * ws));
+        }
+    }
+    (reps.len() > 2).then(|| reps.into_iter().map(|(_, t)| t).collect())
+}
+
+fn enumerate_traces_at(f: &Function, role: usize, n: usize, div: &HashSet<usize>, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>, lane_tid: Option<i64>) -> Vec<Trace> {
     let mut out: Vec<Trace> = Vec::new();
     let mut work: Vec<Vec<bool>> = vec![Vec::new()];
     let mut unsupported: Vec<(usize, String)> = Vec::new();
@@ -1346,7 +1409,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, sig: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: f.kd.iter().any(|(k, v)| k == "g5:loop_ifs_explored" && *v != 0), loop_decisions: 0, occ: HashMap::default() };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, sig: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: f.kd.iter().any(|(k, v)| k == "g5:loop_ifs_explored" && *v != 0), loop_decisions: 0, occ: HashMap::default(), lane_tid, role_sig: Vec::new() };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
@@ -1392,7 +1455,7 @@ pub fn with_reference_pair_checks<R>(g: impl FnOnce() -> R) -> R {
     r
 }
 
-fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
+fn check_pair(f: &Function, traces: &[&Trace], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize, own_reuse: &std::collections::BTreeMap<(usize, String), bool>, owned: &std::collections::BTreeMap<usize, bool>) {
     let reference = REFERENCE_PAIR_CHECKS.with(|c| c.get());
     // OWNER events (lds_owned, every access proven in the issuing thread's own words): never conflict with each other across threads
     let is_owner = |ev: &Ev| f.contract.tiles[ev.tile].owned.is_some() && owned.get(&ev.stmt).copied().unwrap_or(false);
@@ -1848,7 +1911,39 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     // One scenario per loop-iteration count n: enumerate the traces of both roles, check the plan's rings, check every compatible pair. The scenarios are independent except that a finding is reported once per
     // (code, statement) / message over the whole run (the `diags` dedupe). A run with NO finding in any scenario cannot depend on that dedupe (it only ever removes findings), so the scenarios of a clean kernel
     // run concurrently and merge their counters; any finding anywhere re-runs the sequential loop, which reports exactly as before (the reference mode of the differential test is always sequential).
+    // N-way wave roles (more than two role signatures of wave-uniform conditions on the wave index): every role simulated with its own program
+    let roles = role_split(f, &div);
     let run_n = |n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>, checked: &mut usize, paths: &mut usize| {
+        if let Some(reps) = &roles {
+            let per: Vec<Vec<Trace>> = reps.iter().enumerate().map(|(r, &tid)| enumerate_traces_at(f, r, n, &div, diags, untagged, Some(tid))).collect();
+            for tr in per.iter().flatten() {
+                check_plan_rings(f, tr, diags);
+            }
+            // every combination of one path per role whose workgroup-uniform outcomes agree pairwise
+            let mut idx = vec![0usize; per.len()];
+            if per.iter().any(|p| p.is_empty()) {
+                return;
+            }
+            loop {
+                let pick: Vec<&Trace> = idx.iter().enumerate().map(|(r, &k)| &per[r][k]).collect();
+                if pick.iter().enumerate().all(|(x, a)| pick.iter().skip(x + 1).all(|b| compatible(a, b))) {
+                    *paths += 1;
+                    check_pair(f, &pick, n, diags, checked, &own_reuse, &owned);
+                }
+                let mut r = 0;
+                loop {
+                    if r == idx.len() {
+                        return;
+                    }
+                    idx[r] += 1;
+                    if idx[r] < per[r].len() {
+                        break;
+                    }
+                    idx[r] = 0;
+                    r += 1;
+                }
+            }
+        }
         let t0 = enumerate_traces(f, 0, n, &div, diags, untagged);
         let t1 = enumerate_traces(f, 1, n, &div, diags, untagged);
         for tr in t0.iter().chain(t1.iter()) {
@@ -1858,7 +1953,7 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
             for b in &t1 {
                 if compatible(a, b) {
                     *paths += 1;
-                    check_pair(f, [a, b], n, diags, checked, &own_reuse, &owned);
+                    check_pair(f, &[a, b], n, diags, checked, &own_reuse, &owned);
                 }
             }
         }
@@ -1900,10 +1995,14 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     }
     // the claimed period must be real: verify it on the longest simulated trace of each role
     if let Some(p) = period_claim {
-        let ta = enumerate_traces(f, 0, nmax, &div, &mut diags, &mut untagged);
-        let tb = enumerate_traces(f, 1, nmax, &div, &mut diags, &mut untagged);
-        if let (Some(a), Some(b)) = (ta.first(), tb.first()) {
-            if let Err(e) = verify_period_claim(f, &[a, b], p) {
+        // (N-way roles: every role's longest trace)
+        let firsts: Vec<Trace> = match &roles {
+            Some(reps) => reps.iter().enumerate().filter_map(|(r, &tid)| enumerate_traces_at(f, r, nmax, &div, &mut diags, &mut untagged, Some(tid)).into_iter().next()).collect(),
+            None => [0usize, 1].iter().filter_map(|&r| enumerate_traces(f, r, nmax, &div, &mut diags, &mut untagged).into_iter().next()).collect(),
+        };
+        let refs: Vec<&Trace> = firsts.iter().collect();
+        if refs.len() >= 2 {
+            if let Err(e) = verify_period_claim(f, &refs, p) {
                 diags.push(("GV-TILE-UNROLL-LIMIT", Severity::Error, 0, format!("{e}; a launch with more iterations than {nmax} is NOT covered")));
             }
         }
