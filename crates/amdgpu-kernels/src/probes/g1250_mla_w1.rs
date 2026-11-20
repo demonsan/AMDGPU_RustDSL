@@ -80,7 +80,9 @@ pub fn mla_g1250_qh16_w1x(mode: u8) -> Function {
 pub fn mla_g1250_qh16_w1s() -> Function {
     ILP.with(|c| c.set(true));
     STAMPS.with(|c| c.set(true));
+    LEAN.with(|c| c.set(true));
     let f = mla_w1_with("mla_g1250_qh16_w1s", 2, 4);
+    LEAN.with(|c| c.set(false));
     STAMPS.with(|c| c.set(false));
     ILP.with(|c| c.set(false));
     f
@@ -93,6 +95,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let WP = wp;
     assert!(depth >= 4 && (depth & (depth - 1)) == 0);
     let in_flight = ((depth - 4) * wp) as u8;
+    let lean_early = LEAN.with(|c| c.get());
     let layout = PageLayout::plan();
     let mut b = FnBuilder::new(name, 128);
     b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
@@ -180,7 +183,9 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let vbases: Vec<i32> = (0..128).map(|t| { let f = t & 31; (8 * (f >> 4) + (f & 3) + 4 * ((f >> 3) & 1)) * DV + 8 * ((f >> 2) & 1) + (t / 32) * 128 }).collect();
     let vdelta: Vec<i32> = (0..32).map(|i| layout.delta(&vbases, 16 * (i / 8) * DV + 16 * (i % 8))).collect();
     let _ = QUARTER;
-    // the sequence's page ids into LDS (indices clamped to the last page)
+    // the sequence's page ids into LDS (indices clamped to the last page); lean: none (scalar page-id loads)
+    let t00 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
+    if !lean_early {
     let nch = b.bind_i32((ev(npages) + 127) >> 7);
     let k0 = b.c_i32(0);
     let lv = b.begin_loop(&[(DType::I32, Opnd::Val(k0))]);
@@ -194,7 +199,6 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
     let pv = b.load_global(pe, 0, MemTy::B32);
     let sa = b.bind_i32(ev(idx) * 4 + ptab.base as i32);
-    let t00 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     ptab.at(&t00).write(&mut b, |b| b.store_lds(sa, pv, MemTy::B32, false));
     let k1 = b.bind_i32(amdgpu_dsl::varx(kk) + 1);
     b.set_var(kk, Opnd::Val(k1));
@@ -203,12 +207,40 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     b.end_loop();
     b.wait_lds(0);
     b.barrier();
+    }
 
     let nwin = b.bind_i32((ev(npages) + (WP - 1)) >> (WP.trailing_zeros() as i32));
     let neg = b.c_f32(-1.0e30);
     let zf = b.c_f32(0.0);
     let lastp = b.bind_i32(ev(npages) - 1);
     // ---- the per-window pieces (window index `t` an I32 expression; ring slot t & 3, exchange slots t & 1, generation t) ----
+    // the page ids of window t by scalar loads (lean form: loaded one iteration ahead of their stage)
+    let load_pids = |b: &mut FnBuilder, t: ValueId| -> Vec<ValueId> {
+        (0..WP)
+            .map(|pg| {
+                let tp = b.bind_i32(ev(t) * WP + pg);
+                let er = b.bind_i32(ev(kv0) + ev(tp));
+                let el = b.bind_i32(ev(kv_end) - 1);
+                let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+                let eo = b.bind_i32(ev(ec) * 4);
+                let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+                b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 })
+            })
+            .collect()
+    };
+    let stage_pids = |b: &mut FnBuilder, t: ValueId, pids: &[amdgpu_dsl::I32]| {
+        let si = b.bind_i32(ev(t) & (depth - 1));
+        let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
+        let r = kv.at(&sl);
+        for pg in 0..WP {
+            let pid = b.bind_i32(pids[pg as usize].clone() + 0);
+            b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
+            let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(w) * QUARTER);
+            let lds_a = b.bind_i32(r.base() + pg * layout.slot_bytes + ev(w) * layout.quarter_lds);
+            let g0 = tdm_group0(b, pkv, off, Opnd::Val(lds_a));
+            r.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0), Opnd::Val(g1), None, TdmCpol::default()));
+        }
+    };
     let stage = |b: &mut FnBuilder, t: ValueId| {
         let si = b.bind_i32(ev(t) & (depth - 1));
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
@@ -216,9 +248,19 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         for pg in 0..WP {
             let tp = b.bind_i32(ev(t) * WP + pg);
             let tc = b.let_(Op::MinI32(Opnd::Val(tp), Opnd::Val(lastp)));
-            let ta = b.bind_i32((ev(tc) << 2) + ptab.base as i32);
-            let pidv = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
-            let pid = b.read_first_lane(pidv);
+            let pid = if lean_early {
+                // the page id straight from the page table (scalar load; no LDS round trip)
+                let er = b.bind_i32(ev(kv0) + ev(tc));
+                let el = b.bind_i32(ev(kv_end) - 1);
+                let ec = b.let_(Op::MinI32(Opnd::Val(er), Opnd::Val(el)));
+                let eo = b.bind_i32(ev(ec) * 4);
+                let pe = b.let_(Op::PtrAdd { base: Opnd::Val(pltd), byte_off: Opnd::Val(eo) });
+                b.let_(Op::LoadScalar { base: Opnd::Val(pe), byte_off: 0 })
+            } else {
+                let ta = b.bind_i32((ev(tc) << 2) + ptab.base as i32);
+                let pidv = ptab.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0))).read(b, |b| b.load_lds(ta, MemTy::B32));
+                b.read_first_lane(pidv)
+            };
             b.assume_trusted(pid, Ext::c(0), Ext::sym("P") - Ext::c(1), "host contract: every page-table entry < P, the KV pool's page count (KV holds P x 36864 bytes)");
             let off = b.bind_i32(ev(pid) * PAGE_BYTES + ev(w) * QUARTER);
             let lds_a = b.bind_i32(r.base() + pg * layout.slot_bytes + ev(w) * layout.quarter_lds);
@@ -288,7 +330,11 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let si = b.bind_i32(ev(t) & 1);
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = red.at(&sl);
-        let a = b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4);
+        let a = if lean_early {
+            b.bind_i32(r.base() + ev(m) * 32 + (ev(w) * 2 + ev(g)) * 4)
+        } else {
+            b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4)
+        };
         r.write(b, |b| b.store_lds(a, mx, MemTy::B32, false));
     };
     // the window maximum of head m (8 partials)
@@ -296,6 +342,19 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let si = b.bind_i32(ev(t) & 1);
         let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
         let r = red.at(&sl);
+        if lean_early {
+            // the 8 partials of head m are contiguous: one b128 pair
+            let lo = b.bind_i32(r.base() + ev(m) * 32);
+            let hi = b.bind_i32(ev(lo) + 16);
+            return r.read(b, |b| {
+                let v8 = b.load_lds_b128x2(lo, hi);
+                let f: Vec<ValueId> = (0..8u8).map(|e| { let x = b.frag_slice(Opnd::Val(v8), e, 1); f32_of(b, x) }).collect();
+                let a1 = b.max3_f32(f[0], f[1], f[2]);
+                let a2 = b.max3_f32(a1, f[3], f[4]);
+                let a3 = b.max3_f32(a2, f[5], f[6]);
+                b.max_f32(a3, f[7])
+            });
+        }
         let rb = b.bind_i32(r.base() + ev(m) * 4);
         r.read(b, |b| {
             let mut pm: Option<ValueId> = None;
@@ -452,7 +511,15 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
             inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(*s)));
         }
     }
+    let npre = inits.len();
+    if lean {
+        let tf = b.c_i32(depth - 1);
+        for pv0 in load_pids(&mut b, tf) {
+            inits.push((DType::I32, Opnd::Val(pv0)));
+        }
+    }
     let st = b.declare_vars(&inits);
+    let pidv: Vec<_> = if lean { st[npre..].to_vec() } else { Vec::new() };
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
     let sv: Vec<_> = if lean { Vec::new() } else { st[11..11 + WP as usize].to_vec() };
@@ -489,8 +556,18 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         } else {
             None
         };
-        // 1. stage window t + depth - 1
-        stage(&mut b, t3);
+        // 1. stage window t + depth - 1 (lean: page ids loaded one iteration ahead; then those of the next window)
+        if lean {
+            let pe: Vec<amdgpu_dsl::I32> = pidv.iter().map(|&v| amdgpu_dsl::varx(v) + 0).collect();
+            stage_pids(&mut b, t3, &pe);
+            let t4 = b.bind_i32(ev(t3) + 1);
+            let np = load_pids(&mut b, t4);
+            for k in 0..np.len() {
+                b.set_var(pidv[k], Opnd::Val(np[k]));
+            }
+        } else {
+            stage(&mut b, t3);
+        }
         stamp(&mut b);
         // 2. the LDS fragments: K of window t + 2 (both pages, 9 chunks each), P(t), V(t) (8 tiles per page)
         let si2 = b.bind_i32(ev(t2) & (depth - 1));
@@ -823,5 +900,89 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     let off = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
     let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(off) });
     b.store_global(pl, 0, lse, MemTy::B32, false);
+    b.finish()
+}
+
+
+/// WMMA issue probe (gfx1250): every wave runs 64 iterations of 34 `v_wmma_f32_16x16x64_fp8_fp8` and stores its shader-clock cycle count
+/// (out[wave]) and a sink of its accumulators (out[64 + wave]). `k` accumulators used round-robin (dependency distance k); k = 0 is the
+/// one-barrier MLA window's pattern (two 9-deep S chains interleaved with 8 PV accumulators of 2 each).
+pub fn probe_g1250_wmma_lat(k: u32) -> Function {
+    let mut b = FnBuilder::new(&format!("probe_g1250_wmma_lat{k}"), 256);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(128 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wv = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(5)));
+    let w = b.read_first_lane(wv);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(31)));
+    // operands: distinct per-lane fp8 bytes (small values), held in VGPRs
+    let mk = |b: &mut FnBuilder, s: i32| -> ValueId {
+        let parts: Vec<Opnd> = (0..8).map(|j| Opnd::Val(b.bind_i32((ev(lane) & 7) * 0x0101_0101 + (0x3030_3030 + s * 8 + j)))).collect();
+        b.frag_cat(&parts)
+    };
+    let a: Vec<ValueId> = (0..4).map(|s| mk(&mut b, s)).collect();
+    let bb: Vec<ValueId> = (0..4).map(|s| mk(&mut b, 4 + s)).collect();
+    let nacc: usize = if k == 0 { 10 } else { k as usize };
+    let mut inits = Vec::new();
+    for _ in 0..nacc {
+        let z = b.frag_cat(&[Opnd::I32(0); 8]);
+        inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
+    }
+    let accs = b.declare_vars(&inits);
+    let c0 = b.shader_cycles();
+    let c0l = b.let_(Op::PtrLo(Opnd::Val(c0)));
+    let z = b.c_i32(0);
+    let lv = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+    let it = lv[0];
+    b.assume(it, Ext::c(0), Ext::c(64));
+    if k == 0 {
+        // S chains: accs[0] (page 0), accs[1] (page 1), each 9 deep, started from zero each iteration; PV: accs[2..10], 2 per accumulator
+        let mut s0: Option<Opnd> = None;
+        let mut s1: Option<Opnd> = None;
+        for c in 0..9usize {
+            let d0 = b.wmma(WmmaKind::Fp8_16x16x64, a[c % 4], bb[c % 4], s0);
+            s0 = Some(Opnd::Val(d0));
+            let d1 = b.wmma(WmmaKind::Fp8_16x16x64, a[(c + 1) % 4], bb[c % 4], s1);
+            s1 = Some(Opnd::Val(d1));
+            if c < 8 {
+                for pg in 0..2usize {
+                    let o = accs[2 + c];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, a[(pg + 2) % 4], bb[(c + pg) % 4], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+            }
+        }
+        if let (Some(Opnd::Val(x)), Some(Opnd::Val(y))) = (s0, s1) {
+            b.set_var(accs[0], Opnd::Val(x));
+            b.set_var(accs[1], Opnd::Val(y));
+        }
+    } else {
+        for i in 0..34usize {
+            let o = accs[i % nacc];
+            let d = b.wmma(WmmaKind::Fp8_16x16x64, a[i % 4], bb[(i / 4) % 4], Some(Opnd::Var(o)));
+            b.set_var(o, Opnd::Val(d));
+        }
+    }
+    let n = b.bind_i32(amdgpu_dsl::varx(it) + 1);
+    b.set_var(it, Opnd::Val(n));
+    let fin = b.cmp(CmpPred::Ge, CmpTy::I32, n, Opnd::I32(64));
+    b.break_if(fin);
+    b.end_loop();
+    let c1 = b.shader_cycles();
+    let c1l = b.let_(Op::PtrLo(Opnd::Val(c1)));
+    let dt = b.bind_i32(ev(c1l) - ev(c0l));
+    let mut sink: Option<ValueId> = None;
+    for &v in &accs {
+        let e = b.frag_slice(Opnd::Var(v), 0, 1);
+        sink = Some(match sink {
+            None => e,
+            Some(s) => b.add_i32(s, Opnd::Val(e)),
+        });
+    }
+    let o1 = b.bind_i32(ev(w) * 4);
+    let p1 = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o1) });
+    b.store_global(p1, 0, dt, MemTy::B32, false);
+    b.store_global(p1, 256, sink.unwrap(), MemTy::B32, false);
     b.finish()
 }

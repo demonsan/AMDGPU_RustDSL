@@ -685,6 +685,24 @@ static int run_trans(Kernel& k, const char* kn, int runs, int wgs, const char* d
     return bad == 0 ? 0 : 3;
 }
 
+// probe_g1250_wmma_lat<k>: one work-group of THREADS (32 / 128 / 256) threads; prints each wave's cycles for 64 x 34 WMMAs
+static int run_wmmalat(Kernel& k, const char* kn) {
+    const int th = getenv("THREADS") ? atoi(getenv("THREADS")) : 32;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, 128 * 4));
+    HC(hipMemset(dout, 0, 128 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(1, th, args, kn);
+    k.launch(1, th, args, kn);
+    std::vector<uint32_t> o(128);
+    HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+    printf("wmmalat %s threads=%d cycles/wmma per wave:", kn, th);
+    for (int w = 0; w < th / 32; ++w) printf(" %.2f", o[w] / (64.0 * 34.0));
+    printf("  PROBE_OK\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s add|math|tdm <co> [kernel] [arg]\n", argv[0]); return 1; }
     const std::string mode = argv[1];
@@ -702,6 +720,7 @@ int main(int argc, char** argv) {
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "dpp") return run_dpp(k, kn);
     if (mode == "pkmul") return run_pkmul(k, kn);
+    if (mode == "wmmalat") return run_wmmalat(k, kn);
     if (mode == "permlane") return run_permlane(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
