@@ -534,6 +534,69 @@ pub fn probe_g1250_dpp() -> Function {
     b.finish()
 }
 
+/// The gfx1250 lane permutes (`Op::Permlane`, `Op::PermlaneIdxGen`) against a CPU model (tests/gpu/g1250_probe_host.cpp `permlane`): one
+/// wave32 per workgroup, x = (wg << 16) + 1000 + lane, old = 0xdead0000 + lane; case k writes out[(wg * 28 + k) * 32 + lane]. The
+/// cases (the host mirrors them): every kind with several selects / group sizes and fetch-invalid / bound-ctrl settings; then two
+/// `v_permlane_idx_gen_b32` results (x = lane, a = 1 and a = 5), recorded for the model. The partial-EXEC variant is the same kernel with
+/// the EXEC mask narrowed around each permute (tools/mi450/permlane_probe.sh). Kernargs: out @0. 32 work-items.
+pub fn probe_g1250_permlane() -> Function {
+    use amdgpu_dsl::PermlaneKind;
+    let mut b = FnBuilder::new("probe_g1250_permlane", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(3584));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wg16 = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(16)));
+    let x = b.let_(Op::AddI32(Opnd::Val(wg16), Opnd::Val(tid)));
+    let x = b.let_(Op::AddI32(Opnd::Val(x), Opnd::I32(1000)));
+    let old = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(0xdead0000u32 as i32)));
+    let t3 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+    let vsel = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::I32(15)));
+    let wgn = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(3584)));
+    let t4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let base = b.let_(Op::AddI32(Opnd::Val(wgn), Opnd::Val(t4)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(base) });
+    let cases: [(PermlaneKind, Option<u32>, u32, bool, bool); 26] = [
+        (PermlaneKind::P16, Some(1985229328u32), 4275878552u32, false, false),
+        (PermlaneKind::P16, Some(2309737967u32), 19088743u32, false, false),
+        (PermlaneKind::P16, Some(324508639u32), 38177486u32, true, true),
+        (PermlaneKind::X16, Some(1985229328u32), 4275878552u32, false, false),
+        (PermlaneKind::X16, Some(2309737967u32), 19088743u32, true, false),
+        (PermlaneKind::P16Var, None, 0u32, false, false),
+        (PermlaneKind::X16Var, None, 0u32, false, true),
+        (PermlaneKind::Bcast, Some(3u32), 4u32, false, false),
+        (PermlaneKind::Bcast, Some(5u32), 8u32, false, false),
+        (PermlaneKind::Bcast, Some(7u32), 16u32, false, false),
+        (PermlaneKind::Bcast, Some(0u32), 32u32, false, false),
+        (PermlaneKind::Up, Some(1u32), 4u32, false, false),
+        (PermlaneKind::Up, Some(3u32), 8u32, false, false),
+        (PermlaneKind::Up, Some(5u32), 16u32, false, false),
+        (PermlaneKind::Up, Some(1u32), 32u32, false, false),
+        (PermlaneKind::Down, Some(1u32), 4u32, false, false),
+        (PermlaneKind::Down, Some(3u32), 8u32, false, false),
+        (PermlaneKind::Down, Some(5u32), 16u32, false, false),
+        (PermlaneKind::Down, Some(1u32), 32u32, false, false),
+        (PermlaneKind::Xor, Some(1u32), 4u32, false, false),
+        (PermlaneKind::Xor, Some(5u32), 8u32, false, false),
+        (PermlaneKind::Xor, Some(3u32), 16u32, false, false),
+        (PermlaneKind::Xor, Some(16u32), 32u32, false, false),
+        (PermlaneKind::Bcast, Some(1u32), 4u32, true, false),
+        (PermlaneKind::Up, Some(1u32), 8u32, false, true),
+        (PermlaneKind::Xor, Some(1u32), 2u32, true, true),
+    ];
+    for (k, (kind, a, bb, fi, bc)) in cases.iter().enumerate() {
+        let av = match a { Some(v) => Opnd::I32(*v as i32), None => Opnd::Val(vsel) };
+        let v = b.permlane(*kind, x, av, Opnd::I32(*bb as i32), old, *fi, *bc);
+        b.store_global(q, (k * 128) as u32, v, MemTy::B32, false);
+    }
+    for (j, a) in [1i32, 5].iter().enumerate() {
+        let v = b.permlane_idx_gen(tid, Opnd::I32(*a));
+        b.store_global(q, ((26 + j) * 128) as u32, v, MemTy::B32, false);
+    }
+    b.finish()
+}
+
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
 /// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
