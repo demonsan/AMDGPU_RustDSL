@@ -289,6 +289,11 @@ pub fn mla_g1250_qh16_wsy() -> Function {
     mla_ws_with("mla_g1250_qh16_wsy", false, 64 | 256 | 16384 | 65536 | 131072 | 16777216, false)
 }
 
+/// `_ws` with every page in the loop (an odd count padded with a masked page; no tail / last-page code copies).
+pub fn mla_g1250_qh16_wsnt() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsnt", false, 64 | 16384, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
