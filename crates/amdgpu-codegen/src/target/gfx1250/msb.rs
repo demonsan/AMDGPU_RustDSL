@@ -117,6 +117,40 @@ pub fn window(line: &str, cur: &mut Msb, exact: bool) -> Result<Vec<String>, Str
         *cur = Msb([((v >> 6) & 3) as u8, (v & 3) as u8, ((v >> 2) & 3) as u8, ((v >> 4) & 3) as u8]);
         return Ok(vec![line.to_string()]);
     }
+    // a VOPD pair: slot 0 = the two destinations, slot 1 = the two src0, slot 2 = the two vsrc1 (one MSB setting for both components;
+    // the pairing checked that they agree)
+    if let Some((xs, ys)) = t.split_once(" :: ") {
+        let mut need: [Option<u8>; 4] = [None; 4];
+        let mut halves = Vec::new();
+        for h in [xs, ys] {
+            let (mn, rest) = h.split_once(' ').ok_or_else(|| format!("`{t}`"))?;
+            let mut ops: Vec<String> = rest.split(", ").map(|s| s.to_string()).collect();
+            for (k, o) in ops.iter_mut().enumerate() {
+                let Some((lo, hi)) = vgpr_of(o) else { continue };
+                let w = (hi / 256) as u8;
+                if lo / 256 != hi / 256 || k > 2 {
+                    return Err(format!("`{t}`: VOPD operand {o}"));
+                }
+                match need[k] {
+                    Some(x) if x != w => return Err(format!("`{t}`: the VOPD components need different VGPR windows in slot {k}")),
+                    _ => need[k] = Some(w),
+                }
+                *o = low(o, lo, hi);
+            }
+            halves.push(format!("{mn} {}", ops.join(", ")));
+        }
+        let want = Msb([need[0].unwrap_or(cur.0[0]), need[1].unwrap_or(cur.0[1]), need[2].unwrap_or(cur.0[2]), cur.0[3]]);
+        let mut out = Vec::new();
+        if want != *cur {
+            if exact {
+                return Err(format!("`{t}`: the VGPR MSBs in effect do not match the operands"));
+            }
+            *cur = want;
+            out.push(format!("s_set_vgpr_msb {:#x}", want.imm()));
+        }
+        out.push(format!("{} :: {}", halves[0], halves[1]));
+        return Ok(out);
+    }
     let (mn, rest) = match t.find(' ') {
         Some(i) => (&t[..i], &t[i + 1..]),
         None => return Ok(vec![line.to_string()]),
