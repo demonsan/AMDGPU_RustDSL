@@ -245,6 +245,30 @@ about 10 KiB per window and one more barrier phase of latency, not bandwidth.
 whole compute-only window 0.72 -> 0.96 us: the shifted addresses leave the padded layout's conflict-free pattern for `ds_load_tr8`. The aligned-waves collision seen with the barrier (PV 0.13 -> 0.19 us) needs a different remedy
 (for example the two-role structure above, which removes the barrier alignment of the MMA waves' V reads from the softmax phase).
 
+#### Two-role MLA prototype (e08, 2026-11-20)
+
+`mla_g1250_qh16_roles` (`probes/g1250_mla_roles.rs`, run by `tools/mi450/mla_roles.sh`, which builds the MLA host with 256 work-items): 8 waves, waves 0 - 3 = MMA waves (K / V / P fragments, 18 S WMMA + 16 PV WMMA, the S tile to the LDS ring
+`SBUF`), waves 4 - 7 = softmax waves (S from `SBUF`, partial maxima through `RED`, lean arithmetic, P to `PBUF`), one work-group barrier per window, the w1 pipeline one window deeper (iteration t: PV(t), S(t + 3) -> SBUF gen t + 3 /
+softmax: S(t + 2), maxima gen t + 2, window maximum gen t + 1, P(t + 1)). Stub data (window 0 staged once), no KV streaming, no rescale. **The tile protocol, the roles / barrier-count rules and the bounds prover accept it with no new
+trusted fact** (one prover quirk: `AndI32(const 2, 1)` is bounded as 3, so the ring slot of a constant generation is passed explicitly in the prologue; the split barrier form, `s_barrier_signal` early on one role and `s_barrier_wait`
+late, is rejected by the protocol's phase model across roles, so both roles use the full barrier). 464 VGPRs (two waves per SIMD fit), LDS 182,272 B with a 2-slot KV ring (3 slots: about 256 KiB).
+
+Per 128-token window, B = 1, compute-only, us (the same method as above):
+
+| variant | us per window |
+|---|---:|
+| sequential blocks in one wave set (the phase kernels) | 0.718 |
+| the same with lean softmax + lazy rescale | 0.673 |
+| **two roles, as built** (hand-off, 8-wave barrier, lean softmax, no rescale) | **0.452** (0.496 before putting the softmax loads ahead of the maxima store) |
+| two roles, MMA waves' work skipped (hand-off + barrier + the softmax waves) | 0.324 |
+| two roles, softmax waves' math skipped (the MMA waves + hand-off + barrier) | 0.426 |
+| two roles, both skipped (loops, hand-off, barrier only) | 0.205 |
+
+So the roles do overlap the softmax with the MMA blocks (the softmax adds 0.03 us on top of the MMA waves), and the compute-only window drops 0.72 -> 0.45 (-37 %); but it is not the hoped-for 0.3: the MMA waves' path
+(fragment loads -> 34 WMMA -> S store -> `wait_lds(0)` -> barrier) is 0.43 us and the hand-off / barrier skeleton 0.2 us (LDS latency chains of the softmax waves, an 8-wave barrier) adds to it almost serially. Candidate
+next steps (not built): issue the next window's K / V fragment loads before the barrier (the slot is already published), two windows per iteration (one barrier per two windows needs two more ring generations), counted
+`s_wait_dscnt` instead of `wait_lds(0)`. In situ the replica is 0.379 us and `_w1i` 0.958 us; with the roles the compute part falls by 0.27 us, so a real kernel (3-slot ring, KV streaming) would land around 0.7 us.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
