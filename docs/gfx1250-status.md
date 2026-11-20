@@ -190,6 +190,31 @@ blocks already take 0.68 us, 1.8 x the replica's whole window (staging, waits an
 the GEMM epilogue analysis found, and none of it overlaps the WMMAs (0.677 combined vs 0.635 as parts). With perfect hiding of the softmax and the alpha rescale under the MMA blocks the window would be about 0.26 - 0.3 us,
 which is the replica's 0.38 us budget: the lever is overlap (and the lazy rescale), not the MMA blocks.
 
+#### Does the interleave hide the softmax? (same microbenchmarks, e08, 2026-11-20)
+
+More mask bits: 0x20 the w1i-style iteration (the softmax of window t + 1 emitted in 8 steps between the S / PV WMMAs, one barrier at the end), 0x40 lazy O rescale (a uniform `any_lane(alpha < 1)` branch),
+0x80 an independent VALU block (8 chains, 128 instructions; 0x200: mul + add instead of mul + exp2), 0x100 the WMMA stream ordered round-robin over the independent chains (a dependent WMMA never directly follows its
+producer), 0x400 lean softmax arithmetic (no per-token mask, which only the last window needs; the scale folded into one fma per exponent; the maximum on the raw scores): us per window, B = 1:
+
+| experiment | us per window |
+|---|---:|
+| VALU block + barrier (128 instructions, mul + exp2 or mul + add) | 0.19 (0.165 without the barrier: about 3 - 3.7 cycles per VALU instruction, TRANS or not) |
+| PV block + barrier | 0.19 (0.13 without the barrier: the barrier aligns the four waves' V reads and they collide in the LDS) |
+| PV + VALU block, sequential | 0.358 (sum of the parts 0.36) |
+| PV + VALU block, interleaved (adjacent WMMA pairs / spread over independent chains) | 0.330 / 0.327 (-8 %; the max of the parts would be 0.19) |
+| the same with mul + add (no TRANS) | 0.337 / 0.328 |
+| S + VALU: sequential / interleaved | 0.354 / 0.325 |
+| all blocks, sequential blocks + barrier | 0.718 |
+| all blocks, interleaved (w1i-style) | 0.813 (worse: the extra barrier phases and register pressure outweigh the 8 %) |
+| interleaved + lean softmax | 0.718 |
+| interleaved + lean + lazy rescale (steady state: the branch is not taken) | **0.673** |
+
+So a single wave does NOT overlap VALU with WMMA on this part, with independent chains, TRANS or plain VALU, in any order I can express (at most 8 % of the VALU time); the combined cost is the sum, and the levers
+are fewer instructions: the lean softmax arithmetic saves 0.095 us per window (about 90 of about 170 VALU), the lazy rescale 0.045 us (the steady state, where the maximum has stopped growing), together 0.74 -> 0.67 us
+of the 0.72 us compute-only window. The replica's whole window is 0.379 us: its softmax must be below about 0.12 us (about 60 VALU) with WMMA issue the other 0.25, so the remaining gap is the MMA blocks (0.13 + 0.13
+us for 34 WMMA, twice the WMMA time: LDS-read bound, and worse when the waves are barrier-aligned) and the VALU count, not the interleave order. Not measured here (it needs a different structure): two waves per SIMD, where
+one wave's VALU runs under the other's WMMA (the occupancy result for the GEMM was negative, but that loop was WMMA-bound; here the VALU share is 44 %).
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process

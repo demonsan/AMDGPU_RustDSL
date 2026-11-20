@@ -28,11 +28,24 @@ const PH_PV: u32 = 2;
 const PH_ALPHA: u32 = 4;
 const PH_SM: u32 = 8;
 const PH_BAR: u32 = 16;
+/// the interleaved iteration: the softmax of window t + 1 is emitted in steps between the S / PV WMMAs (w1i-style), one barrier at the end
+const PH_ILP: u32 = 32;
+/// with PH_ILP: the O rescale only when some head's maximum grew (a uniform branch), instead of every window
+const PH_LAZY: u32 = 64;
+/// an independent VALU / TRANS block (8 chains of mul + exp2, 8 rounds = 128 instructions): after the other blocks, or (with PH_ILP) one round after each WMMA pair: does a wave overlap VALU with WMMA at all?
+const PH_VALU: u32 = 128;
+/// with PH_ILP: the WMMA stream orders independent chains round-robin (a dependent WMMA never directly follows its producer)
+const PH_SPREAD: u32 = 256;
+/// the VALU block uses mul + add (no TRANS) instead of mul + exp2: does a TRANS op block WMMA co-execution?
+const PH_ALU: u32 = 512;
+/// with PH_ILP + PH_SM: the lean softmax arithmetic (no per-token mask: valid on every window but the last, which a uniform branch would handle; the scale folded into one fma per exponent;
+/// the maximum taken on the raw scores and scaled once): about 90 fewer VALU per window
+const PH_LEAN: u32 = 1024;
 
 /// `mla_g1250_qh16_ph_<hex mask>`.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 0x1f {
+    if mask > 0x7ff {
         return None;
     }
     Some(mla_ph_with(&format!("mla_g1250_qh16_ph_{hex}"), 2, 4, mask))
@@ -315,7 +328,18 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let z = b.frag_cat(&[Opnd::I32(0); 8]);
         inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
     }
+    for _ in 0..8 {
+        inits.push((DType::F32, Opnd::Val(zf)));
+    }
     let st = b.declare_vars(&inits);
+    let uv: Vec<_> = st[11 + WP as usize..11 + WP as usize + 8].to_vec();
+    let valu_round = |b: &mut FnBuilder| {
+        for i in 0..8usize {
+            let x = b.mul_f32(Opnd::Var(uv[i]), cscale);
+            let y = if mask & PH_ALU != 0 { b.add_f32(x, cscale) } else { b.exp2_f32(x) };
+            b.set_var(uv[i], Opnd::Val(y));
+        }
+    };
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
     let sv: Vec<_> = st[11..11 + WP as usize].to_vec();
@@ -323,12 +347,289 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
     };
+    if mask & PH_ILP != 0 && mask & PH_SM != 0 {
+        let c1 = b.c_i32(1);
+        let svo: Vec<Opnd> = sv.iter().map(|&v| Opnd::Var(v)).collect();
+        let x0 = logits(&mut b, c0, &svo);
+        put_max(&mut b, c0, &x0);
+        let x1 = logits(&mut b, c1, &svo);
+        put_max(&mut b, c1, &x1);
+        b.wait_lds(0);
+        b.barrier();
+        let pm0 = get_max(&mut b, c0);
+        let (alpha0, m0, l0) = put_p(&mut b, c0, &x0, Opnd::Var(vm), Opnd::Var(vl), pm0);
+        b.set_var(vm, Opnd::Val(m0));
+        b.set_var(vl, Opnd::Val(l0));
+        b.set_var(va, Opnd::Val(alpha0));
+        b.wait_lds(0);
+        b.barrier();
+    }
     let t_start = cyc(&mut b);
     let z = b.c_i32(0);
     let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
     let it = lvars[0];
     b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
     let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
+    if mask & PH_ILP != 0 {
+        let s_on = mask & PH_S != 0;
+        let pv_on = mask & PH_PV != 0;
+        let sm_on = mask & PH_SM != 0;
+        let t1 = b.bind_i32(ev(t) + 1);
+        let t2 = b.bind_i32(ev(t) + 2);
+        // 1. every LDS fragment first (K of the staged window, P(t) and V(t))
+        let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
+        let sb2 = b.bind_i32(kr.base());
+        let kfr: Vec<Vec<ValueId>> = if s_on {
+            (0..WP)
+                .map(|pg| {
+                    let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
+                    let nope_row = b.bind_i32(ev(pb) + ev(kofs));
+                    let rope_row = b.bind_i32(ev(pb) + ev(rofs));
+                    kr.read(&mut b, |b| {
+                        (0..9)
+                            .map(|c| {
+                                let lo = if c < 8 { b.bind_i32(ev(nope_row) + kdelta[c as usize]) } else { b.bind_i32(ev(rope_row)) };
+                                let hi = b.bind_i32(ev(lo) + 16);
+                                b.load_lds_b128x2(lo, hi)
+                            })
+                            .collect()
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (pa, vfr): (Vec<ValueId>, Vec<Vec<ValueId>>) = if pv_on {
+            let pr_ = if sm_on {
+                let psi = b.bind_i32(ev(t) & 1);
+                pbuf2.at(&SlotIdx::new(Opnd::Val(psi), Opnd::Val(t)))
+            } else {
+                pbuf.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)))
+            };
+            let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+            let pa: Vec<ValueId> = pr_.read(&mut b, |b| {
+                (0..WP)
+                    .map(|pg| {
+                        let lo = b.bind_i32(ev(pbase) + 1024 * pg);
+                        let hi = b.bind_i32(ev(lo) + 16);
+                        b.load_lds_b128x2(lo, hi)
+                    })
+                    .collect()
+            });
+            let kb = b.bind_i32(kr.base());
+            let vfr: Vec<Vec<ValueId>> = (0..WP)
+                .map(|pg| {
+                    let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                    kr.read(&mut b, |b| {
+                        (0..8)
+                            .map(|nt| {
+                                let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                                b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            (pa, vfr)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // 2. O *= alpha(t): every window, or only when some head's maximum grew (a uniform branch)
+        if pv_on && mask & PH_ALPHA != 0 {
+            let lazy = mask & PH_LAZY != 0;
+            if lazy {
+                let grew = b.cmp(CmpPred::Lt, CmpTy::F32, Opnd::Var(va), Opnd::F32(1.0));
+                let any = b.let_(Op::AnyLane(Opnd::Val(grew)));
+                b.begin_if(any);
+            }
+            let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
+            let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+            let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+            let one = b.c_f32(1.0);
+            let hf = b.sub_f32(one, gf);
+            let al: Vec<ValueId> = (0..8usize)
+                .map(|r| {
+                    let a0 = b.let_(Op::BitcastF32(Opnd::Val(sa16[r])));
+                    let a1 = b.let_(Op::BitcastF32(Opnd::Val(sa16[8 + r])));
+                    let u0 = b.mul_f32(a0, hf);
+                    let u1 = b.mul_f32(a1, gf);
+                    b.add_f32(u0, u1)
+                })
+                .collect();
+            for nt in 0..8 {
+                for r in 0..8u8 {
+                    b.var_scale_lane(ov[nt], r, al[r as usize]);
+                }
+            }
+            if lazy {
+                b.end_if();
+            }
+        }
+        // 3. the WMMA stream (S chunk c of both pages, PV tile c of both pages) with the softmax of window t + 1 in 8 steps between the pairs
+        let mut xs: Vec<ValueId> = Vec::new();
+        let mut ps: Vec<ValueId> = Vec::new();
+        let mut pm_v: Option<ValueId> = None;
+        let mut m_new_v: Option<ValueId> = None;
+        let mut alpha_v: Option<ValueId> = None;
+        let mut lsum_v: Option<ValueId> = None;
+        let lean = mask & PH_LEAN != 0;
+        let mut m_old_keep: Option<ValueId> = None;
+        let mut step = |b: &mut FnBuilder, k: usize| match k {
+            0 | 1 if lean => {
+                for r in 0..8u8 {
+                    let si = b.frag_slice(Opnd::Var(sv[k]), r, 1);
+                    xs.push(f32_of(b, si));
+                }
+            }
+            0 | 1 => {
+                let pg = k as i32;
+                let tok0 = b.bind_i32(ev(t1) * (64 * WP) + (64 * pg) + ev(w) * 16 + ev(g) * 8);
+                for r in 0..8u8 {
+                    let si = b.frag_slice(Opnd::Var(sv[pg as usize]), r, 1);
+                    let sf = f32_of(b, si);
+                    let v = b.mul_f32(sf, cscale);
+                    let tok = b.add_i32(tok0, Opnd::I32(r as i32));
+                    let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, ctx);
+                    xs.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
+                }
+            }
+            2 => pm_v = Some(get_max(b, t1)),
+            3 if lean => {
+                let pms = b.mul_f32(pm_v.unwrap(), cscale);
+                let m_new = b.max_f32(Opnd::Var(vm), pms);
+                let dm = b.sub_f32(Opnd::Var(vm), m_new);
+                let alpha = b.exp2_f32(dm);
+                lsum_v = Some(b.mul_f32(Opnd::Var(vl), alpha));
+                m_new_v = Some(b.sub_f32(zf, m_new));   // -m_new, the fma addend
+                alpha_v = Some(alpha);
+                m_old_keep = Some(m_new);
+            }
+            3 => {
+                let m_new = b.max_f32(Opnd::Var(vm), pm_v.unwrap());
+                let dm = b.sub_f32(Opnd::Var(vm), m_new);
+                let alpha = b.exp2_f32(dm);
+                lsum_v = Some(b.mul_f32(Opnd::Var(vl), alpha));
+                m_new_v = Some(m_new);
+                alpha_v = Some(alpha);
+            }
+            4 | 5 if lean => {
+                let pg = k - 4;
+                for r in 0..8usize {
+                    let d = b.let_(Op::FmaF32(Opnd::Val(xs[8 * pg + r]), Opnd::Val(cscale), Opnd::Val(m_new_v.unwrap())));
+                    let p = b.exp2_f32(d);
+                    ps.push(p);
+                    lsum_v = Some(b.add_f32(lsum_v.unwrap(), p));
+                }
+            }
+            4 | 5 => {
+                let pg = k - 4;
+                for r in 0..8usize {
+                    let d = b.sub_f32(xs[8 * pg + r], m_new_v.unwrap());
+                    let p = b.exp2_f32(d);
+                    ps.push(p);
+                    lsum_v = Some(b.add_f32(lsum_v.unwrap(), p));
+                }
+            }
+            _ => {
+                let pg = k - 6;
+                let si = b.bind_i32(ev(t1) & 1);
+                let r = pbuf2.at(&SlotIdx::new(Opnd::Val(si), Opnd::Val(t1)));
+                let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
+                r.write(b, |b| {
+                    let p0 = b.cvt_pk_fp8x4_f32(ps[8 * pg], ps[8 * pg + 1], ps[8 * pg + 2], ps[8 * pg + 3]);
+                    let p1 = b.cvt_pk_fp8x4_f32(ps[8 * pg + 4], ps[8 * pg + 5], ps[8 * pg + 6], ps[8 * pg + 7]);
+                    let a0 = b.bind_i32(ev(pw) + 1024 * pg as i32);
+                    b.store_lds(a0, p0, MemTy::B32, false);
+                    let a1 = b.bind_i32(ev(pw) + (1024 * pg as i32 + 4));
+                    b.store_lds(a1, p1, MemTy::B32, false);
+                });
+            }
+        };
+        let mut next = 0usize;
+        let mut sacc: Vec<Option<Opnd>> = vec![None; WP as usize];
+        // chains: S page 0 / page 1 (9 deep each) and the 8 PV tiles (2 deep: page 0, then page 1); round r issues S chunk r of both pages, PV tile r page 0 and PV tile r - 4 page 1, so that a
+        // dependent WMMA never follows its producer directly and the VALU steps between rounds run in the producer's latency (`PH_SPREAD`) -- or, without it, adjacent pairs as before
+        let spread = mask & PH_SPREAD != 0;
+        let rounds = if spread { 13 } else { 9 };
+        for r in 0..rounds {
+            if spread {
+                if s_on && r < 9 {
+                    for pg in 0..WP as usize {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][r], q[r], sacc[pg]);
+                        sacc[pg] = Some(Opnd::Val(d));
+                    }
+                }
+                if pv_on && r < 8 {
+                    let o = ov[r];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[0], vfr[0][r], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+                if pv_on && r >= 4 && r - 4 < 8 {
+                    let nt = r - 4;
+                    let o = ov[nt];
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[1], vfr[1][nt], Some(Opnd::Var(o)));
+                    b.set_var(o, Opnd::Val(d));
+                }
+            } else {
+                let c = r;
+                if s_on {
+                    for pg in 0..WP as usize {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
+                        sacc[pg] = Some(Opnd::Val(d));
+                    }
+                }
+                if pv_on && c < 8 {
+                    for pg in 0..WP as usize {
+                        let o = ov[c];
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
+                        b.set_var(o, Opnd::Val(d));
+                    }
+                }
+            }
+            if sm_on && next < 8 {
+                step(&mut b, next);
+                next += 1;
+            }
+            if mask & PH_VALU != 0 && r < 8 {
+                valu_round(&mut b);
+            }
+        }
+        while sm_on && next < 8 {
+            step(&mut b, next);
+            next += 1;
+        }
+        // 4. S(t + 2): its maxima to RED, carried for the next window
+        if s_on {
+            let s2: Vec<Opnd> = sacc.iter().map(|o| o.unwrap()).collect();
+            if sm_on {
+                let x2 = if lean {
+                    let mut raw = Vec::new();
+                    for pg in 0..WP as usize {
+                        for r in 0..8u8 {
+                            let si = b.frag_slice(s2[pg], r, 1);
+                            raw.push(f32_of(&mut b, si));
+                        }
+                    }
+                    raw
+                } else {
+                    logits(&mut b, t2, &s2)
+                };
+                put_max(&mut b, t2, &x2);
+            }
+            for pg in 0..WP as usize {
+                if let Opnd::Val(v) = s2[pg] {
+                    b.set_var(sv[pg], Opnd::Val(v));
+                }
+            }
+        }
+        if sm_on {
+            b.set_var(vm, Opnd::Val(if lean { m_old_keep.unwrap() } else { m_new_v.unwrap() }));
+            b.set_var(vl, Opnd::Val(lsum_v.unwrap()));
+            b.set_var(va, Opnd::Val(alpha_v.unwrap()));
+        }
+        b.wait_lds(0);
+        b.barrier();
+    } else {
     if mask & PH_S != 0 {
         // K fragments of the staged window (both pages, 9 chunks each) and the S WMMAs, carried in `sv`
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
@@ -434,6 +735,12 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.wait_lds(0);
         b.barrier();
     }
+    if mask & PH_VALU != 0 {
+        for _ in 0..8 {
+            valu_round(&mut b);
+        }
+    }
+    }
     let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
     b.set_var(it, Opnd::Val(tn));
     let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
@@ -457,6 +764,9 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.store_global(pa0, 56, Opnd::Var(vm), MemTy::B32, false);
     b.store_global(pa0, 60, Opnd::Var(vl), MemTy::B32, false);
     b.store_global(pa0, 64, Opnd::Var(va), MemTy::B32, false);
+    for i in 0..8usize {
+        b.store_global(pa0, (68 + 4 * i) as u32, Opnd::Var(uv[i]), MemTy::B32, false);
+    }
     let _ = &plse;
     b.finish()
 }
