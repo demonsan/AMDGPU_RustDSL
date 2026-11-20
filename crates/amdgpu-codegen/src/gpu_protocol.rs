@@ -33,6 +33,8 @@ enum Item {
     /// `s_waitcnt lgkmcnt(0)`: completes every LDS operation this wave issued before it. (A counted `wait_lds(n > 0)` is not a completion
     /// point for the protocol: the scheduler may reorder independent DS reads, so "n later operations" is not stable through compilation.)
     WaitLds { ord: u32 },
+    /// `wait_lds_writes`: completes every LDS WRITE this wave issued before it (reads issued later may stay in flight)
+    WaitLdsWrites { ord: u32 },
     /// `s_waitcnt lgkmcnt(n > 0)` of an EXACT kernel (the author's order is final, so the in-order DS returns make it a completion point for every
     /// DS operation followed by at least n later DS operations)
     WaitLdsN { ord: u32, count: u8 },
@@ -601,6 +603,7 @@ impl<'a> Sim<'a> {
                 Stmt::WaitTensor { count } | Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Tensor, count } => self.items.push(Item::WaitTensor { ord: self.sig, count: *count }),
             Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Async, count } => self.items.push(Item::WaitAsync { ord: self.sig, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.sig }),
+                Stmt::WaitLdsWrites => self.items.push(Item::WaitLdsWrites { ord: self.sig }),
                 // the combined s_waitcnt (exact mode): both counters
                 Stmt::WaitCnt { vm, lgkm } => {
                     self.items.push(Item::WaitVm { ord: self.sig, count: *vm });
@@ -821,17 +824,19 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
     let ord_of = |it: &Item, dflt: u32| match it {
-        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } | Item::WaitTensor { ord, .. } | Item::WaitAsync { ord, .. } => *ord,
+        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::WaitLdsWrites { ord } | Item::WaitLdsN { ord, .. } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } | Item::WaitTensor { ord, .. } | Item::WaitAsync { ord, .. } => *ord,
         _ => dflt,
     };
     // the event's DS accesses are complete at the first wait_lds(0) after its last access. Barriers in between do not matter for completion (the access
     // window then spans them; the race check uses it). The scheduler never moves an LDS access below a later lgkmcnt wait (sched/order.rs).
     let ds_done = || -> Option<usize> {
-        // lgkmcnt(0); in an exact kernel also lgkmcnt(n) once n later DS operations of this wave were issued (in-order DS returns)
+        // lgkmcnt(0); in an exact kernel also lgkmcnt(n) once n later DS operations of this wave were issued (in-order DS returns); for the writes
+        // of a producer also `wait_lds_writes` (the compiler's count completes exactly the earlier writes)
         let mut later = 0usize;
         for (k, it) in items.iter().enumerate().skip(after) {
             match it {
                 Item::WaitLds { .. } => return Some(k),
+                Item::WaitLdsWrites { .. } if ev.produce => return Some(k),
                 Item::Access { dma: false } => later += 1,
                 Item::WaitLdsN { count, .. } if later >= *count as usize => return Some(k),
                 _ => {}

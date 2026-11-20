@@ -452,6 +452,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VAndB32Dpp => vec![format!("v_and_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
         MOp::VOrB32Dpp => vec![format!("v_or_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
         MOp::VXorB32Dpp => vec![format!("v_xor_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::SWaitLdsWrites => vec![],
         MOp::VPermlane16B32 | MOp::VPermlaneX16B32 | MOp::VPermlane16VarB32 | MOp::VPermlaneX16VarB32 | MOp::VPermlaneBcastB32 | MOp::VPermlaneUpB32 | MOp::VPermlaneDownB32 | MOp::VPermlaneXorB32 => {
             let mn = crate::op_attrs::attrs(inst.op).mnemonic;
             let var = matches!(inst.op, MOp::VPermlane16VarB32 | MOp::VPermlaneX16VarB32);

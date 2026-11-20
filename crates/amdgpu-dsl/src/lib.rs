@@ -1557,6 +1557,10 @@ pub enum Stmt {
     WaitCounter { counter: WaitCtr, count: u8 },
     /// gfx1250: `s_barrier_signal id` (-1 workgroup, -3 cluster, 1..16 named).
     BarrierSignal { id: i32 },
+    /// Wait until every LDS WRITE (store / atomic) this wave issued before is complete, letting LDS reads issued after the last write stay in
+    /// flight: the compiler computes the count (`lgkmcnt` / `DScnt` = the DS operations issued after the last write, in-order completion) after
+    /// scheduling; none when no write is pending. The tile protocol takes it as the completion of the earlier writes (not of reads).
+    WaitLdsWrites,
     /// gfx1250: `s_barrier_wait id`.
     BarrierWait { id: i32 },
     /// gfx1250: initialise named barrier `id` (1..=16) with `members` waves (M0 = members << 16 | id; `s_barrier_init m0`).
@@ -2980,6 +2984,10 @@ impl FnBuilder {
         self.push_stmt(Stmt::VarPkFma { var, start, t: t.into(), s: s.into() });
     }
     /// In place `var[start .. start + 2] *= s` (`Stmt::VarPkMul`, one `v_pk_mul_f32`; `start` even, `s` a Frag2).
+    /// `Stmt::WaitLdsWrites`: complete this wave's earlier LDS writes, the later LDS reads staying in flight (the count is the compiler's).
+    pub fn wait_lds_writes(&mut self) {
+        self.push_stmt(Stmt::WaitLdsWrites);
+    }
     pub fn var_pk_mul(&mut self, var: VarId, start: u8, s: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarPkMul { var, start, s: s.into() });
     }
@@ -5237,7 +5245,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             // (the tensor operations' descriptor groups are checked by lowering: SGPR tuples of the right width)
             Stmt::WaitTensor { .. } | Stmt::TensorLoadToLds { .. } | Stmt::TensorStoreFromLds { .. } => {}
-            Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } => {}
+            Stmt::WaitCounter { .. } | Stmt::BarrierSignal { .. } | Stmt::BarrierWait { .. } | Stmt::SetVgprMsb { .. } | Stmt::WaitLdsWrites => {}
             Stmt::Sys { .. } | Stmt::ExecFromMask { .. } | Stmt::ExecSelect { .. } | Stmt::LoadAsyncLds { .. } => {}
             Stmt::LayoutKey { .. } | Stmt::Goto { .. } | Stmt::AuthorWords { .. } => {
                 if !f.exact {
