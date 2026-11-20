@@ -301,5 +301,7 @@ fn independent_multiplies_pair_into_vopd() {
     }
     let c = amdgpu_codegen::compile_target(&b.finish(), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
     assert!(c.asm.contains("v_dual_"), "{}", c.asm);
-    amdgpu_codegen::amdgpu_target::gfx1250_co::encode_text(&c.asm).unwrap_or_else(|e| panic!("{e}"));
+    for l in c.asm.lines().map(|l| l.trim()).filter(|l| l.starts_with("v_dual_")) {
+        amdgpu_codegen::amdgpu_target::gfx1250_co::encode_line(l, 0, &|_| Some(0)).unwrap_or_else(|e| panic!("{e}"));
+    }
 }
