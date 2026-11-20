@@ -839,7 +839,7 @@ pub enum Op {
     /// group keeps its own value (measured on MI450, tests/gpu/g1250_probe_host.cpp `permlane`).
     Permlane { kind: PermlaneKind, x: Opnd, a: Opnd, b: Opnd, old: Opnd, fi: bool, bc: bool },
     /// gfx1250 `v_permlane_idx_gen_b32 d, x, a`: the byte index for a backwards permute (`ds_bpermute`) built from `x` and `a`. Encoded and
-    /// lowered; its exact function is not modelled here (no public specification): the probe records results but does not check them.
+    /// lowered only in exact mode: its function is not specified (no public specification), so the lowering refuses it elsewhere.
     PermlaneIdxGen { x: Opnd, a: Opnd },
     /// conversion (`CvtOp`; operands and `sel` per op)
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },

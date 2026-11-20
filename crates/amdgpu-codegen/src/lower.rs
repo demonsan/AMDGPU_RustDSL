@@ -4100,8 +4100,10 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::PermlaneIdxGen { x, a } => {
-                if crate::target::cur().name != "gfx1250" {
-                    return Err("v_permlane_idx_gen_b32: a gfx1250 instruction".into());
+                // refused until its function is specified (the encoder and the emitter know it; no kernel may depend on unspecified
+                // behaviour)
+                if crate::target::cur().name != "gfx1250" || !EXACT_LOWERING.with(|e| e.get()) {
+                    return Err("v_permlane_idx_gen_b32: its function is not specified; refused (exact-mode kernels only)".into());
                 }
                 let rx = self.as_v1(*x)?;
                 let sa = self.s_operand(*a)?;
