@@ -8,7 +8,7 @@ cp tests/gpu/g1250_timing.h $O/ 2>/dev/null
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 -I tests/gpu $O/host256.cpp -o $O/host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"; export PROBE_WATCHDOG_S=20 CHECK_B=0
 for k in ${KS:-mla_g1250_qh16_roles}; do
-$A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { tail -3 $O/$k.log; exit 4; }
+env ${EMIT_ENV:-X=1} $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { tail -3 $O/$k.log; exit 4; }
 $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s 2>/dev/null || exit 5
 grep -E "amdhsa_next_free_vgpr|amdhsa_group_segment" $O/$k.s | tr -s ' '
 for ctx in ${CTXS:-16384 32768}; do
