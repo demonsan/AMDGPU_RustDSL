@@ -104,7 +104,11 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
         }
     }
     // VOPD dual issue (opt-in `AMDC_VOPD`): the pairs, before the hazard plan the emitter computes
-    vopd::select(&m, &alloc);
+    if backend == "own" {
+        vopd::select(&m, &alloc);
+    } else {
+        vopd::clear();
+    }
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {
