@@ -25,7 +25,8 @@ thread_local! {
 
 /// The kernel's `vopd` lowering token, or `AMDC_VOPD` (A/B).
 pub fn enabled(m: &MFunction) -> bool {
-    m.vopd || std::env::var("AMDC_VOPD").is_ok()
+    // (AMDC_NO_VOPD: off even for a kernel with the token, A/B only)
+    std::env::var("AMDC_NO_VOPD").is_err() && (m.vopd || std::env::var("AMDC_VOPD").is_ok())
 }
 
 pub fn clear() {
@@ -48,6 +49,8 @@ pub fn break_pair(b: usize, first: usize) {
 fn kind(op: MOp) -> Option<(bool, bool)> {
     Some(match op {
         MOp::VMulF32 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMaxF32 | MOp::VMinF32 | MOp::VMovB32 | MOp::VMovFromS => (true, true),
+        // an FMA whose addend is its destination: `v_dual_fmac_f32`
+        MOp::VFmaF32 => (true, true),
         MOp::VAddU32 | MOp::VSubU32 => (false, true),
         _ => return None,
     })
@@ -70,7 +73,11 @@ pub fn select(m: &MFunction, a: &Alloc) {
         return;
     }
     let ok1 = |i: &MInst| -> bool {
-        kind(i.op).is_some() && !i.pin && i.neg == 0 && !i.e64 && i.words.is_none() && i.dst.is_some() && i.srcs.len() <= 2
+        kind(i.op).is_some() && !i.pin && i.neg == 0 && !i.e64 && i.words.is_none() && i.dst.is_some() && (i.srcs.len() <= 2 || i.op == MOp::VFmaF32)
+            && (i.op != MOp::VFmaF32 || match (&i.srcs.get(2), i.dst) {
+                (Some(Src::Reg(c)), Some(d)) => phys(m, a, *c).map(|x| x.1) == phys(m, a, d).map(|x| x.1) && phys(m, a, d).is_some(),
+                _ => false,
+            })
     };
     PAIRS.with(|p| {
         let mut p = p.borrow_mut();
@@ -122,17 +129,23 @@ pub fn merge(x: &str, y: &str) -> Option<String> {
     let parse = |l: &str| -> Option<(String, Vec<String>)> {
         let l = l.trim();
         let (mn, rest) = l.split_once(' ')?;
-        let base = mn.strip_suffix("_e32")?;
-        let ops: Vec<String> = rest.split(", ").map(|s| s.trim().to_string()).collect();
+        let mut ops: Vec<String> = rest.split(", ").map(|s| s.trim().to_string()).collect();
         if ops.iter().any(|o| o.contains(' ') || o.starts_with('-') || o.starts_with('|')) {
             return None;
         }
+        // `v_fma_f32 d, a, b, d` (the addend is the destination) is `v_fmac_f32 d, a, b`
+        let base = if mn == "v_fma_f32" && ops.len() == 4 && ops[3] == ops[0] {
+            ops.pop();
+            "v_fmac_f32"
+        } else {
+            mn.strip_suffix("_e32")?
+        };
         Some((base.to_string(), ops))
     };
     let (mx, ox) = parse(x)?;
     let (my, oy) = parse(y)?;
-    let xs = ["v_mul_f32", "v_add_f32", "v_sub_f32", "v_max_num_f32", "v_min_num_f32", "v_mov_b32"];
-    let ys = ["v_mul_f32", "v_add_f32", "v_sub_f32", "v_max_num_f32", "v_min_num_f32", "v_mov_b32", "v_add_nc_u32", "v_sub_nc_u32"];
+    let xs = ["v_mul_f32", "v_add_f32", "v_sub_f32", "v_max_num_f32", "v_min_num_f32", "v_mov_b32", "v_fmac_f32"];
+    let ys = ["v_mul_f32", "v_add_f32", "v_sub_f32", "v_max_num_f32", "v_min_num_f32", "v_mov_b32", "v_fmac_f32", "v_add_nc_u32", "v_sub_nc_u32"];
     if !xs.contains(&mx.as_str()) || !ys.contains(&my.as_str()) {
         return None;
     }
