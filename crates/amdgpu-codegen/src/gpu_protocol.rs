@@ -250,7 +250,12 @@ struct Sim<'a> {
     vars: HashMap<VarId, CV>,
     items: Vec<Item>,
     evs: Vec<Ev>,
+    /// workgroup barriers this wave has PASSED (its last `s_barrier_wait` / full barrier): every access from here on is after all waves' accesses
+    /// before their arrival number `ord`
     ord: u32,
+    /// workgroup barriers this wave has ARRIVED at (`s_barrier_signal` / full barrier; `sig >= ord`, `sig > ord` between a split barrier's signal
+    /// and its wait): an access from here on may still run concurrently with other waves' accesses up to phase `sig`
+    sig: u32,
     open: Option<usize>,
     diags: &'a mut Vec<(&'static str, Severity, usize, String)>,
     untagged: &'a mut BTreeSet<usize>,
@@ -561,27 +566,44 @@ impl<'a> Sim<'a> {
                         self.vars.insert(*v, k);
                     }
                 }
+                // a full barrier is the arrival (publication: `Item::Barrier` with the arrival number) and the pass of one workgroup barrier
                 Stmt::Barrier => {
-                    self.items.push(Item::Barrier { ord: self.ord });
-                    self.ord += 1;
+                    self.items.push(Item::Barrier { ord: self.sig });
+                    self.sig += 1;
+                    self.ord = self.sig;
                     self.close();
                 }
-                Stmt::FenceRelease { .. } => self.items.push(Item::Release { ord: self.ord }),
-                Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
-                Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
-                Stmt::WaitTensor { count } | Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Tensor, count } => self.items.push(Item::WaitTensor { ord: self.ord, count: *count }),
-            Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Async, count } => self.items.push(Item::WaitAsync { ord: self.ord, count: *count }),
-                Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
+                // split workgroup barrier (gfx1250 `s_barrier_signal -1` / `s_barrier_wait -1`): the SIGNAL is the arrival - it publishes this wave's
+                // completed accesses (as a full barrier's arrival does) - and the WAIT is the pass: only after it may the wave rely on every other
+                // wave's arrival. Accesses between the two count from the wave's last pass (`ord`) up to its arrival (`sig`): they may run concurrently
+                // with other waves on both sides of the barrier. (Named / cluster barriers: no workgroup-wide ordering is assumed.)
+                Stmt::BarrierSignal { id: -1 } => {
+                    self.items.push(Item::Barrier { ord: self.sig });
+                    self.sig += 1;
+                    self.close();
+                }
+                Stmt::BarrierWait { id: -1 } => {
+                    self.ord = self.sig;
+                    self.close();
+                }
+                // (completion points carry the wave's ARRIVAL count: a read completed here is ordered only before the other waves' accesses after
+                // their pass of the NEXT arrival)
+                Stmt::FenceRelease { .. } => self.items.push(Item::Release { ord: self.sig }),
+                Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.sig, inv: *inv }),
+                Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.sig, count: *count }),
+                Stmt::WaitTensor { count } | Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Tensor, count } => self.items.push(Item::WaitTensor { ord: self.sig, count: *count }),
+            Stmt::WaitCounter { counter: amdgpu_dsl::WaitCtr::Async, count } => self.items.push(Item::WaitAsync { ord: self.sig, count: *count }),
+                Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.sig }),
                 // the combined s_waitcnt (exact mode): both counters
                 Stmt::WaitCnt { vm, lgkm } => {
-                    self.items.push(Item::WaitVm { ord: self.ord, count: *vm });
+                    self.items.push(Item::WaitVm { ord: self.sig, count: *vm });
                     if *lgkm == 0 {
-                        self.items.push(Item::WaitLds { ord: self.ord });
+                        self.items.push(Item::WaitLds { ord: self.sig });
                     } else if f.exact {
-                        self.items.push(Item::WaitLdsN { ord: self.ord, count: *lgkm });
+                        self.items.push(Item::WaitLdsN { ord: self.sig, count: *lgkm });
                     }
                 }
-                Stmt::WaitLds { count } if *count > 0 && f.exact => self.items.push(Item::WaitLdsN { ord: self.ord, count: *count }),
+                Stmt::WaitLds { count } if *count > 0 && f.exact => self.items.push(Item::WaitLdsN { ord: self.sig, count: *count }),
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
                 Stmt::TileConsume { tile, slot, version } => self.open_marker(i, false, tile, slot, version),
                 Stmt::TileEnd => self.close(),
@@ -1324,7 +1346,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 256 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
             break;
         }
-        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: f.kd.iter().any(|(k, v)| k == "g5:loop_ifs_explored" && *v != 0), loop_decisions: 0, occ: HashMap::default() };
+        let mut sim = Sim { f, role, n, div, vals: HashMap::default(), vars: HashMap::default(), items: Vec::new(), evs: Vec::new(), ord: 0, sig: 0, open: None, outer: -1, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported, brk_ord: 0, exit_body: false, loop_ifs: f.kd.iter().any(|(k, v)| k == "g5:loop_ifs_explored" && *v != 0), loop_decisions: 0, occ: HashMap::default() };
         sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
