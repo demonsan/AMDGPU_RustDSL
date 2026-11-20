@@ -637,6 +637,42 @@ pub fn probe_g1250_pkmul() -> Function {
     b.finish()
 }
 
+/// The packed lookup-table converts with their mitigation (the back end's safe follower, the entry prologue; G5 GV-1250-PERMPK16):
+/// lane l: a = 0x01020304 * (l + 1), b = 0x10203040 ^ l, idx = (0x76543210 + l, 0xfedcba98 ^ l); out[(wg * 6 + k) * 32 + l] = the two dwords
+/// of `v_perm_pk16_b4_u4` (k = 0, 1) and the four of `v_perm_pk16_b8_u4` (a, b as the pairs (a, b) / (b, a); k = 2..5). The lookup semantics
+/// are not modelled: the host compares two launches and prints the words (tests/gpu/g1250_probe_host.cpp `permpk16`). 32 work-items.
+pub fn probe_g1250_permpk16() -> Function {
+    let mut b = FnBuilder::new("probe_g1250_permpk16", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(6 * 128));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let t1 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(1)));
+    let a = b.let_(Op::MulI32(Opnd::Val(t1), Opnd::I32(0x0102_0304)));
+    let bb = b.let_(Op::XorI32(Opnd::Val(tid), Opnd::I32(0x1020_3040)));
+    let i0 = b.let_(Op::AddI32(Opnd::Val(tid), Opnd::I32(0x7654_3210)));
+    let i1 = b.let_(Op::XorI32(Opnd::Val(tid), Opnd::I32(0xfedc_ba98u32 as i32)));
+    let idx = b.frag2(i0, i1);
+    let r4 = b.let_(Op::PermPk16 { wide: false, a: Opnd::Val(a), b: Opnd::Val(bb), idx: Opnd::Val(idx) });
+    let ab = b.frag2(a, bb);
+    let ba = b.frag2(bb, a);
+    let r8 = b.let_(Op::PermPk16 { wide: true, a: Opnd::Val(ab), b: Opnd::Val(ba), idx: Opnd::Val(idx) });
+    let wgo = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(6 * 128)));
+    let t4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let o = b.let_(Op::AddI32(Opnd::Val(wgo), Opnd::Val(t4)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
+    for k in 0..2u8 {
+        let v = b.frag_slice(Opnd::Val(r4), k, 1);
+        b.store_global(q, 128 * k as u32, v, MemTy::B32, false);
+    }
+    for k in 0..4u8 {
+        let v = b.frag_slice(Opnd::Val(r8), k, 1);
+        b.store_global(q, 128 * (2 + k as u32), v, MemTy::B32, false);
+    }
+    b.finish()
+}
+
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
 /// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {
