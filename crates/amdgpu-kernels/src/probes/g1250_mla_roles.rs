@@ -362,18 +362,20 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             mx = b.max_f32(mx, x[r]);
         }
         let r = red.at(&SlotIdx::new(slot, Opnd::Val(gen)));
-        let a = b.bind_i32(r.base() + ev(w) * 128 + ev(g) * 64 + ev(m) * 4);
+        // kernel-opt's layout: the 8 partials of head m contiguous (word m * 8 + 2 w + g), read back by one b128 pair
+        let a = b.bind_i32(r.base() + ev(m) * 32 + (ev(w) * 2 + ev(g)) * 4);
         r.write(b, |b| b.store_lds(a, mx, MemTy::B32, false));
     };
     let get_max_g = |b: &mut FnBuilder, gen: ValueId, slot: Opnd| -> ValueId {
         let r = red.at(&SlotIdx::new(slot, Opnd::Val(gen)));
-        let rb = b.bind_i32(r.base() + ev(m) * 4);
+        let rb = b.bind_i32(r.base() + ev(m) * 32);
         r.read(b, |b| {
+            let hi = b.bind_i32(ev(rb) + 16);
+            let v8 = b.load_lds_b128x2(rb, hi);
             let mut pm: Option<ValueId> = None;
-            for k in 0..8 {
-                let a = b.bind_i32(ev(rb) + k * 64);
-                let v = b.load_lds(a, MemTy::B32);
-                let vf = f32_of(b, v);
+            for k in 0..8u8 {
+                let e = b.frag_slice(v8, k, 1);
+                let vf = f32_of(b, e);
                 pm = Some(match pm {
                     None => vf,
                     Some(p) => b.max_f32(p, vf),
