@@ -894,7 +894,15 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                         f.after += 1;
                     }
                 }
-                let lim = if vm { crate::target::T.counters.of(amdgpu_target::MemClass::VmemLoad).max } else { crate::target::T.counters.of(amdgpu_target::MemClass::Lds).max };
+                // the COMPILATION's target counter ranges (gfx1250: DScnt 63, not gfx950's lgkmcnt 15: an LDS load with 15 younger ones is
+                // still in flight there; the vector-memory queue mixes LOADcnt / STOREcnt operations and never retires by count, as in
+                // sched::waits::vm_keep)
+                let t = crate::target::cur();
+                let lim = if vm {
+                    if t.name == "gfx1250" { u32::MAX } else { t.counters.of(amdgpu_target::MemClass::VmemLoad).max }
+                } else {
+                    t.counters.of(amdgpu_target::MemClass::Lds).max
+                };
                 // a counter saturates: an entry with that many younger SAME-counter operations has completed
                 st.retain(|f| f.smem || f.vm != vm || f.after < lim);
                 if at.mem.map_or(true, |mm| !mm.write) || at.smem {
