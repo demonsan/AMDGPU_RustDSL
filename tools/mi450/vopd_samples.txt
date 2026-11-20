@@ -1,0 +1,13 @@
+v_dual_add_f32 v1, v2, v3 :: v_dual_mul_f32 v4, v5, v6
+v_dual_fmac_f32 v0, v4, v8 :: v_dual_fmac_f32 v1, v5, v9
+v_dual_fmac_f32 v0, v4, v8 :: v_dual_fmac_f32 v1, v6, v10
+v_dual_mul_f32 v0, v4, v8 :: v_dual_add_nc_u32 v1, v5, v9
+v_dual_max_num_f32 v0, v4, v8 :: v_dual_min_num_f32 v1, v5, v9
+v_dual_mov_b32 v0, v4 :: v_dual_mov_b32 v1, v5
+v_dual_sub_f32 v0, v4, v8 :: v_dual_and_b32 v1, v5, v9
+v_dual_fma_f32 v0, v4, v8, v12 :: v_dual_fma_f32 v1, v5, v9, v13
+v_dual_fmac_f32 v0, v4, v8 :: v_dual_fmac_f32 v2, v6, v10
+v_dual_fmac_f32 v0, v4, v8 :: v_dual_fmac_f32 v1, v4, v9
+v_dual_fmac_f32 v0, s4, v8 :: v_dual_fmac_f32 v1, s5, v9
+v_dual_exp_f32 v0, v4 :: v_dual_mul_f32 v1, v5, v9
+v_dual_add_f32 v300, v2, v3 :: v_dual_mul_f32 v301, v5, v6
