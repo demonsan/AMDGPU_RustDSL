@@ -454,7 +454,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
         let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
         let t3 = b.bind_i32(ev(t) + 3);
-        if mask & 1 == 0 {
         let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
         let psi = b.bind_i32(ev(t) & 1);
         let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(psi), Opnd::Val(t)));
@@ -469,21 +468,32 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 .collect()
         });
         let kb = b.bind_i32(kr.base());
-        let vfr: Vec<Vec<ValueId>> = (0..WP)
-            .map(|pg| {
-                let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
-                kr.read(&mut b, |b| {
-                    (0..8)
-                        .map(|nt| {
-                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
-                            b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
-                        })
-                        .collect()
+        let vfr: Vec<Vec<ValueId>> = if mask & 1 != 0 {
+            Vec::new()
+        } else {
+            (0..WP)
+                .map(|pg| {
+                    let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                    kr.read(&mut b, |b| {
+                        (0..8)
+                            .map(|nt| {
+                                let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                                b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                            })
+                            .collect()
+                    })
                 })
-            })
-            .collect();
-        let sacc = s_compute(&mut b);
+                .collect()
+        };
+        let sacc: Vec<Opnd> = if mask & 1 != 0 {
+            (0..WP).map(|_| Opnd::Val(b.frag_cat(&[Opnd::I32(0); 8]))).collect()
+        } else {
+            s_compute(&mut b)
+        };
         for nt in 0..8usize {
+            if mask & 1 != 0 {
+                break;
+            }
             for pg in 0..WP as usize {
                 let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][nt], Some(Opnd::Var(ov[nt])));
                 b.set_var(ov[nt], Opnd::Val(d));
@@ -491,7 +501,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         }
         let s3 = b.bind_i32(ev(t3) & 1);
         sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
-        }
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
@@ -509,19 +518,33 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         let t = b.bind_i32(amdgpu_dsl::varx(it) + 0);
         let t1 = b.bind_i32(ev(t) + 1);
         let t2 = b.bind_i32(ev(t) + 2);
-        if mask & 2 == 0 {
         let s2 = b.bind_i32(ev(t2) & 1);
         let xn = sbuf_load(&mut b, t2, Opnd::Val(s2));
         put_max(&mut b, t2, &xn);
         let pm = get_max(&mut b, t1);
         let xo: Vec<Opnd> = xs.iter().map(|&v| Opnd::Var(v)).collect();
-        let (m_new, l_new) = put_p_lean(&mut b, t1, &xo, Opnd::Var(vm), Opnd::Var(vl), pm);
+        let (m_new, l_new) = if mask & 2 != 0 {
+            let si = b.bind_i32(ev(t1) & 1);
+            let r = pbuf.at(&SlotIdx::new(Opnd::Val(si), Opnd::Val(t1)));
+            let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
+            let stub = b.c_i32(0x3838_3838);
+            r.write(&mut b, |b| {
+                for pg in 0..WP {
+                    let a0 = b.bind_i32(ev(pw) + 1024 * pg);
+                    b.store_lds(a0, stub, MemTy::B32, false);
+                    let a1 = b.bind_i32(ev(pw) + (1024 * pg + 4));
+                    b.store_lds(a1, stub, MemTy::B32, false);
+                }
+            });
+            (pm, pm)
+        } else {
+            put_p_lean(&mut b, t1, &xo, Opnd::Var(vm), Opnd::Var(vl), pm)
+        };
         for i in 0..16usize {
             b.set_var(xs[i], Opnd::Val(xn[i]));
         }
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(l_new));
-        }
         b.wait_lds(0);
         b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
