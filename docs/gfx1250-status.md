@@ -195,7 +195,8 @@ I1-select miscompile to 4 rows of both lane halves) and `BADMAP=1` prints which 
 - **MXFP4 GEMM** (e08 round, 2026-11-19): the best kernel is `..._256x256_ks4_s2_epit_roles` (512-K slots in a 2-slot ring: 10.0 PF/s at 8192^3, 7.1 - 7.9 at 4096^3,
   80 % / 65 - 72 % of the reference library kernel). Per-K-step stamps (`RingOpts::stamps`, host `STAMPS=1`) put the K loop at the reference's cycles per WMMA; the remaining
   gap is the per-tile prologue (7 %) and the staged epilogue (14 - 15 %, a fixed ~7,000-cycle tensor-store latency whatever the output width). Tried and dropped, all measured:
-  a 192 x 256 tile (5 - 12 % slower at the same K step; with a separate 96 KiB bf16 staging region and the tensor stores draining behind the next tile the epilogue falls to
+  one tile per CU (4096^3: prologue 4,960 / loop 19,100 / epilogue 5,600 - 7,700 cycles; the 4 x 4 lockstep multicast removes the K = 4096 anomaly: 7.9 vs 6.3 PF/s, dispatch table in the plan doc),
+  two 256 x 128 workgroups per CU (-19 % at 4096^3: the loop is WMMA-bound), a 192 x 256 tile (5 - 12 % slower at the same K step; with a separate 96 KiB bf16 staging region and the tensor stores draining behind the next tile the epilogue falls to
   2,250 cycles but the forced 256-K slot makes the loop 19 % costlier per WMMA: 8.2 vs 8.56 PF/s), epilogue stores from registers overlapped into the next tile's K loop (the
   stores contend with the TDM loads: loop +17 %, 7.8 - 8.4 PF/s), operand swap with bf16 output (direct or conflict-free staged: same epilogue time, 12 % slower window with the
   row permutation), tile staggering, wave-order permutations (the wave skew follows the wave id), lazy prologue, instruction prefetch, 256 x 128 tile, multicast (neutral at
