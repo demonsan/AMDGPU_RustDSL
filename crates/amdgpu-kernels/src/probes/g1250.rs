@@ -481,6 +481,59 @@ pub fn probe_g1250_lds_fadd() -> Function {
     b.finish()
 }
 
+/// The DPP controls of gfx1250, each against a CPU reference (tests/gpu/g1250_probe_host.cpp `dpp`): one wave32 per workgroup,
+/// x = (wg << 8) + 3 lane + 1, and for control k, out[(wg * 20 + k) * 32 + lane] = dpp_k(x) with old = 0xdeadbeef (lanes whose source is
+/// invalid or masked keep old). The list (the host mirrors it): quad_perm [1,0,3,2] / [3,2,1,0]; row_shl 1 / 3; row_shr 1 / 15; row_ror 1 / 4;
+/// row_mirror; row_half_mirror; row_share 0 / 5; row_xmask 1 / 15; dpp8 [1,0,3,2,5,4,7,6] / [7,6,5,4,3,2,1,0]; row_shl 1 with row_mask 0x2;
+/// quad_perm [1,0,3,2] with bank_mask 0x5; row_shr 1 with bound_ctrl (invalid lanes read 0); and v_add_u32_dpp row_xmask 1 (x' + x).
+/// Kernargs: out @0 (20 x 32 dwords per workgroup). 32 work-items.
+pub fn probe_g1250_dpp() -> Function {
+    use amdgpu_dsl::{Dpp, DppAluOp, DppCtrl};
+    let mut b = FnBuilder::new("probe_g1250_dpp", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::grid_x() * Ext::c(20 * 32 * 4));
+    let po = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let wg8 = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(8)));
+    let t3 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(3)));
+    let x = b.let_(Op::AddI32(Opnd::Val(wg8), Opnd::Val(t3)));
+    let x = b.let_(Op::AddI32(Opnd::Val(x), Opnd::I32(1)));
+    let old = b.let_(Op::ConstI32(0xdeadbeefu32 as i32));
+    let ctrls = [
+        Dpp::new(DppCtrl::QuadPerm([1, 0, 3, 2])),
+        Dpp::new(DppCtrl::QuadPerm([3, 2, 1, 0])),
+        Dpp::new(DppCtrl::RowShl(1)),
+        Dpp::new(DppCtrl::RowShl(3)),
+        Dpp::new(DppCtrl::RowShr(1)),
+        Dpp::new(DppCtrl::RowShr(15)),
+        Dpp::new(DppCtrl::RowRor(1)),
+        Dpp::new(DppCtrl::RowRor(4)),
+        Dpp::new(DppCtrl::RowMirror),
+        Dpp::new(DppCtrl::RowHalfMirror),
+        Dpp::new(DppCtrl::RowShare(0)),
+        Dpp::new(DppCtrl::RowShare(5)),
+        Dpp::new(DppCtrl::RowXmask(1)),
+        Dpp::new(DppCtrl::RowXmask(15)),
+        Dpp::new(DppCtrl::Dpp8([1, 0, 3, 2, 5, 4, 7, 6])),
+        Dpp::new(DppCtrl::Dpp8([7, 6, 5, 4, 3, 2, 1, 0])),
+        Dpp { ctrl: DppCtrl::RowShl(1), row_mask: 0x2, bank_mask: 0xf, bound_zero: false },
+        Dpp { ctrl: DppCtrl::QuadPerm([1, 0, 3, 2]), row_mask: 0xf, bank_mask: 0x5, bound_zero: false },
+        Dpp { ctrl: DppCtrl::RowShr(1), row_mask: 0xf, bank_mask: 0xf, bound_zero: true },
+    ];
+    let wg20 = b.let_(Op::MulI32(Opnd::Val(wg), Opnd::I32(20 * 32 * 4)));
+    let t4 = b.let_(Op::ShlI32(Opnd::Val(tid), Opnd::I32(2)));
+    let base = b.let_(Op::AddI32(Opnd::Val(wg20), Opnd::Val(t4)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(base) });
+    for (k, d) in ctrls.iter().enumerate() {
+        let v = b.dpp(*d, x, old);
+        b.store_global(q, (k * 128) as u32, v, MemTy::B32, false);
+    }
+    let v = b.dpp_alu(DppAluOp::AddU32, Dpp::new(DppCtrl::RowXmask(1)), x, x, old);
+    b.store_global(q, 19 * 128, v, MemTy::B32, false);
+    b.finish()
+}
+
 /// P2 (TDM above 64 KiB of LDS): one tensor load of a 1024-dword row (4 KiB) to LDS byte `lds_addr` (LDS declared 163 840 B), read back
 /// with ds_load: out[t * 4 + j] = LDS[lds_addr + 16 t + 4 j] (256 work-items x 4 dwords = the row). Kernargs: src @0, out @8.
 pub fn probe_g1250_tdm_hi(lds_addr: i32) -> Function {

@@ -31,6 +31,10 @@ fn parse_reg(t: &str) -> Option<Op> {
             "m0" => 125,
             "exec_lo" | "exec" => 126,
             "exec_hi" => 127,
+            // the DPP source markers of the VOP word (encode_dpp): DPP16, DPP8, DPP8 with fetch-inactive
+            "__dpp16" => 0xFA,
+            "__dpp8" => 0xE9,
+            "__dpp8fi" => 0xEA,
             _ => {
                 let k = n.strip_prefix("ttmp")?.parse::<u32>().ok()?;
                 if k > 15 {
@@ -208,6 +212,119 @@ fn modv<'a>(i: &'a Inst, k: &str) -> Option<&'a str> {
     i.mods.iter().find(|(m, _)| m == k).map(|(_, v)| v.as_str())
 }
 
+/// A DPP instruction (`<op>_dpp` / `<op>_e64_dpp`): the base VOP1 / VOP2 / VOP3 encoding with the source-0 field set to the DPP marker
+/// (0xFA DPP16, 0xE9 DPP8, 0xEA DPP8 + fi), followed by the DPP word. DPP16 word: src0 VGPR [7:0], dpp_ctrl [16:8] (quad_perm
+/// p0 | p1 << 2 | p2 << 4 | p3 << 6; row_shl 0x100 + n, row_shr 0x110 + n, row_ror 0x120 + n, row_mirror 0x140, row_half_mirror 0x141,
+/// row_share 0x150 + n, row_xmask 0x160 + n), fi [18], bound_ctrl [19], src0 neg / abs [20] / [21], src1 neg / abs [22] / [23] (VOP1 / VOP2;
+/// VOP3 keeps its own modifier fields), bank_mask [27:24], row_mask [31:28]. DPP8 word: src0 VGPR [7:0], 8 lane selectors x 3 bits [31:8].
+/// Checked byte for byte against llvm-mc (tools/mi450/dpp_samples.txt, crates/amdgpu-kernels/tests/gfx1250_encoder.rs).
+fn encode_dpp(t: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>) -> Result<Vec<u8>, String> {
+    let line = t.split("//").next().unwrap_or("").split(';').next().unwrap_or("").trim();
+    let (mn, rest) = line.split_once(char::is_whitespace).ok_or_else(|| format!("`{t}`: operands"))?;
+    let base = mn.strip_suffix("_dpp").unwrap();
+    let vop3 = base.ends_with("_e64");
+    // operands (comma separated, bracket aware) and the trailing DPP modifiers
+    let mut parts: Vec<String> = Vec::new();
+    let (mut depth, mut cur) = (0i32, String::new());
+    for ch in rest.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    parts.push(cur.trim().to_string());
+    let last = parts.pop().unwrap_or_default();
+    let mut toks = last.split_whitespace();
+    parts.push(toks.next().unwrap_or("").to_string());
+    let mods: Vec<(String, String)> = toks.map(|m| m.split_once(':').map(|(k, v)| (k.to_string(), v.to_string())).unwrap_or((m.to_string(), String::new()))).collect();
+    let modv = |k: &str| mods.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
+    let num = |v: &str| -> Result<u32, String> { parse_num(v).map(|x| x as u32).ok_or_else(|| format!("`{t}`: `{v}`")) };
+    let list = |v: &str| -> Result<Vec<u32>, String> { v.trim_start_matches('[').trim_end_matches(']').split(',').map(|x| num(x.trim())).collect() };
+    // source modifiers of the VOP1 / VOP2 form go into the DPP word
+    let (mut neg, mut abs) = ([false; 2], [false; 2]);
+    if parts.len() < 2 {
+        return Err(format!("`{t}`: a DPP instruction needs a source"));
+    }
+    for k in 0..2.min(parts.len() - 1) {
+        let mut s = parts[k + 1].clone();
+        if !vop3 {
+            if let Some(x) = s.strip_prefix('-') {
+                neg[k] = true;
+                s = x.to_string();
+            }
+            if let Some(x) = s.strip_prefix('|').and_then(|x| x.strip_suffix('|')) {
+                abs[k] = true;
+                s = x.to_string();
+            }
+        }
+        parts[k + 1] = s;
+    }
+    let src0_txt = parts[1].trim_start_matches('-').to_string();
+    let src0 = match parse_reg(&src0_txt) {
+        Some(Op::V(r, 1)) if r < 256 => r,
+        _ => return Err(format!("`{t}`: the DPP source 0 must be a VGPR v0..v255 (the window MSBs extend it)")),
+    };
+    let fi = modv("fi").map_or(Ok(0), num)? & 1;
+    let (marker, word) = if let Some(sel) = modv("dpp8") {
+        let s = list(sel)?;
+        if s.len() != 8 || s.iter().any(|x| *x > 7) {
+            return Err(format!("`{t}`: dpp8 needs 8 lane selectors 0..7"));
+        }
+        let w = s.iter().enumerate().fold(src0, |w, (k, x)| w | x << (8 + 3 * k));
+        (if fi != 0 { "__dpp8fi" } else { "__dpp8" }, w)
+    } else {
+        let ctrl = if let Some(q) = modv("quad_perm") {
+            let q = list(q)?;
+            if q.len() != 4 || q.iter().any(|x| *x > 3) {
+                return Err(format!("`{t}`: quad_perm needs 4 selectors 0..3"));
+            }
+            q[0] | q[1] << 2 | q[2] << 4 | q[3] << 6
+        } else if modv("row_mirror").is_some() {
+            0x140
+        } else if modv("row_half_mirror").is_some() {
+            0x141
+        } else {
+            let (key, base_ctrl) = [("row_shl", 0x100u32), ("row_shr", 0x110), ("row_ror", 0x120), ("row_share", 0x150), ("row_xmask", 0x160)]
+                .into_iter()
+                .find(|(k, _)| modv(k).is_some())
+                .ok_or_else(|| format!("`{t}`: no DPP control"))?;
+            let n = num(modv(key).unwrap())?;
+            let lo = if matches!(key, "row_shl" | "row_shr" | "row_ror") { 1 } else { 0 };
+            if n < lo || n > 15 {
+                return Err(format!("`{t}`: {key}:{n} out of range"));
+            }
+            base_ctrl + n
+        };
+        let rm = modv("row_mask").map_or(Ok(0xf), num)? & 0xf;
+        let bm = modv("bank_mask").map_or(Ok(0xf), num)? & 0xf;
+        let bc = modv("bound_ctrl").map_or(Ok(0), num)? & 1;
+        let w = src0 | ctrl << 8 | fi << 18 | bc << 19 | (neg[0] as u32) << 20 | (abs[0] as u32) << 21 | (neg[1] as u32) << 22 | (abs[1] as u32) << 23 | bm << 24 | rm << 28;
+        ("__dpp16", w)
+    };
+    // the base instruction with source 0 replaced by the marker (a VOP3 keeps a negation on it)
+    let neg0 = if vop3 && parts[1].starts_with('-') { "-" } else { "" };
+    parts[1] = format!("{neg0}{marker}");
+    let body = format!("{base} {}", parts.join(", "));
+    let mut out = encode_line(&body, pc, label)?;
+    // a VOP3 DPP form leaves its unused source fields 0 (the plain VOP3 holds the inline constant 0 = 128 there)
+    if vop3 && out.len() == 8 {
+        let mut w1 = u32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+        for k in (parts.len() - 1)..3 {
+            w1 &= !(0x1ff << (9 * k));
+        }
+        out[4..8].copy_from_slice(&d32(w1));
+    }
+    out.extend_from_slice(&d32(word));
+    Ok(out)
+}
+
 /// Encodes one instruction at byte offset `pc` (`label` resolves branch targets to byte offsets).
 pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>) -> Result<Vec<u8>, String> {
     let t = line.trim();
@@ -237,6 +354,9 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         let mut v = d32(0xB000_0000 | op << 23 | simm).to_vec();
         v.extend_from_slice(&d32(parse_num(imm).ok_or_else(|| format!("`{t}`: value"))? as u32));
         return Ok(v);
+    }
+    if t.split_whitespace().next().map_or(false, |m| m.ends_with("_dpp")) {
+        return encode_dpp(t, pc, label);
     }
     let i = parse_inst(t)?;
     let base = i.mn.strip_suffix("_e32").or_else(|| i.mn.strip_suffix("_e64")).unwrap_or(&i.mn);
@@ -372,9 +492,10 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             }
         }
         "VOPC" if !e64 => {
-            // vcc_lo, src0, vsrc1
-            let (s0, lit) = src9(op_at(&i, 1)?)?;
-            let s1 = vreg(op_at(&i, 2)?)?;
+            // vcc_lo, src0, vsrc1 (v_cmpx: no destination operand, it writes EXEC)
+            let k0 = if base.starts_with("v_cmpx") { 0 } else { 1 };
+            let (s0, lit) = src9(op_at(&i, k0)?)?;
+            let s1 = vreg(op_at(&i, k0 + 1)?)?;
             out.extend_from_slice(&d32(0x7C00_0000 | op << 17 | s1 << 9 | s0));
             if let Some(l) = lit {
                 out.extend_from_slice(&d32(l));
@@ -423,7 +544,12 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             let mut opsel = 0u32;
             if let Some(v) = modv(&i, "op_sel") {
                 let f: Vec<u32> = v.trim_start_matches('[').trim_end_matches(']').split(',').map(|x| x.trim().parse::<u32>().unwrap_or(0)).collect();
-                if let Some((last, src)) = f.split_last() {
+                if base.starts_with("v_permlane") {
+                    // the lane permutes: op_sel:[fetch_invalid, bound_ctrl] at [11], [12] (no destination element)
+                    for (k, b) in f.iter().enumerate().take(2) {
+                        opsel |= (b & 1) << (11 + k);
+                    }
+                } else if let Some((last, src)) = f.split_last() {
                     for (k, b) in src.iter().enumerate().take(3) {
                         opsel |= (b & 1) << (11 + k);
                     }
@@ -524,7 +650,8 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
             // stores and the atomics without return: addr, data0; the atomics with return: vdst, addr, data0 (llvm-mc: `ds_add_f32 v1, v2` =
             // d8540000 00000201, `ds_add_rtn_f32 v3, v1, v2` = d9e40000 03000201)
             let atomic = base.starts_with("ds_add") || base.starts_with("ds_max") || base.starts_with("ds_min");
-            let rtn = atomic && base.contains("_rtn");
+            // ds_permute / ds_bpermute: vdst, addr, data0 like an atomic with return (llvm-mc: `ds_bpermute_b32 v1, v2, v3` = dacc0000 01000302)
+            let rtn = (atomic && base.contains("_rtn")) || base.starts_with("ds_permute") || base.starts_with("ds_bpermute");
             let store = base.starts_with("ds_store") || (atomic && !rtn);
             let (vdst, addr, data0) = if store {
                 (0, vreg(op_at(&i, 0)?)?, vreg(op_at(&i, 1)?)?)

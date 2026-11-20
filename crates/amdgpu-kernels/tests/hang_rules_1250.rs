@@ -972,12 +972,33 @@ fn pos_tdm_lds_extent() {
 fn mut_dpp() {
     asm_mutation(&inject("tensor_load_to_lds", &["v_add_f32_dpp v1, 0x12345678, v3 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"]), "GV-1250-DPP");
     asm_mutation(&inject("tensor_load_to_lds", &["v_add_nc_u64_dpp v[0:1], v[2:3], v[4:5] row_shl:1"]), "GV-1250-DPP");
+    // 64-bit float, a no-DPP instruction, a non-row_share control on a row_share-only multiply
+    asm_mutation(&inject("tensor_load_to_lds", &["v_add_f64_e64_dpp v[0:1], v[2:3], v[4:5] row_share:1 row_mask:0xf bank_mask:0xf"]), "GV-1250-DPP");
+    asm_mutation(&inject("tensor_load_to_lds", &["v_permlane16_swap_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]), "GV-1250-DPP");
+    asm_mutation(&inject("tensor_load_to_lds", &["v_mul_lo_u32_e64_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]), "GV-1250-DPP");
 }
 
 #[test]
 fn pos_dpp() {
     asm_positive(&inject("tensor_load_to_lds", &["v_add_f32_dpp v1, v2, v3 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"]));
     asm_positive(&inject("tensor_load_to_lds", &["v_add_f32_dpp v1, 1.0, v3 row_shl:1 row_mask:0xf bank_mask:0xf"]));   // an inline constant is not a literal
+    asm_positive(&inject("tensor_load_to_lds", &["v_mul_lo_u32_e64_dpp v1, v2, v3 row_share:3 row_mask:0xf bank_mask:0xf"]));
+    asm_positive(&inject("tensor_load_to_lds", &["v_mov_b32_dpp v1, v2 dpp8:[1,0,3,2,5,4,7,6] fi:1"]));
+    asm_positive(&inject("tensor_load_to_lds", &["v_fma_mix_f32_e64_dpp v1, v2, v3, v4 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]));
+}
+
+// GV-1250-FORBIDDEN-OP
+
+#[test]
+fn mut_forbidden_op() {
+    for op in ["v_perm_pk16_b4_u4 v[2:3], v1, v4, v[6:7]", "v_perm_pk16_b6_u4 v[2:4], v1, v[4:5], v[6:7]", "v_perm_pk16_b8_u4 v[2:5], v[0:1], v[4:5], v[6:7]"] {
+        asm_mutation(&inject("tensor_load_to_lds", &[op]), "GV-1250-FORBIDDEN-OP");
+    }
+}
+
+#[test]
+fn pos_forbidden_op() {
+    asm_positive(&inject("tensor_load_to_lds", &["v_perm_b32 v1, v2, v3, v4"]));
 }
 
 // GV-1250-PERMLANE-CMPX
@@ -1068,6 +1089,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-TDM-STORE-PAD", "tdm_store_pad"),
     ("GV-1250-TDM-DRAIN", "tdm_drain"),
     ("GV-1250-DPP", "dpp"),
+    ("GV-1250-FORBIDDEN-OP", "forbidden_op"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
     ("GV-1250-DVGPR", "dvgpr"),
     ("GV-1250-PRIV", "priv"),

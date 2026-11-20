@@ -54,7 +54,8 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-SMEM-PENDING", layer: Layer::Asm, what: "an SGPR written by a scalar load (s_load / s_buffer_load) is not mentioned (read, or written again) before an `s_wait_kmcnt 0` / `s_wait_idle` completes the load on every path: SMEM returns out of order, so only a full drain proves it; a tensor operation whose descriptor words are such registers would read stale words and can hang the device" },
     Rule { id: "GV-1250-WAIT-RANGE", layer: Layer::Asm, what: "a wait immediate that does not fit its counter (6 bits for LOADcnt / STOREcnt / DScnt / ASYNCcnt / TENSORcnt / XCNT, 5 bits for KMcnt): the field truncates and the wait does not mean what the author wrote" },
     Rule { id: "GV-1250-TDM-DRAIN", layer: Layer::Asm, what: "a tensor operation never issues with more than 10 tensor operations outstanding, and no tensor / async LDS-writing operation is outstanding at s_endpgm (a sound static bound over all paths; waits lower it, loops that issue without draining are unbounded)" },
-    Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "no DPP modifier together with a literal operand, nor on a 64-bit integer operation" },
+    Rule { id: "GV-1250-DPP", layer: Layer::Asm, what: "DPP only where the hardware supports it: not with a literal operand; not on a 64-bit operation (no 64-bit DPP on this part); not on the instructions without a DPP form (lane reads / writes, swaps, permutes, v_nop, the FMAMK / FMAAK forms, the packed / dot / WMMA VOP3P ops other than FMA_MIX); the 32-bit multiplies of the double-precision unit only with row_share" },
+    Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device whatever surrounds it (the packed lookup-table converts v_perm_pk16_*): forbidden" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
     Rule { id: "GV-1250-PRIV", layer: Layer::Asm, what: "privileged state is not written from a kernel" },
@@ -2206,13 +2207,28 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
                 }
             }
         }
+        // instructions that can hang the device whatever runs next (in any wave): never emitted
+        if ins.mn.starts_with("v_perm_pk16_") {
+            viol(&mut v, "GV-1250-FORBIDDEN-OP", format!("line {}: `{}`: known to hang the device; forbidden", ins.line, ins.mn));
+        }
         // DPP
-        if is_dpp(&ins.ops) {
+        if is_dpp(&ins.ops) || ins.mn.ends_with("_dpp") {
             if has_literal(&ins.ops) {
                 viol(&mut v, "GV-1250-DPP", format!("line {}: `{} {}`: a DPP modifier with a literal operand", ins.line, ins.mn, ins.ops));
             }
-            if ins.mn.contains("_u64") || ins.mn.contains("_i64") || ins.mn.contains("_b64") {
-                viol(&mut v, "GV-1250-DPP", format!("line {}: `{}`: a DPP modifier on a 64-bit integer operation", ins.line, ins.mn));
+            let base = ins.mn.trim_end_matches("_dpp").trim_end_matches("_e64").trim_end_matches("_e32");
+            if ["_u64", "_i64", "_b64", "_f64"].iter().any(|s| base.contains(s)) {
+                viol(&mut v, "GV-1250-DPP", format!("line {}: `{}`: a DPP modifier on a 64-bit operation (no 64-bit DPP on this part)", ins.line, ins.mn));
+            }
+            let no_dpp = base.starts_with("v_readfirstlane") || base.starts_with("v_readlane") || base.starts_with("v_writelane") || base.starts_with("v_swap")
+                || base.starts_with("v_permlane") || base == "v_nop" || base.starts_with("v_fmamk") || base.starts_with("v_fmaak")
+                || ((base.starts_with("v_pk_") || base.starts_with("v_dot") || base.starts_with("v_wmma") || base.starts_with("v_swmmac")) && !base.starts_with("v_fma_mix"));
+            if no_dpp {
+                viol(&mut v, "GV-1250-DPP", format!("line {}: `{}`: this instruction has no DPP form", ins.line, ins.mn));
+            }
+            let row_share_only = matches!(base, "v_mul_lo_u32" | "v_mul_hi_u32" | "v_mul_hi_i32" | "v_mad_u32");
+            if row_share_only && !ins.ops.contains("row_share") {
+                viol(&mut v, "GV-1250-DPP", format!("line {}: `{} {}`: this instruction supports only the row_share DPP control", ins.line, ins.mn, ins.ops));
             }
         }
         // s_getreg_b32 does not wait for idle: of these registers it needs a wait-idle right before (ids from LLVM SIDefines.h, Hwreg::ID_*: STATUS 2, STATE_PRIV 4, EXCP_FLAG_PRIV 17,
