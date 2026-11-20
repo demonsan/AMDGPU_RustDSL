@@ -215,6 +215,60 @@ of the 0.72 us compute-only window. The replica's whole window is 0.379 us: its 
 us for 34 WMMA, twice the WMMA time: LDS-read bound, and worse when the waves are barrier-aligned) and the VALU count, not the interleave order. Not measured here (it needs a different structure): two waves per SIMD, where
 one wave's VALU runs under the other's WMMA (the occupancy result for the GEMM was negative, but that loop was WMMA-bound; here the VALU share is 44 %).
 
+#### Two waves per SIMD (e08, 2026-11-20)
+
+`probe_g1250_waves_<hex g1 g0>` (`probes/g1250_waves.rs`, host `tests/gpu/g1250_waves_host.cpp`, `tools/mi450/waves.sh`): one 256-work-item work-group = 8 waves, waves w and w + 4 share a SIMD; group 0 = waves 0 - 3, group 1 =
+waves 4 - 7; per group a block set: 1 = a WMMA block (2 A + 16 B fragments from LDS, 16 fp8 16 x 16 x 64 WMMA into 8 accumulators), 2 = a VALU block (8 independent mul + exp2 chains, 128 instructions). Cycles per loop iteration per wave:
+
+| group 0 | group 1 | group 0 waves | group 1 waves | |
+|---|---|---:|---:|---|
+| WMMA | idle | 576 | | one wave per SIMD (LDS-read bound: 36 b128 reads per iteration) |
+| VALU | idle | 431 | | about 3.4 cycles per VALU instruction |
+| WMMA + VALU in one wave | idle | 690 | | single-wave baseline: 31 % under the sum of the two (1,007), 20 % above the max |
+| **WMMA** | **VALU** | **576** | **455** | **two waves per SIMD: the WMMA wave is unaffected, the VALU wave 5 % slower: combined = max** |
+| VALU | VALU | 465 | 817 | the VALU pipe does not scale: the second wave takes 2 x |
+| WMMA | WMMA | 1,152 | 1,152 | the LDS / matrix path does not scale either: 2 x |
+| VALU | WMMA + VALU | 443 | 731 | |
+
+So the SIMD does overlap a VALU-only wave with a WMMA / LDS wave (unlike the single-wave interleave of the section above): 576 instead of 690 for the same work, and 576 instead of 1,007 for strictly sequential work; two waves of the same
+kind just serialize.
+
+**MLA structure that uses it** (a dim-split, sketch): 8 waves per work-group, a SIMD hosts one MMA wave and one softmax wave. MMA waves (0 - 3, as today: each owns 128 V dims, 8 O accumulators = 64 VGPRs) run S(t + 2) and PV(t),
+store the S tile (16 heads x 128 tokens of the window, f32, 8 KiB) to an LDS ring SBUF and read P(t) from PBUF; softmax waves (4 - 7: 32 tokens each) read S(t + 1) from SBUF, compute the logits (lean arithmetic), their partial
+maxima (to RED), the exponents, the row sums and the P tile (fp8, 2 KiB) into PBUF, and the lazy O-rescale factor for the MMA waves. One work-group barrier per window publishes everything (the w1 software pipeline, one window
+deeper because the maximum needs a second hop: iteration t reads S(t + 1), writes its partial maxima; iteration t + 1 reads the 4 partials and computes P(t + 1); PV(t + 1) runs in iteration t + 2). Budget: SBUF 3 slots x 8 KiB
+and PBUF / RED a few KiB on top of a KV ring of 3 slots (3 x 2 pages x about 37 KiB = 221 KiB) fit the 320 KiB; each wave may use 512 VGPRs (O 64, S fragments, K / V fragments, 128 for the MMA wave; the softmax wave needs about
+64). Expected per window: max(MMA about 0.25 us, softmax about 0.30 us lean about 0.2 us) + the barrier, i.e. about 0.3 us against 0.68 us compute-only today (the replica: 0.379 us in total). The S / P hand-off through the LDS costs
+about 10 KiB per window and one more barrier phase of latency, not bandwidth.
+
+**V-read stagger: rejected.** Rotating each wave's V tile order by 2 tiles per wave (wave w reads tile (nt + 2 w) % 8 at step nt; `PH_STAG`, mask bit 0x800) makes the PV block 0.13 -> 0.46 us (with the barrier 0.19 -> 0.46) and the
+whole compute-only window 0.72 -> 0.96 us: the shifted addresses leave the padded layout's conflict-free pattern for `ds_load_tr8`. The aligned-waves collision seen with the barrier (PV 0.13 -> 0.19 us) needs a different remedy
+(for example the two-role structure above, which removes the barrier alignment of the MMA waves' V reads from the softmax phase).
+
+#### Two-role MLA prototype (e08, 2026-11-20)
+
+`mla_g1250_qh16_roles` (`probes/g1250_mla_roles.rs`, run by `tools/mi450/mla_roles.sh`, which builds the MLA host with 256 work-items): 8 waves, waves 0 - 3 = MMA waves (K / V / P fragments, 18 S WMMA + 16 PV WMMA, the S tile to the LDS ring
+`SBUF`), waves 4 - 7 = softmax waves (S from `SBUF`, partial maxima through `RED`, lean arithmetic, P to `PBUF`), one work-group barrier per window, the w1 pipeline one window deeper (iteration t: PV(t), S(t + 3) -> SBUF gen t + 3 /
+softmax: S(t + 2), maxima gen t + 2, window maximum gen t + 1, P(t + 1)). Stub data (window 0 staged once), no KV streaming, no rescale. **The tile protocol, the roles / barrier-count rules and the bounds prover accept it with no new
+trusted fact** (one prover quirk: `AndI32(const 2, 1)` is bounded as 3, so the ring slot of a constant generation is passed explicitly in the prologue; the split barrier form, `s_barrier_signal` early on one role and `s_barrier_wait`
+late, is rejected by the protocol's phase model across roles, so both roles use the full barrier). 464 VGPRs (two waves per SIMD fit), LDS 182,272 B with a 2-slot KV ring (3 slots: about 256 KiB).
+
+Per 128-token window, B = 1, compute-only, us (the same method as above):
+
+| variant | us per window |
+|---|---:|
+| sequential blocks in one wave set (the phase kernels) | 0.718 |
+| the same with lean softmax + lazy rescale | 0.673 |
+| **two roles, as built** (hand-off, 8-wave barrier, lean softmax, no rescale) | **0.452** (0.496 before putting the softmax loads ahead of the maxima store) |
+| two roles, MMA waves' work skipped (hand-off + barrier + the softmax waves) | 0.324 |
+| two roles, softmax waves' math skipped (the MMA waves + hand-off + barrier) | 0.426 |
+| two roles, both skipped (loops, hand-off, barrier only) | 0.205 |
+
+So the roles do overlap the softmax with the MMA blocks (the softmax adds 0.03 us on top of the MMA waves), and the compute-only window drops 0.72 -> 0.45 (-37 %); but it is not the hoped-for 0.3: the MMA waves' path
+(fragment loads -> 34 WMMA -> S store -> `wait_lds(0)` -> barrier) is 0.43 us and the hand-off / barrier skeleton 0.2 us (LDS latency chains of the softmax waves, an 8-wave barrier) adds to it almost serially. Candidate
+next steps (not built): issue the next window's K / V fragment loads before the barrier (the slot is already published), two windows per iteration (one barrier per two windows needs two more ring generations), counted
+`s_wait_dscnt` instead of `wait_lds(0)`. In situ the replica is 0.379 us and `_w1i` 0.958 us; with the roles the compute part falls by 0.27 us, so a real kernel (3-slot ring, KV streaming) would land around 0.7 us.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
