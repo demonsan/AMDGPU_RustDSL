@@ -199,6 +199,8 @@ pub static OPS: &[(&str, &str, u16)] = &[
     ("v_ffbl_b32", "VOP1", 58),
     ("v_floor_f32", "VOP1", 36),
     ("v_fma_f32", "VOP3", 531),
+    ("v_fma_mix_f32", "VOP3P", 32),
+    ("v_fma_mixlo_f16", "VOP3P", 33),
     ("v_fmac_f32", "VOP2", 43),
     ("v_fract_f32", "VOP1", 32),
     ("v_log_f32", "VOP1", 39),

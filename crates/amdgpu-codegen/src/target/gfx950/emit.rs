@@ -452,6 +452,16 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VAndB32Dpp => vec![format!("v_and_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
         MOp::VOrB32Dpp => vec![format!("v_or_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
         MOp::VXorB32Dpp => vec![format!("v_xor_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VPermlane16B32 | MOp::VPermlaneX16B32 | MOp::VPermlane16VarB32 | MOp::VPermlaneX16VarB32 | MOp::VPermlaneBcastB32 | MOp::VPermlaneUpB32 | MOp::VPermlaneDownB32 | MOp::VPermlaneXorB32 => {
+            let mn = crate::op_attrs::attrs(inst.op).mnemonic;
+            let var = matches!(inst.op, MOp::VPermlane16VarB32 | MOp::VPermlaneX16VarB32);
+            // srcs: x, a[, b], old (tied to the destination: not printed)
+            let n = if var { 2 } else { 3 };
+            let ops: Vec<String> = inst.srcs.iter().take(n).enumerate().map(|(k, s)| if k == 0 { vr(a, reg_of(s)) } else { src1(a, *s) }).collect();
+            let sel = if inst.imm & 3 != 0 { format!(" op_sel:[{},{}]", inst.imm & 1, inst.imm >> 1 & 1) } else { String::new() };
+            vec![format!("{mn} {}, {}{sel}", vr(a, inst.dst.expect("dst")), ops.join(", "))]
+        }
+        MOp::VPermlaneIdxGenB32 => vec![format!("v_permlane_idx_gen_b32 {}, {}, {}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), src1(a, inst.srcs[1]))],
         MOp::VPermlane16Swap => vec![format!("v_permlane16_swap_b32_e32 {}, {}", vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])))],
         MOp::VCvtPkF32Fp8 => vec![format!("v_cvt_pk_f32_fp8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],
         MOp::VCvtF32Fp8 => vec![format!("v_cvt_f32_fp8_sdwa {}, {} src0_sel:BYTE_{}", d(a), src1(a, inst.srcs[0]), inst.imm & 3)],

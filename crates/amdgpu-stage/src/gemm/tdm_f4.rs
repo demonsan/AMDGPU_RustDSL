@@ -133,6 +133,9 @@ pub struct TdmF4Body {
     /// timing stamps of the K loop (the shader-cycle counter at four points of every steady iteration, summed per phase into loop variables; the kernel stores the sums): stage issue,
     /// window (fragment reads + WMMA issue), the tensor / LDS wait, the barrier and loop overhead
     pub stamps: bool,
+    /// no software pipeline inside the window: the fragments of sub-step s + 1 are read after the WMMAs of s (one fragment set live instead of two: for the kernels that run two
+    /// workgroups per CU, whose other workgroup hides the read latency)
+    pub nopf: bool,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -336,7 +339,7 @@ impl PipeBody for TdmF4Body {
         // software pipeline inside the window: the loads of sub-step s + 1 are issued before the WMMAs of s
         let mut cur = load(b, 0);
         for s in 0..sh.ks {
-            let next = if s + 1 < sh.ks { Some(load(b, s + 1)) } else { None };
+            let next = if s + 1 < sh.ks && !self.nopf { Some(load(b, s + 1)) } else { None };
             for i in 0..sh.tm {
                 for j in 0..sh.tn {
                     let acc = self.acc[(i * sh.tn + j) as usize];
@@ -346,6 +349,8 @@ impl PipeBody for TdmF4Body {
             }
             if let Some(n) = next {
                 cur = n;
+            } else if s + 1 < sh.ks {
+                cur = load(b, s + 1);
             }
         }
         if let (Some(ovl), true) = (self.ovl.clone(), t.staged) {

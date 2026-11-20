@@ -480,17 +480,28 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
+/// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
+/// one CU's LDS (and, below 512 VGPRs per wave, its registers): their prologues, barriers and epilogues fill each other's bubbles (a single-tile-per-CU shape like 4096^3 runs 512 workgroups).
+pub fn gemm_tdm_stage_f4_256x128_ks2_s2(name: &str, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), nopf: name.contains("_nopf"), racompact: name.contains("_rc"), lds_pad: if name.contains("_big") { 45056 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The 512-K 2-slot kernel with bf16 output and no operand swap: the f32 accumulators are rounded in registers (`v_cvt_pk_bf16_f32`), staged as 16-bit pieces into unpadded LDS rows and
 /// stored by one tensor store per wave (half the bytes of the f32 epilogue); host OUT_BF16=1.
 /// As `_bf16s` but the pair exchange (epilogue_lds 6): 32-bit stores of packed bf16 pairs.
+/// As `_bf16p` with the packed-pair exchange (epilogue_lds 7): cvt first, then the neighbour swap and one byte permute per stored dword.
+pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16q(name: &str, roles: bool) -> Function {
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 7, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+}
+
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16p(name: &str, roles: bool) -> Function {
     gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 6, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
@@ -636,6 +647,15 @@ pub struct RingOpts {
     /// the staged tensor-store epilogue in bands: each 32-row band of the wave's block is stored by its own tensor store as soon as it is staged (the LDS staging of band i + 1 overlaps the
     /// store of band i), instead of one store after the whole block
     pub epi_bands: u8,
+    /// no in-window software pipeline (`TdmF4Body::nopf`)
+    pub nopf: bool,
+    /// the A / B row pitch is a kernarg (`lda`, bytes, @72) = K / 2 + PAD instead of K / 2 (host LDA_PAD): row pitches that are powers of two (K = 4096: 2 KiB) land the 256 rows of a
+    /// tile in a few memory channels; the pad moves them apart
+    pub pitch: bool,
+    /// the `racompact` lowering token: the register allocation is the smaller of the scan and the two-phase packing
+    pub racompact: bool,
+    /// extra LDS bytes declared (unused): keeps a kernel to one workgroup per CU whatever its registers
+    pub lds_pad: u32,
 }
 
 impl RingOpts {
@@ -647,7 +667,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0 }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0 }
     }
 }
 
@@ -710,8 +730,17 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.ka_is(44, Ext::grid_x() * Ext::c(tile_n as i64));
         (Ext::grid_y() * Ext::c(tile_m as i64), Ext::grid_x() * Ext::c(tile_n as i64))
     };
-    b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
-    b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+    if ring.pitch {
+        // row pitch of A / B = K / 2 + PAD bytes (the host contract: PAD a multiple of 16, at most 16 KiB)
+        b.arg("lda", DType::I32, 72, 4);
+        b.sym_range("PAD", 0, 1 << 14);
+        b.ka_is(72, Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD"));
+        b.arg_tensor("a", m_rows.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+        b.arg_tensor("b", n_cols.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+    } else {
+        b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
+        b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+    }
     b.arg_tensor("sa", m_rows.clone() * Ext::sym("K128") * Ext::c(4));
     b.arg_tensor("sb", n_cols.clone() * Ext::sym("K128") * Ext::c(4));
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
@@ -729,17 +758,20 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
-    assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || epi == 6 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
-    assert!(epi != 5 && epi != 6 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
+    assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || epi == 6 || epi == 7 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
+    assert!(epi != 5 && epi != 6 && epi != 7 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
     assert!(epi != 4 || (ring.swap && sh.bf16), "epilogue_lds 4: bf16 output with the operand swap");
     assert!(epi != 3 || (ring.swap && sh.bf16), "epilogue_lds 3: bf16 output with the operand swap");
     let (wrows, wcols) = (sh.tm * 32, sh.tn * 16);
     // (the tensor store reads its LDS rows contiguously - the TDM's padding did not apply to the store on MI450: rows 1.. came out shifted -
     // so its staging rows are unpadded)
-    let epi_rs = if epi == 3 || epi == 4 || epi == 5 || epi == 6 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
+    let epi_rs = if epi == 3 || epi == 4 || epi == 5 || epi == 6 || epi == 7 { wcols * 2 } else if epi == 2 { wcols * 4 } else { wcols * 4 + 16 };
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
+        if ring.lds_pad > 0 {
+            let _ = lds.ring("PADLDS", ring.lds_pad as i64, 1, Layout::Linear);
+        }
         if epi == 4 {
             // a separate staging region behind the ring: the next tile's stages load into the ring while the tensor stores still read the staging
             let _ = lds.ring("EPI", need, 1, Layout::Linear);
@@ -872,6 +904,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let col0 = b.mul_i32(wgx, Opnd::I32(tile_n));
     // bytes per row: fp4 K / 2, scales K / 32
     let kb = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(1)));
+    let pitch = if ring.pitch { b.let_(Op::KernargI32 { offset: 72 }) } else { kb };
     let ks = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(5)));
     // cooperative loads: wave w loads rows [w * R / waves, ..) of each tile (R / waves rows)
     let nw = sh.waves();
@@ -891,8 +924,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let (org_a, org_b) = if ring.swap { (col0, row0) } else { (row0, col0) };   // the global row origin of the A / B operand tile
     let row0w = b.add_i32(org_a, rowa_w);
     let col0w = b.add_i32(org_b, rowb_w);
-    let a_org = b.mul_i32(row0w, kb);
-    let b_org = b.mul_i32(col0w, kb);
+    let a_org = b.mul_i32(row0w, pitch);
+    let b_org = b.mul_i32(col0w, pitch);
     let sa_org = b.mul_i32(row0w, ks);
     let sb_org = b.mul_i32(col0w, ks);
     let wl = [
@@ -966,8 +999,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
     let rpad = (row_pad > 0).then(|| ((16 * sh.ks) as u16, (row_pad / 4) as u16));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(kb), (64 * sh.ks) as u16, mask_row, rpad);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(kb), (64 * sh.ks) as u16, mask_col, rpad);
+    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_row, rpad);
+    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_col, rpad);
     let (g1sa, g1sb) = if ring.scale_shuf {
         // preshuffled scales: rows of a 32-row block are K / 4 dwords (K / 128 tiles of 32 dwords); the slice is rows / 32 of them, 32 ks
         // dwords each
@@ -1018,7 +1051,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, row_pad, scale_shuf: ring.scale_shuf };
         pipe.run(b, role, &mut body);
         let t_post = if ring.stamps {
             let c = b.shader_cycles();
@@ -1250,6 +1283,11 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             let m4 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(if epi == 5 { 1 } else { 2 })));
             // epilogue 6: the lane pair shares a dword column (m & ~1 -> (m >> 1) 4 bytes) and the odd lane takes the odd row of each pair
             let odd = b.let_(Op::AndI32(Opnd::Val(m), Opnd::I32(1)));
+            // epilogue 7: the byte selector of the pair permute (even lane {lo(self), lo(neighbour)}, odd lane {hi(neighbour), hi(self)})
+            let permsel = {
+                let c = b.bind_cond(amdgpu_dsl::ox(Opnd::Val(odd)).ne(0));
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(0x0302_0706), b: Opnd::I32(0x0504_0100) })
+            };
             let lb = b.add_i32(wl0, lrow);
             let lb = b.add_i32(lb, m4);
             let lb2 = {
@@ -1278,7 +1316,28 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     for j in 0..sh.tn {
                         let acc = body.acc[(i * sh.tn + j) as usize];
                         let bi2 = b.add_i32(lb2, Opnd::I32(i * 32 * epi_rs));
-if epi == 6 {
+if epi == 7 {
+// bf16 pairs: round the lane's row pairs first (all in one MSB window: the accumulators are read by `v_cvt_pk_bf16_f32` only), swap the packed pairs with the neighbour lane, and
+// pick the halves with one byte permute per pair (the even lane builds {E[r], O[r]} of the even row, the odd lane {E[r + 1], O[r + 1]}): 3 VALU per stored dword, no selects
+let mut pks: Vec<ValueId> = Vec::new();
+for q in 0..8i32 {
+    let xa = b.frag_slice(Opnd::Var(acc), (2 * q) as u8, 1);
+    let xc = b.frag_slice(Opnd::Var(acc), (2 * q + 1) as u8, 1);
+    let fa = b.bitcast_f32(xa);
+    let fc = b.bitcast_f32(xc);
+    pks.push(b.let_(Op::CvtPkBf16F32(Opnd::Val(fa), Opnd::Val(fc))));
+}
+let mut zs: Vec<ValueId> = Vec::new();
+for q in 0..8usize {
+    zs.push(b.let_(Op::DppQuadPerm { x: Opnd::Val(pks[q]), perm: [1, 0, 3, 2] }));
+}
+for q in 0..8i32 {
+    let w = b.let_(Op::PermB32(Opnd::Val(zs[q as usize]), Opnd::Val(pks[q as usize]), Opnd::Val(permsel)));
+    let rowbase = if q < 4 { 2 * q } else { 2 * q + 8 };
+    let addr = b.bind_i32(ev(bi2) + (rowbase * epi_rs + j * 32));
+    b.store_lds_b32(addr, w);
+}
+} else if epi == 6 {
                         // bf16 pairs through a lane exchange: lanes (2k, 2k + 1) hold columns n, n + 1 of the same rows; the even lane keeps the even accumulator rows of the pair, the odd lane the odd ones: each
                         // sends the row the other keeps (`quad_perm` swap), rounds the pair with one `v_cvt_pk_bf16_f32` and stores the dword (half the stores of the f32 staging, 16-bit data)
                         for q in 0..8i32 {
@@ -1330,7 +1389,28 @@ if epi == 6 {
                 for j in 0..sh.tn {
                     let acc = body.acc[(i * sh.tn + j) as usize];
                     let bi2 = b.add_i32(lb2, Opnd::I32(i * 32 * epi_rs));
-if epi == 6 {
+if epi == 7 {
+// bf16 pairs: round the lane's row pairs first (all in one MSB window: the accumulators are read by `v_cvt_pk_bf16_f32` only), swap the packed pairs with the neighbour lane, and
+// pick the halves with one byte permute per pair (the even lane builds {E[r], O[r]} of the even row, the odd lane {E[r + 1], O[r + 1]}): 3 VALU per stored dword, no selects
+let mut pks: Vec<ValueId> = Vec::new();
+for q in 0..8i32 {
+    let xa = b.frag_slice(Opnd::Var(acc), (2 * q) as u8, 1);
+    let xc = b.frag_slice(Opnd::Var(acc), (2 * q + 1) as u8, 1);
+    let fa = b.bitcast_f32(xa);
+    let fc = b.bitcast_f32(xc);
+    pks.push(b.let_(Op::CvtPkBf16F32(Opnd::Val(fa), Opnd::Val(fc))));
+}
+let mut zs: Vec<ValueId> = Vec::new();
+for q in 0..8usize {
+    zs.push(b.let_(Op::DppQuadPerm { x: Opnd::Val(pks[q]), perm: [1, 0, 3, 2] }));
+}
+for q in 0..8i32 {
+    let w = b.let_(Op::PermB32(Opnd::Val(zs[q as usize]), Opnd::Val(pks[q as usize]), Opnd::Val(permsel)));
+    let rowbase = if q < 4 { 2 * q } else { 2 * q + 8 };
+    let addr = b.bind_i32(ev(bi2) + (rowbase * epi_rs + j * 32));
+    b.store_lds_b32(addr, w);
+}
+} else if epi == 6 {
                     // bf16 pairs through a lane exchange: lanes (2k, 2k + 1) hold columns n, n + 1 of the same rows; the even lane keeps the even accumulator rows of the pair, the odd lane the odd ones: each
                     // sends the row the other keeps (`quad_perm` swap), rounds the pair with one `v_cvt_pk_bf16_f32` and stores the dword (half the stores of the f32 staging, 16-bit data)
                     for q in 0..8i32 {
@@ -1374,7 +1454,7 @@ if epi == 6 {
             let c0 = b.add_i32(c0, col0);
             let lin = b.mul_i32(r0, nn);
             let lin = b.add_i32(lin, c0);
-            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(if epi == 5 || epi == 6 { 1 } else { 2 })));
+            let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(if epi == 5 || epi == 6 || epi == 7 { 1 } else { 2 })));
             if epi == 1 {
                 // rows back as b128: lane l holds columns 4 l .. 4 l + 3 of a row (wcols / 4 lanes per row)
                 assert!(wcols % 4 == 0 && 32 % (wcols / 4) == 0 || (wcols / 4) % 32 == 0, "rows split over the lanes");
@@ -1399,7 +1479,7 @@ if epi == 6 {
                 }
             } else {
                 // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
-                let tile = TensorTile { data_size: if epi == 5 || epi == 6 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
+                let tile = TensorTile { data_size: if epi == 5 || epi == 6 || epi == 7 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
                 // (the origin and the LDS base are wave-uniform: scalar descriptor words)
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
@@ -1501,6 +1581,9 @@ if epi == 6 {
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
     if persistent {
         f.lower_opts.push("zeroinit".to_string());
+    }
+    if ring.racompact {
+        f.lower_opts.push("racompact".to_string());
     }
     if clustered {
         f.kd.push(("cluster_dims".into(), (cx * cy) as i64));   // the launch must declare the cluster (and divide the grid by it)

@@ -386,7 +386,76 @@ static int run_varscale(Kernel& k, const char* kn) {
     printf("varscale: nv=%d n=%d bad=%ld %s\n", nv, n, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
     return bad == 0 ? 0 : 3;
 }
-
+// probe_g1250_permlane: the gfx1250 lane permutes against this CPU model (wave32). Selects: P16 / X16: lane i of a 16-lane group reads
+// lane (sel nibble i of the 64-bit {b:a}) of its own / the other group; *_VAR: the per-lane select (3 lane) & 15; BCAST: lane a % size of the
+// group of `size` lanes; UP: lane i - a (values move to higher lanes), DOWN: lane i + a, a lane whose source would leave the group keeping its\n// own value (measured); XOR: i ^ (a & (size - 1)).
+// EXEC (env MASK, default all lanes; the partial-EXEC variant narrows EXEC around each permute): a disabled destination lane keeps old; a
+// disabled source lane is read anyway with fetch-invalid, else it is invalid: 0 with bound-ctrl, else the destination keeps old.  WGS workgroups (default 1).
+static int run_permlane(Kernel& k, const char* kn) {
+    const int wgs = getenv("WGS") ? atoi(getenv("WGS")) : 1;
+    const uint32_t mask = getenv("MASK") ? (uint32_t)strtoul(getenv("MASK"), nullptr, 0) : 0xffffffffu;
+    struct C { int kind; long long a; uint32_t b; int fi, bc; };
+    const C cs[] = {
+        {0, 0x76543210u, 4275878552u, 0, 0}, {0, 0x89abcdefu, 19088743u, 0, 0}, {0, 0x13579bdfu, 38177486u, 1, 1},
+        {1, 0x76543210u, 4275878552u, 0, 0}, {1, 0x89abcdefu, 19088743u, 1, 0}, {2, -1, 0u, 0, 0}, {3, -1, 0u, 0, 1},
+        {4, 3, 4u, 0, 0}, {4, 5, 8u, 0, 0}, {4, 7, 16u, 0, 0}, {4, 0, 32u, 0, 0},
+        {5, 1, 4u, 0, 0}, {5, 3, 8u, 0, 0}, {5, 5, 16u, 0, 0}, {5, 1, 32u, 0, 0},
+        {6, 1, 4u, 0, 0}, {6, 3, 8u, 0, 0}, {6, 5, 16u, 0, 0}, {6, 1, 32u, 0, 0},
+        {7, 1, 4u, 0, 0}, {7, 5, 8u, 0, 0}, {7, 3, 16u, 0, 0}, {7, 16, 32u, 0, 0},
+        {4, 1, 2u, 0, 0}, {5, 7, 8u, 0, 0}, {7, 1, 2u, 0, 0},
+    };
+    const int n = sizeof(cs) / sizeof(cs[0]), stride = n + 2;
+    uint32_t* dout;
+    HC(hipMalloc(&dout, (size_t)wgs * stride * 32 * 4));
+    HC(hipMemset(dout, 0, (size_t)wgs * stride * 32 * 4));
+    std::vector<uint8_t> args(8, 0);
+    put64(args, 0, dout);
+    k.launch(wgs, 32, args, kn);
+    std::vector<uint32_t> o((size_t)wgs * stride * 32);
+    HC(hipMemcpy(o.data(), dout, o.size() * 4, hipMemcpyDeviceToHost));
+    long bad = 0;
+    for (int w = 0; w < wgs; ++w) {
+        for (int c = 0; c < n; ++c) {
+            const C& cc = cs[c];
+            for (int l = 0; l < 32; ++l) {
+                const uint32_t old = 0xdead0000u + l;
+                auto x = [&](int lane) { return (uint32_t)((w << 16) + 1000 + lane); };
+                int s;
+                const int i = l & 15, g = l & 16;
+                const uint64_t sel64 = ((uint64_t)cc.b << 32) | (uint32_t)cc.a;
+                switch (cc.kind) {
+                    case 0: s = g + (int)((sel64 >> (4 * i)) & 15); break;
+                    case 1: s = (g ^ 16) + (int)((sel64 >> (4 * i)) & 15); break;
+                    case 2: s = g + ((3 * l) & 15); break;
+                    case 3: s = (g ^ 16) + ((3 * l) & 15); break;
+                    default: {
+                        const int size = (int)cc.b, gb = l & ~(size - 1), j = l & (size - 1), a = (int)cc.a;
+                        if (cc.kind == 4) s = gb + (a % size);
+                        // UP / DOWN (measured on MI450): a lane whose source would leave the group reads its own value
+                        else if (cc.kind == 5) s = j >= a ? l - a : l;
+                        else if (cc.kind == 6) s = j + a < size ? l + a : l;
+                        else s = gb + ((j ^ a) & (size - 1));
+                    }
+                }
+                uint32_t ref;
+                if (!((mask >> l) & 1)) ref = old;
+                // (the group forms always read the source lane: they ignore EXEC for reads)
+                else if (!((mask >> s) & 1) && !cc.fi && cc.kind < 4) ref = cc.bc ? 0u : old;
+                else ref = x(s);
+                const uint32_t got = o[((size_t)w * stride + c) * 32 + l];
+                if (got != ref) { if (bad < 16) printf("  wg %d case %d lane %d: got %#x ref %#x (src lane %d)\n", w, c, l, got, ref, s); ++bad; }
+            }
+        }
+        if (w == 0 && getenv("DUMP_IDX"))
+            for (int j = 0; j < 2; ++j) {
+                printf("idx_gen a=%d:", j ? 5 : 1);
+                for (int l = 0; l < 32; ++l) printf(" %u", o[((size_t)w * stride + n + j) * 32 + l]);
+                printf("\n");
+            }
+    }
+    printf("permlane: wgs=%d mask=%#x bad=%ld %s\n", wgs, mask, bad, bad == 0 ? "PROBE_OK" : "PROBE_FAIL");
+    return bad == 0 ? 0 : 3;
+}
 // probe_g1250_dpp: every DPP control against this CPU model (wave32: rows of 16 lanes, banks of 4 lanes in a row; a lane whose source is
 // invalid keeps old unless bound_ctrl (then 0); a lane in a disabled row / bank is not written: old). WGS workgroups (default 64).
 static int run_dpp(Kernel& k, const char* kn) {
@@ -605,6 +674,7 @@ int main(int argc, char** argv) {
     if (mode == "varscale") return run_varscale(k, kn);
     if (mode == "lds_fadd") return run_lds_fadd(k, kn);
     if (mode == "dpp") return run_dpp(k, kn);
+    if (mode == "permlane") return run_permlane(k, kn);
     if (mode == "add") return run_add(k, kn, arg > 0 ? arg : 4096);
     if (mode == "math") return run_math(k, kn);
     if (mode == "tdm") return run_tdm(k, kn, arg > 0 ? arg : 64);

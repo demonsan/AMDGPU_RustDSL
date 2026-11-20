@@ -793,7 +793,7 @@ const SAME_PREFIX: &[&str] = &[
     "s_mov_b64", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_mul_i32", "s_mul_hi_u32", "s_min_i32",
     "s_max_i32", "s_min_u32", "s_max_u32", "s_cmp_", "s_cselect_b32", "s_bfe_u32", "s_bfe_i32", "s_lshl_b64", "s_lshr_b64", "s_nop",
     "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz", "s_setprio", "s_sleep", "v_nop",
-    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
+    "v_mad_u64_u32", "v_permlane16_swap_b32", "v_permlane16_b32", "v_permlanex16_b32", "v_permlane16_var_b32", "v_permlanex16_var_b32", "v_permlane_bcast_b32", "v_permlane_up_b32", "v_permlane_down_b32", "v_permlane_xor_b32", "v_permlane_idx_gen_b32", "v_pk_add_f32", "v_pk_fma_f32", "v_pk_mul_f32", "v_rcp_iflag_f32",
 ];
 
 /// The gfx1250 spelling of one gfx950 line (`mnemonic operands...`).

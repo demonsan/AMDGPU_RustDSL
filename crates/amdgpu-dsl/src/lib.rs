@@ -479,6 +479,29 @@ impl Dpp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI32, MaxU32, MinU32, AndB32, OrB32, XorB32 }
 
+/// The gfx1250 lane permutes of `Op::Permlane`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PermlaneKind { P16, X16, P16Var, X16Var, Bcast, Up, Down, Xor }
+
+impl PermlaneKind {
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            PermlaneKind::P16 => "v_permlane16_b32",
+            PermlaneKind::X16 => "v_permlanex16_b32",
+            PermlaneKind::P16Var => "v_permlane16_var_b32",
+            PermlaneKind::X16Var => "v_permlanex16_var_b32",
+            PermlaneKind::Bcast => "v_permlane_bcast_b32",
+            PermlaneKind::Up => "v_permlane_up_b32",
+            PermlaneKind::Down => "v_permlane_down_b32",
+            PermlaneKind::Xor => "v_permlane_xor_b32",
+        }
+    }
+    /// The per-lane select is a VGPR (`_var` forms).
+    pub fn var(self) -> bool {
+        matches!(self, PermlaneKind::P16Var | PermlaneKind::X16Var)
+    }
+}
+
 /// Atomic read-modify-write operations (B3). `IncU32`: old >= value ? 0 : old + 1 (a wrapping counter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32, PkAddBf16, PkAddF16 }
@@ -807,6 +830,17 @@ pub enum Op {
     DppAlu { op: DppAluOp, dpp: Dpp, a: Opnd, b: Opnd, old: Opnd },
     /// `v_permlane16_swap`: exchanges the odd 16-lane rows of `a` with the even rows of `b`; Frag2 (new a, new b)
     Permlane16Swap { a: Opnd, b: Opnd },
+    /// gfx1250 lane permutes (`PermlaneKind`): lane i of the result is `x` of the source lane the kind selects with `a` / `b`; the result
+    /// starts as `old` (lanes the EXEC mask disables keep it; so do lanes whose source is invalid unless `bc`, which then read 0). `fi`
+    /// (fetch invalid): a disabled source lane is read anyway. The 16-lane forms: `a` / `b` the two SGPR halves of the 8 x 4-bit lane
+    /// selects (`P16` / `X16`), or `a` one VGPR of per-lane selects (`P16Var` / `X16Var`, `b` unused); the group forms (`Bcast`, `Up`,
+    /// `Down`, `Xor`): `a` the lane / distance / mask, `b` the group size in lanes; they read every source lane whatever EXEC says and have
+    /// no `fi` / `bc` (a lowering error). `Up` / `Down`: lane i reads lane i - a / i + a of its group; a lane whose source would leave the
+    /// group keeps its own value (measured on MI450, tests/gpu/g1250_probe_host.cpp `permlane`).
+    Permlane { kind: PermlaneKind, x: Opnd, a: Opnd, b: Opnd, old: Opnd, fi: bool, bc: bool },
+    /// gfx1250 `v_permlane_idx_gen_b32 d, x, a`: the byte index for a backwards permute (`ds_bpermute`) built from `x` and `a`. Encoded and
+    /// lowered only in exact mode: its function is not specified (no public specification), so the lowering refuses it elsewhere.
+    PermlaneIdxGen { x: Opnd, a: Opnd },
     /// conversion (`CvtOp`; operands and `sel` per op)
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
@@ -915,6 +949,7 @@ impl Op {
             Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } => DType::U32,
+            Op::Permlane { .. } | Op::PermlaneIdxGen { .. } => DType::U32,
             Op::VAddU64 { .. } => DType::Frag2,
             Op::CvtPkFp8Half { .. } => DType::U32,
             Op::PkNegF32(_) => DType::Frag2,
@@ -1004,6 +1039,8 @@ impl Op {
             Op::BufferAtomicRet { rsrc, voff, soff, value, .. } => { let mut v = vec![*rsrc, *soff, *value]; if let Some(x) = voff { v.push(*x); } v }
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
             Op::Permlane16Swap { a, b } => vec![*a, *b],
+            Op::Permlane { x, a, b, old, .. } => vec![*x, *a, *b, *old],
+            Op::PermlaneIdxGen { x, a } => vec![*x, *a],
             Op::Mfma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
@@ -3809,6 +3846,14 @@ impl FnBuilder {
     /// `v_mov_b32_dpp quad_perm:[p0,p1,p2,p3]`: lane `l` gets lane `4 (l / 4) + perm[l % 4]` of `x` (a 32-bit value; e.g. `[1,0,3,2]` swaps
     /// neighbours, `[2,3,0,1]` swaps pairs). The result is a U32 bit pattern.
     #[track_caller]
+    /// gfx1250 lane permute (`Op::Permlane`): `a` / `b` per `kind` (see there), the result starting as `old`.
+    pub fn permlane(&mut self, kind: PermlaneKind, x: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>, old: impl Into<Opnd>, fi: bool, bc: bool) -> ValueId {
+        self.let_(Op::Permlane { kind, x: x.into(), a: a.into(), b: b.into(), old: old.into(), fi, bc })
+    }
+    /// gfx1250 `v_permlane_idx_gen_b32`.
+    pub fn permlane_idx_gen(&mut self, x: impl Into<Opnd>, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PermlaneIdxGen { x: x.into(), a: a.into() })
+    }
     pub fn dpp_quad_perm(&mut self, x: impl Into<Opnd>, perm: [u8; 4]) -> ValueId {
         assert!(perm.iter().all(|p| *p < 4), "dpp_quad_perm: lane selectors are 0..3");
         self.let_(Op::DppQuadPerm { x: x.into(), perm })
@@ -5863,7 +5908,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                         Op::Raw { scalar, .. } => *scalar,
                         Op::Wmma { .. } => false,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
-                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } | Op::VAddU64 { .. } | Op::CvtPkFp8Half { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
+                        Op::Permlane { .. } | Op::PermlaneIdxGen { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::SwapA { .. } | Op::Permlane16SwapA { .. } | Op::VAddU64 { .. } | Op::CvtPkFp8Half { .. } | Op::Permlane32SwapA { .. } | Op::Permlane32SwapB { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
                         | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaBf16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
                         | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } | Op::AtomicAddU32 { .. }

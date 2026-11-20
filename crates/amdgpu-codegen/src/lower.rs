@@ -671,6 +671,7 @@ impl Lowerer {
             elide_fallthrough: false,
             edge_pad: opt_on("edgepad"),
             ra_dword: opt_on("radword"),
+            ra_compact: opt_on("racompact"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));
@@ -4048,6 +4049,67 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V1);
                 self.copy_reg(d, o)?;
                 self.push(MInst::new(dpp_alu_mop(*op)).def(d).srcreg(ra).srcreg(rb).srcreg(d).imm(dpp.imm()));
+                self.val.insert(dst, d);
+            }
+            Op::Permlane { kind, x, a, b, old, fi, bc } => {
+                if crate::target::cur().name != "gfx1250" {
+                    return Err(format!("{}: a gfx1250 lane permute", kind.mnemonic()));
+                }
+                // the group forms read every source lane whatever EXEC says (no fetch-invalid / bound-ctrl bits: the assembler refuses them)
+                if (*fi || *bc) && !matches!(kind, amdgpu_dsl::PermlaneKind::P16 | amdgpu_dsl::PermlaneKind::X16 | amdgpu_dsl::PermlaneKind::P16Var | amdgpu_dsl::PermlaneKind::X16Var) {
+                    return Err(format!("{}: fetch-invalid / bound-ctrl exist only on the 16-lane permutes (the group forms always read the source lane)", kind.mnemonic()));
+                }
+                let rx = self.as_v1(*x)?;
+                let o = self.as_v1(*old)?;
+                // the selects: VGPR for the _var forms, else SGPR / inline constant (`as_s_or_imm`)
+                // (a VOP3 carries at most one literal: a select that is not an inline constant goes to an SGPR)
+                let sreg = |me: &mut Self, o: Opnd| -> Result<Src, String> {
+                    match me.s_operand(o)? {
+                        Src::Imm(k) if !(-16..=64).contains(&k) => {
+                            let r = me.new_vreg(RClass::S1);
+                            me.push(MInst::new(MOp::SMovB32).def(r).src(Src::Imm(k)));
+                            Ok(Src::Reg(r))
+                        }
+                        s => Ok(s),
+                    }
+                };
+                let sa = if kind.var() { Src::Reg(self.as_v1(*a)?) } else { sreg(self, *a)? };
+                let sb = if kind.var() { None } else { Some(sreg(self, *b)?) };
+                let mut reads = vec![Src::Reg(rx), Src::Reg(o), sa];
+                if let Some(s) = sb {
+                    reads.push(s);
+                }
+                self.touch(&reads);
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, o)?;
+                let mop = match kind {
+                    amdgpu_dsl::PermlaneKind::P16 => MOp::VPermlane16B32,
+                    amdgpu_dsl::PermlaneKind::X16 => MOp::VPermlaneX16B32,
+                    amdgpu_dsl::PermlaneKind::P16Var => MOp::VPermlane16VarB32,
+                    amdgpu_dsl::PermlaneKind::X16Var => MOp::VPermlaneX16VarB32,
+                    amdgpu_dsl::PermlaneKind::Bcast => MOp::VPermlaneBcastB32,
+                    amdgpu_dsl::PermlaneKind::Up => MOp::VPermlaneUpB32,
+                    amdgpu_dsl::PermlaneKind::Down => MOp::VPermlaneDownB32,
+                    amdgpu_dsl::PermlaneKind::Xor => MOp::VPermlaneXorB32,
+                };
+                let mut mi = MInst::new(mop).def(d).srcreg(rx).src(sa);
+                if let Some(s) = sb {
+                    mi = mi.src(s);
+                }
+                self.push(mi.srcreg(d).imm(*fi as i64 | (*bc as i64) << 1));
+                self.val.insert(dst, d);
+            }
+            Op::PermlaneIdxGen { x, a } => {
+                // refused until its function is specified (the encoder and the emitter know it; no kernel may depend on unspecified
+                // behaviour)
+                if crate::target::cur().name != "gfx1250" || !EXACT_LOWERING.with(|e| e.get()) {
+                    return Err("v_permlane_idx_gen_b32: its function is not specified; refused (exact-mode kernels only)".into());
+                }
+                let rx = self.as_v1(*x)?;
+                let sa = self.s_operand(*a)?;
+                self.touch(&[Src::Reg(rx), sa]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VPermlaneIdxGenB32).def(d).srcreg(rx).src(sa));
                 self.val.insert(dst, d);
             }
             Op::Permlane16Swap { a, b } => {

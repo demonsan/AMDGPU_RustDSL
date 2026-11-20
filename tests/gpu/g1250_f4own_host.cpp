@@ -91,9 +91,11 @@ int main(int argc, char** argv) {
                 if (k < lo || k >= hi) A[(size_t)i * KB + k / 2] &= (k & 1) ? 0x0f : 0xf0;
     }
     uint8_t *dA, *dB, *dSA, *dSB; float* dC;
-    HC(hipMalloc(&dA, A.size())); HC(hipMalloc(&dB, B.size())); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); const bool bf16 = getenv("OUT_BF16") != nullptr;   // the kernel writes bf16 (RNE), M x N x 2 bytes
+    // LDA_PAD=bytes: the A / B rows at a pitch of K / 2 + pad bytes (kernarg lda @72; only the `_lda` kernels read it)
+    const size_t lda_pad = getenv("LDA_PAD") ? (size_t)atoi(getenv("LDA_PAD")) : 0;
+    HC(hipMalloc(&dA, (size_t)M * (KB + lda_pad))); HC(hipMalloc(&dB, (size_t)N * (KB + lda_pad))); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); const bool bf16 = getenv("OUT_BF16") != nullptr;   // the kernel writes bf16 (RNE), M x N x 2 bytes
     HC(hipMalloc(&dC, (size_t)M * N * (bf16 ? 2 : 4)));
-    HC(hipMemcpy(dA, A.data(), A.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, B.data(), B.size(), hipMemcpyHostToDevice));
+    HC(hipMemcpy2D(dA, KB + lda_pad, A.data(), KB, KB, M, hipMemcpyHostToDevice)); HC(hipMemcpy2D(dB, KB + lda_pad, B.data(), KB, KB, N, hipMemcpyHostToDevice));
     // SCALE_SHUF=1: the scales in the vendor's preshuffled layout (aiter shuffle_scale_f4: [rows / 32][K / 128][32 rows][4 bytes]; rows and
     // K / 32 here are multiples of 32 and 4); the reference below keeps reading the row-major SA / SB
     auto shuf_scale = [](const std::vector<uint8_t>& s, int rows, int cols) {
@@ -124,11 +126,11 @@ int main(int argc, char** argv) {
     void* dDbg = nullptr;
     const size_t dbg_bytes = (size_t)ty * 64 * 4 * 64;
     if (stamps) { if (tx > 64) { fprintf(stderr, "STAMPS: N / BN = %d must be at most 64\n", tx); return 1; } HC(hipMalloc(&dDbg, dbg_bytes)); HC(hipMemset(dDbg, 0, dbg_bytes)); }
-    struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; int pad_; void* dbg; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1, 0, dDbg};
+    struct { void *a, *b, *sa, *sb, *c; int k, n, ty, lgx, ystep; int pad_; void* dbg; unsigned lda; } ka{dA, dB, dSA, dSB, dC, K, N, ty, lgx, 1, 0, dDbg, (unsigned)(KB + lda_pad)};
     // SWIZZLE=G: the kernel remaps the tile order (rows grouped by G); it needs the log2 of the tile columns (kernarg @52)
     const int swizzle = getenv("SWIZZLE") ? atoi(getenv("SWIZZLE")) : 0;
     if (swizzle && (((1 << lgx) != tx) || ty % swizzle)) { fprintf(stderr, "SWIZZLE=%d: N / BN = %d must be a power of two and the tile rows %d a multiple of it\n", swizzle, tx, ty); return 1; }
-    size_t ksz = (persist || swizzle || stamps) ? sizeof(ka) : 48;
+    size_t ksz = (persist || swizzle || stamps || lda_pad) ? sizeof(ka) : 48;
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     for (int stage = 0; stage < 2; ++stage) {
         unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
