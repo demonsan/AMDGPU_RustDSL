@@ -205,6 +205,8 @@ pub enum MOp {
     VXorB32Dpp,
     VPermlane16Swap,
     /// gfx1250 lane permutes: dst (tied to its old value, the last source), x, a[, b]; imm = fetch_invalid | bound_ctrl << 1
+    /// pseudo (no text): wait for this wave's earlier LDS writes; the wait pass replaces it by the computed `s_waitcnt lgkmcnt(n)` before it
+    SWaitLdsWrites,
     VPermlane16B32,
     VPermlaneX16B32,
     VPermlane16VarB32,

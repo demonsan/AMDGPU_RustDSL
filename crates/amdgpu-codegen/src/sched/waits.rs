@@ -306,6 +306,8 @@ struct Ent {
     after: u32,
     slots: Vec<Slot>,
     smem: bool,
+    /// an LDS write (store / atomic): `SWaitLdsWrites` waits for these
+    wr: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -320,7 +322,14 @@ impl Queue {
         }
         // scalar loads return out of order: never assume they completed because of the count
         self.e.retain(|_, v| v.after < max || v.smem);
-        self.e.insert(id, Ent { after: 0, slots, smem });
+        self.e.insert(id, Ent { after: 0, slots, smem, wr: false });
+    }
+    /// `issue` of an LDS write
+    fn issue_write(&mut self, id: u64, slots: Vec<Slot>, max: u32) {
+        self.issue(id, slots, false, max);
+        if let Some(v) = self.e.get_mut(&id) {
+            v.wr = true;
+        }
     }
 
     /// Smallest `after` among the entries touching `slots`, if any.
@@ -375,6 +384,22 @@ const TN_MAX: u32 = 63;
 
 fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mut Vec<MInst>>) -> usize {
     let mut inserted = 0;
+    // wait for the earlier LDS writes: lgkmcnt(the number of operations younger than the youngest pending write); an SMEM operation in flight
+    // (out of order) forces 0
+    if inst.op == MOp::SWaitLdsWrites {
+        if let Some(n) = st.lg.e.values().filter(|v| v.wr).map(|v| v.after).min() {
+            let n = if st.lg.e.values().any(|v| v.smem) { 0 } else { n };
+            if let Some(o) = out {
+                o.push(MInst::new(MOp::SWaitLgkm).imm(n as i64).auto());
+            }
+            st.lg.complete(n);
+            inserted += 1;
+        }
+        if let Some(o) = out {
+            o.push(inst.clone());
+        }
+        return inserted;
+    }
     // an explicit tensor wait completes the older tensor operations
     if inst.op == MOp::SWaitTensor || (inst.op == MOp::SWaitCtr && inst.imm >> 8 == 6) {
         st.tn.complete((inst.imm & 0xff) as u32);
@@ -525,6 +550,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         slots.extend(ring_issue);
         match a.space {
             Space::Global => st.vm.issue(key, slots, false, vm_keep()),
+            Space::Lds if a.write => st.lg.issue_write(key, slots, lg_max()),
             Space::Lds => st.lg.issue(key, slots, false, lg_max()),
         }
     } else if e.smem {
