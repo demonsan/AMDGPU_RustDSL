@@ -49,6 +49,18 @@ thread_local! {
     static ILP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STAMPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ABL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static LEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `_w1i` with the lean softmax VALU: masked raw S carried (masked once), the per-lane token limit compared against constants, the max on
+/// raw S (scale > 0), and P's exponent as one `v_pk_fma_f32` per two values (S * scale - max)
+pub fn mla_g1250_qh16_w1v() -> Function {
+    ILP.with(|c| c.set(true));
+    LEAN.with(|c| c.set(true));
+    let f = mla_w1_with("mla_g1250_qh16_w1v", 2, 4);
+    LEAN.with(|c| c.set(false));
+    ILP.with(|c| c.set(false));
+    f
 }
 
 /// deletion ablations of `_w1i` (timing only; the output is wrong): 1 = no K reads (Q as the A operand), 2 = no V reads (P as the B
@@ -325,6 +337,76 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         (alpha, m_new, lsum)
     };
 
+    let lean = LEAN.with(|c| c.get());
+    // lean pieces: the masked raw S of window t (lane limit per page vs constant token offsets)
+    let raw_masked = |b: &mut FnBuilder, t: ValueId, s: &[Opnd]| -> Vec<ValueId> {
+        let mut x = Vec::with_capacity(8 * WP as usize);
+        for pg in 0..WP {
+            let lim = b.bind_i32(ev(ctx) - (ev(t) * (64 * WP) + (64 * pg) + ev(w) * 16 + ev(g) * 8));
+            for r in 0..8u8 {
+                let si = b.frag_slice(s[pg as usize], r, 1);
+                let sf = f32_of(b, si);
+                let ok = b.cmp(CmpPred::Gt, CmpTy::I32, lim, Opnd::I32(r as i32));
+                x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(sf), b: Opnd::Val(neg) }));
+            }
+        }
+        x
+    };
+    // P of window t from masked raw values: m_new = max(m_old, pm_raw * scale); exponent pairs by v_pk_fma_f32 (x * scale - m_new)
+    let put_p_lean = |b: &mut FnBuilder, t: ValueId, x: &[Opnd], m_old: Opnd, l_old: Opnd, pm_raw: ValueId| -> (ValueId, ValueId, ValueId) {
+        let pms = b.mul_f32(pm_raw, cscale);
+        let m_new = b.max_f32(m_old, pms);
+        let dm = b.sub_f32(m_old, m_new);
+        let alpha = b.exp2_f32(dm);
+        let sc2 = b.frag2_dup(cscale);
+        let nm = b.neg_f32(m_new);
+        let nm2 = b.frag2_dup(nm);
+        let mut p = Vec::with_capacity(x.len());
+        let dp: Vec<ValueId> = (0..x.len() / 2)
+            .map(|k| {
+                let pair = b.frag_cat(&[x[2 * k], x[2 * k + 1]]);
+                b.pk_fma_f32(pair, sc2, nm2)
+            })
+            .collect();
+        for k in 0..dp.len() {
+            for h in 0..2u8 {
+                let dv = b.frag_slice(Opnd::Val(dp[k]), h, 1);
+                let df = f32_of(b, dv);
+                p.push(b.exp2_f32(df));
+            }
+        }
+        // the sum: pairwise packed adds, then the two lanes
+        let mut pairs: Vec<ValueId> = (0..p.len() / 2).map(|k| b.frag_cat(&[Opnd::Val(p[2 * k]), Opnd::Val(p[2 * k + 1])])).collect();
+        while pairs.len() > 1 {
+            let mut nx = Vec::new();
+            for k in 0..pairs.len() / 2 {
+                nx.push(b.pk_add_f32(pairs[2 * k], pairs[2 * k + 1]));
+            }
+            pairs = nx;
+        }
+        let s0 = b.frag_slice(Opnd::Val(pairs[0]), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(pairs[0]), 1, 1);
+        let s0f = f32_of(b, s0);
+        let s1f = f32_of(b, s1);
+        let ps = b.add_f32(s0f, s1f);
+        let la = b.mul_f32(l_old, alpha);
+        let lsum = b.add_f32(la, ps);
+        let si = b.bind_i32(ev(t) & 1);
+        let sl = SlotIdx::new(Opnd::Val(si), Opnd::Val(t));
+        let r = pbuf.at(&sl);
+        let pw = b.bind_i32(r.base() + ev(lane) * 32 + ev(w) * 8);
+        r.write(b, |b| {
+            for pg in 0..WP as usize {
+                let p0 = b.cvt_pk_fp8x4_f32(p[8 * pg], p[8 * pg + 1], p[8 * pg + 2], p[8 * pg + 3]);
+                let p1 = b.cvt_pk_fp8x4_f32(p[8 * pg + 4], p[8 * pg + 5], p[8 * pg + 6], p[8 * pg + 7]);
+                let a0 = b.bind_i32(ev(pw) + 1024 * pg as i32);
+                b.store_lds(a0, p0, MemTy::B32, false);
+                let a1 = b.bind_i32(ev(pw) + (1024 * pg as i32 + 4));
+                b.store_lds(a1, p1, MemTy::B32, false);
+            }
+        });
+        (alpha, m_new, lsum)
+    };
     // ---- prologue: windows 0, 1, 2 staged; S(0), S(1) and their maxima; P(0) ----
     let c0 = b.c_i32(0);
     let c1i = b.c_i32(1);
@@ -337,15 +419,19 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     b.wait_tensor(in_flight);
     b.barrier();
     let s0 = s_win(&mut b, c0);
-    let x0 = logits(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+    let x0 = if lean { raw_masked(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, c0, &s0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
     put_max(&mut b, c0, &x0);
     let s1 = s_win(&mut b, c1i);
-    let x1 = logits(&mut b, c1i, &s1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+    let x1 = if lean { raw_masked(&mut b, c1i, &s1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, c1i, &s1.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
     put_max(&mut b, c1i, &x1);
     b.wait_lds(0);
     b.barrier();
     let pm0 = get_max(&mut b, c0);
-    let (alpha0, m0, l0) = put_p(&mut b, c0, &x0, Opnd::Val(neg), Opnd::Val(zf), pm0);
+    let (alpha0, m0, l0) = if lean {
+        put_p_lean(&mut b, c0, &x0.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>(), Opnd::Val(neg), Opnd::Val(zf), pm0)
+    } else {
+        put_p(&mut b, c0, &x0, Opnd::Val(neg), Opnd::Val(zf), pm0)
+    };
     b.wait_lds(0);
     b.barrier();
 
@@ -355,13 +441,20 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let z = b.frag_cat(&[Opnd::I32(0); 8]);
         inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(z)));
     }
-    for s in &s1 {
-        inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(*s)));
+    if lean {
+        for x in &x1 {
+            inits.push((DType::F32, Opnd::Val(*x)));
+        }
+    } else {
+        for s in &s1 {
+            inits.push((WmmaKind::Fp8_16x16x64.acc_ty(), Opnd::Val(*s)));
+        }
     }
     let st = b.declare_vars(&inits);
     let (vm, vl, va) = (st[0], st[1], st[2]);
     let ov: Vec<_> = st[3..11].to_vec();
-    let sv: Vec<_> = st[11..11 + WP as usize].to_vec();
+    let sv: Vec<_> = if lean { Vec::new() } else { st[11..11 + WP as usize].to_vec() };
+    let xv: Vec<_> = if lean { st[11..11 + 8 * WP as usize].to_vec() } else { Vec::new() };
     let z = b.c_i32(0);
     let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
     let it = lvars[0];
@@ -457,7 +550,20 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 b.add_f32(u0, u1)
             })
             .collect();
-        if abl != 4 {
+        if false {
+            // (packed O rescale by rebuilt fragments: +32 VALU of copies; kept off until an in-place packed form exists)
+            let ap: Vec<ValueId> = (0..4).map(|k| b.frag_cat(&[Opnd::Val(al[2 * k]), Opnd::Val(al[2 * k + 1])])).collect();
+            for nt in 0..8 {
+                let parts: Vec<Opnd> = (0..4u8)
+                    .map(|k| {
+                        let pr2 = b.frag_slice(Opnd::Var(ov[nt]), 2 * k, 2);
+                        Opnd::Val(b.pk_mul_f32(pr2, ap[k as usize]))
+                    })
+                    .collect();
+                let nv = b.frag_cat(&parts);
+                b.set_var(ov[nt], Opnd::Val(nv));
+            }
+        } else if abl != 4 {
             for nt in 0..8 {
                 for r in 0..8u8 {
                     b.var_scale_lane(ov[nt], r, al[r as usize]);
@@ -507,25 +613,35 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                     }
                 }
             }
-            if c == 1 {
+            if c == 1 && !lean {
                 x1c_keep = logits(&mut b, t1, &sv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>());
             }
             if c == 3 {
                 let pm1 = get_max(&mut b, t1);
-                p1 = Some(put_p(&mut b, t1, &x1c_keep, Opnd::Var(vm), Opnd::Var(vl), pm1));
+                p1 = Some(if lean {
+                    put_p_lean(&mut b, t1, &xv.iter().map(|&v| Opnd::Var(v)).collect::<Vec<_>>(), Opnd::Var(vm), Opnd::Var(vl), pm1)
+                } else {
+                    put_p(&mut b, t1, &x1c_keep, Opnd::Var(vm), Opnd::Var(vl), pm1)
+                });
             }
         }
         stamp(&mut b);
         let s2: Vec<ValueId> = sacc.into_iter().map(|a| match a { Some(Opnd::Val(v)) => v, _ => unreachable!() }).collect();
-        let x2 = logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>());
+        let x2 = if lean { raw_masked(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) } else { logits(&mut b, t2, &s2.iter().map(|&v| Opnd::Val(v)).collect::<Vec<_>>()) };
         put_max(&mut b, t2, &x2);
         stamp(&mut b);
         let (alpha1, m1, l1) = p1.unwrap();
         b.set_var(vm, Opnd::Val(m1));
         b.set_var(vl, Opnd::Val(l1));
         b.set_var(va, Opnd::Val(alpha1));
-        for pg in 0..WP as usize {
-            b.set_var(sv[pg], Opnd::Val(s2[pg]));
+        if lean {
+            for k in 0..xv.len() {
+                b.set_var(xv[k], Opnd::Val(x2[k]));
+            }
+        } else {
+            for pg in 0..WP as usize {
+                b.set_var(sv[pg], Opnd::Val(s2[pg]));
+            }
         }
     } else {
     // 1. stage window t + depth - 1 (into the slot of window t - 1)
