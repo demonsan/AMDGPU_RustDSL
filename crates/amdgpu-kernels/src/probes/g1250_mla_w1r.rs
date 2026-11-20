@@ -232,7 +232,8 @@ pub fn mla_g1250_qh16_w1r() -> Function {
     b.wait_lds(0);
     b.barrier();
     b.begin_if(is_mma);
-    p.epilogue(&mut b, &ov, &lsum, &out, tid);
+    let tid_m = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(127)));
+    p.epilogue(&mut b, &ov, &lsum, &out, tid_m);
     b.else_();
     b.barrier();
     b.end_if();
