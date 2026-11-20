@@ -269,6 +269,12 @@ So the roles do overlap the softmax with the MMA blocks (the softmax adds 0.03 u
 next steps (not built): issue the next window's K / V fragment loads before the barrier (the slot is already published), two windows per iteration (one barrier per two windows needs two more ring generations), counted
 `s_wait_dscnt` instead of `wait_lds(0)`. In situ the replica is 0.379 us and `_w1i` 0.958 us; with the roles the compute part falls by 0.27 us, so a real kernel (3-slot ring, KV streaming) would land around 0.7 us.
 
+#### Two-role prototype, follow-ups (e08, 2026-11-20)
+
+- **Two windows per barrier** (`_roles_8`: every hop crosses a barrier, so the pipeline is 6 windows deep, rings of 4 slots, 496 VGPRs, LDS 203,776 B): 0.446 us per window vs 0.447 with one: the barrier is not the cost.
+- **Fragments hoisted out of the loop** (`_roles_20`, a measurement only: K, P and V fragments read once): 0.354 us per window, so the fragment-load latency chains are 0.09 us of the 0.446; the rest is the two roles' own paths (MMA about 0.35, softmax about 0.32: they overlap, the window is their max plus the barrier).
+- **Blocked on the tile protocol** (requests to backend): the split barrier across roles, the counted `s_wait_dscnt N` completion of stores (pre-barrier fragment loads, `_roles_4`), and N-way role branches (three waves per SIMD: S waves / softmax waves / PV waves, `_roles_10`, block 384, 336 VGPRs per wave): the role model has two roles and does not follow a wave-uniform sub-branch inside a role.
+
 ## 6. Incidents
 
 1. **A device hang during GEMM development** (full account in [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)): a sweep left a process
