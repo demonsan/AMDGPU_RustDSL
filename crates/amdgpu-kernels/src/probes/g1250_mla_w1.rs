@@ -254,6 +254,10 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 let si = b.frag_slice(s[pg as usize], r, 1);
                 let sf = f32_of(b, si);
                 let v = b.mul_f32(sf, cscale);
+                if ABL.with(|c| c.get()) == 4 {
+                    x.push(v);
+                    continue;
+                }
                 let tok = b.add_i32(tok0, Opnd::I32(r as i32));
                 let ok = b.cmp(CmpPred::Lt, CmpTy::I32, tok, ctx);
                 x.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg) }));
@@ -453,9 +457,11 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                 b.add_f32(u0, u1)
             })
             .collect();
-        for nt in 0..8 {
-            for r in 0..8u8 {
-                b.var_scale_lane(ov[nt], r, al[r as usize]);
+        if abl != 4 {
+            for nt in 0..8 {
+                for r in 0..8u8 {
+                    b.var_scale_lane(ov[nt], r, al[r as usize]);
+                }
             }
         }
         // 4. S(t + 2) and PV(t) WMMAs interleaved (independent chains); P(t + 1)'s logits / max read / exps between the first groups
