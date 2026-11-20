@@ -36,11 +36,13 @@ const PH_LAZY: u32 = 64;
 const PH_VALU: u32 = 128;
 /// with PH_ILP: the WMMA stream orders independent chains round-robin (a dependent WMMA never directly follows its producer)
 const PH_SPREAD: u32 = 256;
+/// the VALU block uses mul + add (no TRANS) instead of mul + exp2: does a TRANS op block WMMA co-execution?
+const PH_ALU: u32 = 512;
 
 /// `mla_g1250_qh16_ph_<hex mask>`.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 0x1ff {
+    if mask > 0x3ff {
         return None;
     }
     Some(mla_ph_with(&format!("mla_g1250_qh16_ph_{hex}"), 2, 4, mask))
@@ -331,7 +333,7 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let valu_round = |b: &mut FnBuilder| {
         for i in 0..8usize {
             let x = b.mul_f32(Opnd::Var(uv[i]), cscale);
-            let y = b.exp2_f32(x);
+            let y = if mask & PH_ALU != 0 { b.add_f32(x, cscale) } else { b.exp2_f32(x) };
             b.set_var(uv[i], Opnd::Val(y));
         }
     };
