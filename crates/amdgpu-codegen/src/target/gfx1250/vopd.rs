@@ -25,7 +25,8 @@ thread_local! {
 
 /// The kernel's `vopd` lowering token, or `AMDC_VOPD` (A/B).
 pub fn enabled(m: &MFunction) -> bool {
-    m.vopd || std::env::var("AMDC_VOPD").is_ok()
+    // (AMDC_NO_VOPD: off even for a kernel with the token, A/B only)
+    std::env::var("AMDC_NO_VOPD").is_err() && (m.vopd || std::env::var("AMDC_VOPD").is_ok())
 }
 
 pub fn clear() {
