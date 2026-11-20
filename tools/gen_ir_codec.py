@@ -17,7 +17,7 @@ SRCS = {
 OUT = os.path.join(ROOT, "crates/amdgpu-dsl/src/ir_codec.rs")
 # the IR types (data reachable from Function); FnBuilder / expr types are not data of a Function
 TYPES = ["VarId", "DType", "Opnd", "Op", "WmmaKind", "WmmaScale", "SaluOp", "SysOp", "SysValOp", "Ext", "ArgExtent", "TileDecl", "BufRegion", "LastArriver", "WgMap", "WgWinner", "TdmCpol", "WaitCtr", "Contract", "StageVal", "StageScalar", "StageOutstanding", "StageResources", "StageContract",
-         "Stmt", "Arg", "AgprTarget", "AgprMark", "RegRef", "RegMark", "RegionKind", "RegionDecl", "CompileProfile", "UnOp", "BinOp", "TriOp", "CmpPred", "CmpTy", "MemTy", "D16Ty", "MmaShape", "MmaTy", "MmaKind", "MmaScale", "CachePolicy", "CvtOp", "DppCtrl", "Dpp", "DppAluOp", "AtomicOp",
+         "Stmt", "Arg", "AgprTarget", "AgprMark", "RegRef", "RegMark", "RegionKind", "RegionDecl", "CompileProfile", "UnOp", "BinOp", "TriOp", "CmpPred", "CmpTy", "MemTy", "D16Ty", "MmaShape", "MmaTy", "MmaKind", "MmaScale", "CachePolicy", "CvtOp", "DppCtrl", "Dpp", "DppAluOp", "PermlaneKind", "AtomicOp",
          # the kernel plan (plan.rs, docs/two-weavers.md)
          "KernelPlan", "CtaShape", "RoleDecl", "Cadence", "RingOwner", "RingDecl", "FlagRef", "CrossCtaProtocol", "MemOrder", "RegConstraint", "Phase", "PhaseKind", "OrderSpec", "Budget", "M0Use", "UnitClass", "UnitDecl", "DepKind", "Dep", "RegFileKind", "Via", "HandOff", "SyncRule", "Hints"]
 

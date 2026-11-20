@@ -1760,6 +1760,36 @@ impl IrIds for DppAluOp {
     }
 }
 
+impl FromIr for PermlaneKind {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "P16" => { v.expect_unit("P16")?; Ok(PermlaneKind::P16) }
+            "X16" => { v.expect_unit("X16")?; Ok(PermlaneKind::X16) }
+            "P16Var" => { v.expect_unit("P16Var")?; Ok(PermlaneKind::P16Var) }
+            "X16Var" => { v.expect_unit("X16Var")?; Ok(PermlaneKind::X16Var) }
+            "Bcast" => { v.expect_unit("Bcast")?; Ok(PermlaneKind::Bcast) }
+            "Up" => { v.expect_unit("Up")?; Ok(PermlaneKind::Up) }
+            "Down" => { v.expect_unit("Down")?; Ok(PermlaneKind::Down) }
+            "Xor" => { v.expect_unit("Xor")?; Ok(PermlaneKind::Xor) }
+            other => Err(v.err(format!("unknown PermlaneKind variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for PermlaneKind {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            PermlaneKind::P16 => {}
+            PermlaneKind::X16 => {}
+            PermlaneKind::P16Var => {}
+            PermlaneKind::X16Var => {}
+            PermlaneKind::Bcast => {}
+            PermlaneKind::Up => {}
+            PermlaneKind::Down => {}
+            PermlaneKind::Xor => {}
+        }
+    }
+}
+
 impl FromIr for AtomicOp {
     fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
         match v.name()? {
