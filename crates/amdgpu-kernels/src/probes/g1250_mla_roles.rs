@@ -500,8 +500,6 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         };
         let s3 = b.bind_i32(ev(t3) & 1);
         sbuf_store(&mut b, t3, Opnd::Val(s3), &sacc);
-        b.wait_lds(0);
-        b.barrier_signal(-1);
         for nt in 0..8usize {
             if mask & 1 != 0 {
                 break;
@@ -511,7 +509,8 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 b.set_var(ov[nt], Opnd::Val(d));
             }
         }
-        b.barrier_wait(-1);
+        b.wait_lds(0);
+        b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
         let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
@@ -555,8 +554,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(l_new));
         b.wait_lds(0);
-        b.barrier_signal(-1);
-        b.barrier_wait(-1);
+        b.barrier();
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
         let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
