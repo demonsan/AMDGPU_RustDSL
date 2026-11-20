@@ -11,7 +11,7 @@
 #include <vector>
 #include <unistd.h>
 
-struct CoMeta { long kernarg = -1; long max_flat = -1; long cluster = 0; };   // cluster: work-groups per cluster the kernel was built for (0 = not a cluster kernel)
+struct CoMeta { long kernarg = -1; long max_flat = -1; long cluster = 0; long abi = 0; long ws_bytes = 0; long ctr_bytes = 0; };   // cluster: work-groups per cluster the kernel was built for (0 = not a cluster kernel)
 
 static inline bool co_msgpack_int(const std::vector<unsigned char>& d, size_t p, long* v) {
     if (p >= d.size()) return false;
@@ -69,6 +69,18 @@ static inline CoMeta co_meta(const char* path, const char* kname) {
         size_t pc = (size_t)-1, at = back;
         for (;;) { const size_t q = co_find(d, at, p, key_cl); if (q == (size_t)-1) break; pc = q; at = q + 1; }
         if (pc != (size_t)-1 && co_msgpack_int(d, pc + key_cl.size(), &v)) m.cluster = v;
+        // the launch-ABI keys (.amdc_*) sort before .args: search back to the previous kernel's map (its .kernarg_segment_size)
+        size_t lo = 0;
+        for (size_t at2 = 0;;) { const size_t q = co_find(d, at2, p, key_ka); if (q == (size_t)-1) break; lo = q + 1; at2 = q + 1; }
+        auto last_int = [&](const std::string& key, long* out) {
+            size_t pos = (size_t)-1;
+            for (size_t at2 = lo;;) { const size_t q = co_find(d, at2, p, key); if (q == (size_t)-1) break; pos = q; at2 = q + 1; }
+            long x = 0;
+            if (pos != (size_t)-1 && co_msgpack_int(d, pos + key.size(), &x)) *out = x;
+        };
+        last_int(std::string(1, (char)(0xa0 | 16)) + ".amdc_launch_abi", &m.abi);
+        last_int(std::string(1, (char)(0xa0 | 20)) + ".amdc_split_ws_bytes", &m.ws_bytes);
+        last_int(std::string(1, (char)(0xa0 | 21)) + ".amdc_split_ctr_bytes", &m.ctr_bytes);
         break;
     }
     return m;

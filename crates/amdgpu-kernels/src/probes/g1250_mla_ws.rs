@@ -64,7 +64,18 @@ pub fn mla_g1250_qh16_wsi() -> Function {
 
 /// The KV split across work-groups (grid (S, B)): partials to the workspace; `mla_g1250_qh16_cmb` combines them.
 pub fn mla_g1250_qh16_wsk() -> Function {
-    mla_ws_with("mla_g1250_qh16_wsk", false, 1 | 32, false)
+    with_split_abi(mla_ws_with("mla_g1250_qh16_wsk", false, 1 | 32, false), 1, 0)
+}
+
+/// The launch-ABI facts of the KV-split kernels (code-object metadata `.amdc_launch_abi` / `.amdc_split_ws_bytes` /
+/// `.amdc_split_ctr_bytes`): the MLA host refuses a launch that does not match (e.g. a split kernel launched like `_ws`).
+fn with_split_abi(mut f: Function, abi: i64, ctr_bytes: i64) -> Function {
+    f.kd.push(("launch_abi".into(), abi));
+    f.kd.push(("split_ws_bytes".into(), WS_BYTES));
+    if ctr_bytes > 0 {
+        f.kd.push(("split_ctr_bytes".into(), ctr_bytes));
+    }
+    f
 }
 
 /// The combine of the KV-split partials: grid (1, B), thread t = head t / 8, dims 64 (t % 8) ..: max, rescaled sums, bf16 R and the LSE.
@@ -182,7 +193,10 @@ pub fn mla_g1250_qh16_cmb() -> Function {
     let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
     let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
     b.store_global(pl, 0, lse, MemTy::B32, false);
-    b.finish()
+    let mut f = b.finish();
+    f.kd.push(("launch_abi".into(), 3));
+    f.kd.push(("split_ws_bytes".into(), WS_BYTES));
+    f
 }
 
 /// `_ws` with scalar loads for the sequence bounds, scales and page ids (no LDS page table, no prologue barrier).
@@ -270,7 +284,7 @@ pub fn mla_g1250_qh16_wsp8() -> Function {
 
 /// KV split with the combine fused into the same launch (last-arriver per (sequence, wave); counters in the QTP slot).
 pub fn mla_g1250_qh16_wskf() -> Function {
-    mla_ws_with("mla_g1250_qh16_wskf", false, 64 | 32 | 524288 | 16384 | 65536 | 256, false)
+    with_split_abi(mla_ws_with("mla_g1250_qh16_wskf", false, 64 | 32 | 524288 | 16384 | 65536 | 256, false), 2, 16)
 }
 
 /// `_ws` with the first page's tensor load issued right after the sequence bounds.

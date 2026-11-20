@@ -31,3 +31,17 @@ EXPECT_CLUSTER=16 $O/g1250_f4own_host $O/gemm_g1250_tdm_stage_f4_256x256_ks4_s2_
 echo "--- a plain kernel with CLUSTER=2,2"
 CLUSTER=2,2 $O/g1250_f4own_host $O/gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles.co gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles 1024 1024 1024 0 256 256 128; echo "rc=$?"
 grep -c cluster_workgroups $O/gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_c4x4_lock.s
+echo "--- MLA launch ABI: a fused KV-split kernel launched like the plain kernel (must be refused before any launch)"
+emit mla_g1250_qh16_wskf; emit mla_g1250_qh16_wsk; emit mla_g1250_qh16_cmb; emit mla_g1250_qh16_ws
+$O/g1250_mla_host $O/mla_g1250_qh16_wskf.co mla_g1250_qh16_wskf 128 8192 16 2; echo "rc=$?"
+echo "--- the same with SPLITS but without FUSED; the two-kernel split without COMBINE_CO; the combine kernel alone; a plain kernel with FUSED"
+SPLITS=2 $O/g1250_mla_host $O/mla_g1250_qh16_wskf.co mla_g1250_qh16_wskf 4 1000 16 2; echo "rc=$?"
+SPLITS=2 $O/g1250_mla_host $O/mla_g1250_qh16_wsk.co mla_g1250_qh16_wsk 4 1000 16 2; echo "rc=$?"
+$O/g1250_mla_host $O/mla_g1250_qh16_cmb.co mla_g1250_qh16_cmb 4 1000 16 2; echo "rc=$?"
+FUSED=1 SPLITS=2 $O/g1250_mla_host $O/mla_g1250_qh16_ws.co mla_g1250_qh16_ws 4 1000 16 2; echo "rc=$?"
+echo "--- a split kernel as the paired second kernel"
+CO2=$O/mla_g1250_qh16_wskf.co KERNEL2=mla_g1250_qh16_wskf $O/g1250_mla_host $O/mla_g1250_qh16_ws.co mla_g1250_qh16_ws 4 1000 16 2; echo "rc=$?"
+echo "--- legal: the fused split with its host mode (1 WG first, then the shape that faulted)"
+SPLITS=2 FUSED=1 CHECK_B=1 gpurun $O/g1250_mla_host $O/mla_g1250_qh16_wskf.co mla_g1250_qh16_wskf 1 1000 16 2 2>&1 | grep -E 'MLA_|LAUNCH' | head -2
+SPLITS=2 FUSED=1 gpurun $O/g1250_mla_host $O/mla_g1250_qh16_wskf.co mla_g1250_qh16_wskf 128 8192 16 2 2>&1 | grep -E 'MLA_|LAUNCH' | head -2
+grep -c amdc_launch_abi $O/mla_g1250_qh16_wskf.s

@@ -129,6 +129,31 @@ int main(int argc, char** argv) {
     // SPLITS=S (1, 2, 4, 8) + COMBINE_CO / COMBINE_K: the FIRST kernel is a KV-split kernel on grid (S, B) writing partials to a workspace (passed
     // in the VSC slot; passes = S, flags = log2 S), followed by the combine kernel on grid (1, B); both are timed together as one launch
     const unsigned S = (unsigned)envi("SPLITS", 1);
+    // the launch-ABI class recorded in the code object (.amdc_launch_abi; 0 = the plain qh16 ABI): a KV-split kernel needs its own grid,
+    // kernargs and buffers - launched like the plain kernel it writes its partials through the vendor's small VSC array and counts tickets in
+    // qo_indptr (a fault at large B). Refused here, before any device allocation.
+    {
+        const CoMeta cm = co_meta(argv[1], kn);
+        const bool want_fused = getenv("FUSED") != nullptr, want_comb = getenv("COMBINE_CO") != nullptr;
+        const char* why = nullptr;
+        if (cm.abi == 0 && (want_fused || want_comb)) why = "a plain kernel launched in a KV-split mode (FUSED / COMBINE_CO)";
+        if (cm.abi == 1 && !want_comb) why = "a KV-split kernel (ABI 1: partials + a separate combine kernel) needs SPLITS=S COMBINE_CO=<combine co>";
+        if (cm.abi == 2 && !want_fused) why = "a fused KV-split kernel (ABI 2: last-arriver combine) needs SPLITS=S FUSED=1";
+        if (cm.abi == 3) why = "the combine kernel of a KV split is launched by the host after its split kernel (COMBINE_CO), never on its own";
+        if (cm.abi != 0 && cm.ws_bytes > 8224L * 4) why = "the kernel's workspace per (sequence, split) exceeds what this host allocates";
+        if (cm.abi == 2 && cm.ctr_bytes > 16) why = "the kernel's ticket counters per sequence exceed what this host allocates";
+        if (why) {
+            fprintf(stderr, "LAUNCH-REFUSED: kernel %s (launch ABI %ld, workspace %ld B / sequence / split, counters %ld B / sequence): %s\n", kn, cm.abi, cm.ws_bytes, cm.ctr_bytes, why);
+            _exit(2);
+        }
+        if (const char* co2 = getenv("CO2")) {
+            const char* k2 = getenv("KERNEL2") ? getenv("KERNEL2") : kn;
+            if (co_meta(co2, k2).abi != 0) {
+                fprintf(stderr, "LAUNCH-REFUSED: the paired kernel %s has a KV-split launch ABI (paired runs launch it like the plain kernel)\n", k2);
+                _exit(2);
+            }
+        }
+    }
     KA kas = ka;
     void* cfgs[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &kas, HIP_LAUNCH_PARAM_BUFFER_SIZE, &ksz, HIP_LAUNCH_PARAM_END};
     hipFunction_t fc = nullptr;

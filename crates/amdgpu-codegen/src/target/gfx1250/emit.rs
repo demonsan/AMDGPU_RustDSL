@@ -39,6 +39,9 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "code_end_pad",
     // a launch fact for the hang-safety verifier (workgroups per cluster; `gpu_verify_1250`): accepted, not a descriptor field, never printed
     "cluster_dims",
+    // launch-ABI facts for the hosts (custom metadata keys, never descriptor fields): the ABI class (1 = KV split + combine kernel, 2 = KV
+    // split with the fused last-arriver combine, 3 = the combine kernel of class 1) and the per-buffer extents of its host contract
+    "launch_abi", "split_ws_bytes", "split_ctr_bytes",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
@@ -374,6 +377,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     if let Some(c) = kdv("cluster_dims") {
         if c > 1 {
             out.push_str(&format!("    .cluster_workgroups: {c}\n"));
+        }
+    }
+    // the launch ABI class and its buffer extents (custom keys: the runtime ignores them, the hosts refuse a launch that does not match)
+    for (k, key) in [("launch_abi", "amdc_launch_abi"), ("split_ws_bytes", "amdc_split_ws_bytes"), ("split_ctr_bytes", "amdc_split_ctr_bytes")] {
+        if let Some(v) = kdv(k) {
+            out.push_str(&format!("    .{key}: {v}\n"));
         }
     }
     out.push_str("    .args:\n");
