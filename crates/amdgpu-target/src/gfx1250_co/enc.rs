@@ -325,6 +325,58 @@ fn encode_dpp(t: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>) -> Resu
     Ok(out)
 }
 
+/// The VOPD opcode of a dual component (gfx1250 X set; the Y set adds the integer forms), public LLVM VOPDInstructions.td, numbers
+/// checked against llvm-mc (tools/mi450/vopd_ops.txt).
+fn vopd_op(m: &str, y: bool) -> Option<u32> {
+    Some(match m {
+        "v_dual_fmac_f32" => 0,
+        "v_dual_mul_f32" => 3,
+        "v_dual_add_f32" => 4,
+        "v_dual_sub_f32" => 5,
+        "v_dual_subrev_f32" => 6,
+        "v_dual_mul_dx9_zero_f32" => 7,
+        "v_dual_mov_b32" => 8,
+        "v_dual_max_num_f32" => 10,
+        "v_dual_min_num_f32" => 11,
+        "v_dual_add_nc_u32" if y => 16,
+        "v_dual_lshlrev_b32" if y => 17,
+        "v_dual_sub_nc_u32" if y => 20,
+        "v_dual_lshrrev_b32" if y => 21,
+        "v_dual_ashrrev_i32" if y => 22,
+        "v_dual_max_i32" if y => 23,
+        "v_dual_min_i32" if y => 24,
+        _ => return None,
+    })
+}
+
+/// A VOPD dual-issue pair `v_dual_<x> vdx, src0x[, vsrc1x] :: v_dual_<y> vdy, src0y[, vsrc1y]` (VOPD, 64-bit): word 0 = src0X [8:0],
+/// vsrc1X [16:9], opY [21:17], opX [25:22], 0b110010 [31:26]; word 1 = src0Y [8:0], vsrc1Y [16:9], vdstY >> 1 [23:17], vdstX [31:24]. The
+/// destinations differ in parity, the vsrc1 are VGPRs, no literal (not formed by the compiler). Checked against llvm-mc
+/// (tools/mi450/vopd_samples.txt).
+fn encode_vopd(t: &str) -> Result<Vec<u8>, String> {
+    let line = t.split("//").next().unwrap_or("").split(';').next().unwrap_or("").trim();
+    let (xs, ys) = line.split_once(" :: ").ok_or_else(|| format!("`{t}`: VOPD"))?;
+    let comp = |s: &str, y: bool| -> Result<(u32, u32, u32, u32), String> {
+        let i = parse_inst(s)?;
+        let op = vopd_op(&i.mn, y).ok_or_else(|| format!("`{t}`: `{}` is not a VOPD {} component", i.mn, if y { "Y" } else { "X" }))?;
+        let d = vreg(op_at(&i, 0)?)?;
+        let (s0, lit) = src9(op_at(&i, 1)?)?;
+        if lit.is_some() || i.ops.iter().any(|o| o.1) {
+            return Err(format!("`{t}`: a literal / negated operand in a VOPD component"));
+        }
+        let s1 = if i.mn == "v_dual_mov_b32" { 0 } else { vreg(op_at(&i, 2)?)? };
+        Ok((op, d, s0, s1))
+    };
+    let (opx, dx, s0x, s1x) = comp(xs, false)?;
+    let (opy, dy, s0y, s1y) = comp(ys, true)?;
+    if (dx & 1) == (dy & 1) {
+        return Err(format!("`{t}`: the VOPD destinations must differ in parity"));
+    }
+    let mut out = d32(0xC800_0000 | opx << 22 | opy << 17 | (s1x & 0xff) << 9 | s0x).to_vec();
+    out.extend_from_slice(&d32(dx << 24 | (dy >> 1) << 17 | (s1y & 0xff) << 9 | s0y));
+    Ok(out)
+}
+
 /// Encodes one instruction at byte offset `pc` (`label` resolves branch targets to byte offsets).
 pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>) -> Result<Vec<u8>, String> {
     let t = line.trim();
@@ -357,6 +409,9 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
     }
     if t.split_whitespace().next().map_or(false, |m| m.ends_with("_dpp")) {
         return encode_dpp(t, pc, label);
+    }
+    if t.contains(" :: ") {
+        return encode_vopd(t);
     }
     let i = parse_inst(t)?;
     let base = i.mn.strip_suffix("_e32").or_else(|| i.mn.strip_suffix("_e64")).unwrap_or(&i.mn);
