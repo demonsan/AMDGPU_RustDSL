@@ -391,7 +391,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let r2 = kv.at(&sl2);
         let sb2 = b.bind_i32(r2.base());
         let abl = ABL.with(|c| c.get());
-        let kfr: Vec<Vec<ValueId>> = if abl == 1 { (0..WP).map(|_| q.clone()).collect() } else { (0..WP)
+        let kfr: Vec<Vec<ValueId>> = if abl == 1 { (0..WP).map(|_| (0..9).map(|c| q[(c + 1) % 9]).collect()).collect() } else { (0..WP)
             .map(|pg| {
                 let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
                 let nope_row = b.bind_i32(ev(pb) + ev(kofs));
@@ -424,7 +424,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
         let kr = kv.at(&ksl);
         let kb = b.bind_i32(kr.base());
-        let vfr: Vec<Vec<ValueId>> = if abl == 2 { (0..WP).map(|pg| vec![pa[pg as usize]; 8]).collect() } else { (0..WP)
+        let vfr: Vec<Vec<ValueId>> = if abl == 2 { (0..WP).map(|_| (0..8).map(|nt| q[nt]).collect()).collect() } else { (0..WP)
             .map(|pg| {
                 let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
                 kr.read(&mut b, |b| {
