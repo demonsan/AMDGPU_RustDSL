@@ -2735,6 +2735,13 @@ impl<'a> An<'a> {
             },
             Op::AndI32(a, b) => {
                 let (x, y) = (self.int_of(a), self.int_of(b));
+                // two constants: the exact value (the bounds below only cap it: `2 & 1` would be bounded by 2 / 1 instead of 0)
+                if let (Some(m1), Some(m2)) = (x.point_const(), y.point_const()) {
+                    if m1.d == 1 && m2.d == 1 {
+                        let v = m1.n & m2.n;
+                        return AV::Int(Itv::range(Poly::int(v), Poly::int(v)));
+                    }
+                }
                 let mut hi: Vec<Poly> = Vec::new();
                 let mut ok = false;
                 for (k, (p, q)) in [(&x, &y), (&y, &x)].into_iter().enumerate() {
