@@ -276,3 +276,24 @@ fn bf16_pack_lowers_on_gfx1250() {
 fn copies_over_in_flight_lds_loads_beyond_15_get_their_waits() {
     amdgpu_codegen::compile_target(&amdgpu_kernels::probes::g1250_mla_w1::mla_g1250_qh16_w1x(3), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// VOPD dual issue (the `vopd` lowering token): eight independent f32 multiplies pair up, and the in-process encoder takes the dual lines.
+#[test]
+fn independent_multiplies_pair_into_vopd() {
+    let mut b = FnBuilder::new("probe_vopd_pairs", 32);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg_tensor("out", Ext::c(32 * 4 * 8));
+    b.lower_opts.push("vopd".into());
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let x = b.un(amdgpu_dsl::UnOp::CvtF32I32, t);
+    let ys: Vec<_> = (0..8).map(|k| b.mul_f32(x, Opnd::F32(1.5 + k as f32))).collect();
+    let o = b.let_(Op::ShlI32(Opnd::Val(t), Opnd::I32(2)));
+    let q = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
+    for (k, y) in ys.iter().enumerate() {
+        b.store_global(q, 128 * k as u32, *y, amdgpu_dsl::MemTy::B32, false);
+    }
+    let c = amdgpu_codegen::compile_target(&b.finish(), "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("v_dual_"), "{}", c.asm);
+    amdgpu_codegen::amdgpu_target::gfx1250_co::encode_text(&c.asm).unwrap_or_else(|e| panic!("{e}"));
+}
