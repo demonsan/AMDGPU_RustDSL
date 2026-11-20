@@ -491,7 +491,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) ->
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
 /// one CU's LDS (and, below 512 VGPRs per wave, its registers): their prologues, barriers and epilogues fill each other's bubbles (a single-tile-per-CU shape like 4096^3 runs 512 workgroups).
 pub fn gemm_tdm_stage_f4_256x128_ks2_s2(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), nopf: name.contains("_nopf"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), nopf: name.contains("_nopf"), racompact: name.contains("_rc"), lds_pad: if name.contains("_big") { 45056 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The 512-K 2-slot kernel with bf16 output and no operand swap: the f32 accumulators are rounded in registers (`v_cvt_pk_bf16_f32`), staged as 16-bit pieces into unpadded LDS rows and
@@ -652,6 +652,10 @@ pub struct RingOpts {
     /// the A / B row pitch is a kernarg (`lda`, bytes, @72) = K / 2 + PAD instead of K / 2 (host LDA_PAD): row pitches that are powers of two (K = 4096: 2 KiB) land the 256 rows of a
     /// tile in a few memory channels; the pad moves them apart
     pub pitch: bool,
+    /// the `racompact` lowering token: the register allocation is the smaller of the scan and the two-phase packing
+    pub racompact: bool,
+    /// extra LDS bytes declared (unused): keeps a kernel to one workgroup per CU whatever its registers
+    pub lds_pad: u32,
 }
 
 impl RingOpts {
@@ -663,7 +667,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0 }
     }
 }
 
@@ -765,6 +769,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     if epi > 0 {
         let ring_bytes = ring.slots as i64 * ((bm * row_l + bn * row_l + bm * 4 * sh.ks + bn * 4 * sh.ks) as i64);
         let need = (sh.waves() * wrows * epi_rs) as i64;
+        if ring.lds_pad > 0 {
+            let _ = lds.ring("PADLDS", ring.lds_pad as i64, 1, Layout::Linear);
+        }
         if epi == 4 {
             // a separate staging region behind the ring: the next tile's stages load into the ring while the tensor stores still read the staging
             let _ = lds.ring("EPI", need, 1, Layout::Linear);
@@ -1574,6 +1581,9 @@ for q in 0..8i32 {
     f.lower_opts.extend(["dce"].iter().map(|s| s.to_string()).chain(DEFAULT_SCALAR.iter().map(|s| s.to_string())));
     if persistent {
         f.lower_opts.push("zeroinit".to_string());
+    }
+    if ring.racompact {
+        f.lower_opts.push("racompact".to_string());
     }
     if clustered {
         f.kd.push(("cluster_dims".into(), (cx * cy) as i64));   // the launch must declare the cluster (and divide the grid by it)

@@ -127,5 +127,7 @@ state with the pre-loop prologue state) with a staging buffer outside the ring, 
   **4096 21.9 / 20.6 / 17.3** (7.9 PF/s vs 6.3: -21 %); 5120 **22.9** / 24.7 / 24.6 (+7 %); 6144 **27.7** / 28.6 / 28.9 (+4 %); 8192 30.3 / 30.7 / **28.8** (-5 %). At 8192 x 8192 it is neutral or worse (K = 6144 +14 %,
   12288 +4 %, 4096 -1 %, 16384 -3 %). Dispatch rule for the output shapes with one tile per CU (256 tiles, grid divisible by the 4 x 4 cluster): `_roles_c4x4_lock` for K <= 4096 and K = 8192, the default
   kernel for K = 5120 - 6144 and for larger outputs.
-- **Occupancy 2** (two 256 x 128 workgroups per CU, so that one fills the other's prologue / barrier / epilogue bubbles): the LDS fits (131,072 B each, ks2 2-slot ring), the registers do not yet:
-  the allocator emits 720 VGPRs (624 without the in-window software pipeline) for a kernel whose peak live set is 477 (376), and two waves per SIMD need <= 512 (backend is looking at the allocator).
+- **Occupancy 2 does not help** (two 256 x 128 workgroups per CU, so that one fills the other's prologue / barrier / epilogue bubbles): the LDS fits (131,072 B each, ks2 2-slot ring) and, with backend's `racompact` allocation
+  (`RingOpts::racompact`: 496 VGPRs for a kernel whose peak live set is 477, the default scan emits 720), two waves per SIMD are possible. Measured on e08 at 4096^3 / 8192^3 (PF/s): default allocation (720 VGPRs, one workgroup per CU) 4.94 / 5.57; **compact allocation, two workgroups per CU 3.99 / 5.08 (-19 % / -9 %)**;
+  compact allocation with the LDS declared at 176 KiB (one workgroup per CU, `RingOpts::lds_pad`) 4.90 / 5.74. So the allocation is fine and it is the co-residency that loses: the K loop of one wave per SIMD is already
+  WMMA-bound (the window is 81 % of the iteration), a second wave only adds LDS / TDM / L2 contention. (The 256 x 128 tile itself is far below the 256 x 256 kernel, 4.9 vs 6.2 PF/s at 4096^3.)
