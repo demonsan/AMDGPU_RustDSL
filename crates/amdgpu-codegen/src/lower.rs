@@ -672,6 +672,7 @@ impl Lowerer {
             edge_pad: opt_on("edgepad"),
             ra_dword: opt_on("radword"),
             ra_compact: opt_on("racompact"),
+            vopd: opt_on("vopd"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));
@@ -2672,6 +2673,9 @@ impl Lowerer {
                         let tp = if w == 2 { rt } else { self.sub_alias(rt, 2 * i, RClass::V2) };
                         self.push(MInst::new(MOp::VPkFmaF32).def(acc).srcreg(tp).srcreg(rs).srcreg(acc));
                     }
+                }
+                Stmt::WaitLdsWrites => {
+                    self.push(MInst::new(MOp::SWaitLdsWrites));
                 }
                 Stmt::VarPkMul { var, start, s } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;

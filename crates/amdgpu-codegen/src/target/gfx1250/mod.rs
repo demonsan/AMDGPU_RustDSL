@@ -7,6 +7,7 @@ use amdgpu_dsl::Function;
 pub mod check;
 pub mod cse;
 pub mod dse;
+pub mod vopd;
 pub mod emit;
 pub mod hazards;
 pub mod matorder;
@@ -102,6 +103,8 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
             return Err(format!("{}: gfx1250 wait self-check: {} missing wait(s) in the compiler's own output\n  {}", f.name, errs.len(), errs.join("\n  ")));
         }
     }
+    // VOPD dual issue (opt-in `AMDC_VOPD`): the pairs, before the hazard plan the emitter computes
+    vopd::select(&m, &alloc);
     let asm = match backend {
         "own" => emit::emit_kd(&m, &alloc, &f.kd)?,
         "llvm-tail" => {

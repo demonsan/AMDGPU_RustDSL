@@ -897,6 +897,7 @@ impl FromIr for Stmt {
             "WaitTensor" => { v.expect_struct("WaitTensor")?; Ok(Stmt::WaitTensor { count: FromIr::from_ir(v.field("count")?)? }) }
             "WaitCounter" => { v.expect_struct("WaitCounter")?; Ok(Stmt::WaitCounter { counter: FromIr::from_ir(v.field("counter")?)?, count: FromIr::from_ir(v.field("count")?)? }) }
             "BarrierSignal" => { v.expect_struct("BarrierSignal")?; Ok(Stmt::BarrierSignal { id: FromIr::from_ir(v.field("id")?)? }) }
+            "WaitLdsWrites" => { v.expect_unit("WaitLdsWrites")?; Ok(Stmt::WaitLdsWrites) }
             "BarrierWait" => { v.expect_struct("BarrierWait")?; Ok(Stmt::BarrierWait { id: FromIr::from_ir(v.field("id")?)? }) }
             "BarrierInit" => { v.expect_struct("BarrierInit")?; Ok(Stmt::BarrierInit { id: FromIr::from_ir(v.field("id")?)?, members: FromIr::from_ir(v.field("members")?)? }) }
             "BarrierJoin" => { v.expect_struct("BarrierJoin")?; Ok(Stmt::BarrierJoin { id: FromIr::from_ir(v.field("id")?)? }) }
@@ -999,6 +1000,7 @@ impl IrIds for Stmt {
             Stmt::WaitTensor { count } => { IrIds::ids(&mut (*count), fv, fr); }
             Stmt::WaitCounter { counter, count } => { IrIds::ids(&mut (*counter), fv, fr); IrIds::ids(&mut (*count), fv, fr); }
             Stmt::BarrierSignal { id } => { IrIds::ids(&mut (*id), fv, fr); }
+            Stmt::WaitLdsWrites => {}
             Stmt::BarrierWait { id } => { IrIds::ids(&mut (*id), fv, fr); }
             Stmt::BarrierInit { id, members } => { IrIds::ids(&mut (*id), fv, fr); IrIds::ids(&mut (*members), fv, fr); }
             Stmt::BarrierJoin { id } => { IrIds::ids(&mut (*id), fv, fr); }

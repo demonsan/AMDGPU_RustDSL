@@ -340,6 +340,8 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.wait_lds = Some(*count);
             (ResClass::Sync, vec![], false)
         }
+        // (its count is computed later: no static count for the facts)
+        Stmt::WaitLdsWrites => (ResClass::Sync, vec![], false),
         Stmt::WaitVm { count } => {
             e.wait_vm = Some(*count);
             (ResClass::Sync, vec![], false)
