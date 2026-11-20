@@ -555,7 +555,8 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.set_var(vm, Opnd::Val(m_new));
         b.set_var(vl, Opnd::Val(l_new));
         b.wait_lds(0);
-        b.barrier();
+        b.barrier_signal(-1);
+        b.barrier_wait(-1);
         let tn = b.bind_i32(amdgpu_dsl::varx(it) + 1);
         b.set_var(it, Opnd::Val(tn));
         let fin = b.cmp(CmpPred::Ge, CmpTy::I32, tn, nwin);
