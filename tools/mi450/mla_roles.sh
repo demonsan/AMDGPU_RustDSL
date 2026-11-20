@@ -3,7 +3,7 @@ cd "$SRC"
 O="$W/mlaroles"; rm -rf "$O"; mkdir -p "$O"
 cargo build -q --release -j 64 --bin amdc 2>&1 | grep -E "^error" | head -3
 A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
-sed 's/, 128, 1, 1,/, ${BLK:-256}, 1, 1,/' tests/gpu/g1250_mla_host.cpp > $O/host256.cpp
+sed "s/, 128, 1, 1,/, ${BLK:-256}, 1, 1,/" tests/gpu/g1250_mla_host.cpp > $O/host256.cpp
 cp tests/gpu/g1250_timing.h $O/ 2>/dev/null
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 -I tests/gpu $O/host256.cpp -o $O/host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"; export PROBE_WATCHDOG_S=20 CHECK_B=0

@@ -454,7 +454,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.end_if();
     b.wait_lds(0);
     b.barrier();
-    let is_sm = is_sm_marker(&mut b, role);
+    let is_sm = is_sm_marker(&mut b, role, if three { 2 } else { 1 });
     b.begin_if(is_sm);
     for k in w_n..2 * w_n {
         let xk = sbuf_load(&mut b, gc[k as usize], slot_c(k));
@@ -479,8 +479,8 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     let pa0 = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o0) });
     let z = b.c_i32(0);
     let nitr = b.bind_i32((ev(nwin) + (w_n - 1)) >> ((w_n as u32).trailing_zeros() as i32));
-    // ---- the MMA waves' loop (S and PV in one wave, or split over two roles) ----
-    let mma_loop = |b: &mut FnBuilder, do_s: bool, do_pv: bool| {
+    // ---- the MMA waves' loop: S and PV in each wave, or (with `sub`) a uniform branch inside the loop that makes the first four waves S waves and the next four PV waves ----
+    let mma_loop = |b: &mut FnBuilder, do_s: bool, do_pv: bool, sub: Option<ValueId>| {
         let lvars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
         let it = lvars[0];
         b.assume(it, Ext::c(0), Ext::c((MAX_PAGES / 2) as i64));
@@ -490,11 +490,21 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
             let sp = b.bind_i32(ev(wn) & smask);
             let sa = b.bind_i32(ev(wa) & smask);
             let kr = kv.at(&SlotIdx::new(Opnd::I32(0), Opnd::I32(0)));
-            let kfr = if do_s { k_frags(b) } else { Vec::new() };
-            let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(sp), Opnd::Val(wn)));
-            let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
-            let pa: Vec<ValueId> = if do_pv {
-                pr_.read(b, |b| {
+            if let Some(c) = sub {
+                b.begin_if(c);
+            }
+            if do_s {
+                let kfr = k_frags(b);
+                let sacc = s_chain(b, &kfr);
+                sbuf_store(b, wa, Opnd::Val(sa), &sacc);
+            }
+            if sub.is_some() {
+                b.else_();
+            }
+            if do_pv {
+                let pr_ = pbuf.at(&SlotIdx::new(Opnd::Val(sp), Opnd::Val(wn)));
+                let pbase = b.bind_i32(pr_.base() + ev(lane) * 32);
+                let pa: Vec<ValueId> = pr_.read(b, |b| {
                     (0..WP)
                         .map(|pg| {
                             let lo = b.bind_i32(ev(pbase) + 1024 * pg);
@@ -502,35 +512,30 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                             b.load_lds_b128x2(lo, hi)
                         })
                         .collect()
-                })
-            } else {
-                Vec::new()
-            };
-            let kb = b.bind_i32(kr.base());
-            let vfr: Vec<Vec<ValueId>> = (0..if do_pv { WP } else { 0 })
-                .map(|pg| {
-                    let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
-                    kr.read(b, |b| {
-                        (0..8)
-                            .map(|nt| {
-                                let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
-                                b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
-                            })
-                            .collect()
+                });
+                let kb = b.bind_i32(kr.base());
+                let vfr: Vec<Vec<ValueId>> = (0..WP)
+                    .map(|pg| {
+                        let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
+                        kr.read(b, |b| {
+                            (0..8)
+                                .map(|nt| {
+                                    let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                                    b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
+                                })
+                                .collect()
+                        })
                     })
-                })
-                .collect();
-            if do_s {
-                let sacc = s_chain(b, &kfr);
-                sbuf_store(b, wa, Opnd::Val(sa), &sacc);
-            }
-            if do_pv {
+                    .collect();
                 for nt in 0..8usize {
                     for pg in 0..WP as usize {
                         let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][nt], Some(Opnd::Var(ov[nt])));
                         b.set_var(ov[nt], Opnd::Val(d));
                     }
                 }
+            }
+            if sub.is_some() {
+                b.end_if();
             }
         }
         b.wait_lds(0);
@@ -572,19 +577,23 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
         b.end_loop();
     };
     if three {
-        // S waves (role 0), softmax waves (role 1), PV waves (role 2): three waves per SIMD
-        b.begin_if(is_mma);
-        mma_loop(&mut b, true, false);
+        // waves 0 - 7: the MMA role, its first four waves the S waves and the next four the PV waves (a uniform branch on the wave inside the role's loop); waves 8 - 11: the softmax waves
+        let subc = {
+            let c = b.cmp(CmpPred::Eq, CmpTy::I32, role, Opnd::I32(0));
+            b.let_(Op::AnyLane(Opnd::Val(c)))
+        };
+        let is_mma3 = {
+            let c = b.cmp(CmpPred::Le, CmpTy::I32, role, Opnd::I32(1));
+            b.let_(Op::AnyLane(Opnd::Val(c)))
+        };
+        b.begin_if(is_mma3);
+        mma_loop(&mut b, true, true, Some(subc));
         b.else_();
-        b.begin_if(is_sm);
         sm_loop(&mut b);
-        b.else_();
-        mma_loop(&mut b, false, true);
-        b.end_if();
         b.end_if();
     } else {
         b.begin_if(is_mma);
-        mma_loop(&mut b, true, true);
+        mma_loop(&mut b, true, true, None);
         b.else_();
         sm_loop(&mut b);
         b.end_if();
@@ -607,7 +616,7 @@ fn mla_roles_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
     b.finish()
 }
 
-fn is_sm_marker(b: &mut FnBuilder, role: ValueId) -> ValueId {
-    let c = b.cmp(CmpPred::Eq, CmpTy::I32, role, Opnd::I32(1));
+fn is_sm_marker(b: &mut FnBuilder, role: ValueId, r: i32) -> ValueId {
+    let c = b.cmp(CmpPred::Eq, CmpTy::I32, role, Opnd::I32(r));
     b.let_(Op::AnyLane(Opnd::Val(c)))
 }
