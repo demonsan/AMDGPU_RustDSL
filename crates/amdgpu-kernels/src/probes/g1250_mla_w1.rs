@@ -48,6 +48,18 @@ pub fn mla_g1250_qh16_w1i() -> Function {
 thread_local! {
     static ILP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STAMPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ABL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// deletion ablations of `_w1i` (timing only; the output is wrong): 1 = no K reads (Q as the A operand), 2 = no V reads (P as the B
+/// operand), 3 = no S / PV WMMAs (the fragments are read and folded into the carried values by a cheap op)
+pub fn mla_g1250_qh16_w1x(mode: u8) -> Function {
+    ILP.with(|c| c.set(true));
+    ABL.with(|c| c.set(mode));
+    let f = mla_w1_with(&format!("mla_g1250_qh16_w1x{mode}"), 2, 4);
+    ABL.with(|c| c.set(0));
+    ILP.with(|c| c.set(false));
+    f
 }
 
 /// timing aid (not registered for tests): `_w1i` storing shader-clock stamps of every wave over R[b] (word 64 w + checkpoint)
@@ -378,7 +390,8 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let sl2 = SlotIdx::new(Opnd::Val(si2), Opnd::Val(t2));
         let r2 = kv.at(&sl2);
         let sb2 = b.bind_i32(r2.base());
-        let kfr: Vec<Vec<ValueId>> = (0..WP)
+        let abl = ABL.with(|c| c.get());
+        let kfr: Vec<Vec<ValueId>> = if abl == 1 { (0..WP).map(|_| q.clone()).collect() } else { (0..WP)
             .map(|pg| {
                 let pb = b.bind_i32(ev(sb2) + pg * layout.slot_bytes);
                 let nope_row = b.bind_i32(ev(pb) + ev(kofs));
@@ -393,7 +406,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                         .collect()
                 })
             })
-            .collect();
+            .collect() };
         let psi = b.bind_i32(ev(t) & 1);
         let psl = SlotIdx::new(Opnd::Val(psi), Opnd::Val(t));
         let pr_ = pbuf.at(&psl);
@@ -411,7 +424,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let ksl = SlotIdx::new(Opnd::Val(ksi), Opnd::Val(t));
         let kr = kv.at(&ksl);
         let kb = b.bind_i32(kr.base());
-        let vfr: Vec<Vec<ValueId>> = (0..WP)
+        let vfr: Vec<Vec<ValueId>> = if abl == 2 { (0..WP).map(|pg| vec![pa[pg as usize]; 8]).collect() } else { (0..WP)
             .map(|pg| {
                 let vrow = b.bind_i32(ev(kb) + pg * layout.slot_bytes + ev(vofs));
                 kr.read(&mut b, |b| {
@@ -423,7 +436,7 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
                         .collect()
                 })
             })
-            .collect();
+            .collect() };
         stamp(&mut b);
         // 3. O *= alpha(t) (rows 8 g + r: v_readlane of head 8 g + r, select-free choice of the lane half)
         let sa16: Vec<ValueId> = (0..16u8).map(|h| b.read_lane(Opnd::Var(va), h)).collect();
@@ -451,14 +464,41 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
         let mut x1c_keep = Vec::new();
         for c in 0..9usize {
             for pg in 0..WP as usize {
-                let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
-                sacc[pg] = Some(Opnd::Val(d));
+                if abl == 3 {
+                    // keep the read alive: fold the fragment into the carried S (no WMMA)
+                    let prev = match sacc[pg] { Some(x) => x, None => Opnd::Var(sv[pg]) };
+                    let e = b.frag_slice(Opnd::Val(kfr[pg][c]), 0, 1);
+                    let pv0 = b.frag_slice(prev, 0, 1);
+                    let s0 = b.add_i32(pv0, Opnd::Val(e));
+                    let mut parts = vec![Opnd::Val(s0)];
+                    for k in 1..8u8 {
+                        parts.push(Opnd::Val(b.frag_slice(prev, k, 1)));
+                    }
+                    sacc[pg] = Some(Opnd::Val(b.frag_cat(&parts)));
+                } else {
+                    let d = b.wmma(WmmaKind::Fp8_16x16x64, kfr[pg][c], q[c], sacc[pg]);
+                    sacc[pg] = Some(Opnd::Val(d));
+                }
             }
             if c < 8 {
                 for pg in 0..WP as usize {
                     let o = ov[c];
-                    let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
-                    b.set_var(o, Opnd::Val(d));
+                    if abl == 3 {
+                        let e = b.frag_slice(Opnd::Val(vfr[pg][c]), 0, 1);
+                        let e2 = b.frag_slice(Opnd::Val(pa[pg]), 0, 1);
+                        let o0 = b.frag_slice(Opnd::Var(o), 0, 1);
+                        let s0 = b.add_i32(o0, Opnd::Val(e));
+                        let s1 = b.add_i32(s0, Opnd::Val(e2));
+                        let mut parts = vec![Opnd::Val(s1)];
+                        for k in 1..8u8 {
+                            parts.push(Opnd::Val(b.frag_slice(Opnd::Var(o), k, 1)));
+                        }
+                        let d = b.frag_cat(&parts);
+                        b.set_var(o, Opnd::Val(d));
+                    } else {
+                        let d = b.wmma(WmmaKind::Fp8_16x16x64, pa[pg], vfr[pg][c], Some(Opnd::Var(o)));
+                        b.set_var(o, Opnd::Val(d));
+                    }
                 }
             }
             if c == 1 {
