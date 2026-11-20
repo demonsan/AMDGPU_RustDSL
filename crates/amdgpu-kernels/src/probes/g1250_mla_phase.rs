@@ -41,11 +41,13 @@ const PH_ALU: u32 = 512;
 /// with PH_ILP + PH_SM: the lean softmax arithmetic (no per-token mask: valid on every window but the last, which a uniform branch would handle; the scale folded into one fma per exponent;
 /// the maximum taken on the raw scores and scaled once): about 90 fewer VALU per window
 const PH_LEAN: u32 = 1024;
+/// the V fragment reads of the sequential PV block rotate by 2 tiles per wave (wave w reads tile (nt + 2 w) % 8 at step nt): the four waves, aligned by the barrier, no longer hit the same LDS banks together
+const PH_STAG: u32 = 2048;
 
 /// `mla_g1250_qh16_ph_<hex mask>`.
 pub fn by_mask(hex: &str) -> Option<Function> {
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    if mask > 0x7ff {
+    if mask > 0xfff {
         return None;
     }
     Some(mla_ph_with(&format!("mla_g1250_qh16_ph_{hex}"), 2, 4, mask))
@@ -683,7 +685,13 @@ fn mla_ph_with(name: &str, wp: i32, depth: i32, mask: u32) -> Function {
                 kr.read(&mut b, |b| {
                     (0..8)
                         .map(|nt| {
-                            let a: Vec<ValueId> = (0..4).map(|jj| b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize])).collect();
+                            let du = if mask & PH_STAG != 0 { Some(b.bind_i32(((ev(w) * 2 + nt as i32) & 7) * 16 - nt as i32 * 16)) } else { None };
+                            let a: Vec<ValueId> = (0..4)
+                                .map(|jj| match du {
+                                    Some(d) => b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize] + ev(d)),
+                                    None => b.bind_i32(ev(vrow) + vdelta[8 * jj as usize + nt as usize]),
+                                })
+                                .collect();
                             b.load_lds_tr_b8x4(a[0], a[1], a[2], a[3])
                         })
                         .collect()
