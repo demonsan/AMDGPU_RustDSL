@@ -1205,7 +1205,17 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, slot_bases: Vec::new(), ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        if name.contains("_static") {   // opt-in: measured neutral to -4 % in mode 0, no gain in mode 2
+            for k in 0..ring.slots as i32 {
+                let sl = SlotIdx::new(k, 0);
+                let va = b.bind_i32(ra.at(&sl).base() + ev(abase));
+                let vb = b.bind_i32(rb.at(&sl).base() + ev(bbase));
+                let vsa = b.bind_i32(rsa.at(&sl).base() + ev(sabase));
+                let vsb = b.bind_i32(rsb.at(&sl).base() + ev(sbbase));
+                body.slot_bases.push([va, vb, vsa, vsb]);
+            }
+        }
         let ts_a = if ring.tstamps { Some(cyc_now(b)) } else { None };
         pipe.run(b, role, &mut body);
         let ts_b = if ring.tstamps { Some(cyc_now(b)) } else { None };

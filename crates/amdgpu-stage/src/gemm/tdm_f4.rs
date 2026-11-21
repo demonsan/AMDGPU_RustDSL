@@ -149,6 +149,9 @@ pub struct TdmF4Body {
     /// landed stage (relaxed), meets the workgroup and signals the cluster barrier (no wait): the skew of the 16 workgroups is absorbed by half a window instead of stalling every iteration
     pub defer: bool,
     pub pending: Option<(amdgpu_dsl::I32, SlotIdx, Role)>,
+    /// per STATIC ring slot, the lane's fragment base addresses (slot base + lane offset) of the A, B, A-scale and B-scale rings, computed once before the loops: the window's `ds_load`s then address
+    /// `base + immediate` with no VALU address arithmetic inside the WMMA loop (a VALU -> LDS address dependency costs an `s_wait_alu va_vdst` drain in expert scheduling mode 2)
+    pub slot_bases: Vec<[ValueId; 4]>,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -397,6 +400,10 @@ impl PipeBody for TdmF4Body {
         let (a_s, b_s, sa_s, sb_s) = (self.a.clone(), self.b.clone(), self.sa.clone(), self.sb.clone());
         let (ra, rb, rsa, rsb) = (a_s.at(&t.cur), b_s.at(&t.cur), sa_s.at(&t.cur), sb_s.at(&t.cur));
         let (perm_c, scale_shuf_c) = (self.perm, self.scale_shuf);
+        let sb_static: Option<[ValueId; 4]> = match t.cur.slot {
+            Opnd::I32(k) if (k as usize) < self.slot_bases.len() => Some(self.slot_bases[k as usize]),
+            _ => None,
+        };
         let (abase, bbase, sabase, sbbase) = (self.abase, self.bbase, self.sabase, self.sbbase);
         let (arow, brow) = (64 * sh.ks + self.row_pad, 64 * sh.ks + self.row_pad);   // bytes per A / B row of the slot (padding included)
         let (srow_bytes, _) = (4 * sh.ks, 0);          // bytes per scale row of the slot
@@ -414,7 +421,7 @@ impl PipeBody for TdmF4Body {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for half in 0..2 {
                         for piece in 0..2 {
-                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * if perm_c { 8 } else { 16 }) * arow + s * 64 + piece * 32);
+                            let addr = b.bind_i32((match sb_static { Some(v) => ev(v[0]), None => ra.base() + ev(abase) }) + (i * 32 + half * if perm_c { 8 } else { 16 }) * arow + s * 64 + piece * 32);
                             parts.push(Opnd::Val(b.load_lds_b128(addr)));
                         }
                     }
@@ -424,7 +431,7 @@ impl PipeBody for TdmF4Body {
             rsa.read(b, |b| {
                 for i in 0..sh.tm {
                     let st = if scale_shuf_c { 128 * s } else { 4 * s };
-                    let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + st);
+                    let addr = b.bind_i32((match sb_static { Some(v) => ev(v[2]), None => rsa.base() + ev(sabase) }) + i * 32 * srow_bytes + st);
                     f.sa.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });
@@ -432,7 +439,7 @@ impl PipeBody for TdmF4Body {
                 for j in 0..sh.tn {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for piece in 0..2 {
-                        let addr = b.bind_i32(rb.base() + ev(bbase) + j * 16 * brow + s * 64 + piece * 32);
+                        let addr = b.bind_i32((match sb_static { Some(v) => ev(v[1]), None => rb.base() + ev(bbase) }) + j * 16 * brow + s * 64 + piece * 32);
                         parts.push(Opnd::Val(b.load_lds_b128(addr)));
                     }
                     f.fb.push(Opnd::Val(b.frag_cat(&parts)));
@@ -442,7 +449,7 @@ impl PipeBody for TdmF4Body {
                 for j in 0..sh.tn {
                     // preshuffled: B block j covers rows 16 j .. of the 32-row block j / 2 (lanes m at 16 (j % 2) + m)
                     let (jt, st) = if scale_shuf_c { ((j / 2) * 32 * srow_bytes + (j % 2) * 64, 128 * s) } else { (j * 16 * srow_bytes, 4 * s) };
-                    let addr = b.bind_i32(rsb.base() + ev(sbbase) + jt + st);
+                    let addr = b.bind_i32((match sb_static { Some(v) => ev(v[3]), None => rsb.base() + ev(sbbase) }) + jt + st);
                     f.sb.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
             });
