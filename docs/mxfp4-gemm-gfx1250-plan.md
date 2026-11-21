@@ -176,6 +176,21 @@ WMMAs), the vendor 1.25 + 0.31 (1,280 + 320 for 1,024 WMMAs of several forms): t
 vendor hides the prologue and epilogue (persistent: our 3.0 k + 5.3 - 6.9 k cycles of a 43.6 k tile), (3) its loop iteration does not pay a lockstep barrier on a 2-slot ring (it runs more stages in flight). Putting these
 together: a vendor tile of about 38.5 k cycles at 1.75 GHz = 22 us per tile reproduces 12.4 PF/s; ours with the multicast is 50.5 k cycles (2.6 prologue + 42.1 loop + 5.8 epilogue) at 1.75 GHz.
 
+### Persistent 4 x 4 cluster, with and without the carried first stage (e08, 2026-11-21)
+
+`RingOpts::persistent` now composes with a cluster: the grid is (TX, GYS) work-groups in clusters of 4 x 4, every work-group loops over the tile rows gy, gy + GYS, .. (GYS a multiple of the cluster rows, dividing the tile rows: host
+PERSIST = G gives GYS = G / TX); the cluster barrier at every tile start (after the previous epilogue, before any peer multicasts into the LDS) keeps a peer's multicast out of a ring still used for staging. The contract is
+declared (grid x = TX, grid y = GYS, tiles_y = GYS x NR, ystep = GYS), the tile row is a checked `assume`: **the kernel compiles strict, G5 and the tile protocol accept it with no trusted fact beyond the multicast kernel's**
+(`exp_..._c4x4_lock_persist`); `..._persist_carry` adds the carried first stage and the slot-staged epilogue of the previous section (`PipeBody::stage_next_tile`, multicast: every work-group of the cluster issues the next
+tile's stage 0 at the same point, into a slot every peer freed at the last cluster barrier). All runs bit-exact (`bad = 0`). Cycles and clock at 8192^3 (stamps, median work-group's tile sequence): PC 197.3 k cycles at
+**1.74 GHz** (113 us; the loop 39.1 k per tile against 42.1 k for the non-persistent multicast); the carry variant was not stamped (the scalar register budget is full: out of SGPRs with two stamps), its time is
+108.1 - 108.5 us. The carry composes better with the multicast than with the lone work-group (where it lost 7 % to the clock sag): with 4 x less L2 read traffic the saved cycles are not paid back by the clock.
+
+**The strict acceptance of the carry kernels is NOT a proof.** A negative test (epilogue staging deliberately into the slot that holds the carried stage in flight) also compiles: the epilogue's staging stores are plain `ds_store`s
+outside any declared tile, and the next tile's first stage sits under a wave-uniform `if` (first tile / a next tile exists), so the protocol does not see the hazard. Before this kernel ships the epilogue staging must be a
+declared tile aliasing one ring SLOT (A and B slot regions, two bands deep, drained by `wait_tensor(1)`), the stage under the `if` must be seen by the protocol, and the persistent tile loop must check that the end-of-body
+state (stage 0 of the next tile in flight in slot 0) equals the state after the pre-loop prologue; with backend.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
@@ -192,6 +207,12 @@ compute, so at most 960 cycles = 3.0 % of the 31.8 k-cycle tile (about 1.5 - 2 %
 | 256 (e.g. 4096 x 4096), grid divisible by 4 x 4 | <= 4096 and 8192 | `..._ks4_s2_epit_roles_c4x4_lock` | 4096^3 7.9 (default 6.3 - 7.1); K = 2048 / 3072 6.0 / 7.2 (default 5.5 / 6.9); K = 8192 9.5 (default 9.1) |
 | 256 | 5120 - 6144, other K | `..._ks4_s2_epit_roles` | 7.5 (default) |
 | >= 1,024 (8192 x 8192 and larger) | any multiple of 512 | `..._ks4_s2_epit_roles` | 9.9 - 10.1 (8192^3, K = 16384) |
+| 512 (8192 x 4096), 1,024 (8192^2) with K = 4096, 2048 | multiple of 1024 | **candidate**: the persistent 4 x 4 cluster with the carried first stage (below; experimental, `exp_` prefix, tile protocol not yet extended) | 8192^2 x 4096 8.4 - 8.65 (default 7.9 - 8.0, multicast 8.3); 16384 x 8192 x 4096 8.63 (8.1 - 8.25 / 8.0) |
+
+Clock-aware update (2026-11-21, same GPU, paired alternating, 2 reps; us of the default D / multicast M / persistent cluster PC / persistent cluster + carry PCC): 4096^3 21.95 / **17.36** / 17.6 / **16.9 - 17.1**;
+8192 x 8192 x 4096 68.4 / 66.4 / 66.5 / **64.6**; 16384 x 8192 x 4096 134.5 / 136.8 / 131.8 / **127.2**; 8192^3 112.1 / 112.9 / 112.3 / **108.3**; 8192 x 8192 x 2048 42.1 / 44.3 / 43.4 / **40.4**.
+So M still wins 4096^3 (-21 % against D) and the K = 4096 outputs by 2.8 - 3.4 % where D sags to 1.45 - 1.53 GHz, D wins 8192^3 and 16384 x 8192 x 4096 against M; PCC is the best everywhere:
+-22 % at 4096^3, **-5.5 % / -5.3 %** at 8192 x 8192 x 4096 / 16384 x 8192 x 4096, -3.4 % at 8192^3 (10.15 PF/s), -4.1 % at K = 2048.
 | any, K = 256 mod 512 | | the 256-K kernels (`..._ks2_epit_roles[_relax]`) | 9.3 (relaxed for K <= 3584 or >= 5120, plain for 3840 - 4608) |
 
 Vendor reference on the same node: 11.0 at 4096^3, 12.4 - 12.5 at 8192^3 (so the best of the table is 72 % / 80 %).
