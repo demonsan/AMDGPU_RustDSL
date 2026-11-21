@@ -554,6 +554,10 @@ pub fn mla_g1250_qh16_ws2N() -> Function {
     with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_ws2N", true, WS2_BITS | (1u64 << 40), false)))
 }
 
+pub fn mla_g1250_qh16_wsL() -> Function {
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_wsL", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 41), false)))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -2195,6 +2199,55 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         // (bit 31) bank-conflict-free final read: step k, the 8 threads of head h read 8 consecutive 16-byte chunks (dims 4 (8 k + j) ..),
         // instead of each thread reading its own 256 contiguous bytes (lanes 256 B apart: one bank for the whole wave)
         let j = b.bind_i32(ev(tid) & 7);
+        if branchless & (1u64 << 41) != 0 && dg == 1 {
+            // (bit 41) 16-byte output stores: step k, thread j of head h takes dims 8 (8 k + j) .. + 8 (two LDS chunks 32 B apart per
+            // lane), so the 8 threads of a head write one full 128-byte line per step (the 8-byte form wrote half lines)
+            let hb = if mpad {
+                b.bind_i32(ev(h) * 2048 + (ev(h) >> 3) * 64 + ev(j) * 32 + mo.base as i32)
+            } else {
+                b.bind_i32(ev(h) * 2048 + ev(j) * 32 + mo.base as i32)
+            };
+            let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+                let mut acc: Vec<Option<ValueId>> = vec![None; 64];
+                for wi in 0..nwl {
+                    let v4s: Vec<ValueId> = (0..16)
+                        .map(|q| {
+                            let k = q / 2;
+                            let a = b.bind_i32(ev(hb) + (256 * k + 16 * (q % 2) + wi as i32 * wstride));
+                            b.load_lds_b128(a)
+                        })
+                        .collect();
+                    for q in 0..16usize {
+                        for e in 0..4u8 {
+                            let x = b.frag_slice(Opnd::Val(v4s[q]), e, 1);
+                            let xf = f32_of(b, x);
+                            let tt = b.mul_f32(xf, scaled[wi as usize]);
+                            let i = 4 * q + e as usize;
+                            acc[i] = Some(match acc[i] {
+                                None => tt,
+                                Some(y) => b.add_f32(y, tt),
+                            });
+                        }
+                    }
+                }
+                acc.into_iter().map(|x| x.unwrap()).collect()
+            });
+            let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(j) * 16);
+            let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
+            for k in 0..8u32 {
+                let parts: Vec<Opnd> = (0..4usize).map(|i| Opnd::Val(b.cvt_pk_bf16_f32(outs[8 * k as usize + 2 * i], outs[8 * k as usize + 2 * i + 1]))).collect();
+                let v = b.frag_cat(&parts);
+                b.store_global(prb, 128 * k, v, MemTy::B128, false);
+            }
+            let lg = b.log2_f32(lt);
+            let s2 = b.add_f32(mx, lg);
+            let ln2 = b.c_f32(std::f32::consts::LN_2);
+            let lse = b.mul_f32(s2, ln2);
+            let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
+            let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+            b.store_global(pl, 0, lse, MemTy::B32, false);
+            return b.finish();
+        }
         // chunk k (dims 4 (8 k + j) ..) lies in dim group k / (16 / dg); its waves: group + kk dg (kk = the page group, scale sc[kk])
         let kpg = 16 / dg as i32;
         let hb = if mpad {
