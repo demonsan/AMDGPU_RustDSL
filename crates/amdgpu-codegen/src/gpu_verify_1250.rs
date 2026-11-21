@@ -2314,6 +2314,17 @@ fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
     if !insts.iter().any(|i| i.mn == "s_prefetch_inst") {
         return;
     }
+    // the kernel's code: the instructions before the end of its text (`.size`, a section switch, the kernel descriptor, the metadata)
+    let end_line = asm
+        .lines()
+        .enumerate()
+        .find(|(_, l)| {
+            let l = l.trim();
+            l.starts_with(".size") || l.starts_with(".section") || l.starts_with(".rodata") || l.starts_with(".amdhsa_kernel") || l.starts_with("---") || l.starts_with(".amdgpu_metadata")
+        })
+        .map_or(usize::MAX, |(i, _)| i + 1);
+    let insts: Vec<Inst> = insts.iter().filter(|i| i.line < end_line).cloned().collect();
+    let insts = &insts[..];
     // byte offset of every instruction and the code size
     let mut off: Vec<Option<u64>> = Vec::with_capacity(insts.len());
     let mut size: Option<u64> = Some(0);
