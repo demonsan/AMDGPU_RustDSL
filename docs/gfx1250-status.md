@@ -51,19 +51,27 @@ our own kernels with them.
 **MLA decode, qh16, fp8 Q / KV, page size 64** (same ABI as the vendor kernel, so the host runs both; all results checked against an fp32
 reference, error equal to the vendor's):
 
-| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-21) | kernel |
-|---|---|---|---|
-| 1 x 64 (1) | - | 1.02 | `_ws4` |
-| 4 x 64 (1) | - | 1.27 .. 1.37 | `_ws4` / `_ws2` |
-| 4 x 128 (2) | - | 1.30 | `_ws2` |
-| 4 x 192 (3) | - | 1.27 | `_ws2` |
-| 4 x 256 (4) | - | 1.20 | `_ws2` |
-| 4 x 320 (5) | - | **0.84** | `_ws2` |
-| 4 x 512 (8) | - | **0.86** | `_ws` |
-| 4 x 1000 (16) | 1.65 | **0.91** | `_ws` |
-| 32 x 2048 (32) | 1.90 | **0.92** | `_ws` |
-| 128 x 4096 (64) | 1.38 | **0.90** | `_ws` |
-| 128 x 8192 (128) | 1.65 | **0.91** | `_ws` |
+Final dispatch table (e08 GPU 0, Main d5386dcc, 2026-11-21; each shape paired twice against the vendor, 20 alternating launches,
+us = mean per launch; the dispatched kernel: 1 page -> `_ws4`, 2 .. 6 -> `_ws2`, 7+ -> `_ws`; all MLA_OK):
+
+| B x ctx (pages / sequence) | kernel | vendor us | ours us | ours / vendor (run 1, run 2) |
+|---|---|---|---|---|
+| 1 x 64 (1) | `_ws4` | 2.87 / 3.71 | 3.35 | 1.16, 0.90 |
+| 4 x 64 (1) | `_ws4` | 3.41 / 2.91 | 3.61 / 3.63 | 1.06, 1.25 |
+| 32 x 64 (1) | `_ws4` | 3.49 / 3.86 | 3.73 / 3.70 | 1.07, 0.96 |
+| 4 x 128 (2) | `_ws2` | 3.46 / 3.05 | 4.18 / 4.19 | 1.21, 1.38 |
+| 4 x 192 (3) | `_ws2` | 4.18 / 3.69 | 4.94 / 4.96 | 1.18, 1.34 |
+| 4 x 256 (4) | `_ws2` | 4.20 / 4.14 | 5.14 / 5.03 | 1.22, 1.21 |
+| 4 x 320 (5) | `_ws2` | 7.20 / 7.16 | 5.68 / 5.71 | **0.79, 0.80** |
+| 4 x 512 (8) | `_ws` | 7.65 / 7.80 | 6.47 / 6.47 | **0.85, 0.83** |
+| 4 x 1000 (16) | `_ws` | 9.16 / 9.15 | 8.19 / 8.18 | **0.89, 0.89** |
+| 32 x 2048 (32) | `_ws` | 12.53 / 12.52 | 11.77 / 11.74 | **0.94, 0.94** |
+| 128 x 4096 (64) | `_ws` | 33.55 / 33.97 | 28.42 / 28.41 | **0.85, 0.83** |
+| 128 x 8192 (128) | `_ws` | 53.26 / 53.13 | 47.26 / 47.40 | **0.89, 0.89** |
+| 512 x 8192 (128) | `_ws` | 175.6 / 175.1 | 167.2 / 166.8 | **0.95, 0.95** |
+
+At 1 .. 2 pages the vendor runs at the launch floor (an empty kernel with this ABI: 2.7 .. 2.9 us) and its own time swings 2.9 .. 3.9 us
+between runs; ours is stable (3.35 .. 3.7 us). From 5 pages on ours is 5 .. 21 % faster.
 
 2026-11-21: the final reduce of `_ws` / `_ws2` read its partials with every thread on its own 256 contiguous bytes - the 32 lanes of a
 wave 256 B apart, one LDS bank for the whole wave (a 32-way conflict on 64 b128 loads per thread); the lane-interleaved read (8 threads of a
