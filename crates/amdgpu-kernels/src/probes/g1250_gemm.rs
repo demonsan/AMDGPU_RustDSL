@@ -855,8 +855,25 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.assume_trusted(gy, Ext::c(0), Ext::grid_y() - Ext::c(1), "tile y = cluster id y * cy + position < grid y (grid divisible by the cluster)");
         if persistent {
             // the tile loop: this work-group's tile rows gy, gy + GYS, .. (< TY = GYS NR)
-            let lv = b.begin_loop(&[(DType::I32, Opnd::Val(gy))]);
+            let mut cinits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(gy))];
+            let tc_i = cinits.len();
+            if ring.tstamps {
+                let z0 = b.c_i32(0);
+                cinits.push((DType::I32, Opnd::Val(z0)));
+            }
+            let fi = cinits.len();
+            if ring.carry {
+                let one_c = b.c_i32(1);
+                cinits.push((DType::I32, Opnd::Val(one_c)));
+            }
+            let lv = b.begin_loop(&cinits);
             let vy = lv[0];
+            if ring.tstamps {
+                tc_var = Some(lv[tc_i]);
+            }
+            if ring.carry {
+                first_var = Some(lv[fi]);
+            }
             persist_var = Some(vy);
             let gyc = b.let_(Op::AddI32(Opnd::Var(vy), Opnd::I32(0)));
             b.assume(gyc, Ext::c(0), Ext::sym("GYS") * Ext::sym("NR") - Ext::c(1));
