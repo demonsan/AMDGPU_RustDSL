@@ -155,6 +155,8 @@ pub struct TdmF4Body {
     /// drain overlap (carry mode): the previous tile's `dov_stores` tensor stores per wave may still be in flight at the prologue (waited only down to that count), and the first window issues its stage in
     /// the middle after the drain + a workgroup and a cluster barrier (`first_win` = (it == 0, it != 0) of the window being emitted)
     pub dov: bool,
+    /// the order of the 32 WMMAs of a sub-step: 0 = i outer, j inner (A reused 7 of 8); 1 = 2 x 2 blocks (each pair of consecutive WMMAs shares A or B); 2 = j outer, i inner (B reused 3 of 4)
+    pub wmma_order: u8,
     pub dov_stores: i32,
     pub first_win: Option<(ValueId, ValueId)>,
     /// the overlapped epilogue (see `Ovl`)
@@ -516,12 +518,34 @@ impl PipeBody for TdmF4Body {
                 b.barrier_signal(-3);
                 b.end_if();
             }
-            for i in 0..sh.tm {
-                for j in 0..sh.tn {
-                    let acc = self.acc[(i * sh.tn + j) as usize];
-                    let d = b.wmma_scaled(WmmaKind::ScaleF4_32x16x128, cur.fa[i as usize], cur.fb[j as usize], Some(Opnd::Var(acc)), WmmaScale { sa: cur.sa[i as usize], sb: cur.sb[j as usize], b_row1: false });
-                    b.set_var(acc, Opnd::Val(d));
+            let mut order: Vec<(i32, i32)> = Vec::new();
+            match self.wmma_order {
+                1 => {
+                    for ip in (0..sh.tm).step_by(2) {
+                        for jp in (0..sh.tn).step_by(2) {
+                            order.extend([(ip, jp), (ip, jp + 1), (ip + 1, jp + 1), (ip + 1, jp)]);
+                        }
+                    }
                 }
+                2 => {
+                    for j in 0..sh.tn {
+                        for i in 0..sh.tm {
+                            order.push((i, j));
+                        }
+                    }
+                }
+                _ => {
+                    for i in 0..sh.tm {
+                        for j in 0..sh.tn {
+                            order.push((i, j));
+                        }
+                    }
+                }
+            }
+            for (i, j) in order {
+                let acc = self.acc[(i * sh.tn + j) as usize];
+                let d = b.wmma_scaled(WmmaKind::ScaleF4_32x16x128, cur.fa[i as usize], cur.fb[j as usize], Some(Opnd::Var(acc)), WmmaScale { sa: cur.sa[i as usize], sb: cur.sb[j as usize], b_row1: false });
+                b.set_var(acc, Opnd::Val(d));
             }
             if s == 0 {
                 if let (true, Some((first, _))) = (self.dov, self.first_win) {
