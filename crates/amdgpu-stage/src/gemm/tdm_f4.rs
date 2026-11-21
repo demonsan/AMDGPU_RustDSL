@@ -139,6 +139,8 @@ pub struct TdmF4Body {
     /// no software pipeline inside the window: the fragments of sub-step s + 1 are read after the WMMAs of s (one fragment set live instead of two: for the kernels that run two
     /// workgroups per CU, whose other workgroup hides the read latency)
     pub nopf: bool,
+    /// timing experiment (WRONG results): the fragments of sub-step 0 serve all sub-steps (a quarter of the LDS reads)
+    pub hoist: bool,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -404,7 +406,7 @@ impl PipeBody for TdmF4Body {
         // software pipeline inside the window: the loads of sub-step s + 1 are issued before the WMMAs of s
         let mut cur = load(b, 0);
         for s in 0..sh.ks {
-            let next = if s + 1 < sh.ks && !self.nopf { Some(load(b, s + 1)) } else { None };
+            let next = if s + 1 < sh.ks && !self.nopf && !self.hoist { Some(load(b, s + 1)) } else { None };
             if s + 1 == sh.ks && sh.split && sh.cx * sh.cy > 1 && sh.lock && t.staged && self.steady {
                 // every fragment of the slot is read: complete this wave's reads, meet the workgroup, and one wave signals the cluster barrier (waited for in `stage_complete`)
                 b.wait_lds(0);
@@ -422,7 +424,7 @@ impl PipeBody for TdmF4Body {
             }
             if let Some(n) = next {
                 cur = n;
-            } else if s + 1 < sh.ks {
+            } else if s + 1 < sh.ks && !self.hoist {
                 cur = load(b, s + 1);
             }
         }
