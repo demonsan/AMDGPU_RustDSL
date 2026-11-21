@@ -317,6 +317,264 @@ pub fn verify_mode(m: &MFunction, a: &Alloc, mode0: u8) -> Vec<(u32, bool, Strin
     out
 }
 
+/// The default `s_wait_alu` operand: every depctr field "no wait" (llvm-mc: `s_wait_alu depctr_va_vdst(3)` = 0x3f9f).
+pub const DEPCTR_DEFAULT: u32 = 0xff9f;
+
+/// The depctr operand waiting for va_vdst <= `vd` and vm_vsrc <= `vm` (15 / 7: no wait on that field).
+pub fn depctr(vd: u32, vm: u32) -> u32 {
+    (DEPCTR_DEFAULT & !(0xf << 12) & !(0x7 << 2)) | (vd.min(15) << 12) | (vm.min(7) << 2)
+}
+
+thread_local! {
+    /// test hook: drop the k-th planned `s_wait_alu` (mutation tests: the independent check must then reject the kernel)
+    static MODE2_DROP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `g` with the `k`-th planned mode-2 wait dropped (a mutation test hook).
+#[doc(hidden)]
+pub fn with_mode2_drop<R>(k: usize, g: impl FnOnce() -> R) -> R {
+    MODE2_DROP.with(|c| c.set(Some(k)));
+    let r = g();
+    MODE2_DROP.with(|c| c.set(None));
+    r
+}
+
+/// The MIR with the gfx1250 wait plan's lines in place (as SWaitCtr instructions) and, per instruction of the new list, the original
+/// (block, index) it came from (None: an inserted wait).
+fn with_plan(m: &MFunction, plan: &super::waits::Plan) -> (MFunction, Vec<Vec<Option<usize>>>) {
+    let wait_of = |line: &str| -> Option<MInst> {
+        let (mn, n) = line.trim().split_once(' ')?;
+        let n = u32::from_str_radix(n.trim().trim_start_matches("0x"), 16).ok()? as i64;
+        let c = match mn {
+            "s_wait_loadcnt" => 0,
+            "s_wait_storecnt" => 1,
+            "s_wait_dscnt" => 2,
+            "s_wait_kmcnt" => 3,
+            "s_wait_xcnt" => 4,
+            _ => return None,
+        };
+        Some(MInst::new(MOp::SWaitCtr).imm((c << 8) | n))
+    };
+    let mut m2 = m.clone();
+    let mut orig: Vec<Vec<Option<usize>>> = Vec::new();
+    for (bi, b) in m2.blocks.iter_mut().enumerate() {
+        let mut out = Vec::with_capacity(b.insts.len());
+        let mut o = Vec::with_capacity(b.insts.len());
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for l in plan.before.get(&(bi, ii)).into_iter().flatten() {
+                if let Some(w) = wait_of(l) {
+                    out.push(w);
+                    o.push(None);
+                }
+            }
+            match plan.replace.get(&(bi, ii)) {
+                Some(ls) => {
+                    for l in ls {
+                        if let Some(w) = wait_of(l) {
+                            out.push(w);
+                            o.push(None);
+                        }
+                    }
+                }
+                None => {
+                    out.push(inst.clone());
+                    o.push(Some(ii));
+                }
+            }
+        }
+        for l in plan.end.get(&bi).into_iter().flatten() {
+            if let Some(w) = wait_of(l) {
+                out.push(w);
+                o.push(None);
+            }
+        }
+        b.insts = out;
+        orig.push(o);
+    }
+    (m2, orig)
+}
+
+/// MODE 2 (the relaxed scheduling mode, LLVM's expert scheduling mode 2) for the compiler's own code: the `s_wait_alu` waits the program
+/// then owns (va_vdst: a non-VALU instruction touching a VGPR an outstanding VALU writes, or writing one it reads; vm_vsrc: overwriting a
+/// VGPR an outstanding vector-memory / LDS operation reads), with the smallest counts that complete the needed operations (va_vdst <= the
+/// number of younger VALU operations when one event class is pending, else 0; the counters' saturation as in `issue`), from the same
+/// dataflow over the CFG as the verifier, iterated to a fixpoint over loops. Returns, per original (block, instruction), the depctr operand
+/// of the `s_wait_alu` to emit before it; the result is then CHECKED by `verify_mode(.., 2)` on the code with every wait in place (an
+/// unsound plan is an error, never emitted).
+pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result<std::collections::HashMap<(usize, usize), u32>, Vec<String>> {
+    let (m2, orig) = with_plan(m, plan);
+    let n = m2.blocks.len();
+    let idx: std::collections::HashMap<u32, usize> = m2.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let succ: Vec<Vec<usize>> = m2
+        .blocks
+        .iter()
+        .map(|b| match &b.term {
+            Term::Goto(t) => vec![idx[t]],
+            Term::CondGoto { target, fall, .. } => vec![idx[target], idx[fall]],
+            Term::Endpgm => vec![],
+        })
+        .collect();
+    // the waits (block, index in m2) -> (va_vdst, vm_vsrc); only ever lowered
+    let mut need: std::collections::BTreeMap<(usize, usize), (u32, u32)> = std::collections::BTreeMap::new();
+    let mut entry: Vec<Option<State>> = vec![None; n];
+    entry[0] = Some(State { items: BTreeMap::new(), mode: Some(2) });
+    for _round in 0..400 {
+        let mut changed = false;
+        for bi in 0..n {
+            let Some(mut st) = entry[bi].clone() else { continue };
+            for (ii, inst) in m2.blocks[bi].insts.iter().enumerate() {
+                match inst.op {
+                    MOp::SWaitCtr => {
+                        let c = match inst.imm >> 8 {
+                            0 => Some(Ctr::Load),
+                            1 => Some(Ctr::Store),
+                            2 => Some(Ctr::Ds),
+                            3 => Some(Ctr::Km),
+                            4 => Some(Ctr::X),
+                            _ => None,
+                        };
+                        if let Some(c) = c {
+                            wait(&mut st, c, (inst.imm & 0xff) as u32);
+                        }
+                        continue;
+                    }
+                    MOp::SWaitAlu => {
+                        let d = inst.imm as u32;
+                        wait(&mut st, Ctr::VaVdst, (d >> 12) & 0xf);
+                        wait(&mut st, Ctr::VmVsrc, (d >> 2) & 0x7);
+                        continue;
+                    }
+                    MOp::SSetSchedMode => {
+                        st.mode = Some(inst.imm as u8);
+                        continue;
+                    }
+                    _ => {}
+                }
+                let e = effects(&m2, inst);
+                let reads = keys(&m2, a, &e.reads);
+                let writes = keys(&m2, a, &e.writes);
+                let valu = is_valu(inst.op);
+                let relaxed = st.mode != Some(0);
+                // the waits this instruction needs (the planned one applied first, so a later round only lowers it)
+                let mut vd = 15u32;
+                let mut vm = 7u32;
+                if relaxed {
+                    let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
+                    for c in [Ctr::VaVdst, Ctr::VmVsrc] {
+                        let classes: std::collections::BTreeSet<u8> = st.items.iter().filter(|(k, _)| k.0 == c).map(|(_, v)| v.class).collect();
+                        let in_order = classes.len() <= 1;
+                        for (k, v) in st.items.iter().filter(|(k, _)| k.0 == c) {
+                            let dep = match c {
+                                Ctr::VaVdst => !valu && (hit(&reads, &v.dst) || hit(&writes, &v.dst) || hit(&writes, &v.src)),
+                                _ => hit(&writes, &v.src),
+                            };
+                            if dep {
+                                let _ = k;
+                                let cnt = if in_order { v.younger } else { 0 };
+                                if c == Ctr::VaVdst {
+                                    vd = vd.min(cnt);
+                                } else {
+                                    vm = vm.min(cnt);
+                                }
+                            }
+                        }
+                    }
+                }
+                if vd < 15 || vm < 7 {
+                    let e2 = need.entry((bi, ii)).or_insert((15, 7));
+                    if vd < e2.0 || vm < e2.1 {
+                        e2.0 = e2.0.min(vd);
+                        e2.1 = e2.1.min(vm);
+                        changed = true;
+                    }
+                }
+                if let Some(&(pv, pm)) = need.get(&(bi, ii)) {
+                    wait(&mut st, Ctr::VaVdst, pv);
+                    wait(&mut st, Ctr::VmVsrc, pm);
+                }
+                // the new operation (as in verify_mode)
+                let at = (bi, ii);
+                if e.smem {
+                    issue(&mut st, Ctr::Km, at, 0, writes.clone(), reads.clone(), 1);
+                    if super::xnack() {
+                        issue(&mut st, Ctr::X, at, 1, vec![], reads.clone(), 1);
+                    }
+                } else if let Some(ma) = &e.mem {
+                    let vsrc: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
+                    match ma.space {
+                        Space::Global => {
+                            let c = if !e.writes.is_empty() { Ctr::Load } else { Ctr::Store };
+                            issue(&mut st, c, at, 0, writes.clone(), reads.clone(), 1);
+                            if super::xnack() {
+                                issue(&mut st, Ctr::X, at, 0, vec![], reads.clone(), 1);
+                            }
+                            let class = if crate::op_attrs::attrs(inst.op).mnemonic.starts_with("buffer") { 2 } else { 0 };
+                            issue(&mut st, Ctr::VmVsrc, at, class, vec![], vsrc, 1);
+                        }
+                        Space::Lds => {
+                            issue(&mut st, Ctr::Ds, at, 0, writes.clone(), reads.clone(), 1);
+                            issue(&mut st, Ctr::VmVsrc, at, 1, vec![], vsrc, 1);
+                        }
+                    }
+                } else if valu {
+                    let w = if matches!(inst.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) { 2 } else { 1 };
+                    let vdst: Vec<u32> = writes.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
+                    let vs: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
+                    if !vdst.is_empty() || !vs.is_empty() {
+                        issue(&mut st, Ctr::VaVdst, at, valu_class(inst.op), vdst, vs, w);
+                    }
+                }
+            }
+            for &s in &succ[bi] {
+                let merged = match &entry[s] {
+                    None => st.clone(),
+                    Some(x) => merge(x, &st),
+                };
+                if entry[s].as_ref() != Some(&merged) {
+                    entry[s] = Some(merged);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // the waits back on the original instructions (an inserted memory wait is never a consumer: no entry there)
+    let drop = MODE2_DROP.with(|c| c.get());
+    let mut out: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+    for (k, ((bi, ii), (vd, vm))) in need.iter().enumerate() {
+        if drop == Some(k) {
+            continue;
+        }
+        if let Some(Some(o)) = orig.get(*bi).and_then(|v| v.get(*ii)) {
+            out.insert((*bi, *o), depctr(*vd, *vm));
+        }
+    }
+    // the independent check: the code with every wait in place, in mode 2 from the entry
+    let mut m3 = m2.clone();
+    for (bi, b) in m3.blocks.iter_mut().enumerate() {
+        let mut v = Vec::with_capacity(b.insts.len() + 8);
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if let Some(Some(o)) = orig[bi].get(ii) {
+                if let Some(&d) = out.get(&(bi, *o)) {
+                    let mut w = MInst::new(MOp::SWaitAlu).imm(d as i64);
+                    w.stmt = inst.stmt;
+                    v.push(w);
+                }
+            }
+            v.push(inst.clone());
+        }
+        b.insts = v;
+    }
+    let errs: Vec<String> = verify_mode(&m3, a, 2).into_iter().filter(|(_, hz, _)| !hz).map(|(_, _, msg)| msg).collect();
+    if errs.is_empty() {
+        Ok(out)
+    } else {
+        Err(errs)
+    }
+}
+
 /// The compiler's own waits checked independently (non-exact gfx1250): the MIR with the gfx1250 wait plan's lines (waits.rs: the gfx950
 /// pass's waits converted to split counters, the XCNT waits) put in place of / before the instructions, then the same dataflow as for an
 /// exact kernel. The shared wait pass and its verifier share one counter model; this check uses the gfx1250 counters directly, so a wait the

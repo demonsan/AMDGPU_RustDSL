@@ -938,6 +938,8 @@ pub struct MFunction {
     pub vopd: bool,
     /// `msbgroup` lowering option (gfx1250): group instructions by VGPR window (target/gfx1250/msbgroup.rs)
     pub msb_group: bool,
+    /// `mode2` lowering option (gfx1250): run in the relaxed scheduling mode 2 with the compiler's s_wait_alu waits (check.rs mode2_plan)
+    pub mode2: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
     /// Register planning (DSL `RegMark`s resolved to vregs) and the weave / stage regions instructions are tagged with (`MInst::region`).
