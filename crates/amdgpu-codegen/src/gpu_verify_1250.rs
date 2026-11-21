@@ -2549,7 +2549,23 @@ mod mode2 {
 /// Mode 2: the `s_wait_alu` waits the final text still lacks (instruction expansions of the emitter the MIR model does not see: a large
 /// LDS offset split into a `v_add` + the access, a 64-bit address computed into a temporary, ...), inserted with the smallest counts the
 /// text dataflow allows, until GV-1250-MODE2-WAIT holds (adding waits only removes behaviours, so the result is checked by the rule itself).
+thread_local! {
+    static MODE2_NO_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: `mode2_complete` leaves the text unchanged (the MIR plan alone) - the mutation test of the independent text check.
+#[doc(hidden)]
+pub fn without_mode2_completion<R>(g: impl FnOnce() -> R) -> R {
+    MODE2_NO_COMPLETE.with(|c| c.set(true));
+    let r = g();
+    MODE2_NO_COMPLETE.with(|c| c.set(false));
+    r
+}
+
 pub fn mode2_complete(asm: &str) -> String {
+    if MODE2_NO_COMPLETE.with(|c| c.get()) {
+        return asm.to_string();
+    }
     let mut text = asm.to_string();
     for _round in 0..64 {
         let (insts, _raw, labels) = lex(&text);

@@ -166,6 +166,12 @@ pub fn verify(m: &MFunction, a: &Alloc) -> Vec<(u32, bool, String)> {
 
 /// `verify` with the wave's scheduling mode at entry `mode0` (a kernel that sets it itself overrides it).
 pub fn verify_mode(m: &MFunction, a: &Alloc, mode0: u8) -> Vec<(u32, bool, String)> {
+    verify_mode_pairs(m, a, mode0, &std::collections::HashSet::new())
+}
+
+/// `verify_mode` where the instructions at `pair_second` (block, index) are the second component of a VOPD pair: the pair issues as ONE
+/// VALU instruction, so it adds one (not two) to the younger-operation counts.
+pub fn verify_mode_pairs(m: &MFunction, a: &Alloc, mode0: u8, pair_second: &std::collections::HashSet<(usize, usize)>) -> Vec<(u32, bool, String)> {
     let n = m.blocks.len();
     let idx: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let succ: Vec<Vec<usize>> = m
@@ -284,7 +290,7 @@ pub fn verify_mode(m: &MFunction, a: &Alloc, mode0: u8) -> Vec<(u32, bool, Strin
                         }
                     }
                 } else if valu {
-                    let w = if matches!(inst.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) { 2 } else { 1 };
+                    let w = if pair_second.contains(&(bi, ii)) { 0 } else if matches!(inst.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) { 2 } else { 1 };
                     let vd: Vec<u32> = writes.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     let vs: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     if !vd.is_empty() || !vs.is_empty() {
@@ -518,7 +524,8 @@ pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result
                         }
                     }
                 } else if valu {
-                    let w = if matches!(inst.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) { 2 } else { 1 };
+                    let second = orig[bi].get(ii).copied().flatten().map_or(false, |o| super::vopd::is_second(bi, o));
+                    let w = if second { 0 } else if matches!(inst.op, MOp::VWmmaScaleF32_32x16x128F4 | MOp::VWmmaScaleF32_32x16x128F4Z) { 2 } else { 1 };
                     let vdst: Vec<u32> = writes.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     let vs: Vec<u32> = reads.iter().copied().filter(|r| *r < VGPR_LIMIT).collect();
                     if !vdst.is_empty() || !vs.is_empty() {
@@ -554,6 +561,7 @@ pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result
     }
     // the independent check: the code with every wait in place, in mode 2 from the entry
     let mut m3 = m2.clone();
+    let mut seconds: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     for (bi, b) in m3.blocks.iter_mut().enumerate() {
         let mut v = Vec::with_capacity(b.insts.len() + 8);
         for (ii, inst) in b.insts.iter().enumerate() {
@@ -563,12 +571,15 @@ pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result
                     w.stmt = inst.stmt;
                     v.push(w);
                 }
+                if super::vopd::is_second(bi, *o) {
+                    seconds.insert((bi, v.len()));
+                }
             }
             v.push(inst.clone());
         }
         b.insts = v;
     }
-    let errs: Vec<String> = verify_mode(&m3, a, 2).into_iter().filter(|(_, hz, _)| !hz).map(|(_, _, msg)| msg).collect();
+    let errs: Vec<String> = verify_mode_pairs(&m3, a, 2, &seconds).into_iter().filter(|(_, hz, _)| !hz).map(|(_, _, msg)| msg).collect();
     if errs.is_empty() {
         Ok(out)
     } else {
