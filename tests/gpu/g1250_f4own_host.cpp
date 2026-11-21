@@ -215,7 +215,22 @@ int main(int argc, char** argv) {
         us = 1000.0 * ms / iters;
         tflops = 2.0 * M * N * K / (us * 1e-6) / 1e12;
     }
-    if (stamps && iters > 0) {
+    if (getenv("TSTAMPS") && stamps) {
+    // per-tile stamps of a persistent kernel (tstamps: words 11 .. 13 of the tile's wave record: tile top, after the K loop, after the epilogue): workgroup 0's tile sequence, wave 0 and wave 3
+    std::vector<unsigned> rec(dbg_bytes / 4);
+    HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));
+    const int ystep = persist ? persist / tx : 1;
+    for (int wv : {0, 3}) {
+        unsigned prev_end = 0;
+        for (int row = 0, k = 0; row < ty; row += ystep, ++k) {
+            const unsigned* r = &rec[(((size_t)row * 64 + 0) * 4 + wv) * 16];
+            if (!r[11]) continue;
+            printf("{\"tile\":{\"wave\":%d,\"k\":%d,\"row\":%d,\"top_to_loop_end\":%u,\"epilogue\":%u,\"gap_from_prev_end\":%d}}\n", wv, k, row, r[12] - r[11], r[13] - r[12], prev_end ? (int)(r[11] - prev_end) : -1);
+            prev_end = r[13];
+        }
+    }
+}
+if (stamps && iters > 0) {
         HC(hipDeviceSynchronize());
         std::vector<unsigned> rec(dbg_bytes / 4);
         HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));

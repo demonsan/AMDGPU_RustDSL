@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), tstamps: name.ends_with("_tst"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -662,6 +662,8 @@ pub struct RingOpts {
     pub carry: bool,
     /// the carry mode's epilogue (two 32-row bands deep through the consumed slot's A / B regions) without the carried stage (a measurement: the epilogue's share of the carry's cost)
     pub epi_rot: bool,
+    /// persistent only: per tile and wave three shader-clock stamps (tile top, after the K loop, after the epilogue) into the debug buffer (`dbg` @64: dwords 4 t .. 4 t + 2 of the wave's 64-byte record; host STAMPS=1, at most 4 tiles per workgroup)
+    pub tstamps: bool,
 }
 
 impl RingOpts {
@@ -673,8 +675,13 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
     }
+}
+
+fn cyc_now(b: &mut FnBuilder) -> ValueId {
+    let c = b.shader_cycles();
+    b.let_(Op::PtrLo(Opnd::Val(c)))
 }
 
 fn epi_carry_ok(epi: u8) -> bool {
@@ -704,7 +711,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     }
     b.arg("k", DType::I32, 40, 4);
     b.arg("n", DType::I32, 44, 4);
-    if ring.stamps {
+    if ring.stamps || ring.tstamps {
         b.arg("dbg", DType::Ptr, 64, 8);
         b.arg_tensor("dbg", (if ring.persistent { Ext::sym("TY") } else { Ext::grid_y() }) * Ext::c(64 * 4 * 64));
     }
@@ -795,7 +802,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // swap: the A operand reads the B matrix and its scales (and vice versa)
     assert!(!ring.swap || sh.cx * sh.cy == 1, "operand swap: no cluster");
     let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
-    let pdbg = if ring.stamps { ptr(&mut b, 64) } else { pc };
+    let pdbg = if ring.stamps || ring.tstamps { ptr(&mut b, 64) } else { pc };
     let t_start = if ring.stamps {
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
@@ -811,6 +818,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let clustered = cx * cy > 1;
     let mut persist_var: Option<amdgpu_dsl::VarId> = None;
     let mut first_var: Option<amdgpu_dsl::VarId> = None;
+    let mut tc_var: Option<amdgpu_dsl::VarId> = None;
     let mut ovl_vars: Option<(amdgpu_dsl::VarId, Vec<amdgpu_dsl::VarId>, Vec<amdgpu_dsl::VarId>)> = None;
     // the workgroup's tile coordinates and, in a cluster, its position inside the cluster (TTMP6[3:0] / [7:4]); in a cluster launch TTMP9 / TTMP7[15:0] are the CLUSTER ids
     let (wgx, wgy, wg_x, wg_y) = if clustered {
@@ -857,6 +865,11 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 inits.push((DType::Frag4, Opnd::Val(fz)));
             }
         }
+        let tc_idx = inits.len();
+        if ring.tstamps {
+            let z0 = b.c_i32(0);
+            inits.push((DType::I32, Opnd::Val(z0)));
+        }
         let first_idx = inits.len();
         if ring.carry {
             let one_c = b.c_i32(1);
@@ -866,6 +879,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         let vy = lv[0];
         if ring.carry {
             first_var = Some(lv[first_idx]);
+        }
+        if ring.tstamps {
+            tc_var = Some(lv[tc_idx]);
         }
         if ring.ovl > 0 {
             ovl_vars = Some((lv[1], lv[2..2 + sh.tn as usize].to_vec(), lv[2 + sh.tn as usize..].to_vec()));
@@ -1091,7 +1107,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
         let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, row_pad, scale_shuf: ring.scale_shuf };
+        let ts_a = if ring.tstamps { Some(cyc_now(b)) } else { None };
         pipe.run(b, role, &mut body);
+        let ts_b = if ring.tstamps { Some(cyc_now(b)) } else { None };
         let t_post = if ring.stamps {
             let c = b.shader_cycles();
             Some(b.let_(Op::PtrLo(Opnd::Val(c))))
@@ -1589,6 +1607,16 @@ for q in 0..8i32 {
             }
         }
         }
+        if let (Some(ta), Some(tb), Some(tcv)) = (ts_a, ts_b, tc_var) {
+            let tc_end = cyc_now(b);
+            let _ = tcv;
+            let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+            let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+            let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 11, ta);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 12, tb);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 13, tc_end);
+        }
         if let Some(tp) = t_post {
             let c = b.shader_cycles();
             let t_end = b.let_(Op::PtrLo(Opnd::Val(c)));
@@ -1618,6 +1646,10 @@ for q in 0..8i32 {
         if let Some(fv) = first_var {
             let zero_c = b.c_i32(0);
             b.set_var(fv, Opnd::Val(zero_c));
+        }
+        if let Some(tcv) = tc_var {
+            let n1 = b.bind_i32(amdgpu_dsl::varx(tcv) + 1);
+            b.set_var(tcv, Opnd::Val(n1));
         }
         let done = b.bind_cond(ev(ny).ge(ev(tyk)));
         b.break_if(done);

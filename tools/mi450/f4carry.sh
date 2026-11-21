@@ -12,12 +12,12 @@ for k in $KL; do
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s 2>/dev/null
 done
 run() { k=$1; sh=$2; case $k in *_persist*|*_carry*) export PERSIST=${PG:-256};; *) unset PERSIST;; esac
-  case $k in *stamps*) export STAMPS=1;; *) unset STAMPS;; esac
+  case $k in *stamps*|*_tst) export STAMPS=1 TSTAMPS=1;; *) unset STAMPS TSTAMPS;; esac
   [ -f $O/$k.co ] || return
-  raw=$(gpurun $O/own_host $O/$k.co $k $sh 256 256 128 2>&1); echo "$raw" | grep '"stamps' | cut -c1-600
+  raw=$(gpurun $O/own_host $O/$k.co $k $sh 256 256 128 2>&1); echo "$raw" | grep -E '"stamps|"tile' | cut -c1-600
   out=$(echo "$raw" | grep -E '^\{"host"|HANG|REFUSED|FAIL' | head -1)
   echo "$k $sh: $(echo "$out" | sed -E 's/.*"bad":([0-9]+),"maxrel":([0-9.e+-]+),"us":([0-9.]+),"tflops":([0-9.]+).*/bad=\1 us=\3 tflops=\4/')"; }
-for sh in ${SHAPES:-"2048 2048 2048 5:16" "8192 8192 8192 5:256"}; do pgs=${sh##*:}; sh=${sh%:*}; export PG=$pgs
+for sh in ${SHAPES:-"8192 8192 8192 3:256"}; do pgs=${sh##*:}; sh=${sh%:*}; export PG=$pgs
   for r in 1 2; do for k in $KL; do run $k "$sh"; done; done
 done
 
