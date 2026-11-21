@@ -527,8 +527,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if ipf {
         // MODE.SCALAR_PREFETCH_EN first: the prefetches are NOPs without it (the vendor kernels set it the same way)
         b.enable_scalar_prefetch();
-        // read MODE back (as the vendor kernels do after the setreg): the prefetches below issue after the mode change has taken effect
-        let _mode = b.let_(Op::SysVal { op: amdgpu_dsl::SysValOp::GetReg, imm: 1 | (31 << 11) });
         // the first 16 KB (prologue, the page loop); later windows are fetched where their code starts. A prefetch past the end of the code
         // can fault (an unmapped page): only windows that are known to lie inside the code are requested
         let pc = b.get_pc();
