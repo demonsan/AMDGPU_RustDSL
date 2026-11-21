@@ -35,6 +35,14 @@ pub fn tgt() -> &'static Target {
     cur()
 }
 
+/// The scheduler's latency model target (AMDC_T950_LAT: the gfx950 latencies, A/B).
+pub fn tgt_lat() -> &'static Target {
+    if std::env::var("AMDC_T950_LAT").is_ok() {
+        return T;
+    }
+    tgt()
+}
+
 /// A gfx950 wait-state rule of the SHARED hazard pass, in wait states: the rule of the current target when it describes it; gfx1250
 /// interlocks those dependencies (its software hazards are target/gfx1250/hazards.rs, and the gfx1250 emitter drops the shared pass's
 /// `s_nop`s), so there it is 0. (`AMDC_T950_COMPAT`: the gfx950 value, A/B only.)

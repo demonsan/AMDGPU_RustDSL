@@ -31,11 +31,11 @@ use crate::mir::*;
 
 #[allow(non_snake_case)]
 pub fn SLOT_CYCLES() -> u32 {
-    crate::target::tgt().latency.slot_cycles
+    crate::target::tgt_lat().latency.slot_cycles
 }
 #[allow(non_snake_case)]
 pub fn SLOT_BUDGET() -> u32 {
-    crate::target::tgt().latency.slot_budget
+    crate::target::tgt_lat().latency.slot_budget
 }
 /// Register-pressure cap: a floater never moves more than this many slots (MFMAs) above its source position.
 pub const HOIST_SLOTS: usize = 40;
@@ -44,7 +44,7 @@ pub const HOIST_SLOTS: usize = 40;
 /// 512 cycles: swept 8..32 slots on GEMM v4 (9 alternating rounds, docs/slotfill.md): flat for 12..24 (3011..3026 TF/s vs hand 3002), 2969 at 32.
 #[allow(non_snake_case)]
 pub fn DMA_LATENCY_CYCLES() -> u32 {
-    crate::target::tgt().latency.dma_latency_cycles
+    crate::target::tgt_lat().latency.dma_latency_cycles
 }
 #[allow(non_snake_case)]
 pub fn DMA_SLOTS() -> usize {
