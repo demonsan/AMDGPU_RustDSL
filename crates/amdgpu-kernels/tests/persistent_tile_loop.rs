@@ -34,10 +34,9 @@ fn kernel(declared: bool, drain: bool, fence: bool) -> Function {
     let mut acc = b.c_i32(0);
     for i in 0..2usize {
         b.tile_consume("ring", Opnd::I32(i as i32), Opnd::I32(0));
-        let x = b.load_lds(Opnd::Val(a), MemTy::B32);
+        // (both reads inside the consumed slot: the slot-0 address under the slot-1 marker escaped it, GV-TILE-ESCAPE)
         let xo = b.let_(Op::AddI32(Opnd::Val(a), Opnd::I32((i * 512) as i32)));
         let y = b.load_lds(Opnd::Val(xo), MemTy::B32);
-        acc = b.add_i32(acc, x);
         acc = b.add_i32(acc, y);
         b.tile_end();
     }
