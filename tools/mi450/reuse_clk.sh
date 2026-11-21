@@ -8,7 +8,7 @@ cargo build --release --bin amdc -j 64 2>&1 | grep -E "^error" | head -3
 A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 -I tests/gpu tests/gpu/g1250_f4own_host.cpp -o $O/own_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 B=gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles
-KS="${B}_c4x4_lock_persist_carry ${B}_stamps"
+KS=${KS:-"${B}_c4x4_lock_persist_carry ${B}_stamps"}
 for k in $KS; do
   $A emit $k --target gfx1250 --backend=own --out $O/$k.a.s > /dev/null 2>&1 || { echo "EMIT-FAIL $k"; exit 4; }
   AMDC_WMMA_REUSE=1 $A emit $k --target gfx1250 --backend=own --out $O/$k.b.s > /dev/null 2>&1 || { echo "EMIT-FAIL $k"; exit 4; }
@@ -22,7 +22,7 @@ run() { k=$1; v=$2; unset CLUSTER STAMPS
   case $k in *c4x4*) export CLUSTER=4,4;; esac
   case $k in *stamps*) export STAMPS=1;; esac
   rm -f $O/smi.txt
-  ( for i in $(seq 1 400); do amd-smi metric -g $IDLE_GPU -c -p 2>/dev/null | grep -E "SOCKET_POWER|^\s+CLK:" | head -2 | tr '\n' ' '; echo; sleep 0.05; done > $O/smi.txt ) &
+  ( for i in $(seq 1 4000); do amd-smi metric -g $IDLE_GPU -c -p 2>/dev/null | grep -E "SOCKET_POWER|^\s+CLK:" | head -2 | tr '\n' ' '; echo; sleep 0.05; done > $O/smi.txt ) &
   sp=$!
   raw=$(gpurun $O/own_host $O/$k.$v.co $k 8192 8192 8192 $REPS 256 256 128 2>&1)
   kill $sp 2>/dev/null; wait $sp 2>/dev/null
@@ -30,7 +30,7 @@ run() { k=$1; v=$2; unset CLUSTER STAMPS
   ghz=$(echo "$raw" | grep -oE '"est_ghz":[0-9.]+' | head -1 | cut -d: -f2)
   us=$(echo "$out" | grep -oE '"us":[0-9.]+' | cut -d: -f2); bad=$(echo "$out" | grep -oE '"bad":[0-9]+' | cut -d: -f2)
   # the samples while busy (clock below the idle max and power above idle): median clock / power
-  smi=$(awk '{for(i=1;i<=NF;i++){if($i=="SOCKET_POWER:")p=$(i+1); if($i=="CLK:")c=$(i+1)} if(p>0&&c>0) print c, p}' $O/smi.txt | sort -n | awk '{c[NR]=$1; p[NR]=$2} END{if(NR) printf "smi_mhz_med=%s smi_w_med=%s n=%d", c[int((NR+1)/2)], p[int((NR+1)/2)], NR}')
+  smi=$(awk '{for(i=1;i<=NF;i++){if($i=="SOCKET_POWER:")p=$(i+1); if($i=="CLK:")c=$(i+1)} if(p>0&&c>0) print c, p}' $O/smi.txt | awk '$2 > 1300' | sort -n | awk '{c[NR]=$1; p[NR]=$2} END{if(NR) printf "smi_mhz_med=%s smi_w_med=%s n=%d", c[int((NR+1)/2)], p[int((NR+1)/2)], NR}')
   cyc=""; [ -n "$ghz" ] && [ -n "$us" ] && cyc=$(awk -v g=$ghz -v u=$us 'BEGIN{printf "%.0f", g*u*1000}')
   echo "$k [$v]: bad=$bad us=$us est_ghz=${ghz:--} cycles=${cyc:--} $smi"
 }
