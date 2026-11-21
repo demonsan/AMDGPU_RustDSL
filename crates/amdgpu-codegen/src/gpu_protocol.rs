@@ -1826,7 +1826,7 @@ fn check_pair(f: &Function, traces: &[&Trace], n: usize, diags: &mut Vec<(&'stat
     }
     // the carry form: a carried stage (the next tile's first) must survive to the end of the body: no later access of its bytes by any wave
     // (this tile's own reads / writes of the slot or of a tile reusing its storage), whatever the barriers - the next tile reads it
-    for c in infos.iter().filter(|x| x.ev.carried) {
+    for (ci, c) in infos.iter().enumerate().filter(|(_, x)| x.ev.carried) {
         let rc = range(&c.ev);
         for x in infos.iter() {
             if std::ptr::eq(x, c) || x.ev.global || x.ev.carried {
