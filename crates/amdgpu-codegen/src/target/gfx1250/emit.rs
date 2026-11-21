@@ -322,15 +322,18 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
             Term::Endpgm => out.push_str("    s_endpgm\n"),
         }
     }
-    // operand reuse, opt-in (kd entry `wmma_reuse` = 1 or `AMDC_WMMA_REUSE`; measured neutral on the MXFP4 GEMM, a08-1): a WMMA whose very
-    // next instruction is a WMMA reading the same A (B) registers tells the matrix core to keep them (`matrix_a_reuse` / `matrix_b_reuse`,
-    // as the vendor kernels do). Not in exact mode (the author's bits).
-    if !m.exact && (kdv("wmma_reuse").unwrap_or(0) != 0 || std::env::var("AMDC_WMMA_REUSE").is_ok()) {
-        out = wmma_reuse(&out);
-    }
     // mode 2: the waits of the emitter's own multi-instruction expansions (invisible to the MIR plan), completed on the text
     if !m.exact && super::mode2_enabled(m) {
         out = crate::gpu_verify_1250::mode2_complete(&out);
+    }
+    // operand reuse, default on (kd entry `wmma_reuse` = 0 or `AMDC_NO_WMMA_REUSE` turn it off): a WMMA whose very next instruction is a
+    // WMMA of the same opcode reading the same A (B) register text - no line in between, so no window change and no write between -
+    // tells the matrix core to keep them (`matrix_a_reuse` / `matrix_b_reuse`, as the vendor kernels do; LLVM exposes the bits as operands
+    // of the WMMA intrinsics). After the mode-2 completion, so no inserted wait can separate a flagged pair. Not in exact mode (the
+    // author's bits). Measured (e08, 2026-11-21, paired): the persistent-cluster GEMM 8192^3 -0.4 % us in 3 of 3 short-run pairs, neutral
+    // under sustained load at the power cap (2.5 kW, ~1.52 GHz either way); the MLA has no adjacent WMMA pair.
+    if !m.exact && kdv("wmma_reuse").unwrap_or(1) != 0 && std::env::var("AMDC_NO_WMMA_REUSE").is_err() {
+        out = wmma_reuse(&out);
     }
     // the packed lookup-table converts: a safe instruction must issue right after each (public LLVM fixVPermPk16Hazard): a `v_nop` unless
     // the next instruction in program order is one (G5 GV-1250-PERMPK16 checks the result)
