@@ -584,16 +584,58 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         }
         vregs = Vec::new();
     }
+    // `ralru` / AMDC_RA_LRU (mode 2): a load destination takes the free register range freed LONGEST ago instead of the lowest one, so a
+    // load rarely overwrites a register a matrix op issued just before still reads (each such write-after-read is a `s_wait_alu` that drains
+    // the matrix queue in mode 2). Per VGPR: the interval end at which it was last freed (0: never used).
+    let lru = (m.ra_lru || std::env::var("AMDC_RA_LRU").is_ok()) && std::env::var("AMDC_NO_RA_LRU").is_err();
+    let load_defs: HashSet<VReg> = if lru {
+        m.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| {
+                let e = crate::sched::effects::effects(m, i);
+                e.mem.is_some() && !e.writes.is_empty()
+            })
+            .filter_map(|i| i.dst.map(|d| m.canon(d)))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut freed_at: Vec<usize> = vec![0; used_v.len()];
     for (s, e, r, c) in vregs {
         active.retain(|(ae, ar, ac)| {
             if *ae < s {
+                if ac.is_vector() && phys[*ar as usize] != u32::MAX {
+                    let p0 = phys[*ar as usize] as usize;
+                    for k in p0..(p0 + ac.dwords() as usize).min(freed_at.len()) {
+                        freed_at[k] = *ae;
+                    }
+                }
                 free_phys(&mut used_v, &mut used_s, phys[*ar as usize], *ac);
                 false
             } else {
                 true
             }
         });
-        let slot = if low_only.contains(&r) {
+        let lru_pick = |used: &[bool], c: RClass, base: usize| -> Option<usize> {
+            let width = c.dwords() as usize;
+            let lo = if width == 1 { V_RESERVED } else { width };
+            let mut best: Option<(usize, usize)> = None;
+            let mut i = lo.max(base) - base;
+            while i + width <= used.len() {
+                if (i + base) % width == 0 && (0..width).all(|k| !used[i + k]) {
+                    let age = (0..width).map(|k| freed_at[base + i + k]).max().unwrap_or(0);
+                    if best.map_or(true, |(_, a)| age < a) {
+                        best = Some((i + base, age));
+                    }
+                }
+                i += 1;
+            }
+            best.map(|b| b.0)
+        };
+        let slot = if lru && load_defs.contains(&r) && !low_only.contains(&r) && !plan.active && !(wide_high && acc.contains(&r)) {
+            lru_pick(&used_v, c, 0)
+        } else if low_only.contains(&r) {
             find_slot(&used_v[..256.min(used_v.len())], c, false)
         } else if wide_high && acc.contains(&r) {
             find_slot(&used_v[256..], c, false).map(|x| x + 256).or_else(|| find_slot(&used_v, c, singles_from_top))

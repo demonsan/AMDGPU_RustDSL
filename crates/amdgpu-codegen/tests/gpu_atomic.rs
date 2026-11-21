@@ -83,7 +83,7 @@ fn mfunc(blocks: Vec<(Vec<MInst>, Term)>, classes: Vec<RClass>) -> MFunction {
         vregs: classes,
         loops: Vec::new(),
         alias: Default::default(),
-        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false, mode2: false,
+        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false, mode2: false, ra_lru: false,
         agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }
