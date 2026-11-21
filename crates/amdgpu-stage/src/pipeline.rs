@@ -105,6 +105,12 @@ pub trait PipeBody {
     /// `OneWindow`: the ring depth the driver runs with (`Pipeline::slots`), told to the body before anything is emitted: a body that waits for "all but the stages still in flight" needs it
     /// (`slots - 2` stages stay in flight at the end of a window).
     fn set_ring_depth(&mut self, _slots: u8) {}
+    /// The prologue's stage of tile 0 into `slot` (default: `stage` of key 0). A body in carry mode (`Pipeline::carry`) issues it only for the first output tile of a persistent loop: later tiles find it already in flight.
+    fn stage_tile0(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx) {
+        self.stage(b, role, &I32::c(0), slot);
+    }
+    /// Carry mode, `OneWindow`: at the start of the peeled last window, the free slot receives the first stage of the NEXT output tile (the tile loop's back edge then equals the state after its prologue).
+    fn stage_next_tile(&mut self, _b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {}
     /// After the pipeline's last window: drain what the stages left in flight (the last steady iteration stages a clamped tile nothing waits for). A body whose stages are asynchronous writes
     /// into LDS (tensor loads) must wait for them here: a wave must not end with a copy into LDS outstanding (`GV-1250-TDM-DRAIN`).
     fn finish(&mut self, _b: &mut FnBuilder, _role: Role) {}
@@ -153,12 +159,14 @@ pub struct Pipeline {
     /// `OneWindow`: issue the prologue's stages back to back and wait only for tile 0 (`PipeBody::stage_complete_keep`): one serialized memory round trip fewer before the loop. The later
     /// prologue tiles are completed by the end of the first window, which waits for everything older than the stage it issued.
     pub lazy_prologue: bool,
+    /// `OneWindow`: a persistent tile loop whose tile body starts with its first stage already in flight and ends by issuing the next tile's first stage in the peeled last window (`PipeBody::stage_tile0`, `stage_next_tile`)
+    pub carry: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false, carry: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -191,7 +199,7 @@ impl Pipeline {
         };
         // ---- prologue ----
         let s0 = SlotIdx::new(0, 0);
-        body.stage(b, role, &I32::c(0), &s0);
+        body.stage_tile0(b, role, &s0);
         let lazy = self.lazy_prologue && self.cadence == Cadence::OneWindow;
         if self.cadence != Cadence::RegStaged && !lazy {
             // (RegStaged bodies do not use stage_complete: tile 0 completes at the prologue wait, overlapped with the stores)
@@ -553,6 +561,10 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
+                if !staged && self.carry {
+                    // the peeled last window: the free slot (the one the previous window read) takes the first stage of the next output tile
+                    body.stage_next_tile(b, role, &t.next);
+                }
                 let n2 = t.n2.clone().expect("n2");
                 // rotated weave: the staging of tile t+2 and its completion run two iterations ahead (`iter` +2)
                 let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };

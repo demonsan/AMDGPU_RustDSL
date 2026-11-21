@@ -215,7 +215,35 @@ int main(int argc, char** argv) {
         us = 1000.0 * ms / iters;
         tflops = 2.0 * M * N * K / (us * 1e-6) / 1e12;
     }
-    if (stamps && iters > 0) {
+    if (getenv("TSTAMPS") && stamps) {
+    // per-tile stamps of a persistent kernel (tstamps: words 11 .. 13 of the tile's wave record: tile top, after the K loop, after the epilogue): workgroup 0's tile sequence, wave 0 and wave 3
+    std::vector<unsigned> rec(dbg_bytes / 4);
+    HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));
+    const int ystep = persist ? persist / tx : 1;
+    {
+        // every workgroup (wave 0): first tile top to last tile end, the distribution over the workgroups; and the first tile's top-to-loop-end
+        std::vector<long> tot, first, lastloop, setup;
+        const int nt = ty / ystep;
+        for (int r0 = 0; r0 < ystep; ++r0) for (int c = 0; c < tx; ++c) {
+            const unsigned* f = &rec[(((size_t)r0 * 64 + c) * 4 + 0) * 16];
+            const unsigned* l = &rec[((((size_t)(r0 + (nt - 1) * ystep)) * 64 + c) * 4 + 0) * 16];
+            if (!f[11] || !l[13]) continue;
+            setup.push_back((long)(f[11] - l[14])); tot.push_back((long)(l[13] - f[11])); first.push_back((long)(f[12] - f[11])); lastloop.push_back((long)(l[12] - l[11]));
+        }
+        auto pct = [](std::vector<long> v, double p) { std::sort(v.begin(), v.end()); return v.empty() ? 0L : v[(size_t)(p * (v.size() - 1))]; };
+        printf("{\"tile_dist\":{\"wgs\":%zu,\"total_min\":%ld,\"total_med\":%ld,\"total_max\":%ld,\"first_loop_med\":%ld,\"last_loop_med\":%ld,\"last_loop_max\":%ld,\"setup_med\":%ld,\"start_to_end_med\":%ld}}\n", tot.size(), pct(tot, 0), pct(tot, 0.5), pct(tot, 1), pct(first, 0.5), pct(lastloop, 0.5), pct(lastloop, 1), pct(setup, 0.5), pct(setup, 0.5) + pct(tot, 0.5));
+    }
+    for (int wv : {0, 3}) {
+        unsigned prev_end = 0;
+        for (int row = 0, k = 0; row < ty; row += ystep, ++k) {
+            const unsigned* r = &rec[(((size_t)row * 64 + 0) * 4 + wv) * 16];
+            if (!r[11]) continue;
+            printf("{\"tile\":{\"wave\":%d,\"k\":%d,\"row\":%d,\"top_to_loop_end\":%u,\"epilogue\":%u,\"gap_from_prev_end\":%d}}\n", wv, k, row, r[12] - r[11], r[13] - r[12], prev_end ? (int)(r[11] - prev_end) : -1);
+            prev_end = r[13];
+        }
+    }
+}
+if (stamps && iters > 0) {
         HC(hipDeviceSynchronize());
         std::vector<unsigned> rec(dbg_bytes / 4);
         HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));

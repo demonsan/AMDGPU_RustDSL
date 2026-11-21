@@ -80,7 +80,18 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     // the LDS tile protocol (gpu_protocol: completion incl. the tensor operations' TENSORcnt, publication by barriers, slot reuse) of the
     // kernel's declared tiles / rings
     let proto = crate::gpu_verify::verify_ir_protocol(f);
-    let errs: Vec<String> = proto.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
+    // (`AMDC_TILE_PROTO_WARN`: the tile-protocol DATA-RACE findings `GV-TILE-*` are printed and the compile continues, to measure a schedule whose protocol extension is still to be written; every other finding,
+    // and all the hang rules (`gpu_verify_1250::enforce`, the bounds, the waits), stay errors. Never for code that is shipped.)
+    let warn_tile = std::env::var("AMDC_TILE_PROTO_WARN").is_ok();
+    let mut errs: Vec<String> = Vec::new();
+    for e in proto.errors().iter() {
+        let line = format!("[{}] {}", e.code, e.msg);
+        if warn_tile && e.code.starts_with("GV-TILE-") {
+            eprintln!("warning: (AMDC_TILE_PROTO_WARN) {}: {}", f.name, line);
+        } else {
+            errs.push(line);
+        }
+    }
     if !errs.is_empty() {
         return Err(format!("{}: tile protocol: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
     }
