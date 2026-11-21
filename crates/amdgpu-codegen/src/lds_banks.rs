@@ -130,6 +130,20 @@ impl<'a> Ev<'a> {
                 A::K(v, u) => A::K(v.iter().map(|x| w(x + *k as i64)).collect(), u),
                 A::X => A::X,
             },
+            // a select between two values with the same lane pattern (up to a uniform shift: e.g. the two slots' bases) keeps the pattern;
+            // a wave-uniform condition between different patterns, or a lane-dependent one, does not
+            Op::Select { cond, a, b, .. } => match (self.opnd(a), self.opnd(b)) {
+                (A::K(p, _), A::K(q, _)) => {
+                    let d = q[0] - p[0];
+                    if p.iter().zip(&q).all(|(x, y)| y - x == d) {
+                        let _ = cond;
+                        A::K(p, d != 0 || true)
+                    } else {
+                        A::X
+                    }
+                }
+                _ => A::X,
+            },
             Op::AddI32(a, b) => self.bin(a, b, &|x, y| w(x + y), true, false),
             Op::MulI32(a, b) => self.bin(a, b, &|x, y| w(x * y), false, true),
             Op::ShlI32(a, b) => {
