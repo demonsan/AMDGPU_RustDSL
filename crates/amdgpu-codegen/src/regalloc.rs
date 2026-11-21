@@ -1686,16 +1686,19 @@ impl Plan {
 pub fn check_workgroup_budget(m: &crate::mir::MFunction, a: &Alloc) -> Result<(), String> {
     let n_agpr = agpr_count(m, a);
     let (_, total, _) = unified_budget(a.max_v, n_agpr);
-    let t = crate::target::T;
+    // (the CURRENT target: the compile-time default is gfx950 - wave64, a 512-entry unified file - which made a gfx1250 kernel over 512
+    // VGPRs look unlaunchable and pushed the scheduled path into its unscheduled fallback)
+    let t = crate::target::cur();
     let (g, simds) = match &t.regs.unified {
         Some(u) => (u.total_granule, u.simds),
         None => (t.regs.vgpr.alloc_granule, 4),
     };
+    let file = if t.regs.unified.is_some() { crate::target::unified_total(t) } else { t.regs.vgpr.count };
     let lanes = t.wave.lanes;
     let per_wave = (total + g - 1) / g * g;
     let waves = (m.workgroup_size + lanes - 1) / lanes;
     let per_simd = ((waves + simds - 1) / simds).max(1);
-    let limit = UNIFIED_FILE / per_simd / g * g;
+    let limit = file / per_simd / g * g;
     if per_wave > limit {
         return Err(format!(
             "register budget: workgroup_size {} = {waves} waves -> {per_simd} per SIMD, so each wave may use at most {limit} registers (VGPR + AGPR, \
