@@ -8,6 +8,7 @@ pub mod check;
 pub mod cse;
 pub mod dse;
 pub mod vopd;
+pub mod msbgroup;
 pub mod emit;
 pub mod hazards;
 pub mod matorder;
@@ -101,6 +102,14 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
         let errs: Vec<String> = g.errors().iter().filter(|e| e.code.starts_with("GV-GLB") || e.code.starts_with("GV-TDM") || e.code.starts_with("GV-LDS") || e.code == "GV-TILE-ESCAPE" || e.code == "GV-TILE-PRIVATE-ESCAPE" || e.code == "GV-TILE-UNTAGGED-OVERLAP").map(|e| format!("[{}] {}", e.code, e.msg)).collect();
         if !errs.is_empty() {
             return Err(format!("{}: gfx1250 global / tensor bounds: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
+        }
+    }
+    // VGPR-window grouping (opt-in `msbgroup` / AMDC_MSB_GROUP): fewer s_set_vgpr_msb switches; before the wait / hazard plans (they read this order)
+    let mut m = m;
+    if backend == "own" {
+        let (nb, saved) = msbgroup::group(&mut m, &alloc);
+        if nb > 0 && std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
+            eprintln!("{}: msbgroup: {nb} block(s) reordered, {saved} window switch(es) saved", f.name);
         }
     }
     // the static LDS bank-conflict report (lds_banks.rs): a warning per access above WARN_WAYS ways (`AMDC_NO_BANK_WARN` silences it)
