@@ -485,7 +485,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) ->
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
@@ -713,14 +713,16 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.arg("n", DType::I32, 44, 4);
     if ring.stamps || ring.tstamps {
         b.arg("dbg", DType::Ptr, 64, 8);
-        b.arg_tensor("dbg", (if ring.persistent { Ext::sym("TY") } else { Ext::grid_y() }) * Ext::c(64 * 4 * 64));
+        b.arg_tensor("dbg", (if ring.persistent && sh.cx * sh.cy > 1 { Ext::sym("GYS") * Ext::sym("NR") } else if ring.persistent { Ext::sym("TY") } else { Ext::grid_y() }) * Ext::c(64 * 4 * 64));
     }
     let persistent = ring.persistent;
     if ring.roles && sh.cx * sh.cy > 1 {
         // the two role copies of the loop signal / wait the cluster barrier in different loops; both run nkv - 1 iterations by construction (a trusted, listed fact)
         b.barrier_wait_trips_match(-3);
     }
-    assert!(!(persistent && sh.cx * sh.cy > 1), "persistent: no cluster yet");
+    // persistent + cluster: the grid is (TX, GYS) work-groups in clusters of cx x cy; every work-group loops over the tile rows gy + k GYS (GYS a multiple of cy, TY = GYS NR rows in all): the 16 work-groups of a
+    // cluster run the same number of tiles, the cluster barrier at every tile start (after the previous tile's epilogue) keeps a peer's multicast out of an LDS still used for staging
+    assert!(!persistent || ring.slots == 2 || sh.cx * sh.cy == 1, "persistent cluster: the 2-slot ring");
     if persistent {
         // the outermost loop is the persistent tile loop (G5 verifies one tile body ending quiescent)
         b.persistent_tile_loop();
@@ -737,7 +739,17 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     b.sym_range("K128", (ring.slots as i64 - 1) * sh.ks as i64, 1 << 13);   // at least `slots - 1` K slots: the prologue stages tiles 0 .. slots - 2 as real tiles
     b.ka_is(40, Ext::sym("K128") * Ext::c(128));
     // (persistent: the tile counts are symbols TX / TY, N = TX * BN, kernarg tiles_y = TY; the grid is any number of workgroups)
-    let (m_rows, n_cols) = if persistent {
+    let (m_rows, n_cols) = if persistent && sh.cx * sh.cy > 1 {
+        b.sym_range("TX", 1, 1 << 12);
+        b.sym_range("GYS", 1, 1 << 12);
+        b.sym_range("NR", 1, 1 << 12);
+        b.grid_is(0, Ext::sym("TX"));
+        b.grid_is(1, Ext::sym("GYS"));
+        b.ka_is(44, Ext::sym("TX") * Ext::c(tile_n as i64));
+        b.ka_is(48, Ext::sym("GYS") * Ext::sym("NR"));
+        b.ka_is(56, Ext::sym("GYS"));
+        (Ext::sym("GYS") * Ext::sym("NR") * Ext::c(tile_m as i64), Ext::sym("TX") * Ext::c(tile_n as i64))
+    } else if persistent {
         b.sym_range("TX", 1, 1 << 12);
         b.sym_range("TY", 1, 1 << 12);
         b.ka_is(44, Ext::sym("TX") * Ext::c(tile_n as i64));
@@ -803,7 +815,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(!ring.swap || sh.cx * sh.cy == 1, "operand swap: no cluster");
     let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
     let pdbg = if ring.stamps || ring.tstamps { ptr(&mut b, 64) } else { pc };
-    let t_start = if ring.stamps || ring.tstamps {
+    let t_start = if ring.stamps {
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
     } else {
@@ -841,7 +853,34 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         b.assume_trusted(wy, Ext::c(0), Ext::c(cy as i64 - 1), "cluster position y < cluster dim y (TTMP6[7:4])");
         b.assume_trusted(gx, Ext::c(0), Ext::grid_x() - Ext::c(1), "tile x = cluster id x * cx + position < grid x (grid divisible by the cluster)");
         b.assume_trusted(gy, Ext::c(0), Ext::grid_y() - Ext::c(1), "tile y = cluster id y * cy + position < grid y (grid divisible by the cluster)");
-        (gx, gy, wx, wy)
+        if persistent {
+            // the tile loop: this work-group's tile rows gy, gy + GYS, .. (< TY = GYS NR)
+            let mut cinits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(gy))];
+            let tc_i = cinits.len();
+            if ring.tstamps {
+                let z0 = b.c_i32(0);
+                cinits.push((DType::I32, Opnd::Val(z0)));
+            }
+            let fi = cinits.len();
+            if ring.carry {
+                let one_c = b.c_i32(1);
+                cinits.push((DType::I32, Opnd::Val(one_c)));
+            }
+            let lv = b.begin_loop(&cinits);
+            let vy = lv[0];
+            if ring.tstamps {
+                tc_var = Some(lv[tc_i]);
+            }
+            if ring.carry {
+                first_var = Some(lv[fi]);
+            }
+            persist_var = Some(vy);
+            let gyc = b.let_(Op::AddI32(Opnd::Var(vy), Opnd::I32(0)));
+            b.assume(gyc, Ext::c(0), Ext::sym("GYS") * Ext::sym("NR") - Ext::c(1));
+            (gx, gyc, wx, wy)
+        } else {
+            (gx, gy, wx, wy)
+        }
     } else if persistent {
         // tile column w & (TX - 1), first row w >> log2 TX; the row loop opens here and closes after the epilogue
         let wid = b.let_(Op::WorkgroupIdX);
@@ -1616,9 +1655,13 @@ for q in 0..8i32 {
             let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
             let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
             b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 11, ta);
-            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 12, tb);
+            if !ring.carry {
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 12, tb);
+            } else {
+                let _ = tb;   // (carry: two stamps only, the scalar budget is full)
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 12, ta);
+            }
             b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 13, tc_end);
-            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 14, t_start);
         }
         if let Some(tp) = t_post {
             let c = b.shader_cycles();

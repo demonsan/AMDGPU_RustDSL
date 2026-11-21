@@ -150,6 +150,10 @@ int main(int argc, char** argv) {
     for (int stage = 0; stage < 2; ++stage) {
         unsigned gx = stage == 0 ? g_cx : N / BN, gy = stage == 0 ? g_cy : M / BM;
         if (persist) { gx = stage == 0 ? tx : persist; gy = 1; ka.ystep = gx / tx; }
+        if (persist && g_cx * g_cy > 1) {   // a persistent cluster: a (TX, GYS) grid, GYS a multiple of the cluster rows dividing the tile rows
+            gx = tx; gy = stage == 0 ? g_cy : persist / tx; ka.ystep = gy;
+            if (gy % g_cy || ty % gy) { fprintf(stderr, "LAUNCH-REFUSED: persistent cluster: GYS=%u must be a multiple of %d and divide the tile rows %d\n", gy, g_cy, ty); return 2; }
+        }
         if (stage == 1 && gx == 1 && gy == 1) break;
         hipEvent_t e;
         HC(hipEventCreate(&e));
@@ -205,6 +209,7 @@ int main(int argc, char** argv) {
         HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
         unsigned gx = N / BN, gy = M / BM;
         if (persist) { gx = persist; gy = 1; ka.ystep = persist / tx; }
+        if (persist && g_cx * g_cy > 1) { gx = tx; gy = persist / tx; ka.ystep = gy; }   // a persistent cluster: a (TX, GYS) grid
         for (int w = 0; w < 3; ++w) HC(launch(fn, gx, gy, THR, cfg));
         HC(hipEventRecord(e0, nullptr));
         for (int i = 0; i < iters; ++i) HC(launch(fn, gx, gy, THR, cfg));
