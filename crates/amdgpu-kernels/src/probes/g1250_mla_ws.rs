@@ -110,6 +110,8 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 /// text by G5 (GV-1250-MODE2-WAIT); e08: `_ws` -1 .. -3 %, `_ws2` -1 %, `_ws4` -0.5 %, bit-identical outputs
 fn with_mode2(mut f: Function) -> Function {
     f.lower_opts.push("mode2".into());
+    // fragment loads into the least recently freed registers (fewer mode-2 WAR waits on WMMA operands; 1 wave / SIMD: the whole file is free): -1 .. -4 %
+    f.lower_opts.push("ralru".into());
     f
 }
 
