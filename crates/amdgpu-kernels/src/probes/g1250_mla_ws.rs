@@ -60,6 +60,46 @@ fn packed_row_ptrs(b: &mut FnBuilder, pr: ValueId, bidx: ValueId, g: ValueId, m:
     (odd, prs)
 }
 
+/// 8-byte form: a 4 x 4 transpose inside each lane quad (DPP xor 1 on f32, then xor 2 on the packed bf16 pairs); lane m stores row
+/// 8 g + 4 q + (m & 1) + 2 ((m >> 1) & 1), dims col0 + (m & 12) .. + 3. `prs[q]` (q = 0, 1) from `packed8_row_ptrs`.
+fn store_rows_packed8(b: &mut FnBuilder, y: &[ValueId], odd: ValueId, hi2: ValueId, prs: &[ValueId], off: u32) {
+    for q in 0..2usize {
+        let mut u = Vec::new();
+        for s in 0..2usize {
+            let (r0, r1) = (y[4 * q + 2 * s], y[4 * q + 2 * s + 1]);
+            let send = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(r0), b: Opnd::Val(r1) });
+            let sb = b.let_(Op::BitcastI32(Opnd::Val(send)));
+            let rv = b.let_(Op::DppQuadPerm { x: Opnd::Val(sb), perm: [1, 0, 3, 2] });
+            let rvf = f32_of(b, rv);
+            let lo = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(rvf), b: Opnd::Val(r0) });
+            let hi = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(r1), b: Opnd::Val(rvf) });
+            u.push(b.cvt_pk_bf16_f32(lo, hi));
+        }
+        // u[0]: row 4 q + par, u[1]: row 4 q + 2 + par (dims (m & 14) ..); swap with lane m ^ 2
+        let send = b.let_(Op::Select { ty: DType::U32, cond: Opnd::Val(hi2), a: Opnd::Val(u[0]), b: Opnd::Val(u[1]) });
+        let rv = b.let_(Op::DppQuadPerm { x: Opnd::Val(send), perm: [2, 3, 0, 1] });
+        let w0 = b.let_(Op::Select { ty: DType::U32, cond: Opnd::Val(hi2), a: Opnd::Val(rv), b: Opnd::Val(u[0]) });
+        let w1 = b.let_(Op::Select { ty: DType::U32, cond: Opnd::Val(hi2), a: Opnd::Val(u[1]), b: Opnd::Val(rv) });
+        let v = b.frag_cat(&[Opnd::Val(w0), Opnd::Val(w1)]);
+        b.store_global(prs[q], off, v, MemTy::B64, false);
+    }
+}
+
+fn packed8_row_ptrs(b: &mut FnBuilder, pr: ValueId, bidx: ValueId, g: ValueId, m: ValueId, col0: amdgpu_dsl::I32) -> (ValueId, ValueId, Vec<ValueId>) {
+    let par = b.bind_i32(ev(m) & 1);
+    let odd = b.cmp(CmpPred::Eq, CmpTy::I32, par, Opnd::I32(1));
+    let b2 = b.bind_i32((ev(m) >> 1) & 1);
+    let hi2 = b.cmp(CmpPred::Eq, CmpTy::I32, b2, Opnd::I32(1));
+    let base = b.bind_i32((ev(bidx) * 16 + ev(g) * 8 + ev(par) + ev(b2) * 2) * 1024 + (col0 + (ev(m) & 12)) * 2);
+    let prs = (0..2i32)
+        .map(|q| {
+            let o = b.bind_i32(ev(base) + q * 4096);
+            b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
+        })
+        .collect();
+    (odd, hi2, prs)
+}
+
 fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
 }
@@ -452,6 +492,10 @@ pub fn mla_g1250_qh16_ws4K() -> Function {
 
 pub fn mla_g1250_qh16_ws2K() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2K", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34), false))
+}
+
+pub fn mla_g1250_qh16_ws4K8() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4K8", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35), false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -1409,7 +1453,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
             // (bit 29) no LDS staging, no barrier: every lane stores its 64 bf16 values straight to R (row 8 g + r, dim db + 16 nt + m)
             if branchless & (1u64 << 34) != 0 {
                 // (bit 34) 4-byte stores: lane pairs m, m ^ 1 swap one row of each row pair
+                let p8 = branchless & (1u64 << 35) != 0;
                 let (odd, prs) = packed_row_ptrs(&mut b, pr, bidx, g, m, ev(db));
+                let (odd8, hi2, prs8) = packed8_row_ptrs(&mut b, pr, bidx, g, m, ev(db));
                 for nt in 0..ntw {
                     let y: Vec<ValueId> = (0..8u8)
                         .map(|r| {
@@ -1418,7 +1464,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                             b.mul_f32(ef, inv_r[r as usize])
                         })
                         .collect();
-                    store_rows_packed(&mut b, &y, odd, &prs, 32 * nt as u32);
+                    if p8 {
+                        store_rows_packed8(&mut b, &y, odd8, hi2, &prs8, 32 * nt as u32);
+                    } else {
+                        store_rows_packed(&mut b, &y, odd, &prs, 32 * nt as u32);
+                    }
                 }
             } else {
             let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
