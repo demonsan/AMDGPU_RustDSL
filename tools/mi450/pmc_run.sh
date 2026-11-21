@@ -24,11 +24,11 @@ fi
 OUT="$PMC_ROOT/$TAG"; mkdir -p "$OUT"
 N=$( (ls -d "$OUT"/pass_* 2>/dev/null || true) | wc -l); P="$OUT/pass_$(printf %03d "$N")"; mkdir -p "$P"
 case "$WHAT" in
-  list)  PROF="rocprofv3 --list-avail" ; APP="" ;;
-  trace) PROF="rocprofv3 --kernel-trace --stats --output-format csv -d $P -o run --" ; APP="$*" ;;
+  list)  PROF="/opt/rocm/bin/rocprofv3 --list-avail" ; APP="" ;;
+  trace) PROF="/opt/rocm/bin/rocprofv3 --kernel-trace --stats --output-format csv -d $P -o run --" ; APP="$*" ;;
   *)     # one pass: the counters as given (rocprofv3 refuses a set the hardware cannot count in one pass)
          for c in $WHAT; do case "$c" in *[!A-Za-z0-9_:\[\]=.-]*) echo "pmc_run: bad counter '$c'"; exit 2;; esac; done
-         PROF="rocprofv3 --pmc $WHAT --output-format csv -d $P -o run --" ; APP="$*" ;;
+         PROF="/opt/rocm/bin/rocprofv3 --pmc $WHAT --output-format csv -d $P -o run --" ; APP="$*" ;;
 esac
 [ "$WHAT" = list ] || [ -n "$APP" ] || { echo "pmc_run: no application"; exit 2; }
 echo "pmc_run: tag=$TAG gpu=$GPU pass=$(basename "$P") what='$WHAT'"
@@ -37,8 +37,8 @@ echo "$WHAT | $APP" > "$P/request.txt"
 gpu-lock timeout -s KILL $((PASS_TIMEOUT + 60)) docker run --rm --network none \
   --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES="$GPU" -e PROBE_WATCHDOG_S="${PROBE_WATCHDOG_S:-20}" -e CHECK_B -e CHECK_ROWS -e CLUSTER -e STAMPS -e PERSIST \
-  -u "$(id -u):$(id -g)" -v /data/blyu:/data/blyu -w "$PWD" "$IMAGE" \
-  bash -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP" 2>&1 | grep -vE '^\s*$' | tail -n 60 | tee "$P/log.txt"
+  -u "$(id -u):$(id -g)" -e HOME=/tmp -v /data/blyu:/data/blyu -w "$PWD" --entrypoint /bin/bash "$IMAGE" \
+  -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP" 2>&1 | grep -vE '^\s*$' | tail -n 60 | tee "$P/log.txt"
 rc=${PIPESTATUS[0]}
 du -sh "$P" | sed 's/^/pmc_run: output /'
 ls "$P" | sed 's/^/  /' | head -20
