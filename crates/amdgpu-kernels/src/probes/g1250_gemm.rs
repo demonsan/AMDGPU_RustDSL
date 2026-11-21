@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -660,6 +660,8 @@ pub struct RingOpts {
     /// body starts with its stage 0 already in flight), and the epilogue is staged through the CONSUMED slot only (32-row bands, two bands deep per wave, each wave's tensor store of band i drained
     /// by `wait_tensor(1)` before band i + 2 is staged), so the stores finish before the next tile's stage 1 reuses that slot
     pub carry: bool,
+    /// the carry mode's epilogue (two 32-row bands deep through the consumed slot's A / B regions) without the carried stage (a measurement: the epilogue's share of the carry's cost)
+    pub epi_rot: bool,
 }
 
 impl RingOpts {
@@ -671,7 +673,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false }
     }
 }
 
@@ -1056,7 +1058,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         let tyk_c = b.let_(Op::KernargI32 { offset: 48 });
         let nyr = b.bind_i32(amdgpu_dsl::varx(vy) + ev(ystep_c));
         let lastr = b.bind_i32(ev(tyk_c) - 1);
-        let gyn = b.bind_i32(ev(nyr).lt(ev(tyk_c)).select_i32(ev(nyr), ev(lastr)));
+        let mn = b.let_(Op::MinI32(Opnd::Val(nyr), Opnd::Val(lastr)));
+        let gyn = b.bind_i32(ev(mn).max(0));
         let row0n = b.mul_i32(gyn, Opnd::I32(tile_m));
         let row0wn = b.add_i32(row0n, rowa_w);
         let a_n = b.mul_i32(row0wn, pitch);
@@ -1313,7 +1316,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             }
             // wave block (wrows x wcols f32) row-major at wave * wrows * epi_rs, row stride epi_rs (+16 bytes: the two lane groups' rows 8
             // apart fall in different banks)
-            let wl0 = if ring.carry {
+            let wl0 = if ring.carry || ring.epi_rot {
                 // the consumed slot (nkv even: slot 1): waves 0, 1 stage into its A region, waves 2, 3 into its B region, two bands (32 rows x wcols f32) each
                 let a1 = ra.at(&SlotIdx::new(1, 1)).base();
                 let b1 = rb.at(&SlotIdx::new(1, 1)).base();
@@ -1342,7 +1345,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 let x = b.add_i32(x, orow);
                 b.add_i32(x, mh4)
             };
-            if (ring.epi_bands > 0 || ring.carry) && epi == 2 {
+            if (ring.epi_bands > 0 || ring.carry || ring.epi_rot) && epi == 2 {
                 // band i (rows 32 i .. 32 i + 31 of the wave block, 32 x wcols f32 contiguous in LDS): stage it, store it, stage the next while it drains
                 let r0 = b.mul_i32(wi, Opnd::I32(wrows));
                 let r0 = b.add_i32(r0, row0);
@@ -1353,13 +1356,13 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(2)));
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
-                let per = if ring.carry { 1 } else { sh.tm / ring.epi_bands as i32 };   // 32-row blocks per band
+                let per = if ring.carry || ring.epi_rot { 1 } else { sh.tm / ring.epi_bands as i32 };   // 32-row blocks per band
                 let tile = TensorTile { data_size: 4, tensor_dim: [Opnd::I32(wcols), Opnd::I32(32 * per)], stride0: Opnd::Val(nn), tile: [wcols as u16, (32 * per) as u16], pad: None, wg_mask: 0 };
                 for i in 0..sh.tm {
-                    if ring.carry && i >= 2 {
+                    if (ring.carry || ring.epi_rot) && i >= 2 {
                         b.wait_tensor(1);   // the store of band i - 2 (and, in order, the loads before it) is done: its LDS band is free
                     }
-                    let boff = if ring.carry { (i & 1) * 32 * epi_rs } else { i * 32 * epi_rs };
+                    let boff = if ring.carry || ring.epi_rot { (i & 1) * 32 * epi_rs } else { i * 32 * epi_rs };
                     let bi = b.add_i32(lb, Opnd::I32(boff));
                     for j in 0..sh.tn {
                         let acc = body.acc[(i * sh.tn + j) as usize];
@@ -1425,7 +1428,7 @@ for q in 0..8i32 {
                         let band_bytes = b.mul_i32(nn, Opnd::I32(32 * 4 * i0));
                         let org_i = b.add_i32(org_s, band_bytes);
                         let org_i = b.let_(Op::ReadFirstLane(Opnd::Val(org_i)));
-                        let lds_i = b.add_i32(wl0_s, Opnd::I32(if ring.carry { (i0 & 1) * 32 * epi_rs } else { i0 * 32 * epi_rs }));
+                        let lds_i = b.add_i32(wl0_s, Opnd::I32(if ring.carry || ring.epi_rot { (i0 & 1) * 32 * epi_rs } else { i0 * 32 * epi_rs }));
                         let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_i), Opnd::Val(lds_i));
                         b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
                     }
