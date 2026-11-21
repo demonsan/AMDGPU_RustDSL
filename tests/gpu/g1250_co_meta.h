@@ -105,11 +105,11 @@ static inline void g1250_check_launch(const char* path, const char* kname, size_
     }
 }
 // the operand layout: a kernel built for a pre-shuffled B matrix (metadata `.amdc_b_preshuffle: 1`) must get one, and a plain kernel must not (the result would be silently wrong)
-static inline void g1250_check_bpreshuf(const char* path, const char* kname, bool host_preshuf) {
+static inline void g1250_check_bpreshuf(const char* path, const char* kname, int host_mode) {
     const CoMeta m = co_meta(path, kname);
     if (m.kernarg < 0) return;
-    if ((m.bpre != 0) != host_preshuf) {
-        fprintf(stderr, "LAUNCH-REFUSED: kernel %s %s a pre-shuffled B matrix (rows 3 / 4 bits exchanged per 32-row block), the host %s one (BPRESHUF=1)\n", kname, m.bpre ? "needs" : "does not take", host_preshuf ? "passes" : "passes no");
+    if (m.bpre != host_mode) {
+        fprintf(stderr, "LAUNCH-REFUSED: kernel %s needs B pre-shuffle mode %ld (0 = none, 1 = rows 3 / 4 bits exchanged per 32-row block, 2 = also the block / lane-group order per 128 rows), the host passes mode %d (BPRESHUF=%ld)\n", kname, m.bpre, host_mode, m.bpre);
         _exit(2);
     }
 }

@@ -108,13 +108,21 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&dC, (size_t)M * N * (bf16 ? 2 : 4)));
     // BPRESHUF=1: the B matrix and its scales pre-shuffled for the swapped-operand kernels (the vendor's ABpreShuffle for the WMMA-A operand): bits 3 and 4 of the row index exchanged within every 32-row block;
     // the reference below keeps reading the original B / SB. A kernel declares it in its metadata (.amdc_b_preshuffle) and the launch is refused when kernel and host disagree.
-    const bool bpreshuf = getenv("BPRESHUF") != nullptr;
-    g1250_check_bpreshuf(argv[1], kn, bpreshuf);
+    const int bpremode = getenv("BPRESHUF") ? atoi(getenv("BPRESHUF")) : 0;   // 1: rows 3 / 4 exchanged per 32-row block; 2: + the (block, lane group) order exchanged per 128-row group (direct bf16 stores)
+    const bool bpreshuf = bpremode != 0;
+    g1250_check_bpreshuf(argv[1], kn, bpremode);
     auto bpre_rows = [&](const std::vector<uint8_t>& s, int rows, size_t rowbytes) {
         std::vector<uint8_t> out(s.size());
         for (int r = 0; r < rows; r++) {
-            const int i = r & 31, j = (i & 7) | ((i & 8) << 1) | ((i & 16) >> 1);   // exchange bits 3 and 4
-            memcpy(&out[(size_t)r * rowbytes], &s[(size_t)((r & ~31) | j) * rowbytes], rowbytes);
+            size_t src;
+            if (bpremode == 2) {
+                const int blk = (r >> 5) & 3, mp = r & 31, gg = (mp >> 3) & 1, v = (mp & 7) | ((mp >> 4) << 3);
+                src = (size_t)((r & ~127) | (64 * gg + 16 * blk + v));
+            } else {
+                const int i = r & 31, j = (i & 7) | ((i & 8) << 1) | ((i & 16) >> 1);   // exchange bits 3 and 4
+                src = (size_t)((r & ~31) | j);
+            }
+            memcpy(&out[(size_t)r * rowbytes], &s[src * rowbytes], rowbytes);
         }
         return out;
     };
