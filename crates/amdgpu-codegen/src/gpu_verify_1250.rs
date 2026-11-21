@@ -2383,6 +2383,12 @@ mod mode2 {
     }
 
     pub fn check(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
+        let mut needs = BTreeMap::new();
+        check_needs(insts, labels, v, &mut needs);
+    }
+
+    /// `check`, also returning per instruction index the waits it lacks: (va_vdst count, vm_vsrc count) (15 / 7: none).
+    pub fn check_needs(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>, needs: &mut BTreeMap<usize, (u32, u32)>) {
         let sets_mode2 = insts.iter().any(|i| i.mn.starts_with("s_setreg") && i.ops.to_uppercase().contains("SCHED_MODE"));
         if !sets_mode2 {
             return;
@@ -2470,6 +2476,14 @@ mod mode2 {
                     let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
                     for (k, it) in &st.items {
                         let dep = if it.alu { !valu && (hit(&reads, &it.dst) || hit(&writes, &it.dst) || hit(&writes, &it.src)) } else { hit(&writes, &it.src) };
+                        if dep {
+                            let e = needs.entry(i).or_insert((15, 7));
+                            if it.alu {
+                                e.0 = e.0.min(it.same);
+                            } else {
+                                e.1 = e.1.min(it.same);
+                            }
+                        }
                         if dep && reported.insert((i, *k)) {
                             viol(v, "GV-1250-MODE2-WAIT", format!("line {}: `{} {}` needs `s_wait_alu` {} for line {} (`{}`) on some path (relaxed scheduling mode 2)", ins.line, ins.mn, ins.ops, if it.alu { "va_vdst" } else { "vm_vsrc" }, insts[*k].line, insts[*k].mn));
                         }
@@ -2530,6 +2544,34 @@ mod mode2 {
             }
         }
     }
+}
+
+/// Mode 2: the `s_wait_alu` waits the final text still lacks (instruction expansions of the emitter the MIR model does not see: a large
+/// LDS offset split into a `v_add` + the access, a 64-bit address computed into a temporary, ...), inserted with the smallest counts the
+/// text dataflow allows, until GV-1250-MODE2-WAIT holds (adding waits only removes behaviours, so the result is checked by the rule itself).
+pub fn mode2_complete(asm: &str) -> String {
+    let mut text = asm.to_string();
+    for _round in 0..64 {
+        let (insts, _raw, labels) = lex(&text);
+        let mut v = Vec::new();
+        let mut needs = BTreeMap::new();
+        mode2::check_needs(&insts, &labels, &mut v, &mut needs);
+        if needs.is_empty() {
+            break;
+        }
+        let at: HashMap<usize, (u32, u32)> = needs.iter().map(|(i, n)| (insts[*i].line, *n)).collect();
+        let mut out = String::with_capacity(text.len() + needs.len() * 24);
+        for (ln, l) in text.lines().enumerate() {
+            if let Some(&(vd, vm)) = at.get(&(ln + 1)) {
+                let d = (0xff9fu32 & !(0xf << 12) & !(0x7 << 2)) | (vd.min(15) << 12) | (vm.min(7) << 2);
+                out.push_str(&format!("    s_wait_alu {d:#x}\n"));
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        text = out;
+    }
+    text
 }
 
 /// GV-1250-PREFETCH-BOUNDS (see the rule). Byte offsets: the disassembler's addresses when present, else the in-process encoder's sizes
