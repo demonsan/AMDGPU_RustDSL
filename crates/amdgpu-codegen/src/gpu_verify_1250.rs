@@ -2323,8 +2323,8 @@ fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
             l.starts_with(".size") || l.starts_with(".section") || l.starts_with(".rodata") || l.starts_with(".amdhsa_kernel") || l.starts_with("---") || l.starts_with(".amdgpu_metadata")
         })
         .map_or(usize::MAX, |(i, _)| i + 1);
-    let insts: Vec<Inst> = insts.iter().filter(|i| i.line < end_line).cloned().collect();
-    let insts = &insts[..];
+    let n_code = insts.iter().position(|i| i.line >= end_line).unwrap_or(insts.len());
+    let insts = &insts[..n_code];
     // byte offset of every instruction and the code size
     let mut off: Vec<Option<u64>> = Vec::with_capacity(insts.len());
     let mut size: Option<u64> = Some(0);
