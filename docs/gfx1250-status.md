@@ -75,7 +75,7 @@ All paired against the vendor on one e08 GPU, every run MLA_OK for our kernels. 
 completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in the code object (`.amdc_launch_abi`, the workspace /
 counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
-Dispatch rule (2026-11-21, after the final-read fix): 1 page per sequence -> `_ws4`; 2 .. 7 -> `_ws2`; 8 and more -> `_ws`.
+Dispatch rule (2026-11-21, latest): 1 page per sequence -> `_ws4`; 2 .. 6 -> `_ws2`; 7 and more -> `_ws`. Since the final-read fix: the merge partials padded per 8-head half (-1 .. -3 %), `_ws4`'s direct stores packed to 8 bytes by an in-quad 4 x 4 transpose (DPP xor 1 / xor 2: -5 .. -7 %), `_ws2` merging pairwise (each wave finalizes half its tiles from its partner's partials) with the same 8-byte stores (-1 %). On e08 (ours / vendor; the vendor at 1 .. 2 pages runs at the launch floor and its paired ratio swings): 1 x 64 1.24, 4 x 64 1.1 .. 1.3, 4 x 128 ~1.26, 4 x 256 ~1.2 .. 1.4, 5+ pages 0.82 .. 0.92.
 pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
 the sequence bounds / page ids, full page pairs + the sequence's last page computed apart (the only masked page; every other page
 without mask code), the lean softmax (exponents / exps / sums batched: no TRANS-WAR `v_nop`), the GEMM compile policy. 128 x 4096 and
