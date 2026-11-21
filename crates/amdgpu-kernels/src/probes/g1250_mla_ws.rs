@@ -42,7 +42,7 @@ fn with_vopd(mut f: Function) -> Function {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648, false))
+    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -237,7 +237,7 @@ pub fn mla_g1250_qh16_ws4() -> Function {
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
@@ -388,7 +388,7 @@ pub fn mla_g1250_qh16_dwsb() -> Function {
 }
 
 pub fn mla_g1250_qh16_dws2b() -> Function {
-    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 134217728, false)
+    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | 134217728, false)
 }
 
 /// `_ws` with the bank-conflict-free final read (bit 31)
