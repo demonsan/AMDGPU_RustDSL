@@ -104,7 +104,7 @@ python3 tools/mi450/pmc_sum.py <pass dir> [kernel substring] [--all]    # per-ke
 | GRBM | `GRBM_GUI_ACTIVE`, `GRBM_COUNT`, `GRBM_CP_BUSY`, `GRBM_CPC_BUSY`, `GRBM_SPI_BUSY`, `GRBM_UTCL2_BUSY` | |
 | GL2 | `GL2C_READ` / `WRITE` / `HIT` / `MISS` / `REQ` / `*_SECTORS`, `GL2C_EA_RDREQ*` / `WRREQ*` (memory traffic), `GL2C_BUSY`, `GL2A_BUSY` | 21 GL2C sub-counters |
 | SQC | `SQC_ICACHE_*` / `SQC_DCACHE_*` (instruction / scalar caches) | 12 |
-| TA / TX / SPI / CPC / GL1 | | all (TX 53, SPI 9, CPC 10, …) |
+| TA / TX / SPI / CPC / GL1 | | all (TX 53, SPI 9, CPC 10 and others) |
 
 So the instruction-mix, LDS, wait and WMMA-busy questions cannot be answered with this stack: those counters read 0 for every kernel. The
 static reports (`amdc lds-banks`, `amdc vgpr-banks`) and the shader-clock stamps remain the tools for those. What PMC adds is exact wave /
