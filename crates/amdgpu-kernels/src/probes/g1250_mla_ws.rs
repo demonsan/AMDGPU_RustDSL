@@ -550,6 +550,10 @@ pub fn mla_g1250_qh16_d2b() -> Function {
     with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2b", true, WS2_BITS | 134217728, false)))
 }
 
+pub fn mla_g1250_qh16_ws2N() -> Function {
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_ws2N", true, WS2_BITS | (1u64 << 40), false)))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -671,8 +675,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
     let mpad = branchless & (1u64 << 32) != 0;
     assert!(!mpad || branchless & 2147483648 != 0, "the padded merge layout is read by the interleaved final read (bit 31) only");
     let wstride: i32 = if mpad { 32768 + 128 } else { 32768 };
-    let mo = lds.tile_over("MO", 4 * wstride as i64, &[&kw[0]]);
-    let ml = lds.tile_over("ML", 4 * 16 * 4 * 3, &[&kw[1]]);
+    // bit 40 (with the pairwise merge): the merge buffer over the slot-1 rings, so the merge need not wait for a slot-0 tensor load still
+    // in flight (the loop's prefetch of a page past the wave's last); the drain moves to the kernel end
+    let late_drain = branchless & (1u64 << 40) != 0;
+    assert!(!late_drain || branchless & (1u64 << 33) != 0, "bit 40 needs the pairwise merge (bit 33)");
+    let mo = if late_drain { lds.tile_over("MO", 4 * wstride as i64, &[&kw[1]]) } else { lds.tile_over("MO", 4 * wstride as i64, &[&kw[0]]) };
+    let ml = if late_drain { lds.tile_over("ML", 4 * 16 * 4 * 3, &[&kw[0]]) } else { lds.tile_over("ML", 4 * 16 * 4 * 3, &[&kw[1]]) };
     lds.commit(&mut b);
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
     let (pr, plse, pq, pkv, pltp, pltd, pltl) = (kp(&mut b, 0), kp(&mut b, 1), kp(&mut b, 2), kp(&mut b, 3), kp(&mut b, 4), kp(&mut b, 5), kp(&mut b, 6));
@@ -1467,7 +1475,9 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         b.wait_lds(0);
     }
     b.end_if();
-    b.wait_tensor(0);
+    if !late_drain {
+        b.wait_tensor(0);
+    }
 
     stamp(&mut b);
     if branchless & 134217728 != 0 {
@@ -1938,6 +1948,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
             let ro = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 4);
             let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
             b.store_global(pa, 0, Opnd::Var(sinkv), MemTy::B32, false);
+            b.wait_tensor(0);
             return b.finish();
         }
         let lg = b.log2_f32(lh);
@@ -1947,6 +1958,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
         let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
         b.store_global(pl, 0, lse, MemTy::B32, false);
+        b.wait_tensor(0);
         return b.finish();
     }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
