@@ -132,6 +132,27 @@ state with the pre-loop prologue state) with a staging buffer outside the ring, 
   compact allocation with the LDS declared at 176 KiB (one workgroup per CU, `RingOpts::lds_pad`) 4.90 / 5.74. So the allocation is fine and it is the co-residency that loses: the K loop of one wave per SIMD is already
   WMMA-bound (the window is 81 % of the iteration), a second wave only adds LDS / TDM / L2 contention. (The 256 x 128 tile itself is far below the 256 x 256 kernel, 4.9 vs 6.2 PF/s at 4096^3.)
 
+### Tail prologue + slot-staged epilogue in a persistent loop (e08, 2026-11-21): the cycles drop 5.5 %, the time does not
+
+Idea (lead): in a persistent loop with the 2-slot 512-K ring, the peeled last window of tile t issues tile t + 1's first stage into the free slot, and tile t's epilogue is staged through the CONSUMED slot
+only (the A and B regions of the slot, two 32-row bands deep per wave, each band's tensor store drained by `wait_tensor(1)` before band i + 2 is staged), so the stores are finished before the next tile's
+stage 1 reuses the slot, and the next tile starts with its stage 0 already landed. Built as `RingOpts::carry` (`gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist_carry`; `Pipeline::carry`,
+`PipeBody::stage_tile0` / `stage_next_tile`, a second set of operand origins for the next tile with its row clamped, no stage after the last tile; host PERSIST = G, K a multiple of 1024). It is a measuring build:
+the tile-protocol data-race findings are warnings (`AMDC_TILE_PROTO_WARN`), every hang rule, bound and wait check stays enforced, and the output is bit-exact on every run (host check). `..._persist_rot` = the epilogue
+alone, `..._persist_tst` / `..._persist_carry_tst` = per-tile shader-clock stamps (`RingOpts::tstamps`, host `TSTAMPS=1`).
+
+- **The persistent loop alone costs 1 - 3 %** against the default (one tile per workgroup launched by the hardware): 8192^3 9.88 vs 10.08 PF/s, 8192 x 8192 x 4096 7.75 vs 8.01, 4096^3 6.12 vs 6.29 (the next stage's load queues
+  behind the epilogue stores in the in-order tensor queue).
+- **Per-workgroup cycles do improve** (8192^3, 256 workgroups x 4 tiles, wave 0, every workgroup): persistent 184.4 k cycles for the tile sequence (median; the K loop plus prologue wait 38 k, epilogue 5.6 - 6.7 k, 380 between tiles)
+  vs carry **174.3 k (-5.5 %)** (tiles 1 - 3: loop 35.0 - 35.6 k, epilogue 5.0 - 6.6 k; the first tile is 40 k in both: a cold instruction cache and the first stage), as the model said (the 3.0 k prologue is gone).
+- **The time does not follow.** 8192^3 on 256 workgroups, paired alternating: default 10.1, persistent 9.82 - 9.89, **carry 9.0 - 9.23 PF/s (-7 % against persistent)**; on another GPU of the node carry equals persistent. The cycles-per-microsecond
+  of the stamped runs show why: persistent 184 k cycles in 113 us = 1.63 GHz, carry 174 k in 119.4 us = **1.46 GHz** - at full occupancy the kernel is power / bandwidth limited, and the schedule that keeps the machine busier gets
+  the lower clock. With fewer workgroups (less power, less contention) the cycles show up in the time: PG = 64 **-3.4 %** (316.9 vs 327.7 us), PG = 128 **-3.9 %** (172.5 vs 179.1 us), PG = 256 +7 %.
+- **The shapes that were the second target do not win either** (us, default / persistent / carry): 8192 x 8192 x 4096 69.0 / 69.5 / 69.9; 8192 x 8192 x 2048 42.2 / 44.1 / 44.4; 8192 x 4096 x 4096 35.1 / 36.5 / 38.1; 16384 x 8192 x 4096 135.9 / 134.2 / 138.8.
+- **Verdict:** projected 4 - 5 % at 8192^3 and 8 % at K <= 4096 from the cycle model, measured -2 % ... -9 % against the default at full occupancy: no dispatch rule, and the protocol extension (the back-edge state, slot-level
+  tile aliasing) was not written. Lessons: (1) at 1.5 - 1.6 GHz this GEMM is limited by something other than the cycles of one workgroup (the L2 / HBM traffic at about 28 TB/s of tile loads, or the power cap), so hiding a fixed
+  cost of a workgroup is worth less than its cycles; (2) a clock estimate (cycles / us) belongs next to every stamp comparison.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible

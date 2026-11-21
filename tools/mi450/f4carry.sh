@@ -17,8 +17,8 @@ run() { k=$1; sh=$2; case $k in *_persist*|*_carry*) export PERSIST=${PG:-256};;
   raw=$(gpurun $O/own_host $O/$k.co $k $sh 256 256 128 2>&1); echo "$raw" | grep -E '"stamps|"tile_dist' | cut -c1-600
   out=$(echo "$raw" | grep -E '^\{"host"|HANG|REFUSED|FAIL' | head -1)
   echo "$k $sh: $(echo "$out" | sed -E 's/.*"bad":([0-9]+),"maxrel":([0-9.e+-]+),"us":([0-9.]+),"tflops":([0-9.]+).*/bad=\1 us=\3 tflops=\4/')"; }
-for sh in ${SHAPES:-"8192 8192 8192 3:256"}; do pgs=${sh##*:}; sh=${sh%:*}; export PG=$pgs
-  for r in 1 2; do for k in $KL; do run $k "$sh"; done; done
+for sh in ${SHAPES:-"8192 8192 4096 5:256" "8192 8192 2048 8:256" "8192 4096 4096 8:256" "16384 8192 4096 3:256"}; do pgs=${sh##*:}; sh=${sh%:*}; export PG=$pgs
+  for r in 1 2; do for k in $KL; do run $k "$sh"; done; done; echo "(PG=$PG)"
 done
 
 echo DONE
