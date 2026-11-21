@@ -201,6 +201,22 @@ window (the carried stage goes to the static slot 0, the epilogue stages in slot
 16384 x 8192 x 4096 135.0 - 136.8 / 129.4 - 131.7 / **124.6 - 126.2**. Without the cluster the carry loses (9.1 - 9.2 PF/s at 8192^3: the clock sag): the multicast's lower L2 traffic is what lets the saved cycles show up in the time.
 Registered as `gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_c4x4_lock_persist_carry`; regression and A/B script `tools/mi450/f4pcc.sh`.
 
+### The cluster loop's barrier and the epilogue overlap, after the promotion (e08, 2026-11-21)
+
+**Where the +211 cycles per 512-K iteration of the cluster loop go** (stamps now cover the lock path; 8192^3, wave 0, cycles per iteration: issue / window / tensor wait / barriers = total): default D 76 / 1,915 / 62 / 200 = 2,253;
+lockstep multicast M 76 / 1,936 / **12** / **376** = 2,400. The data has landed (the tensor wait is 12, shorter than D's), the extra is the cluster barrier: +176 cycles on top of the workgroup barrier. Splitting it (`F4Shape::split`, kernel
+`exp_..._c4x4_lock_persist_carry_split`): every workgroup signals the cluster barrier as soon as all its waves have read their fragments (a workgroup barrier + one `s_barrier_signal -3` before the last sub-step's WMMAs of a staged
+window) and waits at the end of the window after its tensor wait and the workgroup barrier: 76 / 2,018 / 12 / 209 = **2,316 (-84 cycles, -3.5 %)**: the barrier phase drops to D's level, but the mid-window workgroup barrier costs 82 cycles inside the
+window. The kernel compiles strict (the protocol follows the split cluster barrier across the role copies) and is bit-exact, but the wall time moves by only about -1 % on average (4096^3 17.2 -> 16.8 us, 8192^3 107.1 -> 104.9, 16384 x 8192 x 4096
+124.2 -> 123.2, 8192^2 x 2048 39.7 -> 40.2, 8192^2 x 4096 63.4 -> 62.9, 3 paired reps, run-to-run noise +-3 %): not promoted. Lockstep every N iterations is not possible with a 2-slot ring: the rendezvous of the next stage's multicast needs the peers' reads of
+the slot to be finished.
+
+**Overlapping the epilogue with the next tile's compute does not fit the LDS.** The epilogue needs the accumulators out of the registers before the next tile's first WMMA (they are the same 512 VGPRs), so the staging (2.3 k cycles) is exposed whatever
+the layout; only the tensor-store drain (2.8 - 3.0 k cycles, of the 5 - 6 k) could run under window 0. The f32 tile is 256 KiB; the 2-slot ring is 288 KiB of the 320 KiB, i.e. 32 KiB are free: staging has to go through slot 1 in two rounds, and slot 1
+is exactly where the next tile's stage 1 lands at the start of window 0, so the drain must finish before it, i.e. before window 0. Delaying stage 1 until the drain is done pushes its landing (about one window of latency) into window 1 and costs as much
+as the drain saves; a bf16 tile (128 KiB) fits one slot but the slot is the same one. The overlap needs either a third slot (no room), bf16 staging into the 32 KiB plus 128 KiB of a slot that the stage does not need until later (no such slot with 512-K stages)
+or accumulators held in a smaller footprint; not built.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
