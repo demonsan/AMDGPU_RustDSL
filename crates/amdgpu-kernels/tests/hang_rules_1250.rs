@@ -1100,6 +1100,39 @@ fn pos_prefetch_bounds() {
     asm_positive(&inject("tensor_load_to_lds", &["s_get_pc_i64 s[36:37]", "s_mov_b32 s38, 0", "s_prefetch_inst s[36:37], 0x0, s38, 0"]));
 }
 
+// GV-1250-MODE2-WAIT (the base stream with the wave put into mode 2 at the start)
+
+fn mode2_stream(extra: &[&str]) -> String {
+    let mut ls = vec!["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2"];
+    ls.extend_from_slice(extra);
+    inject("tensor_load_to_lds", &ls)
+}
+
+#[test]
+fn mut_mode2_wait() {
+    let m = |ls: &[&str]| asm_mutation(&mode2_stream(ls), "GV-1250-MODE2-WAIT");
+    // a VALU-written address read by a vector memory instruction without the va_vdst wait (the stale-address case)
+    m(&["v_add_nc_u32_e32 v40, 4, v40", "global_load_b32 v41, v40, s[0:1]", "s_wait_loadcnt 0x0"]);
+    // a VALU-written LDS address
+    m(&["v_add_nc_u32_e32 v40, 4, v40", "ds_load_b32 v41, v40", "s_wait_dscnt 0x0"]);
+    // a wait that is too weak: va_vdst(1) with no younger VALU of the producer's class
+    m(&["v_add_nc_u32_e32 v40, 4, v40", "s_wait_alu 0x1f9f", "ds_load_b32 v41, v40", "s_wait_dscnt 0x0"]);
+    // a count above the younger same-class VALUs (one younger VALU, va_vdst(2))
+    m(&["v_add_nc_u32_e32 v40, 4, v40", "v_mov_b32_e32 v42, 0", "s_wait_alu 0x2f9f", "ds_load_b32 v41, v40", "s_wait_dscnt 0x0"]);
+    // a store's data register overwritten by a VALU before the store read it (vm_vsrc)
+    m(&["ds_store_b32 v40, v41", "s_wait_alu 0xf9f", "v_mov_b32_e32 v41, 0", "s_wait_dscnt 0x0"]);
+}
+
+#[test]
+fn pos_mode2_wait() {
+    // the waits in place: va_vdst(0) before the load; one younger same-class VALU and va_vdst(1); the LDS counter wait completes the read
+    asm_positive(&mode2_stream(&["v_add_nc_u32_e32 v40, 4, v40", "s_wait_alu 0xf9f", "ds_load_b32 v41, v40", "s_wait_dscnt 0x0"]));
+    asm_positive(&mode2_stream(&["v_add_nc_u32_e32 v40, 4, v40", "v_mov_b32_e32 v42, 0", "s_wait_alu 0x1f9f", "ds_load_b32 v41, v40", "s_wait_dscnt 0x0"]));
+    asm_positive(&mode2_stream(&["ds_store_b32 v40, v41", "s_wait_dscnt 0x0", "v_mov_b32_e32 v41, 0"]));
+    // a different window: v40 in window 1 is v296, not the VALU's v40
+    asm_positive(&mode2_stream(&["v_add_nc_u32_e32 v40, 4, v40", "s_set_vgpr_msb 0x1", "ds_load_b32 v41, v40", "s_set_vgpr_msb 0", "s_wait_alu 0xf9f", "s_wait_dscnt 0x0"]));
+}
+
 // GV-1250-FORBIDDEN-OP
 
 #[test]
@@ -1203,6 +1236,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-FORBIDDEN-OP", "forbidden_op"),
     ("GV-1250-PERMPK16", "permpk16"),
     ("GV-1250-PREFETCH-BOUNDS", "prefetch_bounds"),
+    ("GV-1250-MODE2-WAIT", "mode2_wait"),
     ("GV-1250-VOPD", "vopd"),
     ("GV-1250-CLAUSE-TYPE", "clause_type"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
