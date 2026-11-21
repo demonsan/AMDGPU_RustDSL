@@ -420,7 +420,10 @@ impl<'a> Sim<'a> {
             }
             break ifs;
         };
-        let bad = |s: &mut Self, msg: String| s.diag("GV-TILE-CARRY", Severity::Error, begin, format!("stmt {begin}: persistent tile loop with a carried stage: {msg}"));
+        let bad = |s: &mut Self, msg: String| {
+            let n = s.n;
+            s.diag("GV-TILE-CARRY", Severity::Error, begin, format!("stmt {begin}: persistent tile loop with a carried stage: {msg} ({n} pipelined-loop iteration(s) simulated)"))
+        };
         if ifs.len() < 2 {
             bad(self, format!("{} top-level `if`(s) with tile markers in the body; the carry form needs the prologue `if` (first tile) and the carry `if` (next tile)", ifs.len()));
             return;
