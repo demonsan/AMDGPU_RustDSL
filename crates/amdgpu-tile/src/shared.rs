@@ -278,6 +278,29 @@ impl LdsPlan {
         }
         self.push(Shared { name: name.to_string(), base, slot_stride: bytes, bytes, slots: 1, layout: Layout::Linear, private: false })
     }
+    /// A per-wave private region (`waves` slices of `per_wave` bytes) reusing the storage of given SLOTS of rings (as `tile_over_slots`): placed at the first (ring, slot)'s base, its `waves x per_wave`
+    /// bytes inside the union of the listed slots (asserted), so a stage in flight in ANOTHER slot of the same ring does not conflict with the slices' accesses.
+    pub fn private_over_slots(&mut self, name: &str, per_wave: i64, waves: u32, slots: &[(&Shared, u32)]) -> Shared {
+        let (r0, s0) = slots.first().expect("private_over_slots: at least one (ring, slot)");
+        let base = r0.base + r0.slot_stride * *s0 as i64;
+        let bytes = per_wave * waves as i64;
+        let mut spans: Vec<(i64, i64)> = slots.iter().map(|(r, s)| (r.base + r.slot_stride * *s as i64, r.base + r.slot_stride * *s as i64 + r.bytes)).collect();
+        spans.sort_unstable();
+        let mut covered = base;
+        for (lo, hi) in &spans {
+            if *lo <= covered && *hi > covered {
+                covered = *hi;
+            }
+        }
+        assert!(covered >= base + bytes, "private_over_slots `{name}`: [{base}, {}) is not covered by the listed slots (covered up to {covered})", base + bytes);
+        for (r, s) in slots {
+            assert!(*s < r.slots, "private_over_slots `{name}`: slot {s} of `{}` ({} slots)", r.name, r.slots);
+            if !self.overlays.iter().any(|(n, o)| n == name && *o == r.name) {
+                self.overlays.push((name.to_string(), r.name.clone()));
+            }
+        }
+        self.push(Shared { name: name.to_string(), base, slot_stride: per_wave, bytes: per_wave, slots: waves, layout: Layout::Linear, private: true })
+    }
     /// A per-wave private region (`waves` slices of `per_wave` bytes). With `overlays` non-empty it is placed at the base of the first buffer and reuses their storage
     /// (they must be dead when the region is used - e.g. the Q staging during the epilogue); otherwise it is allocated at the cursor.
     pub fn private(&mut self, name: &str, per_wave: i64, waves: u32, overlays: &[&Shared]) -> Shared {
