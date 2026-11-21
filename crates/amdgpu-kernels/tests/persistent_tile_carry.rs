@@ -106,10 +106,8 @@ fn kernel(m: Mut) -> Function {
     b.tile_end();
     b.wait_lds(0);
     b.barrier();
-    let tl = b.let_(Op::ShlI32(Opnd::Var(vars[0]), Opnd::I32(9)));
     let wo = b.let_(Op::ShlI32(Opnd::Val(wg), Opnd::I32(15)));
-    let o = b.let_(Op::AddI32(Opnd::Val(tl), Opnd::Val(wo)));
-    let o = b.let_(Op::AddI32(Opnd::Val(o), Opnd::Val(a)));
+    let o = b.let_(Op::AddI32(Opnd::Val(wo), Opnd::Val(a)));
     let q = b.let_(Op::PtrAdd { base: Opnd::Val(po), byte_off: Opnd::Val(o) });
     b.store_global(q, 0, y, MemTy::B32, false);
     b.set_var(vars[0], nx);
@@ -137,29 +135,34 @@ fn the_carry_form_is_accepted() {
 #[test]
 fn an_epilogue_over_the_carried_slot_is_rejected() {
     let e = errs(&kernel(Mut::EpiOverCarried));
+    println!("{e}");
     assert!(e.contains("GV-TILE-CARRY") || e.contains("GV-TILE-ALIAS-RACE"), "{e}");
 }
 
 #[test]
 fn a_carried_stage_into_another_slot_is_rejected() {
     let e = errs(&kernel(Mut::CarryOtherSlot));
+    println!("{e}");
     assert!(e.contains("GV-TILE-CARRY"), "{e}");
 }
 
 #[test]
 fn a_read_of_the_carried_slot_after_the_carry_is_rejected() {
     let e = errs(&kernel(Mut::ReadAfterCarry));
+    println!("{e}");
     assert!(e.contains("GV-TILE-CARRY") || e.contains("GV-TILE-RACE"), "{e}");
 }
 
 #[test]
 fn an_access_before_the_prologue_is_rejected() {
     let e = errs(&kernel(Mut::AccessBeforePrologue));
+    println!("{e}");
     assert!(e.contains("GV-TILE-CARRY"), "{e}");
 }
 
 #[test]
 fn a_carried_stage_without_a_generation_advance_is_rejected() {
     let e = errs(&kernel(Mut::SameVersion));
+    println!("{e}");
     assert!(e.contains("GV-TILE-CARRY"), "{e}");
 }
