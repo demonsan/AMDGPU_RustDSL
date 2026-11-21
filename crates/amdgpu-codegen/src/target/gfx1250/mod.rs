@@ -103,6 +103,15 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
             return Err(format!("{}: gfx1250 global / tensor bounds: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
         }
     }
+    // the static LDS bank-conflict report (lds_banks.rs): a warning per access above WARN_WAYS ways (`AMDC_NO_BANK_WARN` silences it)
+    if !f.exact && std::env::var("AMDC_NO_BANK_WARN").is_err() {
+        let r = crate::lds_banks::report(f, 32);
+        let worst: Vec<&crate::lds_banks::Entry> = r.entries.iter().filter(|e| e.ways > crate::lds_banks::WARN_WAYS).collect();
+        if !worst.is_empty() {
+            let w = worst.iter().map(|e| e.ways).max().unwrap_or(0);
+            eprintln!("warning: {}: {} LDS access(es) with more than {}-way bank conflicts (worst {w}-way, first at stmt {}); `amdc lds-banks {}` lists them", f.name, worst.len(), crate::lds_banks::WARN_WAYS, worst[0].stmt, f.name);
+        }
+    }
     // the compiler's waits, checked with the gfx1250 counters themselves (independent of the shared pass's model)
     if backend == "own" && !m.exact {
         let plan = waits::plan(&m, &alloc);
