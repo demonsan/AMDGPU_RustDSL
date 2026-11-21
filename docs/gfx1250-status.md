@@ -69,7 +69,7 @@ All paired against the vendor on one e08 GPU, every run MLA_OK for our kernels. 
 completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in the code object (`.amdc_launch_abi`, the workspace /
 counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
-Dispatch rule: 1 page per sequence -> `mla_g1250_qh16_ws4` (all 4 waves take every page, 128 V dims each), 2 - 8 pages -> `_ws2` (wave
+Dispatch rule (2026-11-21): 1 .. 4 pages per sequence -> `_ws4` (now ending with direct bf16 stores, no cross-wave step: -5 .. -8 % vs the merge ending, and -14 % / -2 % vs `_ws2` at 2 / 4 pages); 5 .. 8 -> `_ws2`; more -> `_ws`. On e08 (ours / vendor): 1 x 64 1.34, 4 x 64 1.10, 32 x 64 1.08, 4 x 128 1.63 (vendor jitter: the paired ratios at 1 .. 2 pages swing 1.1 .. 1.6 because the vendor runs at the ~2.9 us launch floor), 4 x 256 1.54. The launch floor: an empty kernel with the MLA ABI is 2.7 .. 2.9 us, i.e. the vendor's 1-page MLA costs ~0 above it; ours is 1.0 .. 1.3 us above it.
 pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
 the sequence bounds / page ids, full page pairs + the sequence's last page computed apart (the only masked page; every other page
 without mask code), the lean softmax (exponents / exps / sums batched: no TRANS-WAR `v_nop`), the GEMM compile policy. 128 x 4096 and
