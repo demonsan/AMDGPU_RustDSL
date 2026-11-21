@@ -2317,6 +2317,7 @@ fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
     // byte offset of every instruction and the code size
     let mut off: Vec<Option<u64>> = Vec::with_capacity(insts.len());
     let mut size: Option<u64> = Some(0);
+    let mut unsized_line: Option<String> = None;
     let base_addr = insts.first().and_then(|i| i.addr).map(|a| a.0);
     for ins in insts {
         match (ins.addr, base_addr) {
@@ -2329,6 +2330,10 @@ fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
                 let line = if ins.ops.is_empty() { ins.mn.clone() } else { format!("{} {}", ins.mn, ins.ops) };
                 size = match (size, amdgpu_target::gfx1250_co::encode_line(&line, size.unwrap_or(0) as usize, &|_| Some(0))) {
                     (Some(s), Ok(b)) => Some(s + b.len() as u64),
+                    (_, Err(e)) => {
+                        unsized_line.get_or_insert(format!("line {}: {e}", ins.line));
+                        None
+                    }
                     _ => None,
                 };
             }
@@ -2371,7 +2376,10 @@ fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
                         viol(v, "GV-1250-PREFETCH-BOUNDS", format!("{what}: the window [{:#x}, {end:#x}) is not inside the code [0, {total:#x})", line0 * 128));
                     }
                 }
-                _ => viol(v, "GV-1250-PREFETCH-BOUNDS", format!("{what}: the window is not provably inside the code (its base must be a s_get_pc_i64 and its soffset a constant of the same block, the code sizable)")),
+                _ => {
+                    let why = if base.is_none() { "its base is not a s_get_pc_i64 of the same block".to_string() } else if so.is_none() { "its soffset is not a constant of the same block".to_string() } else if size.is_none() { format!("the code size is unknown ({})", unsized_line.clone().unwrap_or_default()) } else { "an operand is not a constant".to_string() };
+                    viol(v, "GV-1250-PREFETCH-BOUNDS", format!("{what}: the window is not provably inside the code: {why}"))
+                }
             }
             continue;
         }
