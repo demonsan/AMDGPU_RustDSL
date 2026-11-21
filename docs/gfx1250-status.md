@@ -51,6 +51,29 @@ our own kernels with them.
 **MLA decode, qh16, fp8 Q / KV, page size 64** (same ABI as the vendor kernel, so the host runs both; all results checked against an fp32
 reference, error equal to the vendor's):
 
+Dispatch table with mode 2 + `ralru` (e08 GPU 0, 2026-11-21 evening; `_ws` / `_ws2` / `_ws4` carry the `mode2` and `ralru` lowering
+tokens: expert scheduling mode 2 with G5-checked text waits, fragment loads into the least recently freed registers; outputs bit-identical
+to mode 0; -1 .. -4 % vs mode 2 alone, -0.5 .. -3 % for mode 2 vs mode 0). Thresholds re-measured paired: 2 pages `_ws2` / `_ws4` 0.95 ..
+0.96; `_ws` / `_ws2` at 5 / 6 / 7 / 8 pages 1.13 / 1.12 / 1.00 .. 1.01 / 0.98 -> **1 page `_ws4`, 2 .. 7 `_ws2`, 8+ `_ws`**.
+
+| B x ctx (pages) | kernel | vendor us | ours us | ours / vendor |
+|---|---|---|---|---|
+| 1 x 64 (1) | `_ws4` | 2.90 | 3.32 | 1.15 |
+| 4 x 64 (1) | `_ws4` | 2.92 | 3.57 | 1.22 |
+| 32 x 64 (1) | `_ws4` | 3.50 | 3.64 | 1.04 |
+| 4 x 128 (2) | `_ws2` | 3.81 | 4.08 | 1.07 |
+| 4 x 192 (3) | `_ws2` | 3.68 | 4.81 | 1.30 |
+| 4 x 256 (4) | `_ws2` | 4.13 | 4.94 | 1.19 |
+| 4 x 320 (5) | `_ws2` | 7.20 | 5.50 | **0.77** |
+| 4 x 512 (8) | `_ws` | 7.66 | 6.40 | **0.84** |
+| 4 x 1000 (16) | `_ws` | 9.19 | 7.93 | **0.86** |
+| 32 x 2048 (32) | `_ws` | 12.53 | 11.09 | **0.89** |
+| 128 x 4096 (64) | `_ws` | 34.29 | 28.07 | **0.82** |
+| 128 x 8192 (128) | `_ws` | 52.28 | 45.43 | **0.87** |
+| 512 x 8192 (128) | `_ws` | 175.8 | 165.7 | **0.94** |
+
+(The vendor at 1 .. 2 pages runs at the launch floor and swings 2.9 .. 3.9 us between runs; the table below is the earlier mode-0 run.)
+
 Final dispatch table (e08 GPU 0, Main d5386dcc, 2026-11-21; each shape paired twice against the vendor, 20 alternating launches,
 us = mean per launch; the dispatched kernel: 1 page -> `_ws4`, 2 .. 6 -> `_ws2`, 7+ -> `_ws`; all MLA_OK):
 
@@ -83,7 +106,7 @@ All paired against the vendor on one e08 GPU, every run MLA_OK for our kernels. 
 completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in the code object (`.amdc_launch_abi`, the workspace /
 counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
-Dispatch rule (2026-11-21, latest): 1 page per sequence -> `_ws4`; 2 .. 6 -> `_ws2`; 7 and more -> `_ws`. Since the final-read fix: the merge partials padded per 8-head half (-1 .. -3 %), `_ws4`'s direct stores packed to 8 bytes by an in-quad 4 x 4 transpose (DPP xor 1 / xor 2: -5 .. -7 %), `_ws2` merging pairwise (each wave finalizes half its tiles from its partner's partials) with the same 8-byte stores (-1 %). On e08 (ours / vendor; the vendor at 1 .. 2 pages runs at the launch floor and its paired ratio swings): 1 x 64 1.24, 4 x 64 1.1 .. 1.3, 4 x 128 ~1.26, 4 x 256 ~1.2 .. 1.4, 5+ pages 0.82 .. 0.92.
+Dispatch rule (2026-11-21, mode 2 + ralru): 1 page per sequence -> `_ws4`; 2 .. 7 -> `_ws2`; 8 and more -> `_ws`.
 
 #### Short sequences (1 .. 6 pages), 2026-11-21 write-up
 
