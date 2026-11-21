@@ -25,7 +25,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         if ["persist", "persist_stamps", "persist_rot", "persist_tst", "persist_carry", "persist_carry_tst"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
         }
-        if rest == "c4x4_lock_persist" {
+        if rest == "c4x4_lock_persist" || rest == "c4x4_lock_persist_carry" {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name, 4, 4));
         }
     }
