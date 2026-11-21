@@ -490,7 +490,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) ->
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: name.contains("_bf16") || name.contains("_dst"), lock: true, split: name.contains("_split") }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: if name.contains("_dst") { 0 } else if name.contains("_bf16") { 3 } else { 2 }, swap: name.contains("_bf16") || name.contains("_dst"), preshuf: name.contains("_bf16") || name.contains("_dst"), dstore: name.contains("_dst"), roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), nowin: name.contains("_nowin"), ahead2: name.contains("_ahead2"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: name.contains("_bf16") || name.contains("_dst"), lock: true, split: name.contains("_split") }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: if name.contains("_dst") { 0 } else if name.contains("_bf16") { 3 } else { 2 }, swap: name.contains("_bf16") || name.contains("_dst"), preshuf: name.contains("_bf16") || name.contains("_dst"), dstore: name.contains("_dst"), pre3: name.contains("_pre3"), roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), nowin: name.contains("_nowin"), ahead2: name.contains("_ahead2"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
@@ -644,6 +644,8 @@ pub struct RingOpts {
     /// the B matrix (the WMMA-A operand in swap mode) and its scales are PRE-SHUFFLED on the host: bits 3 and 4 of the row index exchanged within every 32-row block (the vendor's ABpreShuffle for the swapped operand),
     /// so the swap mode reads plain rows (no row permutation) and a lane's 16 accumulator registers are 16 consecutive output columns. Declared in the code-object metadata: a launch with an unshuffled B is refused.
     pub preshuf: bool,
+    /// A and B pre-shuffled in 16 x 16-byte tiles (host `BPRESHUF=3`; metadata `.amdc_b_preshuffle: 3`): see `TdmF4Body::pre3`
+    pub pre3: bool,
     /// direct bf16 stores from the registers (no LDS staging, no tensor store) with the column-contiguous pre-shuffle (`BPRESHUF=2`): within every 128-row group of B the (block, lane-group) order is exchanged so that
     /// a lane's four 16-column pieces are 64 contiguous columns (128 bytes per row): 64 `global_store_b128` per wave
     pub dstore: bool,
@@ -690,13 +692,25 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, preshuf: false, dstore: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, nowin: false, ahead2: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, preshuf: false, pre3: false, dstore: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, nowin: false, ahead2: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
     }
 }
 
 fn cyc_now(b: &mut FnBuilder) -> ValueId {
     let c = b.shader_cycles();
     b.let_(Op::PtrLo(Opnd::Val(c)))
+}
+
+/// `_th<d>_<s>` in a kernel name: the cache-policy `th` of the operand loads and of the scale loads (measurement)
+fn name_th(name: &str) -> (u8, u8) {
+    if let Some(p) = name.find("_th") {
+        let r = &name[p + 3..];
+        let mut it = r.split(|c: char| !c.is_ascii_digit());
+        let d = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let s = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        return (d, s);
+    }
+    (0, 0)
 }
 
 fn epi_carry_ok(epi: u8) -> bool {
@@ -718,7 +732,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // the output tile: the swap mode reads the B matrix as the A operand, so its tile is bn rows (M) by bm columns (N)
     let (tile_m, tile_n) = if ring.swap { (bn, bm) } else { (bm, bn) };
     // A / B rows in LDS: 64 ks bytes + the TDM padding (`pad`: planner-chosen, conflict-free fragment reads)
-    let row_pad = if pad { if ring.perm() { f4_row_pad_perm(sh.ks) } else { f4_row_pad(sh.ks) } } else { 0 };
+    let row_pad = if ring.pre3 { 0 } else if pad { if ring.perm() { f4_row_pad_perm(sh.ks) } else { f4_row_pad(sh.ks) } } else { 0 };
     let row_l = 64 * sh.ks + row_pad;
     let mut b = FnBuilder::new(name, (sh.waves() * 32) as u32);
     for (i, n) in ["a", "b", "sa", "sb", "c"].iter().enumerate() {
@@ -1071,10 +1085,29 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     let abase = b.mul_i32(a_row_m, Opnd::I32(row_l));
     let abase = b.add_i32(abase, h16);
+    let abase = if ring.pre3 {
+        // group base (a_row / 16 x 4096) + the lane's 16-byte row slot m x 16 + its chunk parity g x 256
+        let gb = b.mul_i32(wi, Opnd::I32(sh.tm * 2 * 4096));
+        let m16 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(4)));
+        let g256 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(8)));
+        let x = b.add_i32(gb, m16);
+        b.add_i32(x, g256)
+    } else {
+        abase
+    };
     let b_row = b.let_(Op::MulI32(Opnd::Val(wj), Opnd::I32(sh.tn * 16)));
     let b_row_m = b.add_i32(b_row, m);
     let bbase = b.mul_i32(b_row_m, Opnd::I32(row_l));
     let bbase = b.add_i32(bbase, h16);
+    let bbase = if ring.pre3 {
+        let gb = b.mul_i32(wj, Opnd::I32(sh.tn * 4096));
+        let m16 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(4)));
+        let g256 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(8)));
+        let x = b.add_i32(gb, m16);
+        b.add_i32(x, g256)
+    } else {
+        bbase
+    };
     let a_row_l = if ring.perm() {
         // the scale row of operand row r = lane: the B-matrix row with bits 3 and 4 of r exchanged
         let lo = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(7)));
@@ -1122,8 +1155,20 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     let (mask_row, mask_col) = if ring.swap { (mask_col, mask_row) } else { (mask_row, mask_col) };
     let k128 = b.let_(Op::LshrI32(Opnd::Val(kk), Opnd::I32(7)));
     let rpad = (row_pad > 0).then(|| ((16 * sh.ks) as u16, (row_pad / 4) as u16));
-    let g1a = g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_row, rpad);
-    let g1b = g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_col, rpad);
+    let (g1a, g1b) = if ring.pre3 {
+        // 16-row groups: one tensor row = the 4096 bytes of a stage slice of a group (16 rows x 16 chunks x 16 bytes), the stride between groups 16 pitches
+        let p16 = b.mul_i32(pitch, Opnd::I32(16));
+        let slice = 64 * sh.ks * 16;
+        (
+            g1(&mut b, pa, a_org, 1, Opnd::I32(slice), rpa / 16, Opnd::Val(p16), slice as u16, mask_row, None),
+            g1(&mut b, pb, b_org, 1, Opnd::I32(slice), rpb / 16, Opnd::Val(p16), slice as u16, mask_col, None),
+        )
+    } else {
+        (
+            g1(&mut b, pa, a_org, 1, Opnd::I32(64 * sh.ks), rpa, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_row, rpad),
+            g1(&mut b, pb, b_org, 1, Opnd::I32(64 * sh.ks), rpb, Opnd::Val(pitch), (64 * sh.ks) as u16, mask_col, rpad),
+        )
+    };
     let (g1sa, g1sb) = if ring.scale_shuf {
         // preshuffled scales: rows of a 32-row block are K / 4 dwords (K / 128 tiles of 32 dwords); the slice is rows / 32 of them, 32 ks
         // dwords each
@@ -1213,7 +1258,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, dov: name.contains("_dov"), wmma_order: if name.contains("_ord1") { 1 } else if name.contains("_ord2") { 2 } else { 0 }, dov_stores: sh.tm, first_win: None, slot_bases: Vec::new(), ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, dov: name.contains("_dov"), pre3: ring.pre3, th_data: name_th(name).0, th_scale: name_th(name).1, wmma_order: if name.contains("_ord1") { 1 } else if name.contains("_ord2") { 2 } else { 0 }, dov_stores: sh.tm, first_win: None, slot_bases: Vec::new(), ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
         if name.contains("_static") {   // opt-in: measured neutral to -4 % in mode 0, no gain in mode 2
             for k in 0..ring.slots as i32 {
                 let sl = SlotIdx::new(k, 0);
@@ -1889,6 +1934,9 @@ for q in 0..8i32 {
     }
     if ring.racompact {
         f.lower_opts.push("racompact".to_string());
+    }
+    if ring.pre3 {
+        f.kd.push(("b_preshuffle".into(), 3));   // A and B in 16 x 16-byte tiles (the vendor's ABpreShuffle layout)
     }
     if ring.preshuf {
         f.kd.push(("b_preshuffle".into(), if ring.dstore { 2 } else { 1 }));   // the B matrix (and its scales) must be pre-shuffled on the host: declared in the code-object metadata, the hosts refuse an unshuffled B

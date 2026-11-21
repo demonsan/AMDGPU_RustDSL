@@ -157,6 +157,12 @@ pub struct TdmF4Body {
     pub dov: bool,
     /// the order of the 32 WMMAs of a sub-step: 0 = i outer, j inner (A reused 7 of 8); 1 = 2 x 2 blocks (each pair of consecutive WMMAs shares A or B); 2 = j outer, i inner (B reused 3 of 4)
     pub wmma_order: u8,
+    /// A and B pre-shuffled in 16 x 16-byte tiles (host `BPRESHUF=3`, the vendor's ABpreShuffle layout): memory [row group g][K chunk c][row r][16 bytes], a stage slice = ONE contiguous run per group
+    /// (4096 bytes for 512 K): long tensor rows, and the fragment loads (lane m reads the 16 bytes of row m of a chunk) are bank-conflict free with NO row padding
+    pub pre3: bool,
+    /// cache-policy `th` of the operand loads and of the scale loads (0 = default; the vendor kernel uses 2 and 5 on its two kinds of loads)
+    pub th_data: u8,
+    pub th_scale: u8,
     pub dov_stores: i32,
     pub first_win: Option<(ValueId, ValueId)>,
     /// the overlapped epilogue (see `Ovl`)
@@ -220,6 +226,7 @@ impl TdmF4Body {
         let kb = b.bind_i32(key0.clone().lshr(1));
         // the scales' K byte offset: K / 32 bytes per row, or (preshuffled) K / 128 tiles of 128 bytes = K bytes
         let ks = if self.scale_shuf { b.bind_i32(key0.clone()) } else { b.bind_i32(key0.clone().lshr(5)) };
+        let kb = if self.pre3 { b.let_(Op::ShlI32(Opnd::Val(kb), Opnd::I32(4))) } else { kb };
         let oa = b.add_i32(self.a_org, kb);
         let ob = b.add_i32(self.b_org, kb);
         let osa = b.add_i32(self.sa_org, ks);
@@ -233,7 +240,10 @@ impl TdmF4Body {
         let g0b = tdm_group0(b, self.pb, ob, lb);
         let g0sa = tdm_group0(b, self.psa, osa, lsa);
         let g0sb = tdm_group0(b, self.psb, osb, lsb);
-        let cp = amdgpu_dsl::TdmCpol::default();
+        let mut cp = amdgpu_dsl::TdmCpol::default();
+        cp.th = self.th_data;
+        let mut cps = amdgpu_dsl::TdmCpol::default();
+        cps.th = self.th_scale;
         let (g1a, g1b, g1sa, g1sb) = (self.g1a, self.g1b, self.g1sa, self.g1sb);
         if do_a {
             ra.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0a), Opnd::Val(g1a), None, cp));
@@ -242,10 +252,10 @@ impl TdmF4Body {
             rb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0b), Opnd::Val(g1b), None, cp));
         }
         if do_a {
-            rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cp));
+            rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cps));
         }
         if do_b {
-            rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
+            rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cps));
         }
         if let Some(t0) = stamp_t0 {
             let t1 = cyc(b);
@@ -439,7 +449,7 @@ impl PipeBody for TdmF4Body {
         }
         let (a_s, b_s, sa_s, sb_s) = (self.a.clone(), self.b.clone(), self.sa.clone(), self.sb.clone());
         let (ra, rb, rsa, rsb) = (a_s.at(&t.cur), b_s.at(&t.cur), sa_s.at(&t.cur), sb_s.at(&t.cur));
-        let (perm_c, scale_shuf_c) = (self.perm, self.scale_shuf);
+        let (perm_c, scale_shuf_c, pre3_c) = (self.perm, self.scale_shuf, self.pre3);
         let sb_static: Option<[ValueId; 4]> = match t.cur.slot {
             Opnd::I32(k) if (k as usize) < self.slot_bases.len() => Some(self.slot_bases[k as usize]),
             _ => None,
@@ -461,7 +471,7 @@ impl PipeBody for TdmF4Body {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for half in 0..2 {
                         for piece in 0..2 {
-                            let addr = b.bind_i32((match sb_static { Some(v) => ev(v[0]), None => ra.base() + ev(abase) }) + (i * 32 + half * if perm_c { 8 } else { 16 }) * arow + s * 64 + piece * 32);
+                            let addr = b.bind_i32((match sb_static { Some(v) => ev(v[0]), None => ra.base() + ev(abase) }) + (if pre3_c { (i * 2 + half) * 4096 + s * 1024 + piece * 512 } else { (i * 32 + half * if perm_c { 8 } else { 16 }) * arow + s * 64 + piece * 32 }));
                             parts.push(Opnd::Val(b.load_lds_b128(addr)));
                         }
                     }
@@ -479,7 +489,7 @@ impl PipeBody for TdmF4Body {
                 for j in 0..sh.tn {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for piece in 0..2 {
-                        let addr = b.bind_i32((match sb_static { Some(v) => ev(v[1]), None => rb.base() + ev(bbase) }) + j * 16 * brow + s * 64 + piece * 32);
+                        let addr = b.bind_i32((match sb_static { Some(v) => ev(v[1]), None => rb.base() + ev(bbase) }) + (if pre3_c { j * 4096 + s * 1024 + piece * 512 } else { j * 16 * brow + s * 64 + piece * 32 }));
                         parts.push(Opnd::Val(b.load_lds_b128(addr)));
                     }
                     f.fb.push(Opnd::Val(b.frag_cat(&parts)));
