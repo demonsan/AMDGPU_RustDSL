@@ -29,6 +29,37 @@ fn branch_bits_lean(bits: u32) -> bool {
     lean
 }
 
+/// The direct bf16 stores of an O tile's 8 rows (lane (m, g): rows 8 g + r, dim col0 + m) packed to 4 bytes: lanes m, m ^ 1 swap one
+/// row of each row pair (DPP quad_perm xor 1); the even lane stores (row r, dims m, m + 1), the odd lane (row r + 1, dims m - 1, m).
+/// `prs[q]`: the lane's pointer for row pair q (row 8 g + 2 q + p, dim col0 + m - p; p = m & 1); `off`: the tile's byte offset.
+fn store_rows_packed(b: &mut FnBuilder, y: &[ValueId], odd: ValueId, prs: &[ValueId], off: u32) {
+    for q in 0..4usize {
+        let (r0, r1) = (y[2 * q], y[2 * q + 1]);
+        let send = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(r0), b: Opnd::Val(r1) });
+        let sb = b.let_(Op::BitcastI32(Opnd::Val(send)));
+        let rv = b.let_(Op::DppQuadPerm { x: Opnd::Val(sb), perm: [1, 0, 3, 2] });
+        let rvf = f32_of(b, rv);
+        let lo = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(rvf), b: Opnd::Val(r0) });
+        let hi = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(odd), a: Opnd::Val(r1), b: Opnd::Val(rvf) });
+        let h = b.cvt_pk_bf16_f32(lo, hi);
+        b.store_global(prs[q], off, h, MemTy::B32, false);
+    }
+}
+
+/// The per-lane row-pair pointers for `store_rows_packed`: R[b][8 g + 2 q + p][col0 + m - p] (bf16).
+fn packed_row_ptrs(b: &mut FnBuilder, pr: ValueId, bidx: ValueId, g: ValueId, m: ValueId, col0: amdgpu_dsl::I32) -> (ValueId, Vec<ValueId>) {
+    let par = b.bind_i32(ev(m) & 1);
+    let odd = b.cmp(CmpPred::Eq, CmpTy::I32, par, Opnd::I32(1));
+    let base = b.bind_i32((ev(bidx) * 16 + ev(g) * 8 + ev(par)) * 1024 + (col0 + (ev(m) & 14)) * 2);
+    let prs = (0..4i32)
+        .map(|q| {
+            let o = b.bind_i32(ev(base) + q * 2048);
+            b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
+        })
+        .collect();
+    (odd, prs)
+}
+
 fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
     b.let_(Op::BitcastF32(Opnd::Val(v)))
 }
@@ -412,6 +443,15 @@ pub fn mla_g1250_qh16_ws2M() -> Function {
 /// `_ws2` with the pairwise merge (bit 33)
 pub fn mla_g1250_qh16_ws2W() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2W", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33), false))
+}
+
+/// packed 4-byte direct stores (bit 34): `_ws4` and the pairwise `_ws2`
+pub fn mla_g1250_qh16_ws4K() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4K", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34), false))
+}
+
+pub fn mla_g1250_qh16_ws2K() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2K", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34), false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -1367,6 +1407,20 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
             .collect();
         if branchless & 536870912 != 0 {
             // (bit 29) no LDS staging, no barrier: every lane stores its 64 bf16 values straight to R (row 8 g + r, dim db + 16 nt + m)
+            if branchless & (1u64 << 34) != 0 {
+                // (bit 34) 4-byte stores: lane pairs m, m ^ 1 swap one row of each row pair
+                let (odd, prs) = packed_row_ptrs(&mut b, pr, bidx, g, m, ev(db));
+                for nt in 0..ntw {
+                    let y: Vec<ValueId> = (0..8u8)
+                        .map(|r| {
+                            let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                            let ef = f32_of(&mut b, e);
+                            b.mul_f32(ef, inv_r[r as usize])
+                        })
+                        .collect();
+                    store_rows_packed(&mut b, &y, odd, &prs, 32 * nt as u32);
+                }
+            } else {
             let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
             let prs: Vec<ValueId> = (0..8i32)
                 .map(|r| {
@@ -1382,6 +1436,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                     let h = b.cvt_pk_bf16_f32(y, y);
                     b.store_global(prs[r as usize], 32 * nt as u32, h, MemTy::U16, false);
                 }
+            }
             }
             let lg = b.log2_f32(lh);
             let s2 = b.add_f32(Opnd::Var(vm), lg);
@@ -1690,11 +1745,28 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                 b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
             })
             .collect();
+        let packed = branchless & (1u64 << 34) != 0;
+        let (odd2, prs2) = packed_row_ptrs(&mut b, pr, bidx, g, m, ev(db) + ev(grp) * (16 * hn as i32));
         for side in 0..2usize {
             let c = if side == 0 { Opnd::Val(is0) } else { Opnd::Val(b.let_(Op::NotI1(Opnd::Val(is0)))) };
             b.begin_if(c);
             for k in 0..hn {
                 let nt = if side == 0 { k } else { hn + k };
+                if packed {
+                    let y: Vec<ValueId> = (0..8u8)
+                        .map(|r| {
+                            let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                            let ef = f32_of(&mut b, e);
+                            let x = b.frag_slice(Opnd::Val(op[k]), r, 1);
+                            let xf = f32_of(&mut b, x);
+                            let y0 = b.mul_f32(ef, fo_r[r as usize]);
+                            let y1 = b.mul_f32(xf, fp_r[r as usize]);
+                            b.add_f32(y0, y1)
+                        })
+                        .collect();
+                    store_rows_packed(&mut b, &y, odd2, &prs2, 32 * k as u32);
+                    continue;
+                }
                 for r in 0..8u8 {
                     let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
                     let ef = f32_of(&mut b, e);
