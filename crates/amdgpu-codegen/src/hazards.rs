@@ -17,10 +17,19 @@ use crate::mir::*;
 
 /// Cycles that must separate a transcendental write from its first reader.
 /// VALU VGPR write -> v_readfirstlane read (target row `valu-readfirstlane`).
-const RFL_WAIT: usize = crate::target::T.hazard("valu-readfirstlane").n() as usize;
+#[allow(non_snake_case)]
+fn RFL_WAIT() -> usize {
+    crate::target::dflt().hazard("valu-readfirstlane").n() as usize
+}
 /// Transcendental result -> a plain VALU reader (target row `trans-valu`; other readers keep `trans-result`).
-const TRANS_VALU: usize = crate::target::T.hazard("trans-valu").n() as usize;
-const TRANS_LATENCY: usize = crate::target::T.hazard("trans-result").n() as usize;
+#[allow(non_snake_case)]
+fn TRANS_VALU() -> usize {
+    crate::target::dflt().hazard("trans-valu").n() as usize
+}
+#[allow(non_snake_case)]
+fn TRANS_LATENCY() -> usize {
+    crate::target::dflt().hazard("trans-result").n() as usize
+}
 
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
@@ -200,7 +209,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     if let Src::Reg(r) = s {
                         if let Some(&(rd, dly)) = vw.get(&canon(*r)) {
                             // v_readfirstlane: tools/readfirstlane_hazard_probe.sh (stale at 0, correct at 1 / 2 wait states)
-                            let rd = if inst.op == MOp::VReadFirstLane { rd - dly + dly.min(RFL_WAIT) } else { rd };
+                            let rd = if inst.op == MOp::VReadFirstLane { rd - dly + dly.min(RFL_WAIT()) } else { rd };
                             earliest = earliest.max(rd);
                         }
                     }
@@ -364,8 +373,8 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             }
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
-                    ready.insert(canon(d), (cycle + TRANS_LATENCY, false));
-                    trv.insert(canon(d), cycle + 1 + TRANS_VALU);
+                    ready.insert(canon(d), (cycle + TRANS_LATENCY(), false));
+                    trv.insert(canon(d), cycle + 1 + TRANS_VALU());
                 }
             }
             if let Some(latency) = mfma_latency(inst.op) {
@@ -381,10 +390,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
             }
             if strict && inst.op.defines_vcc() {
-                vccw.set(cycle + 1 + crate::target::T.hazard("valu-vcc-valu").n() as usize);
+                vccw.set(cycle + 1 + crate::target::dflt().hazard("valu-vcc-valu").n() as usize);
             }
             if strict && matches!(inst.op, MOp::VPtrAdd) {
-                vccw.set(cycle + 1 + crate::target::T.hazard("valu-vcc-valu").n() as usize);
+                vccw.set(cycle + 1 + crate::target::dflt().hazard("valu-vcc-valu").n() as usize);
             }
             // an explicit `s_nop N` already in the stream (hand-authored blocks) covers N+1 wait states
             let spent = if inst.op == MOp::SNop { inst.imm.max(0) as usize + 1 } else { 1 };
@@ -466,7 +475,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
 }
 /// Wait slots (issue distance) after a VMEM store of more than 8 bytes before a VALU may overwrite its data registers: 2 wait states on gfx940+ (so the
 /// next write may issue 3 slots after the store; an `s_waitcnt` between counts as one).
-const STORE_DATA_WAIT: usize = crate::target::T.hazard("wide-store-data").n() as usize;
+#[allow(non_snake_case)]
+fn STORE_DATA_WAIT() -> usize {
+    crate::target::dflt().hazard("wide-store-data").n() as usize
+}
 
 /// Global stores of more than 64 bits of data (`global_store_dwordx3/x4`): the data VGPRs are read over several cycles after issue.
 fn is_wide_vmem_store(op: MOp) -> bool {
@@ -491,12 +503,12 @@ fn is_valu_vgpr_write(m: &MFunction, inst: &MInst) -> bool {
 /// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
 /// VGPR -> VALU write of the same VGPR"), the 32x32x64 scaled and sparse forms 21.
 fn mfma_dst_wait(lat: usize) -> usize {
-    crate::target::T.hazard("mfma-dst-write").by_latency(lat as u32) as usize
+    crate::target::dflt().hazard("mfma-dst-write").by_latency(lat as u32) as usize
 }
 
 /// The SrcC write-after-read window of an MFMA with result latency `lat` (target rule `mfma-srcc-war`).
 fn mfma_srcc_war(lat: usize) -> usize {
-    crate::target::T.hazard("mfma-srcc-war").by_latency(lat as u32) as usize
+    crate::target::dflt().hazard("mfma-srcc-war").by_latency(lat as u32) as usize
 }
 
 /// Post-register-allocation hazard: a VALU (or other) write to a physical VGPR range that a still
@@ -750,7 +762,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             if is_wide_vmem_store(inst.op) {
                 if let Some(Src::Reg(d)) = inst.srcs.get(wide_store_data_idx(inst.op)) {
                     if m.vreg_class(*d).is_vector() {
-                        store_data_inflight.push((cycle, STORE_DATA_WAIT, vec![rng(m, *d)]));
+                        store_data_inflight.push((cycle, STORE_DATA_WAIT(), vec![rng(m, *d)]));
                     }
                 }
             }
@@ -898,7 +910,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                 // still in flight there; the vector-memory queue mixes LOADcnt / STOREcnt operations and never retires by count, as in
                 // sched::waits::vm_keep)
                 // (`AMDC_WAW_OLD_LIMITS`: the old gfx950 ranges, A/B only)
-                let t = if std::env::var("AMDC_WAW_OLD_LIMITS").is_ok() { crate::target::T } else { crate::target::cur() };
+                let t = if std::env::var("AMDC_WAW_OLD_LIMITS").is_ok() { crate::target::dflt() } else { crate::target::cur() };
                 let lim = if vm {
                     if crate::target::cur().name == "gfx1250" && std::env::var("AMDC_WAW_OLD_LIMITS").is_err() { u32::MAX } else { t.counters.of(amdgpu_target::MemClass::VmemLoad).max }
                 } else {
@@ -1054,10 +1066,19 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     if testing::SKIP_VALU_SGPR.with(|s| s.get()) {
         return 0;
     }
-    const VMEM_WAIT: usize = crate::target::T.hazard("valu-sgpr-vmem").n() as usize;
-    const VALU_WAIT: usize = crate::target::T.hazard("valu-sgpr-valu").n() as usize;
+    #[allow(non_snake_case)]
+    fn VMEM_WAIT() -> usize {
+        crate::target::dflt().hazard("valu-sgpr-vmem").n() as usize
+    }
+    #[allow(non_snake_case)]
+    fn VALU_WAIT() -> usize {
+        crate::target::dflt().hazard("valu-sgpr-valu").n() as usize
+    }
     // a lane-mask read (the v_cndmask mask operand) of a VALU-written SGPR pair: target row `valu-sgpr-mask`
-    const MASK_WAIT: usize = crate::target::T.hazard("valu-sgpr-mask").n() as usize;
+    #[allow(non_snake_case)]
+    fn MASK_WAIT() -> usize {
+        crate::target::dflt().hazard("valu-sgpr-mask").n() as usize
+    }
     let pipe = |op: MOp| crate::op_attrs::attrs(op).cost.pipe;
     let is_valu = |op: MOp| matches!(pipe(op), Pipe::Valu | Pipe::Trans | Pipe::Mfma);
     let srange = |m: &MFunction, r: VReg| -> Option<(u32, u32)> {
@@ -1084,7 +1105,7 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
                     }
                 }
             }
-            pend.retain(|p| p.2 < VMEM_WAIT);
+            pend.retain(|p| p.2 < VMEM_WAIT());
         }
         pend
     };
@@ -1120,11 +1141,11 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
         let mut pend: Vec<(u32, u32, usize)> = entry[bi].clone();
         for inst in insts {
             let p = pipe(inst.op);
-            let need_win = if p == Pipe::Vmem { VMEM_WAIT } else if is_valu(inst.op) { VALU_WAIT } else { 0 };
+            let need_win = if p == Pipe::Vmem { VMEM_WAIT() } else if is_valu(inst.op) { VALU_WAIT() } else { 0 };
             if need_win > 0 {
                 let mut need = 0usize;
                 for (k, s) in inst.srcs.iter().enumerate() {
-                    let win = if inst.op == MOp::VCndmaskM && k == 2 { MASK_WAIT } else { need_win };
+                    let win = if inst.op == MOp::VCndmaskM && k == 2 { MASK_WAIT() } else { need_win };
                     if let Src::Reg(r) = s {
                         if let Some((lo, hi)) = srange(m, *r) {
                             for w in &pend {
@@ -1155,7 +1176,7 @@ pub fn pad_valu_sgpr(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
             if let Some((lo, hi)) = def {
                 pend.push((lo, hi, 0));
             }
-            pend.retain(|w| w.2 < VMEM_WAIT);
+            pend.retain(|w| w.2 < VMEM_WAIT());
         }
         m.blocks[bi].insts = out;
     }
@@ -1185,7 +1206,7 @@ pub mod testing {
 /// registers starts a new clause. A `s_nop 0` breaks the clause. Returns the wait states added.
 pub fn pad_soft_clause(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
     use crate::sched::model::Pipe;
-    let n = crate::target::T.hazard("soft-clause-xnack").n() as usize;
+    let n = crate::target::dflt().hazard("soft-clause-xnack").n() as usize;
     // per vreg: (file, lo, hi) with file 0 = vector (VGPR / AGPR tagged), 1 = scalar
     let rng: Vec<(u32, u32, u32)> = (0..m.vregs.len())
         .map(|r| {

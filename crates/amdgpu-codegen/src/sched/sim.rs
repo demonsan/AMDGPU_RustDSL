@@ -5,7 +5,7 @@
 //! One SIMD is simulated with `waves` identical waves running the same loop path. Per wave:
 //! in-order issue, at most one instruction per cycle, `issue` cycles between instructions of the
 //! same pipe, operands ready after the producer's latency, `s_waitcnt` counting in-flight
-//! vm/lgkm operations, `s_nop N` = (N+1)*4 cycles, taken branches cost `BRANCH_TAKEN`. Shared by
+//! vm/lgkm operations, `s_nop N` = (N+1)*4 cycles, taken branches cost `BRANCH_TAKEN()`. Shared by
 //! the waves of the SIMD: each unit is busy `occ` cycles per instruction (plain fp32 ops 2 so two
 //! waves dual-issue, everything else 4+), `s_barrier` releases when all waves arrived.
 
@@ -106,18 +106,18 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
             Term::Goto(t) => {
                 let ti = label_to_block.get(t).copied().unwrap_or(usize::MAX);
                 if !(m.elide_fallthrough && ti == next_layout) {
-                    cost_t += BRANCH_UNCOND as i64;
+                    cost_t += BRANCH_UNCOND() as i64;
                 }
             }
             Term::CondGoto { target, fall, .. } => {
                 let ti = label_to_block.get(target).copied().unwrap_or(usize::MAX);
                 let fi = label_to_block.get(fall).copied().unwrap_or(usize::MAX);
                 if ti == next_in_path && fi != next_in_path {
-                    cost_t += BRANCH_TAKEN as i64;
+                    cost_t += BRANCH_TAKEN() as i64;
                 } else {
-                    cost_t += BRANCH_NOT_TAKEN as i64;
+                    cost_t += BRANCH_NOT_TAKEN() as i64;
                     if !(m.elide_fallthrough && fi == next_layout) {
-                        cost_t += BRANCH_UNCOND as i64;
+                        cost_t += BRANCH_UNCOND() as i64;
                     }
                 }
             }
@@ -132,7 +132,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 is_vmem: false,
                 is_lds: false,
                 extra: cost_t,
-                vcc_extra: if term_reads(&b.term).contains(&VCC) { VCC_TO_BRANCH as i64 } else { 0 },
+                vcc_extra: if term_reads(&b.term).contains(&VCC) { VCC_TO_BRANCH() as i64 } else { 0 },
             });
         }
     }
@@ -203,7 +203,7 @@ fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             if waiting == 0 {
                 break;
             }
-            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST as i64;
+            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST() as i64;
             for w in ws.iter_mut() {
                 if w.at_barrier.is_some() {
                     w.at_barrier = None;

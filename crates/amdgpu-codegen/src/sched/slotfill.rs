@@ -2,7 +2,7 @@
 //! such as `dma_gap`).
 //!
 //! The MFMA sequence of a region is the fixed skeleton (author order kept). Slot `k` is the gap in front of MFMA `k` (slot `M` = after the last one); one slot is one
-//! measured MFMA issue interval (32 cycles, tools/mfma_ceiling.py: 32.25 on gfx950) minus the MFMA's own issue, `SLOT_BUDGET` cycles for everything else.
+//! measured MFMA issue interval (32 cycles, tools/mfma_ceiling.py: 32.25 on gfx950) minus the MFMA's own issue, `SLOT_BUDGET()` cycles for everything else.
 //! Every other instruction (a *floater*) gets a window `[lo, dl]` of slots:
 //!   * `lo`  - the earliest slot that respects its producers (an MFMA reader of the old value, a producer's latency in slots, at most `HOIST_SLOTS` before its source
 //!             position: the register-pressure cap),
@@ -29,15 +29,27 @@ use super::order::set_relax_dma_lds_read;
 use super::{verify, Options};
 use crate::mir::*;
 
-pub const SLOT_CYCLES: u32 = crate::target::T.latency.slot_cycles;
-pub const SLOT_BUDGET: u32 = crate::target::T.latency.slot_budget;
+#[allow(non_snake_case)]
+pub fn SLOT_CYCLES() -> u32 {
+    crate::target::dflt().latency.slot_cycles
+}
+#[allow(non_snake_case)]
+pub fn SLOT_BUDGET() -> u32 {
+    crate::target::dflt().latency.slot_budget
+}
 /// Register-pressure cap: a floater never moves more than this many slots (MFMAs) above its source position.
 pub const HOIST_SLOTS: usize = 40;
-/// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency: `DMA_LATENCY_CYCLES` / `SLOT_CYCLES`).
+/// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency: `DMA_LATENCY_CYCLES()` / `SLOT_CYCLES()`).
 ///
 /// 512 cycles: swept 8..32 slots on GEMM v4 (9 alternating rounds, docs/slotfill.md): flat for 12..24 (3011..3026 TF/s vs hand 3002), 2969 at 32.
-pub const DMA_LATENCY_CYCLES: u32 = crate::target::T.latency.dma_latency_cycles;
-pub const DMA_SLOTS: usize = (DMA_LATENCY_CYCLES / SLOT_CYCLES) as usize;
+#[allow(non_snake_case)]
+pub fn DMA_LATENCY_CYCLES() -> u32 {
+    crate::target::dflt().latency.dma_latency_cycles
+}
+#[allow(non_snake_case)]
+pub fn DMA_SLOTS() -> usize {
+    (DMA_LATENCY_CYCLES() / SLOT_CYCLES()) as usize
+}
 /// Register-pressure budget: the new order may raise the region's peak of live vector dwords (unified VGPR + AGPR) by at most this much over the authored order;
 /// when it would, the hoist cap is halved until it fits.
 pub const PRESSURE_SLACK: i64 = 8;
@@ -149,7 +161,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
         }
     }
     let cost: Vec<u32> = seg.iter().map(|i| model::cost(i.op).issue).collect();
-    let fl = |lat: u32| (lat / SLOT_CYCLES) as usize;
+    let fl = |lat: u32| (lat / SLOT_CYCLES()) as usize;
     let cls: Vec<Option<Class>> = (0..n).map(|i| class_of(&g.eff[i])).collect();
     // ---- windows ----
     // deadlines first (they only look at the consumers), then the releases, clamped to their deadline: a chain of loads in front of the first MFMA has a release
@@ -163,7 +175,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
         }
         // a consumer outside the region (next iteration / next tile) sees the value at the region end
         let mut d = match cls[i] {
-            Some(Class::Dma) => mm.saturating_sub(DMA_SLOTS),
+            Some(Class::Dma) => mm.saturating_sub(DMA_SLOTS()),
             Some(_) => mm.saturating_sub(fl(model::cost(seg[i].op).latency)),
             None => mm,
         };
@@ -210,7 +222,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
             let target = wlo + ((2 * k + 1) * (whi - wlo + 1)) / (2 * nm);
             let s0 = target.clamp(lo[i], dl[i]);
             let mut pick = s0;
-            let fits = |s: usize, used: &Vec<u32>| used[s] + cost[i] <= SLOT_BUDGET;
+            let fits = |s: usize, used: &Vec<u32>| used[s] + cost[i] <= SLOT_BUDGET();
             if !fits(s0, &used) {
                 if let Some(s) = (s0 + 1..=dl[i]).find(|&s| fits(s, &used)) {
                     pick = s;

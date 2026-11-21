@@ -460,8 +460,8 @@ pub fn retryable(e: &str) -> bool {
 
 /// The text `amdc passes --target <t>` prints.
 pub fn describe(target: &str, evidence: bool) -> Result<String, String> {
-    if target != crate::target::T.name {
-        return Err(format!("no pipeline for target {target} (implemented: {}; gfx1250 is a specification only, docs/target-gfx1250.md)", crate::target::T.name));
+    if target != crate::target::dflt().name {
+        return Err(format!("no pipeline for target {target} (implemented: {}; gfx1250 is a specification only, docs/target-gfx1250.md)", crate::target::dflt().name));
     }
     let mut s = format!("pipeline {target}\n");
     let mut n = 0;

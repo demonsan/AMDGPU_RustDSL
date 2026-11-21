@@ -49,7 +49,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     let agprs = crate::regalloc::agpr_count(m, a);
     // gfx950 unified register file: accum_offset = arch VGPRs (rounded to 4), next_free_vgpr = arch + AGPRs (rounded to 8).
     let (accum_offset, vgpr, _waves) = if agprs == 0 {
-        let e = &crate::target::T.emit;
+        let e = &crate::target::dflt().emit;
         let v = round_up(a.max_v, e.vgpr_granule).max(e.vgpr_min);
         (v, v, 0)
     } else {
@@ -57,7 +57,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     };
     // the 8-register rounding must not pass the architectural limit: gfx950 accepts next_free_sgpr <= 102 (vcc is separate); the allocator
     // never uses more than 102 (s0..s101), so a kernel with 97..102 SGPRs declares 102 (rounding to 104 made the assembler reject it)
-    let te = &crate::target::T.emit;
+    let te = &crate::target::dflt().emit;
     let sgpr = round_up(a.max_s, te.sgpr_granule).max(te.sgpr_min).min(te.sgpr_cap);
     // exact mode: the counts the author's registers use (the hardware granules encode them identically)
     let (vgpr, sgpr) = if m.exact && agprs == 0 { (a.max_v.max(1), a.max_s.max(1)) } else { (vgpr, sgpr) };
@@ -98,7 +98,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .kernarg_segment_align: 8\n");
     out.push_str(&format!("    .group_segment_fixed_size: {}\n", m.lds_bytes));
     out.push_str("    .private_segment_fixed_size: 0\n");
-    out.push_str(&format!("    .wavefront_size: {}\n", crate::target::T.wave.lanes));
+    out.push_str(&format!("    .wavefront_size: {}\n", crate::target::dflt().wave.lanes));
     out.push_str("    .max_flat_workgroup_size: ");
     out.push_str(&m.workgroup_size.to_string());
     out.push('\n');
@@ -129,7 +129,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
             }
         }
     }
-    out.push_str(&format!("amdhsa.target: amdgcn-amd-amdhsa--{}\n", crate::target::T.name));
+    out.push_str(&format!("amdhsa.target: amdgcn-amd-amdhsa--{}\n", crate::target::dflt().name));
     out.push_str("amdhsa.version:\n  - 1\n  - 0\n...\n");
     out.push_str(".end_amdgpu_metadata\n");
     out

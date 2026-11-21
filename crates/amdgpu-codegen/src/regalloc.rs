@@ -22,13 +22,25 @@ fn vgpr_count() -> usize {
     crate::target::cur().regs.vgpr.count as usize
 }
 /// AGPRs per wave (a0..a255); arch VGPR + AGPR together must fit the unified 512-register file.
-const AGPR_COUNT: usize = crate::target::agpr_count(crate::target::T) as usize;
-pub const UNIFIED_FILE: u32 = crate::target::unified_total(crate::target::T);
+#[allow(non_snake_case)]
+fn AGPR_COUNT() -> usize {
+    crate::target::agpr_count(crate::target::dflt()) as usize
+}
+#[allow(non_snake_case)]
+pub fn UNIFIED_FILE() -> u32 {
+    crate::target::unified_total(crate::target::dflt())
+}
 // 102 usable SGPRs (the descriptor's next_free_sgpr must stay <= 102; vcc is separate)
-const SGPR_COUNT: usize = crate::target::T.regs.sgpr.count as usize;
+#[allow(non_snake_case)]
+fn SGPR_COUNT() -> usize {
+    crate::target::dflt().regs.sgpr.count as usize
+}
 
 /// Reserved: v0 holds workitem id; s0:s1 kernarg pointer; s2..s4 workgroup ids.
-const V_RESERVED: usize = crate::target::T.regs.vgpr.reserved as usize;
+#[allow(non_snake_case)]
+fn V_RESERVED() -> usize {
+    crate::target::dflt().regs.vgpr.reserved as usize
+}
 /// SGPRs the allocator never hands out: the target's reserved ones (gfx950: the ABI inputs) and, on gfx1250, the kernarg dwords the
 /// hardware preloads after the kernarg pointer (s[2 .. 2 + n], read by `SReadPhys` copies).
 fn s_reserved() -> usize {
@@ -368,8 +380,8 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; vgpr_count()];
-    let mut used_s = vec![false; SGPR_COUNT];
-    for i in 0..V_RESERVED {
+    let mut used_s = vec![false; SGPR_COUNT()];
+    for i in 0..V_RESERVED() {
         used_v[i] = true;
     }
     for i in 0..s_reserved() {
@@ -443,7 +455,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         // Per physical register: the (start, end) intervals already placed on it. Wide tuples first (widest, then longest),
         // every placement checked for overlap in time, so a single may sit in a register between two phases of a tuple.
         let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); vgpr_count()];
-        for i in 0..V_RESERVED {
+        for i in 0..V_RESERVED() {
             occ[i].push((0, usize::MAX));
         }
         let seg_len = |r: VReg| -> usize { segs[r as usize].iter().map(|(a, b)| b - a + 1).sum() };
@@ -474,7 +486,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
                     _ => my.clone(),
                 })
                 .collect();
-            let lo = if width == 1 { V_RESERVED } else { width };
+            let lo = if width == 1 { V_RESERVED() } else { width };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut found = None;
             // gfx1250: v0..v255-only values search below 256; under the retry, wide tuples search above v255 first
@@ -533,7 +545,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
                     }
                 }
                 ev.sort();
-                let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+                let (mut cur, mut peak, mut at) = (V_RESERVED() as i64, 0i64, 0usize);
                 for (p, d) in ev {
                     cur += d;
                     if cur > peak {
@@ -557,7 +569,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             };
             let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut best: Option<(usize, usize)> = None; // (slack, register)
-            for i in V_RESERVED..vgpr_count() {
+            for i in V_RESERVED()..vgpr_count() {
                 if forbid[i] || !occ[i].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os)) {
                     continue;
                 }
@@ -642,7 +654,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
         });
         let lru_pick = |used: &[bool], c: RClass, base: usize| -> Option<usize> {
             let width = c.dwords() as usize;
-            let lo = if width == 1 { V_RESERVED } else { width };
+            let lo = if width == 1 { V_RESERVED() } else { width };
             let mut best: Option<(usize, usize)> = None;
             let mut i = lo.max(base) - base;
             while i + width <= used.len() {
@@ -760,9 +772,9 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             }
         }
         avs.sort_by_key(|x| (x.0, x.1));
-        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); AGPR_COUNT];
+        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); AGPR_COUNT()];
         let fits = |occ: &Vec<Vec<(usize, usize)>>, i: usize, w: usize, s: usize, e: usize| -> bool {
-            i + w <= AGPR_COUNT && (0..w).all(|k| occ[i + k].iter().all(|(os, oe)| *oe < s || e < *os))
+            i + w <= AGPR_COUNT() && (0..w).all(|k| occ[i + k].iter().all(|(os, oe)| *oe < s || e < *os))
         };
         for &(s, e, r, c) in avs.iter().filter(|x| m.agpr_pin.contains_key(&x.2)) {
             let w = c.dwords() as usize;
@@ -783,7 +795,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             let w = c.dwords() as usize;
             let mut i = 0usize;
             let slot = loop {
-                if i + w > AGPR_COUNT {
+                if i + w > AGPR_COUNT() {
                     return Err(format!("out of AGPRs allocating r{r} ({c:?}, live {s}..{e})"));
                 }
                 if i % w == 0 && fits(&occ, i, w, s, e) {
@@ -801,8 +813,8 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     {
         // unified budget: accum_offset (arch VGPRs rounded to 4) + AGPRs <= 512; arch VGPRs alone <= 256
         let arch = (max_v + 3) / 4 * 4;
-        if max_a > 0 && arch + max_a > UNIFIED_FILE as usize {
-            return Err(format!("out of AGPRs: {arch} arch VGPRs + {max_a} AGPRs exceed the unified {UNIFIED_FILE}-register file"));
+        if max_a > 0 && arch + max_a > UNIFIED_FILE() as usize {
+            return Err(format!("out of AGPRs: {arch} arch VGPRs + {max_a} AGPRs exceed the unified {unified_file_v}-register file", unified_file_v = UNIFIED_FILE()));
         }
     }
     // Sub-register views live inside their tuple.
@@ -861,14 +873,14 @@ pub fn agpr_count(m: &MFunction, a: &Alloc) -> u32 {
 /// Unified-file accounting of an allocation: (accum_offset, next_free_vgpr, waves per SIMD). accum_offset is the arch VGPR count rounded to 4
 /// (.amdhsa_accum_offset), next_free_vgpr = accum_offset + AGPRs rounded to 8; waves per SIMD = floor(512 / next_free_vgpr) (at most 8).
 pub fn unified_budget(max_v: u32, agprs: u32) -> (u32, u32, u32) {
-    let t = crate::target::T;
+    let t = crate::target::dflt();
     let (ag, tg, maxw) = match &t.regs.unified {
         Some(u) => (u.accum_granule, u.total_granule, u.max_waves_per_simd),
         None => (t.emit.vgpr_granule, t.regs.vgpr.alloc_granule, 1),
     };
     let accum = ((max_v + ag - 1) / ag * ag).max(t.emit.vgpr_min);
     let total = if agprs == 0 { accum } else { ((accum + agprs + tg - 1) / tg) * tg };
-    let waves = (UNIFIED_FILE / total.max(1)).min(maxw).max(1);
+    let waves = (UNIFIED_FILE() / total.max(1)).min(maxw).max(1);
     (accum, total, waves)
 }
 
@@ -895,7 +907,7 @@ fn find_slot(used: &[bool], c: RClass, singles_from_top: bool) -> Option<usize> 
     let align = width;
     let lo = if c.is_vector() {
         if width == 1 {
-            V_RESERVED
+            V_RESERVED()
         } else {
             width
         }
@@ -1304,7 +1316,7 @@ pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
         }
     }
     ev.sort();
-    let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+    let (mut cur, mut peak, mut at) = (V_RESERVED() as i64, 0i64, 0usize);
     for (p, d) in ev {
         cur += d;
         if cur > peak {

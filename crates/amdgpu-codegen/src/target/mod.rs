@@ -11,6 +11,31 @@ pub mod gfx1250;
 pub const T: &Target = &amdgpu_target::gfx950::GFX950;
 
 thread_local! {
+    /// test guard: consulting the compile-time default target (`dflt`) while another target is current panics
+    static T_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The compile-time default target (gfx950) for the code paths that are gfx950-only by construction (its emitter, the LLVM tail). A
+/// shared pass must use `cur()`; under `with_default_target_guard` this panics when the current target is another one, which is how the
+/// audit test finds a shared pass that still reads gfx950 facts during a gfx1250 compile.
+#[track_caller]
+pub fn dflt() -> &'static Target {
+    if T_GUARD.with(|g| g.get()) && cur().name != T.name {
+        panic!("the default target ({}) was consulted during a {} compile", T.name, cur().name);
+    }
+    T
+}
+
+/// Runs `g` with the default-target guard on (see `dflt`).
+#[doc(hidden)]
+pub fn with_default_target_guard<R>(g: impl FnOnce() -> R) -> R {
+    let prev = T_GUARD.with(|x| x.replace(true));
+    let r = g();
+    T_GUARD.with(|x| x.set(prev));
+    r
+}
+
+thread_local! {
     static CUR: std::cell::Cell<&'static Target> = const { std::cell::Cell::new(&amdgpu_target::gfx950::GFX950) };
 }
 

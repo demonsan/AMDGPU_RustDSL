@@ -197,7 +197,7 @@ pub fn prepare(m: &MFunction, insts: &[MInst], g: &Graph, live_in: &HashSet<VReg
     for i in (0..n).rev() {
         let mut h = costs[i].latency;
         if g.term_vcc_writer == Some(i) {
-            h = h.max(model::VCC_TO_BRANCH + 8);
+            h = h.max(model::VCC_TO_BRANCH() + 8);
         }
         for &(s, lat) in &g.succs[i] {
             h = h.max(lat + height[s]);

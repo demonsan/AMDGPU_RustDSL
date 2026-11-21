@@ -59,18 +59,36 @@ pub(crate) const fn co(pipe: Pipe, issue: u32, occ: u32, latency: u32, grade: Gr
 /// Measured (tools/sched_mb/RESULTS2.md, 1 wave, V): taken backward s_cbranch ~24, uncond s_branch (even to the next label) ~18, not taken ~6,
 /// extra ~20 cycles from a VALU v_cmp issue to the s_cbranch_vccnz that reads it (about 5 independent VALU hide it).
 /// With >=4 waves per CU some launches show +96 per taken branch (cause unknown, not modelled).
-pub const BRANCH_TAKEN: u32 = crate::target::T.latency.branch_taken;
-pub const BRANCH_UNCOND: u32 = crate::target::T.latency.branch_uncond;
-pub const BRANCH_NOT_TAKEN: u32 = crate::target::T.latency.branch_not_taken;
-pub const VCC_TO_BRANCH: u32 = crate::target::T.latency.vcc_to_branch;
-pub const BARRIER_COST: u32 = crate::target::T.latency.barrier;
+#[allow(non_snake_case)]
+pub fn BRANCH_TAKEN() -> u32 {
+    crate::target::dflt().latency.branch_taken
+}
+#[allow(non_snake_case)]
+pub fn BRANCH_UNCOND() -> u32 {
+    crate::target::dflt().latency.branch_uncond
+}
+#[allow(non_snake_case)]
+pub fn BRANCH_NOT_TAKEN() -> u32 {
+    crate::target::dflt().latency.branch_not_taken
+}
+#[allow(non_snake_case)]
+pub fn VCC_TO_BRANCH() -> u32 {
+    crate::target::dflt().latency.vcc_to_branch
+}
+#[allow(non_snake_case)]
+pub fn BARRIER_COST() -> u32 {
+    crate::target::dflt().latency.barrier
+}
 
 /// Global model knobs (also data): whether `v_exp`/`v_rcp` run on their own pipe next to the VALU.
 pub struct ModelParams {
     pub trans_separate_pipe: bool,
 }
 
-pub const PARAMS: ModelParams = ModelParams { trans_separate_pipe: crate::target::T.latency.trans_separate_pipe };
+#[allow(non_snake_case)]
+pub fn PARAMS() -> ModelParams {
+    ModelParams { trans_separate_pipe: crate::target::dflt().latency.trans_separate_pipe }
+}
 
 /// Cost of one opcode (the `cost` attribute of `crate::op_attrs`). Grades: see docs/scheduling.md (tables 1-2).
 pub fn cost(op: MOp) -> OpCost {

@@ -4362,8 +4362,14 @@ fn gcd(a: i128, b: i128) -> i128 {
     a
 }
 
-const VGPR_LIMIT: u32 = crate::target::T.verify.vgpr_limit;
-const SGPR_LIMIT: u32 = crate::target::T.verify.sgpr_limit;
+#[allow(non_snake_case)]
+fn VGPR_LIMIT() -> u32 {
+    crate::target::dflt().verify.vgpr_limit
+}
+#[allow(non_snake_case)]
+fn SGPR_LIMIT() -> u32 {
+    crate::target::dflt().verify.sgpr_limit
+}
 /// the per-workgroup LDS limit of the target being compiled (gfx950: 160 KiB, gfx1250: 320 KiB)
 fn lds_limit() -> u32 {
     crate::target::cur().verify.lds_limit
@@ -4431,8 +4437,8 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             } else if n >= 2 && p % n != 0 {
                 rep.add("GV-REG-POLICY", Severity::Info, format!("vreg {r} ({c:?}) at v{p}: ISA-legal, but not aligned to the tuple width {n} (the allocator normally aligns to the width)"));
             }
-            if p + n > VGPR_LIMIT {
-                rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at v{p}..v{}: exceeds the {VGPR_LIMIT}-VGPR per-wave limit", p + n - 1));
+            if p + n > VGPR_LIMIT() {
+                rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at v{p}..v{}: exceeds the {vgpr_limit_v}-VGPR per-wave limit", p + n - 1, vgpr_limit_v = VGPR_LIMIT()));
             }
         } else {
             if p < 8 && !f.exact {
@@ -4443,8 +4449,8 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if n >= 2 && p % need != 0 {
                 rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors / wider multiple of 4; assembler-measured)", if n == 4 { "descriptor quad" } else { "tuple" }));
             }
-            if p + n > SGPR_LIMIT && !(f.exact && ((p == crate::mir::VCC_PIN && n == 2) || (p == crate::mir::SCC_PIN && n == 1) || (p >= crate::mir::TTMP_PIN && p + n <= crate::mir::TTMP_PIN + 16))) {
-                rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));
+            if p + n > SGPR_LIMIT() && !(f.exact && ((p == crate::mir::VCC_PIN && n == 2) || (p == crate::mir::SCC_PIN && n == 1) || (p >= crate::mir::TTMP_PIN && p + n <= crate::mir::TTMP_PIN + 16))) {
+                rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {sgpr_limit_v}-SGPR limit", p + n - 1, sgpr_limit_v = SGPR_LIMIT()));
             }
         }
     }
@@ -4452,20 +4458,20 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
     let n_agpr = crate::regalloc::agpr_count(m, a);
     if n_agpr > 0 {
         let (accum, total, _) = crate::regalloc::unified_budget(a.max_v, n_agpr);
-        if total > crate::regalloc::UNIFIED_FILE {
-            rep.add("GV-REG-LIMIT", Severity::Error, format!("unified register file: {accum} arch VGPRs (accum_offset) + {n_agpr} AGPRs = {total} > {}", crate::regalloc::UNIFIED_FILE));
+        if total > crate::regalloc::UNIFIED_FILE() {
+            rep.add("GV-REG-LIMIT", Severity::Error, format!("unified register file: {accum} arch VGPRs (accum_offset) + {n_agpr} AGPRs = {total} > {}", crate::regalloc::UNIFIED_FILE()));
         } else {
             rep.ok("agpr-unified-budget");
         }
     }
-    if a.max_v > VGPR_LIMIT {
-        rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} VGPRs (limit {VGPR_LIMIT})", a.max_v));
+    if a.max_v > VGPR_LIMIT() {
+        rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} VGPRs (limit {vgpr_limit_v})", a.max_v, vgpr_limit_v = VGPR_LIMIT()));
     }
     if let Err(e) = crate::regalloc::check_workgroup_budget(m, a) {
         rep.add("GV-REG-OCCUPANCY", Severity::Error, e);
     }
-    if a.max_s > SGPR_LIMIT {
-        rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} SGPRs (limit {SGPR_LIMIT})", a.max_s));
+    if a.max_s > SGPR_LIMIT() {
+        rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} SGPRs (limit {sgpr_limit_v})", a.max_s, sgpr_limit_v = SGPR_LIMIT()));
     }
     if m.lds_bytes > lds_limit() {
         rep.add("GV-LDS-OOB", Severity::Error, format!("declared + spill LDS {} bytes exceeds the {}-byte per-workgroup limit", m.lds_bytes, lds_limit()));
