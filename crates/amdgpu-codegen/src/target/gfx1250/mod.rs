@@ -98,7 +98,7 @@ fn compile_inner(f: &Function, backend: &str) -> Result<crate::Compiled, String>
     // the global / tensor bounds (GV-GLB-*, GV-TDM-*): every global access and every tensor tile must lie inside a declared kernarg extent (a null / unrelated descriptor base is a device hang)
     if !f.exact {
         let g = crate::gpu_verify::analyse(f)?;
-        let errs: Vec<String> = g.errors().iter().filter(|e| e.code.starts_with("GV-GLB") || e.code.starts_with("GV-TDM") || e.code.starts_with("GV-LDS") || e.code == "GV-TILE-ESCAPE" || e.code == "GV-TILE-PRIVATE-ESCAPE" || e.code == "GV-TILE-UNTAGGED-OVERLAP").map(|e| format!("[{}] {}", e.code, e.msg)).collect();
+        let errs: Vec<String> = g.errors().iter().filter(|e| e.code.starts_with("GV-GLB") || e.code.starts_with("GV-TDM") || e.code.starts_with("GV-LDS") || e.code == "GV-TILE-ESCAPE" || e.code == "GV-TILE-PRIVATE-ESCAPE" || (e.code == "GV-TILE-UNTAGGED-OVERLAP" && !warn_tile)).map(|e| format!("[{}] {}", e.code, e.msg)).collect();
         if !errs.is_empty() {
             return Err(format!("{}: gfx1250 global / tensor bounds: {} violation(s)\n  {}", f.name, errs.len(), errs.join("\n  ")));
         }

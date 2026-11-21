@@ -32,6 +32,11 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
         }
     }
+    if let Some(rest) = name.strip_prefix("exp_gemm_g1250_tdm_stage_f4_256x256_ks4_s2_") {
+        if rest == "bf16_roles" || rest == "bf16_roles_stamps" {
+            return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2_bf16(name, true));
+        }
+    }
     if let Some(rest) = name.strip_prefix("exp_gemm_g1250_tdm_stage_f4_256x256_ks2_c4x4_lock_") {
         if rest == "stamps" || rest == "relax_stamps" || rest == "defer_stamps" {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks2_cluster_stamps(name, rest.starts_with("relax")));
