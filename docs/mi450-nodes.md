@@ -70,3 +70,42 @@ A trivial kernel (`out[i] = 3 i + 1`) is built with the node's ROCm clang as a b
 | GPU smoke | `... -Tag mine -GpuTimeoutSec 60 -PayloadFile tools/mi450/smoke.sh` |
 | which GPU is idle | `... -PayloadFile` with `echo "$IDLE_GPU"` (empty: none idle) |
 | clean up | a payload that does `rm -rf "$W/target"` |
+
+## 7. Performance counters on e08 (`tools/mi450/pmc_run.sh`)
+
+The only working PMC stack on e08 is rocprofv3 1.4.1 (ROCm 10.2.0) inside the docker image
+`rocm/atom-dev:ub24-dcgpu-rk-10.2.0a20260922.bkc.20261002-pyt2.14.0-tri-main-atomsrc-gfx1250-1009`. The host's
+`/opt/rocm-10.2.0a20261013` (rocprofv3 1.4.2) is not used. `pmc_run.sh` pins that image.
+
+```
+bash tools/mi450/pmc_run.sh <tag> <gpu> "<COUNTER ...>" <app> [args]   # one counter pass (per dispatch)
+bash tools/mi450/pmc_run.sh <tag> <gpu> trace <app> [args]              # kernel trace + stats
+bash tools/mi450/pmc_run.sh <tag> <gpu> list                            # the counters offered
+python3 tools/mi450/pmc_sum.py <pass dir> [kernel substring] [--all]    # per-kernel medians of a pass
+```
+
+- **Exclusive:** every pass holds the **whole-node** `gpu-lock`, so no other job runs on any GPU during the capture.
+- **Bounded:** passes have hard timeouts inside and outside the container, and a 2 GB file-size cap.
+- **No SPM / streaming / thread trace / VMP:** such options are refused; only per-dispatch counter passes and kernel traces are allowed.
+- **Container:** `--rm`, in the foreground, `--network none`, `/dev/kfd` + `/dev/dri`, only `/data/blyu` mounted, the GPU passed as
+  `HIP_VISIBLE_DEVICES`.
+- **Root inside:** the image's ROCm lives under `/root`, so the pass runs as the container's root, in the pass directory, and hands its
+  output back to the caller (chown). Give the application **absolute paths**.
+- **Output:** `/data/blyu/amdrustdsl/pmc/<tag>/pass_NNN/run_counter_collection.csv`, plus `log.txt` and `request.txt`.
+- **Run it from an `mi450-exec` `-NoGpu` payload.** The GPU mode's `gpurun` already locks, so calling `pmc_run.sh` under it would nest
+  `gpu-lock`.
+- Our hosts and code objects built on the host run unchanged inside the image.
+
+**What counts (2026-11-21, every offered counter swept over an MLA run: `tools/mi450/pmc_sweep.sh`):**
+
+| block | counts | reads 0 |
+|---|---|---|
+| SQ | `SQ_WAVES` (exact: wave count of the grid), `SQ_ITEMS` (exact: work-items), `SQ_BUSY_CYCLES`, `SQ_CYCLES` | every per-instruction / per-wave counter: `SQ_INSTS_*` (VALU, SALU, LDS, SMEM, FLAT, WMMA, TRANS), `SQ_INST_CYCLES_*`, `SQ_INST_LEVEL_*`, `SQ_WAIT_*`, `SQ_WAVE_CYCLES`, `SQ_LEVEL_WAVES`, `SQ_VALU_WMMA_FLOP_*`, `SQ_IFETCH_*` (40 counters, also for HIP-compiled kernels) |
+| GRBM | `GRBM_GUI_ACTIVE`, `GRBM_COUNT`, `GRBM_CP_BUSY`, `GRBM_CPC_BUSY`, `GRBM_SPI_BUSY`, `GRBM_UTCL2_BUSY` | |
+| GL2 | `GL2C_READ` / `WRITE` / `HIT` / `MISS` / `REQ` / `*_SECTORS`, `GL2C_EA_RDREQ*` / `WRREQ*` (memory traffic), `GL2C_BUSY`, `GL2A_BUSY` | 21 GL2C sub-counters |
+| SQC | `SQC_ICACHE_*` / `SQC_DCACHE_*` (instruction / scalar caches) | 12 |
+| TA / TX / SPI / CPC / GL1 | | all (TX 53, SPI 9, CPC 10, …) |
+
+So the instruction-mix, LDS, wait and WMMA-busy questions cannot be answered with this stack: those counters read 0 for every kernel. The
+static reports (`amdc lds-banks`, `amdc vgpr-banks`) and the shader-clock stamps remain the tools for those. What PMC adds is exact wave /
+work-item counts, SQ / GUI busy cycles, and L2 / memory traffic (read / write sectors, DRAM requests, hit rate) per dispatch.
