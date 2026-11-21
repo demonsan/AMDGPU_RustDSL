@@ -322,6 +322,15 @@ pub fn mla_g1250_qh16_wsnl() -> Function {
     mla_ws_with("mla_g1250_qh16_wsnl", false, 64 | 16384 | 65536, false)
 }
 
+/// `_ws` / `_ws4` with the page loaded as a 2D tensor tile (72 x 512 bytes)
+pub fn mla_g1250_qh16_ws2d() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2d", false, 64 | 256 | 16384 | 65536 | 131072 | 33554432, false))
+}
+
+pub fn mla_g1250_qh16_ws42d() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws42d", false, 64 | 256 | 4096 | 32768 | 65536 | 33554432, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -593,7 +602,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.wait_vm(0);
     }
     // one page = one tensor op (4608 x 8 bytes), padded by the plan
-    let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
+    // bit 25: the page as a 2D tile (72 rows of 512 bytes) instead of one 36 KB row (the same LDS stream, so the same padded layout)
+    let tile = if branchless & 33554432 != 0 {
+        TensorTile { data_size: 8, tensor_dim: [Opnd::I32(64), Opnd::I32(PAGE_BYTES / 512)], stride0: Opnd::I32(64), tile: [64, (PAGE_BYTES / 512) as u16], pad: layout.pad, wg_mask: 0 }
+    } else {
+        TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 }
+    };
     let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
     let tile_q = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(QUARTER / 8), Opnd::I32(1)], stride0: Opnd::I32(QUARTER / 8), tile: [(QUARTER / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
     let g1q = if quarters { b.tensor_desc_2d(&tile_q, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0)).1 } else { g1 };
