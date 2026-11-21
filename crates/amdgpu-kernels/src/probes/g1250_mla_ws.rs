@@ -409,6 +409,11 @@ pub fn mla_g1250_qh16_ws2M() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2M", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
+/// `_ws2` with the pairwise merge (bit 33)
+pub fn mla_g1250_qh16_ws2W() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2W", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33), false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -1591,6 +1596,113 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
         let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
         b.store_global(pl, 0, lse, MemTy::B32, false);
+        return b.finish();
+    }
+    if branchless & (1u64 << 33) != 0 && dg == 2 && !split && !tstamp {
+        // (bit 33) pairwise merge of the dim split: waves 2, 3 (page group 1) write their O (lane-native: tile nt, lane l: 8 floats at
+        // nt * 1024 + 32 l), their max and half-sums; waves 0, 1 (page group 0, the same dims) combine them in registers and store bf16
+        // straight to R (no final pass, half the LDS traffic)
+        b.wait_lds(0);
+        b.barrier();
+        let half = b.bind_i32(ev(w) & 1);
+        let rbase = b.bind_i32(ev(half) * 20480 + mo.base as i32);
+        let second = b.cmp(CmpPred::Ge, CmpTy::I32, w, Opnd::I32(2));
+        let lb = b.bind_i32(ev(rbase) + ev(lane) * 32);
+        let lm = b.bind_i32(ev(rbase) + 16384 + ev(lane) * 4);
+        let ll = b.bind_i32(ev(rbase) + 16384 + 128 + ev(lane) * 4);
+        b.begin_if(Opnd::Val(second));
+        mo.at(&t0).write(&mut b, |b| {
+            for nt in 0..ntw {
+                let lo = b.frag_slice(Opnd::Var(ov[nt]), 0, 4);
+                let hi = b.frag_slice(Opnd::Var(ov[nt]), 4, 4);
+                let a0 = b.bind_i32(ev(lb) + 1024 * nt as i32);
+                b.store_lds(a0, lo, MemTy::B128, false);
+                let a1 = b.bind_i32(ev(lb) + (1024 * nt as i32 + 16));
+                b.store_lds(a1, hi, MemTy::B128, false);
+            }
+            b.store_lds(lm, Opnd::Var(vm), MemTy::B32, false);
+            b.store_lds(ll, Opnd::Var(vl), MemTy::B32, false);
+        });
+        b.end_if();
+        b.wait_lds(0);
+        b.barrier();
+        let first = b.cmp(CmpPred::Lt, CmpTy::I32, w, Opnd::I32(2));
+        b.begin_if(Opnd::Val(first));
+        let (mp, lp, op): (ValueId, ValueId, Vec<ValueId>) = mo.at(&t0).read(&mut b, |b| {
+            let mpv = b.load_lds(lm, MemTy::B32);
+            let lpv = b.load_lds(ll, MemTy::B32);
+            let ops: Vec<ValueId> = (0..ntw)
+                .map(|nt| {
+                    let a0 = b.bind_i32(ev(lb) + 1024 * nt as i32);
+                    let a1 = b.bind_i32(ev(a0) + 16);
+                    b.load_lds_b128x2(a0, a1)
+                })
+                .collect();
+            (f32_of(b, mpv), f32_of(b, lpv), ops)
+        });
+        // head m of this lane: M = max(m_own, m_partner), the scales, the row sum L over both lane halves and both waves
+        let mm = b.max_f32(Opnd::Var(vm), mp);
+        let d_o = b.sub_f32(Opnd::Var(vm), mm);
+        let s_o = b.exp2_f32(d_o);
+        let d_p = b.sub_f32(mp, mm);
+        let s_p = b.exp2_f32(d_p);
+        let lo_ = b.mul_f32(Opnd::Var(vl), s_o);
+        let lp_ = b.mul_f32(lp, s_p);
+        let lsum = b.add_f32(lo_, lp_);
+        let sw = b.let_(Op::Permlane16Swap { a: Opnd::Val(lsum), b: Opnd::Val(lsum) });
+        let s0 = b.frag_slice(Opnd::Val(sw), 0, 1);
+        let s1 = b.frag_slice(Opnd::Val(sw), 1, 1);
+        let s0f = f32_of(&mut b, s0);
+        let s1f = f32_of(&mut b, s1);
+        let lh = b.add_f32(s0f, s1f);
+        let rl = b.rcp_f32(lh);
+        let invh = b.mul_f32(rl, ksf);
+        let fo = b.mul_f32(s_o, invh);
+        let fp = b.mul_f32(s_p, invh);
+        let gbits = b.bind_i32(ev(g) * 0x3F80_0000);
+        let gf = b.let_(Op::BitcastF32(Opnd::Val(gbits)));
+        let one = b.c_f32(1.0);
+        let hf = b.sub_f32(one, gf);
+        let rows = |b: &mut FnBuilder, x: ValueId| -> Vec<ValueId> {
+            let s16: Vec<ValueId> = (0..16u8).map(|hh| { let v = b.read_lane(x, hh); f32_of(b, v) }).collect();
+            (0..8usize)
+                .map(|r| {
+                    let t0_ = b.mul_f32(s16[r], hf);
+                    let t1_ = b.mul_f32(s16[8 + r], gf);
+                    b.add_f32(t0_, t1_)
+                })
+                .collect()
+        };
+        let fo_r = rows(&mut b, fo);
+        let fp_r = rows(&mut b, fp);
+        let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
+        let prs: Vec<ValueId> = (0..8i32)
+            .map(|r| {
+                let o = b.bind_i32(ev(rbx) + r * 1024);
+                b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
+            })
+            .collect();
+        for nt in 0..ntw {
+            for r in 0..8u8 {
+                let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                let ef = f32_of(&mut b, e);
+                let x = b.frag_slice(Opnd::Val(op[nt]), r, 1);
+                let xf = f32_of(&mut b, x);
+                let y0 = b.mul_f32(ef, fo_r[r as usize]);
+                let y1 = b.mul_f32(xf, fp_r[r as usize]);
+                let y = b.add_f32(y0, y1);
+                let h = b.cvt_pk_bf16_f32(y, y);
+                b.store_global(prs[r as usize], 32 * nt as u32, h, MemTy::U16, false);
+            }
+        }
+        let lg = b.log2_f32(lh);
+        let s2 = b.add_f32(mm, lg);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lse = b.mul_f32(s2, ln2);
+        let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+        b.store_global(pl, 0, lse, MemTy::B32, false);
+        b.end_if();
         return b.finish();
     }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
