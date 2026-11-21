@@ -43,20 +43,17 @@ pub fn tgt_lat() -> &'static Target {
     tgt()
 }
 
-/// A gfx950 wait-state rule of the SHARED hazard pass, in wait states: the rule of the current target when it describes it; gfx1250
-/// interlocks those dependencies (its software hazards are target/gfx1250/hazards.rs, and the gfx1250 emitter drops the shared pass's
-/// `s_nop`s), so there it is 0. (`AMDC_T950_COMPAT`: the gfx950 value, A/B only.)
+/// A wait-state rule of the SHARED hazard pass (hazards.rs), in wait states. On gfx950 the target's rule. On gfx1250 those dependencies
+/// interlock (its software hazards are target/gfx1250/hazards.rs) and the gfx1250 emitter drops the shared pass's `s_nop`s, so the rule
+/// is no longer a correctness fact there: what remains is the pass's filling of the gaps with independent instructions, a scheduling
+/// heuristic. It keeps the gfx950 distances deliberately (measured, 2026-11-21: zero distances reorder 49 gfx1250 kernels and cost the
+/// MLA ~1 %); a gfx1250 rule of the same name, if the target describes one, wins.
 pub fn shared_hazard(name: &str) -> u32 {
     let t = tgt();
-    // the TRANS result spacing: on gfx1250 not a wait state but the shared pass's latency-driven filling (independent work between a
-    // transcendental and its reader): kept at the described value as a scheduling heuristic (measured: dropping it costs the MLA ~1 %)
-    if t.name == "gfx1250" && matches!(name, "trans-result" | "trans-valu") {
-        return T.hazard(name).n();
-    }
     if t.hazards.iter().any(|h| h.name == name) {
         return t.hazard(name).n();
     }
-    0
+    T.hazard(name).n()
 }
 
 /// `shared_hazard` for the latency-scaled rules (`by_latency`).
@@ -65,7 +62,7 @@ pub fn shared_hazard_by_latency(name: &str, lat: u32) -> u32 {
     if t.hazards.iter().any(|h| h.name == name) {
         return t.hazard(name).by_latency(lat);
     }
-    0
+    T.hazard(name).by_latency(lat)
 }
 
 /// Runs `g` with the default-target guard on (see `dflt`).
