@@ -80,6 +80,8 @@ struct Ev {
     /// the event's LDS writes include atomics (`ds_add_*`: several waves may accumulate into the same words in one phase) / plain stores
     atomic: bool,
     plain: bool,
+    /// the carry form of the persistent tile loop: this produce event is the NEXT tile's first stage (live until the body ends)
+    carried: bool,
 }
 
 struct Trace {
@@ -94,7 +96,7 @@ struct Trace {
 }
 
 /// Regions whose markers the intra-workgroup simulator must not interpret: counted-trust regions and inter-block (last-arriver) regions.
-fn region_skipped(f: &Function, name: &str) -> bool {
+pub(crate) fn region_skipped(f: &Function, name: &str) -> bool {
     f.contract.buf_trusts.iter().any(|(n, _)| n == name) || f.contract.last_arrivers.iter().any(|l| l.region == name)
 }
 
@@ -370,6 +372,91 @@ impl<'a> Sim<'a> {
         self.f.stmts()[begin + 1..close].iter().any(|s| matches!(s, Stmt::BeginLoop { .. }))
     }
 
+    /// The CARRY form of the persistent tile loop (launch fact `g5:persistent_tile_carry`): the body's first stage of the NEXT tile is issued
+    /// inside the body (under a wave-uniform `if`, the peeled last window) and stays in flight across the back edge; the first tile's is issued
+    /// by the body's PROLOGUE `if` (taken in the first iteration). One simulated iteration (the first: prologue taken) covers every later
+    /// iteration when
+    ///  * the carried stage equals the prologue's: the same (tile, slot) set of produce events, the versions shifted by one constant;
+    ///  * the prologue `if` is the body's first protocol-relevant code (nothing of the body touches LDS / issues a tensor operation before it,
+    ///    where a later iteration would already have the carried stage in flight);
+    ///  * apart from the carried stage the body ends quiescent (every other tensor operation completed, a barrier after the last other access);
+    ///  * every access between the carried stage's issue and the body's end is checked against it by the simulation itself (it is a produce
+    ///    event of the iteration: a read / write of its slot there is a race).
+    /// The prologue / carry `if`s are the first / last top-level `if`s of the body with tile markers (both required, distinct).
+    fn carry_at_end(&mut self, first: usize, first_ev: usize, begin: usize, close: usize) {
+        let f = self.f;
+        let mut ifs: Vec<(usize, usize)> = Vec::new();
+        let mut j = begin + 1;
+        while j < close {
+            match &f.stmts()[j] {
+                Stmt::BeginLoop { .. } => j = matching(f, j) + 1,
+                Stmt::BeginIf { .. } => {
+                    let (_, endif) = if_span(f, j);
+                    if f.stmts()[j..endif].iter().any(|s| matches!(s, Stmt::TileProduce { .. })) {
+                        ifs.push((j, endif));
+                    }
+                    j = endif + 1;
+                }
+                _ => j += 1,
+            }
+        }
+        let bad = |s: &mut Self, msg: String| s.diag("GV-TILE-CARRY", Severity::Error, begin, format!("stmt {begin}: persistent tile loop with a carried stage: {msg}"));
+        if ifs.len() < 2 {
+            bad(self, format!("{} top-level `if`(s) with tile markers in the body; the carry form needs the prologue `if` (first tile) and the carry `if` (next tile)", ifs.len()));
+            return;
+        }
+        let (p, c) = (ifs[0], ifs[ifs.len() - 1]);
+        let evs: Vec<Ev> = self.evs[first_ev..].to_vec();
+        let in_span = |e: &Ev, s: (usize, usize)| e.stmt > s.0 && e.stmt < s.1;
+        let pro: Vec<&Ev> = evs.iter().filter(|e| e.produce && in_span(e, p)).collect();
+        let car: Vec<&Ev> = evs.iter().filter(|e| e.produce && in_span(e, c)).collect();
+        // the carried events stay live to the end of the body (checked against every later access of their bytes in check_pair)
+        for e in self.evs[first_ev..].iter_mut() {
+            if e.produce && e.stmt > c.0 && e.stmt < c.1 {
+                e.carried = true;
+            }
+        }
+        if pro.is_empty() {
+            bad(self, format!("the prologue `if` (stmt {}) issues no stage in the simulated first iteration", p.0));
+            return;
+        }
+        // the carry `if` is a runtime decision: in the simulated path(s) where it is not taken, the loop must not continue (nothing to compare)
+        if !car.is_empty() {
+            let mut a: Vec<(usize, i64)> = pro.iter().map(|e| (e.tile, e.slot)).collect();
+            let mut b: Vec<(usize, i64)> = car.iter().map(|e| (e.tile, e.slot)).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            if a != b {
+                let nm = |v: &Vec<(usize, i64)>| v.iter().map(|(t, s)| format!("{}[{s}]", f.contract.tiles[*t].name)).collect::<Vec<_>>().join(", ");
+                bad(self, format!("the carried stage (stmt {}) produces {} but the prologue stage (stmt {}) produces {}: the next iteration would not start in the first iteration's state", c.0, nm(&b), p.0, nm(&a)));
+            } else {
+                let shift: Vec<i64> = car.iter().map(|e| e.ver - pro.iter().find(|q| (q.tile, q.slot) == (e.tile, e.slot)).map_or(e.ver, |q| q.ver)).collect();
+                if shift.windows(2).any(|w| w[0] != w[1]) || shift.first().map_or(false, |&s| s <= 0) {
+                    bad(self, format!("the carried stage's versions are not the prologue's shifted by one positive constant ({shift:?})"));
+                }
+            }
+        }
+        // nothing protocol-relevant of the body before the prologue `if`
+        let pro_start = pro.iter().map(|e| e.start).min().unwrap_or(first);
+        if let Some(k) = self.items[first..pro_start.min(self.items.len())].iter().position(|it| matches!(it, Item::Access { .. } | Item::Tensor)) {
+            let _ = k;
+            bad(self, format!("the body touches LDS / issues a tensor operation before its prologue `if` (stmt {}): a later iteration has the carried stage in flight there", p.0));
+        }
+        // the rest quiescent: tensor operations / accesses outside the carried events
+        let carried: Vec<(usize, usize)> = car.iter().map(|e| (e.start, e.last)).collect();
+        let is_carried = |k: usize| carried.iter().any(|&(s, l)| k >= s && k <= l);
+        let body = &self.items[first.min(self.items.len())..];
+        let at = |k: usize| first + k;
+        let undrained = body.iter().enumerate().rposition(|(k, it)| matches!(it, Item::Tensor) && !is_carried(at(k))).map_or(false, |lt| !body[lt + 1..].iter().any(|it| matches!(it, Item::WaitTensor { count: 0, .. })));
+        let unfenced = body.iter().enumerate().rposition(|(k, it)| matches!(it, Item::Access { .. } | Item::Tensor) && !is_carried(at(k))).map_or(false, |la| !body[la + 1..].iter().any(|it| matches!(it, Item::Barrier { .. })));
+        if undrained {
+            bad(self, "a tensor operation other than the carried stage can be outstanding at the end of the body (drain it with `wait_tensor(0)` before the carried stage, or count it into the carried state)".to_string());
+        }
+        if unfenced {
+            bad(self, "no workgroup barrier after the body's last LDS access outside the carried stage: the next tile could overwrite a slot another wave still reads".to_string());
+        }
+    }
+
     /// The state at the end of a tile body must equal the state at its start, so that simulating one iteration covers them all: every tensor operation of the body completed (a
     /// `wait_tensorcnt 0` after the last one) and a barrier after the body's last LDS access (the next tile's first stage overwrites a slot another wave may still read).
     fn quiescent_at_end(&mut self, first: usize, stmt: usize) {
@@ -437,7 +524,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 0, global, coherent: true, outer: self.outer };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, atomic: false, plain: false, carried: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -627,10 +714,15 @@ impl<'a> Sim<'a> {
                         self.vars.insert(*v, k);
                     }
                     let first = self.items.len();
+                    let first_ev = self.evs.len();
                     self.exec(i + 1, close);
                     self.break_taken = false;
                     self.close();
-                    self.quiescent_at_end(first, i);
+                    if self.f.kd.iter().any(|(k, v)| k == "g5:persistent_tile_carry" && *v != 0) {
+                        self.carry_at_end(first, first_ev, i, close);
+                    } else {
+                        self.quiescent_at_end(first, i);
+                    }
                     i = close + 1;
                     continue;
                 }
@@ -1732,6 +1824,32 @@ fn check_pair(f: &Function, traces: &[&Trace], n: usize, diags: &mut Vec<(&'stat
             }
         }
     }
+    // the carry form: a carried stage (the next tile's first) must survive to the end of the body: no later access of its bytes by any wave
+    // (this tile's own reads / writes of the slot or of a tile reusing its storage), whatever the barriers - the next tile reads it
+    for (ci, c) in infos.iter().enumerate().filter(|(_, x)| x.ev.carried) {
+        let rc = range(&c.ev);
+        for (xi, x) in infos.iter().enumerate() {
+            if xi == ci || x.ev.global || x.ev.carried {
+                continue;
+            }
+            let same = x.ev.tile == c.ev.tile && x.ev.slot == c.ev.slot;
+            let rx = range(&x.ev);
+            let alias = x.ev.tile != c.ev.tile && reuse(x.ev.tile, c.ev.tile) && rx.0 < rc.1 && rc.0 < rx.1;
+            if !(same || alias) {
+                continue;
+            }
+            let later = if x.role == c.role { x.ev.start > c.ev.start } else { x.ev.ord >= c.ev.ord };
+            if later {
+                let msg = format!(
+                    "stmt {} / stmt {}: the {} of `{}`[{}] (role {}, phase {}) touches the bytes of the carried stage `{}`[{}] (version {}, stmt {}, issued at phase {}) after its issue: the next tile reads that stage, so nothing of this tile may read or overwrite it",
+                    x.ev.stmt, c.ev.stmt, if x.ev.produce { "write" } else { "read" }, name(x.ev.tile), x.ev.slot, x.role, x.ev.ord, name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.stmt, c.ev.ord
+                );
+                if !diags.iter().any(|d| d.3 == msg) {
+                    diags.push(("GV-TILE-CARRY", Severity::Error, x.ev.stmt, msg));
+                }
+            }
+        }
+    }
     let pp_msg = |a: &Info, b: &Info, aw: (u32, u32), bw: (u32, u32)| format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1);
     if reference {
         for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
@@ -2217,7 +2335,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, atomic: false, plain: false, carried: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
