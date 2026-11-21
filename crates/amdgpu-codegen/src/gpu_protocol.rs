@@ -385,21 +385,41 @@ impl<'a> Sim<'a> {
     /// The prologue / carry `if`s are the first / last top-level `if`s of the body with tile markers (both required, distinct).
     fn carry_at_end(&mut self, first: usize, first_ev: usize, begin: usize, close: usize) {
         let f = self.f;
-        let mut ifs: Vec<(usize, usize)> = Vec::new();
-        let mut j = begin + 1;
-        while j < close {
-            match &f.stmts()[j] {
-                Stmt::BeginLoop { .. } => j = matching(f, j) + 1,
-                Stmt::BeginIf { .. } => {
-                    let (_, endif) = if_span(f, j);
-                    if f.stmts()[j..endif].iter().any(|s| matches!(s, Stmt::TileProduce { .. })) {
-                        ifs.push((j, endif));
+        // the top-level `if`s with tile markers of a range; a single one that is the WAVE-ROLE split (wave-divergent) is descended into: the
+        // arm this role executed (the one holding this trace's events) is the role's tile body
+        let my_stmts: Vec<usize> = self.evs[first_ev..].iter().map(|e| e.stmt).collect();
+        let mut lo = begin + 1;
+        let mut hi = close;
+        let ifs: Vec<(usize, usize)> = loop {
+            let mut ifs: Vec<(usize, usize)> = Vec::new();
+            let mut j = lo;
+            while j < hi {
+                match &f.stmts()[j] {
+                    Stmt::BeginLoop { .. } => j = matching(f, j) + 1,
+                    Stmt::BeginIf { .. } => {
+                        let (_, endif) = if_span(f, j);
+                        if f.stmts()[j..endif].iter().any(|s| matches!(s, Stmt::TileProduce { .. })) {
+                            ifs.push((j, endif));
+                        }
+                        j = endif + 1;
                     }
-                    j = endif + 1;
+                    _ => j += 1,
                 }
-                _ => j += 1,
             }
-        }
+            if ifs.len() == 1 && self.div.contains(&ifs[0].0) {
+                let (els, endif) = if_span(f, ifs[0].0);
+                let then_r = (ifs[0].0 + 1, els.unwrap_or(endif));
+                let else_r = els.map(|e| (e + 1, endif));
+                let inside = |r: (usize, usize)| my_stmts.iter().any(|&s| s >= r.0 && s < r.1);
+                let arm = if inside(then_r) { Some(then_r) } else { else_r.filter(|&r| inside(r)) };
+                if let Some((a, b)) = arm {
+                    lo = a;
+                    hi = b;
+                    continue;
+                }
+            }
+            break ifs;
+        };
         let bad = |s: &mut Self, msg: String| s.diag("GV-TILE-CARRY", Severity::Error, begin, format!("stmt {begin}: persistent tile loop with a carried stage: {msg}"));
         if ifs.len() < 2 {
             bad(self, format!("{} top-level `if`(s) with tile markers in the body; the carry form needs the prologue `if` (first tile) and the carry `if` (next tile)", ifs.len()));
