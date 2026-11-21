@@ -271,8 +271,10 @@ operands, the carried next-tile origins follow the swap. It compiles strict (car
 
 The staging is limited by LDS bank conflicts and the drain by the length of the global write segments, and the two pull in opposite directions: the 16-byte stores of a lane's 8 columns hit the same banks in every row (bank = column offset only: rows
 are a multiple of 256 bytes apart), a padded row cannot be used because the tensor store reads its LDS source unpadded (rule GV-1250-TDM-STORE-PAD; the earlier measurement of shifted rows), and 64-byte write segments drain 2.7 x slower than 256-byte
-ones. So the bf16 output through the LDS cannot beat the f32 tile (which stores 512-byte rows with 2-way conflicts); the vendor's 64 `ds_store_b128` must use a layout this analysis does not reproduce. Untried: direct global stores from the registers with
-the preshuffle chosen so that a lane's columns across the four 32-column blocks are contiguous (128 bytes per lane, no LDS, no tensor store; the archived direct 16-byte-store variant, whose lanes wrote 32-byte pieces, measured 8.3 - 8.8 PF/s).
+ones. So the bf16 output through the LDS cannot beat the f32 tile (which stores 512-byte rows with 2-way conflicts); the vendor's 64 `ds_store_b128` must use a layout this analysis does not reproduce. Tried afterwards (`exp_..._persist_carry_dst`, host `BPRESHUF=2`, metadata `.amdc_b_preshuffle: 2`): direct `global_store_b128` from the registers (no LDS staging, no tensor store, 64 stores per wave) with a B pre-shuffle
+that makes a lane's four 16-column pieces 64 contiguous columns (the (block, lane-group) order exchanged within every 128-row group): bit-exact, compiles strict, and **much slower**: 8192^3 142.9 - 143.2 us vs 107.5 for f32 (-25 % PF/s), 4096^3 26.6 us
+vs 16.5 - 17.1: the stores of a wave scatter 16-byte pieces over 32 different 128-byte lines per instruction and the write path does not pipeline them under the next tile's loads. bf16 output is therefore a net loss in every form measured
+here (tensor store 7.3 - 8.9 k epilogue cycles, direct stores +33 % per kernel); f32 PCC stays the shipped kernel.
 
 ### Smaller first stage (analysis, not built)
 

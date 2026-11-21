@@ -490,7 +490,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) ->
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: name.contains("_bf16"), lock: true, split: name.contains("_split") }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: if name.contains("_bf16") { 3 } else { 2 }, swap: name.contains("_bf16"), preshuf: name.contains("_bf16"), roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), nowin: name.contains("_nowin"), ahead2: name.contains("_ahead2"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: name.contains("_bf16") || name.contains("_dst"), lock: true, split: name.contains("_split") }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: if name.contains("_dst") { 0 } else if name.contains("_bf16") { 3 } else { 2 }, swap: name.contains("_bf16") || name.contains("_dst"), preshuf: name.contains("_bf16") || name.contains("_dst"), dstore: name.contains("_dst"), roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), nowin: name.contains("_nowin"), ahead2: name.contains("_ahead2"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
@@ -644,6 +644,9 @@ pub struct RingOpts {
     /// the B matrix (the WMMA-A operand in swap mode) and its scales are PRE-SHUFFLED on the host: bits 3 and 4 of the row index exchanged within every 32-row block (the vendor's ABpreShuffle for the swapped operand),
     /// so the swap mode reads plain rows (no row permutation) and a lane's 16 accumulator registers are 16 consecutive output columns. Declared in the code-object metadata: a launch with an unshuffled B is refused.
     pub preshuf: bool,
+    /// direct bf16 stores from the registers (no LDS staging, no tensor store) with the column-contiguous pre-shuffle (`BPRESHUF=2`): within every 128-row group of B the (block, lane-group) order is exchanged so that
+    /// a lane's four 16-column pieces are 64 contiguous columns (128 bytes per row): 64 `global_store_b128` per wave
+    pub dstore: bool,
     /// stagger: the workgroups of odd tile parity (tile column + tile row) sleep `stagger` x 64 clocks at the start, so the epilogue write bursts of the tiles in flight do not all align (0 = off)
     pub stagger: u16,
     /// wave grid order: 0 = (wi, wj) = (w >> 1, w & 1); 1 = Gray order (w0 (0,0), w1 (0,1), w2 (1,1), w3 (1,0)); 2 = transposed (wi, wj) = (w & 1, w >> 1)
@@ -687,7 +690,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, preshuf: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, nowin: false, ahead2: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, preshuf: false, dstore: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, nowin: false, ahead2: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
     }
 }
 
@@ -697,7 +700,7 @@ fn cyc_now(b: &mut FnBuilder) -> ValueId {
 }
 
 fn epi_carry_ok(epi: u8) -> bool {
-    epi == 2 || epi == 3
+    epi == 2 || epi == 3 || epi == 0
 }
 
 pub fn gemm_tdm_stage_f4_opts(name: &str, sh: F4Shape, coop: bool, grouped: bool, hoist_base: bool, pad: bool) -> Function {
@@ -1145,7 +1148,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     pipe.lazy_prologue = ring.lazy;
     pipe.carry = ring.carry;
     pipe.nobar = name.contains("_nobar");
-    assert!(!ring.carry || (persistent && ring.slots == 2 && epi_carry_ok(ring.epilogue_lds)), "carry: persistent, 2 slots, the staged f32 (epilogue 2) or swap + bf16 (epilogue 3) epilogue");
+    assert!(!ring.carry || (persistent && ring.slots == 2 && epi_carry_ok(ring.epilogue_lds) && (ring.epilogue_lds != 0 || (ring.dstore && sh.bf16))), "carry: persistent, 2 slots, the staged f32 (epilogue 2) or swap + bf16 (epilogue 3) epilogue");
     let (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org) = if hoist_base {
         let base = |b: &mut FnBuilder, p: ValueId, o: ValueId| b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
         let z = b.let_(Op::ConstI32(0));
@@ -1429,7 +1432,8 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             }
         } else if ring.swap && sh.bf16 {
             // D[n][m]: the lane holds, for its column m (a row of C), 8 consecutive n at v = 0..7 (+ 16 more at v = 8..15): bf16 pairs packed into 4 dwords, one 16-byte store each
-            let g8s = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(3)));
+            // dstore (pre-shuffle 2): the lane group g owns the wave tile's columns 64 g .. 64 g + 63: piece i (16 columns, regs 0 .. 15) at 64 g + 16 i, two 16-byte stores per piece
+            let g8s = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(if ring.dstore { 6 } else { 3 })));
             let row_bytes = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(1)));
             for i in 0..sh.tm {
                 for j in 0..sh.tn {
@@ -1440,7 +1444,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                     let mr = b.add_i32(mr, m);
                     let n0 = b.mul_i32(wi, Opnd::I32(sh.tm * 32));
                     let n0 = b.add_i32(n0, col0);
-                    let n0 = b.add_i32(n0, Opnd::I32(i * 32));
+                    let n0 = b.add_i32(n0, Opnd::I32(if ring.dstore { i * 16 } else { i * 32 }));
                     let n0 = b.add_i32(n0, g8s);
                     let rb = b.mul_i32(mr, row_bytes);
                     let nb = b.let_(Op::ShlI32(Opnd::Val(n0), Opnd::I32(1)));
@@ -1456,7 +1460,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                         }
                         let v4 = b.frag_cat(&parts);
                         let p = b.let_(Op::PtrAdd { base: Opnd::Val(pc), byte_off: Opnd::Val(off) });
-                        b.store_f32x4(p, (h * 32) as u32, v4);
+                        b.store_f32x4(p, (h * if ring.dstore { 16 } else { 32 }) as u32, v4);
                     }
                 }
             }
@@ -1867,7 +1871,7 @@ for q in 0..8i32 {
         f.lower_opts.push("racompact".to_string());
     }
     if ring.preshuf {
-        f.kd.push(("b_preshuffle".into(), 1));   // the B matrix (and its scales) must be pre-shuffled on the host: declared in the code-object metadata, the hosts refuse an unshuffled B
+        f.kd.push(("b_preshuffle".into(), if ring.dstore { 2 } else { 1 }));   // the B matrix (and its scales) must be pre-shuffled on the host: declared in the code-object metadata, the hosts refuse an unshuffled B
     }
     if clustered {
         f.kd.push(("cluster_dims".into(), (cx * cy) as i64));   // the launch must declare the cluster (and divide the grid by it)
