@@ -21,7 +21,7 @@ fn func(blocks: Vec<Vec<MInst>>, classes: Vec<RClass>) -> MFunction {
         vregs: classes,
         loops: Vec::new(),
         alias: Default::default(),
-        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false,
+        elide_fallthrough: false, edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false, mode2: false,
         agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }

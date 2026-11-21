@@ -75,6 +75,10 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         out.push_str(&format!("    s_mov_b64 s[{p}:{}], 0\n", p + 1));
         out.push_str("    v_nop\n");
         out.push_str(&format!("    global_prefetch_b8 v0, s[{p}:{}] scope:SCOPE_SE\n", p + 1));
+        // the relaxed scheduling mode 2 (token `mode2` / AMDC_MODE2): the program owns the va_vdst / vm_vsrc waits (check.rs mode2_plan)
+        if super::mode2_enabled(m) {
+            out.push_str("    s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2\n");
+        }
     }
     // the split-counter waits (gfx1250 waits.rs): the shared pass's waits re-expressed, plus XCNT
     // exact mode: the author's waits and padding are verified (check.rs), never added to
@@ -82,6 +86,12 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     // the gfx1250 software hazards (hazards.rs); the shared pass's s_nop wait states are not needed on gfx1250 (all other VALU dependencies
     // interlock) and are dropped, except the author's in exact mode
     let hz = if m.exact { super::hazards::Plan::default() } else { super::hazards::plan(m, a) };
+    // mode 2: the s_wait_alu waits, planned and independently checked (an unsound plan is a compile error)
+    let alu: std::collections::HashMap<(usize, usize), u32> = if !m.exact && super::mode2_enabled(m) {
+        super::check::mode2_plan(m, a, &plan).map_err(|e| format!("{}: mode-2 wait self-check: {} missing wait(s)\n  {}", m.name, e.len(), e.join("\n  ")))?
+    } else {
+        Default::default()
+    };
     // VGPRs above v255: the MSB window (msb.rs); 0 at every block start
     let windowed = a.max_v > 256 || m.blocks.iter().any(|b| b.insts.iter().any(|i| i.op == MOp::SSetVgprMsb));
     // (exact mode: the author's MSBs carry along the layout, as the author's code runs; the compiler's are 0 at every block start)
@@ -203,13 +213,16 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
                 None => {
                     let mut v = plan.before.get(&(bi, ii)).cloned().unwrap_or_default();
                     v.extend(hz.before.get(&(bi, ii)).cloned().unwrap_or_default());
+                    if let Some(d) = alu.get(&(bi, ii)) {
+                        v.push(format!("s_wait_alu {d:#x}"));
+                    }
                     v.extend(inst_lines(a, inst).map_err(|e| format!("{}: block {}: {e}", m.name, b.label))?);
                     v
                 }
             };
             // VOPD: the pair's two instructions as one dual line when the final text meets every rule and nothing lands between them
             let mut lines = lines;
-            if super::vopd::is_first(bi, ii) && ii + 1 < b.insts.len() && !plan.replace.contains_key(&(bi, ii + 1)) && !plan.before.contains_key(&(bi, ii + 1)) && !hz.before.contains_key(&(bi, ii + 1)) && b.insts[ii + 1].op != MOp::SNop {
+            if super::vopd::is_first(bi, ii) && ii + 1 < b.insts.len() && !plan.replace.contains_key(&(bi, ii + 1)) && !plan.before.contains_key(&(bi, ii + 1)) && !hz.before.contains_key(&(bi, ii + 1)) && !alu.contains_key(&(bi, ii + 1)) && b.insts[ii + 1].op != MOp::SNop {
                 if let Ok(l2) = inst_lines(a, &b.insts[ii + 1]) {
                     if l2.len() == 1 {
                         if let Some(d) = lines.last().and_then(|l1| super::vopd::merge(l1, &l2[0])) {
