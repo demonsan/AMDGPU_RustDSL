@@ -2056,7 +2056,13 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     // run concurrently and merge their counters; any finding anywhere re-runs the sequential loop, which reports exactly as before (the reference mode of the differential test is always sequential).
     // N-way wave roles (more than two role signatures of wave-uniform conditions on the wave index): every role simulated with its own program
     let roles = role_split(f, &div);
+    // a launch-contract trip-count multiple of the outermost simulated loop (`FnBuilder::loop_trip_multiple`: the host guarantees it, e.g. K a
+    // multiple of two windows): the scenarios with another count are not launches of this kernel
+    let trip_m = f.kd.iter().rev().find(|(k, _)| k == "g5:loop_trip_multiple").map_or(1, |(_, v)| (*v).max(1) as usize);
     let run_n = |n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>, checked: &mut usize, paths: &mut usize| {
+        if n % trip_m != 0 {
+            return;
+        }
         if let Some(reps) = &roles {
             let per: Vec<Vec<Trace>> = reps.iter().enumerate().map(|(r, &tid)| enumerate_traces_at(f, r, n, &div, diags, untagged, Some(tid))).collect();
             for tr in per.iter().flatten() {
@@ -2158,6 +2164,9 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
         // the global instance has no legacy names: its primary code is the protocol verdict itself
         let code = if msg.contains("[global region]") && !proto_alias(code, &msg).is_empty() { proto_alias(code, &msg) } else { code };
         rep.add(code, sev, msg);
+    }
+    if trip_m > 1 {
+        rep.add("GV-ASSUME", Severity::Info, format!("loop_trip_multiple {trip_m}: the outermost pipelined loop runs a multiple of {trip_m} iterations (a launch contract the host must check); other counts are not simulated"));
     }
     for (name, reason) in &f.contract.buf_trusts {
         rep.add("GV-ASSUME", Severity::Info, format!("buf_trust `{name}`: TRUSTED, the protocol of this region is not checked ({reason})"));
