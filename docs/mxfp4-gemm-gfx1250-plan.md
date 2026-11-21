@@ -276,6 +276,32 @@ that makes a lane's four 16-column pieces 64 contiguous columns (the (block, lan
 vs 16.5 - 17.1: the stores of a wave scatter 16-byte pieces over 32 different 128-byte lines per instruction and the write path does not pipeline them under the next tile's loads. bf16 output is therefore a net loss in every form measured
 here (tensor store 7.3 - 8.9 k epilogue cycles, direct stores +33 % per kernel); f32 PCC stays the shipped kernel.
 
+### The K loop at the instruction level: ours against the vendor's (static counts, e08, 2026-11-21)
+
+`tools/analyze_loop.py own|objdump FILE` takes the innermost backward-branch loop with at least 200 WMMAs and prints the instruction classes and the VGPR-bank statistics (bank = register index % 8: the `s_set_vgpr_msb` windows are
+multiples of 256, so they do not move it); counts only. Per 512-K iteration of one wave (128 WMMAs; our loop is a pair of windows = 937 instructions per 256 WMMAs, the vendor's loop 2,686 instructions for 264 WMMAs = 2.06 iterations):
+
+| per iteration | ours (PCC) | vendor |
+|---|---:|---:|
+| instructions | **468** | ~1,300 |
+| `v_wmma` (+ `v_wmma_ld_scale_paired`) | 128 | 128 (+124 ld_scale) |
+| LDS loads (`ds_load_*`) | 176 | ~300 |
+| scalar ALU | 60 | ~425 |
+| `s_set_vgpr_msb` | 55 | ~144 |
+| other VALU | 4 | ~72 |
+| `s_wait_dscnt` | 33 | ~40 |
+| barriers (signal + wait) | 3 + 3 | ~19 + 20 |
+| `s_nop` | 0 | ~14 |
+| `s_wait_tensorcnt` / tensor ops | 1 / 2 | ~9 / n.a. |
+
+* **We execute 2.8 x fewer instructions per iteration than the vendor** (its loop carries ~425 scalar instructions of address / edge-predicate arithmetic, 2 x our LDS loads and 2.6 x our VGPR-window switches), so instruction issue is not what limits our loop.
+* **VGPR banks:** every A (16 registers), B (8) and accumulator (16) block of every WMMA starts at bank 0 in both kernels (8-register aligned blocks): there is nothing to rebalance there. Scale operands (single registers): ours 80 of 256 WMMAs have a scale
+  register in the same bank as the A / B / C start (31 %), 30 of 256 have both scales in one bank; the vendor loads its scales with a separate `v_wmma_ld_scale_paired_b32` (25 % of the pairs in one bank) and flags the reuse of A on 144 and of B on 80 of 256
+  of them (`matrix_a_reuse` / `matrix_b_reuse`). Consecutive WMMAs share the A operand in 87 % of ours (i outer, j inner) against 62 % (A) + 38 % (B) in the vendor's order.
+* **A / B tests of the instruction-level options on PCC** (paired alternating, 3 reps, 8192^3 and 8192 x 8192 x 4096): `AMDC_WMMA_REUSE=1` (544 `matrix_a_reuse` hints) 105.8 - 107.1 vs 105.8 - 108.9 us base: neutral; `AMDC_MSB_GROUP=1` (the loop's switches 110 -> 82 per pair
+  of windows, 462 -> 350 in the kernel) 107.4 - 108.1 vs 106.3 - 106.8 base at 8192^3: neutral to slightly worse, K = 4096 neutral. Register-file bank conflicts, window switches and instruction count are therefore not where the 1.9 k cycles of a window go; they go to
+  the LDS bandwidth (262 KiB of fragment reads + 147 KiB of stage writes per iteration, 85 % of the measured LDS rate) and the WMMA issue (10.7 cycles each) as measured with the hoist / no-window profiles above.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
