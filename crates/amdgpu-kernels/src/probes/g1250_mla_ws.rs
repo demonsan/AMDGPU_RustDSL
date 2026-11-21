@@ -1599,48 +1599,55 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         return b.finish();
     }
     if branchless & (1u64 << 33) != 0 && dg == 2 && !split && !tstamp {
-        // (bit 33) pairwise merge of the dim split: waves 2, 3 (page group 1) write their O (lane-native: tile nt, lane l: 8 floats at
-        // nt * 1024 + 32 l), their max and half-sums; waves 0, 1 (page group 0, the same dims) combine them in registers and store bf16
-        // straight to R (no final pass, half the LDS traffic)
+        // (bit 33) pairwise merge of the dim split, symmetric: waves w and w ^ 2 hold the same 256 dims (other pages). Each finalizes
+        // half the tiles (page group 0: tiles 0 .. 7, group 1: tiles 8 .. 15) and writes the other half for its partner (lane-native:
+        // tile, lane l: 8 floats at 32 l) plus its max / half-sums; then combines in registers and stores bf16 straight to R
         b.wait_lds(0);
         b.barrier();
-        let half = b.bind_i32(ev(w) & 1);
-        let rbase = b.bind_i32(ev(half) * 20480 + mo.base as i32);
-        let second = b.cmp(CmpPred::Ge, CmpTy::I32, w, Opnd::I32(2));
-        let lb = b.bind_i32(ev(rbase) + ev(lane) * 32);
-        let lm = b.bind_i32(ev(rbase) + 16384 + ev(lane) * 4);
-        let ll = b.bind_i32(ev(rbase) + 16384 + 128 + ev(lane) * 4);
-        b.begin_if(Opnd::Val(second));
-        mo.at(&t0).write(&mut b, |b| {
-            for nt in 0..ntw {
-                let lo = b.frag_slice(Opnd::Var(ov[nt]), 0, 4);
-                let hi = b.frag_slice(Opnd::Var(ov[nt]), 4, 4);
-                let a0 = b.bind_i32(ev(lb) + 1024 * nt as i32);
-                b.store_lds(a0, lo, MemTy::B128, false);
-                let a1 = b.bind_i32(ev(lb) + (1024 * nt as i32 + 16));
-                b.store_lds(a1, hi, MemTy::B128, false);
-            }
-            b.store_lds(lm, Opnd::Var(vm), MemTy::B32, false);
-            b.store_lds(ll, Opnd::Var(vl), MemTy::B32, false);
-        });
-        b.end_if();
+        let hn = ntw / 2;
+        let wsz: i32 = (hn as i32) * 1024 + 256;
+        let grp = b.bind_i32(ev(w) >> 1);
+        let wr = b.bind_i32(ev(w) * wsz + ev(lane) * 32 + mo.base as i32);
+        let wml = b.bind_i32(ev(w) * wsz + (hn as i32) * 1024 + ev(lane) * 4 + mo.base as i32);
+        let pw = b.bind_i32(ev(w) ^ 2);
+        let rd = b.bind_i32(ev(pw) * wsz + ev(lane) * 32 + mo.base as i32);
+        let rml = b.bind_i32(ev(pw) * wsz + (hn as i32) * 1024 + ev(lane) * 4 + mo.base as i32);
+        let is0 = b.cmp(CmpPred::Eq, CmpTy::I32, grp, Opnd::I32(0));
+        for side in 0..2usize {
+            // side 0: group 0 writes tiles hn .. ntw; side 1: group 1 writes tiles 0 .. hn
+            let c = if side == 0 { Opnd::Val(is0) } else { Opnd::Val(b.let_(Op::NotI1(Opnd::Val(is0)))) };
+            b.begin_if(c);
+            mo.at(&t0).write(&mut b, |b| {
+                for k in 0..hn {
+                    let nt = if side == 0 { hn + k } else { k };
+                    let lo = b.frag_slice(Opnd::Var(ov[nt]), 0, 4);
+                    let hi = b.frag_slice(Opnd::Var(ov[nt]), 4, 4);
+                    let a0 = b.bind_i32(ev(wr) + 1024 * k as i32);
+                    b.store_lds(a0, lo, MemTy::B128, false);
+                    let a1 = b.bind_i32(ev(wr) + (1024 * k as i32 + 16));
+                    b.store_lds(a1, hi, MemTy::B128, false);
+                }
+                b.store_lds(wml, Opnd::Var(vm), MemTy::B32, false);
+                let a = b.bind_i32(ev(wml) + 128);
+                b.store_lds(a, Opnd::Var(vl), MemTy::B32, false);
+            });
+            b.end_if();
+        }
         b.wait_lds(0);
         b.barrier();
-        let first = b.cmp(CmpPred::Lt, CmpTy::I32, w, Opnd::I32(2));
-        b.begin_if(Opnd::Val(first));
         let (mp, lp, op): (ValueId, ValueId, Vec<ValueId>) = mo.at(&t0).read(&mut b, |b| {
-            let mpv = b.load_lds(lm, MemTy::B32);
-            let lpv = b.load_lds(ll, MemTy::B32);
-            let ops: Vec<ValueId> = (0..ntw)
-                .map(|nt| {
-                    let a0 = b.bind_i32(ev(lb) + 1024 * nt as i32);
+            let mpv = b.load_lds(rml, MemTy::B32);
+            let a = b.bind_i32(ev(rml) + 128);
+            let lpv = b.load_lds(a, MemTy::B32);
+            let ops: Vec<ValueId> = (0..hn)
+                .map(|k| {
+                    let a0 = b.bind_i32(ev(rd) + 1024 * k as i32);
                     let a1 = b.bind_i32(ev(a0) + 16);
                     b.load_lds_b128x2(a0, a1)
                 })
                 .collect();
             (f32_of(b, mpv), f32_of(b, lpv), ops)
         });
-        // head m of this lane: M = max(m_own, m_partner), the scales, the row sum L over both lane halves and both waves
         let mm = b.max_f32(Opnd::Var(vm), mp);
         let d_o = b.sub_f32(Opnd::Var(vm), mm);
         let s_o = b.exp2_f32(d_o);
@@ -1675,25 +1682,32 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         };
         let fo_r = rows(&mut b, fo);
         let fp_r = rows(&mut b, fp);
-        let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
+        // this wave's tiles: grp * hn .. + hn (dims db + 16 (grp hn + k) + m)
+        let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(grp) * (16 * hn as i32) + ev(m)) * 2);
         let prs: Vec<ValueId> = (0..8i32)
             .map(|r| {
                 let o = b.bind_i32(ev(rbx) + r * 1024);
                 b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
             })
             .collect();
-        for nt in 0..ntw {
-            for r in 0..8u8 {
-                let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
-                let ef = f32_of(&mut b, e);
-                let x = b.frag_slice(Opnd::Val(op[nt]), r, 1);
-                let xf = f32_of(&mut b, x);
-                let y0 = b.mul_f32(ef, fo_r[r as usize]);
-                let y1 = b.mul_f32(xf, fp_r[r as usize]);
-                let y = b.add_f32(y0, y1);
-                let h = b.cvt_pk_bf16_f32(y, y);
-                b.store_global(prs[r as usize], 32 * nt as u32, h, MemTy::U16, false);
+        for side in 0..2usize {
+            let c = if side == 0 { Opnd::Val(is0) } else { Opnd::Val(b.let_(Op::NotI1(Opnd::Val(is0)))) };
+            b.begin_if(c);
+            for k in 0..hn {
+                let nt = if side == 0 { k } else { hn + k };
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(&mut b, e);
+                    let x = b.frag_slice(Opnd::Val(op[k]), r, 1);
+                    let xf = f32_of(&mut b, x);
+                    let y0 = b.mul_f32(ef, fo_r[r as usize]);
+                    let y1 = b.mul_f32(xf, fp_r[r as usize]);
+                    let y = b.add_f32(y0, y1);
+                    let h = b.cvt_pk_bf16_f32(y, y);
+                    b.store_global(prs[r as usize], 32 * k as u32, h, MemTy::U16, false);
+                }
             }
+            b.end_if();
         }
         let lg = b.log2_f32(lh);
         let s2 = b.add_f32(mm, lg);
@@ -1702,7 +1716,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
         let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
         let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
         b.store_global(pl, 0, lse, MemTy::B32, false);
-        b.end_if();
         return b.finish();
     }
     // ---- merge the four partials (the rings are dead: every wave is past its loop at the barrier) ----
