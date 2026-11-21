@@ -138,3 +138,14 @@ work-item counts, SQ / GUI busy cycles, and L2 / memory traffic (read / write se
 - **MLA:** both kernels stream the KV cache once (590 B per token: 576 B of KV plus about 2.5 %, every read a DRAM miss).
   - Ours writes 2x the output bytes (4.3 MB vs 2.2 MB).
   - Ours needs 9 % fewer busy cycles at this shape.
+
+**VMP (tomorrow's retry of the zero SQ counters):**
+- `pmc_run.sh` only **checks** VMP, never arms it. Arming is persistent shared GPU state and the user's step: `sudo <skill>/scripts/vmp_setup.sh` on the host, from the mi450-spm-capture skill.
+- **The check:** before each counter pass it runs the skill's `vmp_setup.sh --check` (`PMC_VMP_TOOL`, default `$HOME/spm-skill/scripts/vmp_setup.sh`; host-side, read only) and records the result in `pass_NNN/vmp.txt`:
+  - `armed` (8/8), `not-armed`, or `unknown`;
+  - with no umr installed the state stays `unknown`: the tool would otherwise build umr itself.
+- **Requiring it:** `PMC_REQUIRE_VMP=1` refuses a pass (exit 5) unless VMP is armed.
+- **The retry:** `tools/mi450/pmc_sq_retry.sh` runs with that requirement.
+  - It reruns the SQ instruction / LDS / WMMA / wait counters, first on `probe_g1250_add` (known per-wave instruction counts), then on MLA `_ws2` at ctx 1000 vs 2048.
+  - It stops at the first refusal.
+- **Before the retry (2026-11-21 state of e08):** neither the skill nor `umr` is installed there; passwordless sudo is available.
