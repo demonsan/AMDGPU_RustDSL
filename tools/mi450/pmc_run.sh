@@ -35,7 +35,7 @@ echo "pmc_run: tag=$TAG gpu=$GPU pass=$(basename "$P") what='$WHAT'"
 echo "$WHAT | $APP" > "$P/request.txt"
 # the whole node, exclusive; the container in the foreground (never -d); a hard kill inside AND outside
 gpu-lock timeout -s KILL $((PASS_TIMEOUT + 60)) docker run --rm --network none \
-  --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined \
+  --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES="$GPU" -e PROBE_WATCHDOG_S="${PROBE_WATCHDOG_S:-20}" -e CHECK_B -e CHECK_ROWS -e CLUSTER -e STAMPS -e PERSIST \
   -u "$(id -u):$(id -g)" -v /data/blyu:/data/blyu -w "$PWD" "$IMAGE" \
   bash -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP" 2>&1 | grep -vE '^\s*$' | tail -n 60 | tee "$P/log.txt"
