@@ -42,7 +42,7 @@ fn with_vopd(mut f: Function) -> Function {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072, false))
+    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824, false))
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -232,12 +232,12 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
     // (2026-11-21: the direct bf16-store ending of `_ws4D`: no cross-wave step; -5 .. -8 % at 1 .. 4 pages on e08)
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824, false))
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824, false))
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
@@ -367,6 +367,19 @@ pub fn mla_g1250_qh16_d4b() -> Function {
 /// `_ws4` ending without any cross-wave step: each wave stores its own 128 dims of the 16 heads straight from registers (bf16, 2-byte stores)
 pub fn mla_g1250_qh16_ws4D() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws4D", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+}
+
+/// `_ws4` / `_ws2` / `_ws` with the prologue's loads issued together (bit 30)
+pub fn mla_g1250_qh16_ws4F() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4F", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824, false))
+}
+
+pub fn mla_g1250_qh16_ws2F() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2F", true, 64 | 256 | 16384 | 65536 | 1073741824, false))
+}
+
+pub fn mla_g1250_qh16_wsF() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsF", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824, false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -571,7 +584,23 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         }
     };
     let zero = b.c_i32(0);
-    let early_qk = if early { Some((ld(&mut b, pqs, zero), ld(&mut b, pks, zero))) } else { None };
+    // bit 30: the prologue's loads issued together - the Q fragments first (they depend on the work-group id only), then every scalar
+    // load (scales, the sequence bounds, the score scale) before any of them is used: one scalar round trip instead of three
+    let fastpro = branchless & 1073741824 != 0;
+    let sc_early = if fastpro { Some(b.let_(Op::KernargI32 { offset: 92 })) } else { None };
+    let q_early: Option<Vec<ValueId>> = if fastpro {
+        let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
+        let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
+        Some((0..9u32)
+            .map(|c| {
+                let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
+                b.frag_cat(&parts)
+            })
+            .collect())
+    } else {
+        None
+    };
+    let early_qk = if early || fastpro { Some((ld(&mut b, pqs, zero), ld(&mut b, pks, zero))) } else { None };
     let bo = b.let_(Op::ShlI32(Opnd::Val(bidx), Opnd::I32(2)));
     let kv0 = ld(&mut b, pltp, bo);
     let bo4 = b.add_i32(bo, Opnd::I32(4));
@@ -608,21 +637,29 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     };
     let qsf = b.let_(Op::BitcastF32(Opnd::Val(qs)));
     let ksf = b.let_(Op::BitcastF32(Opnd::Val(ks)));
-    let sc = b.let_(Op::KernargI32 { offset: 92 });
+    let sc = match sc_early {
+        Some(v) => v,
+        None => b.let_(Op::KernargI32 { offset: 92 }),
+    };
     let scf = b.let_(Op::BitcastF32(Opnd::Val(sc)));
     let c1 = b.mul_f32(qsf, ksf);
     let c2 = b.mul_f32(c1, scf);
     let log2e = b.c_f32(std::f32::consts::LOG2_E);
     let cscale = b.mul_f32(c2, log2e);
     // Q fragments (B of S^T): head m, dims 64 c + 32 g .. + 32 (the K order inside a WMMA is free: the K reads use the same one)
-    let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
-    let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
-    let q: Vec<ValueId> = (0..9u32)
-        .map(|c| {
-            let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
-            b.frag_cat(&parts)
-        })
-        .collect();
+    let q: Vec<ValueId> = match q_early {
+        Some(q) => q,
+        None => {
+            let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
+            let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
+            (0..9u32)
+                .map(|c| {
+                    let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
+                    b.frag_cat(&parts)
+                })
+                .collect()
+        }
+    };
     // the timing experiments keep the Q loads alive (one word to R[b]: the output is garbage in these variants)
     let keep_q = |b: &mut FnBuilder| {
         let o = b.bind_i32(ev(bidx) * (16 * 512 * 2));
