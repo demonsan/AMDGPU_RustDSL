@@ -160,6 +160,19 @@ pub struct TdmF4Body {
     pub next_live: Option<ValueId>,
 }
 
+impl TdmF4Body {
+    fn lock_stamp(&mut self, b: &mut FnBuilder) {
+        if self.stamps && self.steady {
+            if let Some(t2) = self.st_t2.take() {
+                let t3 = cyc(b);
+                let d = b.bind_i32(ev(t3) - ev(t2));
+                add_to(b, self.stamp_vars[2], d);
+                b.set_var(self.stamp_vars[4], Opnd::Val(t3));
+            }
+        }
+    }
+}
+
 fn cyc(b: &mut FnBuilder) -> ValueId {
     let c = b.shader_cycles();
     b.let_(Op::PtrLo(Opnd::Val(c)))
@@ -268,10 +281,12 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
+        // (the stamps of the lock path: the tensor wait = window end -> data landed; the barrier phase = from there to the next stage, i.e. the workgroup and the cluster barriers)
         if self.sh.cx * self.sh.cy > 1 && self.sh.lock && self.sh.split && self.steady {
             // the signal went out in the window (every wave had read its fragments); our tensor wait, every wave done (the workgroup barrier), then the cluster wait
             b.wait_tensor(0);
             b.wait_lds(0);
+            self.lock_stamp(b);
             b.barrier();
             b.barrier_wait(-3);
             return;
@@ -280,6 +295,7 @@ impl PipeBody for TdmF4Body {
             // our own tensor wait, every wave of the workgroup done (reads of the previous tile included: the barrier), then one wave signals the cluster barrier and all wait
             b.wait_tensor(0);
             b.wait_lds(0);
+            self.lock_stamp(b);
             b.barrier();
             b.begin_if(Opnd::Val(self.leader));
             b.barrier_signal(-3);
