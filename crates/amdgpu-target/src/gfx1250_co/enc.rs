@@ -408,6 +408,26 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         v.extend_from_slice(&d32(parse_num(imm).ok_or_else(|| format!("`{t}`: value"))? as u32));
         return Ok(v);
     }
+    // s_getreg_b32 sdst, hwreg(<numeric id>, offset, size) (SOPK); the named forms take the generic path
+    if let Some(rest) = t.strip_prefix("s_getreg_b32") {
+        if let Some((d, h)) = rest.trim().split_once(',') {
+            let h = h.trim();
+            if let Some(inner) = h.strip_prefix("hwreg(").and_then(|x| x.strip_suffix(')')) {
+                let f: Vec<&str> = inner.split(',').map(|x| x.trim()).collect();
+                if let Some(id) = f.first().and_then(|x| x.parse::<u32>().ok()) {
+                    let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+                    let size = f.get(2).and_then(|x| x.parse::<u32>().ok()).unwrap_or(32);
+                    if id > 63 || off > 31 || size == 0 || size > 32 {
+                        return Err(format!("`{t}`: hwreg fields"));
+                    }
+                    let sd = d.trim().strip_prefix('s').and_then(|x| x.parse::<u32>().ok()).ok_or_else(|| format!("`{t}`: destination"))?;
+                    let simm = id | off << 6 | (size - 1) << 11;
+                    let (_, op) = lookup("s_getreg_b32").ok_or("s_getreg_b32 not in the tables")?;
+                    return Ok(d32(0xB000_0000 | op << 23 | sd << 16 | simm).to_vec());
+                }
+            }
+        }
+    }
     if t.split_whitespace().next().map_or(false, |m| m.ends_with("_dpp")) {
         return encode_dpp(t, pc, label);
     }
