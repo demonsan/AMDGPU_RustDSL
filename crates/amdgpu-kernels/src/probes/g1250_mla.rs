@@ -228,22 +228,26 @@ fn mla_g1250_qh16_with(name: &str, async_kv: bool, slots: u8, prefetch: bool) ->
     // ---- epilogue: the row sums (8 partials per head) through LDS, O / L * ks to bf16, LSE ----
     b.wait_lds(0);
     b.barrier();
+    // the RED tile's epilogue generation: after every loop generation (the tile counter stays below MAX_PAGES)
+    let tend = amdgpu_tile::shared::SlotIdx::new(Opnd::I32(0), Opnd::I32(1 << 20));
     let rw = b.bind_i32(ev(w) * 128 + ev(g) * 64 + ev(m) * 4 + red.base as i32);
-    b.store_lds(rw, Opnd::Var(vars[1]), MemTy::B32, false);
+    red.at(&tend).write(&mut b, |b| b.store_lds(rw, Opnd::Var(vars[1]), MemTy::B32, false));
     b.wait_lds(0);
     b.barrier();
     let sum_head = |b: &mut FnBuilder, head: amdgpu_dsl::I32| -> ValueId {
-        let mut acc: Option<ValueId> = None;
-        for k in 0..8 {
-            let a = b.bind_i32(head.clone() * 4 + (k * 64 + red.base as i32));
-            let v = b.load_lds(a, MemTy::B32);
-            let vf = b.let_(Op::BitcastF32(Opnd::Val(v)));
-            acc = Some(match acc {
-                None => vf,
-                Some(s) => b.add_f32(s, vf),
-            });
-        }
-        acc.unwrap()
+        red.at(&tend).read(b, |b| {
+            let mut acc: Option<ValueId> = None;
+            for k in 0..8 {
+                let a = b.bind_i32(head.clone() * 4 + (k * 64 + red.base as i32));
+                let v = b.load_lds(a, MemTy::B32);
+                let vf = b.let_(Op::BitcastF32(Opnd::Val(v)));
+                acc = Some(match acc {
+                    None => vf,
+                    Some(s) => b.add_f32(s, vf),
+                });
+            }
+            acc.unwrap()
+        })
     };
     let inv: Vec<ValueId> = (0..8)
         .map(|r| {
