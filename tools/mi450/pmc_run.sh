@@ -8,7 +8,8 @@
 #
 # Rules (the user's): every run holds the WHOLE-NODE gpu-lock (no other job on any GPU during the capture), short hard timeouts, NO SPM
 # (streaming / VMP arming options are refused), the container is --rm with only /data/blyu mounted, /dev/kfd + /dev/dri, and the GPU is
-# passed explicitly (HIP_VISIBLE_DEVICES). Output: CSV under $PMC_ROOT/<tag>/<pass>/ (default /data/blyu/amdrustdsl/pmc).
+# passed explicitly (HIP_VISIBLE_DEVICES). The image's ROCm lives under /root, so the pass runs as the container's root; its output is handed
+# back to the calling user (chown) before the container exits. Output: CSV under $PMC_ROOT/<tag>/<pass>/ (default /data/blyu/amdrustdsl/pmc).
 set -euo pipefail
 IMAGE="rocm/atom-dev:ub24-dcgpu-rk-10.2.0a20260922.bkc.20261002-pyt2.14.0-tri-main-atomsrc-gfx1250-1009"
 PMC_ROOT="${PMC_ROOT:-/data/blyu/amdrustdsl/pmc}"
@@ -37,8 +38,8 @@ echo "$WHAT | $APP" > "$P/request.txt"
 gpu-lock timeout -s KILL $((PASS_TIMEOUT + 60)) docker run --rm --network none \
   --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES="$GPU" -e PROBE_WATCHDOG_S="${PROBE_WATCHDOG_S:-20}" -e CHECK_B -e CHECK_ROWS -e CLUSTER -e STAMPS -e PERSIST \
-  -u "$(id -u):$(id -g)" -e HOME=/tmp -v /data/blyu:/data/blyu -w "$PWD" --entrypoint /bin/bash "$IMAGE" \
-  -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP" 2>&1 | grep -vE '^\s*$' | tail -n 60 | tee "$P/log.txt"
+  -v /data/blyu:/data/blyu -w "$PWD" --entrypoint /bin/bash "$IMAGE" \
+  -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP; r=\$?; chown -R $(id -u):$(id -g) $P; exit \$r" 2>&1 | grep -vE '^\s*$' | tail -n 60 | tee "$P/log.txt"
 rc=${PIPESTATUS[0]}
 du -sh "$P" | sed 's/^/pmc_run: output /'
 ls "$P" | sed 's/^/  /' | head -20
