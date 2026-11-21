@@ -485,7 +485,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) ->
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
