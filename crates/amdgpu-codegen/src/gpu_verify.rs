@@ -2013,6 +2013,22 @@ impl<'a> An<'a> {
                     self.rep.add("GV-TILE-PRIVATE-ESCAPE", Severity::Error, m);
                 }
             }
+            // gfx1250 (its tile protocol is enforced): an unmarked access must provably stay out of every declared shared tile / ring as
+            // well - otherwise its lifetime against the tile's stages (a TDM stage in flight, a slot still read) is unchecked
+            if crate::target::cur().name == "gfx1250" && !self.f.exact {
+                for t in self.f.contract.tiles.iter().filter(|t| !t.private && !t.global) {
+                    if crate::gpu_protocol::region_skipped(self.f, &t.name) {
+                        continue;
+                    }
+                    let (lo, hi) = (t.base as i128, (t.base + t.slot_size * t.slots.max(1) as i64) as i128);
+                    let below = addr.hi.iter().any(|h| self.cx.le(&h.add(&Poly::int(size)), &Poly::int(lo)));
+                    let above = addr.lo.iter().any(|l| self.cx.le(&Poly::int(hi), l));
+                    if !(below || above) {
+                        let m = format!("stmt {}: {what}: LDS access {} (+{size}) outside any tile marker may touch the declared tile `{}` [{lo}, {hi}): mark it (tile_produce / tile_consume on that tile, or on a tile declared over its storage: tile_over / tile_over_slots) so its lifetime is checked against the tile's stages", self.idx, addr.show(), t.name);
+                        self.rep.add("GV-TILE-UNTAGGED-OVERLAP", Severity::Error, m);
+                    }
+                }
+            }
             return;
         };
         let t = &self.f.contract.tiles[ti];

@@ -96,7 +96,7 @@ struct Trace {
 }
 
 /// Regions whose markers the intra-workgroup simulator must not interpret: counted-trust regions and inter-block (last-arriver) regions.
-fn region_skipped(f: &Function, name: &str) -> bool {
+pub(crate) fn region_skipped(f: &Function, name: &str) -> bool {
     f.contract.buf_trusts.iter().any(|(n, _)| n == name) || f.contract.last_arrivers.iter().any(|l| l.region == name)
 }
 
@@ -1828,8 +1828,8 @@ fn check_pair(f: &Function, traces: &[&Trace], n: usize, diags: &mut Vec<(&'stat
     // (this tile's own reads / writes of the slot or of a tile reusing its storage), whatever the barriers - the next tile reads it
     for (ci, c) in infos.iter().enumerate().filter(|(_, x)| x.ev.carried) {
         let rc = range(&c.ev);
-        for x in infos.iter() {
-            if std::ptr::eq(x, c) || x.ev.global || x.ev.carried {
+        for (xi, x) in infos.iter().enumerate() {
+            if xi == ci || x.ev.global || x.ev.carried {
                 continue;
             }
             let same = x.ev.tile == c.ev.tile && x.ev.slot == c.ev.slot;
