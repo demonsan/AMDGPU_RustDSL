@@ -527,6 +527,17 @@ pub fn mla_g1250_qh16_wsR() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_wsR", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 36), false))
 }
 
+/// timing deletions of the shipped `_ws2` (not registered): `d2a` returns once its first page arrived, `d2b` before the merge
+const WS2_BITS: u64 = 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35) | 1048576;
+
+pub fn mla_g1250_qh16_d2a() -> Function {
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2a", true, WS2_BITS | 2048 | 268435456, false)))
+}
+
+pub fn mla_g1250_qh16_d2b() -> Function {
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2b", true, WS2_BITS | 134217728, false)))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
