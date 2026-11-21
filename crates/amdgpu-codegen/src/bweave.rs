@@ -315,6 +315,15 @@ pub fn interleave(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan) -> (us
 
 /// `interleave` with the ring model of the function (tile-marker membership, `RingModel::of_function`).
 pub fn interleave_with(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan, rings: Option<crate::sched::waits::RingModel>) -> (usize, usize) {
+    interleave_density(m, plan, rings, None)
+}
+
+/// `interleave_with` with a VALU density: `Some(d)` places, after each MFMA of the skeleton, filler instructions until `d` VALU instructions
+/// are among them (memory / scalar fillers on the way do not count), never a filler that reads or writes the MFMA just placed (it would
+/// wait out the matrix op's hazard window); the rest after the skeleton. Measured on gfx1250 (tools/mi450/wmma_trans_bench.sh): one
+/// independent VALU (TRANS included) per WMMA hides almost entirely in its shadow, two about half. `None`: the even spread
+/// (ceil(fillers / MFMAs) fillers after each MFMA).
+pub fn interleave_density(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan, rings: Option<crate::sched::waits::RingModel>, density: Option<usize>) -> (usize, usize) {
     use amdgpu_dsl::plan::OrderSpec;
     let free_unit = |id: u32| -> bool {
         plan.units.iter().find(|u| u.id == id).and_then(|u| plan.phases.iter().find(|p| p.id == u.phase)).map_or(false, |p| !matches!(p.order, OrderSpec::Authored))
@@ -397,13 +406,21 @@ pub fn interleave_with(m: &mut MFunction, plan: &amdgpu_dsl::plan::KernelPlan, r
                             if crate::op_attrs::attrs(b.insts[s].op).cost.pipe == Pipe::Mfma {
                                 let mut k = 0;
                                 for &f in &in_fill {
-                                    if k == per {
+                                    if k == density.unwrap_or(per) {
                                         break;
                                     }
-                                    if !done[f] && g.preds[f].iter().all(|&(p, _)| done[p] || !moved.contains(&p)) {
+                                    let ready = !done[f] && g.preds[f].iter().all(|&(p, _)| done[p] || !moved.contains(&p));
+                                    // (density mode: not a reader / writer of the MFMA just placed: it would sit out the hazard window)
+                                    if ready && density.is_some() && g.preds[f].iter().any(|&(p, _)| p == s) {
+                                        continue;
+                                    }
+                                    if ready {
                                         done[f] = true;
                                         ord.push(f);
-                                        k += 1;
+                                        let valu = { let a = crate::op_attrs::attrs(b.insts[f].op); a.mnemonic.starts_with("v_") && a.cost.pipe != Pipe::Mfma };
+                                        if density.is_none() || valu {
+                                            k += 1;
+                                        }
                                     }
                                 }
                             }

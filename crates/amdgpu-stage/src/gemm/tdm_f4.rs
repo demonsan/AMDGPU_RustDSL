@@ -148,6 +148,13 @@ pub struct TdmF4Body {
     /// the stamps of the iteration being emitted: stage end, window end
     pub st_t1: Option<ValueId>,
     pub st_t2: Option<ValueId>,
+    /// carry mode (a persistent tile loop whose next tile's first stage is issued in this tile's last window): `first_tile` = the wave-uniform "this is the loop's first tile" condition (only
+    /// then the prologue stages tile 0), `next_orgs` = the next tile's (a_org, b_org, sa_org, sb_org)
+    pub carry: bool,
+    pub first_tile: Option<ValueId>,
+    pub next_orgs: Option<[ValueId; 4]>,
+    /// carry mode: "a next tile exists" (wave-uniform); without it the last tile issues no stage
+    pub next_live: Option<ValueId>,
 }
 
 fn cyc(b: &mut FnBuilder) -> ValueId {
@@ -212,6 +219,32 @@ impl PipeBody for TdmF4Body {
         }
     }
 
+    fn stage_tile0(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx) {
+        if self.carry {
+            if let Some(first) = self.first_tile {
+                b.begin_if(Opnd::Val(first));
+                self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+                b.end_if();
+                return;
+            }
+        }
+        self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+    }
+
+    fn stage_next_tile(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx) {
+        let n = self.next_orgs.expect("carry: the next tile's origins");
+        let saved = (self.a_org, self.b_org, self.sa_org, self.sb_org);
+        (self.a_org, self.b_org, self.sa_org, self.sb_org) = (n[0], n[1], n[2], n[3]);
+        if let Some(live) = self.next_live {
+            b.begin_if(Opnd::Val(live));
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+            b.end_if();
+        } else {
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+        }
+        (self.a_org, self.b_org, self.sa_org, self.sb_org) = saved;
+    }
+
     fn stage_complete_keep(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx, keep: u8) {
         // tile 0 done, the `keep` later stages (this wave's tensor loads per stage each) still in flight
         let per_stage = if self.roles { 2 } else { 4 };
@@ -223,6 +256,9 @@ impl PipeBody for TdmF4Body {
     }
 
     fn finish(&mut self, b: &mut FnBuilder, _role: Role) {
+        if self.carry {
+            return;   // the next tile's first stage is in flight; the tile loop's exit drains it
+        }
         b.wait_tensor(0);   // the last steady iteration's clamped stage is still in flight
     }
 

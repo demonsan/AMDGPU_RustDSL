@@ -20,6 +20,12 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
 
 pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
     // the MLA per-phase microbenchmarks (any mask: `mla_g1250_qh16_ph_<hex>`)
+    // experimental persistent-loop variants of the 512-K kernel (carry mode, rotating epilogue, stamps): not enumerated by the manifests (they compile only with AMDC_TILE_PROTO_WARN, or are measuring aids)
+    if let Some(rest) = name.strip_prefix("exp_gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_") {
+        if ["persist", "persist_stamps", "persist_rot", "persist_tst", "persist_carry", "persist_carry_tst"].contains(&rest) {
+            return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
+        }
+    }
     if let Some(m) = name.strip_prefix("mla_g1250_qh16_roles_") {
         return crate::probes::g1250_mla_roles::by_mask(m);
     }

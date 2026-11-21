@@ -294,7 +294,17 @@ fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
     // B4: the plan's interleave hints inside Free phases (no Free phase in a plan: nothing changes)
     // (`AMDC_NO_INTERLEAVE`: the B4 merges off, for A/B measurements)
     if let Some(p) = cx.f.plan.as_ref().filter(|_| std::env::var("AMDC_NO_INTERLEAVE").is_err()) {
-        let (_, fell_back) = crate::bweave::interleave_with(&mut s.m, p, crate::sched::waits::RingModel::of_function(cx.f));
+        // gfx1250: a VALU density per WMMA, opt-in (kd `interleave_density`, `AMDC_IDENSITY` for A/B; 0 or unset = the even spread). Measured
+        // on e08 2026-11-21: `_wsi` -1..-2 % with density 1, `_wsp` +1..+1.6 % (the even spread hides more fillers there): mixed, so not default.
+        let density = if crate::target::cur().name == "gfx1250" {
+            let kd = cx.f.kd.iter().rev().find(|x| x.0 == "interleave_density").map(|x| x.1 as usize);
+            let env = std::env::var("AMDC_IDENSITY").ok().and_then(|v| v.parse::<usize>().ok());
+            // (0: the even spread, for A/B)
+            env.or(kd).filter(|&d| d > 0)
+        } else {
+            None
+        };
+        let (_, fell_back) = crate::bweave::interleave_density(&mut s.m, p, crate::sched::waits::RingModel::of_function(cx.f), density);
         if fell_back > 0 && std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
             eprintln!("bweave {}: {fell_back} interleave hint(s) kept their order (a dependence forbids the merge)", cx.f.name);
         }
