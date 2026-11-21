@@ -58,6 +58,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-VOPD", layer: Layer::Asm, what: "every dual-issue (VOPD) instruction is a legal combination: opcodes from the X / Y sets, destinations of opposite parity, each source slot of the two components in different register banks unless the same register, the second source a VGPR, no literal, at most two scalar operands, the Y component not reading the X destination" },
     Rule { id: "GV-1250-CLAUSE-TYPE", layer: Layer::Asm, what: "an instruction clause holds instructions of one memory type only (scalar loads, vector memory, flat, LDS)" },
     Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device (v_nop_power): forbidden" },
+    Rule { id: "GV-1250-PREFETCH-BOUNDS", layer: Layer::Asm, what: "every instruction-prefetch window (s_prefetch_inst: base + offset, (soffset + length) & 31 + 1 lines of 128 bytes) lies provably inside the kernel's code (a window past the end of the code faults): the base a s_get_pc_i64 of the same block, the soffset a constant move of the same block" },
     Rule { id: "GV-1250-PERMPK16", layer: Layer::Asm, what: "a packed lookup-table convert (v_perm_pk16_*) only with its mitigation (public LLVM fixVPermPk16Hazard / isVPermPk16SafeInstr): the kernel entry prologue (s_mov_b64 s[n:n+1], 0; v_nop; global_prefetch_b8 v0, s[n:n+1] before any other vector memory), the very next instruction a safe VALU (or v_nop), EXEC never written in the kernel (so it is non-zero at the instruction), and both table sources VGPRs or both SGPRs" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
     Rule { id: "GV-1250-DVGPR", layer: Layer::Asm, what: "no dynamic VGPR allocation" },
@@ -2306,6 +2307,100 @@ pub fn permpk16_safe_follower(mn: &str, ops: &str) -> bool {
     SAFE.contains(&base)
 }
 
+/// GV-1250-PREFETCH-BOUNDS (see the rule). Byte offsets: the disassembler's addresses when present, else the in-process encoder's sizes
+/// (a line it cannot size makes every window unprovable). `s_get_pc_i64` yields the address of the next instruction. Register values are
+/// tracked within a block (a label resets them); any other write of a tracked register forgets it.
+fn prefetch_rule(asm: &str, insts: &[Inst], v: &mut Vec<Violation>) {
+    if !insts.iter().any(|i| i.mn == "s_prefetch_inst") {
+        return;
+    }
+    // byte offset of every instruction and the code size
+    let mut off: Vec<Option<u64>> = Vec::with_capacity(insts.len());
+    let mut size: Option<u64> = Some(0);
+    let base_addr = insts.first().and_then(|i| i.addr).map(|a| a.0);
+    for ins in insts {
+        match (ins.addr, base_addr) {
+            (Some((a, s)), Some(b0)) => {
+                off.push(Some(a - b0));
+                size = Some(a - b0 + s as u64);
+            }
+            _ => {
+                off.push(size);
+                let line = if ins.ops.is_empty() { ins.mn.clone() } else { format!("{} {}", ins.mn, ins.ops) };
+                size = match (size, amdgpu_target::gfx1250_co::encode_line(&line, size.unwrap_or(0) as usize, &|_| Some(0))) {
+                    (Some(s), Ok(b)) => Some(s + b.len() as u64),
+                    _ => None,
+                };
+            }
+        }
+    }
+    let _ = asm;
+    // labels reset the tracked values: the instruction indices that start a block
+    let (_, _, labels) = lex(asm);
+    let starts: std::collections::HashSet<usize> = labels.values().copied().collect();
+    let mut pc: HashMap<u32, Option<u64>> = HashMap::default();
+    let mut konst: HashMap<u32, i64> = HashMap::default();
+    let first_sgpr = |o: &str| -> Option<(u32, u32)> {
+        let o = o.trim();
+        if let Some(r) = o.strip_prefix("s[") {
+            let (a, b) = r.trim_end_matches(']').split_once(':')?;
+            return Some((a.parse().ok()?, b.parse().ok()?));
+        }
+        o.strip_prefix('s').and_then(|x| x.parse::<u32>().ok()).map(|x| (x, x))
+    };
+    for (k, ins) in insts.iter().enumerate() {
+        if starts.contains(&k) {
+            pc.clear();
+            konst.clear();
+        }
+        let ops: Vec<&str> = ins.ops.split(',').map(|o| o.trim()).collect();
+        if ins.mn == "s_prefetch_inst" {
+            let what = format!("line {}: `{} {}`", ins.line, ins.mn, ins.ops);
+            let base = first_sgpr(ops.first().copied().unwrap_or("")).and_then(|(a, _)| pc.get(&a).copied().flatten());
+            let imm = ops.get(1).and_then(|o| parse_int(o));
+            let so = ops.get(2).and_then(|o| if *o == "null" { Some(0) } else { first_sgpr(o).and_then(|(a, _)| konst.get(&a).copied()).or_else(|| parse_int(o)) });
+            let sdata = ops.get(3).and_then(|o| parse_int(o));
+            match (base, imm, so, sdata, size) {
+                (Some(b), Some(i), Some(s), Some(d), Some(total)) => {
+                    let start = b as i64 + i;
+                    let lines = ((s + d) & 31) + 1;
+                    let line0 = start.div_euclid(128);
+                    let end = (line0 + lines) * 128;
+                    let limit = (total as i64 + 127) / 128 * 128;
+                    if start < 0 || end > limit {
+                        viol(v, "GV-1250-PREFETCH-BOUNDS", format!("{what}: the window [{:#x}, {end:#x}) is not inside the code [0, {total:#x})", line0 * 128));
+                    }
+                }
+                _ => viol(v, "GV-1250-PREFETCH-BOUNDS", format!("{what}: the window is not provably inside the code (its base must be a s_get_pc_i64 and its soffset a constant of the same block, the code sizable)")),
+            }
+            continue;
+        }
+        // writes: the first operand of a scalar instruction is its destination
+        if let Some((a, b)) = ops.first().and_then(|o| first_sgpr(o)).filter(|_| ins.mn.starts_with("s_") && !ins.mn.starts_with("s_wait") && !ins.mn.starts_with("s_prefetch") && !ins.mn.starts_with("s_store") && !ins.mn.starts_with("s_cbranch") && ins.mn != "s_branch" && ins.mn != "s_setreg_imm32_b32" && ins.mn != "s_setreg_b32") {
+            for r in a..=b {
+                pc.remove(&r);
+                konst.remove(&r);
+            }
+            if ins.mn == "s_get_pc_i64" {
+                pc.insert(a, off.get(k + 1).copied().flatten());
+            } else if ins.mn == "s_mov_b32" {
+                if let Some(x) = ops.get(1).and_then(|o| parse_int(o)) {
+                    konst.insert(a, x);
+                }
+            }
+        }
+        // a VALU / VMEM writing SGPRs (v_readlane, v_cmp to sN, ...): forget every tracked register it names first
+        if !ins.mn.starts_with("s_") {
+            if let Some((a, b)) = ops.first().and_then(|o| first_sgpr(o)) {
+                for r in a..=b {
+                    pc.remove(&r);
+                    konst.remove(&r);
+                }
+            }
+        }
+    }
+}
+
 /// GV-1250-PERMPK16 (see the rule): the entry prologue, the follower, EXEC, the table sources.
 fn permpk16_rule(insts: &[Inst], v: &mut Vec<Violation>) {
     let perms: Vec<usize> = insts.iter().enumerate().filter(|(_, i)| i.mn.starts_with("v_perm_pk16_")).map(|(k, _)| k).collect();
@@ -2351,6 +2446,7 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let (insts, raw, labels) = lex(asm);
     let mut v = Vec::new();
     permpk16_rule(&insts, &mut v);
+    prefetch_rule(asm, &insts, &mut v);
     tdm_drain(&insts, &labels, &mut v);
     smem_pending(&insts, &labels, &mut v);
     wait_range(&insts, &mut v);

@@ -1075,6 +1075,31 @@ fn pos_permpk16() {
     }
 }
 
+// GV-1250-PREFETCH-BOUNDS (the base stream is a few hundred bytes of code)
+
+#[test]
+fn mut_prefetch_bounds() {
+    let m = |ls: &[&str]| asm_mutation(&inject("tensor_load_to_lds", ls), "GV-1250-PREFETCH-BOUNDS");
+    // a 4 KB window past the end of the code
+    m(&["s_get_pc_i64 s[36:37]", "s_mov_b32 s38, 31", "s_prefetch_inst s[36:37], 0x0, s38, 0"]);
+    // an offset past the end
+    m(&["s_get_pc_i64 s[36:37]", "s_prefetch_inst s[36:37], 0x10000, null, 0"]);
+    // before the start of the code
+    m(&["s_get_pc_i64 s[36:37]", "s_prefetch_inst s[36:37], -0x2000, null, 0"]);
+    // a base that is not a s_get_pc_i64 / an unknown soffset
+    m(&["s_mov_b64 s[36:37], s[0:1]", "s_prefetch_inst s[36:37], 0x0, null, 0"]);
+    m(&["s_get_pc_i64 s[36:37]", "s_prefetch_inst s[36:37], 0x0, s38, 0"]);
+    // the base register overwritten after the s_get_pc_i64
+    m(&["s_get_pc_i64 s[36:37]", "s_add_co_u32 s36, s36, 0x4000", "s_prefetch_inst s[36:37], 0x0, null, 0"]);
+}
+
+#[test]
+fn pos_prefetch_bounds() {
+    // one line (128 bytes) right after the s_get_pc_i64: inside any kernel of the base stream's size
+    asm_positive(&inject("tensor_load_to_lds", &["s_get_pc_i64 s[36:37]", "s_prefetch_inst s[36:37], 0x0, null, 0"]));
+    asm_positive(&inject("tensor_load_to_lds", &["s_get_pc_i64 s[36:37]", "s_mov_b32 s38, 0", "s_prefetch_inst s[36:37], 0x0, s38, 0"]));
+}
+
 // GV-1250-FORBIDDEN-OP
 
 #[test]
@@ -1177,6 +1202,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("GV-1250-DPP", "dpp"),
     ("GV-1250-FORBIDDEN-OP", "forbidden_op"),
     ("GV-1250-PERMPK16", "permpk16"),
+    ("GV-1250-PREFETCH-BOUNDS", "prefetch_bounds"),
     ("GV-1250-VOPD", "vopd"),
     ("GV-1250-CLAUSE-TYPE", "clause_type"),
     ("GV-1250-PERMLANE-CMPX", "permlane_cmpx"),
