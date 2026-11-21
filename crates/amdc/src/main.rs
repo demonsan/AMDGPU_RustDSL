@@ -1129,6 +1129,23 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "vgpr-banks" => {
+            // the static VGPR read-bank report of the gfx1250 code (amdgpu_codegen::vgpr_banks): `amdc vgpr-banks <kernel> | --all-gfx1250 [--top N]`
+            let top: usize = args.windows(2).find(|w| w[0] == "--top").and_then(|w| w[1].parse().ok()).unwrap_or(8);
+            let names: Vec<String> = match args.get(1).map(|s| s.as_str()) {
+                Some("--all-gfx1250") => amdgpu_kernels::gfx1250_kernel_names().iter().map(|s| s.to_string()).collect(),
+                Some(n) if !n.starts_with("--") => vec![n.to_string()],
+                _ => { usage(); return ExitCode::from(2) }
+            };
+            for n in &names {
+                let f = match load_kernel(n, &args) { Ok(f) => f, Err(c) => return c };
+                match amdgpu_codegen::compile_target(&f, "gfx1250") {
+                    Ok(c) => print!("{}", amdgpu_codegen::vgpr_banks::render(n, &amdgpu_codegen::vgpr_banks::report(&c.asm), top)),
+                    Err(e) => println!("{n}: compile failed: {}", e.lines().next().unwrap_or("")),
+                }
+            }
+            ExitCode::SUCCESS
+        }
         "lds-banks" => {
             // the static LDS bank-conflict report (amdgpu_codegen::lds_banks): `amdc lds-banks <kernel> | --all-gfx1250 [--min-ways N] [--lanes 32|64]`
             let min_ways: u32 = args.windows(2).find(|w| w[0] == "--min-ways").and_then(|w| w[1].parse().ok()).unwrap_or(2);
