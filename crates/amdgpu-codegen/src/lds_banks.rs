@@ -46,6 +46,7 @@ struct Ev<'a> {
     defs: HashMap<u32, &'a Op>,
     vars: HashMap<u32, A>,
     memo: HashMap<u32, A>,
+    why: Option<HashMap<String, usize>>,
 }
 
 impl<'a> Ev<'a> {
@@ -70,7 +71,19 @@ impl<'a> Ev<'a> {
         // (a cycle guard: a value is evaluated once)
         self.memo.insert(v, A::X);
         let r = match self.defs.get(&v).copied() {
-            Some(op) => self.op(op),
+            Some(op) => {
+                let r = self.op(op);
+                // (AMDC_LDS_BANKS_WHY: the ops at which the lane pattern was lost, counted)
+                if matches!(r, A::X) && self.why.is_some() {
+                    let name = format!("{op:?}");
+                    let k = name.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or("?").to_string();
+                    let operands_ok = op.operands().iter().all(|o| !matches!(o, Opnd::Val(x) if matches!(self.memo.get(x), Some(A::X))) && !matches!(o, Opnd::Var(x) if matches!(self.vars.get(&x.0), Some(A::X) | None)));
+                    if operands_ok {
+                        *self.why.as_mut().unwrap().entry(k).or_insert(0) += 1;
+                    }
+                }
+                r
+            }
             None => A::X,
         };
         self.memo.insert(v, r.clone());
@@ -85,6 +98,8 @@ impl<'a> Ev<'a> {
     fn bin(&mut self, a: &Opnd, b: &Opnd, f: &dyn Fn(i64, i64) -> i64, additive: bool, scale_ok: bool) -> A {
         let (x, y) = (self.opnd(a), self.opnd(b));
         match (&x, &y) {
+            // any function of two wave-uniform values is wave-uniform (unknown when either is)
+            (A::K(p, pu), A::K(q, qu)) if (*pu || *qu) && p.iter().all(|v| *v == p[0]) && q.iter().all(|v| *v == q[0]) => A::K(vec![0; self.lanes], true),
             (A::K(p, pu), A::K(q, qu)) => {
                 if additive {
                     return A::K(p.iter().zip(q).map(|(a, b)| f(*a, *b)).collect(), *pu || *qu);
@@ -117,11 +132,30 @@ impl<'a> Ev<'a> {
                 A::K(v, u) => A::K(v.iter().map(|x| w(x + *k as i64)).collect(), u),
                 A::X => A::X,
             },
+            // a select between two values with the same lane pattern (up to a uniform shift: e.g. the two slots' bases) keeps the pattern;
+            // a wave-uniform condition between different patterns, or a lane-dependent one, does not
+            Op::Select { cond, a, b, .. } => match (self.opnd(a), self.opnd(b)) {
+                (A::K(p, _), A::K(q, _)) => {
+                    let d = q[0] - p[0];
+                    if p.iter().zip(&q).all(|(x, y)| y - x == d) {
+                        let _ = cond;
+                        A::K(p, d != 0 || true)
+                    } else {
+                        A::X
+                    }
+                }
+                _ => A::X,
+            },
             Op::AddI32(a, b) => self.bin(a, b, &|x, y| w(x + y), true, false),
             Op::MulI32(a, b) => self.bin(a, b, &|x, y| w(x * y), false, true),
             Op::ShlI32(a, b) => {
-                // only a lane-constant shift amount scales
+                // only a lane-constant shift amount scales; an unknown uniform amount of a uniform value stays uniform
                 let s = self.opnd(b);
+                if let (A::K(sv, true), A::K(av, _)) = (&s, &self.opnd(a)) {
+                    if sv.iter().all(|v| *v == sv[0]) && av.iter().all(|v| *v == av[0]) {
+                        return A::K(vec![0; self.lanes], true);
+                    }
+                }
                 match Self::lane_const(&s) {
                     Some(c) if (0..32).contains(&c) => match self.opnd(a) {
                         A::K(v, u) => A::K(v.iter().map(|x| w(x << c)).collect(), u),
@@ -222,7 +256,7 @@ fn cost(lanes: &[i64], bytes: u32) -> (u32, u32, u32) {
 
 /// The report of `f` for a wave of `lanes` lanes (32 on gfx1250, 64 on gfx950).
 pub fn report(f: &Function, lanes: usize) -> Report {
-    let mut ev = Ev { f, lanes, defs: HashMap::new(), vars: HashMap::new(), memo: HashMap::new() };
+    let mut ev = Ev { f, lanes, defs: HashMap::new(), vars: HashMap::new(), memo: HashMap::new(), why: std::env::var("AMDC_LDS_BANKS_WHY").ok().map(|_| HashMap::new()) };
     for s in f.stmts() {
         if let Stmt::Let { dst, op } = s {
             ev.defs.insert(*dst, op);
@@ -282,6 +316,10 @@ pub fn report(f: &Function, lanes: usize) -> Report {
             A::X => rep.unanalysed += 1,
         }
     };
+    let lost_vars: Vec<u32> = ev.vars.iter().filter(|(_, a)| matches!(a, A::X)).map(|(k, _)| *k).collect();
+    if ev.why.is_some() && !lost_vars.is_empty() {
+        eprintln!("lds_banks: loop variables without a lane pattern: {lost_vars:?}");
+    }
     for (i, s) in f.stmts().iter().enumerate() {
         match s {
             Stmt::Let { op, .. } => match op {
@@ -310,6 +348,11 @@ pub fn report(f: &Function, lanes: usize) -> Report {
             }
             _ => {}
         }
+    }
+    if let Some(w) = &ev.why {
+        let mut v: Vec<_> = w.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("lds_banks: lane pattern lost at {v:?}");
     }
     rep
 }
