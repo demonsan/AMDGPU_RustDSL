@@ -298,7 +298,8 @@ fn run_bweave_order(s: &mut MirState, cx: &PassCtx) -> Result<(), String> {
         let density = if crate::target::cur().name == "gfx1250" {
             let kd = cx.f.kd.iter().rev().find(|x| x.0 == "interleave_density").map(|x| x.1 as usize);
             let env = std::env::var("AMDC_IDENSITY").ok().and_then(|v| v.parse::<usize>().ok());
-            Some(env.or(kd).unwrap_or(1).max(1))
+            // (0: the even spread, for A/B)
+            Some(env.or(kd).unwrap_or(1)).filter(|&d| d > 0)
         } else {
             None
         };
