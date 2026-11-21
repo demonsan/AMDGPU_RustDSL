@@ -46,6 +46,7 @@ struct Ev<'a> {
     defs: HashMap<u32, &'a Op>,
     vars: HashMap<u32, A>,
     memo: HashMap<u32, A>,
+    why: Option<HashMap<String, usize>>,
 }
 
 impl<'a> Ev<'a> {
@@ -70,7 +71,19 @@ impl<'a> Ev<'a> {
         // (a cycle guard: a value is evaluated once)
         self.memo.insert(v, A::X);
         let r = match self.defs.get(&v).copied() {
-            Some(op) => self.op(op),
+            Some(op) => {
+                let r = self.op(op);
+                // (AMDC_LDS_BANKS_WHY: the ops at which the lane pattern was lost, counted)
+                if matches!(r, A::X) && self.why.is_some() {
+                    let name = format!("{op:?}");
+                    let k = name.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or("?").to_string();
+                    let operands_ok = op.operands().iter().all(|o| !matches!(o, Opnd::Val(x) if matches!(self.memo.get(x), Some(A::X))) && !matches!(o, Opnd::Var(x) if matches!(self.vars.get(&x.0), Some(A::X) | None)));
+                    if operands_ok {
+                        *self.why.as_mut().unwrap().entry(k).or_insert(0) += 1;
+                    }
+                }
+                r
+            }
             None => A::X,
         };
         self.memo.insert(v, r.clone());
@@ -222,7 +235,7 @@ fn cost(lanes: &[i64], bytes: u32) -> (u32, u32, u32) {
 
 /// The report of `f` for a wave of `lanes` lanes (32 on gfx1250, 64 on gfx950).
 pub fn report(f: &Function, lanes: usize) -> Report {
-    let mut ev = Ev { f, lanes, defs: HashMap::new(), vars: HashMap::new(), memo: HashMap::new() };
+    let mut ev = Ev { f, lanes, defs: HashMap::new(), vars: HashMap::new(), memo: HashMap::new(), why: std::env::var("AMDC_LDS_BANKS_WHY").ok().map(|_| HashMap::new()) };
     for s in f.stmts() {
         if let Stmt::Let { dst, op } = s {
             ev.defs.insert(*dst, op);
@@ -282,6 +295,10 @@ pub fn report(f: &Function, lanes: usize) -> Report {
             A::X => rep.unanalysed += 1,
         }
     };
+    let lost_vars: Vec<u32> = ev.vars.iter().filter(|(_, a)| matches!(a, A::X)).map(|(k, _)| *k).collect();
+    if ev.why.is_some() && !lost_vars.is_empty() {
+        eprintln!("lds_banks: loop variables without a lane pattern: {lost_vars:?}");
+    }
     for (i, s) in f.stmts().iter().enumerate() {
         match s {
             Stmt::Let { op, .. } => match op {
@@ -310,6 +327,11 @@ pub fn report(f: &Function, lanes: usize) -> Report {
             }
             _ => {}
         }
+    }
+    if let Some(w) = &ev.why {
+        let mut v: Vec<_> = w.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("lds_banks: lane pattern lost at {v:?}");
     }
     rep
 }
