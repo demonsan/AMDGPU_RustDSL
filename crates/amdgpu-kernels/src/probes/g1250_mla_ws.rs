@@ -341,6 +341,19 @@ pub fn mla_g1250_qh16_wsstdp() -> Function {
     mla_ws_with("mla_g1250_qh16_wsstdp", false, 64 | 128 | 256 | 512 | 16384 | 65536 | 131072 | 262144, false)
 }
 
+/// the shipped MLA kernels with the instruction prefetch (MODE.SCALAR_PREFETCH_EN, read back, then windows inside the code)
+pub fn mla_g1250_qh16_wsP() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsP", false, 64 | 128 | 256 | 16384 | 65536 | 131072 | 262144, false))
+}
+
+pub fn mla_g1250_qh16_ws2P() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2P", true, 64 | 128 | 256 | 16384 | 65536, false))
+}
+
+pub fn mla_g1250_qh16_ws4P() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4P", false, 64 | 128 | 256 | 4096 | 32768 | 65536 | 67108864, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -505,7 +518,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
         // 4 windows, or (bit 18) 8: 32 KB, for kernels whose code is known to be longer than that
-        let nwin = if branchless & 262144 != 0 { 8 } else { 4 };
+        // (bit 26: 3 windows, for the small kernels whose code is shorter than 16 KB)
+        let nwin = if branchless & 262144 != 0 { 8 } else if branchless & 67108864 != 0 { 3 } else { 4 };
         for k in 0..nwin {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
