@@ -393,7 +393,12 @@ a pair can have two pages in flight; splitting a page's S, softmax and PV across
 ## 7. Open items
 
 - **VGPR window churn**: the wave-split MLA flips `s_set_vgpr_msb` about 3 times per WMMA (accumulators spread over the banks);
-  window-aware placement of accumulators vs streamed operands (back end).
+  window-aware placement of accumulators vs streamed operands (back end). A window-grouping schedule (`msbgroup`) cuts the switches but
+  measured slower ([`gfx1250-compiler-round1.md`](gfx1250-compiler-round1.md) §8).
+- **Scheduling mode 2** (2026-11-21): opt-in token `mode2`, compiler-planned `s_wait_alu` waits checked by check.rs and by the text-level
+  G5 rule `GV-1250-MODE2-WAIT`. MLA `_ws` / `_ws2` / `_ws4` are 0.2 .. 2.6 % faster and bit-identical. The MXFP4 GEMM stays in mode 0: its
+  address VALUs in the WMMA loop turn into drains of the matrix queue. Details and the VOPD-pair bug the second layer found:
+  [`gfx1250-compiler-round1.md`](gfx1250-compiler-round1.md) §8.
 - **Single-wave scheduling**: with one wave per SIMD, the remaining MLA gap is latency inside a wave (softmax VALU / TRANS against the
   WMMAs); in progress in the back end: an instruction-level software pipeline of page i's softmax under page i - 1's PV WMMAs.
 - **Short sequences** (MLA ~1.2 x the vendor at 4 x 1000 and 32 x 2048): the fixed per-work-group cost (prologue chain, first pages,

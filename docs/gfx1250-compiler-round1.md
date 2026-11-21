@@ -50,7 +50,7 @@ The rows below are the compiler changes behind that table, plus the correctness 
 |---|---|---|---|---|
 | gfx1250 machine model | list-scheduler latencies from the public LLVM speed model for gfx1250 (`AMDC_SCHED_MODEL950` selects the old model for A/B) | no gain on its own: the K loop's order is fixed by the template's software pipeline (fragment reads of sub-step s + 1 issued before the WMMAs of s); reordering with it is the -28 .. -33 % case of the next row | kept | `5e3607ca` |
 | Scheduler preset `SchedPreset::Gemm` (scoreboard waits + DS-read hoisting, no instruction reordering) | adopted for the wave-split MLA (`_wsg`) | **+2 - 5 %**, paired on e08 (backend g25, kernel-opt `_wsg`); list-scheduler reordering (either machine model) **-28 .. -33 %** | preset opt-in per kernel (kept for the MLA); reordering rejected | `docs/lgkm-lookahead.md` (the preset), [`gfx1250-status.md`](gfx1250-status.md) §5 |
-| Scheduling mode | our code runs in mode 0; mode 2 without the extra `s_wait_alu` waits is wrong on hardware (measured) | none (a restriction) | kept | `tools/mi450/mode2.sh`, [`gfx1250-status.md`](gfx1250-status.md) §1 |
+| Scheduling mode | our code runs in mode 0 by default; mode 2 (the relaxed mode) is an opt-in token `mode2` with compiler-planned `s_wait_alu` waits and two verification layers (§8) | MLA `_ws` -1 .. -2.6 %, `_ws2` -0.7 .. -1.2 %, `_ws4` -0.2 .. -0.7 %; the MXFP4 GEMM -2 .. -4 % at 8192^3 (§8) | **opt-in** (MLA candidates; the GEMM stays in mode 0) | §8 below, `tools/mi450/mode2_ab2.sh` |
 
 ## 5. Data movement (kernel templates, found by the same comparisons)
 
@@ -76,6 +76,80 @@ Kernel-level progression of the MXFP4 GEMM (8192^3, PF/s): 0.98 (first stage-tem
 - **Loop instruction profile** (`tools/isa_loop_profile.py`), **paired alternating runs** with the reference on one GPU (`tools/mi450/f4vs256.sh`).
 - **Verifier extensions that the new kernels needed**: `GV-LDS-ASYNC-OVERLAP`, prefetch bounds, `GV-1250-GETREG-IDLE`, a persistent tile loop whose body is simulated once and must end
   quiescent (see [`gfx1250-hang-rules.md`](gfx1250-hang-rules.md)).
+
+## 8. Scheduling mode 2 and VGPR read banks (2026-11-21)
+
+### Mode 2 for the compiler's own code
+
+In the relaxed scheduling mode (mode 2, LLVM's expert scheduling mode 2) the hardware stops checking two dependency classes and the
+program waits for them with `s_wait_alu` (depctr: va_vdst [15:12], vm_vsrc [4:2]; the default operand 0xff9f waits for nothing):
+
+- **va_vdst**: a non-VALU instruction that reads or writes a VGPR an outstanding VALU writes, or writes a VGPR it reads. The VALU event
+  classes XDL (WMMA), TRANS and the rest complete in order within a class and out of order with each other; a scaled f4 WMMA counts twice;
+  **a VOPD pair is one issue**.
+- **vm_vsrc**: any instruction that overwrites a VGPR an outstanding vector-memory / LDS operation still reads (classes LDS, buffer, other);
+  a counted memory wait also completes the operation's source reads.
+- Counter saturation 15 (va_vdst) / 7 (vm_vsrc). The SGPR / VCC classes (va_sdst, va_ssrc, va_vcc, sa_sdst) stay hardware-checked: in
+  public LLVM's SIInsertWaitcnts expert mode tracks exactly VA_VDST and VM_VSRC.
+
+The smallest sound count: while an operation is outstanding, so are the `same` younger operations of its own event class, so the counter is at
+least `same + 1`, and a wait for `n <= same` completes it. The hardware counter counts every class, so the wait also drains the other classes.
+
+Implementation (token `mode2` / `AMDC_MODE2`; `AMDC_NO_MODE2` turns it off):
+
+1. The prologue sets `s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2` (G5 `GV-1250-SCHED-MODE` accepts 0 and 2, rejects 1 / 3).
+2. `check::mode2_plan` plans the waits on the allocated MIR with the gfx1250 memory waits in place: the same dataflow as the exact-mode
+   verifier, over the CFG, iterated to a fixpoint over loops. It then re-checks the result with `check::verify_mode_pairs(.., 2)`.
+3. The emitter completes the waits on the **final text** (`gpu_verify_1250::mode2_complete`). This covers its own multi-instruction
+   expansions the MIR does not show, e.g. a 64-bit async-load address temporary overwritten while the load still reads it.
+4. **G5 `GV-1250-MODE2-WAIT`** re-checks every emitted mode-2 kernel on the text: a dataflow over the text's control flow with the VGPR
+   windows (`s_set_vgpr_msb`) tracked, so registers compare as absolute numbers. This layer does not share code with check.rs's model.
+
+**The bug the second layer found.** The first version counted the two halves of a VOPD pair as two VALU issues, both in the planner and in the
+MIR check (they share the counting), so both accepted it. In `mla_g1250_qh16_ws4`, `v_add_nc_u32 v19, ..` (an LDS address) ; `v_add` ;
+`v_dual_mov .. :: v_dual_mov ..` ; `ds_load_b128 .., v19` got `va_vdst(3)` where only two younger issues exist. The load could read a stale
+address: wrong results from the second page on (cos_diff 6e-3 .. 1.8e-2; mode 0 correct). The text check, which counts a dual line once,
+flagged that site and 28 other kernels. Fixed in the model (a pair's second half adds 0); the text completion covers the expansions.
+
+Tests: G5 mutation / positive streams (`mut_mode2_wait`, `pos_mode2_wait`: a VALU-written global / LDS address, a too-weak count, a count
+above the same-class issues, a store's data register overwritten, a window change). Every planned wait dropped in turn is caught. The real
+kernel mutation `mode2_ws4_stale_address_wait_is_rejected` puts the old `va_vdst(3)` back into `_ws4`.
+
+Hardware (e08, paired; every run correct): the G1 probes; `_ws4` at ctx 64 .. 4113 is **bit-identical** in mode 0 and mode 2
+(`tools/mi450/ws4_mode2_repro.sh`).
+
+| kernel, mode 0 -> mode 2 | 4 x 1000 | 32 x 2048 | 128 x 4096 | 128 x 8192 | 512 x 8192 |
+|---|---|---|---|---|---|
+| `mla_g1250_qh16_ws` | -2.6 % | -1.6 % | -0.9 % | -1.0 % | noise |
+| `mla_g1250_qh16_ws2` | -1.2 % | -1.1 % | +-0 | -0.7 % | noise |
+| `mla_g1250_qh16_ws4` | -0.5 % | -0.7 % | -0.2 % | -0.6 % | noise |
+
+**Why the GEMM does not gain.** `gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles` is -2 .. -4 % at 8192^3 in mode 2 (4096^3 neutral). In its K
+loop every scale / operand `ds_load` takes its address from a `v_add_nc_u32` issued just before it. In mode 2 that dependency needs
+`va_vdst(n)` with `n` = the younger VALUs of the same class, usually 0. The counter counts the WMMAs in flight too, so the wait drains the
+matrix queue, where mode 0's interlock waits for that one register. sched removed those address VALUs from the PCC kernel (static per-slot
+bases plus immediate offsets: loop VALU 8 -> 0, mode-2 waits 16 -> 6 per window pair). Mode 2 then only recovers to mode-0 speed (8192^3
+107.9 vs 107.4 us), and the extra base registers cost 4 % at K = 4096 in mode 0. A scheduling rule that reorders the same way would at best
+reach parity. **The GEMM stays in mode 0; mode 2 is an MLA option.**
+
+### VGPR read banks
+
+`amdc vgpr-banks <kernel> | --all-gfx1250` (`amdgpu_codegen::vgpr_banks`) is a static report over the final text with this model:
+
+- the VGPRs sit in 8 RAMs (register % 8), one read per RAM per cycle;
+- no RAM read for a source in the 4-entry LRU source cache (cleared by EXEC writes, readlane / writelane, cmpx, block starts) or for one
+  written by one of the last 4 VALUs (forwarding);
+- multi-dword operands count per dword, and only the excess over an even spread counts.
+
+The worst kernel has 69 of 1,919 VALU lines with one extra read cycle. The shipped GEMM has 53 of 1,871, all on the WMMA scale operands: two
+single registers in one RAM, at most 1 cycle against a multi-cycle WMMA. The shipped `_ws` has 24 of 1,862. 8-aligned WMMA fragments never
+conflict. Not a lever (sched and kernel-opt measured the same), so a bank-aware allocator is parked.
+
+### VGPR-window grouping (`msbgroup`, opt-in)
+
+A post-RA list schedule that keeps instructions with the same VGPR windows together. It cuts `s_set_vgpr_msb` (GEMM 504 -> 420, `_ws` 452
+-> 423) but costs latency hiding: GEMM -1.7 % at 8192^3, `_ws` +0.3 .. +1 %. It does not help an epilogue whose temporaries / store address
+sit in another window than its sources (that needs allocation, or packing in place).
 
 ## 7. Open after round 1
 
