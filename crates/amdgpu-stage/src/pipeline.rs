@@ -106,6 +106,8 @@ pub trait PipeBody {
     /// (`slots - 2` stages stay in flight at the end of a window).
     fn set_ring_depth(&mut self, _slots: u8) {}
     /// The prologue's stage of tile 0 into `slot` (default: `stage` of key 0). A body in carry mode (`Pipeline::carry`) issues it only for the first output tile of a persistent loop: later tiles find it already in flight.
+    /// `dov`: the (first-window, not-first-window) conditions of the window about to be staged and computed (`it == 0`, `it != 0`), or None
+    fn set_first_window_cond(&mut self, _c: Option<(amdgpu_dsl::ValueId, amdgpu_dsl::ValueId)>) {}
     fn stage_tile0(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx) {
         self.stage(b, role, &I32::c(0), slot);
     }
@@ -163,12 +165,15 @@ pub struct Pipeline {
     pub carry: bool,
     /// deletion profile (WRONG results): no workgroup barrier at the end of a `OneWindow` iteration
     pub nobar: bool,
+    /// carry mode with the drain overlap: the epilogue's tensor stores stay in flight into the next tile; window 0 of the tile (the first of the pair loop, `it == 0`) issues the stage of window 1 in its MIDDLE,
+    /// after a workgroup + cluster barrier that follows the drain of the stores (the stage overwrites the ring slot the stores read)
+    pub dov: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false, carry: false, nobar: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false, carry: false, nobar: false, dov: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -442,6 +447,11 @@ b.assume_trusted(
         let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
         let (lg, vm) = (self.lg(), self.vm_inflight);
         let body_wants_live = body.wants_stage_live();
+        if self.dov && staged && slot == 0 {
+            let f = b.bind_cond(amdgpu_dsl::ox(it).eq(0));
+            let nf = b.bind_cond(amdgpu_dsl::ox(it).ne(0));
+            body.set_first_window_cond(Some((f, nf)));
+        }
         rotate(b, &ONE_WINDOW_PARTS, stage_sel, None, &mut |b, i| match i {
             0 => {
                 let key_n2 = b.let_i32(it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1) << lg);
@@ -462,6 +472,7 @@ b.assume_trusted(
             }
             _ => unreachable!(),
         });
+        body.set_first_window_cond(None);
     }
 
     fn prebind(&self, b: &mut FnBuilder, t: &TileIt) {
