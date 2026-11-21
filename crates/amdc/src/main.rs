@@ -1129,6 +1129,21 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "lds-banks" => {
+            // the static LDS bank-conflict report (amdgpu_codegen::lds_banks): `amdc lds-banks <kernel> | --all-gfx1250 [--min-ways N] [--lanes 32|64]`
+            let min_ways: u32 = args.windows(2).find(|w| w[0] == "--min-ways").and_then(|w| w[1].parse().ok()).unwrap_or(2);
+            let lanes: usize = args.windows(2).find(|w| w[0] == "--lanes").and_then(|w| w[1].parse().ok()).unwrap_or(32);
+            let names: Vec<String> = match args.get(1).map(|s| s.as_str()) {
+                Some("--all-gfx1250") => amdgpu_kernels::gfx1250_kernel_names().iter().map(|s| s.to_string()).collect(),
+                Some(n) if !n.starts_with("--") => vec![n.to_string()],
+                _ => { usage(); return ExitCode::from(2) }
+            };
+            for n in &names {
+                let f = match load_kernel(n, &args) { Ok(f) => f, Err(c) => return c };
+                print!("{}", amdgpu_codegen::lds_banks::render(n, &amdgpu_codegen::lds_banks::report(&f, lanes), min_ways));
+            }
+            ExitCode::SUCCESS
+        }
         "print-ir" => {
             let name = args.get(1).cloned().unwrap_or_default();
             if name.is_empty() || (name.starts_with("--") && from_ir_path(&args).is_none()) { usage(); return ExitCode::from(2); }
