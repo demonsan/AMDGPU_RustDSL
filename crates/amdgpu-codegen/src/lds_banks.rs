@@ -273,6 +273,9 @@ pub fn report(f: &Function, lanes: usize) -> Report {
                     lanes.clear();
                     lanes.extend(v.iter().map(|x| x + e));
                     let (ways, c, i) = cost(&lanes, bytes);
+                    if std::env::var("AMDC_LDS_BANKS_STMT").ok().and_then(|s| s.parse::<usize>().ok()) == Some(stmt) {
+                        eprintln!("stmt {stmt} {what}: lane offsets {lanes:?}");
+                    }
                     rep.entries.push(Entry { stmt, what: what.to_string(), bytes, ways, cost: c, ideal: i });
                 }
             }
