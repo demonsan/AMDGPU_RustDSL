@@ -340,3 +340,26 @@ fn mode2_waits_are_checked_and_each_one_is_needed() {
         assert!(e.contains("mode-2 wait self-check"), "dropping wait {k} was not caught: {e}");
     }
 }
+
+/// The mode-2 miscompile of `mla_g1250_qh16_ws4` (wrong results from the second page on, 2026-11-21): the plan counted a VOPD pair as two
+/// VALU issues and waited `va_vdst(3)` for an LDS address written three lines earlier, where only two younger VALU issues exist. Both layers
+/// must now agree on the correct wait, and the text-level check must reject the old (too weak) wait on the real kernel.
+#[test]
+fn mode2_ws4_stale_address_wait_is_rejected() {
+    let mut f = amdgpu_kernels::kernel_by_name("mla_g1250_qh16_ws4").expect("kernel");
+    f.lower_opts.push("mode2".to_string());
+    // the MIR plan alone (no text completion) is already correct now
+    let c = amdgpu_codegen::gpu_verify_1250::without_mode2_completion(|| amdgpu_codegen::compile_target(&f, "gfx1250")).unwrap_or_else(|e| panic!("{e}"));
+    let lines: Vec<&str> = c.asm.lines().collect();
+    // the site: v_add (address) ; v_add ; v_dual ; s_wait_alu ; ds_load_b128 .., <address>
+    let k = (4..lines.len())
+        .find(|&k| lines[k].trim().starts_with("ds_load_b128") && lines[k - 1].trim().starts_with("s_wait_alu") && lines[k - 2].trim().starts_with("v_dual_"))
+        .expect("the site");
+    assert_eq!(lines[k - 1].trim(), "s_wait_alu 0x2f9f", "{}", lines[k - 4..=k].join("\n"));
+    assert!(amdgpu_codegen::gpu_verify_1250::verify_asm(&c.asm).iter().all(|v| v.rule != "GV-1250-MODE2-WAIT"));
+    // the old plan's wait: rejected by the text-level check
+    let mut bad: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    bad[k - 1] = "    s_wait_alu 0x3f9f".to_string();
+    let v = amdgpu_codegen::gpu_verify_1250::verify_asm(&bad.join("\n"));
+    assert!(v.iter().any(|x| x.rule == "GV-1250-MODE2-WAIT"), "the too-weak wait was accepted");
+}
