@@ -2059,8 +2059,9 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
     // a launch-contract trip-count multiple of the outermost simulated loop (`FnBuilder::loop_trip_multiple`: the host guarantees it, e.g. K a
     // multiple of two windows): the scenarios with another count are not launches of this kernel
     let trip_m = f.kd.iter().rev().find(|(k, _)| k == "g5:loop_trip_multiple").map_or(1, |(_, v)| (*v).max(1) as usize);
+    let trip_r = f.kd.iter().rev().find(|(k, _)| k == "g5:loop_trip_residue").map_or(0, |(_, v)| (*v).max(0) as usize) % trip_m;
     let run_n = |n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>, checked: &mut usize, paths: &mut usize| {
-        if n % trip_m != 0 {
+        if n % trip_m != trip_r {
             return;
         }
         if let Some(reps) = &roles {
@@ -2166,7 +2167,7 @@ pub(crate) fn verify_tiles_cap(f: &Function, rep: &mut Report, cap: Option<usize
         rep.add(code, sev, msg);
     }
     if trip_m > 1 {
-        rep.add("GV-ASSUME", Severity::Info, format!("loop_trip_multiple {trip_m}: the outermost pipelined loop runs a multiple of {trip_m} iterations (a launch contract the host must check); other counts are not simulated"));
+        rep.add("GV-ASSUME", Severity::Info, format!("loop_trip {trip_m}k + {trip_r}: the outermost pipelined loop runs {trip_m}k + {trip_r} iterations (a launch contract the host must check); other counts are not simulated"));
     }
     for (name, reason) in &f.contract.buf_trusts {
         rep.add("GV-ASSUME", Severity::Info, format!("buf_trust `{name}`: TRUSTED, the protocol of this region is not checked ({reason})"));
