@@ -41,7 +41,7 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "cluster_dims",
     // launch-ABI facts for the hosts (custom metadata keys, never descriptor fields): the ABI class (1 = KV split + combine kernel, 2 = KV
     // split with the fused last-arriver combine, 3 = the combine kernel of class 1) and the per-buffer extents of its host contract
-    "launch_abi", "split_ws_bytes", "split_ctr_bytes",
+    "launch_abi", "split_ws_bytes", "split_ctr_bytes", "b_preshuffle",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
@@ -385,7 +385,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         }
     }
     // the launch ABI class and its buffer extents (custom keys: the runtime ignores them, the hosts refuse a launch that does not match)
-    for (k, key) in [("launch_abi", "amdc_launch_abi"), ("split_ws_bytes", "amdc_split_ws_bytes"), ("split_ctr_bytes", "amdc_split_ctr_bytes")] {
+    for (k, key) in [("launch_abi", "amdc_launch_abi"), ("split_ws_bytes", "amdc_split_ws_bytes"), ("split_ctr_bytes", "amdc_split_ctr_bytes"), ("b_preshuffle", "amdc_b_preshuffle")] {
         if let Some(v) = kdv(k) {
             out.push_str(&format!("    .{key}: {v}\n"));
         }

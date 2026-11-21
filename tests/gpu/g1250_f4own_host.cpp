@@ -106,7 +106,20 @@ int main(int argc, char** argv) {
     const size_t lda_pad = getenv("LDA_PAD") ? (size_t)atoi(getenv("LDA_PAD")) : 0;
     HC(hipMalloc(&dA, (size_t)M * (KB + lda_pad))); HC(hipMalloc(&dB, (size_t)N * (KB + lda_pad))); HC(hipMalloc(&dSA, SA.size())); HC(hipMalloc(&dSB, SB.size())); const bool bf16 = getenv("OUT_BF16") != nullptr;   // the kernel writes bf16 (RNE), M x N x 2 bytes
     HC(hipMalloc(&dC, (size_t)M * N * (bf16 ? 2 : 4)));
-    HC(hipMemcpy2D(dA, KB + lda_pad, A.data(), KB, KB, M, hipMemcpyHostToDevice)); HC(hipMemcpy2D(dB, KB + lda_pad, B.data(), KB, KB, N, hipMemcpyHostToDevice));
+    // BPRESHUF=1: the B matrix and its scales pre-shuffled for the swapped-operand kernels (the vendor's ABpreShuffle for the WMMA-A operand): bits 3 and 4 of the row index exchanged within every 32-row block;
+    // the reference below keeps reading the original B / SB. A kernel declares it in its metadata (.amdc_b_preshuffle) and the launch is refused when kernel and host disagree.
+    const bool bpreshuf = getenv("BPRESHUF") != nullptr;
+    g1250_check_bpreshuf(argv[1], kn, bpreshuf);
+    auto bpre_rows = [&](const std::vector<uint8_t>& s, int rows, size_t rowbytes) {
+        std::vector<uint8_t> out(s.size());
+        for (int r = 0; r < rows; r++) {
+            const int i = r & 31, j = (i & 7) | ((i & 8) << 1) | ((i & 16) >> 1);   // exchange bits 3 and 4
+            memcpy(&out[(size_t)r * rowbytes], &s[(size_t)((r & ~31) | j) * rowbytes], rowbytes);
+        }
+        return out;
+    };
+    const std::vector<uint8_t> Bu = bpreshuf ? bpre_rows(B, N, KB) : B, SBu = bpreshuf ? bpre_rows(SB, N, K / 32) : SB;
+    HC(hipMemcpy2D(dA, KB + lda_pad, A.data(), KB, KB, M, hipMemcpyHostToDevice)); HC(hipMemcpy2D(dB, KB + lda_pad, Bu.data(), KB, KB, N, hipMemcpyHostToDevice));
     // SCALE_SHUF=1: the scales in the vendor's preshuffled layout (aiter shuffle_scale_f4: [rows / 32][K / 128][32 rows][4 bytes]; rows and
     // K / 32 here are multiples of 32 and 4); the reference below keeps reading the row-major SA / SB
     auto shuf_scale = [](const std::vector<uint8_t>& s, int rows, int cols) {
@@ -116,10 +129,10 @@ int main(int argc, char** argv) {
         return out;
     };
     if (getenv("SCALE_SHUF")) {
-        const std::vector<uint8_t> sa2 = shuf_scale(SA, M, K / 32), sb2 = shuf_scale(SB, N, K / 32);
+        const std::vector<uint8_t> sa2 = shuf_scale(SA, M, K / 32), sb2 = shuf_scale(SBu, N, K / 32);
         HC(hipMemcpy(dSA, sa2.data(), sa2.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, sb2.data(), sb2.size(), hipMemcpyHostToDevice));
     } else {
-        HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SB.data(), SB.size(), hipMemcpyHostToDevice));
+        HC(hipMemcpy(dSA, SA.data(), SA.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dSB, SBu.data(), SBu.size(), hipMemcpyHostToDevice));
     }
     HC(hipMemset(dC, 0xff, (size_t)M * N * (bf16 ? 2 : 4)));
 

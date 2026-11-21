@@ -11,7 +11,7 @@
 #include <vector>
 #include <unistd.h>
 
-struct CoMeta { long kernarg = -1; long max_flat = -1; long cluster = 0; long abi = 0; long ws_bytes = 0; long ctr_bytes = 0; };   // cluster: work-groups per cluster the kernel was built for (0 = not a cluster kernel)
+struct CoMeta { long kernarg = -1; long max_flat = -1; long cluster = 0; long abi = 0; long ws_bytes = 0; long ctr_bytes = 0; long bpre = 0; };   // cluster: work-groups per cluster the kernel was built for (0 = not a cluster kernel)
 
 static inline bool co_msgpack_int(const std::vector<unsigned char>& d, size_t p, long* v) {
     if (p >= d.size()) return false;
@@ -81,6 +81,7 @@ static inline CoMeta co_meta(const char* path, const char* kname) {
         last_int(std::string(1, (char)(0xa0 | 16)) + ".amdc_launch_abi", &m.abi);
         last_int(std::string(1, (char)(0xa0 | 20)) + ".amdc_split_ws_bytes", &m.ws_bytes);
         last_int(std::string(1, (char)(0xa0 | 21)) + ".amdc_split_ctr_bytes", &m.ctr_bytes);
+        last_int(std::string(1, (char)(0xa0 | 18)) + ".amdc_b_preshuffle", &m.bpre);
         break;
     }
     return m;
@@ -100,6 +101,15 @@ static inline void g1250_check_launch(const char* path, const char* kname, size_
     }
     if (threads > 0 && m.max_flat >= 0 && (exact ? threads != m.max_flat : threads > m.max_flat)) {
         fprintf(stderr, "LAUNCH-REFUSED: kernel %s was built for %ld work-items per work-group, the host launches %ld (a role-split kernel would hang at its first barrier)\n", kname, m.max_flat, threads);
+        _exit(2);
+    }
+}
+// the operand layout: a kernel built for a pre-shuffled B matrix (metadata `.amdc_b_preshuffle: 1`) must get one, and a plain kernel must not (the result would be silently wrong)
+static inline void g1250_check_bpreshuf(const char* path, const char* kname, bool host_preshuf) {
+    const CoMeta m = co_meta(path, kname);
+    if (m.kernarg < 0) return;
+    if ((m.bpre != 0) != host_preshuf) {
+        fprintf(stderr, "LAUNCH-REFUSED: kernel %s %s a pre-shuffled B matrix (rows 3 / 4 bits exchanged per 32-row block), the host %s one (BPRESHUF=1)\n", kname, m.bpre ? "needs" : "does not take", host_preshuf ? "passes" : "passes no");
         _exit(2);
     }
 }
