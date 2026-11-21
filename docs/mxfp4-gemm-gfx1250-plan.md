@@ -217,15 +217,30 @@ is exactly where the next tile's stage 1 lands at the start of window 0, so the 
 as the drain saves; a bf16 tile (128 KiB) fits one slot but the slot is the same one. The overlap needs either a third slot (no room), bf16 staging into the 32 KiB plus 128 KiB of a slot that the stage does not need until later (no such slot with 512-K stages)
 or accumulators held in a smaller footprint; not built.
 
-### The window is not the limit of the K loop: the stage's landing time is (e08, 2026-11-21)
+### Profiles of the K loop: ingest floor, window, ring depth (e08, 2026-11-21; per tile, 8192^3, loop cycles)
 
-Timing experiment (`exp_..._epit_roles_hoist[_stamps]`, WRONG results, SKIPCHECK): the fragments of sub-step 0 serve all four sub-steps, i.e. a quarter of the LDS reads. 8192^3, wave 0, cycles per 512-K iteration
-(issue / window / tensor wait / barrier = total): default 76 / **1,915** / 62 / 205 = **2,257**; hoisted 76 / **1,364** / **545** / 297 = **2,282**. The window shrinks by 29 % and the iteration does not move: the wait for the stage
-takes the difference. The stage issued at the start of window t lands 1,909 - 1,976 cycles later in both runs (147 KiB in about 1.95 k cycles = 75 B/clk per CU), i.e. the 2-slot loop is bound by the landing time of the next stage
-(L2 -> LDS ingest and latency) plus the per-iteration issue + barrier (about 280 cycles), and the window (1.9 k with the LDS reads, 1.36 k without) happens to equal the landing time. So fragment-read / WMMA reordering
-(software pipelining, fewer reads per WMMA, reuse hints) cannot shorten the iteration by itself: it would have to be paired with a faster ingest or a deeper ring (a vendor-like 3 - 4 stages hides the landing behind two windows: its
-iteration is then max(window, ingest) ~ 1.95 k instead of 2.25 k). Our PCC tile: 16 x 2.32 k loop + 5.3 k epilogue + ~1 k = 43.4 k cycles against an ingest floor of 16 x 1.95 k = 31 k; the vendor's 12.4 PF/s at 1.75 GHz needs
-about 2.4 k cycles per 512 K including everything.
+| kernel (all stamped, same GPU) | loop | per 512 K: issue / window / tensor wait / barriers |
+|---|---:|---|
+| default D (2 slots, 512 K) | 35.7 k | 76 / 1,916 / 62 / 205 = 2,257 |
+| D, no window at all (ingest only, wrong results) | **35.8 k** | - |
+| D, fragments read once per window (wrong results) | 35.7 k | 76 / 1,364 / 545 / 297 = 2,282 |
+| multicast M (lock) | 38.1 k | 76 / 1,935 / 12 / 376 = 2,400 |
+| M, no window (ingest only) | **29.8 k** | (1,865 per iteration) |
+| M, fragments read once per window | **30.7 k** | 76 / 1,365 / 186 / 312 = 1,938 |
+| M, fragments read two sub-steps ahead (`ahead2`, bit-exact) | 37.4 k | 76 / 1,891 / 12 / 366 = 2,345 |
+| M split cluster barrier | - | 76 / 2,018 / 12 / 209 = 2,316 |
+| 3-slot 256-K ring, no cluster (`ks2` relax) | 37.8 k | per 256 K: 76 / 977 / 12 / 120 = 1,185 |
+| same, workgroup barrier deleted (wrong results) | **35.7 k** | per 256 K: 83 / 896 / 42 / 106 = 1,127 |
+| 3-slot 256-K ring, multicast, existing lock path | 61.3 k | per 256 K: 76 / 966 / 606 / 290 = 1,938 (the lock path waits for ALL stages) |
+| same, deferred stage + early cluster signal (prototype, bit-exact, strict) | 44.2 k | per 256 K ~ 1,385 |
+
+* **D is bound by the ingest** (L2 -> LDS, 147 KiB in about 2.24 k cycles = 66 B/clk per CU): its loop is 35.8 k with or without the window, with or without a deeper ring (the 3-slot loop with its barrier deleted is again 35.7 k).
+* **The multicast loop is bound by the WINDOW**, not the ingest: its ingest floor is 29.8 k (4 x less L2 traffic), its window is 1.9 k cycles (LDS-read bound: 262 KiB of fragment reads plus 147 KiB of stage writes per iteration is about 85 % of the
+  LDS bandwidth the microbenchmarks give), and reading a quarter of the fragments brings the loop to 30.7 k (-19 %). Reading two sub-steps ahead only cuts the window by 2 % (the latency is already hidden), so what would pay is fewer LDS bytes per
+  WMMA, not scheduling: the 4 x 8 fragment grid of a 128 x 128 wave tile already reuses every A fragment 8 x and every B fragment 4 x (512 bytes per WMMA); a larger per-wave tile does not fit the registers (512 accumulator VGPRs + two fragment sets).
+* **A deeper ring does not help the multicast loop either:** the 256-K slots double the barriers and issues per K (about 420 cycles of overhead per 256 K against 450 per 512 K), the existing 3-slot lock path serialises on a full tensor wait, and
+  a deferred-issue prototype (stage t + 2 issued in the middle of window t after the cluster wait of the previous window's signal, workgroup barrier and relaxed tensor wait at the window end) is correct but 16 % slower (44.2 k).
+* Where the vendor wins, then, is not in the loop (its 12.4 PF/s needs about 2.4 k cycles per 512 K including everything, our PCC loop is 2.32 k) but in the 5 - 6.5 k cycles per tile of epilogue and the ~1 k of tile transitions that stay exposed.
 
 ### Smaller first stage (analysis, not built)
 

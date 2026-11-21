@@ -141,6 +141,14 @@ pub struct TdmF4Body {
     pub nopf: bool,
     /// timing experiment (WRONG results): the fragments of sub-step 0 serve all sub-steps (a quarter of the LDS reads)
     pub hoist: bool,
+    /// ingest-only profile (WRONG results): no fragment reads and no WMMAs in the window
+    pub nowin: bool,
+    /// the in-window software pipeline reads TWO sub-steps ahead (fragments of s + 2 are issued before the WMMAs of s): hides the LDS latency that one sub-step of WMMAs (32 x ~10 cycles) does not
+    pub ahead2: bool,
+    /// 3-slot cluster lock (prototype): the next stage is issued in the MIDDLE of the window (after the first sub-step's WMMAs), after the cluster barrier wait; the window-end `stage_complete` only waits for the
+    /// landed stage (relaxed), meets the workgroup and signals the cluster barrier (no wait): the skew of the 16 workgroups is absorbed by half a window instead of stalling every iteration
+    pub defer: bool,
+    pub pending: Option<(amdgpu_dsl::I32, SlotIdx, Role)>,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -185,8 +193,8 @@ fn add_to(b: &mut FnBuilder, var: VarId, delta: ValueId) {
     b.set_var(var, Opnd::Val(n));
 }
 
-impl PipeBody for TdmF4Body {
-    fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+impl TdmF4Body {
+    fn stage_impl(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
         let stamp_t0 = if self.stamps && self.steady { Some(cyc(b)) } else { None };
         if let Some(t0) = stamp_t0 {
             // the barrier and loop overhead of the previous iteration: from its wait-done stamp to this stage's start
@@ -236,6 +244,16 @@ impl PipeBody for TdmF4Body {
             self.st_t1 = Some(t1);
         }
     }
+}
+
+impl PipeBody for TdmF4Body {
+    fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+        if self.defer && self.steady && self.sh.lock {
+            self.pending = Some((key0.clone(), slot.clone(), role));
+            return;
+        }
+        self.stage_impl(b, role, key0, slot);
+    }
 
     fn stage_tile0(&mut self, b: &mut FnBuilder, role: Role, slot: &SlotIdx) {
         if self.carry {
@@ -279,6 +297,9 @@ impl PipeBody for TdmF4Body {
         if self.carry {
             return;   // the next tile's first stage is in flight; the tile loop's exit drains it
         }
+        if self.defer {
+            b.barrier_wait(-3);   // the signal of the last steady window
+        }
         b.wait_tensor(0);   // the last steady iteration's clamped stage is still in flight
     }
 
@@ -291,6 +312,18 @@ impl PipeBody for TdmF4Body {
             self.lock_stamp(b);
             b.barrier();
             b.barrier_wait(-3);
+            return;
+        }
+        if self.defer && self.steady && self.sh.lock {
+            // relaxed: the stage of the next window has landed (the one just issued stays in flight); every wave done (the workgroup barrier); one wave signals the cluster barrier, the wait is in the next window
+            let per_stage = if self.roles { 2 } else { 4 };
+            b.wait_tensor(per_stage * (self.depth - 2));
+            b.wait_lds(0);
+            self.lock_stamp(b);
+            b.barrier();
+            b.begin_if(Opnd::Val(self.leader));
+            b.barrier_signal(-3);
+            b.end_if();
             return;
         }
         if self.sh.cx * self.sh.cy > 1 && self.sh.lock {
@@ -320,7 +353,14 @@ impl PipeBody for TdmF4Body {
         }
     }
 
-    fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
+    fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, _t0: &TileIt) {
+        if self.defer {
+            // the first steady window waits for a signal: every workgroup has finished the prologue
+            b.begin_if(Opnd::Val(self.leader));
+            b.barrier_signal(-3);
+            b.end_if();
+        }
+    }
 
     fn loop_state(&mut self, b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let n = (self.sh.tm * self.sh.tn) as usize;
@@ -351,7 +391,12 @@ impl PipeBody for TdmF4Body {
 
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let sh = self.sh;
-        let (ra, rb, rsa, rsb) = (self.a.at(&t.cur), self.b.at(&t.cur), self.sa.at(&t.cur), self.sb.at(&t.cur));
+        if self.nowin {
+            return;
+        }
+        let (a_s, b_s, sa_s, sb_s) = (self.a.clone(), self.b.clone(), self.sa.clone(), self.sb.clone());
+        let (ra, rb, rsa, rsb) = (a_s.at(&t.cur), b_s.at(&t.cur), sa_s.at(&t.cur), sb_s.at(&t.cur));
+        let (perm_c, scale_shuf_c) = (self.perm, self.scale_shuf);
         let (abase, bbase, sabase, sbbase) = (self.abase, self.bbase, self.sabase, self.sbbase);
         let (arow, brow) = (64 * sh.ks + self.row_pad, 64 * sh.ks + self.row_pad);   // bytes per A / B row of the slot (padding included)
         let (srow_bytes, _) = (4 * sh.ks, 0);          // bytes per scale row of the slot
@@ -369,7 +414,7 @@ impl PipeBody for TdmF4Body {
                     let mut parts: Vec<Opnd> = Vec::new();
                     for half in 0..2 {
                         for piece in 0..2 {
-                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * if self.perm { 8 } else { 16 }) * arow + s * 64 + piece * 32);
+                            let addr = b.bind_i32(ra.base() + ev(abase) + (i * 32 + half * if perm_c { 8 } else { 16 }) * arow + s * 64 + piece * 32);
                             parts.push(Opnd::Val(b.load_lds_b128(addr)));
                         }
                     }
@@ -378,7 +423,7 @@ impl PipeBody for TdmF4Body {
             });
             rsa.read(b, |b| {
                 for i in 0..sh.tm {
-                    let st = if self.scale_shuf { 128 * s } else { 4 * s };
+                    let st = if scale_shuf_c { 128 * s } else { 4 * s };
                     let addr = b.bind_i32(rsa.base() + ev(sabase) + i * 32 * srow_bytes + st);
                     f.sa.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
@@ -396,7 +441,7 @@ impl PipeBody for TdmF4Body {
             rsb.read(b, |b| {
                 for j in 0..sh.tn {
                     // preshuffled: B block j covers rows 16 j .. of the 32-row block j / 2 (lanes m at 16 (j % 2) + m)
-                    let (jt, st) = if self.scale_shuf { ((j / 2) * 32 * srow_bytes + (j % 2) * 64, 128 * s) } else { (j * 16 * srow_bytes, 4 * s) };
+                    let (jt, st) = if scale_shuf_c { ((j / 2) * 32 * srow_bytes + (j % 2) * 64, 128 * s) } else { (j * 16 * srow_bytes, 4 * s) };
                     let addr = b.bind_i32(rsb.base() + ev(sbbase) + jt + st);
                     f.sb.push(Opnd::Val(b.load_lds_b32(addr)));
                 }
@@ -405,8 +450,19 @@ impl PipeBody for TdmF4Body {
         };
         // software pipeline inside the window: the loads of sub-step s + 1 are issued before the WMMAs of s
         let mut cur = load(b, 0);
+        let mut pre: Option<Frags> = if self.ahead2 && sh.ks > 1 { Some(load(b, 1)) } else { None };
         for s in 0..sh.ks {
-            let next = if s + 1 < sh.ks && !self.nopf && !self.hoist { Some(load(b, s + 1)) } else { None };
+            let next = if self.ahead2 {
+                let n = pre.take();
+                if s + 2 < sh.ks {
+                    pre = Some(load(b, s + 2));
+                }
+                n
+            } else if s + 1 < sh.ks && !self.nopf && !self.hoist {
+                Some(load(b, s + 1))
+            } else {
+                None
+            };
             if s + 1 == sh.ks && sh.split && sh.cx * sh.cy > 1 && sh.lock && t.staged && self.steady {
                 // every fragment of the slot is read: complete this wave's reads, meet the workgroup, and one wave signals the cluster barrier (waited for in `stage_complete`)
                 b.wait_lds(0);
@@ -420,6 +476,13 @@ impl PipeBody for TdmF4Body {
                     let acc = self.acc[(i * sh.tn + j) as usize];
                     let d = b.wmma_scaled(WmmaKind::ScaleF4_32x16x128, cur.fa[i as usize], cur.fb[j as usize], Some(Opnd::Var(acc)), WmmaScale { sa: cur.sa[i as usize], sb: cur.sb[j as usize], b_row1: false });
                     b.set_var(acc, Opnd::Val(d));
+                }
+            }
+            if s == 0 {
+                if let Some((key, slot, role)) = self.pending.take() {
+                    // the deferred stage: the cluster barrier signalled at the end of the previous window (every workgroup has read its slot) must have completed; then the multicast stage goes out
+                    b.barrier_wait(-3);
+                    self.stage_impl(b, role, &key, &slot);
                 }
             }
             if let Some(n) = next {
