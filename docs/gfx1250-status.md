@@ -51,25 +51,31 @@ our own kernels with them.
 **MLA decode, qh16, fp8 Q / KV, page size 64** (same ABI as the vendor kernel, so the host runs both; all results checked against an fp32
 reference, error equal to the vendor's):
 
-| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-20, VOPD build) | kernel |
+| B x ctx (pages / sequence) | first kernel (`mla_g1250_qh16`) / vendor | best of ours / vendor (e08, 2026-11-21) | kernel |
 |---|---|---|---|
-| 1 x 64 (1) | - | 1.22 | `_ws4` |
-| 4 x 64 (1) | - | 1.31 | `_ws4` |
-| 4 x 128 (2) | - | 1.50 | `_ws4` |
-| 4 x 256 (4) | - | 1.52 | `_ws4` |
-| 4 x 512 (8) | - | 1.08 | `_ws2` |
-| 4 x 1000 (16) | 1.65 | 1.19 | `_ws` |
-| 32 x 2048 (32) | 1.90 | 1.15 | `_ws` |
-| 128 x 4096 (64) | 1.38 | **0.94** | `_ws` |
-| 128 x 8192 (128) | 1.65 | **0.98** | `_ws` |
-| 512 x 8192 (128) | 1.34 | 1.01 | `_ws` |
+| 1 x 64 (1) | - | 1.02 | `_ws4` |
+| 4 x 64 (1) | - | 1.27 .. 1.37 | `_ws4` / `_ws2` |
+| 4 x 128 (2) | - | 1.30 | `_ws2` |
+| 4 x 192 (3) | - | 1.27 | `_ws2` |
+| 4 x 256 (4) | - | 1.20 | `_ws2` |
+| 4 x 320 (5) | - | **0.84** | `_ws2` |
+| 4 x 512 (8) | - | **0.86** | `_ws` |
+| 4 x 1000 (16) | 1.65 | **0.91** | `_ws` |
+| 32 x 2048 (32) | 1.90 | **0.92** | `_ws` |
+| 128 x 4096 (64) | 1.38 | **0.90** | `_ws` |
+| 128 x 8192 (128) | 1.65 | **0.91** | `_ws` |
+
+2026-11-21: the final reduce of `_ws` / `_ws2` read its partials with every thread on its own 256 contiguous bytes - the 32 lanes of a
+wave 256 B apart, one LDS bank for the whole wave (a 32-way conflict on 64 b128 loads per thread); the lane-interleaved read (8 threads of a
+head on 8 consecutive 16-byte chunks, 8-byte output stores) took 8 .. 30 % off every shape. `_ws4` ends with direct bf16 stores (no
+cross-wave step) and the prologue issues its loads together. Dispatch: 1 page -> `_ws4`, 2 .. 7 -> `_ws2`, 8 and more -> `_ws`.
 
 All paired against the vendor on one e08 GPU, every run MLA_OK for our kernels. The vendor kernel itself hung once in a timed run at
 512 x 8192 (`GPU HANG ANALYSIS`, 1 of 4 runs; its other runs and ours were correct): that shape's vendor timings are from the runs that
 completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in the code object (`.amdc_launch_abi`, the workspace /
 counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
-Dispatch rule (2026-11-21): 1 .. 4 pages per sequence -> `_ws4` (now ending with direct bf16 stores, no cross-wave step: -5 .. -8 % vs the merge ending, and -14 % / -2 % vs `_ws2` at 2 / 4 pages); 5 .. 8 -> `_ws2`; more -> `_ws`. On e08 (ours / vendor): 1 x 64 1.34, 4 x 64 1.10, 32 x 64 1.08, 4 x 128 1.63 (vendor jitter: the paired ratios at 1 .. 2 pages swing 1.1 .. 1.6 because the vendor runs at the ~2.9 us launch floor), 4 x 256 1.54. The launch floor: an empty kernel with the MLA ABI is 2.7 .. 2.9 us, i.e. the vendor's 1-page MLA costs ~0 above it; ours is 1.0 .. 1.3 us above it.
+Dispatch rule (2026-11-21, after the final-read fix): 1 page per sequence -> `_ws4`; 2 .. 7 -> `_ws2`; 8 and more -> `_ws`.
 pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
 the sequence bounds / page ids, full page pairs + the sequence's last page computed apart (the only masked page; every other page
 without mask code), the lean softmax (exponents / exps / sums batched: no TRANS-WAR `v_nop`), the GEMM compile policy. 128 x 4096 and

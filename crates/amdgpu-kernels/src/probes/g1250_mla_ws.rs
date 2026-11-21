@@ -42,7 +42,7 @@ fn with_vopd(mut f: Function) -> Function {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072, false))
+    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648, false))
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -232,12 +232,12 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
     // (2026-11-21: the direct bf16-store ending of `_ws4D`: no cross-wave step; -5 .. -8 % at 1 .. 4 pages on e08)
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824, false))
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
@@ -367,6 +367,37 @@ pub fn mla_g1250_qh16_d4b() -> Function {
 /// `_ws4` ending without any cross-wave step: each wave stores its own 128 dims of the 16 heads straight from registers (bf16, 2-byte stores)
 pub fn mla_g1250_qh16_ws4D() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws4D", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+}
+
+/// `_ws4` / `_ws2` / `_ws` with the prologue's loads issued together (bit 30)
+pub fn mla_g1250_qh16_ws4F() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4F", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824, false))
+}
+
+pub fn mla_g1250_qh16_ws2F() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2F", true, 64 | 256 | 16384 | 65536 | 1073741824, false))
+}
+
+pub fn mla_g1250_qh16_wsF() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsF", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824, false))
+}
+
+/// timing deletions (not registered): `_ws` / `_ws2` stopping before the merge
+pub fn mla_g1250_qh16_dwsb() -> Function {
+    mla_ws_with("mla_g1250_qh16_dwsb", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 134217728, false)
+}
+
+pub fn mla_g1250_qh16_dws2b() -> Function {
+    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 134217728, false)
+}
+
+/// `_ws` with the bank-conflict-free final read (bit 31)
+pub fn mla_g1250_qh16_wsC() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsC", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648, false))
+}
+
+pub fn mla_g1250_qh16_ws2C() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2C", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -571,7 +602,23 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         }
     };
     let zero = b.c_i32(0);
-    let early_qk = if early { Some((ld(&mut b, pqs, zero), ld(&mut b, pks, zero))) } else { None };
+    // bit 30: the prologue's loads issued together - the Q fragments first (they depend on the work-group id only), then every scalar
+    // load (scales, the sequence bounds, the score scale) before any of them is used: one scalar round trip instead of three
+    let fastpro = branchless & 1073741824 != 0;
+    let sc_early = if fastpro { Some(b.let_(Op::KernargI32 { offset: 92 })) } else { None };
+    let q_early: Option<Vec<ValueId>> = if fastpro {
+        let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
+        let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
+        Some((0..9u32)
+            .map(|c| {
+                let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
+                b.frag_cat(&parts)
+            })
+            .collect())
+    } else {
+        None
+    };
+    let early_qk = if early || fastpro { Some((ld(&mut b, pqs, zero), ld(&mut b, pks, zero))) } else { None };
     let bo = b.let_(Op::ShlI32(Opnd::Val(bidx), Opnd::I32(2)));
     let kv0 = ld(&mut b, pltp, bo);
     let bo4 = b.add_i32(bo, Opnd::I32(4));
@@ -608,21 +655,29 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     };
     let qsf = b.let_(Op::BitcastF32(Opnd::Val(qs)));
     let ksf = b.let_(Op::BitcastF32(Opnd::Val(ks)));
-    let sc = b.let_(Op::KernargI32 { offset: 92 });
+    let sc = match sc_early {
+        Some(v) => v,
+        None => b.let_(Op::KernargI32 { offset: 92 }),
+    };
     let scf = b.let_(Op::BitcastF32(Opnd::Val(sc)));
     let c1 = b.mul_f32(qsf, ksf);
     let c2 = b.mul_f32(c1, scf);
     let log2e = b.c_f32(std::f32::consts::LOG2_E);
     let cscale = b.mul_f32(c2, log2e);
     // Q fragments (B of S^T): head m, dims 64 c + 32 g .. + 32 (the K order inside a WMMA is free: the K reads use the same one)
-    let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
-    let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
-    let q: Vec<ValueId> = (0..9u32)
-        .map(|c| {
-            let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
-            b.frag_cat(&parts)
-        })
-        .collect();
+    let q: Vec<ValueId> = match q_early {
+        Some(q) => q,
+        None => {
+            let qrow = b.bind_i32((ev(bidx) * 16 + ev(m)) * 768 + ev(g) * 32);
+            let pqr = b.let_(Op::PtrAdd { base: Opnd::Val(pq), byte_off: Opnd::Val(qrow) });
+            (0..9u32)
+                .map(|c| {
+                    let parts: Vec<Opnd> = (0..2u32).map(|j| Opnd::Val(b.load_global(pqr, 64 * c + 16 * j, MemTy::B128))).collect();
+                    b.frag_cat(&parts)
+                })
+                .collect()
+        }
+    };
     // the timing experiments keep the Q loads alive (one word to R[b]: the output is garbage in these variants)
     let keep_q = |b: &mut FnBuilder| {
         let o = b.bind_i32(ev(bidx) * (16 * 512 * 2));
@@ -1750,6 +1805,56 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let rl = b.rcp_f32(lt);
     let inv = b.mul_f32(rl, ksf);
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();
+    if branchless & 2147483648 != 0 {
+        // (bit 31) bank-conflict-free final read: step k, the 8 threads of head h read 8 consecutive 16-byte chunks (dims 4 (8 k + j) ..),
+        // instead of each thread reading its own 256 contiguous bytes (lanes 256 B apart: one bank for the whole wave)
+        let j = b.bind_i32(ev(tid) & 7);
+        // chunk k (dims 4 (8 k + j) ..) lies in dim group k / (16 / dg); its waves: group + kk dg (kk = the page group, scale sc[kk])
+        let kpg = 16 / dg as i32;
+        let hb = b.bind_i32(ev(h) * 2048 + ev(j) * 16 + mo.base as i32);
+        let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
+            let mut acc: Vec<Option<ValueId>> = vec![None; 64];
+            for wi in 0..nwl {
+                let v4s: Vec<ValueId> = (0..16)
+                    .map(|k| {
+                        let wave = if dg > 1 { k / kpg + wi as i32 * dg as i32 } else { wi as i32 };
+                        let a = b.bind_i32(ev(hb) + (128 * k + wave * 32768));
+                        b.load_lds_b128(a)
+                    })
+                    .collect();
+                for k in 0..16 {
+                    for e in 0..4u8 {
+                        let x = b.frag_slice(Opnd::Val(v4s[k as usize]), e, 1);
+                        let xf = f32_of(b, x);
+                        let t = b.mul_f32(xf, scaled[wi as usize]);
+                        let i = 4 * k as usize + e as usize;
+                        acc[i] = Some(match acc[i] {
+                            None => t,
+                            Some(y) => b.add_f32(y, t),
+                        });
+                    }
+                }
+            }
+            acc.into_iter().map(|x| x.unwrap()).collect()
+        });
+        // 4 bf16 (8 bytes) per step: R[b][h][4 (8 k + j) ..]
+        let rb_off = b.bind_i32((ev(bidx) * 16 + ev(h)) * 1024 + ev(j) * 8);
+        let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb_off) });
+        for k in 0..16u32 {
+            let p0 = b.cvt_pk_bf16_f32(outs[4 * k as usize], outs[4 * k as usize + 1]);
+            let p1 = b.cvt_pk_bf16_f32(outs[4 * k as usize + 2], outs[4 * k as usize + 3]);
+            let v = b.frag_cat(&[Opnd::Val(p0), Opnd::Val(p1)]);
+            b.store_global(prb, 64 * k, v, MemTy::B64, false);
+        }
+        let lg = b.log2_f32(lt);
+        let s2 = b.add_f32(mx, lg);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lse = b.mul_f32(s2, ln2);
+        let lo = b.bind_i32((ev(bidx) * 16 + ev(h)) * 4);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+        b.store_global(pl, 0, lse, MemTy::B32, false);
+        return b.finish();
+    }
     let fb: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(d0) * 4 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
     let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
         let mut acc: Vec<Option<ValueId>> = vec![None; 64];
