@@ -161,12 +161,14 @@ pub struct Pipeline {
     pub lazy_prologue: bool,
     /// `OneWindow`: a persistent tile loop whose tile body starts with its first stage already in flight and ends by issuing the next tile's first stage in the peeled last window (`PipeBody::stage_tile0`, `stage_next_tile`)
     pub carry: bool,
+    /// deletion profile (WRONG results): no workgroup barrier at the end of a `OneWindow` iteration
+    pub nobar: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false, carry: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, ahead2: false, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, rs_depth: 2, unroll2: false, slots: 3, lazy_prologue: false, carry: false, nobar: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -454,7 +456,9 @@ b.assume_trusted(
                 b.wait_vm(vm);
                 body.stage_complete(b, role, &n2);
                 b.wait_lds(0);
-                b.barrier();
+                if !self.nobar {
+                    b.barrier();
+                }
             }
             _ => unreachable!(),
         });
@@ -645,7 +649,9 @@ b.assume_trusted(
                         b.wait_vm(vm);
                         body.stage_complete(b, role, &n2);
                         b.wait_lds(0);
-                        b.barrier();
+                        if !self.nobar {
+                            b.barrier();
+                        }
                     }
                     _ => unreachable!(),
                 });
