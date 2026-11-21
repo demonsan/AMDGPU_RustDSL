@@ -396,6 +396,10 @@ pub fn mla_g1250_qh16_wsC() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_wsC", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648, false))
 }
 
+pub fn mla_g1250_qh16_ws2C() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2C", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -1801,15 +1805,23 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let rl = b.rcp_f32(lt);
     let inv = b.mul_f32(rl, ksf);
     let scaled: Vec<ValueId> = sc.iter().map(|&s| b.mul_f32(s, inv)).collect();
-    if branchless & 2147483648 != 0 && dg == 1 {
+    if branchless & 2147483648 != 0 {
         // (bit 31) bank-conflict-free final read: step k, the 8 threads of head h read 8 consecutive 16-byte chunks (dims 4 (8 k + j) ..),
         // instead of each thread reading its own 256 contiguous bytes (lanes 256 B apart: one bank for the whole wave)
         let j = b.bind_i32(ev(tid) & 7);
-        let fb2: Vec<ValueId> = (0..nwl).map(|wi| b.bind_i32(ev(h) * 2048 + ev(j) * 16 + ev(wl[wi]) * 32768 + mo.base as i32)).collect();
+        // chunk k (dims 4 (8 k + j) ..) lies in dim group k / (16 / dg); its waves: group + kk dg (kk = the page group, scale sc[kk])
+        let kpg = 16 / dg as i32;
+        let hb = b.bind_i32(ev(h) * 2048 + ev(j) * 16 + mo.base as i32);
         let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
             let mut acc: Vec<Option<ValueId>> = vec![None; 64];
             for wi in 0..nwl {
-                let v4s: Vec<ValueId> = (0..16).map(|k| { let a = b.bind_i32(ev(fb2[wi]) + 128 * k); b.load_lds_b128(a) }).collect();
+                let v4s: Vec<ValueId> = (0..16)
+                    .map(|k| {
+                        let wave = if dg > 1 { k / kpg + wi as i32 * dg as i32 } else { wi as i32 };
+                        let a = b.bind_i32(ev(hb) + (128 * k + wave * 32768));
+                        b.load_lds_b128(a)
+                    })
+                    .collect();
                 for k in 0..16 {
                     for e in 0..4u8 {
                         let x = b.frag_slice(Opnd::Val(v4s[k as usize]), e, 1);
