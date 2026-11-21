@@ -4364,11 +4364,11 @@ fn gcd(a: i128, b: i128) -> i128 {
 
 #[allow(non_snake_case)]
 fn VGPR_LIMIT() -> u32 {
-    crate::target::dflt().verify.vgpr_limit
+    crate::target::tgt().verify.vgpr_limit
 }
 #[allow(non_snake_case)]
 fn SGPR_LIMIT() -> u32 {
-    crate::target::dflt().verify.sgpr_limit
+    crate::target::tgt().verify.sgpr_limit
 }
 /// the per-workgroup LDS limit of the target being compiled (gfx950: 160 KiB, gfx1250: 320 KiB)
 fn lds_limit() -> u32 {

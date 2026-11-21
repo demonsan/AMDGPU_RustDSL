@@ -61,23 +61,23 @@ pub(crate) const fn co(pipe: Pipe, issue: u32, occ: u32, latency: u32, grade: Gr
 /// With >=4 waves per CU some launches show +96 per taken branch (cause unknown, not modelled).
 #[allow(non_snake_case)]
 pub fn BRANCH_TAKEN() -> u32 {
-    crate::target::dflt().latency.branch_taken
+    crate::target::tgt().latency.branch_taken
 }
 #[allow(non_snake_case)]
 pub fn BRANCH_UNCOND() -> u32 {
-    crate::target::dflt().latency.branch_uncond
+    crate::target::tgt().latency.branch_uncond
 }
 #[allow(non_snake_case)]
 pub fn BRANCH_NOT_TAKEN() -> u32 {
-    crate::target::dflt().latency.branch_not_taken
+    crate::target::tgt().latency.branch_not_taken
 }
 #[allow(non_snake_case)]
 pub fn VCC_TO_BRANCH() -> u32 {
-    crate::target::dflt().latency.vcc_to_branch
+    crate::target::tgt().latency.vcc_to_branch
 }
 #[allow(non_snake_case)]
 pub fn BARRIER_COST() -> u32 {
-    crate::target::dflt().latency.barrier
+    crate::target::tgt().latency.barrier
 }
 
 /// Global model knobs (also data): whether `v_exp`/`v_rcp` run on their own pipe next to the VALU.
@@ -87,7 +87,7 @@ pub struct ModelParams {
 
 #[allow(non_snake_case)]
 pub fn PARAMS() -> ModelParams {
-    ModelParams { trans_separate_pipe: crate::target::dflt().latency.trans_separate_pipe }
+    ModelParams { trans_separate_pipe: crate::target::tgt().latency.trans_separate_pipe }
 }
 
 /// Cost of one opcode (the `cost` attribute of `crate::op_attrs`). Grades: see docs/scheduling.md (tables 1-2).

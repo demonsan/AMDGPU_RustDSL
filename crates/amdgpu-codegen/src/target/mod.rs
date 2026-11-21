@@ -26,6 +26,35 @@ pub fn dflt() -> &'static Target {
     T
 }
 
+/// The target a shared pass reads its facts from: the current one (`AMDC_T950_COMPAT`: the old behaviour, the compile-time default
+/// gfx950, for A/B measurements of the audit's changes only).
+pub fn tgt() -> &'static Target {
+    if std::env::var("AMDC_T950_COMPAT").is_ok() {
+        return T;
+    }
+    cur()
+}
+
+/// A gfx950 wait-state rule of the SHARED hazard pass, in wait states: the rule of the current target when it describes it; gfx1250
+/// interlocks those dependencies (its software hazards are target/gfx1250/hazards.rs, and the gfx1250 emitter drops the shared pass's
+/// `s_nop`s), so there it is 0. (`AMDC_T950_COMPAT`: the gfx950 value, A/B only.)
+pub fn shared_hazard(name: &str) -> u32 {
+    let t = tgt();
+    if t.hazards.iter().any(|h| h.name == name) {
+        return t.hazard(name).n();
+    }
+    0
+}
+
+/// `shared_hazard` for the latency-scaled rules (`by_latency`).
+pub fn shared_hazard_by_latency(name: &str, lat: u32) -> u32 {
+    let t = tgt();
+    if t.hazards.iter().any(|h| h.name == name) {
+        return t.hazard(name).by_latency(lat);
+    }
+    0
+}
+
 /// Runs `g` with the default-target guard on (see `dflt`).
 #[doc(hidden)]
 pub fn with_default_target_guard<R>(g: impl FnOnce() -> R) -> R {

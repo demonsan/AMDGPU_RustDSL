@@ -24,22 +24,22 @@ fn vgpr_count() -> usize {
 /// AGPRs per wave (a0..a255); arch VGPR + AGPR together must fit the unified 512-register file.
 #[allow(non_snake_case)]
 fn AGPR_COUNT() -> usize {
-    crate::target::agpr_count(crate::target::dflt()) as usize
+    crate::target::agpr_count(crate::target::tgt()) as usize
 }
 #[allow(non_snake_case)]
 pub fn UNIFIED_FILE() -> u32 {
-    crate::target::unified_total(crate::target::dflt())
+    crate::target::unified_total(crate::target::tgt())
 }
 // 102 usable SGPRs (the descriptor's next_free_sgpr must stay <= 102; vcc is separate)
 #[allow(non_snake_case)]
 fn SGPR_COUNT() -> usize {
-    crate::target::dflt().regs.sgpr.count as usize
+    crate::target::tgt().regs.sgpr.count as usize
 }
 
 /// Reserved: v0 holds workitem id; s0:s1 kernarg pointer; s2..s4 workgroup ids.
 #[allow(non_snake_case)]
 fn V_RESERVED() -> usize {
-    crate::target::dflt().regs.vgpr.reserved as usize
+    crate::target::tgt().regs.vgpr.reserved as usize
 }
 /// SGPRs the allocator never hands out: the target's reserved ones (gfx950: the ABI inputs) and, on gfx1250, the kernarg dwords the
 /// hardware preloads after the kernarg pointer (s[2 .. 2 + n], read by `SReadPhys` copies).
@@ -873,7 +873,7 @@ pub fn agpr_count(m: &MFunction, a: &Alloc) -> u32 {
 /// Unified-file accounting of an allocation: (accum_offset, next_free_vgpr, waves per SIMD). accum_offset is the arch VGPR count rounded to 4
 /// (.amdhsa_accum_offset), next_free_vgpr = accum_offset + AGPRs rounded to 8; waves per SIMD = floor(512 / next_free_vgpr) (at most 8).
 pub fn unified_budget(max_v: u32, agprs: u32) -> (u32, u32, u32) {
-    let t = crate::target::dflt();
+    let t = crate::target::tgt();
     let (ag, tg, maxw) = match &t.regs.unified {
         Some(u) => (u.accum_granule, u.total_granule, u.max_waves_per_simd),
         None => (t.emit.vgpr_granule, t.regs.vgpr.alloc_granule, 1),
