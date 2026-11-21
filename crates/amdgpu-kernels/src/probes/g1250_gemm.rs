@@ -1367,8 +1367,11 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 b.mul_i32(wid, Opnd::I32(32768))
             };
             b.tile_produce(e3_name, Opnd::Val(e3_key), Opnd::I32(0));
+            // the staging layout: chunks of `cw` columns (a store tile of cw x 128 rows each), rows of 2 cw bytes: wider chunks = fewer, longer global write segments but more LDS bank conflicts in the 16-byte stores
+            let cw: i32 = if name.contains("_cw128") { 128 } else if name.contains("_cw64") { 64 } else { 32 };
+            let cb = 2 * cw;
             let g32 = b.let_(Op::ShlI32(Opnd::Val(g), Opnd::I32(5)));
-            let m64 = b.let_(Op::ShlI32(Opnd::Val(m), Opnd::I32(6)));
+            let m64 = b.mul_i32(m, Opnd::I32(cb));
             let l0 = b.add_i32(wbase, m64);
             let l0 = b.add_i32(l0, g32);
             for i in 0..sh.tm {
@@ -1384,31 +1387,41 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                             parts.push(Opnd::Val(b.let_(Op::CvtPkBf16F32(Opnd::Val(f0), Opnd::Val(f1)))));
                         }
                         let v4 = b.frag_cat(&parts);
-                        let addr = b.bind_i32(ev(l0) + (i * 8192 + j * 1024 + h * 16));
+                        let addr = b.bind_i32(ev(l0) + (((i * 32) / cw) * (128 * cb) + j * 16 * cb + ((i * 32) % cw) * 2 + h * 16));
                         b.store_lds_b128(addr, v4);
                     }
                 }
             }
             b.tile_end();
             b.wait_lds(0);
+            let t3_e1 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
             b.tile_consume(e3_name, Opnd::Val(e3_key), Opnd::I32(0));
             let r0 = b.mul_i32(wj, Opnd::I32(sh.tn * 16));
             let r0 = b.add_i32(r0, row0);
-            let tile = TensorTile { data_size: 2, tensor_dim: [Opnd::I32(32), Opnd::I32(sh.tn * 16)], stride0: Opnd::Val(nn), tile: [32, (sh.tn * 16) as u16], pad: None, wg_mask: 0 };
-            for i in 0..sh.tm {
+            let tile = TensorTile { data_size: 2, tensor_dim: [Opnd::I32(cw), Opnd::I32(sh.tn * 16)], stride0: Opnd::Val(nn), tile: [cw as u16, (sh.tn * 16) as u16], pad: None, wg_mask: 0 };
+            for i in 0..(sh.tm * 32 / cw) {
                 let c0 = b.mul_i32(wi, Opnd::I32(sh.tm * 32));
                 let c0 = b.add_i32(c0, col0);
-                let c0 = b.add_i32(c0, Opnd::I32(i * 32));
+                let c0 = b.add_i32(c0, Opnd::I32(i * cw));
                 let lin = b.mul_i32(r0, nn);
                 let lin = b.add_i32(lin, c0);
                 let org = b.let_(Op::ShlI32(Opnd::Val(lin), Opnd::I32(1)));
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
-                let lw = b.bind_i32(ev(wbase) + i * 8192);
+                let lw = b.bind_i32(ev(wbase) + i * (128 * cb));
                 let lw_s = b.let_(Op::ReadFirstLane(Opnd::Val(lw)));
                 let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(lw_s));
                 b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
             }
             b.tile_end();
+            if let Some(e1) = t3_e1 {
+                let c = b.shader_cycles();
+                let e2 = b.let_(Op::PtrLo(Opnd::Val(c)));
+                let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
+                let wgl = b.bind_i32(ev(wgy) * 64 + ev(gxm));
+                let rec = b.bind_i32(((ev(wgl) << 2) + ev(w)) * 64);
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 9, e1);
+                b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 10, e2);
+            }
             b.wait_tensor(0);
             if persistent {
                 b.wait_lds(0);

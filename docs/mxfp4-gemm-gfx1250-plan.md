@@ -253,6 +253,27 @@ operands are swapped, so a lane's 8 accumulator registers of a row segment are 8
 issue each) happen once per 64 instructions instead of once per few. Our own archived swap + bf16 staged variant (`_bf16`, tag `archive/g1250-gemm-variants-2026-11-20`) had the same epilogue structure (2,250 cycles) but reads the swapped
 operand with a row permutation (rows (m & 7) + 16 (m >> 3)) that cost 12 % of the window; the vendor avoids it by pre-shuffling the operand in memory.
 
+### bf16 output with a pre-shuffled B: built, proven, slower (e08, 2026-11-21)
+
+`exp_..._epit_roles_c4x4_lock_persist_carry_bf16`: the persistent multicast kernel with the carried first stage, the WMMA operands swapped (A operand = the B matrix, so a lane's 16 accumulator registers are 16 CONSECUTIVE output columns),
+**B and its scales pre-shuffled on the host** (bits 3 and 4 of the row index exchanged within every 32-row block, host `BPRESHUF=1`; the swap mode then reads plain rows: the window is 1,931 cycles like the f32 kernel's, the 12 % permutation
+cost of the archived swap kernels is gone), 256 `v_cvt_pk_bf16_f32` + 64 `ds_store_b128` per wave into the slot-1 regions (one 32 KiB slice per wave, declared with `private_over_slots` and the produce / consume markers) and tensor stores of
+the staged tile. The code object declares the layout (`.amdc_b_preshuffle: 1`, a new launch-ABI key: the hosts refuse a launch whose B is not pre-shuffled, and a plain kernel launched with a shuffled B), the multicast masks follow the swapped
+operands, the carried next-tile origins follow the swap. It compiles strict (carry + markers + bounds), the negative cases of the f32 kernel apply unchanged, and the output is bit-exact against a bf16 reference at 2048^3 - 8192^3.
+**It is slower than the f32 kernel**: 8192^3 116.4 - 117.1 us vs 105.7 - 105.9 (-9 % PF/s), 4096^3 16.4 - 16.6 vs 16.7 - 17.1 (equal), because the bf16 epilogue is 7.3 - 8.9 k cycles against 5.9 k for f32 (stamps, 8192^3):
+
+| staging chunk width (columns per tensor store) | LDS staging | tensor-store issue | drain | epilogue |
+|---|---:|---:|---:|---:|
+| 32 (4 stores of 64-byte rows; conflict factor 4) | 2.1 k | 1.6 k | 5.2 k | 8.9 k |
+| 64 (2 stores of 128-byte rows) | 2.7 k | 0.15 k | 4.6 k | 7.5 k |
+| 128 (1 store of 256-byte rows; conflict factor 16) | **5.4 k** | 0.09 k | **1.9 k** | 7.3 k |
+| f32 reference (1 store of 512-byte rows) | 2.3 k | 0.08 k | 3.4 k | 5.9 k |
+
+The staging is limited by LDS bank conflicts and the drain by the length of the global write segments, and the two pull in opposite directions: the 16-byte stores of a lane's 8 columns hit the same banks in every row (bank = column offset only: rows
+are a multiple of 256 bytes apart), a padded row cannot be used because the tensor store reads its LDS source unpadded (rule GV-1250-TDM-STORE-PAD; the earlier measurement of shifted rows), and 64-byte write segments drain 2.7 x slower than 256-byte
+ones. So the bf16 output through the LDS cannot beat the f32 tile (which stores 512-byte rows with 2-way conflicts); the vendor's 64 `ds_store_b128` must use a layout this analysis does not reproduce. Untried: direct global stores from the registers with
+the preshuffle chosen so that a lane's columns across the four 32-column blocks are contiguous (128 bytes per lane, no LDS, no tensor store; the archived direct 16-byte-store variant, whose lanes wrote 32-byte pieces, measured 8.3 - 8.8 PF/s).
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible

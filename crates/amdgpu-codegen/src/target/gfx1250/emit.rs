@@ -41,7 +41,7 @@ pub const KD_DIRECTIVES: &[&str] = &[
     "cluster_dims",
     // launch-ABI facts for the hosts (custom metadata keys, never descriptor fields): the ABI class (1 = KV split + combine kernel, 2 = KV
     // split with the fused last-arriver combine, 3 = the combine kernel of class 1) and the per-buffer extents of its host contract
-    "launch_abi", "split_ws_bytes", "split_ctr_bytes",
+    "launch_abi", "split_ws_bytes", "split_ctr_bytes", "b_preshuffle",
 ];
 
 /// `emit` with the author's descriptor directives (`kd`) replacing the emitter's.
