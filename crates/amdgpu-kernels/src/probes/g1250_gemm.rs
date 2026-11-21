@@ -803,7 +803,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     assert!(!ring.swap || sh.cx * sh.cy == 1, "operand swap: no cluster");
     let (pa, pb, psa, psb) = if ring.swap { (pb, pa, psb, psa) } else { (pa, pb, psa, psb) };
     let pdbg = if ring.stamps || ring.tstamps { ptr(&mut b, 64) } else { pc };
-    let t_start = if ring.stamps {
+    let t_start = if ring.stamps || ring.tstamps {
         let c = b.shader_cycles();
         b.let_(Op::PtrLo(Opnd::Val(c)))
     } else {
@@ -1618,6 +1618,7 @@ for q in 0..8i32 {
             b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 11, ta);
             b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 12, tb);
             b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 13, tc_end);
+            b.stamp_store(Opnd::Val(pdbg), Opnd::Val(rec), 14, t_start);
         }
         if let Some(tp) = t_post {
             let c = b.shader_cycles();

@@ -222,16 +222,16 @@ int main(int argc, char** argv) {
     const int ystep = persist ? persist / tx : 1;
     {
         // every workgroup (wave 0): first tile top to last tile end, the distribution over the workgroups; and the first tile's top-to-loop-end
-        std::vector<long> tot, first, lastloop;
+        std::vector<long> tot, first, lastloop, setup;
         const int nt = ty / ystep;
         for (int r0 = 0; r0 < ystep; ++r0) for (int c = 0; c < tx; ++c) {
             const unsigned* f = &rec[(((size_t)r0 * 64 + c) * 4 + 0) * 16];
             const unsigned* l = &rec[((((size_t)(r0 + (nt - 1) * ystep)) * 64 + c) * 4 + 0) * 16];
             if (!f[11] || !l[13]) continue;
-            tot.push_back((long)(l[13] - f[11])); first.push_back((long)(f[12] - f[11])); lastloop.push_back((long)(l[12] - l[11]));
+            setup.push_back((long)(f[11] - l[14])); tot.push_back((long)(l[13] - f[11])); first.push_back((long)(f[12] - f[11])); lastloop.push_back((long)(l[12] - l[11]));
         }
         auto pct = [](std::vector<long> v, double p) { std::sort(v.begin(), v.end()); return v.empty() ? 0L : v[(size_t)(p * (v.size() - 1))]; };
-        printf("{\"tile_dist\":{\"wgs\":%zu,\"total_min\":%ld,\"total_med\":%ld,\"total_max\":%ld,\"first_loop_med\":%ld,\"last_loop_med\":%ld,\"last_loop_max\":%ld}}\n", tot.size(), pct(tot, 0), pct(tot, 0.5), pct(tot, 1), pct(first, 0.5), pct(lastloop, 0.5), pct(lastloop, 1));
+        printf("{\"tile_dist\":{\"wgs\":%zu,\"total_min\":%ld,\"total_med\":%ld,\"total_max\":%ld,\"first_loop_med\":%ld,\"last_loop_med\":%ld,\"last_loop_max\":%ld,\"setup_med\":%ld,\"start_to_end_med\":%ld}}\n", tot.size(), pct(tot, 0), pct(tot, 0.5), pct(tot, 1), pct(first, 0.5), pct(lastloop, 0.5), pct(lastloop, 1), pct(setup, 0.5), pct(setup, 0.5) + pct(tot, 0.5));
     }
     for (int wv : {0, 3}) {
         unsigned prev_end = 0;
