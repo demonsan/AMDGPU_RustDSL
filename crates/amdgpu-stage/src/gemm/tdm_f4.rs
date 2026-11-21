@@ -37,6 +37,9 @@ pub struct F4Shape {
     /// cluster only: keep the workgroups of the cluster in lockstep, one cluster barrier per K tile (the vendor loop's `s_barrier_signal -3` / wait): the multicast rendezvous then finds its peers
     /// asking at about the same time instead of waiting for the timeout
     pub lock: bool,
+    /// cluster lock only: the cluster barrier is SPLIT: every workgroup signals it as soon as all its waves have finished reading the slot (before the last sub-step's WMMAs of a staged window) and waits for it at the
+    /// end of the window, after its own tensor wait and the workgroup barrier: the skew between the workgroups is absorbed by the last sub-step instead of stalling the whole workgroup
+    pub split: bool,
 }
 
 impl F4Shape {
@@ -265,6 +268,14 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
+        if self.sh.cx * self.sh.cy > 1 && self.sh.lock && self.sh.split && self.steady {
+            // the signal went out in the window (every wave had read its fragments); our tensor wait, every wave done (the workgroup barrier), then the cluster wait
+            b.wait_tensor(0);
+            b.wait_lds(0);
+            b.barrier();
+            b.barrier_wait(-3);
+            return;
+        }
         if self.sh.cx * self.sh.cy > 1 && self.sh.lock {
             // our own tensor wait, every wave of the workgroup done (reads of the previous tile included: the barrier), then one wave signals the cluster barrier and all wait
             b.wait_tensor(0);
@@ -378,6 +389,14 @@ impl PipeBody for TdmF4Body {
         let mut cur = load(b, 0);
         for s in 0..sh.ks {
             let next = if s + 1 < sh.ks && !self.nopf { Some(load(b, s + 1)) } else { None };
+            if s + 1 == sh.ks && sh.split && sh.cx * sh.cy > 1 && sh.lock && t.staged && self.steady {
+                // every fragment of the slot is read: complete this wave's reads, meet the workgroup, and one wave signals the cluster barrier (waited for in `stage_complete`)
+                b.wait_lds(0);
+                b.barrier();
+                b.begin_if(Opnd::Val(self.leader));
+                b.barrier_signal(-3);
+                b.end_if();
+            }
             for i in 0..sh.tm {
                 for j in 0..sh.tn {
                     let acc = self.acc[(i * sh.tn + j) as usize];
