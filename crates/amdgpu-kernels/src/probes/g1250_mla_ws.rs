@@ -322,6 +322,52 @@ pub fn mla_g1250_qh16_wsnl() -> Function {
     mla_ws_with("mla_g1250_qh16_wsnl", false, 64 | 16384 | 65536, false)
 }
 
+/// `_ws` / `_ws4` with the page loaded as a 2D tensor tile (72 x 512 bytes)
+pub fn mla_g1250_qh16_ws2d() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2d", false, 64 | 256 | 16384 | 65536 | 131072 | 33554432, false))
+}
+
+pub fn mla_g1250_qh16_ws42d() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws42d", false, 64 | 256 | 4096 | 32768 | 65536 | 33554432, false))
+}
+
+/// timing aid: `_ws4` with stamps (not registered)
+pub fn mla_g1250_qh16_ws4std() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4std", false, 64 | 256 | 4096 | 32768 | 65536 | 512, false)
+}
+
+/// timing aid: `_wsstd` with the instruction prefetch (32 KB at entry + windows at the tail / merge / final)
+pub fn mla_g1250_qh16_wsstdp() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsstdp", false, 64 | 128 | 256 | 512 | 16384 | 65536 | 131072 | 262144, false)
+}
+
+/// the shipped MLA kernels with the instruction prefetch (MODE.SCALAR_PREFETCH_EN, read back, then windows inside the code)
+pub fn mla_g1250_qh16_wsP() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsP", false, 64 | 128 | 256 | 16384 | 65536 | 131072 | 262144, false))
+}
+
+pub fn mla_g1250_qh16_ws2P() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2P", true, 64 | 128 | 256 | 16384 | 65536, false))
+}
+
+pub fn mla_g1250_qh16_ws4P() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4P", false, 64 | 128 | 256 | 4096 | 32768 | 65536 | 67108864, false))
+}
+
+/// timing deletions of `_ws4` (not registered; wrong output): `d4a` returns after the first page arrived, `d4b` before the merge
+pub fn mla_g1250_qh16_d4a() -> Function {
+    mla_ws_with("mla_g1250_qh16_d4a", false, 64 | 256 | 4096 | 32768 | 65536 | 2048 | 268435456, false)
+}
+
+pub fn mla_g1250_qh16_d4b() -> Function {
+    mla_ws_with("mla_g1250_qh16_d4b", false, 64 | 256 | 4096 | 32768 | 65536 | 134217728, false)
+}
+
+/// `_ws4` ending without any cross-wave step: each wave stores its own 128 dims of the 16 heads straight from registers (bf16, 2-byte stores)
+pub fn mla_g1250_qh16_ws4D() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4D", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -450,6 +496,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.let_(Op::PtrLo(Opnd::Val(c)))
     };
     // instruction prefetch of the code that follows (n x 4 KB from here)
+    // (mid-kernel prefetch windows dropped: no measured gain, and the last one could reach past the end of .text: GV-1250-PREFETCH-BOUNDS)
+    #[allow(unused)]
     let pf_here = |b: &mut FnBuilder, n: u32| {
         if ipf {
             let pc = b.get_pc();
@@ -479,12 +527,15 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if ipf {
         // MODE.SCALAR_PREFETCH_EN first: the prefetches are NOPs without it (the vendor kernels set it the same way)
         b.enable_scalar_prefetch();
+        // read MODE back (as the vendor kernels do after the setreg): the prefetches below issue after the mode change has taken effect
+        let _mode = b.let_(Op::SysVal { op: amdgpu_dsl::SysValOp::GetReg, imm: 1 | (31 << 11) });
         // the first 16 KB (prologue, the page loop); later windows are fetched where their code starts. A prefetch past the end of the code
         // can fault (an unmapped page): only windows that are known to lie inside the code are requested
         let pc = b.get_pc();
         let nl = b.let_(Op::MovS { ty: DType::I32, a: Opnd::I32(31) });
         // 4 windows, or (bit 18) 8: 32 KB, for kernels whose code is known to be longer than that
-        let nwin = if branchless & 262144 != 0 { 8 } else { 4 };
+        // (bit 26: 3 windows, for the small kernels whose code is shorter than 16 KB)
+        let nwin = if branchless & 262144 != 0 { 8 } else if branchless & 67108864 != 0 { 3 } else { 4 };
         for k in 0..nwin {
             b.prefetch_inst(pc, 0x1000 * k, nl);
         }
@@ -593,7 +644,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.wait_vm(0);
     }
     // one page = one tensor op (4608 x 8 bytes), padded by the plan
-    let tile = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
+    // bit 25: the page as a 2D tile (72 rows of 512 bytes) instead of one 36 KB row (the same LDS stream, so the same padded layout)
+    let tile = if branchless & 33554432 != 0 {
+        TensorTile { data_size: 8, tensor_dim: [Opnd::I32(64), Opnd::I32(PAGE_BYTES / 512)], stride0: Opnd::I32(64), tile: [64, (PAGE_BYTES / 512) as u16], pad: layout.pad, wg_mask: 0 }
+    } else {
+        TensorTile { data_size: 8, tensor_dim: [Opnd::I32(PAGE_BYTES / 8), Opnd::I32(1)], stride0: Opnd::I32(PAGE_BYTES / 8), tile: [(PAGE_BYTES / 8) as u16, 1], pad: layout.pad, wg_mask: 0 }
+    };
     let (_, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0));
     let tile_q = TensorTile { data_size: 8, tensor_dim: [Opnd::I32(QUARTER / 8), Opnd::I32(1)], stride0: Opnd::I32(QUARTER / 8), tile: [(QUARTER / 8) as u16, 1], pad: layout.pad, wg_mask: 0 };
     let g1q = if quarters { b.tensor_desc_2d(&tile_q, Opnd::Val(pkv), Opnd::I32(0), Opnd::I32(0)).1 } else { g1 };
@@ -1009,6 +1065,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if exit_tdm {
         b.wait_tensor(0);
         keep_q(&mut b);
+        if branchless & 268435456 != 0 {
+            // (bit 28, timing deletion) return right after the first page has arrived
+            b.end_if();
+            return b.finish();
+        }
     }
     if !pipe && tail && !exit_tdm && lastsep {
         // the wave's full pages: all but the sequence's last page when this wave owns it
@@ -1098,13 +1159,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let odd = b.bind_i32(ev(nw) & 1);
         let is_odd = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
         b.begin_if(is_odd);
-        pf_here(&mut b, 2);
         b.wait_tensor(0);
         compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
-        if tstamp {
-            // timing experiment: the same page again (warm instruction cache; the output is garbage in this variant anyway)
-            compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
-        }
         b.end_if();
     } else if !pipe && !exit_tdm {
         let npairs = b.bind_i32((ev(nw) + 1) >> 1);
@@ -1193,7 +1249,21 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_tensor(0);
 
     stamp(&mut b);
-    pf_here(&mut b, 1);
+    if branchless & 134217728 != 0 {
+        // (bit 27, timing deletion) stop before the merge: one word of every O accumulator to R keeps the page compute alive
+        let mut acc: Option<ValueId> = None;
+        for &o in &ov {
+            let e = b.frag_slice(Opnd::Var(o), 0, 1);
+            acc = Some(match acc {
+                None => e,
+                Some(a) => b.add_i32(a, Opnd::Val(e)),
+            });
+        }
+        let ro = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 4);
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
+        b.store_global(pa, 0, acc.unwrap(), MemTy::B32, false);
+        return b.finish();
+    }
     let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     // (measured slower than the merge path below on e08 - 5.1 vs 4.3 us at 1 x 64 - and kept off: bit 15 set in `_ws4`)
     if dg == 4 && !split && !tstamp && branchless & 32768 == 0 {
@@ -1222,6 +1292,33 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
                 b.add_f32(t0_, t1_)
             })
             .collect();
+        if branchless & 536870912 != 0 {
+            // (bit 29) no LDS staging, no barrier: every lane stores its 64 bf16 values straight to R (row 8 g + r, dim db + 16 nt + m)
+            let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
+            let prs: Vec<ValueId> = (0..8i32)
+                .map(|r| {
+                    let o = b.bind_i32(ev(rbx) + r * 1024);
+                    b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
+                })
+                .collect();
+            for nt in 0..ntw {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(&mut b, e);
+                    let y = b.mul_f32(ef, inv_r[r as usize]);
+                    let h = b.cvt_pk_bf16_f32(y, y);
+                    b.store_global(prs[r as usize], 32 * nt as u32, h, MemTy::U16, false);
+                }
+            }
+            let lg = b.log2_f32(lh);
+            let s2 = b.add_f32(Opnd::Var(vm), lg);
+            let ln2 = b.c_f32(std::f32::consts::LN_2);
+            let lse = b.mul_f32(s2, ln2);
+            let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+            let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+            b.store_global(pl, 0, lse, MemTy::B32, false);
+            return b.finish();
+        }
         // the wave's staging area: [16 heads][128 dims] f32 at w * 8 KB of the merge buffer
         let sbase = b.bind_i32(ev(w) * 8192 + (ev(g) * 8 * 128 + ev(m)) * 4 + mo.base as i32);
         b.wait_lds(0);
@@ -1454,7 +1551,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_lds(0);
     b.barrier();
     stamp(&mut b);
-    pf_here(&mut b, 1);
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);

@@ -135,3 +135,12 @@ pub fn mla_g1250_qh16_w1p() -> Function {
     p.epilogue(&mut b, &ov, &lsum, &out, tid);
     b.finish()
 }
+
+
+/// Timing floor (not a correct kernel): the MLA ABI with an empty body (the launch, wave creation and exit of one 128-work-item work-group
+/// per sequence; the output is not written).
+pub fn mla_g1250_qh16_empty() -> Function {
+    let mut b = FnBuilder::new("mla_g1250_qh16_empty", 128);
+    W1Parts::declare_args(&mut b);
+    b.finish()
+}
