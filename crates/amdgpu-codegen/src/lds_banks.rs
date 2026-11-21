@@ -98,6 +98,8 @@ impl<'a> Ev<'a> {
     fn bin(&mut self, a: &Opnd, b: &Opnd, f: &dyn Fn(i64, i64) -> i64, additive: bool, scale_ok: bool) -> A {
         let (x, y) = (self.opnd(a), self.opnd(b));
         match (&x, &y) {
+            // any function of two wave-uniform values is wave-uniform (unknown when either is)
+            (A::K(p, pu), A::K(q, qu)) if (*pu || *qu) && p.iter().all(|v| *v == p[0]) && q.iter().all(|v| *v == q[0]) => A::K(vec![0; self.lanes], true),
             (A::K(p, pu), A::K(q, qu)) => {
                 if additive {
                     return A::K(p.iter().zip(q).map(|(a, b)| f(*a, *b)).collect(), *pu || *qu);
@@ -147,8 +149,13 @@ impl<'a> Ev<'a> {
             Op::AddI32(a, b) => self.bin(a, b, &|x, y| w(x + y), true, false),
             Op::MulI32(a, b) => self.bin(a, b, &|x, y| w(x * y), false, true),
             Op::ShlI32(a, b) => {
-                // only a lane-constant shift amount scales
+                // only a lane-constant shift amount scales; an unknown uniform amount of a uniform value stays uniform
                 let s = self.opnd(b);
+                if let (A::K(sv, true), A::K(av, _)) = (&s, &self.opnd(a)) {
+                    if sv.iter().all(|v| *v == sv[0]) && av.iter().all(|v| *v == av[0]) {
+                        return A::K(vec![0; self.lanes], true);
+                    }
+                }
                 match Self::lane_const(&s) {
                     Some(c) if (0..32).contains(&c) => match self.opnd(a) {
                         A::K(v, u) => A::K(v.iter().map(|x| w(x << c)).collect(), u),
