@@ -223,7 +223,7 @@ impl TdmF4Body {
         let kb = b.bind_i32(key0.clone().lshr(1));
         // the scales' K byte offset: K / 32 bytes per row, or (preshuffled) K / 128 tiles of 128 bytes = K bytes
         let ks = if self.scale_shuf { b.bind_i32(key0.clone()) } else { b.bind_i32(key0.clone().lshr(5)) };
-        let kb = if self.pre3 { b.bind_i32(kb.clone() << 4i32) } else { kb };
+        let kb = if self.pre3 { b.let_(Op::ShlI32(Opnd::Val(kb), Opnd::I32(4))) } else { kb };
         let oa = b.add_i32(self.a_org, kb);
         let ob = b.add_i32(self.b_org, kb);
         let osa = b.add_i32(self.sa_org, ks);
