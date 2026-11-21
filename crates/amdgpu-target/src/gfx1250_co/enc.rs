@@ -408,13 +408,18 @@ pub fn encode_line(line: &str, pc: usize, label: &dyn Fn(&str) -> Option<usize>)
         v.extend_from_slice(&d32(parse_num(imm).ok_or_else(|| format!("`{t}`: value"))? as u32));
         return Ok(v);
     }
-    // s_getreg_b32 sdst, hwreg(<numeric id>, offset, size) (SOPK); the named forms take the generic path
+    // s_getreg_b32 sdst, hwreg(<id or MODE / SCHED_MODE name>, offset, size) (SOPK); other names take the generic path
     if let Some(rest) = t.strip_prefix("s_getreg_b32") {
         if let Some((d, h)) = rest.trim().split_once(',') {
             let h = h.trim();
             if let Some(inner) = h.strip_prefix("hwreg(").and_then(|x| x.strip_suffix(')')) {
                 let f: Vec<&str> = inner.split(',').map(|x| x.trim()).collect();
-                if let Some(id) = f.first().and_then(|x| x.parse::<u32>().ok()) {
+                let named = |x: &str| match x {
+                    "HW_REG_WAVE_MODE" => Some(1u32),
+                    "HW_REG_WAVE_SCHED_MODE" => Some(26u32),
+                    _ => x.parse::<u32>().ok(),
+                };
+                if let Some(id) = f.first().and_then(|x| named(x)) {
                     let off = f.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
                     let size = f.get(2).and_then(|x| x.parse::<u32>().ok()).unwrap_or(32);
                     if id > 63 || off > 31 || size == 0 || size > 32 {

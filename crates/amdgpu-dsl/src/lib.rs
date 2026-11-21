@@ -3960,6 +3960,13 @@ impl FnBuilder {
 
     /// PROTOTYPE launch fact (trusted, listed): the tile body may end with tensor STORES outstanding (the next tile's epilogue waits for them before it rewrites the staging region, and the
     /// kernel drains after the loop); the protocol's quiescence check does not require a drain at the end of the body.
+    /// The persistent tile loop in its CARRY form (with `persistent_tile_loop`): the body issues the next tile's first stage (a top-level `if`
+    /// late in the body) and the first tile's under its prologue `if` (the first top-level `if` with tile markers); gpu_protocol checks that
+    /// the two stages produce the same slots (versions shifted by a constant), that nothing of the body precedes the prologue, that the
+    /// carried stage's bytes are untouched after its issue, and that the rest of the body ends quiescent (GV-TILE-CARRY).
+    pub fn persistent_tile_carry(&mut self) {
+        self.f.kd.push(("g5:persistent_tile_carry".to_string(), 1));
+    }
     pub fn persistent_tile_overlap_stores(&mut self) {
         self.f.kd.push(("g5:persistent_tile_overlap_stores".to_string(), 1));
     }

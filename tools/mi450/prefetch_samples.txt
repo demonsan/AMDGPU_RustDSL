@@ -1,0 +1,4 @@
+s_get_pc_i64 s[36:37]
+s_prefetch_inst s[36:37], 0x1000, s38, 0
+s_prefetch_inst s[36:37], 0x0, null, 0
+s_getreg_b32 s36, hwreg(HW_REG_WAVE_MODE, 0, 32)
