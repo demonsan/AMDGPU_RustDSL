@@ -38,6 +38,9 @@ pub(crate) fn slots(mn: &str, n_ops: usize) -> Option<Vec<Option<usize>>> {
     let mn = mn.strip_suffix("_dpp").unwrap_or(mn);
     let base = mn.strip_suffix("_e32").or_else(|| mn.strip_suffix("_e64")).unwrap_or(mn);
     let fmt = OPS.iter().find(|(m, _, _)| *m == base).map(|x| x.1)?;
+    if n_ops == 0 {
+        return Some(Vec::new());
+    }
     let mut v = vec![None; n_ops];
     match fmt {
         "VOPC" => {
