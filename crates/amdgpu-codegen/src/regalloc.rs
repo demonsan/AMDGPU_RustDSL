@@ -102,6 +102,8 @@ enum Policy {
 }
 
 thread_local! {
+    /// the plain allocation computed inside the `ralru` one (its register count bounds the rotation)
+    static LRU_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// gfx1250 retry: wide tuples (accumulators) first above v255, so the low window stays free for the operands that must be in v0..v255
     static WIDE_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ACC_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -587,7 +589,28 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
     // `ralru` / AMDC_RA_LRU (mode 2): a load destination takes the free register range freed LONGEST ago instead of the lowest one, so a
     // load rarely overwrites a register a matrix op issued just before still reads (each such write-after-read is a `s_wait_alu` that drains
     // the matrix queue in mode 2). Per VGPR: the interval end at which it was last freed (0: never used).
-    let lru = (m.ra_lru || std::env::var("AMDC_RA_LRU").is_ok()) && std::env::var("AMDC_NO_RA_LRU").is_err();
+    let lru = (m.ra_lru || std::env::var("AMDC_RA_LRU").is_ok()) && std::env::var("AMDC_NO_RA_LRU").is_err() && !LRU_OFF.with(|c| c.get());
+    // the registers the rotation may use: no more than keeps the kernel's occupancy - the waves per SIMD its LDS allows (320 KiB per CU on
+    // gfx1250) and those of the plain allocation, whichever is fewer - so the hint never costs a resident wave
+    let lru_cap = if lru {
+        let base = LRU_OFF.with(|c| c.set(true));
+        let _ = base;
+        let plain = allocate_policy_once(m, policy);
+        LRU_OFF.with(|c| c.set(false));
+        match plain {
+            Ok(pa) => {
+                let waves_wg = (m.workgroup_size as usize).div_ceil(32).max(1);
+                let wgs_lds = if m.lds_bytes > 0 { (320 * 1024 / m.lds_bytes as usize).max(1) } else { 64 };
+                let occ_lds = (wgs_lds * waves_wg).div_ceil(4).max(1);
+                let occ_vgpr = (1024 / (pa.max_v as usize).max(1)).max(1);
+                let occ = occ_lds.min(occ_vgpr).max(1);
+                ((1024 / occ) / 8 * 8).max(pa.max_v as usize).min(used_v.len())
+            }
+            Err(_) => used_v.len(),
+        }
+    } else {
+        used_v.len()
+    };
     let load_defs: HashSet<VReg> = if lru {
         m.blocks
             .iter()
@@ -634,7 +657,7 @@ fn allocate_policy_once(m: &MFunction, policy: Policy) -> Result<Alloc, String> 
             best.map(|b| b.0)
         };
         let slot = if lru && load_defs.contains(&r) && !low_only.contains(&r) && !plan.active && !(wide_high && acc.contains(&r)) {
-            lru_pick(&used_v, c, 0)
+            lru_pick(&used_v[..lru_cap], c, 0).or_else(|| find_slot(&used_v, c, singles_from_top))
         } else if low_only.contains(&r) {
             find_slot(&used_v[..256.min(used_v.len())], c, false)
         } else if wide_high && acc.contains(&r) {
