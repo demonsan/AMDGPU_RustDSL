@@ -38,7 +38,7 @@ echo "$WHAT | $APP" > "$P/request.txt"
 # the whole node, exclusive; the container in the foreground (never -d); a hard kill inside AND outside
 gpu-lock timeout -s KILL $((PASS_TIMEOUT + 60)) docker run --rm --network none \
   --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" --security-opt seccomp=unconfined \
-  -e HIP_VISIBLE_DEVICES="$GPU" -e PROBE_WATCHDOG_S="${PROBE_WATCHDOG_S:-20}" -e CHECK_B -e CHECK_ROWS -e CLUSTER -e STAMPS -e PERSIST \
+  -e HIP_VISIBLE_DEVICES="$GPU" -e PROBE_WATCHDOG_S="${PROBE_WATCHDOG_S:-20}" -e CHECK_B -e CHECK_ROWS -e CLUSTER -e STAMPS -e PERSIST -e BPRESHUF -e OUT_BF16 -e SCALE_SHUF \
   -v /data/blyu:/data/blyu -w "$P" --entrypoint /bin/bash "$IMAGE" \
   -c "ulimit -f 2097152; timeout -s KILL $PASS_TIMEOUT $PROF $APP; r=\$?; chown -R $(id -u):$(id -g) $P; rm -rf $P/.rocprofv3; exit \$r" 2>&1 | grep -vE '^\s*$' | tee "$P/log.txt" | tail -n 40
 rc=${PIPESTATUS[0]}

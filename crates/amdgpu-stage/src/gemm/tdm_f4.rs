@@ -160,6 +160,9 @@ pub struct TdmF4Body {
     /// A and B pre-shuffled in 16 x 16-byte tiles (host `BPRESHUF=3`, the vendor's ABpreShuffle layout): memory [row group g][K chunk c][row r][16 bytes], a stage slice = ONE contiguous run per group
     /// (4096 bytes for 512 K): long tensor rows, and the fragment loads (lane m reads the 16 bytes of row m of a chunk) are bank-conflict free with NO row padding
     pub pre3: bool,
+    /// cache-policy `th` of the operand loads and of the scale loads (0 = default; the vendor kernel uses 2 and 5 on its two kinds of loads)
+    pub th_data: u8,
+    pub th_scale: u8,
     pub dov_stores: i32,
     pub first_win: Option<(ValueId, ValueId)>,
     /// the overlapped epilogue (see `Ovl`)
@@ -237,7 +240,10 @@ impl TdmF4Body {
         let g0b = tdm_group0(b, self.pb, ob, lb);
         let g0sa = tdm_group0(b, self.psa, osa, lsa);
         let g0sb = tdm_group0(b, self.psb, osb, lsb);
-        let cp = amdgpu_dsl::TdmCpol::default();
+        let mut cp = amdgpu_dsl::TdmCpol::default();
+        cp.th = self.th_data;
+        let mut cps = amdgpu_dsl::TdmCpol::default();
+        cps.th = self.th_scale;
         let (g1a, g1b, g1sa, g1sb) = (self.g1a, self.g1b, self.g1sa, self.g1sb);
         if do_a {
             ra.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0a), Opnd::Val(g1a), None, cp));
@@ -246,10 +252,10 @@ impl TdmF4Body {
             rb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0b), Opnd::Val(g1b), None, cp));
         }
         if do_a {
-            rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cp));
+            rsa.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sa), Opnd::Val(g1sa), None, cps));
         }
         if do_b {
-            rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cp));
+            rsb.write(b, |b| b.tensor_load_to_lds(Opnd::Val(g0sb), Opnd::Val(g1sb), None, cps));
         }
         if let Some(t0) = stamp_t0 {
             let t1 = cyc(b);
