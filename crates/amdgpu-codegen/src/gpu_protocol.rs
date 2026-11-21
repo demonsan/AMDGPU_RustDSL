@@ -80,6 +80,8 @@ struct Ev {
     /// the event's LDS writes include atomics (`ds_add_*`: several waves may accumulate into the same words in one phase) / plain stores
     atomic: bool,
     plain: bool,
+    /// the carry form of the persistent tile loop: this produce event is the NEXT tile's first stage (live until the body ends)
+    carried: bool,
 }
 
 struct Trace {
@@ -408,6 +410,12 @@ impl<'a> Sim<'a> {
         let in_span = |e: &Ev, s: (usize, usize)| e.stmt > s.0 && e.stmt < s.1;
         let pro: Vec<&Ev> = evs.iter().filter(|e| e.produce && in_span(e, p)).collect();
         let car: Vec<&Ev> = evs.iter().filter(|e| e.produce && in_span(e, c)).collect();
+        // the carried events stay live to the end of the body (checked against every later access of their bytes in check_pair)
+        for e in self.evs[first_ev..].iter_mut() {
+            if e.produce && e.stmt > c.0 && e.stmt < c.1 {
+                e.carried = true;
+            }
+        }
         if pro.is_empty() {
             bad(self, format!("the prologue `if` (stmt {}) issues no stage in the simulated first iteration", p.0));
             return;
@@ -516,7 +524,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 0, global, coherent: true, outer: self.outer };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, tensor: false, asyncld: false, atomic: false, plain: false, carried: false, n_acc: 0, global, coherent: true, outer: self.outer };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open);
@@ -1816,6 +1824,32 @@ fn check_pair(f: &Function, traces: &[&Trace], n: usize, diags: &mut Vec<(&'stat
             }
         }
     }
+    // the carry form: a carried stage (the next tile's first) must survive to the end of the body: no later access of its bytes by any wave
+    // (this tile's own reads / writes of the slot or of a tile reusing its storage), whatever the barriers - the next tile reads it
+    for c in infos.iter().filter(|x| x.ev.carried) {
+        let rc = range(&c.ev);
+        for x in infos.iter() {
+            if std::ptr::eq(x, c) || x.ev.global || x.ev.carried {
+                continue;
+            }
+            let same = x.ev.tile == c.ev.tile && x.ev.slot == c.ev.slot;
+            let rx = range(&x.ev);
+            let alias = x.ev.tile != c.ev.tile && reuse(x.ev.tile, c.ev.tile) && rx.0 < rc.1 && rc.0 < rx.1;
+            if !(same || alias) {
+                continue;
+            }
+            let later = if x.role == c.role { x.ev.start > c.ev.start } else { x.ev.ord >= c.ev.ord };
+            if later {
+                let msg = format!(
+                    "stmt {} / stmt {}: the {} of `{}`[{}] (role {}, phase {}) touches the bytes of the carried stage `{}`[{}] (version {}, stmt {}, issued at phase {}) after its issue: the next tile reads that stage, so nothing of this tile may read or overwrite it",
+                    x.ev.stmt, c.ev.stmt, if x.ev.produce { "write" } else { "read" }, name(x.ev.tile), x.ev.slot, x.role, x.ev.ord, name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.stmt, c.ev.ord
+                );
+                if !diags.iter().any(|d| d.3 == msg) {
+                    diags.push(("GV-TILE-CARRY", Severity::Error, x.ev.stmt, msg));
+                }
+            }
+        }
+    }
     let pp_msg = |a: &Info, b: &Info, aw: (u32, u32), bw: (u32, u32)| format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1);
     if reference {
         for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
@@ -2301,7 +2335,7 @@ mod plan_ring_tests {
     use crate::sched::waits::RingModel;
 
     fn ev(produce: bool, dma: bool, stmt: usize, slot: i64) -> Ev {
-        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, atomic: false, plain: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
+        Ev { produce, tile: 0, slot, ver: 0, ord: 3, stmt, start: 0, last: 0, dma, ds: !dma, tensor: false, asyncld: false, atomic: false, plain: false, carried: false, n_acc: 1, global: false, coherent: true, outer: Default::default() }
     }
 
     fn model(slots: u32, dma_iter: i64, read_iter: i64) -> RingModel {
