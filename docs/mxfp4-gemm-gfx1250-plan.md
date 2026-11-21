@@ -191,6 +191,16 @@ outside any declared tile, and the next tile's first stage sits under a wave-uni
 declared tile aliasing one ring SLOT (A and B slot regions, two bands deep, drained by `wait_tensor(1)`), the stage under the `if` must be seen by the protocol, and the persistent tile loop must check that the end-of-body
 state (stage 0 of the next tile in flight in slot 0) equals the state after the pre-loop prologue; with backend.
 
+### The persistent cluster with the carried first stage, proven and promoted (e08, 2026-11-21)
+
+With backend's g54 protocol work (GV-TILE-UNTAGGED-OVERLAP, GV-TILE-CARRY, `tile_over_slots`) the carry kernel is proven rather than accepted vacuously: every GEMM epilogue's staging is a declared region (`EPIW`, private slices over the dead
+rings; `EPIA` / `EPIB`, `LdsPlan::private_over_slots` over the A / B regions of ring slot 1 only) with produce / consume markers; the pipeline's carry mode runs pairs of windows in the static slots 0 / 1 and peels the steady and the last
+window (the carried stage goes to the static slot 0, the epilogue stages in slot 1; K is declared as 2 ks KQ x 128, KQ >= 2, so the host refuses other K); the verifier's role descent checks the prologue / carry `if` of each role arm
+(GV-TILE-CARRY) and the negative case (epilogue regions over slot 0) is rejected with GV-TILE-ALIAS-RACE on both the lone and the cluster kernel. Paired alternating, 2 reps, us (default D / multicast M / **PCC**):
+4096^3 22.0 / 17.3 / **16.7 - 17.3**; 8192^2 x 2048 41.6 - 43.3 / 43.8 - 44.1 / **39.5 - 39.9**; 8192^2 x 4096 67.3 - 68.9 / 66.7 - 68.3 / **63.4 - 64.1**; 8192^3 108.8 - 112.7 / 111.2 - 111.4 / **106.6 - 107.6** (10.2 - 10.3 PF/s);
+16384 x 8192 x 4096 135.0 - 136.8 / 129.4 - 131.7 / **124.6 - 126.2**. Without the cluster the carry loses (9.1 - 9.2 PF/s at 8192^3: the clock sag): the multicast's lower L2 traffic is what lets the saved cycles show up in the time.
+Registered as `gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_c4x4_lock_persist_carry`; regression and A/B script `tools/mi450/f4pcc.sh`.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
@@ -207,7 +217,8 @@ compute, so at most 960 cycles = 3.0 % of the 31.8 k-cycle tile (about 1.5 - 2 %
 | 256 (e.g. 4096 x 4096), grid divisible by 4 x 4 | <= 4096 and 8192 | `..._ks4_s2_epit_roles_c4x4_lock` | 4096^3 7.9 (default 6.3 - 7.1); K = 2048 / 3072 6.0 / 7.2 (default 5.5 / 6.9); K = 8192 9.5 (default 9.1) |
 | 256 | 5120 - 6144, other K | `..._ks4_s2_epit_roles` | 7.5 (default) |
 | >= 1,024 (8192 x 8192 and larger) | any multiple of 512 | `..._ks4_s2_epit_roles` | 9.9 - 10.1 (8192^3, K = 16384) |
-| 512 (8192 x 4096), 1,024 (8192^2) with K = 4096, 2048 | multiple of 1024 | **candidate**: the persistent 4 x 4 cluster with the carried first stage (below; experimental, `exp_` prefix, tile protocol not yet extended) | 8192^2 x 4096 8.4 - 8.65 (default 7.9 - 8.0, multicast 8.3); 16384 x 8192 x 4096 8.63 (8.1 - 8.25 / 8.0) |
+| **any output divisible by 4 x 4 tiles (>= 256 tiles; 4096^2 and larger)** | multiple of 1024, >= 2048 | **`..._ks4_s2_epit_roles_c4x4_lock_persist_carry`** (persistent 4 x 4 cluster, carried first stage, slot-staged epilogue; fully proven: GV-TILE-CARRY, negative case rejected; host PERSIST defaults to 256) | 4096^3 7.9 - 8.25 (multicast 7.95, default 6.25); 8192^2 x 2048 6.9 (6.3 / 6.5); 8192^2 x 4096 8.6 - 8.7 (8.05 - 8.25 / 8.0 - 8.2); 8192^3 **10.2 - 10.3** (9.9 / 9.8 - 10.1); 16384 x 8192 x 4096 8.7 - 8.8 (8.35 - 8.5 / 8.0 - 8.15) |
+| outputs NOT divisible by 4 x 4 tiles, or K a multiple of 512 but not of 1024 | | the rows below | |
 
 Clock-aware update (2026-11-21, same GPU, paired alternating, 2 reps; us of the default D / multicast M / persistent cluster PC / persistent cluster + carry PCC): 4096^3 21.95 / **17.36** / 17.6 / **16.9 - 17.1**;
 8192 x 8192 x 4096 68.4 / 66.4 / 66.5 / **64.6**; 16384 x 8192 x 4096 134.5 / 136.8 / 131.8 / **127.2**; 8192^3 112.1 / 112.9 / 112.3 / **108.3**; 8192 x 8192 x 2048 42.1 / 44.3 / 43.4 / **40.4**.
