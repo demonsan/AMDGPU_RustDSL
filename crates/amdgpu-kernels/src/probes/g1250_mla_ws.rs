@@ -354,6 +354,15 @@ pub fn mla_g1250_qh16_ws4P() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws4P", false, 64 | 128 | 256 | 4096 | 32768 | 65536 | 67108864, false))
 }
 
+/// timing deletions of `_ws4` (not registered; wrong output): `d4a` returns after the first page arrived, `d4b` before the merge
+pub fn mla_g1250_qh16_d4a() -> Function {
+    mla_ws_with("mla_g1250_qh16_d4a", false, 64 | 256 | 4096 | 32768 | 65536 | 2048 | 268435456, false)
+}
+
+pub fn mla_g1250_qh16_d4b() -> Function {
+    mla_ws_with("mla_g1250_qh16_d4b", false, 64 | 256 | 4096 | 32768 | 65536 | 134217728, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -1049,6 +1058,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if exit_tdm {
         b.wait_tensor(0);
         keep_q(&mut b);
+        if branchless & 268435456 != 0 {
+            // (bit 28, timing deletion) return right after the first page has arrived
+            b.end_if();
+            return b.finish();
+        }
     }
     if !pipe && tail && !exit_tdm && lastsep {
         // the wave's full pages: all but the sequence's last page when this wave owns it
@@ -1230,6 +1244,21 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
 
     stamp(&mut b);
     pf_here(&mut b, 1);
+    if branchless & 134217728 != 0 {
+        // (bit 27, timing deletion) stop before the merge: one word of every O accumulator to R keeps the page compute alive
+        let mut acc: Option<ValueId> = None;
+        for &o in &ov {
+            let e = b.frag_slice(Opnd::Var(o), 0, 1);
+            acc = Some(match acc {
+                None => e,
+                Some(a) => b.add_i32(a, Opnd::Val(e)),
+            });
+        }
+        let ro = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 4);
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
+        b.store_global(pa, 0, acc.unwrap(), MemTy::B32, false);
+        return b.finish();
+    }
     let t0 = SlotIdx::new(Opnd::I32(0), Opnd::I32(0));
     // (measured slower than the merge path below on e08 - 5.1 vs 4.3 us at 1 x 64 - and kept off: bit 15 set in `_ws4`)
     if dg == 4 && !split && !tstamp && branchless & 32768 == 0 {
