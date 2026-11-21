@@ -1,4 +1,4 @@
-﻿//! The kernel registry: every kernel of the repository by name (`amdc emit <name>`, the gates, the tests), and the list `amdc list` prints.
+//! The kernel registry: every kernel of the repository by name (`amdc emit <name>`, the gates, the tests), and the list `amdc list` prints.
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
@@ -25,11 +25,21 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         if ["persist", "persist_stamps", "persist_rot", "persist_tst", "persist_carry", "persist_carry_tst"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
         }
-        if ["c4x4_lock_persist", "c4x4_lock_persist_carry", "c4x4_lock_persist_tst", "c4x4_lock_persist_carry_tst", "c4x4_lock_persist_carry_split", "c4x4_lock_split", "c4x4_lock_split_stamps"].contains(&rest) {
+        if ["c4x4_lock_persist", "c4x4_lock_persist_carry", "c4x4_lock_persist_tst", "c4x4_lock_persist_carry_tst", "c4x4_lock_persist_carry_split", "c4x4_lock_split", "c4x4_lock_split_stamps", "c4x4_lock_nowin_stamps", "c4x4_lock_hoist_stamps", "c4x4_lock_ahead2_stamps", "c4x4_lock_persist_carry_ahead2"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name, 4, 4));
         }
-        if ["hoist", "hoist_stamps"].contains(&rest) {
+        if ["hoist", "hoist_stamps", "nowin_stamps"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
+        }
+    }
+    if let Some(rest) = name.strip_prefix("exp_gemm_g1250_tdm_stage_f4_256x256_ks2_c4x4_lock_") {
+        if rest == "stamps" || rest == "relax_stamps" || rest == "defer_stamps" {
+            return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks2_cluster_stamps(name, rest.starts_with("relax")));
+        }
+    }
+    if let Some(rest) = name.strip_prefix("exp_gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles_relax_") {
+        if ["nobar", "nobar_stamps"].contains(&rest) {
+            return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks2_epit_stamps(name, true, true));
         }
     }
     if let Some(m) = name.strip_prefix("mla_g1250_qh16_roles_") {
