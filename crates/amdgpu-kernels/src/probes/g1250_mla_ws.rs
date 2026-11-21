@@ -363,6 +363,11 @@ pub fn mla_g1250_qh16_d4b() -> Function {
     mla_ws_with("mla_g1250_qh16_d4b", false, 64 | 256 | 4096 | 32768 | 65536 | 134217728, false)
 }
 
+/// `_ws4` ending without any cross-wave step: each wave stores its own 128 dims of the 16 heads straight from registers (bf16, 2-byte stores)
+pub fn mla_g1250_qh16_ws4D() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4D", false, 64 | 256 | 4096 | 65536 | 536870912, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -491,6 +496,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         b.let_(Op::PtrLo(Opnd::Val(c)))
     };
     // instruction prefetch of the code that follows (n x 4 KB from here)
+    // (mid-kernel prefetch windows dropped: no measured gain, and the last one could reach past the end of .text: GV-1250-PREFETCH-BOUNDS)
+    #[allow(unused)]
     let pf_here = |b: &mut FnBuilder, n: u32| {
         if ipf {
             let pc = b.get_pc();
@@ -1152,7 +1159,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let odd = b.bind_i32(ev(nw) & 1);
         let is_odd = b.cmp(CmpPred::Ne, CmpTy::I32, odd, Opnd::I32(0));
         b.begin_if(is_odd);
-        pf_here(&mut b, 2);
         b.wait_tensor(0);
         compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
         b.end_if();
@@ -1243,7 +1249,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_tensor(0);
 
     stamp(&mut b);
-    pf_here(&mut b, 1);
     if branchless & 134217728 != 0 {
         // (bit 27, timing deletion) stop before the merge: one word of every O accumulator to R keeps the page compute alive
         let mut acc: Option<ValueId> = None;
@@ -1287,6 +1292,33 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
                 b.add_f32(t0_, t1_)
             })
             .collect();
+        if branchless & 536870912 != 0 {
+            // (bit 29) no LDS staging, no barrier: every lane stores its 64 bf16 values straight to R (row 8 g + r, dim db + 16 nt + m)
+            let rbx = b.bind_i32((ev(bidx) * 16 + ev(g) * 8) * 1024 + (ev(db) + ev(m)) * 2);
+            let prs: Vec<ValueId> = (0..8i32)
+                .map(|r| {
+                    let o = b.bind_i32(ev(rbx) + r * 1024);
+                    b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(o) })
+                })
+                .collect();
+            for nt in 0..ntw {
+                for r in 0..8u8 {
+                    let e = b.frag_slice(Opnd::Var(ov[nt]), r, 1);
+                    let ef = f32_of(&mut b, e);
+                    let y = b.mul_f32(ef, inv_r[r as usize]);
+                    let h = b.cvt_pk_bf16_f32(y, y);
+                    b.store_global(prs[r as usize], 32 * nt as u32, h, MemTy::U16, false);
+                }
+            }
+            let lg = b.log2_f32(lh);
+            let s2 = b.add_f32(Opnd::Var(vm), lg);
+            let ln2 = b.c_f32(std::f32::consts::LN_2);
+            let lse = b.mul_f32(s2, ln2);
+            let lo = b.bind_i32((ev(bidx) * 16 + ev(m)) * 4);
+            let pl = b.let_(Op::PtrAdd { base: Opnd::Val(plse), byte_off: Opnd::Val(lo) });
+            b.store_global(pl, 0, lse, MemTy::B32, false);
+            return b.finish();
+        }
         // the wave's staging area: [16 heads][128 dims] f32 at w * 8 KB of the merge buffer
         let sbase = b.bind_i32(ev(w) * 8192 + (ev(g) * 8 * 128 + ev(m)) * 4 + mo.base as i32);
         b.wait_lds(0);
@@ -1519,7 +1551,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     b.wait_lds(0);
     b.barrier();
     stamp(&mut b);
-    pf_here(&mut b, 1);
     // thread t: head h = t / 8, dims 64 (t % 8) .. + 64
     let h = b.bind_i32(ev(tid) >> 3);
     let d0 = b.bind_i32((ev(tid) & 7) << 6);
