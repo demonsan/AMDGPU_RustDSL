@@ -513,6 +513,11 @@ pub fn mla_g1250_qh16_ws2E() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2E", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35) | 1048576, false))
 }
 
+/// the shipped forms with the rotated-alpha packed rescale (bit 36)
+pub fn mla_g1250_qh16_wsR() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsR", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 36), false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -1079,10 +1084,22 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                 b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(g0c), a: Opnd::Val(a0), b: Opnd::Val(a1) })
             })
             .collect();
+        if branchless & (1u64 << 36) != 0 {
+            // (bit 36) the 8 row alphas as one fragment rotated by 2 (row r at element r + 2: another VGPR RAM than O's row r, which
+            // sits at RAM r of an 8-aligned accumulator), O rows (2 k, 2 k + 1) scaled in place by one v_pk_mul_f32
+            let alf = b.frag_cat(&(0..8usize).map(|i| Opnd::Val(al[(i + 6) % 8])).collect::<Vec<_>>());
+            for nt in 0..ntw {
+                for k in 0..4u8 {
+                    let pair = b.frag_slice(Opnd::Val(alf), (2 * k + 2) % 8, 2);
+                    b.var_pk_mul(ov[nt], 2 * k, pair);
+                }
+            }
+        } else {
         for nt in 0..ntw {
             for r in 0..8u8 {
                 b.var_scale_lane(ov[nt], r, al[r as usize]);
             }
+        }
         }
         if !bl_rescale {
             b.end_if();
