@@ -534,6 +534,10 @@ pub fn mla_g1250_qh16_d2a() -> Function {
     with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2a", true, WS2_BITS | 2048 | 268435456, false)))
 }
 
+pub fn mla_g1250_qh16_d2c() -> Function {
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2c", true, WS2_BITS | 134217728 | (1u64 << 37), false)))
+}
+
 pub fn mla_g1250_qh16_d2b() -> Function {
     with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_d2b", true, WS2_BITS | 134217728, false)))
 }
@@ -1467,6 +1471,17 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                 None => e,
                 Some(a) => b.add_i32(a, Opnd::Val(e)),
             });
+        }
+        if branchless & (1u64 << 37) != 0 {
+            // (bit 37) the output's full size (16 KB per sequence: 8 x 16 B per thread), the merge left out
+            let ro = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 16);
+            let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
+            let v = b.frag_cat(&[Opnd::Val(acc.unwrap()); 4]);
+            for k in 0..8u32 {
+                let pk = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::I32(2048 * k as i32) });
+                b.store_global(pk, 0, v, MemTy::B128, false);
+            }
+            return b.finish();
         }
         let ro = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 4);
         let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(ro) });
