@@ -504,6 +504,15 @@ pub fn mla_g1250_qh16_ws2K8() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2K8", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35), false))
 }
 
+/// the shipped `_ws4` / `_ws2` with the first page's tensor load issued right after the sequence bounds (bit 20)
+pub fn mla_g1250_qh16_ws4E() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4E", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35) | 1048576, false))
+}
+
+pub fn mla_g1250_qh16_ws2E() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2E", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35) | 1048576, false))
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
