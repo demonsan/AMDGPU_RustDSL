@@ -106,6 +106,13 @@ fn f32_of(b: &mut FnBuilder, v: ValueId) -> ValueId {
 
 /// VOPD dual issue for the shipped kernels (lowering token `vopd`; measured on e08 2026-11-20: `_ws` -1.3 .. -4.9 % per shape, every shape
 /// MLA_OK)
+/// expert scheduling mode 2 (the `mode2` lowering token): the scheduler owns the VALU dependency waits (s_wait_alu), checked on the final
+/// text by G5 (GV-1250-MODE2-WAIT); e08: `_ws` -1 .. -3 %, `_ws2` -1 %, `_ws4` -0.5 %, bit-identical outputs
+fn with_mode2(mut f: Function) -> Function {
+    f.lower_opts.push("mode2".into());
+    f
+}
+
 fn with_vopd(mut f: Function) -> Function {
     f.lower_opts.push("vopd".to_string());
     f
@@ -113,7 +120,7 @@ fn with_vopd(mut f: Function) -> Function {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32), false))
+    with_mode2(with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32), false)))
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -304,13 +311,13 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 pub fn mla_g1250_qh16_ws4() -> Function {
     // (2026-11-21: the direct bf16-store ending of `_ws4D`: no cross-wave step; -5 .. -8 % at 1 .. 4 pages on e08)
     // (2026-11-21: direct stores packed to 8 bytes by an in-quad transpose: bits 34, 35)
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35) | 1048576, false))
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35) | 1048576, false)))
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
     // (2026-11-21: the pairwise merge with 8-byte packed direct stores: bits 33 .. 35; -1 % vs the merge + final pass)
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35) | 1048576, false))
+    with_mode2(with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35) | 1048576, false)))
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
