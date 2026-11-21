@@ -739,8 +739,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // the host contract (docs/gfx1250-hang-rules.md, tensor bounds): the grid covers the output exactly (N = grid x * BN, M = grid y * BM), K a multiple of the slot's K; the buffers hold A / B
     // (fp4: K / 2 bytes per row), their scales (K / 32 bytes per row) and C (f32, M x N). Every tensor tile and every store is proven inside these extents.
     // K = 128 * K128 (K128 a multiple of ks, at least two K slots so the prologue's second stage is a real tile): the extents below are polynomials, no divisions
+    // carry: K = 2 ks KQ x 128 (an even number of K slots: the carried stage lands in the static slot 0, the epilogue stages in the consumed slot 1)
+    let k128e: Ext = if ring.carry {
+        b.sym_range("KQ", 1, 1 << 12);
+        Ext::sym("KQ") * Ext::c(2 * sh.ks as i64)
+    } else {
+        Ext::sym("K128")
+    };
     b.sym_range("K128", (ring.slots as i64 - 1) * sh.ks as i64, 1 << 13);   // at least `slots - 1` K slots: the prologue stages tiles 0 .. slots - 2 as real tiles
-    b.ka_is(40, Ext::sym("K128") * Ext::c(128));
+    b.ka_is(40, k128e.clone() * Ext::c(128));
     // (persistent: the tile counts are symbols TX / TY, N = TX * BN, kernarg tiles_y = TY; the grid is any number of workgroups)
     let (m_rows, n_cols) = if persistent && sh.cx * sh.cy > 1 {
         b.sym_range("TX", 1, 1 << 12);
@@ -766,15 +773,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         // row pitch of A / B = K / 2 + PAD bytes (the host contract: PAD a multiple of 16, at most 16 KiB)
         b.arg("lda", DType::I32, 72, 4);
         b.sym_range("PAD", 0, 1 << 14);
-        b.ka_is(72, Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD"));
-        b.arg_tensor("a", m_rows.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
-        b.arg_tensor("b", n_cols.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+        b.ka_is(72, k128e.clone() * Ext::c(64) + Ext::sym("PAD"));
+        b.arg_tensor("a", m_rows.clone() * (k128e.clone() * Ext::c(64) + Ext::sym("PAD")));
+        b.arg_tensor("b", n_cols.clone() * (k128e.clone() * Ext::c(64) + Ext::sym("PAD")));
     } else {
-        b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
-        b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+        b.arg_tensor("a", m_rows.clone() * k128e.clone() * Ext::c(64));
+        b.arg_tensor("b", n_cols.clone() * k128e.clone() * Ext::c(64));
     }
-    b.arg_tensor("sa", m_rows.clone() * Ext::sym("K128") * Ext::c(4));
-    b.arg_tensor("sb", n_cols.clone() * Ext::sym("K128") * Ext::c(4));
+    b.arg_tensor("sa", m_rows.clone() * k128e.clone() * Ext::c(4));
+    b.arg_tensor("sb", n_cols.clone() * k128e.clone() * Ext::c(4));
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
     let mut lds = LdsPlan::new();
     let (ra, rb, rsa, rsb) = if grouped {

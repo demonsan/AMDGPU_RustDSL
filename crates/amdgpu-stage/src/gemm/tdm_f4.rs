@@ -235,12 +235,14 @@ impl PipeBody for TdmF4Body {
         let n = self.next_orgs.expect("carry: the next tile's origins");
         let saved = (self.a_org, self.b_org, self.sa_org, self.sb_org);
         (self.a_org, self.b_org, self.sa_org, self.sb_org) = (n[0], n[1], n[2], n[3]);
+        // the carried stage goes to the STATIC slot 0 (the prologue's slot): the host contract is an even tile count (K a multiple of two slots of K), so slot 0 is the free one at the last window
+        let s0 = SlotIdx::new(Opnd::I32(0), slot.gen.clone());
         if let Some(live) = self.next_live {
             b.begin_if(Opnd::Val(live));
-            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), &s0);
             b.end_if();
         } else {
-            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), &s0);
         }
         (self.a_org, self.b_org, self.sa_org, self.sb_org) = saved;
     }
