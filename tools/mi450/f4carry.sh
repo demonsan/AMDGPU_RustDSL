@@ -6,7 +6,7 @@ A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang
 /opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/rocm -std=c++17 -I tests/gpu tests/gpu/g1250_f4own_host.cpp -o $O/own_host -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib || exit 6
 echo "GPU: ${IDLE_GPU:-none}"
 export PROBE_WATCHDOG_S=25 CHECK_ROWS=16
-KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist_carry}
+KL=${KERNELS:-gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles exp_gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist exp_gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist_carry}
 for k in $KL; do
   AMDC_TILE_PROTO_WARN=1 $A emit $k --target gfx1250 --backend=own --out $O/$k.s > $O/$k.log 2>&1 || { echo "[$k] EMIT-FAIL"; tail -4 $O/$k.log | cut -c1-600; continue; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -o $O/$k.co $O/$k.s 2>/dev/null

@@ -136,7 +136,7 @@ state with the pre-loop prologue state) with a staging buffer outside the ring, 
 
 Idea (lead): in a persistent loop with the 2-slot 512-K ring, the peeled last window of tile t issues tile t + 1's first stage into the free slot, and tile t's epilogue is staged through the CONSUMED slot
 only (the A and B regions of the slot, two 32-row bands deep per wave, each band's tensor store drained by `wait_tensor(1)` before band i + 2 is staged), so the stores are finished before the next tile's
-stage 1 reuses the slot, and the next tile starts with its stage 0 already landed. Built as `RingOpts::carry` (`gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist_carry`; `Pipeline::carry`,
+stage 1 reuses the slot, and the next tile starts with its stage 0 already landed. Built as `RingOpts::carry` (`exp_gemm_g1250_tdm_stage_f4_256x256_ks4_s2_epit_roles_persist_carry`, the `exp_` family is not enumerated by the manifests; `Pipeline::carry`,
 `PipeBody::stage_tile0` / `stage_next_tile`, a second set of operand origins for the next tile with its row clamped, no stage after the last tile; host PERSIST = G, K a multiple of 1024). It is a measuring build:
 the tile-protocol data-race findings are warnings (`AMDC_TILE_PROTO_WARN`), every hang rule, bound and wait check stays enforced, and the output is bit-exact on every run (host check). `..._persist_rot` = the epilogue
 alone, `..._persist_tst` / `..._persist_carry_tst` = per-tile shader-clock stamps (`RingOpts::tstamps`, host `TSTAMPS=1`).
