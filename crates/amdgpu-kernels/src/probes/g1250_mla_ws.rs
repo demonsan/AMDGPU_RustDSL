@@ -303,7 +303,8 @@ pub fn mla_g1250_qh16_wsx1() -> Function {
 /// sequences with few pages.
 pub fn mla_g1250_qh16_ws4() -> Function {
     // (2026-11-21: the direct bf16-store ending of `_ws4D`: no cross-wave step; -5 .. -8 % at 1 .. 4 pages on e08)
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824, false))
+    // (2026-11-21: direct stores packed to 8 bytes by an in-quad transpose: bits 34, 35)
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws4", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35), false))
 }
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
@@ -496,6 +497,10 @@ pub fn mla_g1250_qh16_ws2K() -> Function {
 
 pub fn mla_g1250_qh16_ws4K8() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws4K8", false, 64 | 256 | 4096 | 65536 | 536870912 | 1073741824 | (1u64 << 34) | (1u64 << 35), false))
+}
+
+pub fn mla_g1250_qh16_ws2K8() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2K8", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35), false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -1797,6 +1802,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
             .collect();
         let packed = branchless & (1u64 << 34) != 0;
         let (odd2, prs2) = packed_row_ptrs(&mut b, pr, bidx, g, m, ev(db) + ev(grp) * (16 * hn as i32));
+        let p8w = branchless & (1u64 << 35) != 0;
+        let (odd8w, hi2w, prs8w) = packed8_row_ptrs(&mut b, pr, bidx, g, m, ev(db) + ev(grp) * (16 * hn as i32));
         for side in 0..2usize {
             let c = if side == 0 { Opnd::Val(is0) } else { Opnd::Val(b.let_(Op::NotI1(Opnd::Val(is0)))) };
             b.begin_if(c);
@@ -1814,7 +1821,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Functio
                             b.add_f32(y0, y1)
                         })
                         .collect();
-                    store_rows_packed(&mut b, &y, odd2, &prs2, 32 * k as u32);
+                    if p8w {
+                        store_rows_packed8(&mut b, &y, odd8w, hi2w, &prs8w, 32 * k as u32);
+                    } else {
+                        store_rows_packed(&mut b, &y, odd2, &prs2, 32 * k as u32);
+                    }
                     continue;
                 }
                 for r in 0..8u8 {
