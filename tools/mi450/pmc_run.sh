@@ -22,7 +22,7 @@ if printf '%s\n' "$WHAT" "$@" | grep -qiE 'spm|--pmc-stream|vmp|pc[-_]sampl|--at
   echo "pmc_run: REFUSED - SPM / streaming / thread-trace / VMP options are not allowed (counter passes and kernel traces only)"; exit 3
 fi
 OUT="$PMC_ROOT/$TAG"; mkdir -p "$OUT"
-N=$(ls -d "$OUT"/pass_* 2>/dev/null | wc -l); P="$OUT/pass_$(printf %03d "$N")"; mkdir -p "$P"
+N=$( (ls -d "$OUT"/pass_* 2>/dev/null || true) | wc -l); P="$OUT/pass_$(printf %03d "$N")"; mkdir -p "$P"
 case "$WHAT" in
   list)  PROF="rocprofv3 --list-avail" ; APP="" ;;
   trace) PROF="rocprofv3 --kernel-trace --stats --output-format csv -d $P -o run --" ; APP="$*" ;;
