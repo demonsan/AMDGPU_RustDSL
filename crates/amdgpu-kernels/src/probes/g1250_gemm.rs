@@ -1148,6 +1148,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     pipe.lazy_prologue = ring.lazy;
     pipe.carry = ring.carry;
     pipe.nobar = name.contains("_nobar");
+    pipe.dov = name.contains("_dov");
     assert!(!ring.carry || (persistent && ring.slots == 2 && epi_carry_ok(ring.epilogue_lds) && (ring.epilogue_lds != 0 || (ring.dstore && sh.bf16))), "carry: persistent, 2 slots, the staged f32 (epilogue 2) or swap + bf16 (epilogue 3) epilogue");
     let (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org) = if hoist_base {
         let base = |b: &mut FnBuilder, p: ValueId, o: ValueId| b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(o) });
@@ -1200,12 +1201,19 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         }
     }
     if clustered {
-        b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
+        if name.contains("_dov") && first_cond.is_some() {
+            // drain overlap: the later tiles are protected by the barrier of window 0 (after the drain of the previous tile's stores)
+            b.begin_if(Opnd::Val(first_cond.unwrap()));
+            b.cluster_barrier();
+            b.end_if();
+        } else {
+            b.cluster_barrier();   // every workgroup of the cluster is resident before anyone multicasts into its LDS
+        }
     }
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, slot_bases: Vec::new(), ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, nowin: ring.nowin, ahead2: ring.ahead2, defer: name.contains("_defer"), pending: None, dov: name.contains("_dov"), dov_stores: sh.tm, first_win: None, slot_bases: Vec::new(), ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
         if name.contains("_static") {   // opt-in: measured neutral to -4 % in mode 0, no gain in mode 2
             for k in 0..ring.slots as i32 {
                 let sl = SlotIdx::new(k, 0);
@@ -1648,7 +1656,9 @@ for q in 0..8i32 {
                         b.tile_end();
                     }
                 }
-                b.wait_tensor(0);
+                if !name.contains("_dov") {
+                    b.wait_tensor(0);   // (drain overlap: the stores stay in flight into the next tile)
+                }
             } else {
             epi_mark(b, 0, 0, None);
             for i in 0..sh.tm {

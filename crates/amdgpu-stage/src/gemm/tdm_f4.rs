@@ -152,6 +152,11 @@ pub struct TdmF4Body {
     /// per STATIC ring slot, the lane's fragment base addresses (slot base + lane offset) of the A, B, A-scale and B-scale rings, computed once before the loops: the window's `ds_load`s then address
     /// `base + immediate` with no VALU address arithmetic inside the WMMA loop (a VALU -> LDS address dependency costs an `s_wait_alu va_vdst` drain in expert scheduling mode 2)
     pub slot_bases: Vec<[ValueId; 4]>,
+    /// drain overlap (carry mode): the previous tile's `dov_stores` tensor stores per wave may still be in flight at the prologue (waited only down to that count), and the first window issues its stage in
+    /// the middle after the drain + a workgroup and a cluster barrier (`first_win` = (it == 0, it != 0) of the window being emitted)
+    pub dov: bool,
+    pub dov_stores: i32,
+    pub first_win: Option<(ValueId, ValueId)>,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -250,7 +255,21 @@ impl TdmF4Body {
 }
 
 impl PipeBody for TdmF4Body {
+    fn set_first_window_cond(&mut self, c: Option<(ValueId, ValueId)>) {
+        self.first_win = c;
+    }
+
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &amdgpu_dsl::I32, slot: &SlotIdx) {
+        if self.dov && self.steady {
+            if let Some((_, not_first)) = self.first_win {
+                // a later window: the stage goes out now; the first window of the tile: in the middle of the window (see `window`)
+                self.pending = Some((key0.clone(), slot.clone(), role));
+                b.begin_if(Opnd::Val(not_first));
+                self.stage_impl(b, role, key0, slot);
+                b.end_if();
+                return;
+            }
+        }
         if self.defer && self.steady && self.sh.lock {
             self.pending = Some((key0.clone(), slot.clone(), role));
             return;
@@ -327,6 +346,25 @@ impl PipeBody for TdmF4Body {
             b.begin_if(Opnd::Val(self.leader));
             b.barrier_signal(-3);
             b.end_if();
+            return;
+        }
+        if self.dov && !self.steady && self.sh.cx * self.sh.cy > 1 && self.sh.lock {
+            // the carried stage of this tile has landed (the stores of the previous tile may stay in flight: they were issued after the carried loads, which complete first)
+            if let Some(first) = self.first_tile {
+                b.begin_if(Opnd::Val(first));
+                b.wait_tensor(0);
+                b.else_();
+                b.wait_tensor(self.dov_stores as u8);
+                b.end_if();
+            } else {
+                b.wait_tensor(0);
+            }
+            b.wait_lds(0);
+            b.barrier();
+            b.begin_if(Opnd::Val(self.leader));
+            b.barrier_signal(-3);
+            b.end_if();
+            b.barrier_wait(-3);
             return;
         }
         if self.sh.cx * self.sh.cy > 1 && self.sh.lock {
@@ -486,6 +524,20 @@ impl PipeBody for TdmF4Body {
                 }
             }
             if s == 0 {
+                if let (true, Some((first, _))) = (self.dov, self.first_win) {
+                    if let Some((key, slot, role)) = self.pending.take() {
+                        // window 0 of a tile: the previous tile''s stores have read the slot this stage overwrites once EVERY wave of EVERY workgroup of the cluster has drained them
+                        b.begin_if(Opnd::Val(first));
+                        b.wait_tensor(0);
+                        b.barrier();
+                        b.begin_if(Opnd::Val(self.leader));
+                        b.barrier_signal(-3);
+                        b.end_if();
+                        b.barrier_wait(-3);
+                        self.stage_impl(b, role, &key, &slot);
+                        b.end_if();
+                    }
+                }
                 if let Some((key, slot, role)) = self.pending.take() {
                     // the deferred stage: the cluster barrier signalled at the end of the previous window (every workgroup has read its slot) must have completed; then the multicast stage goes out
                     b.barrier_wait(-3);

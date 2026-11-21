@@ -302,6 +302,20 @@ multiples of 256, so they do not move it); counts only. Per 512-K iteration of o
   of windows, 462 -> 350 in the kernel) 107.4 - 108.1 vs 106.3 - 106.8 base at 8192^3: neutral to slightly worse, K = 4096 neutral. Register-file bank conflicts, window switches and instruction count are therefore not where the 1.9 k cycles of a window go; they go to
   the LDS bandwidth (262 KiB of fragment reads + 147 KiB of stage writes per iteration, 85 % of the measured LDS rate) and the WMMA issue (10.7 cycles each) as measured with the hoist / no-window profiles above.
 
+### Separate epilogue staging region and the drain overlap (e08, 2026-11-21)
+
+**LDS budget.** 327,680 B; the 2-slot 512-K ring is 294,912 (A and B rows of 272 B x 256, two 4 KiB scale tiles, per slot), free 32,768. The TDM descriptor (ISA Table 63) has no LDS swizzle field (workgroup mask, data size,
+atomic barrier, iterate, pad enable / interval / amount, tile dims, strides), the padding is load-direction only (a padded STORE reads its LDS source unpadded: GV-1250-TDM-STORE-PAD), and the pad is 16 B per 256 B row = 16 KiB in the
+whole ring; the scales cannot leave LDS (64 KiB per operand at K = 8192). Overlapping the whole epilogue with the next tile's compute needs the old tile's accumulators out of the registers before the new tile's first WMMA (512 + 512 + ~250
+VGPRs > 1,024): either the whole tile staged (256 KiB f32, 128 KiB bf16: no room) or window 0 split into half / quarter windows that write new accumulators only as the old ones are freed (B fragments re-read: +1.0 .. +2 k cycles
+per tile) with staging rounds of at most 48 - 64 KiB that each wait for the previous drain (~1.5 k): not feasible. Structures that do free LDS (slot K = 384, 3 x 256-K slots) cost as much in barriers / issues as they could hide.
+
+**Drain overlap without extra LDS** (`exp_..._persist_carry_dov`): the epilogue's tensor stores stay in flight into the next tile (the final `wait_tensor(0)` is gone, the prologue waits only down to the 4 stores), the tile-start
+cluster barrier is dropped for the later tiles, and window 0 (`it == 0` of the pair loop) issues its stage in the MIDDLE of the window after the drain, a workgroup barrier and one cluster barrier (the stage multicasts into the slot the
+stores read). Bit-exact; the tile protocol reports exactly one finding (`GV-TILE-CARRY: a tensor operation other than the carried stage can be outstanding at the end of the body`: the carried-store form is not modelled yet). **It is
+slower**: 8192^3 109.1 - 111.9 us vs 105.5 - 106.9 for PCC (+3.5 %), 4096^3 17.1 - 17.6 vs 16.7, 8192 x 8192 x 4096 equal: the stage lands about 1.95 k cycles after its issue and window 0 is 1.9 k, so issuing it half a window late
+(plus the extra barriers) stalls window 1 by about what the overlapped drain saves, and the draining stores compete with that stage's loads. Not promoted.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
