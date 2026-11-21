@@ -42,7 +42,7 @@ fn with_vopd(mut f: Function) -> Function {
 
 pub fn mla_g1250_qh16_ws() -> Function {
     // the default: scalar loads for the sequence bounds / scales / page ids, full page pairs + an odd tail page
-    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648, false))
+    with_vopd(mla_ws_with(MLA_WS_NAME, false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
 /// `_ws` with the per-page mask and the O rescale branch-free (a select on every page; the rescale on every page).
@@ -237,7 +237,7 @@ pub fn mla_g1250_qh16_ws4() -> Function {
 
 /// `_ws` with wave pairs sharing a page (256 dims each), scalar loads and the odd tail page.
 pub fn mla_g1250_qh16_ws2() -> Function {
-    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
 /// Repro for the back end (not in the registry): `_wsstd` without the `wait_vm(0)` before the loop: the wait self-check rejects the output.
@@ -388,7 +388,7 @@ pub fn mla_g1250_qh16_dwsb() -> Function {
 }
 
 pub fn mla_g1250_qh16_dws2b() -> Function {
-    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 134217728, false)
+    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32) | 134217728, false)
 }
 
 /// `_ws` with the bank-conflict-free final read (bit 31)
@@ -398,6 +398,15 @@ pub fn mla_g1250_qh16_wsC() -> Function {
 
 pub fn mla_g1250_qh16_ws2C() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws2C", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648, false))
+}
+
+/// `_ws` / `_ws2` with the padded merge layout (bit 32)
+pub fn mla_g1250_qh16_wsM() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_wsM", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 2147483648 | (1u64 << 32), false))
+}
+
+pub fn mla_g1250_qh16_ws2M() -> Function {
+    with_vopd(mla_ws_with("mla_g1250_qh16_ws2M", true, 64 | 256 | 16384 | 65536 | 1073741824 | 2147483648 | (1u64 << 32), false))
 }
 
 pub fn mla_g1250_qh16_wsbm() -> Function {
@@ -422,7 +431,7 @@ pub fn mla_g1250_qh16_wsd() -> Function {
     mla_ws_with("mla_g1250_qh16_wsd", true, 0, false)
 }
 
-fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Function {
+fn mla_ws_with(name: &str, dsplit: bool, branchless: u64, pipe: bool) -> Function {
     // bit 4 of `branchless`: the intra-page form (`_wsi`); bit 5: the KV split across work-groups (`_wsk`: partials to a workspace, `_cmb` combines)
     let intra = branchless & 16 != 0;
     let split = branchless & 32 != 0;
@@ -452,7 +461,7 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let tail = branchless & 256 != 0;
     // bit 16: lean softmax (only with `tail`: no fully masked page exists, so a masked logit's exp2 underflows to 0 and needs no select):
     // the mask as a branch-free select on the logits, no I1 loop variables
-    let lean = branch_bits_lean(branchless);
+    let lean = branch_bits_lean(branchless as u32);
     // bit 17 (with `lean`): the sequence's last page (the only one that can be partial) is computed apart, with the mask; every other page
     // without any mask code
     let lastsep = branchless & 131072 != 0;
@@ -516,7 +525,12 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     let kw = [lds.private("KVW0", slot, 4, &[]), lds.private("KVW1", slot, 4, &[])];
     let atr = lds.private("ATR", 64, 4, &[]);
     let ptab = lds.tile("PTAB", 4 * MAX_PAGES as i64, Layout::Linear);
-    let mo = lds.tile_over("MO", 4 * 16 * 512 * 4, &[&kw[0]]);
+    // bit 32: the merge partials padded by 64 bytes per 8-head half (the two lane halves of a wave's stores land 16 banks apart instead
+    // of on the same banks); a wave's region 2 x 64 bytes longer
+    let mpad = branchless & (1u64 << 32) != 0;
+    assert!(!mpad || branchless & 2147483648 != 0, "the padded merge layout is read by the interleaved final read (bit 31) only");
+    let wstride: i32 = if mpad { 32768 + 128 } else { 32768 };
+    let mo = lds.tile_over("MO", 4 * wstride as i64, &[&kw[0]]);
     let ml = lds.tile_over("ML", 4 * 16 * 4 * 3, &[&kw[1]]);
     lds.commit(&mut b);
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 8 * i });
@@ -1590,7 +1604,11 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let al = b.bind_i32(256 + (ev(w) * 2 + ev(g)) * 64 + ev(m) * 4 + ml.base as i32);
         mlw(b, al, Opnd::Var(vl));
     });
-    let mob = b.bind_i32(ev(w) * 32768 + (ev(g) * 4096 + ev(db) + ev(m)) * 4 + mo.base as i32);
+    let mob = if mpad {
+        b.bind_i32(ev(w) * wstride + ev(g) * (16384 + 64) + (ev(db) + ev(m)) * 4 + mo.base as i32)
+    } else {
+        b.bind_i32(ev(w) * 32768 + (ev(g) * 4096 + ev(db) + ev(m)) * 4 + mo.base as i32)
+    };
     mo.at(&t0).write(&mut b, |b| {
         for nt in 0..ntw {
             for r in 0..8u8 {
@@ -1811,14 +1829,18 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         let j = b.bind_i32(ev(tid) & 7);
         // chunk k (dims 4 (8 k + j) ..) lies in dim group k / (16 / dg); its waves: group + kk dg (kk = the page group, scale sc[kk])
         let kpg = 16 / dg as i32;
-        let hb = b.bind_i32(ev(h) * 2048 + ev(j) * 16 + mo.base as i32);
+        let hb = if mpad {
+            b.bind_i32(ev(h) * 2048 + (ev(h) >> 3) * 64 + ev(j) * 16 + mo.base as i32)
+        } else {
+            b.bind_i32(ev(h) * 2048 + ev(j) * 16 + mo.base as i32)
+        };
         let outs: Vec<ValueId> = mo.at(&t0).read(&mut b, |b| {
             let mut acc: Vec<Option<ValueId>> = vec![None; 64];
             for wi in 0..nwl {
                 let v4s: Vec<ValueId> = (0..16)
                     .map(|k| {
                         let wave = if dg > 1 { k / kpg + wi as i32 * dg as i32 } else { wi as i32 };
-                        let a = b.bind_i32(ev(hb) + (128 * k + wave * 32768));
+                        let a = b.bind_i32(ev(hb) + (128 * k + wave * wstride));
                         b.load_lds_b128(a)
                     })
                     .collect();
