@@ -37,6 +37,9 @@ pub struct F4Shape {
     /// cluster only: keep the workgroups of the cluster in lockstep, one cluster barrier per K tile (the vendor loop's `s_barrier_signal -3` / wait): the multicast rendezvous then finds its peers
     /// asking at about the same time instead of waiting for the timeout
     pub lock: bool,
+    /// cluster lock only: the cluster barrier is SPLIT: every workgroup signals it as soon as all its waves have finished reading the slot (before the last sub-step's WMMAs of a staged window) and waits for it at the
+    /// end of the window, after its own tensor wait and the workgroup barrier: the skew between the workgroups is absorbed by the last sub-step instead of stalling the whole workgroup
+    pub split: bool,
 }
 
 impl F4Shape {
@@ -136,6 +139,8 @@ pub struct TdmF4Body {
     /// no software pipeline inside the window: the fragments of sub-step s + 1 are read after the WMMAs of s (one fragment set live instead of two: for the kernels that run two
     /// workgroups per CU, whose other workgroup hides the read latency)
     pub nopf: bool,
+    /// timing experiment (WRONG results): the fragments of sub-step 0 serve all sub-steps (a quarter of the LDS reads)
+    pub hoist: bool,
     /// the overlapped epilogue (see `Ovl`)
     pub ovl: Option<Ovl>,
     /// the C pointer (kernarg) for the overlapped stores
@@ -155,6 +160,19 @@ pub struct TdmF4Body {
     pub next_orgs: Option<[ValueId; 4]>,
     /// carry mode: "a next tile exists" (wave-uniform); without it the last tile issues no stage
     pub next_live: Option<ValueId>,
+}
+
+impl TdmF4Body {
+    fn lock_stamp(&mut self, b: &mut FnBuilder) {
+        if self.stamps && self.steady {
+            if let Some(t2) = self.st_t2.take() {
+                let t3 = cyc(b);
+                let d = b.bind_i32(ev(t3) - ev(t2));
+                add_to(b, self.stamp_vars[2], d);
+                b.set_var(self.stamp_vars[4], Opnd::Val(t3));
+            }
+        }
+    }
 }
 
 fn cyc(b: &mut FnBuilder) -> ValueId {
@@ -265,10 +283,21 @@ impl PipeBody for TdmF4Body {
     }
 
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {
+        // (the stamps of the lock path: the tensor wait = window end -> data landed; the barrier phase = from there to the next stage, i.e. the workgroup and the cluster barriers)
+        if self.sh.cx * self.sh.cy > 1 && self.sh.lock && self.sh.split && self.steady {
+            // the signal went out in the window (every wave had read its fragments); our tensor wait, every wave done (the workgroup barrier), then the cluster wait
+            b.wait_tensor(0);
+            b.wait_lds(0);
+            self.lock_stamp(b);
+            b.barrier();
+            b.barrier_wait(-3);
+            return;
+        }
         if self.sh.cx * self.sh.cy > 1 && self.sh.lock {
             // our own tensor wait, every wave of the workgroup done (reads of the previous tile included: the barrier), then one wave signals the cluster barrier and all wait
             b.wait_tensor(0);
             b.wait_lds(0);
+            self.lock_stamp(b);
             b.barrier();
             b.begin_if(Opnd::Val(self.leader));
             b.barrier_signal(-3);
@@ -377,7 +406,15 @@ impl PipeBody for TdmF4Body {
         // software pipeline inside the window: the loads of sub-step s + 1 are issued before the WMMAs of s
         let mut cur = load(b, 0);
         for s in 0..sh.ks {
-            let next = if s + 1 < sh.ks && !self.nopf { Some(load(b, s + 1)) } else { None };
+            let next = if s + 1 < sh.ks && !self.nopf && !self.hoist { Some(load(b, s + 1)) } else { None };
+            if s + 1 == sh.ks && sh.split && sh.cx * sh.cy > 1 && sh.lock && t.staged && self.steady {
+                // every fragment of the slot is read: complete this wave's reads, meet the workgroup, and one wave signals the cluster barrier (waited for in `stage_complete`)
+                b.wait_lds(0);
+                b.barrier();
+                b.begin_if(Opnd::Val(self.leader));
+                b.barrier_signal(-3);
+                b.end_if();
+            }
             for i in 0..sh.tm {
                 for j in 0..sh.tn {
                     let acc = self.acc[(i * sh.tn + j) as usize];
@@ -387,7 +424,7 @@ impl PipeBody for TdmF4Body {
             }
             if let Some(n) = next {
                 cur = n;
-            } else if s + 1 < sh.ks {
+            } else if s + 1 < sh.ks && !self.hoist {
                 cur = load(b, s + 1);
             }
         }

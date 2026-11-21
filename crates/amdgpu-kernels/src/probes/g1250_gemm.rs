@@ -258,7 +258,7 @@ pub const F4_NAME: &str = "gemm_g1250_tdm_stage_f4";
 /// per 32 K (`sa` [M][K / 32] bytes, `sb` [N][K / 32] bytes), `v_wmma_scale_f32_32x16x128_f4`. A 128 x 64 C tile per workgroup (4 waves 2 x 2, each wave 2 x 2 WMMAs of 32 x 16), K tiles of
 /// 128, the 3-slot ring of the OneWindow cadence. Kernargs: a @0, b @8, sa @16, sb @24, c @32 (pointers), k @40 (K elements, a multiple of 128), n @44. Grid (N / 64, M / 128).
 pub fn gemm_tdm_stage_f4() -> Function {
-    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_NAME, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// 128 x 128 tile (4 waves, each 2 x 4 WMMAs).
@@ -270,15 +270,15 @@ pub const F4_256X64: &str = "gemm_g1250_tdm_stage_f4_256x64";
 pub const F4_256X128: &str = "gemm_g1250_tdm_stage_f4_256x128";
 
 pub fn gemm_tdm_stage_f4_128x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X64, F4Shape { wm: 2, wn: 2, tm: 4, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// K sub-steps per ring slot (a slot holds `ks x 128` K elements: more WMMAs per barrier / tensor wait; the fragment loads of the next sub-step are issued before the WMMAs of the current one).
@@ -287,7 +287,7 @@ pub const F4_128X128_KS4: &str = "gemm_g1250_tdm_stage_f4_128x128_ks4";
 pub const F4_256X128_KS2: &str = "gemm_g1250_tdm_stage_f4_256x128_ks2";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// The vendor-shaped tile: 256 x 256 per workgroup, 4 waves (2 x 2) of 128 x 128 (4 x 8 WMMAs of 32 x 16 each per K step), ks = 2.
@@ -295,25 +295,25 @@ pub const F4_256X256_KS2: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2";
 pub const F4_256X256_KS2_HB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_hb";
 /// `gemm_tdm_stage_f4_256x256_ks2` with the tile origins hoisted out of the pipeline (`gemm_tdm_stage_f4_opts`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_hb() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, true, false)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_HB, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, true, false)
 }
 
 pub const F4_256X256_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad";
 /// `gemm_tdm_stage_f4_256x256_ks2` with the planner's TDM row padding (conflict-free A / B fragment reads; `f4_row_pad`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true)
 }
 
 pub const F4_256X256_KS2_PAD_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax";
 /// `_256x256_ks2_pad` with the relaxed tensor waits (each window completes the previous stage's tile; `F4Shape::relax`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad_relax() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_PAD_RELAX, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true)
 }
 
 /// The padded 256 x 256 kernel with the relaxed tensor wait over a deeper ring: `slots - 2` stages stay in flight at the end of a window (4 slots: two tiles of lookahead past the next one).
 pub const F4_256X256_KS2_PAD_RELAX_S4: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_relax_s4";
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ring(name: &str, ring: RingOpts) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, ring)
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, ring)
 }
 
 /// The padded 256 x 256 kernel with wave roles: waves 0, 1 issue the A and SA loads, waves 2, 3 the B and SB loads (2 tensor loads per wave per stage), each role its own copy of the loop;
@@ -321,52 +321,52 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ring(name: &str, ring: RingOpts) -> Fun
 pub const F4_256X256_KS2_PAD_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles";
 pub const F4_256X256_KS2_PAD_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_roles_relax";
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad_roles(name: &str, relax: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: SLOTS as u8, roles: true, ..Default::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: SLOTS as u8, roles: true, ..Default::default() })
 }
 
 pub const F4_128X128_KS2_PAD: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_pad";
 pub fn gemm_tdm_stage_f4_128x128_ks2_pad() -> Function {
-    gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(F4_128X128_KS2_PAD, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true)
 }
 
 /// The cluster variants with the planner's TDM row padding.
 pub fn gemm_tdm_stage_f4_256x256_ks2_cluster_pad(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_opts(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false, false, true)
+    gemm_tdm_stage_f4_opts(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false, split: false }, true, false, false, true)
 }
 
 pub fn gemm_tdm_stage_f4_256x256_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X256_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// The 256 x 256 tile in a cluster of `cx` x `cy` workgroups (the vendor launches 4 x 4): A (and its scales) multicast along the cluster row, B along the column.
 pub fn gemm_tdm_stage_f4_256x256_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// The same with the cluster kept in lockstep (one cluster barrier per K tile).
 pub fn gemm_tdm_stage_f4_256x256_ks2_cluster_lock(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false)
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true, split: false }, true, false)
 }
 
 /// The 256 x 256 tile with a bf16 output (like the vendor kernel): half the C bytes.
 pub const F4_256X256_KS2_BF16: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_bf16";
 pub fn gemm_tdm_stage_f4_256x256_ks2_bf16() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X256_KS2_BF16, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X256_KS2_BF16, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_128x128_ks4() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS4, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 pub fn gemm_tdm_stage_f4_256x128_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_256X128_KS2, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// Relaxed tensor waits (`F4Shape::relax`): the 128 x 128 tile with 2 sub-steps per slot.
 pub const F4_128X128_KS2_RELAX: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_relax";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2_relax() -> Function {
-    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_128X128_KS2_RELAX, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: true, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// Cluster multicast (docs/mxfp4-gemm-gfx1250-plan.md step 8): the 128 x 128 tile, 2 K sub-steps per slot, in a cluster of 2 x 2 / 2 x 1 / 1 x 2 workgroups (launch with the cluster attribute and
@@ -376,7 +376,7 @@ pub const F4_128X128_KS2_C2X1: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c2x1"
 pub const F4_128X128_KS2_C1X2: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_c1x2";
 
 pub fn gemm_tdm_stage_f4_128x128_ks2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx, cy, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(name, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx, cy, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// The 8-wave 256 x 64 tile (4 x 2 waves, each 2 x 2 WMMAs, cooperative loads, the original interleaved ring layout): the configuration that hung a device on 2026-11-17 (declared LDS 86,784 B).
@@ -384,7 +384,7 @@ pub fn gemm_tdm_stage_f4_128x128_ks2_cluster(name: &str, cx: i32, cy: i32) -> Fu
 pub const F4_8W: &str = "gemm_g1250_tdm_stage_f4_8w_256x64";
 
 pub fn gemm_tdm_stage_f4_8w_256x64() -> Function {
-    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, true)
+    gemm_tdm_stage_f4_with(F4_8W, F4Shape { wm: 4, wn: 2, tm: 2, tn: 2, ks: 1, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, true)
 }
 
 /// The ks = 2 kernels (the K tile of a slot = 2 x 128 elements): `_ks2_grouped` is the layout of the original wrong-result build (the four parts interleaved per slot by `ring_group`, declared 103,936
@@ -393,11 +393,11 @@ pub const F4_KS2_GROUPED: &str = "gemm_g1250_tdm_stage_f4_ks2_grouped";
 pub const F4_KS2: &str = "gemm_g1250_tdm_stage_f4_ks2";
 
 pub fn gemm_tdm_stage_f4_ks2_grouped() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, true)
+    gemm_tdm_stage_f4_with(F4_KS2_GROUPED, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, true)
 }
 
 pub fn gemm_tdm_stage_f4_ks2() -> Function {
-    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false)
+    gemm_tdm_stage_f4_with(F4_KS2, F4Shape { wm: 2, wn: 2, tm: 2, tn: 2, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false)
 }
 
 /// The MXFP4 stage-template GEMM for a workgroup shape (`sh`) and the loading scheme (`coop`: every wave loads a slice of the tile; otherwise every wave loads all of it). The four rings (A, B and the
@@ -416,23 +416,23 @@ pub fn gemm_tdm_stage_f4_with(name: &str, sh: F4Shape, coop: bool, grouped: bool
 pub const F4_256X256_KS2_PERSIST: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_persist";
 /// The padded 256 x 256 ks2 kernel on a persistent grid (`RingOpts::persistent`; host PERSIST=G).
 pub fn gemm_tdm_stage_f4_256x256_ks2_persist() -> Function {
-    gemm_tdm_stage_f4_ring(F4_256X256_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(F4_256X256_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
 }
 
 pub const F4_128X128_KS2_PERSIST: &str = "gemm_g1250_tdm_stage_f4_128x128_ks2_persist";
 pub fn gemm_tdm_stage_f4_128x128_ks2_persist() -> Function {
-    gemm_tdm_stage_f4_ring(F4_128X128_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(F4_128X128_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 2, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
 }
 
 pub const F4_256X128_KS2_PERSIST: &str = "gemm_g1250_tdm_stage_f4_256x128_ks2_persist";
 pub fn gemm_tdm_stage_f4_256x128_ks2_persist() -> Function {
-    gemm_tdm_stage_f4_ring(F4_256X128_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(F4_256X128_KS2_PERSIST, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { persistent: true, ..RingOpts::default() })
 }
 
 pub const F4_256X256_KS2_SS: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_ss";
 /// The padded 256 x 256 ks2 kernel with the preshuffled scale layout (host SCALE_SHUF=1).
 pub fn gemm_tdm_stage_f4_256x256_ks2_ss() -> Function {
-    gemm_tdm_stage_f4_ring(F4_256X256_KS2_SS, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(F4_256X256_KS2_SS, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { scale_shuf: true, ..RingOpts::default() })
 }
 
 /// The padded 256 x 256 kernel with the preshuffled scales composed with the relaxed tensor wait and / or the wave roles (host SCALE_SHUF=1).
@@ -440,14 +440,14 @@ pub const F4_256X256_KS2_PAD_SS_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_k
 pub const F4_256X256_KS2_PAD_SS_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles";
 pub const F4_256X256_KS2_PAD_SS_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_pad_ss_roles_relax";
 pub fn gemm_tdm_stage_f4_256x256_ks2_pad_ss_opts(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { scale_shuf: true, roles, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { scale_shuf: true, roles, ..RingOpts::default() })
 }
 
 pub const F4_256X256_KS2_EPIB: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epib";
 pub const F4_256X256_KS2_EPIT: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit";
 /// The padded 256 x 256 ks2 kernel with the C epilogue staged through LDS: b128 global stores (`_epib`) or one tensor store per wave (`_epit`).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epi(name: &str, epi: u8) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: epi, ..RingOpts::default() })
 }
 
 /// The padded 256 x 256 kernel with the LDS-staged epilogue (`epi`: 1 = b128 global stores, 2 = a tensor store per wave) composed with the relaxed tensor wait and / or the wave roles.
@@ -455,43 +455,43 @@ pub const F4_256X256_KS2_EPIT_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2
 pub const F4_256X256_KS2_EPIT_ROLES: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles";
 pub const F4_256X256_KS2_EPIT_ROLES_RELAX: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_epit_roles_relax";
 pub fn gemm_tdm_stage_f4_256x256_ks2_epi_opts(name: &str, epi: u8, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: epi, roles, ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (4 waves of 128 x 64) with the TDM-store epilogue: twice the workgroups of the 256 x 256 tile (512 at 4096^3), for the shapes that fill the machine only once.
 pub fn gemm_tdm_stage_f4_256x128_ks2_epit_opts(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel with the tile-order swizzle (host SWIZZLE=G, G = `swizzle` tile rows per group).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_swz(name: &str, relax: bool, roles: bool, swizzle: u8) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, swizzle, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, swizzle, ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel with the lazy prologue: the loop starts after tile 0 only (the next tile is still in flight).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_lazy(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, lazy: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, lazy: true, ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel with an instruction prefetch of `n` x 4 KiB at the start.
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bool, n: u8) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, iprefetch: n, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, iprefetch: n, ..RingOpts::default() })
 }
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), tstamps: name.ends_with("_tst"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), tstamps: name.ends_with("_tst"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx, cy, bf16: false, lock: true, split: name.contains("_split") }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles: name.contains("_roles_"), stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), tstamps: name.ends_with("_tst"), ..RingOpts::default() })
 }
 
 /// The 256 x 128 tile (waves of 128 x 64: 256 accumulator VGPRs) with K slots of 256 in a 2-slot ring: 116 KiB of ring, 131 KiB with the staged f32 epilogue aliasing it, so TWO workgroups fit
 /// one CU's LDS (and, below 512 VGPRs per wave, its registers): their prologues, barriers and epilogues fill each other's bubbles (a single-tile-per-CU shape like 4096^3 runs 512 workgroups).
 pub fn gemm_tdm_stage_f4_256x128_ks2_s2(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), nopf: name.contains("_nopf"), racompact: name.contains("_rc"), lds_pad: if name.contains("_big") { 45056 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 4, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), nopf: name.contains("_nopf"), racompact: name.contains("_rc"), lds_pad: if name.contains("_big") { 45056 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The 512-K 2-slot kernel with bf16 output and no operand swap: the f32 accumulators are rounded in registers (`v_cvt_pk_bf16_f32`), staged as 16-bit pieces into unpadded LDS rows and
@@ -499,67 +499,67 @@ pub fn gemm_tdm_stage_f4_256x128_ks2_s2(name: &str, roles: bool) -> Function {
 /// As `_bf16s` but the pair exchange (epilogue_lds 6): 32-bit stores of packed bf16 pairs.
 /// As `_bf16p` with the packed-pair exchange (epilogue_lds 7): cvt first, then the neighbour swap and one byte permute per stored dword.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16q(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 7, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 7, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16p(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 6, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 6, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16s(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 5, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 5, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 /// The vendor's 192 x 256 tile with the operand swap (A operand = the B matrix: 4 x 6 blocks of 32 x 16 per wave), K slots of 256 in a 3-slot ring, wave roles, a persistent grid and a
 /// SEPARATE bf16 staging region whose four tensor stores per wave drain behind the next tile's prologue (host PERSIST=G, OUT_BF16=1; M a multiple of 192).
 pub fn gemm_tdm_stage_f4_192x256_swap_ovl(name: &str, relax: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 6, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles: true, swap: true, persistent: true, epilogue_lds: 4, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 6, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { roles: true, swap: true, persistent: true, epilogue_lds: 4, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 /// The vendor's 192 x 256 tile (2 x 2 waves of 96 x 128: 3 x 8 blocks, 24 accumulator blocks) with K slots of 256, the f32 LDS-staged epilogue and wave roles; M a multiple of 192.
 /// The 192 x 256 tile with K slots of 512 in a 2-slot ring (f32 staged epilogue aliasing the ring).
 pub fn gemm_tdm_stage_f4_192x256_ks4_s2(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 pub fn gemm_tdm_stage_f4_192x256_ks2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 3, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, ..RingOpts::default() })
 }
 
 /// The 512-K 2-slot tile on a persistent grid with the operand swap and the overlapped bf16 epilogue (host PERSIST=G, OUT_BF16=1).
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_ovl(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, roles, swap: true, persistent: true, ovl_burst: name.contains("a_roles"), ovl: if name.contains("_ovl0") { 0 } else if name.contains("_ovl8") { 8 } else if name.contains("_ovl16") { 16 } else { 32 }, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, roles, swap: true, persistent: true, ovl_burst: name.contains("a_roles"), ovl: if name.contains("_ovl0") { 0 } else if name.contains("_ovl8") { 8 } else if name.contains("_ovl16") { 16 } else { 32 }, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 /// The 256 x 256 kernel with the operand swap and the bf16 direct epilogue (host OUT_BF16=1): no LDS staging, no tensor store.
 pub fn gemm_tdm_stage_f4_256x256_ks2_swapbf16(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { roles, swap: true, stamps: name.ends_with("_stamps"), persistent: name.ends_with("_persist"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { roles, swap: true, stamps: name.ends_with("_stamps"), persistent: name.ends_with("_persist"), ..RingOpts::default() })
 }
 
 /// The 2-slot ks 4 tile with the swap + bf16 LDS-staged epilogue (host OUT_BF16=1): 16-byte conflict-free LDS stores of packed bf16 and four tensor stores of 64-byte-wide chunks per wave.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2_bf16(name: &str, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 3, swap: true, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax: false, cx: 1, cy: 1, bf16: true, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 3, swap: true, roles, stamps: name.ends_with("_stamps"), ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel with the K-loop phase stamps (host STAMPS=1).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_stamps(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, stamps: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, stamps: true, ..RingOpts::default() })
 }
 
 /// The best 256 x 256 kernel on a persistent grid (host PERSIST=G): no cross-tile overlap (the LDS-staged epilogue uses the whole LDS), only the tile loop.
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_persist(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, roles, persistent: true, ..RingOpts::default() })
 }
 
 /// The padded 256 x 256 kernel with the TDM-store epilogue in a cluster of `cx` x `cy` workgroups, lockstep (one cluster barrier per K tile).
 pub fn gemm_tdm_stage_f4_256x256_ks2_epit_cluster(name: &str, cx: i32, cy: i32) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true }, true, false, false, true, RingOpts { epilogue_lds: 2, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx, cy, bf16: false, lock: true, split: false }, true, false, false, true, RingOpts { epilogue_lds: 2, ..RingOpts::default() })
 }
 
 pub const F4_256X256_KS2_NOPAD: &str = "gemm_g1250_tdm_stage_f4_256x256_ks2_nopad";
 /// The unpadded LDS layout (8-way bank conflicts on the fragment reads), for A/B against the default.
 pub fn gemm_tdm_stage_f4_256x256_ks2_nopad() -> Function {
-    gemm_tdm_stage_f4_opts(F4_256X256_KS2_NOPAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false }, true, false, false, false)
+    gemm_tdm_stage_f4_opts(F4_256X256_KS2_NOPAD, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 2, relax: false, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, false)
 }
 
 /// The A / B row padding (bytes) that makes the fragment reads conflict-free: the TDM pads every `64 ks`-byte row (interval = the row's
@@ -649,6 +649,8 @@ pub struct RingOpts {
     pub epi_bands: u8,
     /// no in-window software pipeline (`TdmF4Body::nopf`)
     pub nopf: bool,
+    /// timing experiment: fragments read once per window (wrong results)
+    pub hoist: bool,
     /// the A / B row pitch is a kernarg (`lda`, bytes, @72) = K / 2 + PAD instead of K / 2 (host LDA_PAD): row pitches that are powers of two (K = 4096: 2 KiB) land the 256 rows of a
     /// tile in a few memory channels; the pad moves them apart
     pub pitch: bool,
@@ -675,7 +677,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
     }
 }
 
@@ -1177,7 +1179,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
         let ts_a = if ring.tstamps { Some(cyc_now(b)) } else { None };
         pipe.run(b, role, &mut body);
         let ts_b = if ring.tstamps { Some(cyc_now(b)) } else { None };

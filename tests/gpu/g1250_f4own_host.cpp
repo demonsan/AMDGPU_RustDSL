@@ -126,8 +126,10 @@ int main(int argc, char** argv) {
     // PERSIST=G: a persistent kernel (a tile loop inside): G workgroups (a multiple of the tile columns N / BN), each takes the tile column
     // w % (N / BN) and the rows w / (N / BN), + G / (N / BN), ..; extra kernargs: tile rows M / BM @48, log2(N / BN) @52, the row step @56.
     // The first (smoke) launch is one workgroup per tile column (row step 1).
-    const int persist = getenv("PERSIST") ? atoi(getenv("PERSIST")) : 0;
+    int persist = getenv("PERSIST") ? atoi(getenv("PERSIST")) : 0;
     const int tx = N / BN, ty = M / BM;
+    // a persistent kernel without PERSIST: one workgroup per CU (256 of them, at most the tile count); the cluster form needs GYS = PERSIST / TX to be a multiple of the cluster rows dividing the tile rows (checked at the launch)
+    if (!persist && strstr(kn, "persist")) { persist = tx * ty < 256 ? tx * ty : 256; fprintf(stderr, "PERSIST not set: using %d\n", persist); }
     int lgx = 0;
     while ((1 << lgx) < tx) ++lgx;
     if (persist && ((1 << lgx) != tx || persist % tx || persist > tx * ty)) { fprintf(stderr, "PERSIST=%d: N / BN = %d must be a power of two dividing it, at most %d tiles\n", persist, tx, tx * ty); return 1; }
