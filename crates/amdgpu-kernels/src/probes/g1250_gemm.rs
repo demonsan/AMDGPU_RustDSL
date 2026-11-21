@@ -741,7 +741,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // K = 128 * K128 (K128 a multiple of ks, at least two K slots so the prologue's second stage is a real tile): the extents below are polynomials, no divisions
     // carry: K = 2 ks KQ x 128 (an even number of K slots: the carried stage lands in the static slot 0, the epilogue stages in the consumed slot 1)
     let k128e: Ext = if ring.carry {
-        b.sym_range("KQ", 1, 1 << 12);
+        b.sym_range("KQ", 2, 1 << 12);   // K >= 4 slots: the loop runs (nkv - 2) / 2 >= 1 pairs of windows
         Ext::sym("KQ") * Ext::c(2 * sh.ks as i64)
     } else {
         Ext::sym("K128")
