@@ -9,6 +9,11 @@ pub mod cse;
 pub mod dse;
 pub mod vopd;
 pub mod msbgroup;
+
+/// The relaxed scheduling mode 2 for the compiler's own code: the kernel's `mode2` token or `AMDC_MODE2` (`AMDC_NO_MODE2` off).
+pub fn mode2_enabled(m: &crate::mir::MFunction) -> bool {
+    !m.exact && std::env::var("AMDC_NO_MODE2").is_err() && (m.mode2 || std::env::var("AMDC_MODE2").is_ok())
+}
 pub mod emit;
 pub mod hazards;
 pub mod matorder;

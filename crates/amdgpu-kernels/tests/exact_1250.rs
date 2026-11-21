@@ -322,3 +322,21 @@ fn permpk16_compiles_with_its_mitigation() {
         }
     }
 }
+
+/// Mode 2 (the relaxed scheduling mode, token `mode2`): the compiler's `s_wait_alu` waits are checked independently - dropping any one of
+/// them (here each planned wait in turn, e.g. a VALU write of a VMEM address register read without its va_vdst wait: stale addresses on
+/// the hardware) must make the compile fail.
+#[test]
+fn mode2_waits_are_checked_and_each_one_is_needed() {
+    let mut f = amdgpu_kernels::kernel_by_name("probe_g1250_add").expect("probe");
+    f.lower_opts.push("mode2".to_string());
+    let c = amdgpu_codegen::compile_target(&f, "gfx1250").unwrap_or_else(|e| panic!("{e}"));
+    assert!(c.asm.contains("hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2"), "{}", c.asm);
+    let n = c.asm.lines().filter(|l| l.trim().starts_with("s_wait_alu")).count();
+    assert!(n > 0, "{}", c.asm);
+    for k in 0..n {
+        let r = amdgpu_codegen::target::gfx1250::check::with_mode2_drop(k, || amdgpu_codegen::compile_target(&f, "gfx1250"));
+        let e = r.err().unwrap_or_default();
+        assert!(e.contains("mode-2 wait self-check"), "dropping wait {k} was not caught: {e}");
+    }
+}
