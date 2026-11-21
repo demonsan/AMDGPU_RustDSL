@@ -153,6 +153,8 @@ pub struct TdmF4Body {
     pub carry: bool,
     pub first_tile: Option<ValueId>,
     pub next_orgs: Option<[ValueId; 4]>,
+    /// carry mode: "a next tile exists" (wave-uniform); without it the last tile issues no stage
+    pub next_live: Option<ValueId>,
 }
 
 fn cyc(b: &mut FnBuilder) -> ValueId {
@@ -233,7 +235,13 @@ impl PipeBody for TdmF4Body {
         let n = self.next_orgs.expect("carry: the next tile's origins");
         let saved = (self.a_org, self.b_org, self.sa_org, self.sb_org);
         (self.a_org, self.b_org, self.sa_org, self.sb_org) = (n[0], n[1], n[2], n[3]);
-        self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+        if let Some(live) = self.next_live {
+            b.begin_if(Opnd::Val(live));
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+            b.end_if();
+        } else {
+            self.stage(b, role, &amdgpu_dsl::I32::c(0), slot);
+        }
         (self.a_org, self.b_org, self.sa_org, self.sb_org) = saved;
     }
 

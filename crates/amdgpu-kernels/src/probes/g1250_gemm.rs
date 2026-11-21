@@ -1068,12 +1068,14 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         (pa, pb, psa, psb, a_org, b_org, sa_org, sb_org)
     };
     // carry mode: the next tile's operand origins (its row clamped to the last tile row: the tile after the last one is staged but never used; the loop exit drains it) and the first-tile condition
+    let mut next_live_c: Option<ValueId> = None;
     let carry_next: Option<[ValueId; 4]> = if ring.carry {
         let vy = persist_var.expect("carry: persistent");
         let ystep_c = b.let_(Op::KernargI32 { offset: 56 });
         let tyk_c = b.let_(Op::KernargI32 { offset: 48 });
         let nyr = b.bind_i32(amdgpu_dsl::varx(vy) + ev(ystep_c));
         let lastr = b.bind_i32(ev(tyk_c) - 1);
+        next_live_c = Some(b.bind_cond(ev(nyr).lt(ev(tyk_c))));
         let mn = b.let_(Op::MinI32(Opnd::Val(nyr), Opnd::Val(lastr)));
         let gyn = b.bind_i32(ev(mn).max(0));
         let row0n = b.mul_i32(gyn, Opnd::I32(tile_m));
@@ -1106,7 +1108,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
         let ts_a = if ring.tstamps { Some(cyc_now(b)) } else { None };
         pipe.run(b, role, &mut body);
         let ts_b = if ring.tstamps { Some(cyc_now(b)) } else { None };
