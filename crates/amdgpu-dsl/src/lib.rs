@@ -3967,6 +3967,16 @@ impl FnBuilder {
     pub fn persistent_tile_carry(&mut self) {
         self.f.kd.push(("g5:persistent_tile_carry".to_string(), 1));
     }
+    /// Launch contract for the tile protocol: the outermost pipelined loop (the K loop) runs a multiple of `m` iterations (the host must
+    /// check it, e.g. K a multiple of two ring windows); gpu_protocol simulates only those counts and lists the assumption (GV-ASSUME).
+    pub fn loop_trip_multiple(&mut self, m: u32) {
+        self.loop_trip(m, 0);
+    }
+    /// `loop_trip_multiple` with a residue: the loop runs `m k + r` iterations (e.g. a peeled last window: K windows = loop iterations + 1).
+    pub fn loop_trip(&mut self, m: u32, r: u32) {
+        self.f.kd.push(("g5:loop_trip_multiple".to_string(), m as i64));
+        self.f.kd.push(("g5:loop_trip_residue".to_string(), r as i64));
+    }
     pub fn persistent_tile_overlap_stores(&mut self) {
         self.f.kd.push(("g5:persistent_tile_overlap_stores".to_string(), 1));
     }
