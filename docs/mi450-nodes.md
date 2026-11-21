@@ -109,3 +109,32 @@ python3 tools/mi450/pmc_sum.py <pass dir> [kernel substring] [--all]    # per-ke
 So the instruction-mix, LDS, wait and WMMA-busy questions cannot be answered with this stack: those counters read 0 for every kernel. The
 static reports (`amdc lds-banks`, `amdc vgpr-banks`) and the shader-clock stamps remain the tools for those. What PMC adds is exact wave /
 work-item counts, SQ / GUI busy cycles, and L2 / memory traffic (read / write sectors, DRAM requests, hit rate) per dispatch.
+
+**Enabling the zero SQ counters:** nothing found that would turn them on without SPM.
+- The image's `rocprofv3 --help` has no SQ control / stage-mask option for counter passes; the `--att-perfcounter*` options belong to thread trace and are gfx9-only.
+- aqlprofile's environment knobs are SPM-only (`AQLPROFILE_SPM_*`, `ROCP_SPM_KFD_MODE`).
+- `config.yaml` defines `SQ_INSTS_VALU` for gfx1250 as SQ event 128, with no requirement noted.
+- It is the same for HIP-compiled kernels, so it is a property of this stack, not of our code objects.
+
+**First traffic measurements (2026-11-21, `tools/mi450/pmc_traffic.sh`; medians over the timed dispatches; GL2C sector = 32 B, checked against the output sizes):**
+
+| run | L2 read | L2 write | L2 hit rate | DRAM write req | `GRBM_GUI_ACTIVE` |
+|---|---|---|---|---|---|
+| GEMM D, 8192^3 | 2.31 GB | 268 MB (f32 C) | 90 % | 1.049 M | 1.92 M |
+| GEMM M (4x4 multicast), 8192^3 | 805 MB | 268 MB | 80 % | 1.049 M | 1.99 M |
+| GEMM PCC, 8192^3 | 805 MB | 268 MB | 80 % | 1.049 M | 1.92 M |
+| vendor f4gemm (bf16 C), 8192^3 | 615 MB | 134 MB | 87 % | 0.525 M | 1.30 M |
+| GEMM D, 4096^3 | 292 MB | 67 MB | 81 % | 0.263 M | 675 k |
+| GEMM M, 4096^3 | 103 MB | 67 MB | 61 % | 0.263 M | 666 k |
+| GEMM PCC, 4096^3 | 102 MB | 67 MB | 61 % | 0.263 M | 661 k |
+| vendor f4gemm, 4096^3 | 81 MB | 34 MB | 78 % | 0.132 M | 516 k |
+| MLA `_ws`, 128 x 8192 | 619 MB | 4.3 MB | 3.4 % | 33 k | 997 k |
+| vendor MLA, 128 x 8192 | 618 MB | 2.2 MB | 3.5 % | 8.8 k | 1096 k |
+
+- **GEMM:**
+  - The operand reads are L2 hits in the timed loop (DRAM read requests are a few thousand: the inputs stay resident). DRAM traffic is the output.
+  - Multicast cuts our L2 reads 2.9x (2.31 GB to 805 MB at 8192^3), but they are still 1.3x the vendor's (615 MB).
+  - Our f32 output writes twice the vendor's bf16 bytes.
+- **MLA:** both kernels stream the KV cache once (590 B per token: 576 B of KV plus about 2.5 %, every read a DRAM miss).
+  - Ours writes 2x the output bytes (4.3 MB vs 2.2 MB).
+  - Ours needs 9 % fewer busy cycles at this shape.
