@@ -879,16 +879,17 @@ fn mla_w1_with(name: &str, wp: i32, depth: i32) -> Function {
     });
     b.wait_lds(0);
     b.barrier();
-    let rb = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 128);
+    // thread t copies 16-byte chunks t, t + 128, ..: consecutive lanes on consecutive chunks (conflict-free; was 128 B apart, 8-way)
+    let rb = b.bind_i32(ev(bidx) * (16 * 512 * 2) + ev(tid) * 16);
     let prb = b.let_(Op::PtrAdd { base: Opnd::Val(pr), byte_off: Opnd::Val(rb) });
     out.at(&t00).read(&mut b, |b| {
         let rows: Vec<ValueId> = (0..8).map(|k| {
-            let a = b.bind_i32(ev(tid) * 128 + (16 * k + ob));
+            let a = b.bind_i32(ev(tid) * 16 + (2048 * k + ob));
             b.load_lds_b128(a)
         }).collect();
         for k in 0..8u32 {
             if !STAMPS.with(|c| c.get()) {
-                b.store_global(prb, 16 * k, rows[k as usize], MemTy::B128, false);
+                { let pk = b.let_(Op::PtrAdd { base: Opnd::Val(prb), byte_off: Opnd::I32(2048 * k as i32) }); b.store_global(pk, 0, rows[k as usize], MemTy::B128, false); }
             }
         }
     });
