@@ -242,6 +242,17 @@ or accumulators held in a smaller footprint; not built.
   a deferred-issue prototype (stage t + 2 issued in the middle of window t after the cluster wait of the previous window's signal, workgroup barrier and relaxed tensor wait at the window end) is correct but 16 % slower (44.2 k).
 * Where the vendor wins, then, is not in the loop (its 12.4 PF/s needs about 2.4 k cycles per 512 K including everything, our PCC loop is 2.32 k) but in the 5 - 6.5 k cycles per tile of epilogue and the ~1 k of tile transitions that stay exposed.
 
+### The vendor kernel's epilogue, by instruction class (e08 disassembly, 2026-11-21; counts only)
+
+`f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps` (6,238 instructions: many tile-edge and K-remainder copies of the same loop): 1,024 `v_wmma_scale_f32_32x16x128_f4` (+ 256 `v_wmma_ld_scale_paired_b32`), 1,280 `ds_load_b128` + 320 `ds_load_b32`
+(1.25 + 0.31 per WMMA, the same read traffic as ours), 154 `s_barrier_*`, 30 `s_wait_tensorcnt`, 6 `global_prefetch_b8` (the next tile's operands into L2), the tensor operations as raw encodings the installed objdump does not name.
+**Epilogue** (the code after the last window of a tile): **256 `v_cvt_pk_bf16_f32`** (one per accumulator pair, in four runs of 64 with ONE `s_set_vgpr_msb` per run), **64 `ds_store_b128`** (four runs of 16, one MSB switch per run; two
+halves of 128 cvt + 32 stores with a single `s_wait_dscnt` between them), then `s_wait_dscnt 0`, a workgroup barrier and the tensor store(s) from LDS; no `v_perm`, no DPP, no `v_permlane`, no per-element stores. About 370 instructions
+in total against our 512 `ds_store_b32` plus ~600 address / MSB instructions (f32) or the 1,120-instruction bf16 pair staging (7.4 k cycles). The reason is the layout: both operands are pre-shuffled on the host (`ABpreShuffle`) and the WMMA
+operands are swapped, so a lane's 8 accumulator registers of a row segment are 8 CONSECUTIVE output columns: pack four pairs, one 16-byte LDS store, no lane exchange, and the VGPR-window switches (`s_set_vgpr_msb`, about 12 cycles of
+issue each) happen once per 64 instructions instead of once per few. Our own archived swap + bf16 staged variant (`_bf16`, tag `archive/g1250-gemm-variants-2026-11-20`) had the same epilogue structure (2,250 cycles) but reads the swapped
+operand with a row permutation (rows (m & 7) + 16 (m >> 3)) that cost 12 % of the window; the vendor avoids it by pre-shuffling the operand in memory.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible
