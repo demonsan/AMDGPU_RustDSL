@@ -382,6 +382,15 @@ pub fn mla_g1250_qh16_wsF() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_wsF", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824, false))
 }
 
+/// timing deletions (not registered): `_ws` / `_ws2` stopping before the merge
+pub fn mla_g1250_qh16_dwsb() -> Function {
+    mla_ws_with("mla_g1250_qh16_dwsb", false, 64 | 256 | 16384 | 65536 | 131072 | 1073741824 | 134217728, false)
+}
+
+pub fn mla_g1250_qh16_dws2b() -> Function {
+    mla_ws_with("mla_g1250_qh16_dws2b", true, 64 | 256 | 16384 | 65536 | 1073741824 | 134217728, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
