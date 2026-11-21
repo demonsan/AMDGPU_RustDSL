@@ -3,7 +3,9 @@
 //! windows in their natural order switches the windows almost every instruction. Per block, a list schedule over the dependence graph (the
 //! shared one, plus the PHYSICAL register dependences of the allocation: this runs after register allocation) that keeps issuing ready
 //! instructions whose windows match the current state, and only when none does takes the earliest ready instruction in program order. The
-//! new order is applied only when it emits fewer window switches than the old one.
+//! new order is applied only when it emits fewer window switches than the old one. Measured on e08 (2026-11-21, tools/mi450/msbgroup_ab.sh):
+//! GEMM ks4_s2_epit_roles 504 -> 420 switches but 8192^3 -1.7 %, MLA _ws 452 -> 423 switches and +0.3 .. +1 %: it costs latency hiding, so opt-in.
+//! (It does not help an epilogue whose temporaries / store address sit in another window than the sources: those need allocation.)
 
 use super::msb::Msb;
 use crate::mir::*;
