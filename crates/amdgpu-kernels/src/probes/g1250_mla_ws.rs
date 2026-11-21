@@ -331,6 +331,11 @@ pub fn mla_g1250_qh16_ws42d() -> Function {
     with_vopd(mla_ws_with("mla_g1250_qh16_ws42d", false, 64 | 256 | 4096 | 32768 | 65536 | 33554432, false))
 }
 
+/// timing aid: `_ws4` with stamps (not registered)
+pub fn mla_g1250_qh16_ws4std() -> Function {
+    mla_ws_with("mla_g1250_qh16_ws4std", false, 64 | 256 | 4096 | 32768 | 65536 | 512, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
