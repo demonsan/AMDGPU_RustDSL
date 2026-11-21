@@ -48,6 +48,11 @@ pub fn tgt_lat() -> &'static Target {
 /// `s_nop`s), so there it is 0. (`AMDC_T950_COMPAT`: the gfx950 value, A/B only.)
 pub fn shared_hazard(name: &str) -> u32 {
     let t = tgt();
+    // the TRANS result spacing: on gfx1250 not a wait state but the shared pass's latency-driven filling (independent work between a
+    // transcendental and its reader): kept at the described value as a scheduling heuristic (measured: dropping it costs the MLA ~1 %)
+    if t.name == "gfx1250" && matches!(name, "trans-result" | "trans-valu") {
+        return T.hazard(name).n();
+    }
     if t.hazards.iter().any(|h| h.name == name) {
         return t.hazard(name).n();
     }
