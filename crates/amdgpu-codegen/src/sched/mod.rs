@@ -296,7 +296,11 @@ mod tests;
 /// The per-wave register budget a scheduler may plan for: 512 / ceil(waves / 4) registers per wave, minus 8 of headroom, capped at 240 (the
 /// default arch-VGPR budget).
 pub fn launch_vgpr_budget(workgroup_size: u32) -> u32 {
-    let waves = (workgroup_size + 63) / 64;
+    // (the current target: gfx950 wave64 with a 512-entry unified file and 240 arch VGPRs by default; gfx1250 wave32 with 1024 VGPRs)
+    let t = crate::target::tgt();
+    let lanes = t.wave.lanes;
+    let waves = (workgroup_size + lanes - 1) / lanes;
     let per_simd = ((waves + 3) / 4).max(1);
-    (512 / per_simd).saturating_sub(8).min(240)
+    let (file, cap) = if t.regs.unified.is_some() { (crate::target::unified_total(t), 240) } else { (t.regs.vgpr.count, t.regs.vgpr.count) };
+    (file / per_simd).saturating_sub(8).min(cap)
 }
