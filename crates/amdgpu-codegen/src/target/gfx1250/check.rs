@@ -99,9 +99,11 @@ fn ctr_name(c: Ctr) -> &'static str {
 
 /// A wait for `n` on counter `c`.
 fn wait(st: &mut State, c: Ctr, n: u32) {
-    let classes: std::collections::BTreeSet<u8> = st.items.iter().filter(|(k, _)| k.0 == c).map(|(_, v)| v.class).collect();
-    let in_order = !matches!(c, Ctr::Km) && classes.len() <= 1 && !(c == Ctr::X && st.items.iter().any(|(k, _)| k.0 == Ctr::X && k.2 == 1));
-    let done: Vec<Key> = st.items.iter().filter(|(k, v)| k.0 == c && (n == 0 || (in_order && v.younger >= n))).map(|(k, _)| *k).collect();
+    // an event class completes in order, the classes out of order with each other: while an operation is outstanding so are the `same`
+    // younger operations of its class, so the counter is at least same + 1; a wait for n <= same therefore completes it (with one class
+    // pending, same = younger). The scalar loads (and the scalar translations) complete out of order: only n = 0.
+    let ooo = matches!(c, Ctr::Km) || (c == Ctr::X && st.items.iter().any(|(k, _)| k.0 == Ctr::X && k.2 == 1));
+    let done: Vec<Key> = st.items.iter().filter(|(k, v)| k.0 == c && (n == 0 || (!ooo && v.same >= n))).map(|(k, _)| *k).collect();
     for k in done {
         st.items.remove(&k);
         // a completed load / store / LDS operation has also finished its translation and its source reads
@@ -461,8 +463,6 @@ pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result
                 if relaxed {
                     let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
                     for c in [Ctr::VaVdst, Ctr::VmVsrc] {
-                        let classes: std::collections::BTreeSet<u8> = st.items.iter().filter(|(k, _)| k.0 == c).map(|(_, v)| v.class).collect();
-                        let in_order = classes.len() <= 1;
                         for (k, v) in st.items.iter().filter(|(k, _)| k.0 == c) {
                             let dep = match c {
                                 Ctr::VaVdst => !valu && (hit(&reads, &v.dst) || hit(&writes, &v.dst) || hit(&writes, &v.src)),
@@ -470,7 +470,8 @@ pub fn mode2_plan(m: &MFunction, a: &Alloc, plan: &super::waits::Plan) -> Result
                             };
                             if dep {
                                 let _ = k;
-                                let cnt = if in_order { v.younger } else { 0 };
+                                // (the younger operations of its own event class: see `wait`)
+                                let cnt = v.same;
                                 if c == Ctr::VaVdst {
                                     vd = vd.min(cnt);
                                 } else {
