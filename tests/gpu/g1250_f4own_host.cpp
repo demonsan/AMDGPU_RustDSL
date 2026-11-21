@@ -126,8 +126,18 @@ int main(int argc, char** argv) {
         }
         return out;
     };
-    const std::vector<uint8_t> Bu = bpreshuf ? bpre_rows(B, N, KB) : B, SBu = bpreshuf ? bpre_rows(SB, N, K / 32) : SB;
-    HC(hipMemcpy2D(dA, KB + lda_pad, A.data(), KB, KB, M, hipMemcpyHostToDevice)); HC(hipMemcpy2D(dB, KB + lda_pad, Bu.data(), KB, KB, N, hipMemcpyHostToDevice));
+    // mode 3 (the vendor's ABpreShuffle layout of the operands, 16 x 16-byte tiles): memory [row / 16][byte / 16][row % 16][byte % 16]; the scales stay row-major
+    auto tile16 = [&](const std::vector<uint8_t>& s, int rows) {
+        std::vector<uint8_t> out(s.size());
+        for (int r = 0; r < rows; r++)
+            for (size_t c = 0; c < KB; c++) out[((size_t)(r / 16) * KB * 16) + (c / 16) * 256 + (size_t)(r % 16) * 16 + c % 16] = s[(size_t)r * KB + c];
+        return out;
+    };
+    if (bpremode == 3 && lda_pad) { fprintf(stderr, "BPRESHUF=3 needs LDA_PAD=0\n"); return 1; }
+    const std::vector<uint8_t> Bu = bpremode == 3 ? tile16(B, N) : (bpreshuf ? bpre_rows(B, N, KB) : B), SBu = (bpreshuf && bpremode != 3) ? bpre_rows(SB, N, K / 32) : SB;
+    const std::vector<uint8_t> Au = bpremode == 3 ? tile16(A, M) : A;
+    if (bpremode == 3) { HC(hipMemcpy(dA, Au.data(), Au.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dB, Bu.data(), Bu.size(), hipMemcpyHostToDevice)); }
+    else { HC(hipMemcpy2D(dA, KB + lda_pad, A.data(), KB, KB, M, hipMemcpyHostToDevice)); HC(hipMemcpy2D(dB, KB + lda_pad, Bu.data(), KB, KB, N, hipMemcpyHostToDevice)); }
     // SCALE_SHUF=1: the scales in the vendor's preshuffled layout (aiter shuffle_scale_f4: [rows / 32][K / 128][32 rows][4 bytes]; rows and
     // K / 32 here are multiples of 32 and 4); the reference below keeps reading the row-major SA / SB
     auto shuf_scale = [](const std::vector<uint8_t>& s, int rows, int cols) {
