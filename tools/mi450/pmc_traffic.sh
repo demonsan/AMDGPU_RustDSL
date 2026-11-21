@@ -1,5 +1,5 @@
 # L2 / memory traffic per dispatch (pmc_run.sh, the counters that count on e08): the MXFP4 GEMM kernels D / M / PCC and the vendor f4gemm
-# at 8192^3 and 4096^3, the MLA _ws and the vendor MLA at 128 x 8192. Two short passes per run (the whole-node lock is held per pass only).
+# at 8192^3 and 4096^3, the MLA _ws and the vendor MLA at 128 x 8192. Three short passes (GL2C takes at most four counters per pass) per run (the whole-node lock is held per pass only).
 set -u
 cd "$SRC"
 A="$CARGO_TARGET_DIR/release/amdc"; CL=/opt/rocm/llvm/bin/clang; O=$W/pmctraffic; rm -rf $O; mkdir -p $O
@@ -12,11 +12,12 @@ H="/opt/rocm/bin/amdclang++ -x hip -O2 --offload-arch=gfx1250 --rocm-path=/opt/r
 $H tests/gpu/g1250_f4own_host.cpp -o $O/own_host 2>/dev/null && $H tests/gpu/g1250_f4gemm_host.cpp -o $O/vendor_host 2>/dev/null && $H tests/gpu/g1250_mla_host.cpp -o $O/mla_host 2>/dev/null || { echo HOST-BUILD-FAIL; exit 6; }
 VCO=$BASE/vendor/gfx1250/f4gemm/f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_ps.co; VK=$(grep -a -o '_ZN[0-9A-Za-z_]*E' $VCO | head -1)
 MCO=$BASE/vendor/gfx1250/mla/mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co; MK=_ZN5aiter34mla_a8w8_qh16_1tg_16mx1_32nx4_np_3pE
-P1="GL2C_READ_SECTORS GL2C_WRITE_SECTORS GL2C_HIT GL2C_MISS GL2C_REQ SQ_WAVES"
-P2="GL2C_EA_RDREQ GL2C_EA_RDREQ_32B GL2C_EA_RDREQ_64B GL2C_EA_WRREQ GRBM_GUI_ACTIVE SQ_BUSY_CYCLES"
+P1="GL2C_READ_SECTORS GL2C_WRITE_SECTORS GL2C_HIT GL2C_MISS"
+P2="GL2C_EA_RDREQ GL2C_EA_RDREQ_32B GL2C_EA_RDREQ_64B GL2C_EA_WRREQ"
+P3="GL2C_REQ SQ_WAVES GRBM_GUI_ACTIVE SQ_BUSY_CYCLES"
 GPU=${PMC_GPU:-0}
 pass() { tag=$1; filt=$2; shift 2
-  for set in "$P1" "$P2"; do
+  for set in "$P1" "$P2" "$P3"; do
     PASS_TIMEOUT=90 bash tools/mi450/pmc_run.sh $tag $GPU "$set" "$@" > $O/last.txt 2>&1
     grep -qE '"bad":0|MLA_OK' $O/last.txt || { echo "[$tag] RUN-FAIL: $(grep -E 'bad|FAIL|HANG|rror' $O/last.txt | head -2 | cut -c1-200)"; return; }
     L=$(ls -d /data/blyu/amdrustdsl/pmc/$tag/pass_* | tail -1)
