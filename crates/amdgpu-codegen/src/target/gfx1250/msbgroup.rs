@@ -115,6 +115,17 @@ pub fn group(m: &mut MFunction, a: &Alloc) -> (usize, usize) {
         // pinned instructions and anything that is not a plain ALU / memory op keep their order relative to everything (a barrier: every
         // earlier instruction precedes it, it precedes every later one)
         let fence: Vec<bool> = insts.iter().enumerate().map(|(j, i)| i.pin || i.words.is_some() || !matches!(g.eff[j].fence, crate::sched::effects::Fence::None)).collect();
+        // memory operations keep their relative order (counted waits - lgkmcnt / dscnt / vmcnt - name the N most recent ones)
+        let mut last_mem: Option<usize> = None;
+        for j in 0..n {
+            let e = &g.eff[j];
+            if e.mem.is_some() || e.smem || crate::op_attrs::attrs(insts[j].op).mnemonic.starts_with("tensor_") {
+                if let Some(p) = last_mem {
+                    preds[j].push(p);
+                }
+                last_mem = Some(j);
+            }
+        }
         let mut last_fence: Option<usize> = None;
         for j in 0..n {
             if let Some(f) = last_fence {
