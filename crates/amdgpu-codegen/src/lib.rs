@@ -14,6 +14,7 @@ pub mod fxhash;
 pub mod gpu_verify;
 pub mod gpu_verify_1250;
 pub mod lds_banks;
+pub mod vgpr_banks;
 pub mod functional_proofs;
 pub mod ir_print;
 pub mod diag;
