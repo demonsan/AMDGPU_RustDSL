@@ -153,6 +153,29 @@ alone, `..._persist_tst` / `..._persist_carry_tst` = per-tile shader-clock stamp
   tile aliasing) was not written. Lessons: (1) at 1.5 - 1.6 GHz this GEMM is limited by something other than the cycles of one workgroup (the L2 / HBM traffic at about 28 TB/s of tile loads, or the power cap), so hiding a fixed
   cost of a workgroup is worth less than its cycles; (2) a clock estimate (cycles / us) belongs next to every stamp comparison.
 
+### The core clock the GEMM holds, with and without multicast (e08, 2026-11-21)
+
+The stamp host now prints `"clock":{"est_ghz":...}` next to the phase stamps: the per-tile cycles of the stamped kernel times the tiles per CU, over the kernel's microseconds (`g1250_f4own_host`; for the persistent
+tile stamps: the median workgroup's tile sequence over the microseconds). Default `..._ks4_s2_epit_roles` (D) against the 4 x 4 lockstep multicast `..._roles_c4x4_lock` (M), 2 reps each, same GPU, us and the clock:
+
+| shape | D us | M us | D clock | M clock | D loop cycles / 512 K | M loop cycles / 512 K |
+|---|---:|---:|---:|---:|---:|---:|
+| 4096^3 | 22.0 - 22.4 | **17.3 - 17.4** | 1.36 GHz | 1.64 - 1.66 | 18.8 k per tile loop (8 iterations) | 20.6 k |
+| 8192^3 | 109.8 - 111.0 | 112.6 - 113.3 | 1.60 - 1.65 | **1.75 - 1.77** | 35.7 k per tile (2,233 per iteration) | 42.1 - 42.5 k (2,634 per iteration) |
+| 8192 x 8192 x 4096 | 69.1 - 69.7 | **67.3 - 67.5** | 1.45 - 1.51 | 1.69 - 1.70 | 17.7 k | 20.4 - 20.5 k |
+| 16384 x 8192 x 4096 | 135.0 - 136.5 | **130.8 - 131.2** | 1.51 - 1.53 | 1.71 - 1.73 | 17.6 k | 20.5 k |
+
+So the multicast raises the clock by 7 - 20 % (less L2 -> LDS traffic: the A tile is fetched once per cluster row, the B tile once per cluster column, 4 x less L2 read traffic per WMMA than the 272 bytes per 32 x 16 x 128
+WMMA of a lone 256 x 256 tile), but its K loop is 15 - 18 % longer in cycles (the lockstep cluster barrier per 512 K: window 1,900 as in the default, barrier + wait +400 cycles per iteration: with a 2-slot ring there
+is no slack for the slowest of 16 workgroups), so the time is a wash at 8192^3 and 3 - 4 % better at K = 4096 and 21 % better at 4096^3. The clock of the lone-workgroup kernel is what the earlier cycle comparisons
+missed (persistent loop with a carried first stage: 184 k -> 174 k cycles per workgroup (-5.5 %) at 1.63 -> 1.46 GHz).
+
+**Per-FLOP traffic (ours vs the vendor's `f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps`).** Both are 256 x 256 tiles of four waves with 128 x 128 per wave: L2 -> LDS fill is 34 KiB per 128 K per workgroup =
+272 bytes per WMMA (A 16 KiB + B 16 KiB + the 1 + 1 KiB scales) without multicast, about 70 with the 4 x 4 cluster. LDS reads: ours 1.0 `ds_load_b128` + 0.375 `ds_load_b32` per WMMA over the whole kernel (768 + 288 for 768
+WMMAs), the vendor 1.25 + 0.31 (1,280 + 320 for 1,024 WMMAs of several forms): the LDS read traffic per FLOP is the same, it is NOT the difference. What differs is (1) the cluster (L2 traffic / clock above), (2) the
+vendor hides the prologue and epilogue (persistent: our 3.0 k + 5.3 - 6.9 k cycles of a 43.6 k tile), (3) its loop iteration does not pay a lockstep barrier on a 2-slot ring (it runs more stages in flight). Putting these
+together: a vendor tile of about 38.5 k cycles at 1.75 GHz = 22 us per tile reproduces 12.4 PF/s; ours with the multicast is 50.5 k cycles (2.6 prologue + 42.1 loop + 5.8 epilogue) at 1.75 GHz.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible

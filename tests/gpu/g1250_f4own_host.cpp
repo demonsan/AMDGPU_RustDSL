@@ -231,6 +231,7 @@ int main(int argc, char** argv) {
             setup.push_back((long)(f[11] - l[14])); tot.push_back((long)(l[13] - f[11])); first.push_back((long)(f[12] - f[11])); lastloop.push_back((long)(l[12] - l[11]));
         }
         auto pct = [](std::vector<long> v, double p) { std::sort(v.begin(), v.end()); return v.empty() ? 0L : v[(size_t)(p * (v.size() - 1))]; };
+        if (us > 0) printf("{\"clock\":{\"est_ghz\":%.3f,\"basis\":\"median workgroup tile sequence cycles / kernel us\"}}\n", (double)pct(tot, 0.5) / (us * 1e3));
         printf("{\"tile_dist\":{\"wgs\":%zu,\"total_min\":%ld,\"total_med\":%ld,\"total_max\":%ld,\"first_loop_med\":%ld,\"last_loop_med\":%ld,\"last_loop_max\":%ld,\"setup_med\":%ld,\"start_to_end_med\":%ld}}\n", tot.size(), pct(tot, 0), pct(tot, 0.5), pct(tot, 1), pct(first, 0.5), pct(lastloop, 0.5), pct(lastloop, 1), pct(setup, 0.5), pct(setup, 0.5) + pct(tot, 0.5));
     }
     for (int wv : {0, 3}) {
@@ -248,6 +249,7 @@ if (stamps && iters > 0) {
         std::vector<unsigned> rec(dbg_bytes / 4);
         HC(hipMemcpy(rec.data(), dDbg, dbg_bytes, hipMemcpyDeviceToHost));
         const char* ph[4] = {"issue", "window", "wait", "barrier"};
+        double clk_tile = 0; int clk_n = 0;
         for (int w = 0; w < 4; ++w) {
             double sum[4] = {0, 0, 0, 0}; long cnt = 0; double it = 0, pro = 0, lp = 0, epi = 0, e1 = 0, e2 = 0, e3 = 0;
             for (int r = 0; r < ty; ++r) for (int c = 0; c < tx; ++c) {
@@ -257,8 +259,14 @@ if (stamps && iters > 0) {
                 it += q[4]; ++cnt; pro += (double)(unsigned)(q[5] - q[8]); lp += (double)(unsigned)(q[6] - q[5]); epi += (double)(unsigned)(q[7] - q[6]); e1 += (double)(unsigned)(q[9] - q[6]); e2 += (double)(unsigned)(q[10] - q[9]); e3 += (double)(unsigned)(q[7] - q[10]);
             }
             if (cnt) printf("{\"stamps\":{\"wave\":%d,\"records\":%ld,\"iters\":%.1f,\"cycles_per_iter\":{\"issue\":%.1f,\"window\":%.1f,\"wait\":%.1f,\"barrier\":%.1f,\"total\":%.1f}}}\n", w, cnt, it / cnt, sum[0] / cnt, sum[1] / cnt, sum[2] / cnt, sum[3] / cnt, (sum[0] + sum[1] + sum[2] + sum[3]) / cnt);
+            if (cnt) { clk_tile += (pro + lp + epi) / cnt; ++clk_n; }
             if (cnt) printf("{\"stamps_kernel\":{\"wave\":%d,\"prologue\":%.0f,\"loop\":%.0f,\"epilogue\":%.0f,\"epi_stage\":%.0f,\"epi_issue\":%.0f,\"epi_store_wait\":%.0f}}\n", w, pro / cnt, lp / cnt, epi / cnt, e1 / cnt, e2 / cnt, e3 / cnt);
             (void)ph;
+        }
+        if (clk_n && us > 0 && !persist) {
+            // the hardware runs ceil(tiles / CUs) tiles back to back per CU: the per-tile cycles of the stamps x that, over the kernel time = the core clock the run held
+            const int tiles = (N / BN) * (M / BM), cus = 256, per_cu = (tiles + cus - 1) / cus;
+            printf("{\"clock\":{\"est_ghz\":%.3f,\"basis\":\"per-tile stamp cycles x %d tiles per CU / kernel us\"}}\n", (clk_tile / clk_n) * per_cu / (us * 1e3), per_cu);
         }
     }
     printf("{\"host\":\"g1250_f4own\",\"kernel\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"bad\":%ld,\"maxrel\":%.3g,\"us\":%.2f,\"tflops\":%.3f,\"ok\":%s}\n", kn, M, N, K, bad, maxrel, us, tflops, bad == 0 ? "true" : "false");

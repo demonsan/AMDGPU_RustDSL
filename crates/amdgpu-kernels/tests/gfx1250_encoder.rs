@@ -64,6 +64,10 @@ fn the_emitted_lines_encode_like_llvm_mc() {
         lines.push(l.to_string());
     }
     // DPP16 / DPP8 (VOP1, VOP2, VOP3 forms; every control, masks, bound_ctrl, fi, source modifiers): tools/mi450/dpp_samples.txt
+    // s_getreg_b32 with a numeric hardware register id
+    for l in include_str!("../../../tools/mi450/hwreg_samples.txt").lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        lines.push(l.to_string());
+    }
     // the packed lookup-table converts (v_perm_pk16_*)
     for l in include_str!("../../../tools/mi450/permpk16_samples.txt").lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
         lines.push(l.to_string());
