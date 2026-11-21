@@ -217,6 +217,16 @@ is exactly where the next tile's stage 1 lands at the start of window 0, so the 
 as the drain saves; a bf16 tile (128 KiB) fits one slot but the slot is the same one. The overlap needs either a third slot (no room), bf16 staging into the 32 KiB plus 128 KiB of a slot that the stage does not need until later (no such slot with 512-K stages)
 or accumulators held in a smaller footprint; not built.
 
+### The window is not the limit of the K loop: the stage's landing time is (e08, 2026-11-21)
+
+Timing experiment (`exp_..._epit_roles_hoist[_stamps]`, WRONG results, SKIPCHECK): the fragments of sub-step 0 serve all four sub-steps, i.e. a quarter of the LDS reads. 8192^3, wave 0, cycles per 512-K iteration
+(issue / window / tensor wait / barrier = total): default 76 / **1,915** / 62 / 205 = **2,257**; hoisted 76 / **1,364** / **545** / 297 = **2,282**. The window shrinks by 29 % and the iteration does not move: the wait for the stage
+takes the difference. The stage issued at the start of window t lands 1,909 - 1,976 cycles later in both runs (147 KiB in about 1.95 k cycles = 75 B/clk per CU), i.e. the 2-slot loop is bound by the landing time of the next stage
+(L2 -> LDS ingest and latency) plus the per-iteration issue + barrier (about 280 cycles), and the window (1.9 k with the LDS reads, 1.36 k without) happens to equal the landing time. So fragment-read / WMMA reordering
+(software pipelining, fewer reads per WMMA, reuse hints) cannot shorten the iteration by itself: it would have to be paired with a faster ingest or a deeper ring (a vendor-like 3 - 4 stages hides the landing behind two windows: its
+iteration is then max(window, ingest) ~ 1.95 k instead of 2.25 k). Our PCC tile: 16 x 2.32 k loop + 5.3 k epilogue + ~1 k = 43.4 k cycles against an ingest floor of 16 x 1.95 k = 31 k; the vendor's 12.4 PF/s at 1.75 GHz needs
+about 2.4 k cycles per 512 K including everything.
+
 ### Smaller first stage (analysis, not built)
 
 The idea: split the first stage's loads into K halves, wait for the first half only, and run the first two sub-steps while the second half lands (peeling tile 0's window into the prologue). A layout-compatible

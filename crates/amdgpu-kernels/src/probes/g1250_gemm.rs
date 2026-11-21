@@ -480,7 +480,7 @@ pub fn gemm_tdm_stage_f4_256x256_ks2_epit_ipf(name: &str, relax: bool, roles: bo
 
 /// The 256 x 256 tile with K slots of 512 (ks 4) in a 2-slot ring: one barrier and one stage (2 tensor loads per wave) per 512 K instead of 256, the next slot loading during the whole window.
 pub fn gemm_tdm_stage_f4_256x256_ks4_s2(name: &str, relax: bool, roles: bool) -> Function {
-    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), tstamps: name.ends_with("_tst"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
+    gemm_tdm_stage_f4_ring(name, F4Shape { wm: 2, wn: 2, tm: 4, tn: 8, ks: 4, relax, cx: 1, cy: 1, bf16: false, lock: false, split: false }, true, false, false, true, RingOpts { slots: 2, epilogue_lds: 2, roles, stamps: name.ends_with("_stamps"), hoist: name.contains("_hoist"), persistent: name.contains("_persist") || name.contains("_carry"), carry: name.contains("_carry"), epi_rot: name.contains("_rot"), tstamps: name.ends_with("_tst"), pitch: name.contains("_lda"), epi_bands: if name.contains("_bands2") { 2 } else if name.contains("_bands") { 4 } else { 0 }, stagger: if name.contains("_stag") { name.rsplit("_stag").next().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 }, wave_order: if name.contains("_gray") { 1 } else if name.contains("_wt") { 2 } else { 0 }, ..RingOpts::default() })
 }
 
 /// The ks 4 two-slot tile in a lockstep multicast cluster of `cx` x `cy` workgroups (one cluster barrier per 512 K).
@@ -649,6 +649,8 @@ pub struct RingOpts {
     pub epi_bands: u8,
     /// no in-window software pipeline (`TdmF4Body::nopf`)
     pub nopf: bool,
+    /// timing experiment: fragments read once per window (wrong results)
+    pub hoist: bool,
     /// the A / B row pitch is a kernarg (`lda`, bytes, @72) = K / 2 + PAD instead of K / 2 (host LDA_PAD): row pitches that are powers of two (K = 4096: 2 KiB) land the 256 rows of a
     /// tile in a few memory channels; the pad moves them apart
     pub pitch: bool,
@@ -675,7 +677,7 @@ impl RingOpts {
 
 impl Default for RingOpts {
     fn default() -> Self {
-        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
+        RingOpts { slots: SLOTS as u8, roles: false, persistent: false, scale_shuf: false, epilogue_lds: 0, swizzle: 0, lazy: false, iprefetch: 0, stamps: false, swap: false, stagger: 0, wave_order: 0, ovl: 0, ovl_burst: false, epi_bands: 0, nopf: false, hoist: false, pitch: false, racompact: false, lds_pad: 0, carry: false, epi_rot: false, tstamps: false }
     }
 }
 
@@ -1177,7 +1179,7 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
 
     let ovl_ctx = ovl_vars.as_ref().map(|(hp, ptrs, prev)| amdgpu_stage::gemm::tdm_f4::Ovl { ptrs: ptrs.clone(), hp: *hp, prev: prev.clone(), groups: ring.ovl as i32 / 2, burst: ring.ovl_burst });
     let mut emit = |b: &mut FnBuilder, role: Role| {
-        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
+        let mut body = TdmF4Body { sh, a: ra.clone(), b: rb.clone(), sa: rsa.clone(), sb: rsb.clone(), pa, pb, psa, psb, a_org, b_org, sa_org, sb_org, g1a, g1b, g1sa, g1sb, abase, bbase, sabase, sbbase, wl, acc: Vec::new(), steady: false, leader, depth: 3, roles: ring.roles, stamps: ring.stamps, nopf: ring.nopf, hoist: ring.hoist, ovl: ovl_ctx.clone(), pc_c: pc, perm: ring.perm(), stamp_vars: Vec::new(), st_t1: None, st_t2: None, carry: ring.carry, first_tile: first_cond, next_orgs: carry_next, next_live: next_live_c, row_pad, scale_shuf: ring.scale_shuf };
         let ts_a = if ring.tstamps { Some(cyc_now(b)) } else { None };
         pipe.run(b, role, &mut body);
         let ts_b = if ring.tstamps { Some(cyc_now(b)) } else { None };
