@@ -58,6 +58,7 @@ pub const RULES: &[Rule] = &[
     Rule { id: "GV-1250-VOPD", layer: Layer::Asm, what: "every dual-issue (VOPD) instruction is a legal combination: opcodes from the X / Y sets, destinations of opposite parity, each source slot of the two components in different register banks unless the same register, the second source a VGPR, no literal, at most two scalar operands, the Y component not reading the X destination" },
     Rule { id: "GV-1250-CLAUSE-TYPE", layer: Layer::Asm, what: "an instruction clause holds instructions of one memory type only (scalar loads, vector memory, flat, LDS)" },
     Rule { id: "GV-1250-FORBIDDEN-OP", layer: Layer::Asm, what: "an instruction known to hang the device (v_nop_power): forbidden" },
+    Rule { id: "GV-1250-MODE2-WAIT", layer: Layer::Asm, what: "in the relaxed scheduling mode 2 every dependency the hardware leaves to the program is waited for on every path of the final text: a non-VALU instruction touching a VGPR an outstanding VALU writes (or writing one it reads) after `s_wait_alu` va_vdst, an instruction overwriting a VGPR an outstanding vector-memory / LDS operation reads after vm_vsrc (or the operation's counter wait) - with the per-class completion order" },
     Rule { id: "GV-1250-PREFETCH-BOUNDS", layer: Layer::Asm, what: "every instruction-prefetch window (s_prefetch_inst: base + offset, (soffset + length) & 31 + 1 lines of 128 bytes) lies provably inside the kernel's code (a window past the end of the code faults): the base a s_get_pc_i64 of the same block, the soffset a constant move of the same block" },
     Rule { id: "GV-1250-PERMPK16", layer: Layer::Asm, what: "a packed lookup-table convert (v_perm_pk16_*) only with its mitigation (public LLVM fixVPermPk16Hazard / isVPermPk16SafeInstr): the kernel entry prologue (s_mov_b64 s[n:n+1], 0; v_nop; global_prefetch_b8 v0, s[n:n+1] before any other vector memory), the very next instruction a safe VALU (or v_nop), EXEC never written in the kernel (so it is non-zero at the instruction), and both table sources VGPRs or both SGPRs" },
     Rule { id: "GV-1250-PERMLANE-CMPX", layer: Layer::Asm, what: "a lane permute does not directly follow a v_cmpx" },
@@ -2307,6 +2308,288 @@ pub fn permpk16_safe_follower(mn: &str, ops: &str) -> bool {
     SAFE.contains(&base)
 }
 
+/// GV-1250-MODE2-WAIT: a second, text-level check of the mode-2 waits (independent of check.rs's MIR model): a dataflow over the text's
+/// control flow with the VGPR windows (`s_set_vgpr_msb`) tracked, so registers compare as absolute numbers. Outstanding VALU operations
+/// (event classes XDL / TRANS / other: in order within a class; a scaled f4 WMMA counts twice) and vector-memory / LDS source reads (classes
+/// LDS / buffer / other; also completed by their counter's wait for `n` once `n` younger operations of that counter were issued).
+mod mode2 {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Debug)]
+    pub struct It {
+        pub alu: bool,
+        pub class: u8,
+        pub same: u32,
+        /// (vm items) the memory counter: 0 load, 1 store, 2 LDS; and the younger operations of that counter
+        pub ctr: u8,
+        pub cy: u32,
+        pub dst: Vec<u32>,
+        pub src: Vec<u32>,
+    }
+
+    #[derive(Clone, PartialEq, Debug, Default)]
+    pub struct St {
+        pub items: BTreeMap<usize, It>,
+        /// the VGPR window per slot (None: differs between paths)
+        pub msb: [Option<u8>; 4],
+        pub mode: Option<u8>,
+    }
+
+    fn merge(a: &St, b: &St) -> St {
+        let mut r = a.clone();
+        for (k, v) in &b.items {
+            match r.items.get_mut(k) {
+                Some(x) => {
+                    x.same = x.same.min(v.same);
+                    x.cy = x.cy.min(v.cy);
+                }
+                None => {
+                    r.items.insert(*k, v.clone());
+                }
+            }
+        }
+        for s in 0..4 {
+            if a.msb[s] != b.msb[s] {
+                r.msb[s] = None;
+            }
+        }
+        r.mode = if a.mode == b.mode { a.mode } else { None };
+        r
+    }
+
+    /// The absolute VGPRs of an operand in slot `s` (None window: every window, a wildcard).
+    fn vregs(tok: &str, w: Option<u8>) -> Vec<u32> {
+        let t = tok.trim().trim_start_matches('-').trim_start_matches('|').trim_end_matches('|');
+        let (lo, hi) = if let Some(r) = t.strip_prefix("v[") {
+            match r.trim_end_matches(']').split_once(':').and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))) {
+                Some(x) => x,
+                None => return Vec::new(),
+            }
+        } else {
+            match t.strip_prefix('v').and_then(|x| x.parse::<u32>().ok()) {
+                Some(r) => (r, r),
+                None => return Vec::new(),
+            }
+        };
+        let ws: Vec<u32> = match w {
+            Some(w) => vec![w as u32],
+            None => (0..4).collect(),
+        };
+        ws.iter().flat_map(|w| (lo..=hi).map(move |r| r + 256 * w)).collect()
+    }
+
+    fn trans(mn: &str) -> bool {
+        ["v_exp_", "v_log_", "v_rcp_", "v_rsq_", "v_sqrt_", "v_sin_", "v_cos_", "v_rcp_iflag"].iter().any(|p| mn.starts_with(p))
+    }
+
+    pub fn check(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>) {
+        let mut needs = BTreeMap::new();
+        check_needs(insts, labels, v, &mut needs);
+    }
+
+    /// `check`, also returning per instruction index the waits it lacks: (va_vdst count, vm_vsrc count) (15 / 7: none).
+    pub fn check_needs(insts: &[Inst], labels: &HashMap<String, usize>, v: &mut Vec<Violation>, needs: &mut BTreeMap<usize, (u32, u32)>) {
+        let sets_mode2 = insts.iter().any(|i| i.mn.starts_with("s_setreg") && i.ops.to_uppercase().contains("SCHED_MODE"));
+        if !sets_mode2 {
+            return;
+        }
+        let n = insts.len();
+        let mut at: Vec<Option<St>> = vec![None; n + 1];
+        at[0] = Some(St { items: BTreeMap::new(), msb: [Some(0); 4], mode: Some(0) });
+        let mut work = vec![0usize];
+        let mut reported: std::collections::BTreeSet<(usize, usize)> = Default::default();
+        let mut steps = 0usize;
+        while let Some(i) = work.pop() {
+            steps += 1;
+            if i >= n || steps > 4_000_000 {
+                continue;
+            }
+            let ins = &insts[i];
+            let mut st = at[i].clone().unwrap_or_default();
+            let mn = ins.mn.as_str();
+            // mode, windows, waits
+            if mn.starts_with("s_setreg") && ins.ops.to_uppercase().contains("SCHED_MODE") {
+                let val = ins.ops.rsplit(',').next().and_then(|x| parse_int(x));
+                st.mode = val.map(|x| (x & 3) as u8);
+            } else if mn == "s_set_vgpr_msb" {
+                if let Some(x) = parse_int(&ins.ops) {
+                    let x = x as u32;
+                    st.msb = [Some(((x >> 6) & 3) as u8), Some((x & 3) as u8), Some(((x >> 2) & 3) as u8), Some(((x >> 4) & 3) as u8)];
+                }
+            } else if mn == "s_wait_alu" || mn == "s_wait_idle" {
+                let (vd, vm) = if mn == "s_wait_idle" {
+                    (0, 0)
+                } else if let Some(x) = parse_int(&ins.ops) {
+                    (((x >> 12) & 0xf) as u32, ((x >> 2) & 7) as u32)
+                } else {
+                    // symbolic: depctr_va_vdst(n) depctr_vm_vsrc(n)
+                    let f = |name: &str, dflt: u32| ins.ops.split_whitespace().find_map(|t| t.strip_prefix(name).and_then(|r| r.trim_start_matches('(').trim_end_matches(')').parse::<u32>().ok())).unwrap_or(dflt);
+                    (f("depctr_va_vdst", 15), f("depctr_vm_vsrc", 7))
+                };
+                st.items.retain(|_, it| if it.alu { !(vd == 0 || it.same >= vd) || vd == 15 } else { !(vm == 0 || it.same >= vm) || vm == 7 });
+            } else if let Some(c) = match mn {
+                "s_wait_loadcnt" => Some(0u8),
+                "s_wait_storecnt" => Some(1),
+                "s_wait_dscnt" => Some(2),
+                _ => None,
+            } {
+                if let Some(x) = parse_int(&ins.ops) {
+                    st.items.retain(|_, it| !(!it.alu && it.ctr == c && (x == 0 || it.cy >= x as u32)));
+                }
+            } else if mn.starts_with("v_") || mn.starts_with("global_") || mn.starts_with("buffer_") || mn.starts_with("scratch_") || mn.starts_with("flat_") || mn.starts_with("ds_") {
+                let relaxed = st.mode != Some(0);
+                let duals: Vec<(String, Vec<String>)> = {
+                    let full = format!("{} {}", ins.mn, ins.ops);
+                    full.split("::").map(|h| {
+                        let h = h.trim();
+                        let (m, r) = h.split_once(char::is_whitespace).unwrap_or((h, ""));
+                        (m.to_string(), r.split(',').map(|x| x.trim().split_whitespace().next().unwrap_or("").to_string()).filter(|x| !x.is_empty()).collect())
+                    }).collect()
+                };
+                let mut reads: Vec<u32> = Vec::new();
+                let mut writes: Vec<u32> = Vec::new();
+                for (m, ops) in &duals {
+                    let sl = crate::target::gfx1250::msb::slots(m, ops.len()).unwrap_or_else(|| vec![Some(1); ops.len()]);
+                    let valu = m.starts_with("v_");
+                    let load = !valu && (m.contains("load") || m.contains("_read") || (m.contains("atomic") && m.contains("rtn")));
+                    let is_cmp = m.starts_with("v_cmp");
+                    for (k, o) in ops.iter().enumerate() {
+                        let s = sl.get(k).copied().flatten();
+                        let w = match s {
+                            Some(s @ 0..=3) => st.msb[s],
+                            _ => Some(0),
+                        };
+                        let r = vregs(o, w);
+                        let first_is_dst = (valu && !is_cmp && m != "v_readfirstlane_b32" && !m.starts_with("v_readlane")) || load;
+                        if k == 0 && first_is_dst {
+                            writes.extend(r.iter().copied());
+                            if m.starts_with("v_fmac") || m.starts_with("v_wmma") || m.starts_with("v_swmmac") {
+                                reads.extend(r.iter().copied());
+                            }
+                        } else {
+                            reads.extend(r.iter().copied());
+                        }
+                    }
+                }
+                let valu = mn.starts_with("v_");
+                if relaxed {
+                    let hit = |xs: &[u32], ys: &[u32]| xs.iter().any(|x| ys.contains(x));
+                    for (k, it) in &st.items {
+                        let dep = if it.alu { !valu && (hit(&reads, &it.dst) || hit(&writes, &it.dst) || hit(&writes, &it.src)) } else { hit(&writes, &it.src) };
+                        if dep {
+                            let e = needs.entry(i).or_insert((15, 7));
+                            if it.alu {
+                                e.0 = e.0.min(it.same);
+                            } else {
+                                e.1 = e.1.min(it.same);
+                            }
+                        }
+                        if dep && reported.insert((i, *k)) {
+                            viol(v, "GV-1250-MODE2-WAIT", format!("line {}: `{} {}` needs `s_wait_alu` {} for line {} (`{}`) on some path (relaxed scheduling mode 2)", ins.line, ins.mn, ins.ops, if it.alu { "va_vdst" } else { "vm_vsrc" }, insts[*k].line, insts[*k].mn));
+                        }
+                    }
+                }
+                // the new operation
+                if valu {
+                    let class = if mn.starts_with("v_wmma") || mn.starts_with("v_swmmac") { 2 } else if trans(mn) { 1 } else { 0 };
+                    let w = if mn.starts_with("v_wmma_scale") && mn.ends_with("_f4") { 2 } else { 1 };
+                    for it in st.items.values_mut().filter(|x| x.alu && x.class == class) {
+                        it.same = (it.same + w).min(64);
+                    }
+                    st.items.retain(|_, x| !(x.alu && x.same >= 15));
+                    if !writes.is_empty() || !reads.is_empty() {
+                        st.items.insert(i, It { alu: true, class, same: 0, ctr: 0, cy: 0, dst: writes, src: reads });
+                    }
+                } else {
+                    let ctr = if mn.starts_with("ds_") { 2 } else if mn.contains("store") { 1 } else { 0 };
+                    let class = if mn.starts_with("ds_") { 1 } else if mn.starts_with("buffer_") { 2 } else { 0 };
+                    for it in st.items.values_mut().filter(|x| !x.alu) {
+                        if it.class == class {
+                            it.same = (it.same + 1).min(64);
+                        }
+                        if it.ctr == ctr {
+                            it.cy = (it.cy + 1).min(64);
+                        }
+                    }
+                    st.items.retain(|_, x| !(!x.alu && x.same >= 7));
+                    if !reads.is_empty() {
+                        st.items.insert(i, It { alu: false, class, same: 0, ctr, cy: 0, dst: Vec::new(), src: reads });
+                    }
+                }
+            }
+            // successors
+            let mut succ: Vec<usize> = Vec::new();
+            let branch = mn == "s_branch" || mn.starts_with("s_cbranch");
+            if !(mn == "s_branch" || mn == "s_endpgm" || mn == "s_setpc_b64") {
+                succ.push(i + 1);
+            }
+            if branch {
+                let target = ins.ops.split(',').next().unwrap_or("").trim();
+                if let Some(t) = labels.get(target) {
+                    succ.push(*t);
+                }
+            }
+            for t in succ {
+                if t > n {
+                    continue;
+                }
+                let m = match &at[t] {
+                    None => st.clone(),
+                    Some(x) => merge(x, &st),
+                };
+                if at[t].as_ref() != Some(&m) {
+                    at[t] = Some(m);
+                    work.push(t);
+                }
+            }
+        }
+    }
+}
+
+/// Mode 2: the `s_wait_alu` waits the final text still lacks (instruction expansions of the emitter the MIR model does not see: a large
+/// LDS offset split into a `v_add` + the access, a 64-bit address computed into a temporary, ...), inserted with the smallest counts the
+/// text dataflow allows, until GV-1250-MODE2-WAIT holds (adding waits only removes behaviours, so the result is checked by the rule itself).
+thread_local! {
+    static MODE2_NO_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: `mode2_complete` leaves the text unchanged (the MIR plan alone) - the mutation test of the independent text check.
+#[doc(hidden)]
+pub fn without_mode2_completion<R>(g: impl FnOnce() -> R) -> R {
+    MODE2_NO_COMPLETE.with(|c| c.set(true));
+    let r = g();
+    MODE2_NO_COMPLETE.with(|c| c.set(false));
+    r
+}
+
+pub fn mode2_complete(asm: &str) -> String {
+    if MODE2_NO_COMPLETE.with(|c| c.get()) {
+        return asm.to_string();
+    }
+    let mut text = asm.to_string();
+    for _round in 0..64 {
+        let (insts, _raw, labels) = lex(&text);
+        let mut v = Vec::new();
+        let mut needs = BTreeMap::new();
+        mode2::check_needs(&insts, &labels, &mut v, &mut needs);
+        if needs.is_empty() {
+            break;
+        }
+        let at: HashMap<usize, (u32, u32)> = needs.iter().map(|(i, n)| (insts[*i].line, *n)).collect();
+        let mut out = String::with_capacity(text.len() + needs.len() * 24);
+        for (ln, l) in text.lines().enumerate() {
+            if let Some(&(vd, vm)) = at.get(&(ln + 1)) {
+                let d = (0xff9fu32 & !(0xf << 12) & !(0x7 << 2)) | (vd.min(15) << 12) | (vm.min(7) << 2);
+                out.push_str(&format!("    s_wait_alu {d:#x}\n"));
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        text = out;
+    }
+    text
+}
+
 /// GV-1250-PREFETCH-BOUNDS (see the rule). Byte offsets: the disassembler's addresses when present, else the in-process encoder's sizes
 /// (a line it cannot size makes every window unprovable). `s_get_pc_i64` yields the address of the next instruction. Register values are
 /// tracked within a block (a label resets them); any other write of a tracked register forgets it.
@@ -2466,6 +2749,7 @@ pub fn verify_asm(asm: &str) -> Vec<Violation> {
     let mut v = Vec::new();
     permpk16_rule(&insts, &mut v);
     prefetch_rule(asm, &insts, &mut v);
+    mode2::check(&insts, &labels, &mut v);
     tdm_drain(&insts, &labels, &mut v);
     smem_pending(&insts, &labels, &mut v);
     wait_range(&insts, &mut v);

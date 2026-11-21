@@ -328,6 +328,10 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
     if !m.exact && (kdv("wmma_reuse").unwrap_or(0) != 0 || std::env::var("AMDC_WMMA_REUSE").is_ok()) {
         out = wmma_reuse(&out);
     }
+    // mode 2: the waits of the emitter's own multi-instruction expansions (invisible to the MIR plan), completed on the text
+    if !m.exact && super::mode2_enabled(m) {
+        out = crate::gpu_verify_1250::mode2_complete(&out);
+    }
     // the packed lookup-table converts: a safe instruction must issue right after each (public LLVM fixVPermPk16Hazard): a `v_nop` unless
     // the next instruction in program order is one (G5 GV-1250-PERMPK16 checks the result)
     if !m.exact {
