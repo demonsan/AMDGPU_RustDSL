@@ -336,6 +336,11 @@ pub fn mla_g1250_qh16_ws4std() -> Function {
     mla_ws_with("mla_g1250_qh16_ws4std", false, 64 | 256 | 4096 | 32768 | 65536 | 512, false)
 }
 
+/// timing aid: `_wsstd` with the instruction prefetch (32 KB at entry + windows at the tail / merge / final)
+pub fn mla_g1250_qh16_wsstdp() -> Function {
+    mla_ws_with("mla_g1250_qh16_wsstdp", false, 64 | 128 | 256 | 512 | 16384 | 65536 | 131072 | 262144, false)
+}
+
 pub fn mla_g1250_qh16_wsbm() -> Function {
     mla_ws_with("mla_g1250_qh16_wsbm", false, 1, false)
 }
@@ -493,6 +498,8 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
     if ipf {
         // MODE.SCALAR_PREFETCH_EN first: the prefetches are NOPs without it (the vendor kernels set it the same way)
         b.enable_scalar_prefetch();
+        // read MODE back (as the vendor kernels do after the setreg): the prefetches below issue after the mode change has taken effect
+        let _mode = b.let_(Op::SysVal { op: amdgpu_dsl::SysValOp::GetReg, imm: 1 | (31 << 11) });
         // the first 16 KB (prologue, the page loop); later windows are fetched where their code starts. A prefetch past the end of the code
         // can fault (an unmapped page): only windows that are known to lie inside the code are requested
         let pc = b.get_pc();
@@ -1120,10 +1127,6 @@ fn mla_ws_with(name: &str, dsplit: bool, branchless: u32, pipe: bool) -> Functio
         pf_here(&mut b, 2);
         b.wait_tensor(0);
         compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
-        if tstamp {
-            // timing experiment: the same page again (warm instruction cache; the output is garbage in this variant anyway)
-            compute(&mut b, 0, amdgpu_dsl::varx(gl) + 0);
-        }
         b.end_if();
     } else if !pipe && !exit_tdm {
         let npairs = b.bind_i32((ev(nw) + 1) >> 1);
