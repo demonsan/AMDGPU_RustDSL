@@ -504,7 +504,7 @@ mod tests {
             loops: Vec::new(),
             alias: Default::default(),
             elide_fallthrough: false,
-            edge_pad: false, ra_dword: false, ra_compact: false, vopd: false,
+            edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false,
             agpr_pin: Default::default(),
             reg_hints: Default::default(),
         }
@@ -572,7 +572,7 @@ mod interleave_tests {
             loops: Vec::new(),
             alias: Default::default(),
             elide_fallthrough: false,
-            edge_pad: false, ra_dword: false, ra_compact: false, vopd: false,
+            edge_pad: false, ra_dword: false, ra_compact: false, vopd: false, msb_group: false,
             agpr_pin: Default::default(),
             reg_hints: Default::default(),
         }

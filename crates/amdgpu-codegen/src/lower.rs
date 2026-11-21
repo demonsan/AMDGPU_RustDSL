@@ -673,6 +673,7 @@ impl Lowerer {
             ra_dword: opt_on("radword"),
             ra_compact: opt_on("racompact"),
             vopd: opt_on("vopd"),
+            msb_group: opt_on("msbgroup"),
             agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));

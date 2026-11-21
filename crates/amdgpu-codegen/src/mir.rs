@@ -936,6 +936,8 @@ pub struct MFunction {
     pub ra_compact: bool,
     /// `vopd` lowering option (gfx1250): VOPD dual-issue pairing (target/gfx1250/vopd.rs; `AMDC_VOPD` for A/B)
     pub vopd: bool,
+    /// `msbgroup` lowering option (gfx1250): group instructions by VGPR window (target/gfx1250/msbgroup.rs)
+    pub msb_group: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
     /// Register planning (DSL `RegMark`s resolved to vregs) and the weave / stage regions instructions are tagged with (`MInst::region`).
