@@ -25,7 +25,7 @@ pub fn kernel_by_name_raw(name: &str) -> Option<amdgpu_dsl::Function> {
         if ["persist", "persist_stamps", "persist_rot", "persist_tst", "persist_carry", "persist_carry_tst"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2(name, false, true));
         }
-        if ["c4x4_lock_persist", "c4x4_lock_persist_carry", "c4x4_lock_persist_tst", "c4x4_lock_persist_carry_tst", "c4x4_lock_persist_carry_split", "c4x4_lock_split", "c4x4_lock_split_stamps", "c4x4_lock_nowin_stamps", "c4x4_lock_hoist_stamps", "c4x4_lock_ahead2_stamps", "c4x4_lock_persist_carry_ahead2"].contains(&rest) {
+        if ["c4x4_lock_persist", "c4x4_lock_persist_carry", "c4x4_lock_persist_tst", "c4x4_lock_persist_carry_tst", "c4x4_lock_persist_carry_split", "c4x4_lock_split", "c4x4_lock_split_stamps", "c4x4_lock_nowin_stamps", "c4x4_lock_hoist_stamps", "c4x4_lock_ahead2_stamps", "c4x4_lock_persist_carry_ahead2", "c4x4_lock_persist_carry_bf16"].contains(&rest) {
             return Some(crate::probes::g1250_gemm::gemm_tdm_stage_f4_256x256_ks4_s2_cluster(name, 4, 4));
         }
         if ["hoist", "hoist_stamps", "nowin_stamps"].contains(&rest) {

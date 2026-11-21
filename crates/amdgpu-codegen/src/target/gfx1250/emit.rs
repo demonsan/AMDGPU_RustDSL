@@ -385,7 +385,7 @@ pub fn emit_kd(m: &MFunction, a: &Alloc, kd: &[(String, i64)]) -> Result<String,
         }
     }
     // the launch ABI class and its buffer extents (custom keys: the runtime ignores them, the hosts refuse a launch that does not match)
-    for (k, key) in [("launch_abi", "amdc_launch_abi"), ("split_ws_bytes", "amdc_split_ws_bytes"), ("split_ctr_bytes", "amdc_split_ctr_bytes")] {
+    for (k, key) in [("launch_abi", "amdc_launch_abi"), ("split_ws_bytes", "amdc_split_ws_bytes"), ("split_ctr_bytes", "amdc_split_ctr_bytes"), ("b_preshuffle", "amdc_b_preshuffle")] {
         if let Some(v) = kdv(k) {
             out.push_str(&format!("    .{key}: {v}\n"));
         }
