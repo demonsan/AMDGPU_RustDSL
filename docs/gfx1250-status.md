@@ -76,6 +76,28 @@ completed. KV-split kernels (`_wsk`, `_wskf`, `_cmb`) carry their launch ABI in 
 counter extents); `g1250_mla_host` refuses a mismatched launch before any allocation (tools/mi450/launch_contract.sh).
 
 Dispatch rule (2026-11-21, latest): 1 page per sequence -> `_ws4`; 2 .. 6 -> `_ws2`; 7 and more -> `_ws`. Since the final-read fix: the merge partials padded per 8-head half (-1 .. -3 %), `_ws4`'s direct stores packed to 8 bytes by an in-quad 4 x 4 transpose (DPP xor 1 / xor 2: -5 .. -7 %), `_ws2` merging pairwise (each wave finalizes half its tiles from its partner's partials) with the same 8-byte stores (-1 %). On e08 (ours / vendor; the vendor at 1 .. 2 pages runs at the launch floor and its paired ratio swings): 1 x 64 1.24, 4 x 64 1.1 .. 1.3, 4 x 128 ~1.26, 4 x 256 ~1.2 .. 1.4, 5+ pages 0.82 .. 0.92.
+
+#### Short sequences (1 .. 6 pages), 2026-11-21 write-up
+
+The floor on e08: an empty kernel with the MLA ABI runs at 2.7 .. 2.9 us per back-to-back launch; the vendor's 1 .. 2-page MLA is at
+that floor (~2.9 us), so its own work is hidden by the launch rate. Ours, by deletion (kernels stopped at a point, timed - the stamp variant
+distorts first-execution phases and is not used for this): prologue +0.6 us over the empty kernel, the first page's arrival and compute
+mostly under it, the ending (merge, final reduce, stores) the largest avoidable part. What was done, in order (all paired on e08, each
+kept only where it won):
+- the final reduce's LDS reads had every lane 256 B apart (one bank for the wave, 32-way): lane-interleaved chunks -> `_ws` 0.70 .. 0.92,
+  `_ws2` 0.80 .. 0.88 (the largest single win of the day: `_ws` / `_ws2` under the vendor from 5 pages on);
+- `_ws4` (every wave all pages, a quarter of the dims) needs no cross-wave merge at all: direct bf16 stores from registers, then packed to
+  4 bytes (DPP xor-1 row swap) and to 8 bytes (an in-quad 4 x 4 transpose, xor-1 then xor-2): 0.93 .. 0.95, then 0.94 .. 0.97, then 0.985;
+- the merge partials padded per 8-head half (the lane halves' stores 16 banks apart): 0.97 .. 0.99;
+- `_ws2` merging pairwise (each wave finalizes half its tiles from its partner's partials) with the 8-byte stores: 0.99 (with 2-byte
+  stores the same scheme lost 5 .. 7 %);
+- the prologue's loads issued together (Q first, then all scalars before any use): 0.98 .. 0.995;
+- the first page's tensor load right after the sequence bounds (`_ws4` / `_ws2`): 0.97 .. 0.98 / 0.96 .. 0.97.
+Rejected: instruction prefetch (0 on the real kernels; its stamp-variant gain was the stamps' own cost), the 2D page tensor tile (0),
+all-pages-in-the-loop (+1 .. +5 %), the pairwise merge with 2-byte stores (+5 .. +7 %).
+Result (ours / vendor): 1 page 1.2 .. 1.3, 2 .. 4 pages 1.1 .. 1.3 (both noisy: the vendor sits on the launch floor), 5+ pages
+0.82 .. 0.92. What remains at 1 .. 4 pages is the prologue's three scalar round trips before the first tensor load and one page of
+latency-bound compute; closing it would need the vendor's structure (async per-lane page loads, no tensor descriptor round trip).
 pairs share a page), more -> `_ws` (each wave its own pages, private 2-slot ring, final cross-wave merge). `_ws` today: scalar loads for
 the sequence bounds / page ids, full page pairs + the sequence's last page computed apart (the only masked page; every other page
 without mask code), the lean softmax (exponents / exps / sums batched: no TRANS-WAR `v_nop`), the GEMM compile policy. 128 x 4096 and
