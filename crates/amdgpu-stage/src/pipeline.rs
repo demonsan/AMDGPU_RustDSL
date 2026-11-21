@@ -266,6 +266,32 @@ impl Pipeline {
         let idx0 = inits.pop().expect("idx");
         inits.extend(state);
         inits.push(idx0);
+        if self.carry && self.cadence == Cadence::OneWindow && self.slots == 2 {
+            // carry mode, 2-slot ring, an even tile count (the host contract): the loop runs PAIRS of windows in the static slots 0 and 1 (tile it even in slot 0), then the steady window of tile nkv - 2 (slot 0) and
+            // the last tile nkv - 1 (slot 1) are peeled: the slot of every window, of the carried stage (slot 0) and of the epilogue (slot 1) is static, whatever the tile count
+            let vars = b.begin_loop(&inits);
+            let (it, _idx) = (vars[0], vars[1 + ns]);
+            body.bind_state(&vars[1..1 + ns]);
+b.assume_trusted(
+            it,
+            Ext::c(0),
+            self.nkv_bound.clone(),
+            "tile counter (tile::Pipeline): starts at 0 and the loop exits at it >= nkv - 1, so the body only runs with it <= nkv - 2 <= ceil(rows / tile_rows); the guard compares against a derived value the interval engine cannot relate to the bound",
+        );
+            self.iter_static(b, role, body, Opnd::Var(it), 0, true);
+            let it1 = b.bind_i32(varx(it) + 1);
+            self.iter_static(b, role, body, Opnd::Val(it1), 1, true);
+            let it2 = b.bind_i32(varx(it) + 2);
+            b.set_var(it, Opnd::Val(it2));
+            let nkv_m2 = b.let_i32(ev(self.nkv) - 2);
+            let stop = b.bind_cond(!ev(it2).lt(&nkv_m2));
+            b.break_if(stop);
+            b.end_loop();
+            self.iter_static(b, role, body, Opnd::Var(it), 0, true);
+            let itl = b.bind_i32(varx(it) + 1);
+            self.iter_static(b, role, body, Opnd::Val(itl), 1, false);
+            return;
+        }
         let vars = b.begin_loop(&inits);
         let (it, idx) = (vars[0], vars[1 + ns]);
         body.bind_state(&vars[1..1 + ns]);
@@ -397,6 +423,41 @@ impl Pipeline {
         b.else_();
         self.iter(b, role, body, it, idx, false, false, last_barrier);
         b.end_if();
+    }
+
+    /// One `OneWindow` iteration of tile `it` in the STATIC ring slot `slot` of a 2-slot ring (carry mode); the peeled last window (`staged` = false) issues the next output tile's first stage.
+    #[allow(clippy::too_many_arguments)]
+    fn iter_static(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: i32, staged: bool) {
+        let nkv = ev(self.nkv);
+        let other = 1 - slot;
+        let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
+        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2: Some(SlotIdx::new(other, b.bind_opnd(&it_p1))), masked: false, staged, tile_rows: self.tile_rows };
+        self.prebind(b, &t);
+        if !staged && self.carry {
+            body.stage_next_tile(b, role, &t.next);
+        }
+        let n2 = t.n2.clone().expect("n2");
+        let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+        let (lg, vm) = (self.lg(), self.vm_inflight);
+        let body_wants_live = body.wants_stage_live();
+        rotate(b, &ONE_WINDOW_PARTS, stage_sel, None, &mut |b, i| match i {
+            0 => {
+                let key_n2 = b.let_i32(it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1) << lg);
+                if body_wants_live {
+                    let live = b.bind_cond(it_p1.lt(&nkv));
+                    body.stage_live(b, live);
+                }
+                body.stage(b, role, &key_n2, &n2);
+            }
+            1 => body.window(b, role, &t),
+            2 => {
+                b.wait_vm(vm);
+                body.stage_complete(b, role, &n2);
+                b.wait_lds(0);
+                b.barrier();
+            }
+            _ => unreachable!(),
+        });
     }
 
     fn prebind(&self, b: &mut FnBuilder, t: &TileIt) {

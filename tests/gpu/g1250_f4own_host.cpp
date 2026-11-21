@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
             if (*p == '_' && sscanf(p, "_%dx%d_", &nbm, &nbn) == 2 && nbm >= 64) break; else nbm = nbn = 0;
         if (nbm && (nbm != BM || nbn != BN)) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s is a %d x %d tile kernel, the host was given BM=%d BN=%d\n", kn, nbm, nbn, BM, BN); return 2; }
         const int kstep = strstr(kn, "_ks4") ? 512 : strstr(kn, "_ks2") ? 256 : 128;
+        if (strstr(kn, "_carry") && (K % (2 * kstep) || K < 4 * kstep)) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s (carried first stage) needs K to be an even number of slots of %d and at least 4 slots, K=%d\n", kn, kstep, K); return 2; }
         if (K % kstep) { fprintf(stderr, "LAUNCH-REFUSED: kernel %s needs K to be a multiple of %d, K=%d\n", kn, kstep, K); return 2; }
     }
     if (M % BM || N % BN || K % 128) { fprintf(stderr, "M %% %d, N %% %d, K %% 128 required\n", BM, BN); return 1; }

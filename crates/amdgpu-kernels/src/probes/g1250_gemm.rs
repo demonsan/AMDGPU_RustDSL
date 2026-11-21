@@ -726,6 +726,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     if persistent {
         // the outermost loop is the persistent tile loop (G5 verifies one tile body ending quiescent)
         b.persistent_tile_loop();
+        if ring.carry {
+            b.persistent_tile_carry();   // the body issues the next tile's first stage late; the verifier checks it equals the prologue's (GV-TILE-CARRY)
+        }
         if ring.epilogue_lds == 4 {
             b.persistent_tile_overlap_stores();
         }
@@ -736,8 +739,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     // the host contract (docs/gfx1250-hang-rules.md, tensor bounds): the grid covers the output exactly (N = grid x * BN, M = grid y * BM), K a multiple of the slot's K; the buffers hold A / B
     // (fp4: K / 2 bytes per row), their scales (K / 32 bytes per row) and C (f32, M x N). Every tensor tile and every store is proven inside these extents.
     // K = 128 * K128 (K128 a multiple of ks, at least two K slots so the prologue's second stage is a real tile): the extents below are polynomials, no divisions
+    // carry: K = 2 ks KQ x 128 (an even number of K slots: the carried stage lands in the static slot 0, the epilogue stages in the consumed slot 1)
+    let k128e: Ext = if ring.carry {
+        b.sym_range("KQ", 2, 1 << 12);   // K >= 4 slots: the loop runs (nkv - 2) / 2 >= 1 pairs of windows
+        Ext::sym("KQ") * Ext::c(2 * sh.ks as i64)
+    } else {
+        Ext::sym("K128")
+    };
     b.sym_range("K128", (ring.slots as i64 - 1) * sh.ks as i64, 1 << 13);   // at least `slots - 1` K slots: the prologue stages tiles 0 .. slots - 2 as real tiles
-    b.ka_is(40, Ext::sym("K128") * Ext::c(128));
+    b.ka_is(40, k128e.clone() * Ext::c(128));
     // (persistent: the tile counts are symbols TX / TY, N = TX * BN, kernarg tiles_y = TY; the grid is any number of workgroups)
     let (m_rows, n_cols) = if persistent && sh.cx * sh.cy > 1 {
         b.sym_range("TX", 1, 1 << 12);
@@ -763,15 +773,15 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
         // row pitch of A / B = K / 2 + PAD bytes (the host contract: PAD a multiple of 16, at most 16 KiB)
         b.arg("lda", DType::I32, 72, 4);
         b.sym_range("PAD", 0, 1 << 14);
-        b.ka_is(72, Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD"));
-        b.arg_tensor("a", m_rows.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
-        b.arg_tensor("b", n_cols.clone() * (Ext::sym("K128") * Ext::c(64) + Ext::sym("PAD")));
+        b.ka_is(72, k128e.clone() * Ext::c(64) + Ext::sym("PAD"));
+        b.arg_tensor("a", m_rows.clone() * (k128e.clone() * Ext::c(64) + Ext::sym("PAD")));
+        b.arg_tensor("b", n_cols.clone() * (k128e.clone() * Ext::c(64) + Ext::sym("PAD")));
     } else {
-        b.arg_tensor("a", m_rows.clone() * Ext::sym("K128") * Ext::c(64));
-        b.arg_tensor("b", n_cols.clone() * Ext::sym("K128") * Ext::c(64));
+        b.arg_tensor("a", m_rows.clone() * k128e.clone() * Ext::c(64));
+        b.arg_tensor("b", n_cols.clone() * k128e.clone() * Ext::c(64));
     }
-    b.arg_tensor("sa", m_rows.clone() * Ext::sym("K128") * Ext::c(4));
-    b.arg_tensor("sb", n_cols.clone() * Ext::sym("K128") * Ext::c(4));
+    b.arg_tensor("sa", m_rows.clone() * k128e.clone() * Ext::c(4));
+    b.arg_tensor("sb", n_cols.clone() * k128e.clone() * Ext::c(4));
     b.arg_tensor("c", m_rows * n_cols * Ext::c(if sh.bf16 { 2 } else { 4 }));
     let mut lds = LdsPlan::new();
     let (ra, rb, rsa, rsb) = if grouped {
@@ -787,6 +797,9 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
     };
     // the LDS-staged epilogue aliases the (dead) ring from offset 0: the plan must cover waves x (wave rows) x (wave columns x 4 + 16) bytes
     let epi = ring.epilogue_lds;
+    let epi_rot_c = ring.carry || ring.epi_rot;
+    let mut epi_extra: Option<amdgpu_tile::shared::Shared> = None;
+    let (mut epi_a, mut epi_b, mut epi_w): (Option<amdgpu_tile::shared::Shared>, Option<amdgpu_tile::shared::Shared>, Option<amdgpu_tile::shared::Shared>) = (None, None, None);
     assert!(epi == 0 || epi == 3 || epi == 4 || epi == 5 || epi == 6 || epi == 7 || !sh.bf16, "the LDS epilogue: f32 output (bf16: epilogue_lds 3 / 4 with the swap, 5 without)");
     assert!(epi != 5 && epi != 6 && epi != 7 || (!ring.swap && sh.bf16), "epilogue_lds 5: bf16 output, no operand swap (the f32 accumulators are rounded in registers and staged as 16-bit pieces)");
     assert!(epi != 4 || (ring.swap && sh.bf16), "epilogue_lds 4: bf16 output with the operand swap");
@@ -805,7 +818,24 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
             // a separate staging region behind the ring: the next tile's stages load into the ring while the tensor stores still read the staging
             let _ = lds.ring("EPI", need, 1, Layout::Linear);
         } else if need > ring_bytes {
-            let _ = lds.ring("EPI", need - ring_bytes, 1, Layout::Linear);
+            epi_extra = Some(lds.ring("EPI", need - ring_bytes, 1, Layout::Linear));
+        }
+        // the staging as DECLARED regions of the tile protocol (GV-TILE-UNTAGGED-OVERLAP: an unmarked access must avoid every declared buffer). One private slice per (wave, band):
+        // the dead rings (non-carry; the protocol checks they are dead), or - carry / rotating epilogue - the A and B regions of ring slot 1 only (slot 0 holds the carried stage in flight),
+        // four slices of 32 rows x wcols f32 per role (two per wave: band i uses slice 2 (wave in role) + (i & 1), generation i / 2).
+        if epi != 4 && epi != 3 {
+            if epi_rot_c {
+                assert!(ring.roles, "the rotating epilogue needs the wave roles (its regions are per role)");
+                epi_a = Some(lds.private_over_slots("EPIA", 32 * epi_rs as i64, 4, &[(&ra, 1)]));
+                epi_b = Some(lds.private_over_slots("EPIB", 32 * epi_rs as i64, 4, &[(&rb, 1)]));
+            } else {
+                let mut ov: Vec<&amdgpu_tile::shared::Shared> = vec![&ra, &rb, &rsa, &rsb];
+                if let Some(e) = &epi_extra {
+                    ov.push(e);
+                }
+                let nbands = if ring.epi_bands > 0 { ring.epi_bands as i64 } else { 1 };
+                epi_w = Some(lds.private("EPIW", (wrows * epi_rs) as i64 / nbands, sh.waves() as u32 * nbands as u32, &ov));
+            }
         }
     }
     lds.commit(&mut b);
@@ -1394,6 +1424,30 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                 let c = b.bind_cond(amdgpu_dsl::ox(Opnd::Val(odd)).ne(0));
                 b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(0x0302_0706), b: Opnd::I32(0x0504_0100) })
             };
+            // the protocol markers of the staging: (region, slice key, generation) of band `band` of this wave; kind 0 = produce, 1 = consume
+            let nb_c: i32 = if ring.epi_bands > 0 { ring.epi_bands as i32 } else { 1 };
+            let epi_mark = |b: &mut FnBuilder, kind: u8, band: i32, key: Option<ValueId>| -> ValueId {
+                if epi == 4 || epi == 3 {
+                    return wid;
+                }
+                let (name, slice, gen): (&str, ValueId, i32) = if epi_rot_c {
+                    let nm = match role {
+                        Role::A => "EPIA",
+                        Role::B => "EPIB",
+                        _ => panic!("the rotating epilogue needs the role copies"),
+                    };
+                    (nm, key.unwrap_or_else(|| b.bind_i32(ev(wsl) * 2 + (band & 1))), band / 2)
+                } else {
+                    ("EPIW", key.unwrap_or_else(|| b.bind_i32(ev(wid) * nb_c + band)), 0)
+                };
+                if kind == 0 {
+                    b.tile_produce(name, Opnd::Val(slice), Opnd::I32(gen));
+                } else {
+                    b.tile_consume(name, Opnd::Val(slice), Opnd::I32(gen));
+                }
+                slice
+            };
+            let _ = (&epi_a, &epi_b, &epi_w);
             let lb = b.add_i32(wl0, lrow);
             let lb = b.add_i32(lb, m4);
             let lb2 = {
@@ -1422,7 +1476,26 @@ pub fn gemm_tdm_stage_f4_ring(name: &str, sh: F4Shape, coop: bool, grouped: bool
                         b.wait_tensor(1);   // the store of band i - 2 (and, in order, the loads before it) is done: its LDS band is free
                     }
                     let boff = if ring.carry || ring.epi_rot { (i & 1) * 32 * epi_rs } else { i * 32 * epi_rs };
-                    let bi = b.add_i32(lb, Opnd::I32(boff));
+                    // rotating epilogue: the band's address derives from its slice key (the verifier requires it): region base + key * slice bytes
+                    let mut band_base: Option<ValueId> = None;
+                    let mut band_key: Option<ValueId> = None;
+                    let bi = if epi_rot_c {
+                        let key = epi_mark(b, 0, i, None);
+                        band_key = Some(key);
+                        let epr = match role {
+                            Role::A => epi_a.as_ref().expect("EPIA"),
+                            _ => epi_b.as_ref().expect("EPIB"),
+                        };
+                        let bb = b.bind_i32(epr.mine(key).base());
+                        band_base = Some(bb);
+                        let t1 = b.add_i32(bb, lrow);
+                        b.add_i32(t1, m4)
+                    } else {
+                        if i % per == 0 {
+                            epi_mark(b, 0, i / per, None);
+                        }
+                        b.add_i32(lb, Opnd::I32(boff))
+                    };
                     for j in 0..sh.tn {
                         let acc = body.acc[(i * sh.tn + j) as usize];
                         let bi2 = b.add_i32(lb2, Opnd::I32(boff));
@@ -1482,18 +1555,25 @@ for q in 0..8i32 {
                         }
                     }
                     if (i + 1) % per == 0 {
+                        b.tile_end();
                         b.wait_lds(0);
                         let i0 = i + 1 - per;   // the band's first 32-row block
                         let band_bytes = b.mul_i32(nn, Opnd::I32(32 * 4 * i0));
                         let org_i = b.add_i32(org_s, band_bytes);
                         let org_i = b.let_(Op::ReadFirstLane(Opnd::Val(org_i)));
-                        let lds_i = b.add_i32(wl0_s, Opnd::I32(if ring.carry || ring.epi_rot { (i0 & 1) * 32 * epi_rs } else { i0 * 32 * epi_rs }));
+                        let lds_i = match band_base {
+                            Some(bb) => b.let_(Op::ReadFirstLane(Opnd::Val(bb))),
+                            None => b.add_i32(wl0_s, Opnd::I32(i0 * 32 * epi_rs)),
+                        };
                         let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_i), Opnd::Val(lds_i));
+                        epi_mark(b, 1, if epi_rot_c { i0 } else { i0 / per }, band_key);
                         b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                        b.tile_end();
                     }
                 }
                 b.wait_tensor(0);
             } else {
+            epi_mark(b, 0, 0, None);
             for i in 0..sh.tm {
                 let bi = b.add_i32(lb, Opnd::I32(i * 32 * epi_rs));
                 for j in 0..sh.tn {
@@ -1555,6 +1635,7 @@ for q in 0..8i32 {
                     }
                 }
             }
+            b.tile_end();
             b.wait_lds(0);
             let t_e1 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
             // the wave's C block origin (f32 elements): rows row0 + wi * wrows, columns col0 + wj * wcols
@@ -1576,6 +1657,7 @@ for q in 0..8i32 {
                 let lr = b.add_i32(wl0, l16);
                 let cols_b = b.let_(Op::ShlI32(Opnd::Val(nn), Opnd::I32(2)));
                 let gofs = b.add_i32(org, l16);
+                epi_mark(b, 1, 0, None);
                 for q in 0..wrows {
                     for ch in 0..chunks {
                         let la = b.bind_i32(ev(lr) + (q * epi_rs + ch * 512));
@@ -1587,6 +1669,7 @@ for q in 0..8i32 {
                         b.store_f32x4(p, 0, v4);
                     }
                 }
+                b.tile_end();
             } else {
                 // one tensor store per wave: the block (wcols x wrows f32) from LDS (rows padded by 4 dwords) to C (row stride N)
                 let tile = TensorTile { data_size: if epi == 5 || epi == 6 || epi == 7 { 2 } else { 4 }, tensor_dim: [Opnd::I32(wcols), Opnd::I32(wrows)], stride0: Opnd::Val(nn), tile: [wcols as u16, wrows as u16], pad: None, wg_mask: 0 };
@@ -1594,7 +1677,9 @@ for q in 0..8i32 {
                 let org_s = b.let_(Op::ReadFirstLane(Opnd::Val(org)));
                 let wl0_s = b.let_(Op::ReadFirstLane(Opnd::Val(wl0)));
                 let (g0, g1) = b.tensor_desc_2d(&tile, Opnd::Val(pc), Opnd::Val(org_s), Opnd::Val(wl0_s));
+                epi_mark(b, 1, 0, None);
                 b.tensor_store_from_lds(Opnd::Val(g0), Opnd::Val(g1), None, amdgpu_dsl::TdmCpol::default());
+                b.tile_end();
                 let t_e2 = if ring.stamps { let c = b.shader_cycles(); Some(b.let_(Op::PtrLo(Opnd::Val(c)))) } else { None };
                 if let (Some(e1), Some(e2)) = (t_e1, t_e2) {
                     let gxm = b.let_(Op::AndI32(Opnd::Val(wgx), Opnd::I32(63)));
